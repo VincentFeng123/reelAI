@@ -37,6 +37,21 @@ function detectTouchLikeDevice(): boolean {
   return navigator.maxTouchPoints > 0;
 }
 
+function detectMobilePhoneDevice(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  const ua = navigator.userAgent || "";
+  const isIpadLike =
+    /iPad/i.test(ua) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1) ||
+    /Macintosh/i.test(ua) && navigator.maxTouchPoints > 1;
+  const isTabletUa = /Tablet|PlayBook|Silk/i.test(ua) || (/Android/i.test(ua) && !/Mobile/i.test(ua));
+  const isPhoneUa = /iPhone|iPod|Android.+Mobile|Windows Phone|Mobile/i.test(ua);
+  const narrowTouchViewport = (window.matchMedia?.("(max-width: 767px)").matches ?? false) && detectTouchLikeDevice();
+  return !isIpadLike && !isTabletUa && (isPhoneUa || narrowTouchViewport);
+}
+
 function loadYouTubeIframeApi(): Promise<void> {
   if (typeof window === "undefined") {
     return Promise.resolve();
@@ -131,6 +146,7 @@ export function ReelCard({
   const [currentSec, setCurrentSec] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isTouchLikeDevice, setIsTouchLikeDevice] = useState(false);
+  const [isMobilePhoneDevice, setIsMobilePhoneDevice] = useState(false);
 
   const videoId = useMemo(() => extractVideoId(reel.video_url), [reel.video_url]);
   const clipStart = Math.max(0, Math.floor(reel.t_start));
@@ -151,21 +167,35 @@ export function ReelCard({
     const mediaQuery = window.matchMedia?.("(pointer: coarse)");
     const update = () => {
       setIsTouchLikeDevice(detectTouchLikeDevice());
+      setIsMobilePhoneDevice(detectMobilePhoneDevice());
     };
     update();
+    const onResize = () => update();
+    window.addEventListener("resize", onResize);
     if (!mediaQuery) {
-      return;
+      return () => {
+        window.removeEventListener("resize", onResize);
+      };
     }
     const add = (mediaQuery as MediaQueryList & { addListener?: (listener: () => void) => void }).addListener;
     const remove = (mediaQuery as MediaQueryList & { removeListener?: (listener: () => void) => void }).removeListener;
     if (typeof mediaQuery.addEventListener === "function") {
       mediaQuery.addEventListener("change", update);
-      return () => mediaQuery.removeEventListener("change", update);
+      return () => {
+        mediaQuery.removeEventListener("change", update);
+        window.removeEventListener("resize", onResize);
+      };
     }
     if (typeof add === "function" && typeof remove === "function") {
       add.call(mediaQuery, update);
-      return () => remove.call(mediaQuery, update);
+      return () => {
+        remove.call(mediaQuery, update);
+        window.removeEventListener("resize", onResize);
+      };
     }
+    return () => {
+      window.removeEventListener("resize", onResize);
+    };
   }, []);
 
   const stopProgressTimer = useCallback(() => {
@@ -598,6 +628,9 @@ export function ReelCard({
     `grid h-9 w-9 place-items-center text-base transition ${
       active ? "text-white" : "text-white/88 hover:text-white"
     } disabled:text-white/35`;
+  const controlsChromeClass = isMobilePhoneDevice
+    ? "rounded-2xl border border-white/20 bg-black/70 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.38)] backdrop-blur-md"
+    : "px-0 py-0";
 
   return (
     <section className="relative h-full min-h-full w-full snap-start overflow-hidden rounded-3xl border border-white/20 bg-black/80">
@@ -654,7 +687,7 @@ export function ReelCard({
         onTouchEnd={stopFeedGesturePropagation}
         className="absolute inset-x-0 bottom-0 z-20 p-3"
       >
-        <div className="rounded-2xl border border-white/20 bg-black/42 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.35)] backdrop-blur-md md:rounded-none md:border-0 md:bg-transparent md:shadow-none md:backdrop-blur-none">
+        <div className={controlsChromeClass}>
           {showCaptions && activeCaptionText ? (
             <div className="mb-2 flex justify-center px-1">
               <p className="max-w-[92%] rounded-xl bg-black/78 px-3 py-2 text-center text-[12px] font-medium leading-relaxed text-white/96">
