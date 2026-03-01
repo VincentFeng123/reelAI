@@ -628,8 +628,6 @@ export function ReelCard({
 
       <div className="pointer-events-none absolute inset-x-0 top-0 z-[16] h-10 bg-black/95" />
 
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[18] h-[52%] bg-gradient-to-t from-black/78 via-black/52 to-transparent backdrop-blur-md" />
-
       {isActive ? (
         <button
           type="button"
@@ -667,7 +665,7 @@ export function ReelCard({
 
           <div className="mb-2 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <div className="inline-flex h-9 items-center rounded-full border border-white/30 bg-black/82 px-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/92">
+              <div className="inline-flex h-9 items-center rounded-full border border-white/30 bg-black/82 px-3 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/92">
                 {formatClock(currentSec)} / {formatClock(clipDuration)}
               </div>
               {onOpenContent ? (
