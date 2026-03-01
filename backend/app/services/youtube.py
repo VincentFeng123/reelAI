@@ -41,6 +41,7 @@ class YouTubeService:
     def __init__(self) -> None:
         settings = get_settings()
         self.api_key = settings.youtube_api_key
+        self.transcript_api = YouTubeTranscriptApi()
 
     def search_videos(
         self,
@@ -459,11 +460,17 @@ class YouTubeService:
     def get_transcript(self, conn, video_id: str) -> list[dict[str, Any]]:
         cached = fetch_one(conn, "SELECT transcript_json FROM transcript_cache WHERE video_id = ?", (video_id,))
         if cached:
-            return json.loads(cached["transcript_json"])
+            try:
+                cached_transcript = json.loads(cached["transcript_json"])
+            except json.JSONDecodeError:
+                cached_transcript = []
+            # Keep non-empty cache hits, but allow refetch when older runs cached an empty transcript.
+            if cached_transcript:
+                return cached_transcript
 
         transcript: list[dict[str, Any]] = []
         try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=["en"])
+            transcript = self.transcript_api.fetch(video_id, languages=["en"]).to_raw_data()
         except NoTranscriptFound:
             transcript = self._fallback_any_transcript(video_id)
         except (TranscriptsDisabled, VideoUnavailable):
@@ -471,27 +478,35 @@ class YouTubeService:
         except Exception:
             transcript = []
 
-        upsert(
-            conn,
-            "transcript_cache",
-            {
-                "video_id": video_id,
-                "transcript_json": dumps_json(transcript),
-                "created_at": now_iso(),
-            },
-            pk="video_id",
-        )
+        if transcript:
+            upsert(
+                conn,
+                "transcript_cache",
+                {
+                    "video_id": video_id,
+                    "transcript_json": dumps_json(transcript),
+                    "created_at": now_iso(),
+                },
+                pk="video_id",
+            )
         return transcript
 
     def _fallback_any_transcript(self, video_id: str) -> list[dict[str, Any]]:
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript_list = self.transcript_api.list(video_id)
+            try:
+                return transcript_list.find_manually_created_transcript(["en"]).fetch().to_raw_data()
+            except NoTranscriptFound:
+                pass
+            try:
+                return transcript_list.find_generated_transcript(["en"]).fetch().to_raw_data()
+            except NoTranscriptFound:
+                pass
             for transcript in transcript_list:
-                if transcript.language_code.startswith("en"):
-                    return transcript.fetch()
-            first = next(iter(transcript_list), None)
-            if first:
-                return first.fetch()
+                try:
+                    return transcript.fetch().to_raw_data()
+                except Exception:
+                    continue
         except Exception:
             return []
         return []
