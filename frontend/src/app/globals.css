@@ -1,0 +1,308 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --mouse-x: 50vw;
+  --mouse-y: 50vh;
+  --grid-size: 42px;
+  --grid-glow-opacity: 0;
+}
+
+html,
+body {
+  width: 100%;
+  max-width: 100%;
+  min-height: 100%;
+  overflow: hidden;
+}
+
+body {
+  position: relative;
+  margin: 0;
+  padding: 16px;
+  color: #f5f5f5;
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+    #050505;
+  background-size:
+    var(--grid-size) var(--grid-size),
+    var(--grid-size) var(--grid-size),
+    auto;
+  background-attachment: fixed;
+  font-family:
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
+  text-rendering: geometricPrecision;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: var(--grid-glow-opacity);
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+  background-size:
+    var(--grid-size) var(--grid-size),
+    var(--grid-size) var(--grid-size);
+  -webkit-mask-image: radial-gradient(
+    165px circle at var(--mouse-x) var(--mouse-y),
+    rgba(0, 0, 0, 0.76) 0%,
+    rgba(0, 0, 0, 0.5) 40%,
+    transparent 68%
+  );
+  mask-image: radial-gradient(
+    165px circle at var(--mouse-x) var(--mouse-y),
+    rgba(0, 0, 0, 0.76) 0%,
+    rgba(0, 0, 0, 0.5) 40%,
+    transparent 68%
+  );
+  transition: opacity 180ms ease-out;
+}
+
+body > * {
+  position: relative;
+  z-index: 1;
+}
+
+input,
+textarea,
+button {
+  font: inherit;
+}
+
+::selection {
+  background: #fff;
+  color: #000;
+}
+
+.reel-overlay {
+  background: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, 0.1) 0%,
+    rgba(0, 0, 0, 0.45) 45%,
+    rgba(0, 0, 0, 0.8) 100%
+  );
+}
+
+.reel-scroll {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.reel-scroll::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.reel-range {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  outline: none;
+}
+
+.reel-range::-webkit-slider-runnable-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.32);
+}
+
+.reel-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -6px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.28);
+}
+
+.reel-range::-moz-range-track {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.32);
+}
+
+.reel-range::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.28);
+}
+
+.volumetric-glow-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 1;
+  overflow: hidden;
+  isolation: isolate;
+  background: #000;
+}
+
+.volumetric-glow-canvas::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background:
+    radial-gradient(1400px 1000px at 95% 50%, rgba(200, 220, 255, 0.12), transparent 55%),
+    radial-gradient(1100px 800px at 90% 45%, rgba(120, 165, 255, 0.10), transparent 58%),
+    radial-gradient(600px 450px at 50% 35%, rgba(140, 170, 240, 0.05), transparent 65%);
+  mix-blend-mode: screen;
+}
+
+.volumetric-glow-canvas::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background:
+    radial-gradient(130% 80% at 12% -10%, rgba(0, 0, 0, 0.88), rgba(0, 0, 0, 0) 55%),
+    radial-gradient(130% 85% at 15% 110%, rgba(0, 0, 0, 0.82), rgba(0, 0, 0, 0) 52%),
+    radial-gradient(140% 120% at 50% 50%, rgba(0, 0, 0, 0) 55%, rgba(0, 0, 0, 0.25) 100%);
+}
+
+.home-hero-shell::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 1;
+  background: radial-gradient(100% 130% at 50% 50%, rgba(0, 0, 0, 0) 53%, rgba(0, 0, 0, 0.22) 100%);
+}
+
+.home-hero-bg {
+  transform: translateZ(0);
+}
+
+.volumetric-glow-canvas canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.volumetric-light-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  opacity: 1;
+  overflow: hidden;
+  isolation: isolate;
+  background: #000;
+}
+
+.volumetric-light-canvas::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background:
+    radial-gradient(1400px 1000px at 95% 50%, rgba(140, 170, 255, 0.06), transparent 55%),
+    radial-gradient(1100px 800px at 90% 45%, rgba(100, 130, 220, 0.05), transparent 58%),
+    radial-gradient(600px 450px at 50% 35%, rgba(110, 140, 230, 0.03), transparent 65%);
+  mix-blend-mode: screen;
+}
+
+.volumetric-light-canvas::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background:
+    radial-gradient(130% 80% at 12% -10%, rgba(0, 0, 0, 0.90), rgba(0, 0, 0, 0) 55%),
+    radial-gradient(130% 85% at 15% 110%, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0) 52%),
+    radial-gradient(140% 120% at 50% 50%, rgba(0, 0, 0, 0) 55%, rgba(0, 0, 0, 0.28) 100%);
+}
+
+.volumetric-light-canvas canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+@keyframes mobile-sidenav-in {
+  from {
+    transform: translateX(-28px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes mobile-sidenav-out {
+  from {
+    transform: translateX(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateX(-28px);
+    opacity: 0;
+  }
+}
+
+@keyframes mobile-overlay-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes mobile-overlay-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .animate-mobile-sidenav-in {
+    animation: mobile-sidenav-in 260ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
+
+  .animate-mobile-sidenav-out {
+    animation: mobile-sidenav-out 240ms cubic-bezier(0.4, 0, 1, 1) forwards;
+  }
+
+  .animate-mobile-overlay-in {
+    animation: mobile-overlay-in 220ms ease-out forwards;
+  }
+
+  .animate-mobile-overlay-out {
+    animation: mobile-overlay-out 200ms ease-in forwards;
+  }
+}
