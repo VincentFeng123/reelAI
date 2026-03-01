@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import logging
 from typing import Iterable
 
 import numpy as np
@@ -8,6 +9,8 @@ from openai import OpenAI
 
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, now_iso, upsert
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingService:
@@ -37,7 +40,12 @@ class EmbeddingService:
         if missing_indices:
             missing_texts = [text_list[i] for i in missing_indices]
             if self.client:
-                fetched = self._embed_openai(missing_texts)
+                try:
+                    fetched = self._embed_openai(missing_texts)
+                except Exception as exc:
+                    # Keep API endpoints alive even when OpenAI quota/model calls fail.
+                    logger.warning("OpenAI embeddings failed; falling back to local embeddings: %s", exc)
+                    fetched = self._embed_local(missing_texts)
             else:
                 fetched = self._embed_local(missing_texts)
 
