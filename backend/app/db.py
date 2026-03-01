@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -135,6 +136,9 @@ CREATE TABLE IF NOT EXISTS llm_cache (
 );
 """
 
+_db_init_lock = threading.Lock()
+_db_ready = False
+
 
 def _db_path() -> str:
     settings = get_settings()
@@ -143,13 +147,26 @@ def _db_path() -> str:
 
 
 def init_db() -> None:
+    global _db_ready
     with sqlite3.connect(_db_path()) as conn:
         conn.executescript(SCHEMA)
         conn.commit()
+    _db_ready = True
+
+
+def ensure_db_initialized() -> None:
+    global _db_ready
+    if _db_ready:
+        return
+    with _db_init_lock:
+        if _db_ready:
+            return
+        init_db()
 
 
 @contextmanager
 def get_conn():
+    ensure_db_initialized()
     conn = sqlite3.connect(_db_path(), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000;")
