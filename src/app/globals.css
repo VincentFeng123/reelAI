@@ -21,6 +21,14 @@ body {
   overflow: hidden;
 }
 
+@media (max-width: 767px) {
+  html,
+  body {
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+}
+
 body {
   position: relative;
   margin: 0;

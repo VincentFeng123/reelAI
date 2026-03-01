@@ -802,7 +802,7 @@ function FeedPageInner() {
   }
 
   return (
-    <main className="fixed inset-4 overflow-hidden">
+    <main className="fixed inset-4 overflow-visible md:overflow-hidden">
       <button
         type="button"
         onClick={() => router.push("/")}
