@@ -366,7 +366,7 @@ export default function HomePage() {
   );
 
   return (
-    <main className="home-hero-shell fixed inset-4 overflow-x-visible overflow-y-auto md:overflow-hidden">
+    <main className="home-hero-shell fixed inset-0 overflow-x-visible overflow-y-auto md:inset-4 md:overflow-hidden">
       <div className="home-hero-bg pointer-events-none absolute inset-0 z-0 overflow-hidden">
         <HeroGhostSvg />
         <div className="absolute -top-[50%] bottom-0 left-0 -right-[100%]">
@@ -392,7 +392,7 @@ export default function HomePage() {
       </button>
 
       {mobileSidebarOpen ? (
-        <div className="fixed inset-0 z-50 lg:hidden">
+        <div className="fixed left-0 top-0 z-50 h-[100dvh] w-screen lg:hidden">
           <button
             type="button"
             aria-label="Close topic menu overlay"
@@ -400,7 +400,7 @@ export default function HomePage() {
             className={`absolute inset-0 bg-black/70 ${mobileSidebarClosing ? "animate-mobile-overlay-out" : "animate-mobile-overlay-in"}`}
           />
           <aside
-            className={`absolute inset-y-0 left-0 h-screen w-[82vw] max-w-[340px] rounded-r-3xl bg-black/42 px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.45)] backdrop-blur-xl ${
+            className={`absolute left-0 top-0 h-[100dvh] w-[82vw] max-w-[340px] rounded-r-3xl bg-black/42 px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.45)] backdrop-blur-xl ${
               mobileSidebarClosing ? "animate-mobile-sidenav-out" : "animate-mobile-sidenav-in"
             }`}
           >
