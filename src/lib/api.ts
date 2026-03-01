@@ -6,12 +6,24 @@ import type {
   ReelsGenerateResponse,
 } from "@/lib/types";
 
-const API_BASE = (
+const RAW_API_BASE = (
   process.env.NEXT_PUBLIC_API_BASE || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "")
 ).replace(/\/$/, "");
-const BACKEND_DOWN_ERROR = API_BASE
-  ? `Cannot reach backend at ${API_BASE}. Make sure the backend server is running.`
+const BACKEND_DOWN_ERROR = RAW_API_BASE
+  ? `Cannot reach backend at ${RAW_API_BASE}. Make sure the backend server is running.`
   : "Cannot reach backend. Check your deployment and API routes.";
+
+function apiUrl(path: string): string {
+  const cleanPath = path.startsWith("/") ? path : `/${path}`;
+  if (!RAW_API_BASE) {
+    return `/api${cleanPath}`;
+  }
+  const cleanBase = RAW_API_BASE.replace(/\/$/, "");
+  if (cleanBase.endsWith("/api")) {
+    return `${cleanBase}${cleanPath}`;
+  }
+  return `${cleanBase}/api${cleanPath}`;
+}
 
 export async function uploadMaterial(params: {
   text?: string;
@@ -29,7 +41,7 @@ export async function uploadMaterial(params: {
     form.append("subject_tag", params.subjectTag);
   }
 
-  const res = await safeFetch(`${API_BASE}/api/material`, {
+  const res = await safeFetch(apiUrl("/material"), {
     method: "POST",
     body: form,
   });
@@ -41,7 +53,7 @@ export async function generateReels(params: {
   numReels?: number;
   conceptId?: string;
 }): Promise<ReelsGenerateResponse> {
-  const res = await safeFetch(`${API_BASE}/api/reels/generate`, {
+  const res = await safeFetch(apiUrl("/reels/generate"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -73,7 +85,7 @@ export async function fetchFeed(params: {
     creative_commons_only: "false",
   });
 
-  const res = await safeFetch(`${API_BASE}/api/feed?${query}`, {
+  const res = await safeFetch(`${apiUrl("/feed")}?${query}`, {
     cache: "no-store",
   });
 
@@ -87,7 +99,7 @@ export async function sendFeedback(params: {
   rating?: number;
   saved?: boolean;
 }): Promise<void> {
-  await safeFetch(`${API_BASE}/api/reels/feedback`, {
+  await safeFetch(apiUrl("/reels/feedback"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -108,7 +120,7 @@ export async function askStudyChat(params: {
   text?: string;
   history?: ChatMessage[];
 }): Promise<ChatResponse> {
-  const res = await safeFetch(`${API_BASE}/api/chat`, {
+  const res = await safeFetch(apiUrl("/chat"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",

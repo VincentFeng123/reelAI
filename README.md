@@ -280,7 +280,7 @@ From repo root:
 
 How this works in one project:
 - Next.js serves the frontend from root (`src/...`).
-- Vercel runs Python API at `api/index.py`, which reuses `backend/app/main.py`.
+- Vercel runs Python API at `api/index.py` and `api/[...path].py`, both reusing `backend/app/main.py`.
 - Root `requirements.txt` pulls backend dependencies for the Python runtime.
 
 ### Verify
