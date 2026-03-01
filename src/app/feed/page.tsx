@@ -3,6 +3,7 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
+import { LoadingFlappyMiniGame } from "@/components/LoadingFlappyMiniGame";
 import { ReelCard } from "@/components/ReelCard";
 import { askStudyChat, fetchFeed, generateReels, sendFeedback, uploadMaterial } from "@/lib/api";
 import type { ChatMessage, Reel } from "@/lib/types";
@@ -1058,6 +1059,9 @@ function FeedPageInner() {
             {reels.length === 0 ? (
               <div className="absolute inset-0 grid place-items-center p-6">
                 <div className="max-w-sm rounded-3xl border border-white/20 bg-black/68 px-5 py-4 text-center text-white backdrop-blur">
+                  {loading || bootstrappingFirstReels || generatingMore ? (
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-white/62">Loading feed</p>
+                  ) : null}
                   <p className="text-sm font-semibold">
                     {loading || bootstrappingFirstReels || generatingMore ? "Preparing your first reels..." : "No reels yet"}
                   </p>
@@ -1075,6 +1079,7 @@ function FeedPageInner() {
                       Generate Reels
                     </button>
                   ) : null}
+                  {loading || bootstrappingFirstReels || generatingMore ? <LoadingFlappyMiniGame /> : null}
                 </div>
               </div>
             ) : null}

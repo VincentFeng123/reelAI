@@ -9,6 +9,8 @@ import { VolumetricLightBackground } from "@/components/VolumetricLightBackgroun
 
 const HISTORY_STORAGE_KEY = "studyreels-material-history";
 const LEGACY_TOPIC_HISTORY_STORAGE_KEY = "studyreels-reel-topic-history";
+const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
+const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const MAX_HISTORY_ITEMS = 120;
 const MOBILE_SIDEBAR_CLOSE_MS = 260;
 
@@ -159,6 +161,20 @@ export default function HomePage() {
     setActiveHistoryMenuId(null);
   }, []);
 
+  const clearAllHistory = useCallback(() => {
+    historyRef.current = [];
+    setHistory([]);
+    setHistoryQuery("");
+    setError(null);
+    setActiveHistoryMenuId(null);
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(HISTORY_STORAGE_KEY);
+      window.localStorage.removeItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY);
+      window.localStorage.removeItem(MATERIAL_SEEDS_STORAGE_KEY);
+      window.localStorage.removeItem(FEED_PROGRESS_STORAGE_KEY);
+    }
+  }, []);
+
   const clearMobileSidebarCloseTimer = useCallback(() => {
     if (mobileSidebarCloseTimerRef.current !== null) {
       window.clearTimeout(mobileSidebarCloseTimerRef.current);
@@ -272,13 +288,22 @@ export default function HomePage() {
         <p className="hidden text-lg font-bold leading-none text-white/90 lg:block" aria-label="StudyReels logo">
           ▲
         </p>
-        <button
-          type="button"
-          onClick={clearTopicDraft}
-          className="rounded-xl border border-white/25 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/90 transition hover:bg-white/12"
-        >
-          New Chat
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={clearAllHistory}
+            className="rounded-xl border border-white/20 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/78 transition hover:bg-white/10 hover:text-white"
+          >
+            Clear History
+          </button>
+          <button
+            type="button"
+            onClick={clearTopicDraft}
+            className="rounded-xl border border-white/25 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/90 transition hover:bg-white/12"
+          >
+            New Chat
+          </button>
+        </div>
       </div>
 
       <div className="mt-3">
