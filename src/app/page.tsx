@@ -288,22 +288,13 @@ export default function HomePage() {
         <p className="hidden text-lg font-bold leading-none text-white/90 lg:block" aria-label="StudyReels logo">
           ▲
         </p>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={clearAllHistory}
-            className="rounded-xl border border-white/20 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/78 transition hover:bg-white/10 hover:text-white"
-          >
-            Clear History
-          </button>
-          <button
-            type="button"
-            onClick={clearTopicDraft}
-            className="rounded-xl border border-white/25 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/90 transition hover:bg-white/12"
-          >
-            New Chat
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={clearTopicDraft}
+          className="rounded-xl border border-white/25 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/90 transition hover:bg-white/12"
+        >
+          New Chat
+        </button>
       </div>
 
       <div className="mt-3">
@@ -316,7 +307,16 @@ export default function HomePage() {
       </div>
 
       <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
-        <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">History</p>
+        <div className="mb-2 flex items-center justify-between">
+          <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">History</p>
+          <button
+            type="button"
+            onClick={clearAllHistory}
+            className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60 transition hover:text-white"
+          >
+            Clear History
+          </button>
+        </div>
         <div className="relative pb-1">
           <div className="relative space-y-1.5">
             {filteredHistory.length === 0 ? (
