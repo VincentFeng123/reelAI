@@ -654,7 +654,7 @@ export function ReelCard({
         onTouchEnd={stopFeedGesturePropagation}
         className="absolute inset-x-0 bottom-0 z-20 p-3"
       >
-        <div className="rounded-2xl border border-white/20 bg-black/42 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.35)] backdrop-blur-md">
+        <div className="rounded-2xl border border-white/20 bg-black/42 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.35)] backdrop-blur-md md:rounded-none md:border-0 md:bg-transparent md:shadow-none md:backdrop-blur-none">
           {showCaptions && activeCaptionText ? (
             <div className="mb-2 flex justify-center px-1">
               <p className="max-w-[92%] rounded-xl bg-black/78 px-3 py-2 text-center text-[12px] font-medium leading-relaxed text-white/96">
