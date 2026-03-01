@@ -180,6 +180,12 @@ async def create_material(
 
 @app.post("/api/reels/generate", response_model=ReelsGenerateResponse)
 def generate_reels(payload: ReelsGenerateRequest):
+    if not youtube_service.api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="YOUTUBE_API_KEY is missing. Configure it in backend/.env to retrieve internet videos.",
+        )
+
     with get_conn() as conn:
         material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
         if not material:
@@ -225,7 +231,7 @@ def feed(
 
         ranked = reel_service.ranked_feed(conn, material_id)
         # Auto-expand the feed while users scroll so we can keep serving fresh reels.
-        if autofill:
+        if autofill and youtube_service.api_key:
             target_total = page * limit + prefetch
             attempts = 0
             while len(ranked) < target_total and attempts < 3:
