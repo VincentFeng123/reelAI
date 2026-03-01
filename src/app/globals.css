@@ -27,6 +27,17 @@ body {
     overflow-x: hidden;
     overflow-y: auto;
   }
+
+  /* Prevent iOS Safari from auto-zooming focused form controls. */
+  input,
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+
+  button {
+    touch-action: manipulation;
+  }
 }
 
 body {
