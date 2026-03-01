@@ -144,7 +144,10 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
   };
 
   return (
-    <form onSubmit={onSubmit} className="flex h-full w-full flex-col overflow-hidden px-6 py-6 md:px-10 md:py-8 lg:px-5">
+    <form
+      onSubmit={onSubmit}
+      className="flex h-full w-full flex-col overflow-x-visible overflow-y-auto px-6 py-6 pb-24 md:overflow-hidden md:px-10 md:py-8 md:pb-8 lg:px-5"
+    >
       <header className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
         <div>
           <p className="text-center text-xs font-semibold uppercase tracking-[0.18em] text-white/55 md:text-left">Study Feed</p>

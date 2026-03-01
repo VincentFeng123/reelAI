@@ -366,7 +366,7 @@ export default function HomePage() {
   );
 
   return (
-    <main className="home-hero-shell fixed inset-4 overflow-visible md:overflow-hidden">
+    <main className="home-hero-shell fixed inset-4 overflow-x-visible overflow-y-auto md:overflow-hidden">
       <div className="home-hero-bg pointer-events-none absolute inset-0 z-0 overflow-hidden">
         <HeroGhostSvg />
         <div className="absolute -top-[50%] bottom-0 left-0 -right-[100%]">
@@ -429,7 +429,7 @@ export default function HomePage() {
           <span className="h-[80%] w-px rounded-full bg-white/20" />
         </div>
 
-        <section className="min-h-0 overflow-hidden rounded-3xl bg-black/62 lg:my-2 lg:w-[97%] lg:justify-self-end">
+        <section className="min-h-0 overflow-visible rounded-3xl bg-black/62 md:overflow-hidden lg:my-2 lg:w-[97%] lg:justify-self-end">
           <UploadPanel onMaterialCreated={onUploadMaterialCreated} />
         </section>
       </div>
