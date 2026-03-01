@@ -193,31 +193,65 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
           />
         </div>
 
-        <div>
-          <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">File</label>
-          <input
-            id="material-file"
-            className="sr-only"
-            type="file"
-            accept=".pdf,.docx,.txt"
-            onChange={(e) => setFile(e.target.files?.[0])}
-          />
-          <label
-            htmlFor="material-file"
-            onDragOver={(event) => {
-              event.preventDefault();
-              setIsDraggingFile(true);
-            }}
-            onDragLeave={() => setIsDraggingFile(false)}
-            onDrop={onFileDrop}
-            className={`flex h-12 w-full cursor-pointer items-center rounded-2xl border bg-black/45 px-4 text-sm text-white outline-none transition ${
-              isDraggingFile ? "border-white/70" : "border-white/30"
-            }`}
-          >
-            <span className={`truncate ${selectedFileName ? "text-white" : "text-white/40"}`}>
-              {selectedFileName || "Drag & drop or choose file (.pdf, .docx, .txt)"}
-            </span>
-          </label>
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+          <div className="min-w-0 flex-1">
+            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">File</label>
+            <input
+              id="material-file"
+              className="sr-only"
+              type="file"
+              accept=".pdf,.docx,.txt"
+              onChange={(e) => setFile(e.target.files?.[0])}
+            />
+            <label
+              htmlFor="material-file"
+              onDragOver={(event) => {
+                event.preventDefault();
+                setIsDraggingFile(true);
+              }}
+              onDragLeave={() => setIsDraggingFile(false)}
+              onDrop={onFileDrop}
+              className={`flex h-12 w-full cursor-pointer items-center rounded-2xl border bg-black/45 px-4 text-sm text-white outline-none transition ${
+                isDraggingFile ? "border-white/70" : "border-white/30"
+              }`}
+            >
+              <span className={`truncate ${selectedFileName ? "text-white" : "text-white/40"}`}>
+                {selectedFileName || "Drag & drop or choose file"}
+              </span>
+            </label>
+          </div>
+
+          <div className="w-full sm:w-[176px]">
+            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Generation Speed</label>
+            <div className="relative grid h-12 grid-cols-2 items-center rounded-2xl border border-white/25 bg-black/45 p-1">
+              <span
+                aria-hidden="true"
+                className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%-4px)] rounded-xl bg-white transition-transform duration-300 ease-out ${
+                  generationMode === "fast" ? "translate-x-full" : "translate-x-0"
+                }`}
+              />
+              <button
+                type="button"
+                onClick={() => setGenerationMode("slow")}
+                className={`relative z-10 rounded-xl px-2 py-2 text-xs font-semibold uppercase tracking-[0.08em] transition-colors duration-200 ${
+                  generationMode === "slow" ? "text-black" : "text-white/80"
+                }`}
+                aria-pressed={generationMode === "slow"}
+              >
+                Slow
+              </button>
+              <button
+                type="button"
+                onClick={() => setGenerationMode("fast")}
+                className={`relative z-10 rounded-xl px-2 py-2 text-xs font-semibold uppercase tracking-[0.08em] transition-colors duration-200 ${
+                  generationMode === "fast" ? "text-black" : "text-white/80"
+                }`}
+                aria-pressed={generationMode === "fast"}
+              >
+                Fast
+              </button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -233,33 +267,13 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
 
       <div className="mt-2 shrink-0 flex flex-col gap-2 md:mt-6 md:gap-3 md:flex-row md:items-center md:justify-between">
         <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>
-        <div className="mt-0 flex w-full flex-col gap-2 md:mt-4 md:w-auto md:flex-row md:items-center">
-          <div className="inline-flex h-11 items-center rounded-2xl border border-white/25 bg-black/45 p-1 text-xs font-semibold uppercase tracking-[0.08em] text-white">
-            <button
-              type="button"
-              onClick={() => setGenerationMode("slow")}
-              className={`rounded-xl px-3 py-2 transition ${generationMode === "slow" ? "bg-white text-black" : "text-white/80 hover:bg-white/10"}`}
-              aria-pressed={generationMode === "slow"}
-            >
-              Slow
-            </button>
-            <button
-              type="button"
-              onClick={() => setGenerationMode("fast")}
-              className={`rounded-xl px-3 py-2 transition ${generationMode === "fast" ? "bg-white text-black" : "text-white/80 hover:bg-white/10"}`}
-              aria-pressed={generationMode === "fast"}
-            >
-              Fast
-            </button>
-          </div>
-          <button
-            type="submit"
-            disabled={disabled}
-            className="w-full rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:w-auto"
-          >
-            {loading ? "Starting..." : "Start Learning"}
-          </button>
-        </div>
+        <button
+          type="submit"
+          disabled={disabled}
+          className="mt-0 w-full rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:mt-4 md:w-auto"
+        >
+          {loading ? "Starting..." : "Start Learning"}
+        </button>
       </div>
     </form>
   );
