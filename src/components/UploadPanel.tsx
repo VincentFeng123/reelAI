@@ -209,12 +209,12 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
         />
       </div>
 
-      <div className="mt-6 shrink-0 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+      <div className="mt-2 shrink-0 flex flex-col gap-2 md:mt-6 md:gap-3 md:flex-row md:items-center md:justify-between">
         <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>
         <button
           type="submit"
           disabled={disabled}
-          className="mt-2 w-full rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:mt-4 md:w-auto"
+          className="mt-0 w-full rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:mt-4 md:w-auto"
         >
           {loading ? "Starting..." : "Start Learning"}
         </button>
