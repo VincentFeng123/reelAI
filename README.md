@@ -165,6 +165,9 @@ Response:
 
 ```text
 .
+├── api
+│   └── index.py                # Vercel Python entrypoint -> FastAPI app
+├── requirements.txt            # Includes backend/requirements.txt for Vercel python runtime
 ├── README.md
 ├── backend
 │   ├── .env.example
@@ -185,24 +188,20 @@ Response:
 │           ├── text_utils.py
 │           ├── vector_search.py
 │           └── youtube.py
-└── frontend
-    ├── .env.local.example
-    ├── package.json
-    ├── tailwind.config.ts
-    ├── next.config.ts
-    ├── README.md
-    └── src
-        ├── app
-        │   ├── page.tsx
-        │   ├── feed/page.tsx
-        │   ├── layout.tsx
-        │   └── globals.css
-        ├── components
-        │   ├── UploadPanel.tsx
-        │   └── ReelCard.tsx
-        └── lib
-            ├── api.ts
-            └── types.ts
+├── package.json
+├── next.config.ts
+└── src
+    ├── app
+    │   ├── page.tsx
+    │   ├── feed/page.tsx
+    │   ├── layout.tsx
+    │   └── globals.css
+    ├── components
+    │   ├── UploadPanel.tsx
+    │   └── ReelCard.tsx
+    └── lib
+        ├── api.ts
+        └── types.ts
 ```
 
 ## 5) Implementation steps (what the code does)
@@ -224,8 +223,9 @@ Response:
 - Retrieval and segment generation: `backend/app/services/reels.py`
 - Segmenter logic: `backend/app/services/segmenter.py`
 - YouTube search + transcript caching: `backend/app/services/youtube.py`
-- Frontend feed page: `frontend/src/app/feed/page.tsx`
-- Frontend reel UI: `frontend/src/components/ReelCard.tsx`
+- Vercel API entrypoint: `api/index.py`
+- Frontend feed page: `src/app/feed/page.tsx`
+- Frontend reel UI: `src/components/ReelCard.tsx`
 
 ## 7) Run locally
 
@@ -242,7 +242,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ### Frontend
 ```bash
-cd frontend
+cd /Users/vincentfeng/Documents/reelAI
 npm install
 cp .env.local.example .env.local
 npm run dev
@@ -261,50 +261,32 @@ From repo root:
 
 - `host-up.sh` starts backend on `127.0.0.1:8000` and frontend on `127.0.0.1:3001`.
 - Backend in `host-up.sh` runs in stable mode (no auto-reload watcher) for persistent hosting reliability.
-- It clears `frontend/.next` before starting frontend to avoid stale chunk runtime errors.
+- It clears `.next` before starting frontend to avoid stale chunk runtime errors.
 - Logs are written to `.logs/backend.log` and `.logs/frontend.log`.
 
-## 8) Deploy on Vercel (frontend + backend from one GitHub repo)
+## 8) Deploy on Vercel (single project)
 
-### 8.1 Push this folder to GitHub
-
-This workspace is not currently a Git repository. Initialize and push:
-
-```bash
-cd /Users/vincentfeng/Documents/reelAI
-git init
-git add .
-git commit -m "Initial StudyReels monorepo"
-git branch -M main
-git remote add origin https://github.com/<your-user>/<your-repo>.git
-git push -u origin main
-```
-
-### 8.2 Create backend Vercel project
-
-1. In Vercel, import the same GitHub repo.
-2. Set **Root Directory** to `backend`.
-3. Vercel will use `backend/vercel.json` and deploy FastAPI as Python serverless.
-4. Add backend environment variables:
+1. Import this GitHub repo into Vercel as a single project.
+2. Set **Root Directory** to the repo root (`.`).
+3. Add environment variables:
    - `APP_ENV=prod`
-   - `FRONTEND_ORIGIN=https://<your-frontend-domain>`
+   - `FRONTEND_ORIGIN=https://<your-project-domain>`
    - `OPENAI_API_KEY=...`
    - `YOUTUBE_API_KEY=...`
-   - Optional S3 values if using object storage.
-5. Deploy and note backend URL, for example `https://studyreels-backend.vercel.app`.
+   - Optional: S3 variables if using object storage.
+4. Optional frontend variable:
+   - `NEXT_PUBLIC_API_BASE` (leave unset for same-origin `/api`; set only if pointing to a different backend URL)
+5. Deploy.
 
-### 8.3 Create frontend Vercel project
+How this works in one project:
+- Next.js serves the frontend from root (`src/...`).
+- Vercel runs Python API at `api/index.py`, which reuses `backend/app/main.py`.
+- Root `requirements.txt` pulls backend dependencies for the Python runtime.
 
-1. Import the same GitHub repo again as a second Vercel project.
-2. Set **Root Directory** to `frontend`.
-3. Add environment variable:
-   - `NEXT_PUBLIC_API_BASE=https://<your-backend-domain>`
-4. Deploy.
+### Verify
 
-### 8.4 Verify
-
-- Frontend loads: `https://<frontend-domain>`
-- Backend health works: `https://<backend-domain>/api/health`
+- Frontend loads: `https://<project-domain>`
+- Backend health works: `https://<project-domain>/api/health`
 
 ## 9) Legal/ToS constraints and MVP choice
 

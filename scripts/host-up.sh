@@ -50,9 +50,9 @@ start_frontend() {
   fi
 
   # Prevent stale Next runtime chunk errors from previous dev sessions.
-  rm -rf "$ROOT_DIR/frontend/.next"
+  rm -rf "$ROOT_DIR/.next"
 
-  nohup bash -lc "cd '$ROOT_DIR/frontend' && exec npm run dev -- --hostname 0.0.0.0 --port 3001" \
+  nohup bash -lc "cd '$ROOT_DIR' && exec npm run dev -- --hostname 0.0.0.0 --port 3001" \
     >"$LOG_DIR/frontend.log" 2>&1 &
   echo $! >"$PID_DIR/frontend.pid"
   if wait_for_port 3001 40 0.5; then

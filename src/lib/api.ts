@@ -6,8 +6,12 @@ import type {
   ReelsGenerateResponse,
 } from "@/lib/types";
 
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
-const BACKEND_DOWN_ERROR = `Cannot reach backend at ${API_BASE}. Make sure the backend server is running.`;
+const API_BASE = (
+  process.env.NEXT_PUBLIC_API_BASE || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "")
+).replace(/\/$/, "");
+const BACKEND_DOWN_ERROR = API_BASE
+  ? `Cannot reach backend at ${API_BASE}. Make sure the backend server is running.`
+  : "Cannot reach backend. Check your deployment and API routes.";
 
 export async function uploadMaterial(params: {
   text?: string;

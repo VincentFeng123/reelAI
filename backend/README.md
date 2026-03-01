@@ -22,12 +22,13 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ## Deploy on Vercel
 
-Deploy this folder as a separate Vercel project with root directory `backend`.
+Deploy the repo as a single project from root (`.`).
 
-- The repo includes `backend/vercel.json` for Python serverless deployment.
+- Python entrypoint is `api/index.py`, which imports `backend.app.main:app`.
+- Root `requirements.txt` includes `backend/requirements.txt` for dependency install.
 - Set env vars in Vercel:
   - `APP_ENV=prod`
-  - `FRONTEND_ORIGIN=https://<your-frontend-domain>`
+  - `FRONTEND_ORIGIN=https://<your-project-domain>`
   - `OPENAI_API_KEY=...`
   - `YOUTUBE_API_KEY=...`
-- `DATA_DIR` automatically defaults to `/tmp/studyreels-data` on Vercel.
+- `DATA_DIR` defaults to `/tmp/studyreels-data` on Vercel.
