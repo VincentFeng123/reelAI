@@ -14,3 +14,7 @@ frontend/.next/
 # Env
 backend/.env
 frontend/.env.local
+
+# Runtime artifacts
+.logs/
+.pids/
