@@ -1,13 +1,15 @@
 "use client";
 
-import { type DragEvent, type FormEvent, useCallback, useMemo, useState } from "react";
+import { type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { uploadMaterial } from "@/lib/api";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
+const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
 const MAX_MATERIAL_SEEDS = 120;
 const MAX_SEED_TEXT_CHARS = 16000;
+type GenerationMode = "slow" | "fast";
 
 type MaterialSeed = {
   topic?: string;
@@ -56,6 +58,7 @@ type UploadPanelProps = {
     materialId: string;
     title: string;
     topic?: string;
+    generationMode: GenerationMode;
   }) => void | Promise<void>;
 };
 
@@ -82,7 +85,25 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
   const selectedFileName = file?.name ?? "";
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const saved = window.localStorage.getItem(GENERATION_MODE_STORAGE_KEY);
+    if (saved === "fast" || saved === "slow") {
+      setGenerationMode(saved);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(GENERATION_MODE_STORAGE_KEY, generationMode);
+  }, [generationMode]);
 
   const disabled = useMemo(() => {
     return loading || (!file && !topic.trim() && !text.trim());
@@ -124,15 +145,16 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
           materialId: material.material_id,
           title,
           topic: topicValue || undefined,
+          generationMode,
         });
       }
-      router.push(`/feed?material_id=${material.material_id}`);
+      router.push(`/feed?material_id=${material.material_id}&generation_mode=${generationMode}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something failed");
     } finally {
       setLoading(false);
     }
-  }, [file, onMaterialCreated, router, text, topic]);
+  }, [file, generationMode, onMaterialCreated, router, text, topic]);
 
   const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
@@ -211,13 +233,33 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
 
       <div className="mt-2 shrink-0 flex flex-col gap-2 md:mt-6 md:gap-3 md:flex-row md:items-center md:justify-between">
         <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>
-        <button
-          type="submit"
-          disabled={disabled}
-          className="mt-0 w-full rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:mt-4 md:w-auto"
-        >
-          {loading ? "Starting..." : "Start Learning"}
-        </button>
+        <div className="mt-0 flex w-full flex-col gap-2 md:mt-4 md:w-auto md:flex-row md:items-center">
+          <div className="inline-flex h-11 items-center rounded-2xl border border-white/25 bg-black/45 p-1 text-xs font-semibold uppercase tracking-[0.08em] text-white">
+            <button
+              type="button"
+              onClick={() => setGenerationMode("slow")}
+              className={`rounded-xl px-3 py-2 transition ${generationMode === "slow" ? "bg-white text-black" : "text-white/80 hover:bg-white/10"}`}
+              aria-pressed={generationMode === "slow"}
+            >
+              Slow
+            </button>
+            <button
+              type="button"
+              onClick={() => setGenerationMode("fast")}
+              className={`rounded-xl px-3 py-2 transition ${generationMode === "fast" ? "bg-white text-black" : "text-white/80 hover:bg-white/10"}`}
+              aria-pressed={generationMode === "fast"}
+            >
+              Fast
+            </button>
+          </div>
+          <button
+            type="submit"
+            disabled={disabled}
+            className="w-full rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:w-auto"
+          >
+            {loading ? "Starting..." : "Start Learning"}
+          </button>
+        </div>
       </div>
     </form>
   );

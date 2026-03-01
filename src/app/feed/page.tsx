@@ -104,6 +104,7 @@ function FeedPageInner() {
   const params = useSearchParams();
   const router = useRouter();
   const materialId = params.get("material_id") || "";
+  const generationModeParam = params.get("generation_mode");
 
   const [reels, setReels] = useState<Reel[]>([]);
   const [page, setPage] = useState(1);
@@ -192,6 +193,10 @@ function FeedPageInner() {
   const isFastGeneration = generationMode === "fast";
 
   useEffect(() => {
+    if (generationModeParam === "fast" || generationModeParam === "slow") {
+      setGenerationMode(generationModeParam);
+      return;
+    }
     if (typeof window === "undefined") {
       return;
     }
@@ -199,7 +204,7 @@ function FeedPageInner() {
     if (savedMode === "fast" || savedMode === "slow") {
       setGenerationMode(savedMode);
     }
-  }, []);
+  }, [generationModeParam]);
 
   useEffect(() => {
     if (typeof window === "undefined") {

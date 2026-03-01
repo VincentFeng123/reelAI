@@ -13,12 +13,14 @@ const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const MAX_HISTORY_ITEMS = 120;
 const MOBILE_SIDEBAR_CLOSE_MS = 260;
+type GenerationMode = "slow" | "fast";
 
 type HistoryItem = {
   materialId: string;
   title: string;
   updatedAt: number;
   starred: boolean;
+  generationMode: GenerationMode;
 };
 
 function parseMaterialHistory(raw: string | null): HistoryItem[] {
@@ -32,11 +34,12 @@ function parseMaterialHistory(raw: string | null): HistoryItem[] {
     }
     return parsed
       .filter((item) => item && typeof item.materialId === "string" && typeof item.title === "string")
-      .map((item) => ({
+      .map((item): HistoryItem => ({
         materialId: String(item.materialId),
         title: String(item.title).trim() || "New Study Session",
         updatedAt: Number(item.updatedAt) || 0,
         starred: Boolean(item.starred),
+        generationMode: item.generationMode === "fast" ? "fast" : "slow",
       }))
       .slice(0, MAX_HISTORY_ITEMS);
   } catch {
@@ -62,11 +65,12 @@ function parseLegacyTopicHistory(raw: string | null): HistoryItem[] {
           String(item.materialId).trim() &&
           String(item.topic).trim(),
       )
-      .map((item) => ({
+      .map((item): HistoryItem => ({
         materialId: String(item.materialId),
         title: String(item.topic).trim(),
         updatedAt: Number(item.updatedAt) || 0,
         starred: false,
+        generationMode: "slow",
       }))
       .slice(0, MAX_HISTORY_ITEMS);
   } catch {
@@ -83,10 +87,18 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
       continue;
     }
     if (item.updatedAt > existing.updatedAt) {
-      map.set(item.materialId, { ...item, starred: item.starred || existing.starred });
+      map.set(item.materialId, {
+        ...item,
+        starred: item.starred || existing.starred,
+        generationMode: item.generationMode || existing.generationMode || "slow",
+      });
       continue;
     }
-    map.set(item.materialId, { ...existing, starred: existing.starred || item.starred });
+    map.set(item.materialId, {
+      ...existing,
+      starred: existing.starred || item.starred,
+      generationMode: existing.generationMode || item.generationMode || "slow",
+    });
   }
   return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_HISTORY_ITEMS);
 }
@@ -141,13 +153,14 @@ export default function HomePage() {
   }, []);
 
   const upsertHistory = useCallback(
-    (entry: { materialId: string; title: string; updatedAt: number; starred?: boolean }) => {
+    (entry: { materialId: string; title: string; updatedAt: number; starred?: boolean; generationMode?: GenerationMode }) => {
       const existing = historyRef.current.find((item) => item.materialId === entry.materialId);
       const merged: HistoryItem = {
         materialId: entry.materialId,
         title: entry.title,
         updatedAt: entry.updatedAt,
         starred: entry.starred ?? existing?.starred ?? false,
+        generationMode: entry.generationMode ?? existing?.generationMode ?? "slow",
       };
       const next = [merged, ...historyRef.current.filter((item) => item.materialId !== merged.materialId)].slice(0, MAX_HISTORY_ITEMS);
       persistHistory(next);
@@ -221,7 +234,8 @@ export default function HomePage() {
       }
       setActiveHistoryMenuId(null);
       forceCloseMobileSidebar();
-      router.push(`/feed?material_id=${materialId}`);
+      const mode = existing?.generationMode ?? "slow";
+      router.push(`/feed?material_id=${materialId}&generation_mode=${mode}`);
     },
     [forceCloseMobileSidebar, router, upsertHistory],
   );
@@ -271,12 +285,13 @@ export default function HomePage() {
   }, [activeHistoryMenuId]);
 
   const onUploadMaterialCreated = useCallback(
-    async (params: { materialId: string; title: string; topic?: string }) => {
+    async (params: { materialId: string; title: string; topic?: string; generationMode: GenerationMode }) => {
       const nextTitle = params.title?.trim() || params.topic?.trim() || "New Study Session";
       upsertHistory({
         materialId: params.materialId,
         title: nextTitle,
         updatedAt: Date.now(),
+        generationMode: params.generationMode,
       });
     },
     [upsertHistory],
@@ -332,6 +347,9 @@ export default function HomePage() {
                     <div className="flex items-center gap-1.5">
                       {entry.starred ? <i className="fa-solid fa-star text-[10px] text-white/75" aria-hidden="true" /> : null}
                       <p className="truncate font-semibold leading-none">{entry.title}</p>
+                      <span className="shrink-0 rounded-md border border-white/20 bg-black/55 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/68">
+                        {entry.generationMode}
+                      </span>
                     </div>
                   </button>
 
