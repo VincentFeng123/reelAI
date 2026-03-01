@@ -384,7 +384,11 @@ export default function HomePage() {
         type="button"
         onClick={openMobileSidebar}
         aria-label="Open topic menu"
-        className={`fixed left-3 top-3 z-[70] grid h-10 w-10 place-items-center text-white/90 transition-opacity hover:text-white md:left-7 md:top-7 lg:hidden ${
+        style={{
+          left: "max(env(safe-area-inset-left), 0px)",
+          top: "max(env(safe-area-inset-top), 0px)",
+        }}
+        className={`fixed z-[70] grid h-10 w-10 place-items-center text-white/90 transition-opacity hover:text-white md:left-7 md:top-7 lg:hidden ${
           mobileSidebarOpen ? "pointer-events-none opacity-0" : "opacity-100"
         }`}
       >
