@@ -385,8 +385,8 @@ export default function HomePage() {
         onClick={openMobileSidebar}
         aria-label="Open topic menu"
         style={{
-          left: "max(env(safe-area-inset-left), 0px)",
-          top: "max(env(safe-area-inset-top), 0px)",
+          left: "calc(max(env(safe-area-inset-left), 0px) + 10px)",
+          top: "calc(max(env(safe-area-inset-top), 0px) + 10px)",
         }}
         className={`fixed z-[70] grid h-10 w-10 place-items-center text-white/90 transition-opacity hover:text-white md:left-7 md:top-7 lg:hidden ${
           mobileSidebarOpen ? "pointer-events-none opacity-0" : "opacity-100"
