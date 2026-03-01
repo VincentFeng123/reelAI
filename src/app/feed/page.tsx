@@ -22,8 +22,10 @@ const RIGHT_TOP_MIN_PX = 220;
 const RIGHT_BOTTOM_MIN_PX = 180;
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
+const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
 const MAX_SAVED_FEED_PROGRESS = 240;
 type FeedbackAction = "helpful" | "confusing" | "save";
+type GenerationMode = "slow" | "fast";
 
 type ReelFeedbackState = {
   helpful?: boolean;
@@ -122,6 +124,7 @@ function FeedPageInner() {
   const [chatError, setChatError] = useState<string | null>(null);
   const [rightPanelWidthPx, setRightPanelWidthPx] = useState(360);
   const [rightTopRatio, setRightTopRatio] = useState(0.62);
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
 
   const feedViewportRef = useRef<HTMLDivElement | null>(null);
   const isFetchingRef = useRef(false);
@@ -145,6 +148,7 @@ function FeedPageInner() {
   const pendingResumeRef = useRef<FeedProgressEntry | null>(null);
   const resumeAppliedRef = useRef(false);
   const resumeLoadingRef = useRef(false);
+  const isFastTopUpRef = useRef(false);
 
   const reelVideoKey = useCallback((reel: Reel): string => {
     const match = reel.video_url.match(/\/embed\/([^?&/]+)/);
@@ -185,6 +189,24 @@ function FeedPageInner() {
   );
 
   const hasMore = reels.length < total;
+  const isFastGeneration = generationMode === "fast";
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const savedMode = window.localStorage.getItem(GENERATION_MODE_STORAGE_KEY);
+    if (savedMode === "fast" || savedMode === "slow") {
+      setGenerationMode(savedMode);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(GENERATION_MODE_STORAGE_KEY, generationMode);
+  }, [generationMode]);
 
   const recoverMissingMaterial = useCallback(
     async (missingMaterialId: string): Promise<boolean> => {
@@ -243,6 +265,7 @@ function FeedPageInner() {
           limit: PAGE_SIZE,
           autofill: options?.autofill ?? false,
           prefetch: 7,
+          generationMode,
         });
 
         setTotal(data.total);
@@ -272,13 +295,14 @@ function FeedPageInner() {
         isFetchingRef.current = false;
       }
     },
-    [dedupeByIdentity, materialId, recoverMissingMaterial],
+    [dedupeByIdentity, generationMode, materialId, recoverMissingMaterial],
   );
 
   const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
     if (!materialId || isGeneratingRef.current || !canRequestMore) {
       return [];
     }
+    const batchSize = isFastGeneration ? 2 : 7;
     isGeneratingRef.current = true;
     setGeneratingMore(true);
     if (options?.surfaceError) {
@@ -287,7 +311,8 @@ function FeedPageInner() {
     try {
       const generated = await generateReels({
         materialId,
-        numReels: 7,
+        numReels: batchSize,
+        generationMode,
       });
       if (generated.reels.length === 0) {
         emptyGenerateStreakRef.current += 1;
@@ -315,7 +340,7 @@ function FeedPageInner() {
       setGeneratingMore(false);
       isGeneratingRef.current = false;
     }
-  }, [canRequestMore, materialId]);
+  }, [canRequestMore, generationMode, isFastGeneration, materialId]);
 
   useEffect(() => {
     if (!materialId) {
@@ -343,7 +368,7 @@ function FeedPageInner() {
     emptyGenerateStreakRef.current = 0;
     bootstrapAttemptedRef.current = false;
     loadPage(1, { autofill: false });
-  }, [materialId, loadPage]);
+  }, [materialId]);
 
   const appendGeneratedReels = useCallback(
     (generated: Reel[]) => {
@@ -362,6 +387,34 @@ function FeedPageInner() {
     [dedupeByIdentity],
   );
 
+  const runFastTopUp = useCallback(async () => {
+    if (
+      !materialId ||
+      generationMode !== "fast" ||
+      !canRequestMore ||
+      isFastTopUpRef.current ||
+      isGeneratingRef.current
+    ) {
+      return;
+    }
+    isFastTopUpRef.current = true;
+    try {
+      const generated = await generateReels({
+        materialId,
+        numReels: 5,
+        generationMode,
+      });
+      if (generated.reels.length > 0) {
+        emptyGenerateStreakRef.current = 0;
+        appendGeneratedReels(generated.reels);
+      }
+    } catch (e) {
+      console.warn("Fast mode background top-up failed:", e);
+    } finally {
+      isFastTopUpRef.current = false;
+    }
+  }, [appendGeneratedReels, canRequestMore, generationMode, materialId]);
+
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {
       if (!materialId || isGeneratingRef.current || !canRequestMore) {
@@ -371,11 +424,14 @@ function FeedPageInner() {
       try {
         const generated = await requestMore({ surfaceError: manual });
         appendGeneratedReels(generated);
+        if (generationMode === "fast" && generated.length > 0) {
+          void runFastTopUp();
+        }
       } finally {
         setBootstrappingFirstReels(false);
       }
     },
-    [appendGeneratedReels, canRequestMore, materialId, requestMore],
+    [appendGeneratedReels, canRequestMore, generationMode, materialId, requestMore, runFastTopUp],
   );
 
   useEffect(() => {
@@ -394,13 +450,16 @@ function FeedPageInner() {
       loadPage(page + 1, { autofill: false });
       return;
     }
-      if (canRequestMore && !isGeneratingRef.current) {
-        void (async () => {
-          const generated = await requestMore();
-          appendGeneratedReels(generated);
-        })();
-      }
-  }, [appendGeneratedReels, canRequestMore, hasMore, loadPage, page, requestMore]);
+    if (canRequestMore && !isGeneratingRef.current) {
+      void (async () => {
+        const generated = await requestMore();
+        appendGeneratedReels(generated);
+        if (generationMode === "fast" && generated.length > 0) {
+          void runFastTopUp();
+        }
+      })();
+    }
+  }, [appendGeneratedReels, canRequestMore, generationMode, hasMore, loadPage, page, requestMore, runFastTopUp]);
 
   const maybeResumeProgress = useCallback(() => {
     if (!materialId || resumeAppliedRef.current) {
@@ -448,6 +507,9 @@ function FeedPageInner() {
       void (async () => {
         const generated = await requestMore();
         appendGeneratedReels(generated);
+        if (generationMode === "fast" && generated.length > 0) {
+          void runFastTopUp();
+        }
       })().finally(() => {
         resumeLoadingRef.current = false;
       });
@@ -456,7 +518,7 @@ function FeedPageInner() {
 
     setActiveIndex((prev) => (reels.length > 0 ? Math.min(prev, reels.length - 1) : 0));
     resumeAppliedRef.current = true;
-  }, [appendGeneratedReels, canRequestMore, hasMore, loadPage, materialId, page, reels, requestMore]);
+  }, [appendGeneratedReels, canRequestMore, generationMode, hasMore, loadPage, materialId, page, reels, requestMore, runFastTopUp]);
 
   useEffect(() => {
     maybeResumeProgress();
@@ -1023,6 +1085,24 @@ function FeedPageInner() {
       >
         <i className="fa-solid fa-arrow-left text-xs" aria-hidden="true" />
       </button>
+      <div className="absolute right-3 top-3 z-[9999] flex items-center rounded-xl border border-white/20 bg-black/60 p-1 text-[11px] font-semibold text-white backdrop-blur-md">
+        <button
+          type="button"
+          onClick={() => setGenerationMode("slow")}
+          className={`rounded-lg px-2.5 py-1 transition ${generationMode === "slow" ? "bg-white text-black" : "text-white/80 hover:bg-white/10"}`}
+          aria-pressed={generationMode === "slow"}
+        >
+          Slow
+        </button>
+        <button
+          type="button"
+          onClick={() => setGenerationMode("fast")}
+          className={`rounded-lg px-2.5 py-1 transition ${generationMode === "fast" ? "bg-white text-black" : "text-white/80 hover:bg-white/10"}`}
+          aria-pressed={generationMode === "fast"}
+        >
+          Fast
+        </button>
+      </div>
       {error ? (
         <div className="absolute left-0 right-0 top-3 z-30 mx-auto w-fit rounded-full border border-white/25 bg-black/75 px-4 py-2 text-xs text-white">
           {error}

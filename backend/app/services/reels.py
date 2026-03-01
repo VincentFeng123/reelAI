@@ -36,6 +36,7 @@ class ReelService:
         concept_id: str | None,
         num_reels: int,
         creative_commons_only: bool,
+        fast_mode: bool = False,
     ) -> list[dict[str, Any]]:
         params: tuple[Any, ...] = (material_id,)
         concept_where = "WHERE material_id = ?"
@@ -54,6 +55,8 @@ class ReelService:
         if not concepts:
             return []
         concepts = self._order_concepts(conn, material_id, concepts)
+        if fast_mode:
+            concepts = concepts[:4]
 
         existing_video_ids = {
             str(r["video_id"])
@@ -71,7 +74,7 @@ class ReelService:
 
         for concept in concepts:
             concept_keywords = json.loads(concept["keywords_json"])
-            concept_embedding = self._get_concept_embedding(conn, concept)
+            concept_embedding = self._get_concept_embedding(conn, concept) if not fast_mode else None
             concept_terms = [concept["title"], *concept_keywords, concept.get("summary", "")]
             vague_topic = self._is_vague_concept(
                 title=concept["title"],
@@ -79,16 +82,19 @@ class ReelService:
                 summary=concept.get("summary", ""),
             )
             queries = self._build_query_variants(concept["title"], concept_keywords, subject_tag)
+            if fast_mode:
+                queries = queries[:2]
             seen_video_ids: set[str] = set()
 
             for query in queries:
                 # First pull short-form videos; then broaden to any duration for long-form clipping.
-                for duration in ("short", None):
+                durations = ("short", None) if not fast_mode else ("short",)
+                for duration in durations:
                     prefer_short_query = duration == "short"
                     videos = self.youtube_service.search_videos(
                         conn,
                         query=query,
-                        max_results=8,
+                        max_results=4 if fast_mode else 8,
                         creative_commons_only=creative_commons_only,
                         video_duration=duration,
                     )
@@ -110,24 +116,31 @@ class ReelService:
                         segments: list[SegmentMatch] = []
 
                         if transcript:
-                            chunks, chunk_embeddings = self._load_or_create_transcript_chunks(conn, video["id"], transcript)
-                            if chunks and len(chunk_embeddings) > 0:
-                                segments = select_segments(
-                                    concept_embedding,
-                                    chunk_embeddings,
-                                    chunks,
+                            if fast_mode:
+                                segments = self._fast_segments_from_transcript(
+                                    transcript=transcript,
                                     concept_terms=concept_terms,
-                                    top_k=6 if vague_topic else 4,
+                                    max_segments=2,
                                 )
-                                if vague_topic:
-                                    expanded = self._split_video_into_short_segments(
-                                        concept_embedding=concept_embedding,
-                                        chunk_embeddings=chunk_embeddings,
-                                        chunks=chunks,
+                            else:
+                                chunks, chunk_embeddings = self._load_or_create_transcript_chunks(conn, video["id"], transcript)
+                                if chunks and len(chunk_embeddings) > 0:
+                                    segments = select_segments(
+                                        concept_embedding,
+                                        chunk_embeddings,
+                                        chunks,
                                         concept_terms=concept_terms,
-                                        max_segments=8,
+                                        top_k=6 if vague_topic else 4,
                                     )
-                                    segments = self._merge_unique_segments([*segments, *expanded], max_items=8)
+                                    if vague_topic:
+                                        expanded = self._split_video_into_short_segments(
+                                            concept_embedding=concept_embedding,
+                                            chunk_embeddings=chunk_embeddings,
+                                            chunks=chunks,
+                                            concept_terms=concept_terms,
+                                            max_segments=8,
+                                        )
+                                        segments = self._merge_unique_segments([*segments, *expanded], max_items=8)
 
                             if not segments:
                                 segments = self._fallback_segments_from_transcript(transcript)
@@ -170,6 +183,7 @@ class ReelService:
                                 segment=segment,
                                 clip_window=clip_window,
                                 transcript=transcript,
+                                fast_mode=fast_mode,
                             )
                             if not reel:
                                 continue
@@ -347,6 +361,49 @@ class ReelService:
             )
 
         return chunks, embeddings
+
+    def _fast_segments_from_transcript(
+        self,
+        transcript: list[dict[str, Any]],
+        concept_terms: list[str],
+        max_segments: int = 2,
+    ) -> list[SegmentMatch]:
+        chunks = chunk_transcript(transcript)
+        if not chunks:
+            return self._fallback_segments_from_transcript(transcript)
+
+        scored: list[SegmentMatch] = []
+        for chunk in chunks:
+            lexical = lexical_overlap_score(chunk.text, concept_terms)
+            scored.append(
+                SegmentMatch(
+                    chunk_index=chunk.chunk_index,
+                    t_start=chunk.t_start,
+                    t_end=chunk.t_end,
+                    text=chunk.text,
+                    score=0.05 + 0.35 * lexical,
+                )
+            )
+
+        scored.sort(key=lambda item: item.score, reverse=True)
+        selected: list[SegmentMatch] = []
+        for candidate in scored:
+            overlap = False
+            for prev in selected:
+                latest_start = max(candidate.t_start, prev.t_start)
+                earliest_end = min(candidate.t_end, prev.t_end)
+                if earliest_end - latest_start > 6:
+                    overlap = True
+                    break
+            if overlap:
+                continue
+            selected.append(candidate)
+            if len(selected) >= max_segments:
+                break
+
+        if not selected:
+            return self._fallback_segments_from_transcript(transcript)
+        return selected
 
     def _is_vague_concept(self, title: str, keywords: list[str], summary: str) -> bool:
         title_terms = normalize_terms([title])
@@ -532,6 +589,7 @@ class ReelService:
         segment: SegmentMatch,
         clip_window: tuple[int, int] | None = None,
         transcript: list[dict[str, Any]] | None = None,
+        fast_mode: bool = False,
     ) -> dict[str, Any] | None:
         reel_id = str(uuid.uuid4())
         if clip_window is None:
@@ -566,6 +624,7 @@ class ReelService:
             video_description=video_description,
             transcript_snippet=segment.text[:700],
             takeaways=takeaways,
+            fast_mode=fast_mode,
         )
 
         try:
@@ -652,6 +711,7 @@ class ReelService:
         video_description: str,
         transcript_snippet: str,
         takeaways: list[str],
+        fast_mode: bool = False,
     ) -> str:
         fallback = self._fallback_ai_summary(
             concept_title=concept_title,
@@ -660,6 +720,9 @@ class ReelService:
             transcript_snippet=transcript_snippet,
             takeaways=takeaways,
         )
+        if fast_mode:
+            return fallback
+
         cache_payload = "|".join(
             [
                 self.chat_model,
@@ -974,7 +1037,7 @@ class ReelService:
             },
         )
 
-    def ranked_feed(self, conn, material_id: str) -> list[dict[str, Any]]:
+    def ranked_feed(self, conn, material_id: str, fast_mode: bool = False) -> list[dict[str, Any]]:
         reel_rows = fetch_all(
             conn,
             """
@@ -1063,6 +1126,7 @@ class ReelService:
                 video_description=video_description,
                 transcript_snippet=str(row.get("transcript_snippet") or ""),
                 takeaways=takeaways,
+                fast_mode=fast_mode,
             )
             score = (
                 float(row["base_score"])

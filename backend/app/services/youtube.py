@@ -1,6 +1,7 @@
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
@@ -42,6 +43,7 @@ class YouTubeService:
         settings = get_settings()
         self.api_key = settings.youtube_api_key
         self.transcript_api = YouTubeTranscriptApi()
+        self.empty_transcript_ttl_sec = 6 * 60 * 60
 
     def search_videos(
         self,
@@ -458,15 +460,20 @@ class YouTubeService:
         return result
 
     def get_transcript(self, conn, video_id: str) -> list[dict[str, Any]]:
-        cached = fetch_one(conn, "SELECT transcript_json FROM transcript_cache WHERE video_id = ?", (video_id,))
+        cached = fetch_one(conn, "SELECT transcript_json, created_at FROM transcript_cache WHERE video_id = ?", (video_id,))
         if cached:
             try:
                 cached_transcript = json.loads(cached["transcript_json"])
             except json.JSONDecodeError:
                 cached_transcript = []
-            # Keep non-empty cache hits, but allow refetch when older runs cached an empty transcript.
             if cached_transcript:
                 return cached_transcript
+            # Short-term cache misses to avoid hammering transcript fetch on videos with no transcript.
+            created_at = self._parse_cache_time(str(cached.get("created_at") or ""))
+            if created_at:
+                age_sec = (datetime.now(timezone.utc) - created_at).total_seconds()
+                if age_sec < self.empty_transcript_ttl_sec:
+                    return []
 
         transcript: list[dict[str, Any]] = []
         try:
@@ -478,18 +485,28 @@ class YouTubeService:
         except Exception:
             transcript = []
 
-        if transcript:
-            upsert(
-                conn,
-                "transcript_cache",
-                {
-                    "video_id": video_id,
-                    "transcript_json": dumps_json(transcript),
-                    "created_at": now_iso(),
-                },
-                pk="video_id",
-            )
+        upsert(
+            conn,
+            "transcript_cache",
+            {
+                "video_id": video_id,
+                "transcript_json": dumps_json(transcript),
+                "created_at": now_iso(),
+            },
+            pk="video_id",
+        )
         return transcript
+
+    def _parse_cache_time(self, value: str) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except ValueError:
+            return None
 
     def _fallback_any_transcript(self, video_id: str) -> list[dict[str, Any]]:
         try:

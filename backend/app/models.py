@@ -1,3 +1,5 @@
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -18,6 +20,7 @@ class ReelsGenerateRequest(BaseModel):
     concept_id: str | None = None
     num_reels: int = Field(default=8, ge=1, le=30)
     creative_commons_only: bool = False
+    generation_mode: Literal["slow", "fast"] = "slow"
 
 
 class CaptionCue(BaseModel):

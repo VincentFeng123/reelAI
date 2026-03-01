@@ -1,5 +1,6 @@
 import os
 import uuid
+from typing import Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -198,6 +199,7 @@ def generate_reels(payload: ReelsGenerateRequest):
                 concept_id=payload.concept_id,
                 num_reels=payload.num_reels,
                 creative_commons_only=payload.creative_commons_only,
+                fast_mode=payload.generation_mode == "fast",
             )
         except YouTubeApiRequestError as e:
             raise HTTPException(status_code=502, detail=str(e)) from e
@@ -212,6 +214,7 @@ def feed(
     autofill: bool = True,
     prefetch: int = 7,
     creative_commons_only: bool = False,
+    generation_mode: Literal["slow", "fast"] = "slow",
 ):
     if page < 1:
         page = 1
@@ -229,7 +232,8 @@ def feed(
         if not material:
             raise HTTPException(status_code=404, detail="material_id not found")
 
-        ranked = reel_service.ranked_feed(conn, material_id)
+        fast_mode = generation_mode == "fast"
+        ranked = reel_service.ranked_feed(conn, material_id, fast_mode=fast_mode)
         # Auto-expand the feed while users scroll so we can keep serving fresh reels.
         if autofill and youtube_service.api_key:
             target_total = page * limit + prefetch
@@ -243,13 +247,14 @@ def feed(
                         concept_id=None,
                         num_reels=min(12, need + 2),
                         creative_commons_only=creative_commons_only,
+                        fast_mode=fast_mode,
                     )
                 except YouTubeApiRequestError:
                     break
                 attempts += 1
                 if not generated:
                     break
-                ranked = reel_service.ranked_feed(conn, material_id)
+                ranked = reel_service.ranked_feed(conn, material_id, fast_mode=fast_mode)
 
     total = len(ranked)
     start = (page - 1) * limit

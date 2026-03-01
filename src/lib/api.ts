@@ -52,6 +52,7 @@ export async function generateReels(params: {
   materialId: string;
   numReels?: number;
   conceptId?: string;
+  generationMode?: "slow" | "fast";
 }): Promise<ReelsGenerateResponse> {
   const res = await safeFetch(apiUrl("/reels/generate"), {
     method: "POST",
@@ -63,6 +64,7 @@ export async function generateReels(params: {
       concept_id: params.conceptId,
       num_reels: params.numReels ?? 7,
       creative_commons_only: false,
+      generation_mode: params.generationMode ?? "slow",
     }),
   });
 
@@ -75,6 +77,7 @@ export async function fetchFeed(params: {
   limit: number;
   prefetch?: number;
   autofill?: boolean;
+  generationMode?: "slow" | "fast";
 }): Promise<FeedResponse> {
   const query = new URLSearchParams({
     material_id: params.materialId,
@@ -83,6 +86,7 @@ export async function fetchFeed(params: {
     autofill: String(params.autofill ?? true),
     prefetch: String(params.prefetch ?? 7),
     creative_commons_only: "false",
+    generation_mode: params.generationMode ?? "slow",
   });
 
   const res = await safeFetch(`${apiUrl("/feed")}?${query}`, {
