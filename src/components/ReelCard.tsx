@@ -143,7 +143,6 @@ export function ReelCard({
         .sort((a, b) => a.start - b.start),
     [reel.captions],
   );
-  const shouldForceMutedAutoplay = isTouchLikeDevice && !didUserInteractRef.current;
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -356,12 +355,7 @@ export function ReelCard({
               event.target.mute();
               event.target.seekTo(clipStart, true);
               event.target.playVideo();
-              if (!shouldForceMutedAutoplay && !mutedPreference) {
-                event.target.unMute();
-                setIsMuted(false);
-              } else {
-                setIsMuted(true);
-              }
+              setIsMuted(true);
               setIsReady(true);
               setIsPlaying(true);
               setCurrentSec(0);
@@ -434,11 +428,8 @@ export function ReelCard({
     showResumeMask,
     startProgressTimer,
     stopProgressTimer,
-    shouldForceMutedAutoplay,
     syncProgress,
     videoId,
-    mutedPreference,
-    isActive,
     destroyPlayerSafely,
   ]);
 
