@@ -178,6 +178,8 @@ class ReelService:
 
                             if len(generated) >= num_reels:
                                 return generated
+                            # Keep only one reel per video to avoid repeated content.
+                            break
 
         return generated
 
@@ -1100,12 +1102,23 @@ class ReelService:
 
         scored.sort(key=lambda x: (x["score"], x["created_at"]), reverse=True)
         deduped: list[dict[str, Any]] = []
+        seen_reel_ids: set[str] = set()
         seen_video_ids: set[str] = set()
+        seen_clip_keys: set[str] = set()
         for item in scored:
+            reel_id = str(item.get("reel_id") or "")
+            if reel_id and reel_id in seen_reel_ids:
+                continue
             video_id = str(item.get("video_id") or "")
+            clip_key = f"{video_id}:{int(float(item.get('t_start') or 0))}:{int(float(item.get('t_end') or 0))}"
+            if clip_key in seen_clip_keys:
+                continue
             if not video_id or video_id in seen_video_ids:
                 continue
+            if reel_id:
+                seen_reel_ids.add(reel_id)
             seen_video_ids.add(video_id)
+            seen_clip_keys.add(clip_key)
             clean_item = dict(item)
             clean_item.pop("video_id", None)
             deduped.append(clean_item)

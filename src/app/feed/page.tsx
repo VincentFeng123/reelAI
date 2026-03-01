@@ -151,17 +151,33 @@ function FeedPageInner() {
     return match?.[1] || reel.video_url;
   }, []);
 
-  const dedupeByVideo = useCallback(
-    (rows: Reel[]): Reel[] => {
-      const seen = new Set<string>();
+  const dedupeByIdentity = useCallback(
+    (rows: Reel[], existing: Reel[] = []): Reel[] => {
+      const seenVideoKeys = new Set<string>();
+      const seenReelIds = new Set<string>();
       const deduped: Reel[] = [];
-      for (const reel of rows) {
-        const key = reelVideoKey(reel);
-        if (seen.has(key)) {
-          continue;
+
+      const pushIfUnique = (reel: Reel) => {
+        const reelId = String(reel.reel_id || "").trim();
+        const videoKey = reelVideoKey(reel);
+        if (reelId && seenReelIds.has(reelId)) {
+          return;
         }
-        seen.add(key);
+        if (seenVideoKeys.has(videoKey)) {
+          return;
+        }
+        if (reelId) {
+          seenReelIds.add(reelId);
+        }
+        seenVideoKeys.add(videoKey);
         deduped.push(reel);
+      };
+
+      for (const reel of existing) {
+        pushIfUnique(reel);
+      }
+      for (const reel of rows) {
+        pushIfUnique(reel);
       }
       return deduped;
     },
@@ -233,20 +249,11 @@ function FeedPageInner() {
         setPage(targetPage);
 
         if (targetPage === 1) {
-          setReels(dedupeByVideo(data.reels));
+          const deduped = dedupeByIdentity(data.reels);
+          setReels(deduped);
+          setTotal(Math.max(data.total, deduped.length));
         } else {
-          setReels((prev) => {
-            const seen = new Set(prev.map((r) => reelVideoKey(r)));
-            const merged = [...prev];
-            for (const reel of data.reels) {
-              const key = reelVideoKey(reel);
-              if (!seen.has(key)) {
-                merged.push(reel);
-                seen.add(key);
-              }
-            }
-            return merged;
-          });
+          setReels((prev) => dedupeByIdentity(data.reels, prev));
         }
       } catch (e) {
         if (targetPage === 1) {
@@ -265,7 +272,7 @@ function FeedPageInner() {
         isFetchingRef.current = false;
       }
     },
-    [dedupeByVideo, materialId, recoverMissingMaterial, reelVideoKey],
+    [dedupeByIdentity, materialId, recoverMissingMaterial],
   );
 
   const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
@@ -344,24 +351,15 @@ function FeedPageInner() {
         return;
       }
       setReels((prev) => {
-        const seen = new Set(prev.map((r) => reelVideoKey(r)));
-        const merged = [...prev];
-        let added = 0;
-        for (const reel of generated) {
-          const key = reelVideoKey(reel);
-          if (!seen.has(key)) {
-            merged.push(reel);
-            seen.add(key);
-            added += 1;
-          }
-        }
+        const merged = dedupeByIdentity(generated, prev);
+        const added = merged.length - prev.length;
         if (added > 0) {
           setTotal((prevTotal) => Math.max(prevTotal, merged.length));
         }
         return merged;
       });
     },
-    [reelVideoKey],
+    [dedupeByIdentity],
   );
 
   const bootstrapFirstReels = useCallback(
