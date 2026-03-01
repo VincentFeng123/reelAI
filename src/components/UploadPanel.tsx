@@ -193,7 +193,7 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
           />
         </div>
 
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+        <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_190px] sm:items-end">
           <div className="min-w-0 flex-1">
             <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">File</label>
             <input
@@ -221,7 +221,7 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
             </label>
           </div>
 
-          <div className="w-full sm:w-[176px]">
+          <div className="w-full">
             <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Generation Speed</label>
             <div className="relative grid h-12 grid-cols-2 items-center rounded-2xl border border-white/25 bg-black/45 p-1">
               <span
@@ -233,7 +233,7 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
               <button
                 type="button"
                 onClick={() => setGenerationMode("slow")}
-                className={`relative z-10 rounded-xl px-2 py-2 text-xs font-semibold uppercase tracking-[0.08em] transition-colors duration-200 ${
+                className={`relative z-10 rounded-xl px-2 py-2 text-[10px] font-semibold uppercase tracking-[0.06em] transition-colors duration-200 ${
                   generationMode === "slow" ? "text-black" : "text-white/80"
                 }`}
                 aria-pressed={generationMode === "slow"}
@@ -243,7 +243,7 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
               <button
                 type="button"
                 onClick={() => setGenerationMode("fast")}
-                className={`relative z-10 rounded-xl px-2 py-2 text-xs font-semibold uppercase tracking-[0.08em] transition-colors duration-200 ${
+                className={`relative z-10 rounded-xl px-2 py-2 text-[10px] font-semibold uppercase tracking-[0.06em] transition-colors duration-200 ${
                   generationMode === "fast" ? "text-black" : "text-white/80"
                 }`}
                 aria-pressed={generationMode === "fast"}
