@@ -20,6 +20,8 @@ const RIGHT_SPLIT_BAR_PX = 14;
 const RIGHT_TOP_MIN_PX = 220;
 const RIGHT_BOTTOM_MIN_PX = 180;
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
+const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
+const MAX_SAVED_FEED_PROGRESS = 240;
 type FeedbackAction = "helpful" | "confusing" | "save";
 
 type ReelFeedbackState = {
@@ -36,6 +38,12 @@ type MaterialSeed = {
   updatedAt?: number;
 };
 
+type FeedProgressEntry = {
+  index: number;
+  reelId?: string;
+  updatedAt: number;
+};
+
 function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
   if (!raw) {
     return {};
@@ -46,6 +54,40 @@ function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
       return {};
     }
     return parsed as Record<string, MaterialSeed>;
+  } catch {
+    return {};
+  }
+}
+
+function parseFeedProgress(raw: string | null): Record<string, FeedProgressEntry> {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const result: Record<string, FeedProgressEntry> = {};
+    for (const [materialId, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!materialId || typeof materialId !== "string") {
+        continue;
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      const row = value as Record<string, unknown>;
+      const index = Number(row.index);
+      if (!Number.isFinite(index) || index < 0) {
+        continue;
+      }
+      result[materialId] = {
+        index: Math.floor(index),
+        reelId: typeof row.reelId === "string" && row.reelId.trim() ? row.reelId.trim() : undefined,
+        updatedAt: Number(row.updatedAt) || 0,
+      };
+    }
+    return result;
   } catch {
     return {};
   }
@@ -99,6 +141,9 @@ function FeedPageInner() {
   const dragModeRef = useRef<"lr" | "tb" | null>(null);
   const isRecoveringMissingMaterialRef = useRef(false);
   const recoveryAttemptedIdsRef = useRef<Set<string>>(new Set());
+  const pendingResumeRef = useRef<FeedProgressEntry | null>(null);
+  const resumeAppliedRef = useRef(false);
+  const resumeLoadingRef = useRef(false);
 
   const reelVideoKey = useCallback((reel: Reel): string => {
     const match = reel.video_url.match(/\/embed\/([^?&/]+)/);
@@ -266,9 +311,20 @@ function FeedPageInner() {
 
   useEffect(() => {
     if (!materialId) {
+      pendingResumeRef.current = null;
+      resumeAppliedRef.current = false;
+      resumeLoadingRef.current = false;
       setLoading(false);
       return;
     }
+    if (typeof window !== "undefined") {
+      const allProgress = parseFeedProgress(window.localStorage.getItem(FEED_PROGRESS_STORAGE_KEY));
+      pendingResumeRef.current = allProgress[materialId] ?? null;
+    } else {
+      pendingResumeRef.current = null;
+    }
+    resumeAppliedRef.current = false;
+    resumeLoadingRef.current = false;
     recoveryAttemptedIdsRef.current.clear();
     setLoading(true);
     setCanRequestMore(true);
@@ -347,6 +403,66 @@ function FeedPageInner() {
       }
   }, [appendGeneratedReels, canRequestMore, hasMore, loadPage, page, requestMore]);
 
+  const maybeResumeProgress = useCallback(() => {
+    if (!materialId || resumeAppliedRef.current) {
+      return;
+    }
+    const target = pendingResumeRef.current;
+    if (!target) {
+      resumeAppliedRef.current = true;
+      return;
+    }
+    if (reels.length === 0) {
+      return;
+    }
+
+    if (target.reelId) {
+      const reelIndex = reels.findIndex((reel) => reel.reel_id === target.reelId);
+      if (reelIndex >= 0) {
+        setActiveIndex((prev) => (prev === reelIndex ? prev : reelIndex));
+        resumeAppliedRef.current = true;
+        return;
+      }
+    }
+
+    const targetIndex = Math.max(0, Math.floor(target.index || 0));
+    if (targetIndex < reels.length) {
+      setActiveIndex((prev) => (prev === targetIndex ? prev : targetIndex));
+      resumeAppliedRef.current = true;
+      return;
+    }
+
+    if (resumeLoadingRef.current) {
+      return;
+    }
+
+    if (hasMore) {
+      resumeLoadingRef.current = true;
+      void loadPage(page + 1, { autofill: false }).finally(() => {
+        resumeLoadingRef.current = false;
+      });
+      return;
+    }
+
+    if (canRequestMore) {
+      resumeLoadingRef.current = true;
+      void (async () => {
+        const generated = await requestMore();
+        appendGeneratedReels(generated);
+      })().finally(() => {
+        resumeLoadingRef.current = false;
+      });
+      return;
+    }
+
+    setActiveIndex((prev) => (reels.length > 0 ? Math.min(prev, reels.length - 1) : 0));
+    resumeAppliedRef.current = true;
+  }, [appendGeneratedReels, canRequestMore, hasMore, loadPage, materialId, page, reels, requestMore]);
+
+  useEffect(() => {
+    maybeResumeProgress();
+  }, [maybeResumeProgress]);
+
   useEffect(() => {
     setActiveIndex((prev) => {
       if (reels.length === 0) {
@@ -359,6 +475,27 @@ function FeedPageInner() {
   useEffect(() => {
     activeIndexRef.current = activeIndex;
   }, [activeIndex]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !materialId || reels.length === 0) {
+      return;
+    }
+    const index = clamp(activeIndex, 0, reels.length - 1);
+    const activeReel = reels[index];
+    if (!activeReel?.reel_id) {
+      return;
+    }
+    const allProgress = parseFeedProgress(window.localStorage.getItem(FEED_PROGRESS_STORAGE_KEY));
+    allProgress[materialId] = {
+      index,
+      reelId: activeReel.reel_id,
+      updatedAt: Date.now(),
+    };
+    const ordered = Object.entries(allProgress)
+      .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+      .slice(0, MAX_SAVED_FEED_PROGRESS);
+    window.localStorage.setItem(FEED_PROGRESS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
+  }, [activeIndex, materialId, reels]);
 
   useEffect(() => {
     return () => {
