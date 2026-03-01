@@ -43,6 +43,7 @@ function FeedPageInner() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [generatingMore, setGeneratingMore] = useState(false);
+  const [bootstrappingFirstReels, setBootstrappingFirstReels] = useState(false);
   const [canRequestMore, setCanRequestMore] = useState(true);
   const [activeIndex, setActiveIndex] = useState(0);
   const [feedbackByReel, setFeedbackByReel] = useState<Record<string, ReelFeedbackState>>({});
@@ -69,6 +70,7 @@ function FeedPageInner() {
   const wheelGestureReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const touchStartYRef = useRef<number | null>(null);
   const emptyGenerateStreakRef = useRef(0);
+  const bootstrapAttemptedRef = useRef(false);
   const desktopShellRef = useRef<HTMLDivElement | null>(null);
   const rightColumnRef = useRef<HTMLDivElement | null>(null);
   const dragModeRef = useRef<"lr" | "tb" | null>(null);
@@ -145,13 +147,15 @@ function FeedPageInner() {
     [dedupeByVideo, materialId, reelVideoKey],
   );
 
-  const requestMore = useCallback(async (): Promise<Reel[]> => {
+  const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
     if (!materialId || isGeneratingRef.current || !canRequestMore) {
       return [];
     }
     isGeneratingRef.current = true;
     setGeneratingMore(true);
-    setError(null);
+    if (options?.surfaceError) {
+      setError(null);
+    }
     try {
       const generated = await generateReels({
         materialId,
@@ -162,6 +166,9 @@ function FeedPageInner() {
         if (emptyGenerateStreakRef.current >= 4) {
           setCanRequestMore(false);
         }
+        if (options?.surfaceError) {
+          setError("No reels were generated yet. Try a broader topic or add more source text.");
+        }
         return [];
       }
       emptyGenerateStreakRef.current = 0;
@@ -171,6 +178,9 @@ function FeedPageInner() {
       emptyGenerateStreakRef.current += 1;
       if (emptyGenerateStreakRef.current >= 3) {
         setCanRequestMore(false);
+      }
+      if (options?.surfaceError) {
+        setError(e instanceof Error ? e.message : "Could not generate reels right now.");
       }
       return [];
     } finally {
@@ -189,9 +199,61 @@ function FeedPageInner() {
     setActiveIndex(0);
     setFeedbackByReel({});
     setMobileDetailsOpen(false);
+    setBootstrappingFirstReels(false);
     emptyGenerateStreakRef.current = 0;
-    loadPage(1, { autofill: true });
+    bootstrapAttemptedRef.current = false;
+    loadPage(1, { autofill: false });
   }, [materialId, loadPage]);
+
+  const appendGeneratedReels = useCallback(
+    (generated: Reel[]) => {
+      if (!generated.length) {
+        return;
+      }
+      setReels((prev) => {
+        const seen = new Set(prev.map((r) => reelVideoKey(r)));
+        const merged = [...prev];
+        let added = 0;
+        for (const reel of generated) {
+          const key = reelVideoKey(reel);
+          if (!seen.has(key)) {
+            merged.push(reel);
+            seen.add(key);
+            added += 1;
+          }
+        }
+        if (added > 0) {
+          setTotal((prevTotal) => Math.max(prevTotal, merged.length));
+        }
+        return merged;
+      });
+    },
+    [reelVideoKey],
+  );
+
+  const bootstrapFirstReels = useCallback(
+    async (manual = false) => {
+      if (!materialId || isGeneratingRef.current || !canRequestMore) {
+        return;
+      }
+      setBootstrappingFirstReels(true);
+      try {
+        const generated = await requestMore({ surfaceError: manual });
+        appendGeneratedReels(generated);
+      } finally {
+        setBootstrappingFirstReels(false);
+      }
+    },
+    [appendGeneratedReels, canRequestMore, materialId, requestMore],
+  );
+
+  useEffect(() => {
+    if (!materialId || loading || reels.length > 0 || bootstrapAttemptedRef.current) {
+      return;
+    }
+    bootstrapAttemptedRef.current = true;
+    void bootstrapFirstReels(false);
+  }, [bootstrapFirstReels, loading, materialId, reels.length]);
 
   const maybeLoadMore = useCallback(() => {
     if (isFetchingRef.current) {
@@ -201,31 +263,13 @@ function FeedPageInner() {
       loadPage(page + 1, { autofill: false });
       return;
     }
-    if (canRequestMore && !isGeneratingRef.current) {
-      void (async () => {
-        const generated = await requestMore();
-        if (generated.length) {
-          setReels((prev) => {
-            const seen = new Set(prev.map((r) => reelVideoKey(r)));
-            const merged = [...prev];
-            let added = 0;
-            for (const reel of generated) {
-              const key = reelVideoKey(reel);
-              if (!seen.has(key)) {
-                merged.push(reel);
-                seen.add(key);
-                added += 1;
-              }
-            }
-            if (added > 0) {
-              setTotal((prevTotal) => Math.max(prevTotal, merged.length));
-            }
-            return merged;
-          });
-        }
-      })();
-    }
-  }, [canRequestMore, hasMore, loadPage, page, reelVideoKey, requestMore]);
+      if (canRequestMore && !isGeneratingRef.current) {
+        void (async () => {
+          const generated = await requestMore();
+          appendGeneratedReels(generated);
+        })();
+      }
+  }, [appendGeneratedReels, canRequestMore, hasMore, loadPage, page, requestMore]);
 
   useEffect(() => {
     setActiveIndex((prev) => {
@@ -798,6 +842,29 @@ function FeedPageInner() {
                 </div>
               ))}
             </div>
+            {reels.length === 0 ? (
+              <div className="absolute inset-0 grid place-items-center p-6">
+                <div className="max-w-sm rounded-3xl border border-white/20 bg-black/68 px-5 py-4 text-center text-white backdrop-blur">
+                  <p className="text-sm font-semibold">
+                    {loading || bootstrappingFirstReels || generatingMore ? "Preparing your first reels..." : "No reels yet"}
+                  </p>
+                  <p className="mt-2 text-xs text-white/72">
+                    {loading || bootstrappingFirstReels || generatingMore
+                      ? "This can take a little while on first generation."
+                      : "Try generating again, or adjust your topic/material for broader matches."}
+                  </p>
+                  {!loading && !bootstrappingFirstReels && !generatingMore ? (
+                    <button
+                      type="button"
+                      onClick={() => void bootstrapFirstReels(true)}
+                      className="mt-3 rounded-xl border border-white/25 bg-white px-3.5 py-2 text-xs font-semibold text-black"
+                    >
+                      Generate Reels
+                    </button>
+                  ) : null}
+                </div>
+              </div>
+            ) : null}
           </div>
 
           {mobileDetailsOpen && activeReel ? (
