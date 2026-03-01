@@ -132,9 +132,6 @@ class ReelService:
                             if not segments:
                                 segments = self._fallback_segments_from_transcript(transcript)
                         else:
-                            if not use_full_short_clip:
-                                # Long-form cutting requires transcript timestamps.
-                                continue
                             metadata_segment = self._fallback_segment_from_video_metadata(video, concept_terms)
                             if metadata_segment:
                                 segments = [metadata_segment]
@@ -768,15 +765,17 @@ class ReelService:
         if not prefer_short_query:
             return False
         if video_duration_sec <= 0:
-            return False
+            # Scraped fallback results often have unknown duration; still allow short-clip mode.
+            return True
         # Shorts are currently up to ~3 minutes; keep full playback for these.
         return video_duration_sec <= 185
 
     def _full_short_clip_window(self, video_duration_sec: int) -> tuple[int, int] | None:
+        effective_duration = video_duration_sec if video_duration_sec > 0 else 60
         return self._normalize_clip_window(
             t_start=0.0,
-            t_end=float(video_duration_sec),
-            video_duration_sec=video_duration_sec,
+            t_end=float(effective_duration),
+            video_duration_sec=effective_duration,
             min_len=1,
             max_len=0,
             allow_exceed_max=True,
