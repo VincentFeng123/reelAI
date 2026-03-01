@@ -8,10 +8,10 @@ const FLOOR_HEIGHT = 10;
 const BIRD_X = 78;
 const BIRD_RADIUS = 6;
 const PIPE_WIDTH = 24;
-const PIPE_GAP = 44;
+const PIPE_GAP = 58;
 const PIPE_SPEED = 1.9;
 const GRAVITY = 0.24;
-const FLAP_VELOCITY = -4.3;
+const FLAP_VELOCITY = -3.4;
 const BEST_SCORE_KEY = "studyreels-flappy-best";
 
 type Pipe = {
