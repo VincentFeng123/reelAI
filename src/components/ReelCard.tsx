@@ -628,6 +628,8 @@ export function ReelCard({
 
       <div className="pointer-events-none absolute inset-x-0 top-0 z-[16] h-10 bg-black/95" />
 
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-[18] h-[52%] bg-gradient-to-t from-black/78 via-black/52 to-transparent backdrop-blur-md" />
+
       {isActive ? (
         <button
           type="button"
@@ -654,79 +656,81 @@ export function ReelCard({
         onTouchEnd={stopFeedGesturePropagation}
         className="absolute inset-x-0 bottom-0 z-20 p-3"
       >
-        {showCaptions && activeCaptionText ? (
-          <div className="mb-2 flex justify-center px-1">
-            <p className="max-w-[92%] rounded-xl bg-black/78 px-3 py-2 text-center text-[12px] font-medium leading-relaxed text-white/96">
-              {activeCaptionText}
-            </p>
-          </div>
-        ) : null}
-
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <div className="inline-flex h-9 items-center rounded-full border border-white/30 bg-black/82 px-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/92">
-              {formatClock(currentSec)} / {formatClock(clipDuration)}
+        <div className="rounded-2xl border border-white/20 bg-black/42 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.35)] backdrop-blur-md">
+          {showCaptions && activeCaptionText ? (
+            <div className="mb-2 flex justify-center px-1">
+              <p className="max-w-[92%] rounded-xl bg-black/78 px-3 py-2 text-center text-[12px] font-medium leading-relaxed text-white/96">
+                {activeCaptionText}
+              </p>
             </div>
-            {onOpenContent ? (
+          ) : null}
+
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <div className="inline-flex h-9 items-center rounded-full border border-white/30 bg-black/82 px-3 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/92">
+                {formatClock(currentSec)} / {formatClock(clipDuration)}
+              </div>
+              {onOpenContent ? (
+                <button
+                  type="button"
+                  data-reel-control="true"
+                  onClick={onOpenContent}
+                  className="inline-flex h-8 items-center rounded-full border border-white/28 px-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/92 transition hover:bg-white/10 lg:hidden"
+                >
+                  Content
+                </button>
+              ) : null}
+            </div>
+            <div className="flex items-center gap-2">
               <button
                 type="button"
                 data-reel-control="true"
-                onClick={onOpenContent}
-                className="inline-flex h-8 items-center rounded-full border border-white/28 px-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/92 transition hover:bg-white/10 lg:hidden"
+                onClick={togglePlayPause}
+                className={controlButtonClass(Boolean(isPlaying))}
+                disabled={!controlsEnabled}
+                aria-label={isPlaying ? "Pause" : "Play"}
+                title={isPlaying ? "Pause" : "Play"}
               >
-                Content
+                <i className={`fa-solid ${isPlaying ? "fa-pause" : "fa-play"}`} aria-hidden="true" />
               </button>
-            ) : null}
+              <button
+                type="button"
+                data-reel-control="true"
+                onClick={toggleMute}
+                className={controlButtonClass(!isMuted)}
+                disabled={!controlsEnabled}
+                aria-label={isMuted ? "Unmute" : "Mute"}
+              >
+                <i className={`fa-solid ${isMuted ? "fa-volume-xmark" : "fa-volume-high"}`} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                data-reel-control="true"
+                onClick={toggleCaptions}
+                className={controlButtonClass(showCaptions)}
+                disabled={!controlsEnabled}
+                aria-label={showCaptions ? "Hide captions" : "Show captions"}
+                title={showCaptions ? "Hide captions" : "Show captions"}
+              >
+                <i className="fa-regular fa-closed-captioning" aria-hidden="true" />
+              </button>
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              data-reel-control="true"
-              onClick={togglePlayPause}
-              className={controlButtonClass(Boolean(isPlaying))}
-              disabled={!controlsEnabled}
-              aria-label={isPlaying ? "Pause" : "Play"}
-              title={isPlaying ? "Pause" : "Play"}
-            >
-              <i className={`fa-solid ${isPlaying ? "fa-pause" : "fa-play"}`} aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              data-reel-control="true"
-              onClick={toggleMute}
-              className={controlButtonClass(!isMuted)}
-              disabled={!controlsEnabled}
-              aria-label={isMuted ? "Unmute" : "Mute"}
-            >
-              <i className={`fa-solid ${isMuted ? "fa-volume-xmark" : "fa-volume-high"}`} aria-hidden="true" />
-            </button>
-            <button
-              type="button"
-              data-reel-control="true"
-              onClick={toggleCaptions}
-              className={controlButtonClass(showCaptions)}
-              disabled={!controlsEnabled}
-              aria-label={showCaptions ? "Hide captions" : "Show captions"}
-              title={showCaptions ? "Hide captions" : "Show captions"}
-            >
-              <i className="fa-regular fa-closed-captioning" aria-hidden="true" />
-            </button>
-          </div>
+
+          <input
+            data-reel-control="true"
+            type="range"
+            min={0}
+            max={clipDuration}
+            step={0.1}
+            value={currentSec}
+            onChange={onSeek}
+            className="reel-range h-1.5 w-full cursor-pointer disabled:opacity-40"
+            disabled={!controlsEnabled}
+          />
+
+          {loadError ? <p className="mt-2 inline-flex rounded-full bg-black/76 px-3 py-1 text-xs text-white/78">{loadError}</p> : null}
         </div>
-
-        <input
-          data-reel-control="true"
-          type="range"
-          min={0}
-          max={clipDuration}
-          step={0.1}
-          value={currentSec}
-          onChange={onSeek}
-          className="reel-range h-1.5 w-full cursor-pointer disabled:opacity-40"
-          disabled={!controlsEnabled}
-        />
-
-        {loadError ? <p className="mt-2 inline-flex rounded-full bg-black/76 px-3 py-1 text-xs text-white/78">{loadError}</p> : null}
       </div>
     </section>
   );

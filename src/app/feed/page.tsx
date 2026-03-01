@@ -883,7 +883,7 @@ function FeedPageInner() {
         type="button"
         onClick={() => router.push("/")}
         aria-label="Back to main page"
-        className="absolute left-3 top-3 z-[9999] grid h-9 w-9 place-items-center rounded-xl border border-white/25 bg-black/72 text-white transition hover:bg-white/12"
+        className="absolute left-3 top-3 z-[9999] grid h-9 w-9 place-items-center rounded-xl border border-white/28 bg-black/50 text-white shadow-[0_8px_24px_rgba(0,0,0,0.35)] backdrop-blur-md transition hover:bg-white/12"
       >
         <i className="fa-solid fa-arrow-left text-xs" aria-hidden="true" />
       </button>
