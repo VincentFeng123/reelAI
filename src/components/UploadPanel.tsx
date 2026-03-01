@@ -5,6 +5,52 @@ import { useRouter } from "next/navigation";
 
 import { uploadMaterial } from "@/lib/api";
 
+const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
+const MAX_MATERIAL_SEEDS = 120;
+const MAX_SEED_TEXT_CHARS = 16000;
+
+type MaterialSeed = {
+  topic?: string;
+  text?: string;
+  title: string;
+  updatedAt: number;
+};
+
+function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const normalized: Record<string, MaterialSeed> = {};
+    for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!id || typeof id !== "string") {
+        continue;
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      const seed = value as Record<string, unknown>;
+      const title = String(seed.title || "").trim();
+      if (!title) {
+        continue;
+      }
+      normalized[id] = {
+        topic: String(seed.topic || "").trim() || undefined,
+        text: String(seed.text || "").trim() || undefined,
+        title,
+        updatedAt: Number(seed.updatedAt) || 0,
+      };
+    }
+    return normalized;
+  } catch {
+    return {};
+  }
+}
+
 type UploadPanelProps = {
   onMaterialCreated?: (params: {
     materialId: string;
@@ -50,19 +96,33 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
     try {
       const topicValue = topic.trim();
       const textValue = text.trim();
+      const title = buildMaterialTitle({
+        topic: topicValue,
+        text: textValue,
+        fileName: file?.name ?? "",
+      });
       const material = await uploadMaterial({
         text: textValue || undefined,
         file,
         subjectTag: topicValue || undefined,
       });
+      if (typeof window !== "undefined") {
+        const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
+        seeds[material.material_id] = {
+          topic: topicValue || undefined,
+          text: textValue ? textValue.slice(0, MAX_SEED_TEXT_CHARS) : undefined,
+          title,
+          updatedAt: Date.now(),
+        };
+        const ordered = Object.entries(seeds)
+          .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+          .slice(0, MAX_MATERIAL_SEEDS);
+        window.localStorage.setItem(MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
+      }
       if (onMaterialCreated) {
         await onMaterialCreated({
           materialId: material.material_id,
-          title: buildMaterialTitle({
-            topic: topicValue,
-            text: textValue,
-            fileName: file?.name ?? "",
-          }),
+          title,
           topic: topicValue || undefined,
         });
       }

@@ -4,7 +4,7 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { ReelCard } from "@/components/ReelCard";
-import { askStudyChat, fetchFeed, generateReels, sendFeedback } from "@/lib/api";
+import { askStudyChat, fetchFeed, generateReels, sendFeedback, uploadMaterial } from "@/lib/api";
 import type { ChatMessage, Reel } from "@/lib/types";
 
 const PAGE_SIZE = 5;
@@ -19,6 +19,7 @@ const LEFT_PANEL_MIN_PX = 380;
 const RIGHT_SPLIT_BAR_PX = 14;
 const RIGHT_TOP_MIN_PX = 220;
 const RIGHT_BOTTOM_MIN_PX = 180;
+const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 type FeedbackAction = "helpful" | "confusing" | "save";
 
 type ReelFeedbackState = {
@@ -27,6 +28,28 @@ type ReelFeedbackState = {
   saved?: boolean;
   rating?: number;
 };
+
+type MaterialSeed = {
+  topic?: string;
+  text?: string;
+  title?: string;
+  updatedAt?: number;
+};
+
+function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    return parsed as Record<string, MaterialSeed>;
+  } catch {
+    return {};
+  }
+}
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -74,6 +97,8 @@ function FeedPageInner() {
   const desktopShellRef = useRef<HTMLDivElement | null>(null);
   const rightColumnRef = useRef<HTMLDivElement | null>(null);
   const dragModeRef = useRef<"lr" | "tb" | null>(null);
+  const isRecoveringMissingMaterialRef = useRef(false);
+  const recoveryAttemptedIdsRef = useRef<Set<string>>(new Set());
 
   const reelVideoKey = useCallback((reel: Reel): string => {
     const match = reel.video_url.match(/\/embed\/([^?&/]+)/);
@@ -98,6 +123,48 @@ function FeedPageInner() {
   );
 
   const hasMore = reels.length < total;
+
+  const recoverMissingMaterial = useCallback(
+    async (missingMaterialId: string): Promise<boolean> => {
+      if (typeof window === "undefined" || isRecoveringMissingMaterialRef.current) {
+        return false;
+      }
+
+      const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
+      const seed = seeds[missingMaterialId];
+      const topic = String(seed?.topic || "").trim();
+      const text = String(seed?.text || "").trim();
+      if (!topic && !text) {
+        return false;
+      }
+
+      isRecoveringMissingMaterialRef.current = true;
+      setError("Session expired on server. Rebuilding your material...");
+      try {
+        const rebuilt = await uploadMaterial({
+          subjectTag: topic || undefined,
+          text: text || undefined,
+        });
+        const rebuiltId = rebuilt.material_id;
+        seeds[rebuiltId] = {
+          ...seed,
+          topic: topic || undefined,
+          text: text || undefined,
+          updatedAt: Date.now(),
+        };
+        delete seeds[missingMaterialId];
+        window.localStorage.setItem(MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(seeds));
+        router.replace(`/feed?material_id=${rebuiltId}`);
+        return true;
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Could not rebuild material.");
+        return false;
+      } finally {
+        isRecoveringMissingMaterialRef.current = false;
+      }
+    },
+    [router],
+  );
 
   const loadPage = useCallback(
     async (targetPage: number, options?: { autofill?: boolean }) => {
@@ -137,14 +204,22 @@ function FeedPageInner() {
         }
       } catch (e) {
         if (targetPage === 1) {
-          setError(e instanceof Error ? e.message : "Feed failed to load");
+          const message = e instanceof Error ? e.message : "Feed failed to load";
+          if (/material_id not found/i.test(message) && !recoveryAttemptedIdsRef.current.has(materialId)) {
+            recoveryAttemptedIdsRef.current.add(materialId);
+            const recovered = await recoverMissingMaterial(materialId);
+            if (recovered) {
+              return;
+            }
+          }
+          setError(message);
         }
       } finally {
         setLoading(false);
         isFetchingRef.current = false;
       }
     },
-    [dedupeByVideo, materialId, reelVideoKey],
+    [dedupeByVideo, materialId, recoverMissingMaterial, reelVideoKey],
   );
 
   const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
@@ -194,6 +269,7 @@ function FeedPageInner() {
       setLoading(false);
       return;
     }
+    recoveryAttemptedIdsRef.current.clear();
     setLoading(true);
     setCanRequestMore(true);
     setActiveIndex(0);
