@@ -58,15 +58,31 @@ class ReelService:
         if fast_mode:
             concepts = concepts[:4]
 
-        existing_video_ids = {
-            str(r["video_id"])
+        existing_clip_keys = {
+            self._clip_key(
+                str(r.get("video_id") or ""),
+                float(r.get("t_start") or 0),
+                float(r.get("t_end") or 0),
+            )
             for r in fetch_all(
                 conn,
-                "SELECT video_id FROM reels WHERE material_id = ?",
+                "SELECT video_id, t_start, t_end FROM reels WHERE material_id = ?",
                 (material_id,),
             )
             if r.get("video_id")
         }
+        existing_video_counts = {
+            str(r["video_id"]): int(r["reel_count"] or 0)
+            for r in fetch_all(
+                conn,
+                "SELECT video_id, COUNT(*) AS reel_count FROM reels WHERE material_id = ? GROUP BY video_id",
+                (material_id,),
+            )
+            if r.get("video_id")
+        }
+        generated_video_counts: dict[str, int] = {}
+        generated_clip_keys: set[str] = set()
+        max_segments_per_video = 1 if fast_mode else 3
 
         generated: list[dict[str, Any]] = []
         material = fetch_one(conn, "SELECT subject_tag FROM materials WHERE id = ?", (material_id,))
@@ -88,13 +104,13 @@ class ReelService:
 
             for query in queries:
                 # First pull short-form videos; then broaden to any duration for long-form clipping.
-                durations = ("short", None) if not fast_mode else ("short",)
+                durations = ("short", None)
                 for duration in durations:
                     prefer_short_query = duration == "short"
                     videos = self.youtube_service.search_videos(
                         conn,
                         query=query,
-                        max_results=4 if fast_mode else 8,
+                        max_results=4 if fast_mode else 12,
                         creative_commons_only=creative_commons_only,
                         video_duration=duration,
                     )
@@ -103,7 +119,9 @@ class ReelService:
                         if video["id"] in seen_video_ids:
                             continue
                         seen_video_ids.add(video["id"])
-                        if video["id"] in existing_video_ids:
+                        existing_for_video = existing_video_counts.get(video["id"], 0)
+                        generated_for_video = generated_video_counts.get(video["id"], 0)
+                        if existing_for_video + generated_for_video >= max_segments_per_video:
                             continue
                         video_duration = int(video.get("duration_sec") or 0)
 
@@ -175,6 +193,9 @@ class ReelService:
                             if not clip_window:
                                 continue
                             start_sec, end_sec = clip_window
+                            clip_key = self._clip_key(video["id"], start_sec, end_sec)
+                            if clip_key in existing_clip_keys or clip_key in generated_clip_keys:
+                                continue
                             reel = self._create_reel(
                                 conn,
                                 material_id=material_id,
@@ -188,12 +209,13 @@ class ReelService:
                             if not reel:
                                 continue
                             generated.append(reel)
-                            existing_video_ids.add(video["id"])
+                            generated_clip_keys.add(clip_key)
+                            generated_video_counts[video["id"]] = generated_video_counts.get(video["id"], 0) + 1
 
                             if len(generated) >= num_reels:
                                 return generated
-                            # Keep only one reel per video to avoid repeated content.
-                            break
+                            if existing_for_video + generated_video_counts.get(video["id"], 0) >= max_segments_per_video:
+                                break
 
         return generated
 
@@ -238,6 +260,10 @@ class ReelService:
             f"{subject}{title} shorts explained",
             f"{subject}{title} practice problems solved",
             f"{subject}{title} crash course",
+            f"{subject}{title} explained",
+            f"{subject}{title} full lecture",
+            f"{subject}{title} examples",
+            f"{subject}{title}",
         ]
         seen = set()
         deduped: list[str] = []
@@ -249,6 +275,9 @@ class ReelService:
             seen.add(key)
             deduped.append(cleaned)
         return deduped
+
+    def _clip_key(self, video_id: str, t_start: float, t_end: float) -> str:
+        return f"{video_id}:{int(float(t_start))}:{int(float(t_end))}"
 
     def _order_concepts(self, conn, material_id: str, concepts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         concept_counts = {
@@ -1167,21 +1196,19 @@ class ReelService:
         scored.sort(key=lambda x: (x["score"], x["created_at"]), reverse=True)
         deduped: list[dict[str, Any]] = []
         seen_reel_ids: set[str] = set()
-        seen_video_ids: set[str] = set()
         seen_clip_keys: set[str] = set()
         for item in scored:
             reel_id = str(item.get("reel_id") or "")
             if reel_id and reel_id in seen_reel_ids:
                 continue
             video_id = str(item.get("video_id") or "")
-            clip_key = f"{video_id}:{int(float(item.get('t_start') or 0))}:{int(float(item.get('t_end') or 0))}"
-            if clip_key in seen_clip_keys:
+            if not video_id:
                 continue
-            if not video_id or video_id in seen_video_ids:
+            clip_key = self._clip_key(video_id, float(item.get("t_start") or 0), float(item.get("t_end") or 0))
+            if clip_key in seen_clip_keys:
                 continue
             if reel_id:
                 seen_reel_ids.add(reel_id)
-            seen_video_ids.add(video_id)
             seen_clip_keys.add(clip_key)
             clean_item = dict(item)
             clean_item.pop("video_id", None)

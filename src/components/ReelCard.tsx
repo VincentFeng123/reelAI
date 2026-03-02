@@ -25,6 +25,7 @@ type YouTubePlayer = {
 const YOUTUBE_SCRIPT_ID = "studyreels-youtube-iframe-api";
 const PLAYER_REVEAL_DELAY_MS = 0;
 const RESUME_MASK_MS = 480;
+const DESKTOP_VERTICAL_PLAYER_CROP_PX = 96;
 let youtubeApiLoadPromise: Promise<void> | null = null;
 
 function detectTouchLikeDevice(): boolean {
@@ -147,6 +148,7 @@ export function ReelCard({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isTouchLikeDevice, setIsTouchLikeDevice] = useState(false);
   const [isMobilePhoneDevice, setIsMobilePhoneDevice] = useState(false);
+  const [desktopCoverScale, setDesktopCoverScale] = useState({ widthPct: 100, heightPct: 100 });
 
   const videoId = useMemo(() => extractVideoId(reel.video_url), [reel.video_url]);
   const clipStart = Math.max(0, Math.floor(reel.t_start));
@@ -197,6 +199,48 @@ export function ReelCard({
       window.removeEventListener("resize", onResize);
     };
   }, []);
+
+  useEffect(() => {
+    if (!isActive || isMobilePhoneDevice || typeof window === "undefined") {
+      return;
+    }
+    const host = hostContainerRef.current;
+    const frame = host?.parentElement;
+    if (!host || !frame) {
+      return;
+    }
+
+    const TARGET_ASPECT = 16 / 9;
+    const BLEED = 1.06;
+    const MIN_PERCENT = 100;
+    const MAX_PERCENT = 260;
+    const computeCover = () => {
+      const rect = frame.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) {
+        return;
+      }
+      const containerAspect = rect.width / rect.height;
+      let widthPct = 100;
+      let heightPct = 100;
+      if (containerAspect > TARGET_ASPECT) {
+        heightPct = (containerAspect / TARGET_ASPECT) * 100;
+      } else {
+        widthPct = (TARGET_ASPECT / containerAspect) * 100;
+      }
+      widthPct = clamp(widthPct * BLEED, MIN_PERCENT, MAX_PERCENT);
+      heightPct = clamp(heightPct * BLEED, MIN_PERCENT, MAX_PERCENT);
+      setDesktopCoverScale({ widthPct, heightPct });
+    };
+
+    computeCover();
+    const observer = new ResizeObserver(computeCover);
+    observer.observe(frame);
+    window.addEventListener("resize", computeCover);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", computeCover);
+    };
+  }, [isActive, isMobilePhoneDevice]);
 
   const stopProgressTimer = useCallback(() => {
     if (progressTimerRef.current) {
@@ -606,9 +650,8 @@ export function ReelCard({
     if (!showCaptions) {
       return "";
     }
-    const fallback = reel.transcript_snippet?.trim() || "No captions available for this reel.";
     if (captionCues.length === 0) {
-      return fallback;
+      return isMobilePhoneDevice ? "" : "No caption available.";
     }
 
     const now = clamp(currentSec, 0, clipDuration);
@@ -623,7 +666,10 @@ export function ReelCard({
       }
     }
     return "";
-  }, [captionCues, clipDuration, currentSec, reel.transcript_snippet, showCaptions]);
+  }, [captionCues, clipDuration, currentSec, isMobilePhoneDevice, showCaptions]);
+  const captionClass = isMobilePhoneDevice
+    ? "max-w-[92%] px-1 text-center text-[12px] font-medium leading-relaxed text-white/96 [text-shadow:0_1px_3px_rgba(0,0,0,0.9)]"
+    : "max-w-[92%] rounded-xl border border-white/16 bg-black/72 px-3 py-2 text-center text-[12px] font-medium leading-relaxed text-white/96 backdrop-blur-sm";
   const controlButtonClass = (active: boolean) =>
     `grid h-9 w-9 place-items-center text-base transition ${
       active ? "text-white" : "text-white/88 hover:text-white"
@@ -631,14 +677,26 @@ export function ReelCard({
   const controlsChromeClass = isMobilePhoneDevice
     ? "rounded-2xl border border-white/20 bg-black/70 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.38)] backdrop-blur-md"
     : "px-0 py-0";
+  const hostContainerClass = isMobilePhoneDevice
+    ? "pointer-events-none absolute inset-x-0 -top-14 h-[calc(100%+56px)] w-full"
+    : "pointer-events-none absolute left-1/2 top-1/2";
+  const hostContainerStyle = isMobilePhoneDevice
+    ? undefined
+    : ({
+        width: `${desktopCoverScale.widthPct}%`,
+        // Crop fixed-height YouTube chrome that can appear as a black band at the bottom.
+        height: `calc(${desktopCoverScale.heightPct}% + ${DESKTOP_VERTICAL_PLAYER_CROP_PX}px)`,
+        transform: `translate(-50%, calc(-50% - ${DESKTOP_VERTICAL_PLAYER_CROP_PX / 2}px))`,
+      } as const);
 
   return (
-    <section className="relative h-full min-h-full w-full snap-start overflow-hidden rounded-3xl border border-white/20 bg-black/80">
+    <section className="relative h-full min-h-full w-full snap-start overflow-hidden rounded-none border-0 bg-transparent lg:rounded-3xl lg:border lg:border-white/20">
       {isActive ? (
         <div className="absolute inset-0 overflow-hidden">
           <div
             ref={hostContainerRef}
-            className="pointer-events-none absolute inset-x-0 -top-14 h-[calc(100%+56px)] w-full"
+            className={hostContainerClass}
+            style={hostContainerStyle}
           />
         </div>
       ) : (
@@ -690,7 +748,7 @@ export function ReelCard({
         <div className={controlsChromeClass}>
           {showCaptions && activeCaptionText ? (
             <div className="mb-2 flex justify-center px-1">
-              <p className="max-w-[92%] rounded-xl bg-black/78 px-3 py-2 text-center text-[12px] font-medium leading-relaxed text-white/96">
+              <p className={captionClass}>
                 {activeCaptionText}
               </p>
             </div>

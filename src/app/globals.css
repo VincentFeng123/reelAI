@@ -4,6 +4,22 @@
 
 * {
   box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.5) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 2px;
+  height: 2px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 1px;
 }
 
 :root {
@@ -113,6 +129,18 @@ button {
   font: inherit;
 }
 
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus {
+  -webkit-text-fill-color: #fff;
+  -webkit-box-shadow: 0 0 0 1000px transparent inset;
+  box-shadow: 0 0 0 1000px transparent inset;
+  transition: background-color 9999s ease-out 0s;
+}
+
 ::selection {
   background: #fff;
   color: #000;
@@ -218,7 +246,7 @@ button {
   inset: 0;
   pointer-events: none;
   z-index: 1;
-  background: radial-gradient(100% 130% at 50% 50%, rgba(0, 0, 0, 0) 53%, rgba(0, 0, 0, 0.22) 100%);
+  background: radial-gradient(100% 130% at 50% 50%, rgba(0, 0, 0, 0) 56%, rgba(0, 0, 0, 0.08) 100%);
 }
 
 .home-hero-bg {
@@ -235,14 +263,15 @@ button {
 }
 
 .volumetric-light-canvas {
-  position: absolute;
-  inset: 0;
+  position: fixed;
+  top: 0;
+  right: 0;
   width: 100%;
   height: 100%;
-  opacity: 1;
+  opacity: 0.92;
   overflow: hidden;
   isolation: isolate;
-  background: #000;
+  background: transparent;
 }
 
 .volumetric-light-canvas::before {
@@ -252,9 +281,9 @@ button {
   z-index: 1;
   pointer-events: none;
   background:
-    radial-gradient(1400px 1000px at 95% 50%, rgba(140, 170, 255, 0.06), transparent 55%),
-    radial-gradient(1100px 800px at 90% 45%, rgba(100, 130, 220, 0.05), transparent 58%),
-    radial-gradient(600px 450px at 50% 35%, rgba(110, 140, 230, 0.03), transparent 65%);
+    radial-gradient(1400px 1000px at 95% 50%, rgba(140, 170, 255, 0.035), transparent 58%),
+    radial-gradient(1100px 800px at 90% 45%, rgba(100, 130, 220, 0.03), transparent 60%),
+    radial-gradient(600px 450px at 50% 35%, rgba(110, 140, 230, 0.022), transparent 68%);
   mix-blend-mode: screen;
 }
 
@@ -265,9 +294,9 @@ button {
   z-index: 2;
   pointer-events: none;
   background:
-    radial-gradient(130% 80% at 12% -10%, rgba(0, 0, 0, 0.90), rgba(0, 0, 0, 0) 55%),
-    radial-gradient(130% 85% at 15% 110%, rgba(0, 0, 0, 0.85), rgba(0, 0, 0, 0) 52%),
-    radial-gradient(140% 120% at 50% 50%, rgba(0, 0, 0, 0) 55%, rgba(0, 0, 0, 0.28) 100%);
+    radial-gradient(130% 80% at 12% -10%, rgba(0, 0, 0, 0.28), rgba(0, 0, 0, 0) 60%),
+    radial-gradient(130% 85% at 15% 110%, rgba(0, 0, 0, 0.22), rgba(0, 0, 0, 0) 58%),
+    radial-gradient(140% 120% at 50% 50%, rgba(0, 0, 0, 0) 60%, rgba(0, 0, 0, 0.1) 100%);
 }
 
 .volumetric-light-canvas canvas {
@@ -277,6 +306,9 @@ button {
   display: block;
   width: 100% !important;
   height: 100% !important;
+  opacity: 0.88;
+  filter: saturate(1.02) brightness(1.05);
+  mix-blend-mode: screen;
 }
 
 @keyframes mobile-sidenav-in {

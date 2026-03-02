@@ -89,14 +89,15 @@ CREATE TABLE IF NOT EXISTS reels (
 
 CREATE INDEX IF NOT EXISTS idx_reels_material_id ON reels(material_id);
 CREATE INDEX IF NOT EXISTS idx_reels_concept_id ON reels(concept_id);
--- Keep only one reel per (material, video) and enforce it going forward.
+-- Keep only one reel per exact (material, video, clip window) and enforce it going forward.
 DELETE FROM reels
 WHERE rowid NOT IN (
     SELECT MIN(rowid)
     FROM reels
-    GROUP BY material_id, video_id
+    GROUP BY material_id, video_id, CAST(t_start AS INTEGER), CAST(t_end AS INTEGER)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_unique ON reels(material_id, video_id);
+DROP INDEX IF EXISTS idx_reels_material_video_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique ON reels(material_id, video_id, t_start, t_end);
 
 CREATE TABLE IF NOT EXISTS reel_feedback (
     id TEXT PRIMARY KEY,

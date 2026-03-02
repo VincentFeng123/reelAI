@@ -10,6 +10,13 @@ const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
 const MAX_MATERIAL_SEEDS = 120;
 const MAX_SEED_TEXT_CHARS = 16000;
 type GenerationMode = "slow" | "fast";
+type InputMode = "topic" | "source" | "file";
+
+const INPUT_MODE_OPTIONS: Array<{ value: InputMode; label: string }> = [
+  { value: "topic", label: "Topic" },
+  { value: "source", label: "Text" },
+  { value: "file", label: "File Upload" },
+];
 
 type MaterialSeed = {
   topic?: string;
@@ -79,9 +86,10 @@ function buildMaterialTitle(params: { topic: string; text: string; fileName: str
 
 export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
   const router = useRouter();
-  const [topic, setTopic] = useState("");
+  const [topics, setTopics] = useState<string[]>([""]);
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | undefined>();
+  const [inputMode, setInputMode] = useState<InputMode>("source");
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -106,8 +114,17 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
   }, [generationMode]);
 
   const disabled = useMemo(() => {
-    return loading || (!file && !topic.trim() && !text.trim());
-  }, [file, loading, text, topic]);
+    if (loading) {
+      return true;
+    }
+    if (inputMode === "topic") {
+      return !topics.some((t) => t.trim());
+    }
+    if (inputMode === "source") {
+      return !text.trim();
+    }
+    return !file;
+  }, [file, inputMode, loading, text, topics]);
 
   const onSubmit = useCallback(async (event: FormEvent) => {
     event.preventDefault();
@@ -115,16 +132,17 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
     setLoading(true);
 
     try {
-      const topicValue = topic.trim();
-      const textValue = text.trim();
+      const topicValue = inputMode === "topic" ? topics.map((t) => t.trim()).filter(Boolean).join(", ") : "";
+      const textValue = inputMode === "source" ? text.trim() : "";
+      const fileValue = inputMode === "file" ? file : undefined;
       const title = buildMaterialTitle({
         topic: topicValue,
         text: textValue,
-        fileName: file?.name ?? "",
+        fileName: fileValue?.name ?? "",
       });
       const material = await uploadMaterial({
         text: textValue || undefined,
-        file,
+        file: fileValue,
         subjectTag: topicValue || undefined,
       });
       if (typeof window !== "undefined") {
@@ -154,7 +172,7 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
     } finally {
       setLoading(false);
     }
-  }, [file, generationMode, onMaterialCreated, router, text, topic]);
+  }, [file, generationMode, inputMode, onMaterialCreated, router, text, topics]);
 
   const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
@@ -168,41 +186,114 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
   return (
     <form
       onSubmit={onSubmit}
-      className="flex h-full w-full flex-col overflow-x-visible overflow-y-auto px-6 py-6 pb-24 md:overflow-hidden md:px-10 md:py-8 md:pb-8 lg:px-5"
+      className="flex h-full w-full flex-col justify-end overflow-x-visible overflow-y-auto px-6 py-6 pb-14 md:overflow-hidden md:px-10 md:py-8 md:pb-8 lg:px-5"
     >
-      <header className="mb-5 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-        <div>
-          <p className="text-center text-xs font-semibold uppercase tracking-[0.18em] text-white/55 md:text-left">Study Feed</p>
-          <div className="mt-8 md:mt-2">
-            <h1 className="text-3xl font-bold tracking-tight md:text-5xl">StudyReels</h1>
-            <p className="mt-2 max-w-2xl text-sm text-white/68">
-              Type a topic, paste text, upload a file, or combine all of them. The feed starts with short reels and keeps expanding as you scroll.
-            </p>
-          </div>
+      <header className="relative mb-4 text-center">
+        <p className="relative z-20 text-xs font-semibold uppercase tracking-[0.2em] text-white/55">Study Feed</p>
+        <div className="mt-12 md:mt-7">
+          <h1 className="relative z-[1] text-[clamp(3.2rem,12vw,8.25rem)] font-black leading-[0.9] tracking-tight text-[#e8e6fc]">Study Reels</h1>
+          <p className="relative z-20 mt-5 text-sm text-white/68">Pick a mode, add your material, and start your short study feed.</p>
         </div>
       </header>
 
-      <div className="mt-10 grid gap-4 md:mt-0 md:grid-cols-2">
-        <div>
-          <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Topic</label>
-          <input
-            className="h-12 w-full rounded-2xl border border-white/30 bg-black/45 px-4 text-sm text-white outline-none transition placeholder:text-white/40 focus:border-white/65"
-            placeholder="e.g. linear regression"
-            value={topic}
-            onChange={(e) => setTopic(e.target.value)}
-          />
-        </div>
+      <input
+        id="material-file"
+        className="sr-only"
+        type="file"
+        accept=".pdf,.docx,.txt"
+        onChange={(e) => setFile(e.target.files?.[0])}
+      />
 
-        <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_190px] sm:items-end">
-          <div className="min-w-0 flex-1">
-            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">File</label>
-            <input
-              id="material-file"
-              className="sr-only"
-              type="file"
-              accept=".pdf,.docx,.txt"
-              onChange={(e) => setFile(e.target.files?.[0])}
-            />
+      <div className="relative z-20 mt-8 max-w-[300px] md:mt-2 md:max-w-[390px]">
+        <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Input Mode</p>
+        <div role="tablist" aria-label="Select input mode" className="relative grid w-full grid-cols-3 rounded-2xl border border-white/25 bg-black/45 p-1">
+          <span
+            aria-hidden="true"
+            className="pointer-events-none absolute bottom-1 left-1 top-1 w-[calc((100%-8px)/3)] rounded-xl bg-white transition-transform duration-300 ease-out"
+            style={{
+              transform: `translateX(${INPUT_MODE_OPTIONS.findIndex((option) => option.value === inputMode) * 100}%)`,
+            }}
+          />
+          {INPUT_MODE_OPTIONS.map((option) => (
+            <button
+              key={option.value}
+              role="tab"
+              type="button"
+              aria-selected={inputMode === option.value}
+              onClick={() => {
+                setInputMode(option.value);
+                setError(null);
+              }}
+              className={`relative z-10 rounded-xl px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.07em] transition-colors md:px-3 md:py-2 md:text-xs ${
+                inputMode === option.value ? "text-black" : "text-white/80 hover:text-white"
+              }`}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div className="relative z-20 mt-6 h-[160px] min-h-[160px] md:mt-4 md:h-[175px] md:min-h-[175px]">
+        {inputMode === "topic" ? (
+          <>
+            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Topics</label>
+            <div className="h-full min-h-[160px] md:min-h-[175px] flex flex-col gap-2 overflow-y-auto">
+              {topics.map((t, i) => (
+                <div key={i} className="flex items-center gap-3 pr-1">
+                  <div className="w-full rounded-2xl border border-white/30 bg-black/42 backdrop-blur-xl transition focus-within:border-white/65">
+                    <input
+                      className="h-12 w-full rounded-2xl border-0 bg-transparent px-4 text-sm text-white outline-none placeholder:text-white/40"
+                      placeholder={i === 0 ? "e.g. linear regression" : "e.g. another topic"}
+                      value={t}
+                      onChange={(e) => {
+                        const next = [...topics];
+                        next[i] = e.target.value;
+                        setTopics(next);
+                      }}
+                    />
+                  </div>
+                  {topics.length > 1 ? (
+                    <button
+                      type="button"
+                      onClick={() => setTopics(topics.filter((_, j) => j !== i))}
+                      className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-white/25 bg-black/40 text-white/80 backdrop-blur-xl transition hover:bg-black/55 hover:text-white"
+                      aria-label="Remove topic"
+                    >
+                      <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() => setTopics([...topics, ""])}
+                className="mt-1 flex w-fit items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold text-white/60 transition hover:text-white/90"
+              >
+                <i className="fa-solid fa-plus text-[10px]" aria-hidden="true" />
+                Add topic
+              </button>
+            </div>
+          </>
+        ) : null}
+
+        {inputMode === "source" ? (
+          <>
+            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Text</label>
+            <div className="h-full rounded-2xl border border-white/30 bg-black/42 backdrop-blur-xl transition focus-within:border-white/65">
+              <textarea
+                className="h-full min-h-[160px] w-full resize-none overflow-y-auto rounded-2xl border-0 bg-transparent p-5 text-sm leading-relaxed text-white outline-none placeholder:text-white/40 md:min-h-[175px]"
+                placeholder="Paste notes, textbook text, or any material here..."
+                value={text}
+                onChange={(e) => setText(e.target.value)}
+              />
+            </div>
+          </>
+        ) : null}
+
+        {inputMode === "file" ? (
+          <>
+            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">File Upload</label>
             <label
               htmlFor="material-file"
               onDragOver={(event) => {
@@ -211,17 +302,26 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
               }}
               onDragLeave={() => setIsDraggingFile(false)}
               onDrop={onFileDrop}
-              className={`flex h-12 w-full cursor-pointer items-center rounded-2xl border bg-black/45 px-4 text-sm text-white outline-none transition ${
-                isDraggingFile ? "border-white/70" : "border-white/30"
+              className={`flex h-full min-h-[160px] w-full cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed bg-black/42 p-6 text-center text-white outline-none backdrop-blur-xl transition md:min-h-[175px] ${
+                isDraggingFile ? "border-white/70 bg-black/52" : "border-white/30"
               }`}
             >
-              <span className={`truncate ${selectedFileName ? "text-white" : "text-white/40"}`}>
-                {selectedFileName || "Drag & drop or choose file"}
+              <span className="grid h-12 w-12 place-items-center rounded-full border border-white/25 bg-black/45 text-white/85">
+                <i className="fa-solid fa-arrow-up-from-bracket text-base" aria-hidden="true" />
               </span>
+              <p className={`mt-4 max-w-[90%] truncate text-sm font-semibold ${selectedFileName ? "text-white" : "text-white/85"}`}>
+                {selectedFileName || "Drag and drop your file here"}
+              </p>
+              <p className="mt-1 text-xs text-white/58">{selectedFileName ? "Click to replace file" : "Or click to browse (PDF, DOCX, TXT)"}</p>
             </label>
-          </div>
+          </>
+        ) : null}
+      </div>
 
-          <div className="w-full">
+      <div className="relative z-20 mt-6 shrink-0 flex flex-col gap-2 md:mt-6">
+        <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>
+        <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+          <div className="w-full md:max-w-[220px]">
             <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Generation Speed</label>
             <div className="relative grid h-12 grid-cols-2 items-center rounded-2xl border border-white/25 bg-black/45 p-1">
               <span
@@ -252,28 +352,15 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
               </button>
             </div>
           </div>
+
+          <button
+            type="submit"
+            disabled={disabled}
+            className="w-full rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:w-auto"
+          >
+            {loading ? "Starting..." : "Start Learning"}
+          </button>
         </div>
-      </div>
-
-      <div className="mt-4 flex-[1.15] min-h-[220px]">
-        <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Source Text</label>
-        <textarea
-          className="h-full min-h-[220px] w-full resize-none overflow-y-auto rounded-2xl border border-white/30 bg-black/45 p-5 text-sm leading-relaxed text-white outline-none transition placeholder:text-white/40 focus:border-white/65"
-          placeholder="Paste notes, textbook text, or any material here..."
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-        />
-      </div>
-
-      <div className="mt-2 shrink-0 flex flex-col gap-2 md:mt-6 md:gap-3 md:flex-row md:items-center md:justify-between">
-        <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>
-        <button
-          type="submit"
-          disabled={disabled}
-          className="mt-0 w-full rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:mt-4 md:w-auto"
-        >
-          {loading ? "Starting..." : "Start Learning"}
-        </button>
       </div>
     </form>
   );

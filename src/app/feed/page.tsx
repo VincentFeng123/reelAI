@@ -23,6 +23,7 @@ const RIGHT_BOTTOM_MIN_PX = 180;
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
+const HISTORY_STORAGE_KEY = "studyreels-material-history";
 const MAX_SAVED_FEED_PROGRESS = 240;
 type FeedbackAction = "helpful" | "confusing" | "save";
 type GenerationMode = "slow" | "fast";
@@ -151,30 +152,33 @@ function FeedPageInner() {
   const resumeLoadingRef = useRef(false);
   const isFastTopUpRef = useRef(false);
 
-  const reelVideoKey = useCallback((reel: Reel): string => {
+  const reelClipKey = useCallback((reel: Reel): string => {
     const match = reel.video_url.match(/\/embed\/([^?&/]+)/);
-    return match?.[1] || reel.video_url;
+    const videoId = match?.[1] || reel.video_url;
+    const start = Math.floor(Number(reel.t_start) || 0);
+    const end = Math.floor(Number(reel.t_end) || 0);
+    return `${videoId}:${start}:${end}`;
   }, []);
 
   const dedupeByIdentity = useCallback(
     (rows: Reel[], existing: Reel[] = []): Reel[] => {
-      const seenVideoKeys = new Set<string>();
+      const seenClipKeys = new Set<string>();
       const seenReelIds = new Set<string>();
       const deduped: Reel[] = [];
 
       const pushIfUnique = (reel: Reel) => {
         const reelId = String(reel.reel_id || "").trim();
-        const videoKey = reelVideoKey(reel);
+        const clipKey = reelClipKey(reel);
         if (reelId && seenReelIds.has(reelId)) {
           return;
         }
-        if (seenVideoKeys.has(videoKey)) {
+        if (seenClipKeys.has(clipKey)) {
           return;
         }
         if (reelId) {
           seenReelIds.add(reelId);
         }
-        seenVideoKeys.add(videoKey);
+        seenClipKeys.add(clipKey);
         deduped.push(reel);
       };
 
@@ -186,7 +190,7 @@ function FeedPageInner() {
       }
       return deduped;
     },
-    [reelVideoKey],
+    [reelClipKey],
   );
 
   const hasMore = reels.length < total;
@@ -211,7 +215,56 @@ function FeedPageInner() {
       return;
     }
     window.localStorage.setItem(GENERATION_MODE_STORAGE_KEY, generationMode);
-  }, [generationMode]);
+    if (!materialId) {
+      return;
+    }
+    try {
+      const rawHistory = window.localStorage.getItem(HISTORY_STORAGE_KEY);
+      if (!rawHistory) {
+        return;
+      }
+      const parsed = JSON.parse(rawHistory);
+      if (!Array.isArray(parsed)) {
+        return;
+      }
+      let didChange = false;
+      const updated = parsed.map((item) => {
+        if (!item || typeof item !== "object") {
+          return item;
+        }
+        const row = item as Record<string, unknown>;
+        if (String(row.materialId || "") !== materialId) {
+          return item;
+        }
+        if (row.generationMode === generationMode) {
+          return item;
+        }
+        didChange = true;
+        return {
+          ...row,
+          generationMode,
+        };
+      });
+      if (didChange) {
+        window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(updated));
+      }
+    } catch {
+      // Ignore malformed history payloads and keep feed mode persistence functional.
+    }
+  }, [generationMode, materialId]);
+
+  useEffect(() => {
+    if (!materialId) {
+      return;
+    }
+    if (generationModeParam === generationMode) {
+      return;
+    }
+    const nextParams = new URLSearchParams(params.toString());
+    nextParams.set("material_id", materialId);
+    nextParams.set("generation_mode", generationMode);
+    router.replace(`/feed?${nextParams.toString()}`, { scroll: false });
+  }, [generationMode, generationModeParam, materialId, params, router]);
 
   const recoverMissingMaterial = useCallback(
     async (missingMaterialId: string): Promise<boolean> => {
@@ -465,6 +518,23 @@ function FeedPageInner() {
       })();
     }
   }, [appendGeneratedReels, canRequestMore, generationMode, hasMore, loadPage, page, requestMore, runFastTopUp]);
+
+  const shouldBlockDownwardAtEnd = useCallback(
+    (direction: 1 | -1): boolean => {
+      if (direction <= 0 || reels.length === 0) {
+        return false;
+      }
+      if (activeIndexRef.current < reels.length - 1) {
+        return false;
+      }
+      maybeLoadMore();
+      wheelGestureConsumedRef.current = false;
+      wheelReadyToRearmRef.current = false;
+      wheelAccumRef.current = 0;
+      return true;
+    },
+    [maybeLoadMore, reels.length],
+  );
 
   const maybeResumeProgress = useCallback(() => {
     if (!materialId || resumeAppliedRef.current) {
@@ -795,12 +865,15 @@ function FeedPageInner() {
         return;
       }
 
-      wheelGestureConsumedRef.current = true;
       const direction: 1 | -1 = wheelAccumRef.current > 0 ? 1 : -1;
       wheelAccumRef.current = 0;
+      if (shouldBlockDownwardAtEnd(direction)) {
+        return;
+      }
+      wheelGestureConsumedRef.current = true;
       jumpOneReel(direction);
     },
-    [isControlTarget, jumpOneReel, reels.length, resetFeedScrollPosition],
+    [isControlTarget, jumpOneReel, reels.length, resetFeedScrollPosition, shouldBlockDownwardAtEnd],
   );
 
   useEffect(() => {
@@ -855,6 +928,10 @@ function FeedPageInner() {
       if (Math.abs(deltaY) < 28) {
         return;
       }
+      const direction: 1 | -1 = deltaY > 0 ? 1 : -1;
+      if (shouldBlockDownwardAtEnd(direction)) {
+        return;
+      }
       if (isTransitioningRef.current) {
         return;
       }
@@ -864,14 +941,28 @@ function FeedPageInner() {
         return;
       }
       stepLockUntilRef.current = now + TOUCH_GESTURE_COOLDOWN_MS;
-      jumpOneReel(deltaY > 0 ? 1 : -1);
+      jumpOneReel(direction);
     },
-    [isControlTarget, jumpOneReel, reels.length],
+    [isControlTarget, jumpOneReel, reels.length, shouldBlockDownwardAtEnd],
   );
 
   const activeReel = reels[activeIndex] ?? null;
   const activeReelPosition = activeReel ? activeIndex + 1 : 0;
   const loadedReelCount = reels.length;
+  const atLastLoadedReel = reels.length > 0 && activeIndex >= reels.length - 1;
+  const noMoreReelsAvailable =
+    atLastLoadedReel &&
+    reels.length > 0 &&
+    !hasMore &&
+    !canRequestMore &&
+    !generatingMore &&
+    !bootstrappingFirstReels &&
+    !loading;
+  const waitingForMoreReels =
+    atLastLoadedReel &&
+    reels.length > 0 &&
+    !noMoreReelsAvailable &&
+    (hasMore || generatingMore || bootstrappingFirstReels || canRequestMore);
   const activeVideoDescription = useMemo(() => {
     if (!activeReel) {
       return "";
@@ -1062,26 +1153,81 @@ function FeedPageInner() {
       </span>
     </div>
   );
+  const renderGenerationModeToggle = (className?: string) => (
+    <div
+      role="group"
+      aria-label="Generation mode"
+      className={[
+        "relative grid h-10 w-[128px] grid-cols-2 items-center rounded-2xl border border-white/25 bg-black/60 p-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-white backdrop-blur-md",
+        className,
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      <span
+        aria-hidden="true"
+        className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%-4px)] rounded-xl bg-white transition-transform duration-300 ease-out ${
+          generationMode === "fast" ? "translate-x-full" : "translate-x-0"
+        }`}
+      />
+      <button
+        type="button"
+        onClick={() => setGenerationMode("slow")}
+        className={`relative z-10 rounded-xl px-2 py-1 transition-colors ${generationMode === "slow" ? "text-black" : "text-white/82"}`}
+        aria-pressed={generationMode === "slow"}
+      >
+        Slow
+      </button>
+      <button
+        type="button"
+        onClick={() => setGenerationMode("fast")}
+        className={`relative z-10 rounded-xl px-2 py-1 transition-colors ${generationMode === "fast" ? "text-black" : "text-white/82"}`}
+        aria-pressed={generationMode === "fast"}
+      >
+        Fast
+      </button>
+    </div>
+  );
+  const renderMobileFeedbackButton = (action: FeedbackAction, label: string, iconClass: string, active: boolean) => (
+    <button
+      type="button"
+      onClick={() => submitActiveFeedback(action)}
+      className={`grid h-10 w-10 place-items-center rounded-2xl border text-sm transition backdrop-blur-md ${
+        active ? "border-white bg-white text-black" : "border-white/28 bg-black/60 text-white/92 hover:bg-black/70"
+      }`}
+      disabled={pendingAction !== null}
+      aria-label={label}
+      title={label}
+    >
+      {pendingAction === action ? (
+        <i className="fa-solid fa-spinner fa-spin" aria-hidden="true" />
+      ) : (
+        <i className={`fa-solid ${iconClass}`} aria-hidden="true" />
+      )}
+    </button>
+  );
   const rightTopPercent = Math.round(rightTopRatio * 1000) / 10;
 
   if (!materialId) {
     return (
-      <main className="fixed inset-4 flex items-center justify-center px-6">
-        <div className="rounded-3xl border border-white/25 bg-black/60 p-6 text-center text-white backdrop-blur-sm">
-          <p className="text-sm">Missing material_id.</p>
-          <button
-            className="mt-4 rounded-2xl border border-white/25 bg-white px-4 py-2 text-xs font-semibold text-black"
-            onClick={() => router.push("/")}
-          >
-            Back to Upload
-          </button>
+      <main className="fixed inset-0 px-6 md:inset-4">
+        <div className="flex h-full items-center justify-center">
+          <div className="rounded-3xl border border-white/25 bg-black/60 p-6 text-center text-white backdrop-blur-sm">
+            <p className="text-sm">Missing material_id.</p>
+            <button
+              className="mt-4 rounded-2xl border border-white/25 bg-white px-4 py-2 text-xs font-semibold text-black"
+              onClick={() => router.push("/")}
+            >
+              Back to Upload
+            </button>
+          </div>
         </div>
       </main>
     );
   }
 
   return (
-    <main className="fixed inset-4 overflow-visible md:overflow-hidden">
+    <main className="fixed inset-0 overflow-visible md:inset-4 md:overflow-hidden">
       <button
         type="button"
         onClick={() => router.push("/")}
@@ -1090,23 +1236,8 @@ function FeedPageInner() {
       >
         <i className="fa-solid fa-arrow-left text-xs" aria-hidden="true" />
       </button>
-      <div className="absolute right-3 top-3 z-[9999] flex items-center rounded-xl border border-white/20 bg-black/60 p-1 text-[11px] font-semibold text-white backdrop-blur-md">
-        <button
-          type="button"
-          onClick={() => setGenerationMode("slow")}
-          className={`rounded-lg px-2.5 py-1 transition ${generationMode === "slow" ? "bg-white text-black" : "text-white/80 hover:bg-white/10"}`}
-          aria-pressed={generationMode === "slow"}
-        >
-          Slow
-        </button>
-        <button
-          type="button"
-          onClick={() => setGenerationMode("fast")}
-          className={`rounded-lg px-2.5 py-1 transition ${generationMode === "fast" ? "bg-white text-black" : "text-white/80 hover:bg-white/10"}`}
-          aria-pressed={generationMode === "fast"}
-        >
-          Fast
-        </button>
+      <div className="absolute right-3 top-3 z-[9999] lg:hidden">
+        {renderGenerationModeToggle("shadow-[0_8px_24px_rgba(0,0,0,0.35)]")}
       </div>
       {error ? (
         <div className="absolute left-0 right-0 top-3 z-30 mx-auto w-fit rounded-full border border-white/25 bg-black/75 px-4 py-2 text-xs text-white">
@@ -1114,21 +1245,28 @@ function FeedPageInner() {
         </div>
       ) : null}
 
-      <div ref={desktopShellRef} className="h-full min-h-0 lg:flex">
-        <section className="relative h-full min-h-0 lg:min-w-0 lg:flex-1">
+      <div ref={desktopShellRef} className="h-full min-h-[100dvh] md:min-h-0 lg:flex">
+        <section className="relative h-[100dvh] min-h-[100dvh] md:h-full md:min-h-0 lg:min-w-0 lg:flex-1">
+          {activeReel && !mobileDetailsOpen ? (
+            <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2 rounded-2xl border border-white/20 bg-black/55 p-2 shadow-[0_10px_28px_rgba(0,0,0,0.38)] backdrop-blur-md lg:hidden">
+              {renderMobileFeedbackButton("helpful", "Helpful", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
+              {renderMobileFeedbackButton("confusing", "Confusing", "fa-circle-question", Boolean(activeFeedback.confusing))}
+              {renderMobileFeedbackButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
+            </div>
+          ) : null}
           <div
             ref={feedViewportRef}
             onTouchStart={onFeedTouchStart}
             onTouchMove={onFeedTouchMove}
             onTouchEnd={onFeedTouchEnd}
-            className="reel-scroll h-full min-h-0 overflow-hidden rounded-3xl overscroll-none touch-none"
+            className="reel-scroll h-[100dvh] min-h-[100dvh] overflow-hidden rounded-none overscroll-none touch-none md:h-full md:min-h-0 lg:h-full lg:min-h-0 lg:rounded-3xl"
           >
             <div
               className="flex h-full flex-col transition-transform duration-300 ease-out"
               style={{ transform: `translate3d(0, -${activeIndex * 100}%, 0)` }}
             >
               {reels.map((reel, index) => (
-                <div key={reel.reel_id} className="h-full shrink-0 grow-0 basis-full">
+                <div key={reel.reel_id} className="h-[100dvh] shrink-0 grow-0 basis-full md:h-full lg:h-full">
                   <ReelCard
                     reel={reel}
                     isActive={index === activeIndex}
@@ -1166,6 +1304,20 @@ function FeedPageInner() {
                 </div>
               </div>
             ) : null}
+            {reels.length > 0 && waitingForMoreReels ? (
+              <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-4">
+                <div className="rounded-full border border-white/20 bg-black/72 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/80 backdrop-blur-sm">
+                  Finding more reels...
+                </div>
+              </div>
+            ) : null}
+            {reels.length > 0 && noMoreReelsAvailable ? (
+              <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-4">
+                <div className="rounded-full border border-white/20 bg-black/72 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/78 backdrop-blur-sm">
+                  No more reels found for this topic.
+                </div>
+              </div>
+            ) : null}
           </div>
 
           {mobileDetailsOpen && activeReel ? (
@@ -1200,11 +1352,6 @@ function FeedPageInner() {
                   <p className="break-words [overflow-wrap:anywhere]">{activeAiSummary}</p>
                 </div>
 
-                <div className="mt-4 mb-2.5 flex flex-wrap gap-2">
-                  {renderFeedbackIconButton("helpful", "Helpful", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
-                  {renderFeedbackIconButton("confusing", "Confusing", "fa-circle-question", Boolean(activeFeedback.confusing))}
-                  {renderFeedbackIconButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
-                </div>
               </div>
             </div>
           ) : null}
@@ -1247,10 +1394,11 @@ function FeedPageInner() {
                 </div>
 
                 <div className="mt-auto pt-4 mb-[17px]">
-                  <div className="flex flex-wrap gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     {renderFeedbackIconButton("helpful", "Helpful", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
                     {renderFeedbackIconButton("confusing", "Confusing", "fa-circle-question", Boolean(activeFeedback.confusing))}
                     {renderFeedbackIconButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
+                    {renderGenerationModeToggle()}
                   </div>
                 </div>
               </div>
@@ -1328,7 +1476,7 @@ export default function FeedPage() {
   return (
     <Suspense
       fallback={
-        <main className="fixed inset-4 flex items-center justify-center text-sm text-white">
+        <main className="fixed inset-0 flex items-center justify-center text-sm text-white md:inset-4">
           Loading feed...
         </main>
       }

@@ -409,12 +409,12 @@ export default function HomePage() {
   );
 
   return (
-    <main className="home-hero-shell fixed inset-0 overflow-x-visible overflow-y-auto md:inset-4 md:overflow-hidden">
+    <main className="home-hero-shell fixed inset-0 h-[100dvh] overflow-x-visible overflow-y-auto md:overflow-hidden">
+      <div className="absolute -top-[28%] -right-[0%] bottom-0 z-[2] w-[100%]">
+        <VolumetricLightBackground />
+      </div>
       <div className="home-hero-bg pointer-events-none absolute inset-0 z-0 overflow-hidden">
         <HeroGhostSvg />
-        <div className="absolute -top-[50%] bottom-0 left-0 -right-[100%]">
-          <VolumetricLightBackground />
-        </div>
       </div>
 
       {error ? (
@@ -467,12 +467,12 @@ export default function HomePage() {
         </div>
       ) : null}
 
-      <div className="relative z-10 h-full min-h-0 lg:grid lg:grid-cols-[280px_1px_minmax(0,1fr)]">
-        <aside className="hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-2 text-white lg:mt-7 lg:mb-2 lg:flex">
+      <div className="relative h-full min-h-0 lg:grid lg:grid-cols-[280px_1px_minmax(0,1fr)]">
+        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-2 text-white lg:mt-7 lg:mb-2 lg:flex lg:px-5">
           {sidebarPanelContent}
         </aside>
 
-        <div className="hidden h-full items-center justify-center lg:flex lg:translate-x-3">
+        <div className="relative z-20 hidden h-full items-center justify-center lg:flex lg:translate-x-3">
           <span className="h-[80%] w-px rounded-full bg-white/20" />
         </div>
 
