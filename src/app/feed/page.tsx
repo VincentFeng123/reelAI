@@ -253,18 +253,22 @@ function FeedPageInner() {
     }
   }, [generationMode, materialId]);
 
-  useEffect(() => {
-    if (!materialId) {
-      return;
-    }
-    if (generationModeParam === generationMode) {
-      return;
-    }
-    const nextParams = new URLSearchParams(params.toString());
-    nextParams.set("material_id", materialId);
-    nextParams.set("generation_mode", generationMode);
-    router.replace(`/feed?${nextParams.toString()}`, { scroll: false });
-  }, [generationMode, generationModeParam, materialId, params, router]);
+  const setGenerationModeWithUrlSync = useCallback(
+    (nextMode: GenerationMode) => {
+      if (nextMode === generationMode) {
+        return;
+      }
+      setGenerationMode(nextMode);
+      if (!materialId) {
+        return;
+      }
+      const nextParams = new URLSearchParams(params.toString());
+      nextParams.set("material_id", materialId);
+      nextParams.set("generation_mode", nextMode);
+      router.replace(`/feed?${nextParams.toString()}`, { scroll: false });
+    },
+    [generationMode, materialId, params, router],
+  );
 
   const recoverMissingMaterial = useCallback(
     async (missingMaterialId: string): Promise<boolean> => {
@@ -1172,7 +1176,7 @@ function FeedPageInner() {
       />
       <button
         type="button"
-        onClick={() => setGenerationMode("slow")}
+        onClick={() => setGenerationModeWithUrlSync("slow")}
         className={`relative z-10 rounded-xl px-2 py-1 transition-colors ${generationMode === "slow" ? "text-black" : "text-white/82"}`}
         aria-pressed={generationMode === "slow"}
       >
@@ -1180,7 +1184,7 @@ function FeedPageInner() {
       </button>
       <button
         type="button"
-        onClick={() => setGenerationMode("fast")}
+        onClick={() => setGenerationModeWithUrlSync("fast")}
         className={`relative z-10 rounded-xl px-2 py-1 transition-colors ${generationMode === "fast" ? "text-black" : "text-white/82"}`}
         aria-pressed={generationMode === "fast"}
       >

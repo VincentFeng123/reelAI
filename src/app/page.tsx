@@ -220,6 +220,17 @@ export default function HomePage() {
     setMobileSidebarOpen(false);
   }, [clearMobileSidebarCloseTimer]);
 
+  const isSidebarInteractiveTarget = useCallback((target: EventTarget | null): boolean => {
+    if (!(target instanceof Element)) {
+      return false;
+    }
+    return Boolean(
+      target.closest(
+        "button, a, input, textarea, select, label, [role='button'], [data-history-actions='true'], [contenteditable='true']",
+      ),
+    );
+  }, []);
+
   useEffect(() => {
     return () => {
       clearMobileSidebarCloseTimer();
@@ -300,9 +311,9 @@ export default function HomePage() {
   const sidebarPanelContent = (
     <>
       <div className="mt-10 flex items-center justify-end gap-2 lg:mt-0 lg:justify-between">
-        <p className="hidden text-lg font-bold leading-none text-white/90 lg:block" aria-label="StudyReels logo">
-          ▲
-        </p>
+        <span className="hidden items-center text-[#e8e6fc]/65 lg:inline-flex" aria-label="Sidebar icon">
+          <i className="fa-solid fa-tape text-[1.7rem] leading-none" aria-hidden="true" />
+        </span>
         <button
           type="button"
           onClick={clearTopicDraft}
@@ -437,6 +448,17 @@ export default function HomePage() {
       >
         <i className="fa-solid fa-bars text-base" aria-hidden="true" />
       </button>
+      <div
+        aria-hidden="true"
+        style={{
+          top: "calc(max(env(safe-area-inset-top), 0px) + 10px)",
+        }}
+        className={`pointer-events-none fixed left-1/2 z-[70] flex h-10 -translate-x-1/2 items-center transition-opacity md:hidden ${
+          mobileSidebarOpen ? "opacity-0" : "opacity-100"
+        }`}
+      >
+        <img src="/logo.png" alt="" className="h-auto w-[5rem] object-contain opacity-70" />
+      </div>
 
       {mobileSidebarOpen ? (
         <div className="fixed left-0 top-0 z-50 h-[100dvh] w-screen lg:hidden">
@@ -447,13 +469,19 @@ export default function HomePage() {
             className={`absolute inset-0 bg-black/70 ${mobileSidebarClosing ? "animate-mobile-overlay-out" : "animate-mobile-overlay-in"}`}
           />
           <aside
-            className={`absolute left-0 top-0 h-[100dvh] w-[82vw] max-w-[340px] rounded-r-3xl bg-black/42 px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.45)] backdrop-blur-xl ${
+            onClick={(event) => {
+              if (isSidebarInteractiveTarget(event.target)) {
+                return;
+              }
+              closeMobileSidebar();
+            }}
+            className={`absolute inset-4 rounded-3xl bg-black/42 px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.45)] backdrop-blur-xl ${
               mobileSidebarClosing ? "animate-mobile-sidenav-out" : "animate-mobile-sidenav-in"
             }`}
           >
-            <p className="absolute left-3 top-4 text-lg font-bold leading-none text-white/90" aria-label="StudyReels logo">
-              ▲
-            </p>
+            <span className="absolute left-3 top-5 inline-flex items-center text-[#e8e6fc]/65" aria-label="Sidebar icon">
+              <i className="fa-solid fa-tape text-[1.2rem] leading-none" aria-hidden="true" />
+            </span>
             <button
               type="button"
               onClick={closeMobileSidebar}

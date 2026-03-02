@@ -189,8 +189,12 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
       className="flex h-full w-full flex-col justify-end overflow-x-visible overflow-y-auto px-6 py-6 pb-14 md:overflow-hidden md:px-10 md:py-8 md:pb-8 lg:px-5"
     >
       <header className="relative mb-4 text-center">
-        <p className="relative z-20 text-xs font-semibold uppercase tracking-[0.2em] text-white/55">Study Feed</p>
-        <div className="mt-12 md:mt-7">
+        <img
+          src="/logo.png"
+          alt="StudyReels logo"
+          className="relative z-20 mx-auto hidden h-8 w-[10.5rem] max-w-[52vw] translate-y-4 object-cover opacity-70 md:block"
+        />
+        <div className="mt-16 md:mt-20">
           <h1 className="relative z-[1] text-[clamp(3.2rem,12vw,8.25rem)] font-black leading-[0.9] tracking-tight text-[#e8e6fc]">Study Reels</h1>
           <p className="relative z-20 mt-5 text-sm text-white/68">Pick a mode, add your material, and start your short study feed.</p>
         </div>
