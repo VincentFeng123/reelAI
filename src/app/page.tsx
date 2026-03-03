@@ -311,8 +311,11 @@ export default function HomePage() {
   const sidebarPanelContent = (
     <>
       <div className="mt-10 flex items-center justify-end gap-2 lg:mt-0 lg:justify-between">
-        <span className="hidden items-center text-[#e8e6fc]/65 lg:inline-flex" aria-label="Sidebar icon">
-          <i className="fa-solid fa-tape text-[1.7rem] leading-none" aria-hidden="true" />
+        <span
+          aria-hidden="true"
+          className="hidden h-8 w-8 -translate-x-2 items-center justify-center text-xl font-black leading-none tracking-tight text-white/58 lg:inline-flex"
+        >
+          R
         </span>
         <button
           type="button"
@@ -353,12 +356,12 @@ export default function HomePage() {
                   <button
                     type="button"
                     onClick={() => openMaterialFeed(entry.materialId)}
-                    className="h-9 w-full rounded-xl border border-white/15 bg-black/45 px-2.5 pr-10 text-left text-xs text-white/85 transition hover:bg-white/8"
+                    className="h-9 w-full rounded-xl border border-white/15 bg-black/45 px-2.5 pr-10 text-left text-xs text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
                   >
                     <div className="flex items-center gap-1.5">
-                      {entry.starred ? <i className="fa-solid fa-star text-[10px] text-white/75" aria-hidden="true" /> : null}
-                      <p className="truncate font-semibold leading-none">{entry.title}</p>
-                      <span className="shrink-0 rounded-md border border-white/20 bg-black/55 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/68">
+                      {entry.starred ? <i className="fa-solid fa-star text-[10px] text-white/75 transition-colors group-hover:text-white" aria-hidden="true" /> : null}
+                      <p className="truncate font-semibold leading-none transition-colors group-hover:text-white">{entry.title}</p>
+                      <span className="shrink-0 rounded-md border border-white/20 bg-black/55 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/68 transition-colors group-hover:border-white/35 group-hover:text-white">
                         {entry.generationMode}
                       </span>
                     </div>
@@ -479,8 +482,11 @@ export default function HomePage() {
               mobileSidebarClosing ? "animate-mobile-sidenav-out" : "animate-mobile-sidenav-in"
             }`}
           >
-            <span className="absolute left-3 top-5 inline-flex items-center text-[#e8e6fc]/65" aria-label="Sidebar icon">
-              <i className="fa-solid fa-tape text-[1.2rem] leading-none" aria-hidden="true" />
+            <span
+              aria-hidden="true"
+              className="absolute left-3 top-1 inline-flex h-10 w-10 -translate-x-2 items-center justify-center text-2xl font-black leading-none tracking-tight text-white/58"
+            >
+              R
             </span>
             <button
               type="button"

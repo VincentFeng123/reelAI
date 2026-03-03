@@ -351,6 +351,28 @@ textarea:-webkit-autofill:focus {
   }
 }
 
+@keyframes mobile-sheet-in {
+  from {
+    transform: translateY(36px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes mobile-sheet-out {
+  from {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(36px);
+    opacity: 0;
+  }
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .animate-mobile-sidenav-in {
     animation: mobile-sidenav-in 260ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
@@ -366,5 +388,13 @@ textarea:-webkit-autofill:focus {
 
   .animate-mobile-overlay-out {
     animation: mobile-overlay-out 200ms ease-in forwards;
+  }
+
+  .animate-mobile-sheet-in {
+    animation: mobile-sheet-in 300ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
+
+  .animate-mobile-sheet-out {
+    animation: mobile-sheet-out 220ms cubic-bezier(0.4, 0, 1, 1) forwards;
   }
 }

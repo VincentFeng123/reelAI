@@ -192,10 +192,10 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
         <img
           src="/logo.png"
           alt="StudyReels logo"
-          className="relative z-20 mx-auto hidden h-6 w-[7rem] max-w-[36vw] translate-y-12 object-cover opacity-70 md:block"
+          className="relative z-20 mx-auto hidden h-4 w-[4.75rem] max-w-[26vw] translate-y-16 object-cover opacity-70 md:block"
         />
         <div className="mt-16 md:mt-20">
-          <h1 className="relative z-[1] text-[clamp(3.2rem,12vw,8.25rem)] font-black leading-[0.9] tracking-tight text-[#e8e6fc]">Study Reels</h1>
+          <h1 className="relative z-[1] text-[clamp(3.2rem,12vw,8.25rem)] font-black leading-[0.9] tracking-tight text-[#e8e6fc]/72">Study Reels</h1>
           <p className="relative z-20 mt-5 text-sm text-white/68">Pick a mode, add your material, and start your short study feed.</p>
         </div>
       </header>
@@ -337,8 +337,8 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
               <button
                 type="button"
                 onClick={() => setGenerationMode("slow")}
-                className={`relative z-10 rounded-xl px-2 py-2 text-sm font-semibold uppercase tracking-[0.04em] transition-colors duration-200 ${
-                  generationMode === "slow" ? "text-black" : "text-white/80"
+                className={`relative z-10 rounded-xl px-2 py-2 text-[11px] font-semibold uppercase tracking-[0.04em] transition-colors duration-200 ${
+                  generationMode === "slow" ? "text-black" : "text-white/75 hover:text-white"
                 }`}
                 aria-pressed={generationMode === "slow"}
               >
@@ -347,8 +347,8 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
               <button
                 type="button"
                 onClick={() => setGenerationMode("fast")}
-                className={`relative z-10 rounded-xl px-2 py-2 text-sm font-semibold uppercase tracking-[0.04em] transition-colors duration-200 ${
-                  generationMode === "fast" ? "text-black" : "text-white/80"
+                className={`relative z-10 rounded-xl px-2 py-2 text-[11px] font-semibold uppercase tracking-[0.04em] transition-colors duration-200 ${
+                  generationMode === "fast" ? "text-black" : "text-white/75 hover:text-white"
                 }`}
                 aria-pressed={generationMode === "fast"}
               >

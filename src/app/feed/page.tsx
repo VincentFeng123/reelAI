@@ -20,6 +20,7 @@ const LEFT_PANEL_MIN_PX = 380;
 const RIGHT_SPLIT_BAR_PX = 14;
 const RIGHT_TOP_MIN_PX = 220;
 const RIGHT_BOTTOM_MIN_PX = 180;
+const MOBILE_DETAILS_CLOSE_MS = 240;
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
@@ -119,6 +120,7 @@ function FeedPageInner() {
   const [feedbackByReel, setFeedbackByReel] = useState<Record<string, ReelFeedbackState>>({});
   const [pendingAction, setPendingAction] = useState<FeedbackAction | null>(null);
   const [mobileDetailsOpen, setMobileDetailsOpen] = useState(false);
+  const [mobileDetailsClosing, setMobileDetailsClosing] = useState(false);
   const [mutedPreference, setMutedPreference] = useState(true);
   const [chatByReel, setChatByReel] = useState<Record<string, ChatMessage[]>>({});
   const [chatInput, setChatInput] = useState("");
@@ -151,6 +153,7 @@ function FeedPageInner() {
   const resumeAppliedRef = useRef(false);
   const resumeLoadingRef = useRef(false);
   const isFastTopUpRef = useRef(false);
+  const mobileDetailsCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const reelClipKey = useCallback((reel: Reel): string => {
     const match = reel.video_url.match(/\/embed\/([^?&/]+)/);
@@ -647,15 +650,48 @@ function FeedPageInner() {
         clearTimeout(wheelGestureReleaseTimerRef.current);
         wheelGestureReleaseTimerRef.current = null;
       }
+      if (mobileDetailsCloseTimerRef.current) {
+        clearTimeout(mobileDetailsCloseTimerRef.current);
+        mobileDetailsCloseTimerRef.current = null;
+      }
       wheelReadyToRearmRef.current = false;
     };
   }, []);
 
   useEffect(() => {
+    if (mobileDetailsCloseTimerRef.current) {
+      clearTimeout(mobileDetailsCloseTimerRef.current);
+      mobileDetailsCloseTimerRef.current = null;
+    }
+    setMobileDetailsClosing(false);
     setMobileDetailsOpen(false);
     setChatInput("");
     setChatError(null);
   }, [activeIndex]);
+
+  const openMobileDetails = useCallback(() => {
+    if (mobileDetailsCloseTimerRef.current) {
+      clearTimeout(mobileDetailsCloseTimerRef.current);
+      mobileDetailsCloseTimerRef.current = null;
+    }
+    setMobileDetailsClosing(false);
+    setMobileDetailsOpen(true);
+  }, []);
+
+  const closeMobileDetails = useCallback(() => {
+    if (!mobileDetailsOpen || mobileDetailsClosing) {
+      return;
+    }
+    setMobileDetailsClosing(true);
+    if (mobileDetailsCloseTimerRef.current) {
+      clearTimeout(mobileDetailsCloseTimerRef.current);
+    }
+    mobileDetailsCloseTimerRef.current = setTimeout(() => {
+      setMobileDetailsOpen(false);
+      setMobileDetailsClosing(false);
+      mobileDetailsCloseTimerRef.current = null;
+    }, MOBILE_DETAILS_CLOSE_MS);
+  }, [mobileDetailsClosing, mobileDetailsOpen]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -951,8 +987,6 @@ function FeedPageInner() {
   );
 
   const activeReel = reels[activeIndex] ?? null;
-  const activeReelPosition = activeReel ? activeIndex + 1 : 0;
-  const loadedReelCount = reels.length;
   const atLastLoadedReel = reels.length > 0 && activeIndex >= reels.length - 1;
   const noMoreReelsAvailable =
     atLastLoadedReel &&
@@ -1252,7 +1286,7 @@ function FeedPageInner() {
       <div ref={desktopShellRef} className="h-full min-h-[100dvh] md:min-h-0 lg:flex">
         <section className="relative h-[100dvh] min-h-[100dvh] md:h-full md:min-h-0 lg:min-w-0 lg:flex-1">
           {activeReel && !mobileDetailsOpen ? (
-            <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2 rounded-2xl border border-white/20 bg-black/55 p-2 shadow-[0_10px_28px_rgba(0,0,0,0.38)] backdrop-blur-md lg:hidden">
+            <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2 lg:hidden">
               {renderMobileFeedbackButton("helpful", "Helpful", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
               {renderMobileFeedbackButton("confusing", "Confusing", "fa-circle-question", Boolean(activeFeedback.confusing))}
               {renderMobileFeedbackButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
@@ -1263,20 +1297,20 @@ function FeedPageInner() {
             onTouchStart={onFeedTouchStart}
             onTouchMove={onFeedTouchMove}
             onTouchEnd={onFeedTouchEnd}
-            className="reel-scroll h-[100dvh] min-h-[100dvh] overflow-hidden rounded-none overscroll-none touch-none md:h-full md:min-h-0 lg:h-full lg:min-h-0 lg:rounded-3xl"
+            className="reel-scroll m-4 h-[calc(100dvh-2rem)] min-h-[calc(100dvh-2rem)] overflow-hidden rounded-3xl overscroll-none touch-none md:m-0 md:h-full md:min-h-0 lg:h-full lg:min-h-0"
           >
             <div
               className="flex h-full flex-col transition-transform duration-300 ease-out"
               style={{ transform: `translate3d(0, -${activeIndex * 100}%, 0)` }}
             >
               {reels.map((reel, index) => (
-                <div key={reel.reel_id} className="h-[100dvh] shrink-0 grow-0 basis-full md:h-full lg:h-full">
+                <div key={reel.reel_id} className="h-[calc(100dvh-2rem)] shrink-0 grow-0 basis-full md:h-full lg:h-full">
                   <ReelCard
                     reel={reel}
                     isActive={index === activeIndex}
                     mutedPreference={mutedPreference}
                     onMutedPreferenceChange={setMutedPreference}
-                    onOpenContent={index === activeIndex ? () => setMobileDetailsOpen(true) : undefined}
+                    onOpenContent={index === activeIndex ? openMobileDetails : undefined}
                   />
                 </div>
               ))}
@@ -1329,22 +1363,22 @@ function FeedPageInner() {
               <button
                 aria-label="Close content panel"
                 className="absolute inset-0 bg-black/55"
-                onClick={() => setMobileDetailsOpen(false)}
+                onClick={closeMobileDetails}
               />
-              <div className="absolute inset-x-0 bottom-0 max-h-[74svh] overflow-y-auto rounded-t-3xl border border-white/20 bg-black/92 px-4 pt-4 pb-0 text-white backdrop-blur">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="inline-flex w-fit rounded-full border border-white/25 bg-black/70 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.12em] text-white">
-                    Reel {activeReelPosition}/{loadedReelCount} loaded
-                  </div>
-                  <button
-                    onClick={() => setMobileDetailsOpen(false)}
-                    className="rounded-xl border border-white/25 bg-black/60 px-3 py-1.5 text-xs font-semibold text-white"
-                  >
-                    Close
-                  </button>
-                </div>
-
-                <h2 className="mt-3 text-xl font-bold leading-tight">{activeReel.concept_title}</h2>
+              <div
+                className={`absolute inset-x-4 bottom-8 max-h-[80svh] touch-pan-y overflow-y-auto overscroll-y-contain rounded-3xl border border-white/20 bg-black/92 px-4 pt-4 pb-4 text-white backdrop-blur [-webkit-overflow-scrolling:touch] ${
+                  mobileDetailsClosing ? "animate-mobile-sheet-out" : "animate-mobile-sheet-in"
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={closeMobileDetails}
+                  aria-label="Close content panel"
+                  className="absolute right-3 top-3 grid h-8 w-8 place-items-center text-base text-white/85 transition hover:text-white"
+                >
+                  <i className="fa-solid fa-xmark" aria-hidden="true" />
+                </button>
+                <h2 className="pr-8 text-xl font-bold leading-tight">{activeReel.concept_title}</h2>
 
                 <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Video Description</p>
