@@ -22,10 +22,15 @@ const RIGHT_TOP_MIN_PX = 220;
 const RIGHT_BOTTOM_MIN_PX = 180;
 const MOBILE_DETAILS_CLOSE_MS = 240;
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
+const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
+const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
 const HISTORY_STORAGE_KEY = "studyreels-material-history";
+const MUTED_STORAGE_KEY = "studyreels-muted";
 const MAX_SAVED_FEED_PROGRESS = 240;
+const MAX_SAVED_FEED_SESSIONS = 24;
+const MAX_REELS_PER_FEED_SESSION = 80;
 type FeedbackAction = "helpful" | "confusing" | "save";
 type GenerationMode = "slow" | "fast";
 
@@ -43,9 +48,28 @@ type MaterialSeed = {
   updatedAt?: number;
 };
 
+type MaterialGroup = {
+  materialIds?: string[];
+  title?: string;
+  updatedAt?: number;
+};
+
 type FeedProgressEntry = {
   index: number;
   reelId?: string;
+  updatedAt: number;
+};
+
+type FeedSessionSnapshot = {
+  reels: Reel[];
+  page: number;
+  total: number;
+  canRequestMore: boolean;
+  generationMode: GenerationMode;
+  mutedPreference: boolean;
+  captionsPreference: boolean;
+  activeIndex: number;
+  activeReelId?: string;
   updatedAt: number;
 };
 
@@ -59,6 +83,44 @@ function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
       return {};
     }
     return parsed as Record<string, MaterialSeed>;
+  } catch {
+    return {};
+  }
+}
+
+function parseMaterialGroups(raw: string | null): Record<string, MaterialGroup> {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const result: Record<string, MaterialGroup> = {};
+    for (const [materialId, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!materialId || typeof materialId !== "string") {
+        continue;
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      const row = value as Record<string, unknown>;
+      const materialIds = Array.isArray(row.materialIds)
+        ? row.materialIds
+            .map((id) => String(id || "").trim())
+            .filter(Boolean)
+        : [];
+      if (materialIds.length === 0) {
+        continue;
+      }
+      result[materialId] = {
+        materialIds: Array.from(new Set(materialIds)),
+        title: typeof row.title === "string" && row.title.trim() ? row.title.trim() : undefined,
+        updatedAt: Number(row.updatedAt) || 0,
+      };
+    }
+    return result;
   } catch {
     return {};
   }
@@ -89,6 +151,58 @@ function parseFeedProgress(raw: string | null): Record<string, FeedProgressEntry
       result[materialId] = {
         index: Math.floor(index),
         reelId: typeof row.reelId === "string" && row.reelId.trim() ? row.reelId.trim() : undefined,
+        updatedAt: Number(row.updatedAt) || 0,
+      };
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
+function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapshot> {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const result: Record<string, FeedSessionSnapshot> = {};
+    for (const [materialId, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!materialId || typeof materialId !== "string") {
+        continue;
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      const row = value as Record<string, unknown>;
+      const reels = Array.isArray(row.reels)
+        ? row.reels
+            .filter((item) => {
+              if (!item || typeof item !== "object" || Array.isArray(item)) {
+                return false;
+              }
+              const reel = item as Record<string, unknown>;
+              return typeof reel.reel_id === "string" && reel.reel_id.trim() && typeof reel.video_url === "string";
+            })
+            .map((item) => item as Reel)
+            .slice(-MAX_REELS_PER_FEED_SESSION)
+        : [];
+      const page = Math.max(1, Math.floor(Number(row.page) || 1));
+      const total = Math.max(reels.length, Math.floor(Number(row.total) || reels.length));
+      const activeIndex = Math.max(0, Math.floor(Number(row.activeIndex) || 0));
+      result[materialId] = {
+        reels,
+        page,
+        total,
+        canRequestMore: row.canRequestMore !== false,
+        generationMode: row.generationMode === "fast" ? "fast" : "slow",
+        mutedPreference: row.mutedPreference !== false,
+        captionsPreference: Boolean(row.captionsPreference),
+        activeIndex,
+        activeReelId: typeof row.activeReelId === "string" && row.activeReelId.trim() ? row.activeReelId.trim() : undefined,
         updatedAt: Number(row.updatedAt) || 0,
       };
     }
@@ -129,6 +243,8 @@ function FeedPageInner() {
   const [rightPanelWidthPx, setRightPanelWidthPx] = useState(360);
   const [rightTopRatio, setRightTopRatio] = useState(0.62);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
+  const [captionsPreference, setCaptionsPreference] = useState(false);
+  const [sessionHydrated, setSessionHydrated] = useState(false);
 
   const feedViewportRef = useRef<HTMLDivElement | null>(null);
   const isFetchingRef = useRef(false);
@@ -154,6 +270,9 @@ function FeedPageInner() {
   const resumeLoadingRef = useRef(false);
   const isFastTopUpRef = useRef(false);
   const mobileDetailsCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mutedRestoredFromSnapshotRef = useRef(false);
+  const hydratedMaterialIdRef = useRef<string | null>(null);
+  const materialIdsForFeedRef = useRef<string[]>([]);
 
   const reelClipKey = useCallback((reel: Reel): string => {
     const match = reel.video_url.match(/\/embed\/([^?&/]+)/);
@@ -195,6 +314,37 @@ function FeedPageInner() {
     },
     [reelClipKey],
   );
+
+  const interleaveReelBatches = useCallback((batches: Reel[][]): Reel[] => {
+    if (batches.length <= 1) {
+      return batches[0] ? [...batches[0]] : [];
+    }
+    const queues = batches.map((batch) => [...batch]);
+    const merged: Reel[] = [];
+    let added = true;
+    while (added) {
+      added = false;
+      for (const queue of queues) {
+        const next = queue.shift();
+        if (!next) {
+          continue;
+        }
+        merged.push(next);
+        added = true;
+      }
+    }
+    return merged;
+  }, []);
+
+  const getFeedMaterialIds = useCallback((): string[] => {
+    const ids = materialIdsForFeedRef.current
+      .map((id) => id.trim())
+      .filter(Boolean);
+    if (ids.length > 0) {
+      return ids;
+    }
+    return materialId ? [materialId] : [];
+  }, [materialId]);
 
   const hasMore = reels.length < total;
   const isFastGeneration = generationMode === "fast";
@@ -317,69 +467,110 @@ function FeedPageInner() {
 
   const loadPage = useCallback(
     async (targetPage: number, options?: { autofill?: boolean }) => {
-      if (!materialId || isFetchingRef.current) {
+      const feedMaterialIds = getFeedMaterialIds();
+      if (feedMaterialIds.length === 0 || isFetchingRef.current) {
         return;
       }
       isFetchingRef.current = true;
       setError(null);
 
       try {
-        const data = await fetchFeed({
-          materialId,
-          page: targetPage,
-          limit: PAGE_SIZE,
-          autofill: options?.autofill ?? false,
-          prefetch: 7,
-          generationMode,
-        });
+        const rows = await Promise.all(
+          feedMaterialIds.map(async (id) => {
+            try {
+              const data = await fetchFeed({
+                materialId: id,
+                page: targetPage,
+                limit: PAGE_SIZE,
+                autofill: options?.autofill ?? false,
+                prefetch: 7,
+                generationMode,
+              });
+              return { materialId: id, data, error: null };
+            } catch (error) {
+              return { materialId: id, data: null, error };
+            }
+          }),
+        );
 
-        setTotal(data.total);
+        const successful = rows.filter((row) => row.data);
+        if (successful.length === 0) {
+          if (targetPage === 1) {
+            const firstError = rows[0]?.error;
+            const message = firstError instanceof Error ? firstError.message : "Feed failed to load";
+            if (
+              feedMaterialIds.length === 1 &&
+              /material_id not found/i.test(message) &&
+              !recoveryAttemptedIdsRef.current.has(materialId)
+            ) {
+              recoveryAttemptedIdsRef.current.add(materialId);
+              const recovered = await recoverMissingMaterial(materialId);
+              if (recovered) {
+                return;
+              }
+            }
+            setError(message);
+          }
+          return;
+        }
+
+        const fetchedReels = dedupeByIdentity(interleaveReelBatches(successful.map((row) => row.data!.reels)));
+        const fetchedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data!.total) || 0), 0);
+
         setPage(targetPage);
+        setTotal(Math.max(fetchedTotal, fetchedReels.length));
 
         if (targetPage === 1) {
-          const deduped = dedupeByIdentity(data.reels);
-          setReels(deduped);
-          setTotal(Math.max(data.total, deduped.length));
+          setReels(fetchedReels);
         } else {
-          setReels((prev) => dedupeByIdentity(data.reels, prev));
+          setReels((prev) => dedupeByIdentity(fetchedReels, prev));
+        }
+
+        if (successful.length < rows.length) {
+          const failedIds = rows.filter((row) => !row.data).map((row) => row.materialId);
+          console.warn("Some topic feeds failed to load:", failedIds);
         }
       } catch (e) {
         if (targetPage === 1) {
-          const message = e instanceof Error ? e.message : "Feed failed to load";
-          if (/material_id not found/i.test(message) && !recoveryAttemptedIdsRef.current.has(materialId)) {
-            recoveryAttemptedIdsRef.current.add(materialId);
-            const recovered = await recoverMissingMaterial(materialId);
-            if (recovered) {
-              return;
-            }
-          }
-          setError(message);
+          setError(e instanceof Error ? e.message : "Feed failed to load");
         }
       } finally {
         setLoading(false);
         isFetchingRef.current = false;
       }
     },
-    [dedupeByIdentity, generationMode, materialId, recoverMissingMaterial],
+    [dedupeByIdentity, generationMode, getFeedMaterialIds, interleaveReelBatches, materialId, recoverMissingMaterial],
   );
 
   const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
-    if (!materialId || isGeneratingRef.current || !canRequestMore) {
+    const feedMaterialIds = getFeedMaterialIds();
+    if (feedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
       return [];
     }
     const batchSize = isFastGeneration ? 2 : 7;
+    const perTopicBatch = Math.max(1, Math.ceil(batchSize / feedMaterialIds.length));
     isGeneratingRef.current = true;
     setGeneratingMore(true);
     if (options?.surfaceError) {
       setError(null);
     }
     try {
-      const generated = await generateReels({
-        materialId,
-        numReels: batchSize,
-        generationMode,
-      });
-      if (generated.reels.length === 0) {
+      const generatedRows = await Promise.all(
+        feedMaterialIds.map(async (id) => {
+          try {
+            return await generateReels({
+              materialId: id,
+              numReels: perTopicBatch,
+              generationMode,
+            });
+          } catch (e) {
+            console.warn(`Background reel generation failed for topic material ${id}:`, e);
+            return null;
+          }
+        }),
+      );
+      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row?.reels ?? [])));
+      if (generated.length === 0) {
         emptyGenerateStreakRef.current += 1;
         if (emptyGenerateStreakRef.current >= 4) {
           setCanRequestMore(false);
@@ -390,7 +581,7 @@ function FeedPageInner() {
         return [];
       }
       emptyGenerateStreakRef.current = 0;
-      return generated.reels;
+      return generated;
     } catch (e) {
       console.warn("Background reel generation failed:", e);
       emptyGenerateStreakRef.current += 1;
@@ -405,26 +596,49 @@ function FeedPageInner() {
       setGeneratingMore(false);
       isGeneratingRef.current = false;
     }
-  }, [canRequestMore, generationMode, isFastGeneration, materialId]);
+  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, interleaveReelBatches, isFastGeneration]);
 
   useEffect(() => {
+    mutedRestoredFromSnapshotRef.current = false;
     if (!materialId) {
+      materialIdsForFeedRef.current = [];
+      hydratedMaterialIdRef.current = null;
+      setSessionHydrated(false);
       pendingResumeRef.current = null;
       resumeAppliedRef.current = false;
       resumeLoadingRef.current = false;
       setLoading(false);
       return;
     }
+    if (hydratedMaterialIdRef.current === materialId) {
+      return;
+    }
+    hydratedMaterialIdRef.current = materialId;
+    setSessionHydrated(false);
+    let resumeTarget: FeedProgressEntry | null = null;
+    let restoredSession: FeedSessionSnapshot | null = null;
+    let feedMaterialIds = [materialId];
     if (typeof window !== "undefined") {
       const allProgress = parseFeedProgress(window.localStorage.getItem(FEED_PROGRESS_STORAGE_KEY));
-      pendingResumeRef.current = allProgress[materialId] ?? null;
-    } else {
-      pendingResumeRef.current = null;
+      resumeTarget = allProgress[materialId] ?? null;
+      const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));
+      restoredSession = allSessions[materialId] ?? null;
+      const allGroups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
+      const groupedIds = allGroups[materialId]?.materialIds ?? [];
+      if (groupedIds.length > 0) {
+        const normalized = groupedIds.map((id) => id.trim()).filter(Boolean);
+        feedMaterialIds = normalized.includes(materialId) ? normalized : [materialId, ...normalized];
+      }
     }
+    materialIdsForFeedRef.current = Array.from(new Set(feedMaterialIds));
+    pendingResumeRef.current = resumeTarget;
     resumeAppliedRef.current = false;
     resumeLoadingRef.current = false;
     recoveryAttemptedIdsRef.current.clear();
-    setLoading(true);
+    setLoading(!restoredSession || restoredSession.reels.length === 0);
+    setReels([]);
+    setPage(1);
+    setTotal(0);
     setCanRequestMore(true);
     setActiveIndex(0);
     setFeedbackByReel({});
@@ -432,8 +646,43 @@ function FeedPageInner() {
     setBootstrappingFirstReels(false);
     emptyGenerateStreakRef.current = 0;
     bootstrapAttemptedRef.current = false;
-    loadPage(1, { autofill: false });
-  }, [materialId]);
+    if (restoredSession) {
+      const restoredReels = dedupeByIdentity(restoredSession.reels).slice(-MAX_REELS_PER_FEED_SESSION);
+      const restoredIndex = restoredReels.length > 0 ? clamp(restoredSession.activeIndex, 0, restoredReels.length - 1) : 0;
+      const restoredReelId = restoredReels[restoredIndex]?.reel_id;
+      setReels(restoredReels);
+      setPage(restoredSession.page);
+      setTotal(Math.max(restoredSession.total, restoredReels.length));
+      setCanRequestMore(restoredSession.canRequestMore);
+      const modeFromQuery =
+        generationModeParam === "fast" || generationModeParam === "slow" ? generationModeParam : null;
+      setGenerationMode(modeFromQuery ?? restoredSession.generationMode);
+      setMutedPreference(restoredSession.mutedPreference);
+      setCaptionsPreference(restoredSession.captionsPreference);
+      mutedRestoredFromSnapshotRef.current = true;
+      if (restoredReels.length > 0) {
+        const snapshotResume: FeedProgressEntry = {
+          index: restoredIndex,
+          reelId: restoredSession.activeReelId ?? restoredReelId,
+          updatedAt: restoredSession.updatedAt || Date.now(),
+        };
+        if (!resumeTarget || snapshotResume.updatedAt >= (resumeTarget.updatedAt || 0)) {
+          pendingResumeRef.current = snapshotResume;
+        }
+      }
+      setSessionHydrated(true);
+    }
+    if (!restoredSession || restoredSession.reels.length === 0) {
+      void loadPage(1, { autofill: false });
+    }
+  }, [dedupeByIdentity, generationModeParam, materialId, loadPage]);
+
+  useEffect(() => {
+    if (!materialId || sessionHydrated || loading) {
+      return;
+    }
+    setSessionHydrated(true);
+  }, [loading, materialId, sessionHydrated]);
 
   const appendGeneratedReels = useCallback(
     (generated: Reel[]) => {
@@ -453,32 +702,38 @@ function FeedPageInner() {
   );
 
   const runFastTopUp = useCallback(async () => {
-    if (
-      !materialId ||
-      generationMode !== "fast" ||
-      !canRequestMore ||
-      isFastTopUpRef.current ||
-      isGeneratingRef.current
-    ) {
+    const feedMaterialIds = getFeedMaterialIds();
+    if (feedMaterialIds.length === 0 || generationMode !== "fast" || !canRequestMore || isFastTopUpRef.current || isGeneratingRef.current) {
       return;
     }
+    const perTopicBatch = Math.max(1, Math.ceil(5 / feedMaterialIds.length));
     isFastTopUpRef.current = true;
     try {
-      const generated = await generateReels({
-        materialId,
-        numReels: 5,
-        generationMode,
-      });
-      if (generated.reels.length > 0) {
+      const generatedRows = await Promise.all(
+        feedMaterialIds.map(async (id) => {
+          try {
+            return await generateReels({
+              materialId: id,
+              numReels: perTopicBatch,
+              generationMode,
+            });
+          } catch (e) {
+            console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
+            return null;
+          }
+        }),
+      );
+      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row?.reels ?? [])));
+      if (generated.length > 0) {
         emptyGenerateStreakRef.current = 0;
-        appendGeneratedReels(generated.reels);
+        appendGeneratedReels(generated);
       }
     } catch (e) {
       console.warn("Fast mode background top-up failed:", e);
     } finally {
       isFastTopUpRef.current = false;
     }
-  }, [appendGeneratedReels, canRequestMore, generationMode, materialId]);
+  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, interleaveReelBatches]);
 
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {
@@ -697,7 +952,10 @@ function FeedPageInner() {
     if (typeof window === "undefined") {
       return;
     }
-    const saved = window.localStorage.getItem("studyreels-muted");
+    if (mutedRestoredFromSnapshotRef.current) {
+      return;
+    }
+    const saved = window.localStorage.getItem(MUTED_STORAGE_KEY);
     if (saved === "0") {
       setMutedPreference(false);
     } else if (saved === "1") {
@@ -709,8 +967,46 @@ function FeedPageInner() {
     if (typeof window === "undefined") {
       return;
     }
-    window.localStorage.setItem("studyreels-muted", mutedPreference ? "1" : "0");
+    window.localStorage.setItem(MUTED_STORAGE_KEY, mutedPreference ? "1" : "0");
   }, [mutedPreference]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !materialId || !sessionHydrated) {
+      return;
+    }
+    const dedupedReels = dedupeByIdentity(reels).slice(-MAX_REELS_PER_FEED_SESSION);
+    const index = dedupedReels.length > 0 ? clamp(activeIndex, 0, dedupedReels.length - 1) : 0;
+    const activeReelId = dedupedReels[index]?.reel_id;
+    const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));
+    allSessions[materialId] = {
+      reels: dedupedReels,
+      page: Math.max(1, Math.floor(page || 1)),
+      total: Math.max(total, dedupedReels.length),
+      canRequestMore,
+      generationMode,
+      mutedPreference,
+      captionsPreference,
+      activeIndex: index,
+      activeReelId,
+      updatedAt: Date.now(),
+    };
+    const ordered = Object.entries(allSessions)
+      .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+      .slice(0, MAX_SAVED_FEED_SESSIONS);
+    window.localStorage.setItem(FEED_SESSION_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
+  }, [
+    activeIndex,
+    canRequestMore,
+    captionsPreference,
+    dedupeByIdentity,
+    generationMode,
+    materialId,
+    mutedPreference,
+    page,
+    reels,
+    sessionHydrated,
+    total,
+  ]);
 
   const stopDragging = useCallback(() => {
     dragModeRef.current = null;
@@ -1039,6 +1335,21 @@ function FeedPageInner() {
     return "No AI summary available for this reel.";
   }, [activeReel]);
 
+  const activeRelevanceReason = useMemo(() => {
+    if (!activeReel) {
+      return "";
+    }
+    const reason = activeReel.relevance_reason?.trim();
+    if (reason) {
+      return reason;
+    }
+    const terms = (activeReel.matched_terms ?? []).map((term) => term.trim()).filter(Boolean).slice(0, 5);
+    if (terms.length > 0) {
+      return `Matched terms from your material: ${terms.join(", ")}.`;
+    }
+    return "This reel was selected using semantic and keyword overlap with your uploaded material.";
+  }, [activeReel]);
+
   const activeFeedback = useMemo(() => {
     if (!activeReel) {
       return {};
@@ -1087,6 +1398,8 @@ function FeedPageInner() {
       const contextText = [
         activeReel.video_description,
         activeReel.ai_summary,
+        activeReel.relevance_reason,
+        ...(activeReel.matched_terms ?? []),
         activeReel.transcript_snippet,
         ...activeReel.takeaways,
       ]
@@ -1310,6 +1623,8 @@ function FeedPageInner() {
                     isActive={index === activeIndex}
                     mutedPreference={mutedPreference}
                     onMutedPreferenceChange={setMutedPreference}
+                    captionsEnabled={captionsPreference}
+                    onCaptionsEnabledChange={setCaptionsPreference}
                     onOpenContent={index === activeIndex ? openMobileDetails : undefined}
                   />
                 </div>
@@ -1390,6 +1705,30 @@ function FeedPageInner() {
                   <p className="break-words [overflow-wrap:anywhere]">{activeAiSummary}</p>
                 </div>
 
+                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Why This Matches</p>
+                    {typeof activeReel.relevance_score === "number" ? (
+                      <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/65">
+                        Score {activeReel.relevance_score.toFixed(2)}
+                      </span>
+                    ) : null}
+                  </div>
+                  <p className="break-words [overflow-wrap:anywhere]">{activeRelevanceReason}</p>
+                  {(activeReel.matched_terms?.length ?? 0) > 0 ? (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {(activeReel.matched_terms ?? []).slice(0, 6).map((term) => (
+                        <span
+                          key={`mobile-match-${activeReel.reel_id}-${term}`}
+                          className="rounded-full border border-white/20 bg-black/60 px-2 py-0.5 text-[10px] text-white/78"
+                        >
+                          {term}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+
               </div>
             </div>
           ) : null}
@@ -1429,6 +1768,30 @@ function FeedPageInner() {
                 <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">AI Summary</p>
                   <p className="break-words [overflow-wrap:anywhere]">{activeAiSummary}</p>
+                </div>
+
+                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Why This Matches</p>
+                    {typeof activeReel.relevance_score === "number" ? (
+                      <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/65">
+                        Score {activeReel.relevance_score.toFixed(2)}
+                      </span>
+                    ) : null}
+                  </div>
+                  <p className="break-words [overflow-wrap:anywhere]">{activeRelevanceReason}</p>
+                  {(activeReel.matched_terms?.length ?? 0) > 0 ? (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {(activeReel.matched_terms ?? []).slice(0, 6).map((term) => (
+                        <span
+                          key={`desktop-match-${activeReel.reel_id}-${term}`}
+                          className="rounded-full border border-white/20 bg-black/60 px-2 py-0.5 text-[10px] text-white/78"
+                        >
+                          {term}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="mt-auto pt-4 mb-[17px]">

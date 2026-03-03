@@ -24,6 +24,9 @@ export type Reel = {
   takeaways: string[];
   captions?: CaptionCue[];
   score: number;
+  relevance_score?: number;
+  matched_terms?: string[];
+  relevance_reason?: string;
   concept_position?: number;
   total_concepts?: number;
 };

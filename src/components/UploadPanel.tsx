@@ -6,8 +6,10 @@ import { useRouter } from "next/navigation";
 import { uploadMaterial } from "@/lib/api";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
+const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
 const MAX_MATERIAL_SEEDS = 120;
+const MAX_MATERIAL_GROUPS = 80;
 const MAX_SEED_TEXT_CHARS = 16000;
 type GenerationMode = "slow" | "fast";
 type InputMode = "topic" | "source" | "file";
@@ -22,6 +24,12 @@ type MaterialSeed = {
   topic?: string;
   text?: string;
   title: string;
+  updatedAt: number;
+};
+
+type MaterialGroup = {
+  materialIds: string[];
+  title?: string;
   updatedAt: number;
 };
 
@@ -52,6 +60,48 @@ function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
         text: String(seed.text || "").trim() || undefined,
         title,
         updatedAt: Number(seed.updatedAt) || 0,
+      };
+    }
+    return normalized;
+  } catch {
+    return {};
+  }
+}
+
+function parseMaterialGroups(raw: string | null): Record<string, MaterialGroup> {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const normalized: Record<string, MaterialGroup> = {};
+    for (const [id, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!id || typeof id !== "string") {
+        continue;
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      const group = value as Record<string, unknown>;
+      const materialIds = Array.isArray(group.materialIds)
+        ? Array.from(
+            new Set(
+              group.materialIds
+                .map((row) => String(row || "").trim())
+                .filter(Boolean),
+            ),
+          )
+        : [];
+      if (materialIds.length === 0) {
+        continue;
+      }
+      normalized[id] = {
+        materialIds,
+        title: typeof group.title === "string" && group.title.trim() ? group.title.trim() : undefined,
+        updatedAt: Number(group.updatedAt) || 0,
       };
     }
     return normalized;
@@ -132,7 +182,8 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
     setLoading(true);
 
     try {
-      const topicValue = inputMode === "topic" ? topics.map((t) => t.trim()).filter(Boolean).join(", ") : "";
+      const topicList = inputMode === "topic" ? topics.map((t) => t.trim()).filter(Boolean) : [];
+      const topicValue = topicList.join(", ");
       const textValue = inputMode === "source" ? text.trim() : "";
       const fileValue = inputMode === "file" ? file : undefined;
       const title = buildMaterialTitle({
@@ -140,33 +191,83 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
         text: textValue,
         fileName: fileValue?.name ?? "",
       });
-      const material = await uploadMaterial({
-        text: textValue || undefined,
-        file: fileValue,
-        subjectTag: topicValue || undefined,
-      });
+      let materialIds: string[] = [];
+      if (inputMode === "topic" && topicList.length > 1) {
+        const uploads = await Promise.all(
+          topicList.map(async (topic) =>
+            uploadMaterial({
+              subjectTag: topic,
+            }),
+          ),
+        );
+        materialIds = uploads.map((row) => row.material_id).filter(Boolean);
+      } else {
+        const material = await uploadMaterial({
+          text: textValue || undefined,
+          file: fileValue,
+          subjectTag: topicValue || undefined,
+        });
+        materialIds = [material.material_id];
+      }
+
+      const primaryMaterialId = materialIds[0];
+      if (!primaryMaterialId) {
+        throw new Error("Material creation failed.");
+      }
+
       if (typeof window !== "undefined") {
         const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
-        seeds[material.material_id] = {
-          topic: topicValue || undefined,
-          text: textValue ? textValue.slice(0, MAX_SEED_TEXT_CHARS) : undefined,
-          title,
-          updatedAt: Date.now(),
-        };
+        const now = Date.now();
+        if (inputMode === "topic" && topicList.length > 1) {
+          materialIds.forEach((id, index) => {
+            const topic = topicList[index]?.trim();
+            if (!id || !topic) {
+              return;
+            }
+            seeds[id] = {
+              topic,
+              text: undefined,
+              title: topic,
+              updatedAt: now - index,
+            };
+          });
+        } else {
+          seeds[primaryMaterialId] = {
+            topic: topicValue || undefined,
+            text: textValue ? textValue.slice(0, MAX_SEED_TEXT_CHARS) : undefined,
+            title,
+            updatedAt: now,
+          };
+        }
         const ordered = Object.entries(seeds)
           .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
           .slice(0, MAX_MATERIAL_SEEDS);
         window.localStorage.setItem(MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
+
+        const groups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
+        if (inputMode === "topic" && topicList.length > 1) {
+          groups[primaryMaterialId] = {
+            materialIds,
+            title,
+            updatedAt: now,
+          };
+        } else {
+          delete groups[primaryMaterialId];
+        }
+        const orderedGroups = Object.entries(groups)
+          .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+          .slice(0, MAX_MATERIAL_GROUPS);
+        window.localStorage.setItem(MATERIAL_GROUPS_STORAGE_KEY, JSON.stringify(Object.fromEntries(orderedGroups)));
       }
       if (onMaterialCreated) {
         await onMaterialCreated({
-          materialId: material.material_id,
+          materialId: primaryMaterialId,
           title,
           topic: topicValue || undefined,
           generationMode,
         });
       }
-      router.push(`/feed?material_id=${material.material_id}&generation_mode=${generationMode}`);
+      router.push(`/feed?material_id=${primaryMaterialId}&generation_mode=${generationMode}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something failed");
     } finally {
@@ -195,7 +296,7 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
           className="relative z-20 mx-auto hidden h-4 w-[4.75rem] max-w-[26vw] translate-y-16 object-cover opacity-70 md:block"
         />
         <div className="mt-16 md:mt-20">
-          <h1 className="relative z-[1] text-[clamp(3.2rem,12vw,8.25rem)] font-black leading-[0.9] tracking-tight text-[#e8e6fc]/72">Study Reels</h1>
+          <h1 className="relative z-[1] text-[clamp(3.2rem,12vw,8.25rem)] font-black leading-[0.9] tracking-tight text-[#e8e6fc]/30">Study Reels</h1>
           <p className="relative z-20 mt-5 text-sm text-white/68">Pick a mode, add your material, and start your short study feed.</p>
         </div>
       </header>

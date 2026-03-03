@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
+import { CommunityReelsPanel } from "@/components/CommunityReelsPanel";
 import { HeroGhostSvg } from "@/components/HeroGhostSvg";
 import { UploadPanel } from "@/components/UploadPanel";
 import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
@@ -10,10 +11,13 @@ import { VolumetricLightBackground } from "@/components/VolumetricLightBackgroun
 const HISTORY_STORAGE_KEY = "studyreels-material-history";
 const LEGACY_TOPIC_HISTORY_STORAGE_KEY = "studyreels-reel-topic-history";
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
+const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
+const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const MAX_HISTORY_ITEMS = 120;
 const MOBILE_SIDEBAR_CLOSE_MS = 260;
 type GenerationMode = "slow" | "fast";
+type SidebarTab = "search" | "community" | "create";
 
 type HistoryItem = {
   materialId: string;
@@ -109,7 +113,9 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileSidebarClosing, setMobileSidebarClosing] = useState(false);
+  const [topChromeOffset, setTopChromeOffset] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
+  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("community");
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const historyRef = useRef<HistoryItem[]>([]);
   const mobileSidebarCloseTimerRef = useRef<number | null>(null);
@@ -168,12 +174,6 @@ export default function HomePage() {
     [persistHistory],
   );
 
-  const clearTopicDraft = useCallback(() => {
-    setHistoryQuery("");
-    setError(null);
-    setActiveHistoryMenuId(null);
-  }, []);
-
   const clearAllHistory = useCallback(() => {
     historyRef.current = [];
     setHistory([]);
@@ -184,7 +184,9 @@ export default function HomePage() {
       window.localStorage.removeItem(HISTORY_STORAGE_KEY);
       window.localStorage.removeItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY);
       window.localStorage.removeItem(MATERIAL_SEEDS_STORAGE_KEY);
+      window.localStorage.removeItem(MATERIAL_GROUPS_STORAGE_KEY);
       window.localStorage.removeItem(FEED_PROGRESS_STORAGE_KEY);
+      window.localStorage.removeItem(FEED_SESSION_STORAGE_KEY);
     }
   }, []);
 
@@ -220,6 +222,14 @@ export default function HomePage() {
     setMobileSidebarOpen(false);
   }, [clearMobileSidebarCloseTimer]);
 
+  const startNewSearch = useCallback(() => {
+    setActiveSidebarTab("search");
+    setHistoryQuery("");
+    setError(null);
+    setActiveHistoryMenuId(null);
+    forceCloseMobileSidebar();
+  }, [forceCloseMobileSidebar]);
+
   const isSidebarInteractiveTarget = useCallback((target: EventTarget | null): boolean => {
     if (!(target instanceof Element)) {
       return false;
@@ -236,6 +246,11 @@ export default function HomePage() {
       clearMobileSidebarCloseTimer();
     };
   }, [clearMobileSidebarCloseTimer]);
+
+  const onMainScroll = useCallback((event: UIEvent<HTMLElement>) => {
+    const isOffset = event.currentTarget.scrollTop > 2;
+    setTopChromeOffset((prev) => (prev === isOffset ? prev : isOffset));
+  }, []);
 
   const openMaterialFeed = useCallback(
     (materialId: string) => {
@@ -308,6 +323,17 @@ export default function HomePage() {
     [upsertHistory],
   );
 
+  const switchSidebarTab = useCallback(
+    (tab: SidebarTab) => {
+      setActiveSidebarTab(tab);
+      setActiveHistoryMenuId(null);
+      setError(null);
+      forceCloseMobileSidebar();
+    },
+    [forceCloseMobileSidebar],
+  );
+  const isCommunityPanel = activeSidebarTab === "community" || activeSidebarTab === "create";
+
   const sidebarPanelContent = (
     <>
       <div className="mt-10 flex items-center justify-end gap-2 lg:mt-0 lg:justify-between">
@@ -319,11 +345,47 @@ export default function HomePage() {
         </span>
         <button
           type="button"
-          onClick={clearTopicDraft}
-          className="rounded-xl border border-white/25 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/90 transition hover:bg-white/12"
+          onClick={startNewSearch}
+          className="rounded-xl border border-white/15 bg-transparent px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
         >
-          New Chat
+          New Search
         </button>
+      </div>
+
+      <div className="group relative mt-3">
+        <button
+          type="button"
+          onClick={() => switchSidebarTab("community")}
+          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 hover:bg-white/10 hover:text-white ${
+            activeSidebarTab === "community" ? "border-white/15 text-white" : "border-white/15 text-white/85"
+          }`}
+        >
+          <div className="flex h-full items-center justify-between gap-1.5">
+            <p className="truncate font-semibold leading-none">Community Reels</p>
+            <i className="fa-solid fa-users text-[11px] text-white/74 transition-colors duration-200 group-hover:text-white" aria-hidden="true" />
+          </div>
+        </button>
+        <span className="pointer-events-none absolute left-0 top-full z-20 mt-1.5 translate-y-1 rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-[10px] text-white/92 opacity-0 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-all duration-150 delay-0 group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-700">
+          Curated reel sets from the community
+        </span>
+      </div>
+
+      <div className="group relative mt-2">
+        <button
+          type="button"
+          onClick={() => switchSidebarTab("create")}
+          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 hover:bg-white/10 hover:text-white ${
+            activeSidebarTab === "create" ? "border-white/25 text-white" : "border-white/15 text-white/85"
+          }`}
+        >
+          <div className="flex h-full items-center justify-between gap-1.5">
+            <p className="truncate font-semibold leading-none">Create Set</p>
+            <i className="fa-solid fa-plus text-[11px] text-white/74 transition-colors duration-200 group-hover:text-white" aria-hidden="true" />
+          </div>
+        </button>
+        <span className="pointer-events-none absolute left-0 top-full z-20 mt-1.5 translate-y-1 rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-[10px] text-white/92 opacity-0 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-all duration-150 delay-0 group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-700">
+          Build and publish your own community reel set
+        </span>
       </div>
 
       <div className="mt-3">
@@ -361,7 +423,7 @@ export default function HomePage() {
                     <div className="flex items-center gap-1.5">
                       {entry.starred ? <i className="fa-solid fa-star text-[10px] text-white/75 transition-colors group-hover:text-white" aria-hidden="true" /> : null}
                       <p className="truncate font-semibold leading-none transition-colors group-hover:text-white">{entry.title}</p>
-                      <span className="shrink-0 rounded-md border border-white/20 bg-black/55 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/68 transition-colors group-hover:border-white/35 group-hover:text-white">
+                      <span className="shrink-0 rounded-md bg-black/55 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/68 transition-colors group-hover:text-white">
                         {entry.generationMode}
                       </span>
                     </div>
@@ -423,19 +485,33 @@ export default function HomePage() {
   );
 
   return (
-    <main className="home-hero-shell fixed inset-0 h-[100dvh] overflow-x-visible overflow-y-auto md:overflow-hidden">
-      <div className="absolute -top-[28%] -right-[0%] bottom-0 z-[2] w-[100%]">
-        <VolumetricLightBackground />
-      </div>
+    <main onScroll={onMainScroll} className="home-hero-shell fixed inset-0 h-[100dvh] overflow-x-hidden overflow-y-auto lg:overflow-hidden">
+      {activeSidebarTab === "search" ? (
+        <div className="absolute -top-[28%] -right-[0%] bottom-0 z-[2] w-[100%]">
+          <VolumetricLightBackground />
+        </div>
+      ) : null}
       <div className="home-hero-bg pointer-events-none absolute inset-0 z-0 overflow-hidden">
         <HeroGhostSvg />
       </div>
+      {isCommunityPanel ? (
+        <div className="pointer-events-none absolute inset-0 z-[3] bg-black" />
+      ) : null}
 
       {error ? (
         <div className="absolute left-0 right-0 top-3 z-30 mx-auto w-fit rounded-full border border-white/25 bg-black/80 px-4 py-2 text-xs text-white">
           {error}
         </div>
       ) : null}
+
+      <div
+        aria-hidden="true"
+        className={`pointer-events-none fixed inset-x-0 top-0 z-[68] h-[calc(max(env(safe-area-inset-top),0px)+68px)] transition-opacity duration-150 lg:hidden ${
+          topChromeOffset && !mobileSidebarOpen ? "opacity-100" : "opacity-0"
+        }`}
+      >
+        <div className="h-full w-full bg-black/28 backdrop-blur-[28px] backdrop-saturate-180" />
+      </div>
 
       <button
         type="button"
@@ -456,11 +532,11 @@ export default function HomePage() {
         style={{
           top: "calc(max(env(safe-area-inset-top), 0px) + 10px)",
         }}
-        className={`pointer-events-none fixed left-1/2 z-[70] flex h-10 -translate-x-1/2 items-center transition-opacity md:hidden ${
+        className={`pointer-events-none fixed left-1/2 z-[70] flex h-10 -translate-x-1/2 items-center transition-opacity lg:hidden ${
           mobileSidebarOpen ? "opacity-0" : "opacity-100"
         }`}
       >
-        <img src="/logo.png" alt="" className="h-auto w-[5rem] object-contain opacity-70" />
+        <img src="/logo.png" alt="" className="h-auto w-[5rem] object-contain opacity-70 md:w-[5.5rem]" />
       </div>
 
       {mobileSidebarOpen ? (
@@ -478,7 +554,7 @@ export default function HomePage() {
               }
               closeMobileSidebar();
             }}
-            className={`absolute inset-4 rounded-3xl bg-black/42 px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.45)] backdrop-blur-xl ${
+            className={`absolute bottom-4 left-4 top-4 w-[min(24rem,calc(100vw-2rem))] rounded-3xl bg-black/30 px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.45)] backdrop-blur-[26px] backdrop-saturate-150 ${
               mobileSidebarClosing ? "animate-mobile-sidenav-out" : "animate-mobile-sidenav-in"
             }`}
           >
@@ -501,7 +577,7 @@ export default function HomePage() {
         </div>
       ) : null}
 
-      <div className="relative h-full min-h-0 lg:grid lg:grid-cols-[280px_1px_minmax(0,1fr)]">
+      <div className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:grid lg:grid-cols-[280px_1px_minmax(0,1fr)]">
         <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-2 text-white lg:mt-7 lg:mb-2 lg:flex lg:px-5">
           {sidebarPanelContent}
         </aside>
@@ -510,8 +586,18 @@ export default function HomePage() {
           <span className="h-[80%] w-px rounded-full bg-white/20" />
         </div>
 
-        <section className="min-h-0 overflow-visible rounded-3xl bg-black/62 md:overflow-hidden lg:my-2 lg:w-[97%] lg:justify-self-end">
-          <UploadPanel onMaterialCreated={onUploadMaterialCreated} />
+        <section
+          className={`relative z-20 min-h-0 w-full overflow-hidden rounded-3xl bg-black/62 lg:my-2 lg:justify-self-end ${
+            activeSidebarTab === "community"
+              ? "translate-x-1 md:translate-x-2 lg:translate-x-3 lg:w-[99%]"
+              : "lg:w-[97%]"
+          }`}
+        >
+          {activeSidebarTab === "search" ? (
+            <UploadPanel onMaterialCreated={onUploadMaterialCreated} />
+          ) : (
+            <CommunityReelsPanel mode={activeSidebarTab === "create" ? "create" : "community"} />
+          )}
         </section>
       </div>
     </main>

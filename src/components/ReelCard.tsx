@@ -9,6 +9,8 @@ type Props = {
   isActive: boolean;
   mutedPreference: boolean;
   onMutedPreferenceChange: (nextMuted: boolean) => void;
+  captionsEnabled: boolean;
+  onCaptionsEnabledChange: (nextEnabled: boolean) => void;
   onOpenContent?: () => void;
 };
 
@@ -129,6 +131,8 @@ export function ReelCard({
   isActive,
   mutedPreference,
   onMutedPreferenceChange,
+  captionsEnabled,
+  onCaptionsEnabledChange,
   onOpenContent,
 }: Props) {
   const hostContainerRef = useRef<HTMLDivElement | null>(null);
@@ -143,7 +147,6 @@ export function ReelCard({
   const [isMuted, setIsMuted] = useState(mutedPreference);
   const [isSurfaceVisible, setIsSurfaceVisible] = useState(false);
   const [isResumeMaskVisible, setIsResumeMaskVisible] = useState(false);
-  const [showCaptions, setShowCaptions] = useState(false);
   const [currentSec, setCurrentSec] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isTouchLikeDevice, setIsTouchLikeDevice] = useState(false);
@@ -154,6 +157,7 @@ export function ReelCard({
   const clipStart = Math.max(0, Math.floor(reel.t_start));
   const clipEnd = Math.max(clipStart + 1, Math.ceil(reel.t_end));
   const clipDuration = Math.max(1, clipEnd - clipStart);
+  const showCaptions = captionsEnabled;
   const captionCues = useMemo(
     () =>
       (reel.captions ?? [])
@@ -369,7 +373,6 @@ export function ReelCard({
     setIsMuted(mutedPreference);
     setIsSurfaceVisible(false);
     setIsResumeMaskVisible(false);
-    setShowCaptions(false);
     setLoadError(null);
     didUserInteractRef.current = false;
 
@@ -594,8 +597,8 @@ export function ReelCard({
   }, []);
 
   const toggleCaptions = useCallback(() => {
-    setShowCaptions((prev) => !prev);
-  }, []);
+    onCaptionsEnabledChange(!captionsEnabled);
+  }, [captionsEnabled, onCaptionsEnabledChange]);
 
   useEffect(() => {
     if (!isActive) {

@@ -43,6 +43,9 @@ class ReelOut(BaseModel):
     takeaways: list[str]
     captions: list[CaptionCue] = Field(default_factory=list)
     score: float
+    relevance_score: float | None = None
+    matched_terms: list[str] = Field(default_factory=list)
+    relevance_reason: str = ""
     concept_position: int | None = None
     total_concepts: int | None = None
 

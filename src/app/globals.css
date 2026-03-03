@@ -166,6 +166,10 @@ textarea:-webkit-autofill:focus {
   display: none;
 }
 
+.balanced-scroll-gutter {
+  scrollbar-gutter: stable both-edges;
+}
+
 .reel-range {
   -webkit-appearance: none;
   appearance: none;
@@ -373,6 +377,64 @@ textarea:-webkit-autofill:focus {
   }
 }
 
+@keyframes featured-slide-enter-forward {
+  from {
+    opacity: 0;
+    transform: translateX(22px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes featured-slide-enter-backward {
+  from {
+    opacity: 0;
+    transform: translateX(-22px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes featured-slide-exit-forward {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(-22px);
+  }
+}
+
+@keyframes featured-slide-exit-backward {
+  from {
+    opacity: 1;
+    transform: translateX(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(22px);
+  }
+}
+
+.animate-featured-slide-enter-forward,
+.animate-featured-slide-enter-backward {
+  opacity: 1;
+  transform: translateX(0);
+  will-change: transform, opacity;
+}
+
+.animate-featured-slide-exit-forward,
+.animate-featured-slide-exit-backward {
+  opacity: 0;
+  transform: translateX(0);
+  will-change: transform, opacity;
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .animate-mobile-sidenav-in {
     animation: mobile-sidenav-in 260ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
@@ -396,5 +458,21 @@ textarea:-webkit-autofill:focus {
 
   .animate-mobile-sheet-out {
     animation: mobile-sheet-out 220ms cubic-bezier(0.4, 0, 1, 1) forwards;
+  }
+
+  .animate-featured-slide-enter-forward {
+    animation: featured-slide-enter-forward 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .animate-featured-slide-enter-backward {
+    animation: featured-slide-enter-backward 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+
+  .animate-featured-slide-exit-forward {
+    animation: featured-slide-exit-forward 520ms cubic-bezier(0.4, 0, 1, 1) both;
+  }
+
+  .animate-featured-slide-exit-backward {
+    animation: featured-slide-exit-backward 520ms cubic-bezier(0.4, 0, 1, 1) both;
   }
 }
