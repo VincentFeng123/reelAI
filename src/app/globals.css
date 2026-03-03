@@ -268,7 +268,7 @@ textarea:-webkit-autofill:focus {
   right: 0;
   width: 100%;
   height: 100%;
-  opacity: 0.92;
+  opacity: 0.96;
   overflow: hidden;
   isolation: isolate;
   background: transparent;
@@ -281,9 +281,9 @@ textarea:-webkit-autofill:focus {
   z-index: 1;
   pointer-events: none;
   background:
-    radial-gradient(1400px 1000px at 95% 50%, rgba(140, 170, 255, 0.035), transparent 58%),
-    radial-gradient(1100px 800px at 90% 45%, rgba(100, 130, 220, 0.03), transparent 60%),
-    radial-gradient(600px 450px at 50% 35%, rgba(110, 140, 230, 0.022), transparent 68%);
+    radial-gradient(1400px 1000px at 95% 50%, rgba(140, 170, 255, 0.048), transparent 58%),
+    radial-gradient(1100px 800px at 90% 45%, rgba(100, 130, 220, 0.042), transparent 60%),
+    radial-gradient(600px 450px at 50% 35%, rgba(110, 140, 230, 0.03), transparent 68%);
   mix-blend-mode: screen;
 }
 
@@ -294,9 +294,9 @@ textarea:-webkit-autofill:focus {
   z-index: 2;
   pointer-events: none;
   background:
-    radial-gradient(130% 80% at 12% -10%, rgba(0, 0, 0, 0.28), rgba(0, 0, 0, 0) 60%),
-    radial-gradient(130% 85% at 15% 110%, rgba(0, 0, 0, 0.22), rgba(0, 0, 0, 0) 58%),
-    radial-gradient(140% 120% at 50% 50%, rgba(0, 0, 0, 0) 60%, rgba(0, 0, 0, 0.1) 100%);
+    radial-gradient(130% 80% at 12% -10%, rgba(0, 0, 0, 0.22), rgba(0, 0, 0, 0) 60%),
+    radial-gradient(130% 85% at 15% 110%, rgba(0, 0, 0, 0.17), rgba(0, 0, 0, 0) 58%),
+    radial-gradient(140% 120% at 50% 50%, rgba(0, 0, 0, 0) 60%, rgba(0, 0, 0, 0.07) 100%);
 }
 
 .volumetric-light-canvas canvas {
@@ -306,8 +306,8 @@ textarea:-webkit-autofill:focus {
   display: block;
   width: 100% !important;
   height: 100% !important;
-  opacity: 0.88;
-  filter: saturate(1.02) brightness(1.05);
+  opacity: 0.92;
+  filter: saturate(1.04) brightness(1.1);
   mix-blend-mode: screen;
 }
 
