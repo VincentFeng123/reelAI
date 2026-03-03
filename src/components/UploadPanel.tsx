@@ -360,7 +360,7 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
           <button
             type="submit"
             disabled={disabled}
-            className="w-full rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:w-auto"
+            className="inline-flex w-full items-center justify-center rounded-2xl border border-white/30 bg-white px-7 py-3 text-sm font-bold text-black transition hover:bg-white/92 disabled:cursor-not-allowed disabled:opacity-60 md:w-[12rem]"
           >
             {loading ? "Starting..." : "Start Learning"}
           </button>
