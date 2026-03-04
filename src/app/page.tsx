@@ -355,14 +355,44 @@ export default function HomePage() {
       <div className="group relative mt-3">
         <button
           type="button"
+          onClick={startNewSearch}
+          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+            activeSidebarTab === "search" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+          }`}
+        >
+          <div className="flex h-full items-center justify-between gap-1.5">
+            <p className="truncate font-semibold leading-none">New Chat</p>
+            <i
+              className={`fa-solid fa-magnifying-glass text-[11px] ${
+                activeSidebarTab === "search" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+              }`}
+              aria-hidden="true"
+            />
+          </div>
+        </button>
+        <span className="pointer-events-none absolute left-0 top-full z-20 mt-1.5 translate-y-1 rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-[10px] text-white/92 opacity-0 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-all duration-150 delay-0 group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-700">
+          Start a new chat session
+        </span>
+      </div>
+
+      <div className="group relative mt-2">
+        <button
+          type="button"
           onClick={() => switchSidebarTab("community")}
-          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 hover:bg-white/10 hover:text-white ${
-            activeSidebarTab === "community" ? "border-white/15 text-white" : "border-white/15 text-white/85"
+          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+            activeSidebarTab === "community"
+              ? "border-white bg-white text-black"
+              : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
           }`}
         >
           <div className="flex h-full items-center justify-between gap-1.5">
             <p className="truncate font-semibold leading-none">Community Reels</p>
-            <i className="fa-solid fa-users text-[11px] text-white/74 transition-colors duration-200 group-hover:text-white" aria-hidden="true" />
+            <i
+              className={`fa-solid fa-users text-[11px] ${
+                activeSidebarTab === "community" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+              }`}
+              aria-hidden="true"
+            />
           </div>
         </button>
         <span className="pointer-events-none absolute left-0 top-full z-20 mt-1.5 translate-y-1 rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-[10px] text-white/92 opacity-0 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-all duration-150 delay-0 group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-700">
@@ -374,13 +404,18 @@ export default function HomePage() {
         <button
           type="button"
           onClick={() => switchSidebarTab("create")}
-          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 hover:bg-white/10 hover:text-white ${
-            activeSidebarTab === "create" ? "border-white/25 text-white" : "border-white/15 text-white/85"
+          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+            activeSidebarTab === "create" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
           }`}
         >
           <div className="flex h-full items-center justify-between gap-1.5">
             <p className="truncate font-semibold leading-none">Create Set</p>
-            <i className="fa-solid fa-plus text-[11px] text-white/74 transition-colors duration-200 group-hover:text-white" aria-hidden="true" />
+            <i
+              className={`fa-solid fa-plus text-[11px] ${
+                activeSidebarTab === "create" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+              }`}
+              aria-hidden="true"
+            />
           </div>
         </button>
         <span className="pointer-events-none absolute left-0 top-full z-20 mt-1.5 translate-y-1 rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-[10px] text-white/92 opacity-0 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-all duration-150 delay-0 group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-700">
@@ -589,7 +624,7 @@ export default function HomePage() {
         <section
           className={`relative z-20 min-h-0 w-full overflow-hidden rounded-3xl bg-black/62 lg:my-2 lg:justify-self-end ${
             activeSidebarTab === "community"
-              ? "translate-x-1 md:translate-x-2 lg:translate-x-3 lg:w-[99%]"
+              ? "translate-x-0 md:translate-x-1 lg:translate-x-2 lg:w-[99%]"
               : "lg:w-[97%]"
           }`}
         >
