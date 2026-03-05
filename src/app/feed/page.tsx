@@ -1475,49 +1475,21 @@ function FeedPageInner() {
     [activeFeedback, activeReel],
   );
 
-  const actionButtonClass = (active: boolean) =>
-    `grid h-10 w-10 place-items-center rounded-2xl border text-sm transition ${
-      active ? "border-white bg-white text-black" : "border-white/30 bg-transparent text-white hover:bg-white/10"
-    }`;
-
-  const renderFeedbackIconButton = (
-    action: FeedbackAction,
-    label: string,
-    iconClass: string,
-    active: boolean,
-  ) => (
-    <div className="group relative">
-      <button
-        onClick={() => submitActiveFeedback(action)}
-        className={actionButtonClass(active)}
-        disabled={pendingAction !== null}
-        aria-label={label}
-      >
-        {pendingAction === action ? (
-          <i className="fa-solid fa-spinner fa-spin" aria-hidden="true" />
-        ) : (
-          <i className={`fa-solid ${iconClass}`} aria-hidden="true" />
-        )}
-      </button>
-      <span className="pointer-events-none absolute bottom-full left-1/2 mb-2 -translate-x-1/2 translate-y-1 whitespace-nowrap rounded-md border border-white/20 bg-black/85 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-white opacity-0 transition-all duration-150 delay-0 group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-500">
-        {label}
-      </span>
-    </div>
-  );
   const renderGenerationModeToggle = (className?: string) => (
     <div
       role="group"
       aria-label="Generation mode"
       className={[
-        "relative grid h-10 w-[128px] grid-cols-2 items-center rounded-2xl border border-white/25 bg-black/60 p-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-white backdrop-blur-md",
+        "relative grid h-10 w-[128px] grid-cols-2 items-center overflow-hidden rounded-2xl border border-white/25 bg-white/[0.06] p-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-white backdrop-blur-lg",
         className,
       ]
         .filter(Boolean)
         .join(" ")}
     >
+      <span aria-hidden="true" className="pointer-events-none absolute inset-0 bg-black/45" />
       <span
         aria-hidden="true"
-        className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%-4px)] rounded-xl bg-white transition-transform duration-300 ease-out ${
+        className={`pointer-events-none absolute bottom-1 left-1 top-1 z-10 w-[calc(50%-4px)] rounded-xl bg-white transition-transform duration-300 ease-out ${
           generationMode === "fast" ? "translate-x-full" : "translate-x-0"
         }`}
       />
@@ -1543,17 +1515,18 @@ function FeedPageInner() {
     <button
       type="button"
       onClick={() => submitActiveFeedback(action)}
-      className={`grid h-10 w-10 place-items-center rounded-2xl border text-sm transition backdrop-blur-md ${
-        active ? "border-white bg-white text-black" : "border-white/28 bg-black/60 text-white/92 hover:bg-black/70"
+      className={`relative grid h-10 w-10 place-items-center overflow-hidden rounded-2xl border-[0.8px] text-sm transition backdrop-blur-lg ${
+        active ? "border-white/70 text-white" : "border-white/35 text-white/90 hover:border-white/55"
       }`}
       disabled={pendingAction !== null}
       aria-label={label}
       title={label}
     >
+      <span aria-hidden="true" className={`pointer-events-none absolute inset-0 ${active ? "bg-black/55" : "bg-black/45"}`} />
       {pendingAction === action ? (
-        <i className="fa-solid fa-spinner fa-spin" aria-hidden="true" />
+        <i className="fa-solid fa-spinner fa-spin relative z-10" aria-hidden="true" />
       ) : (
-        <i className={`fa-solid ${iconClass}`} aria-hidden="true" />
+        <i className={`fa-solid ${iconClass} relative z-10`} aria-hidden="true" />
       )}
     </button>
   );
@@ -1598,8 +1571,11 @@ function FeedPageInner() {
 
       <div ref={desktopShellRef} className="h-full min-h-[100dvh] md:min-h-0 lg:flex">
         <section className="relative h-[100dvh] min-h-[100dvh] md:h-full md:min-h-0 lg:min-w-0 lg:flex-1">
+          <div className="absolute right-3 top-3 z-30 hidden lg:block">
+            {renderGenerationModeToggle("shadow-[0_8px_24px_rgba(0,0,0,0.35)]")}
+          </div>
           {activeReel && !mobileDetailsOpen ? (
-            <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2 lg:hidden">
+            <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2">
               {renderMobileFeedbackButton("helpful", "Helpful", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
               {renderMobileFeedbackButton("confusing", "Confusing", "fa-circle-question", Boolean(activeFeedback.confusing))}
               {renderMobileFeedbackButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
@@ -1753,11 +1729,11 @@ function FeedPageInner() {
             gridTemplateRows: `${rightTopPercent}% ${RIGHT_SPLIT_BAR_PX}px minmax(0, 1fr)`,
           }}
         >
-          <aside className="min-h-0 min-w-0 overflow-y-auto rounded-3xl border border-white/20 bg-black/72 px-5 pt-5 pb-0 text-white">
+          <aside className="min-h-0 min-w-0 overflow-y-auto rounded-3xl border border-white/20 bg-black/72 px-5 pt-5 pb-2 text-white">
             {!activeReel ? (
               <div className="flex h-full items-center justify-center text-sm text-white/80">Loading reel details...</div>
             ) : (
-              <div className="flex h-full flex-col">
+              <div className="flex min-h-full flex-col pb-2">
                 <h2 className="text-2xl font-bold leading-tight">{activeReel.concept_title}</h2>
 
                 <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
@@ -1770,7 +1746,7 @@ function FeedPageInner() {
                   <p className="break-words [overflow-wrap:anywhere]">{activeAiSummary}</p>
                 </div>
 
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-3 mb-0 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
                   <div className="mb-1 flex items-center justify-between gap-2">
                     <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Why This Matches</p>
                     {typeof activeReel.relevance_score === "number" ? (
@@ -1793,15 +1769,8 @@ function FeedPageInner() {
                     </div>
                   ) : null}
                 </div>
+                <div aria-hidden="true" className="h-1 shrink-0" />
 
-                <div className="mt-auto pt-4 mb-[17px]">
-                  <div className="flex flex-wrap items-center gap-2">
-                    {renderFeedbackIconButton("helpful", "Helpful", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
-                    {renderFeedbackIconButton("confusing", "Confusing", "fa-circle-question", Boolean(activeFeedback.confusing))}
-                    {renderFeedbackIconButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
-                    {renderGenerationModeToggle()}
-                  </div>
-                </div>
               </div>
             )}
           </aside>
@@ -1829,7 +1798,9 @@ function FeedPageInner() {
                     <div
                       key={`${activeReel.reel_id}-chat-${idx}`}
                       className={`rounded-xl px-3 py-2 text-sm leading-relaxed break-words [overflow-wrap:anywhere] ${
-                        msg.role === "user" ? "ml-8 bg-black/70 text-white" : "mr-8 bg-white/10 text-white/92"
+                        msg.role === "user"
+                          ? "ml-auto w-fit max-w-[85%] bg-[#1b1b1b] text-right text-white"
+                          : "mr-8 bg-white/10 text-white/92"
                       }`}
                     >
                       {msg.content}

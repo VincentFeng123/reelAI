@@ -2,7 +2,6 @@ import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 
 import "@fortawesome/fontawesome-free/css/all.min.css";
-import { GridGlowTracker } from "@/components/GridGlowTracker";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -25,7 +24,6 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className="antialiased">
-        <GridGlowTracker />
         {children}
       </body>
     </html>

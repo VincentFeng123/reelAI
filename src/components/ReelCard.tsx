@@ -27,7 +27,8 @@ type YouTubePlayer = {
 const YOUTUBE_SCRIPT_ID = "studyreels-youtube-iframe-api";
 const PLAYER_REVEAL_DELAY_MS = 0;
 const RESUME_MASK_MS = 480;
-const DESKTOP_VERTICAL_PLAYER_CROP_PX = 96;
+const AUTOPLAY_RETRY_DELAY_MS = 320;
+const AUTOPLAY_MAX_RETRIES = 5;
 let youtubeApiLoadPromise: Promise<void> | null = null;
 
 function detectTouchLikeDevice(): boolean {
@@ -140,6 +141,8 @@ export function ReelCard({
   const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resumeMaskTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoplayRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoplayRetryCountRef = useRef(0);
   const didUserInteractRef = useRef(false);
 
   const [isReady, setIsReady] = useState(false);
@@ -151,7 +154,6 @@ export function ReelCard({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isTouchLikeDevice, setIsTouchLikeDevice] = useState(false);
   const [isMobilePhoneDevice, setIsMobilePhoneDevice] = useState(false);
-  const [desktopCoverScale, setDesktopCoverScale] = useState({ widthPct: 100, heightPct: 100 });
 
   const videoId = useMemo(() => extractVideoId(reel.video_url), [reel.video_url]);
   const clipStart = Math.max(0, Math.floor(reel.t_start));
@@ -203,48 +205,6 @@ export function ReelCard({
       window.removeEventListener("resize", onResize);
     };
   }, []);
-
-  useEffect(() => {
-    if (!isActive || isMobilePhoneDevice || typeof window === "undefined") {
-      return;
-    }
-    const host = hostContainerRef.current;
-    const frame = host?.parentElement;
-    if (!host || !frame) {
-      return;
-    }
-
-    const TARGET_ASPECT = 16 / 9;
-    const BLEED = 1.06;
-    const MIN_PERCENT = 100;
-    const MAX_PERCENT = 260;
-    const computeCover = () => {
-      const rect = frame.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) {
-        return;
-      }
-      const containerAspect = rect.width / rect.height;
-      let widthPct = 100;
-      let heightPct = 100;
-      if (containerAspect > TARGET_ASPECT) {
-        heightPct = (containerAspect / TARGET_ASPECT) * 100;
-      } else {
-        widthPct = (TARGET_ASPECT / containerAspect) * 100;
-      }
-      widthPct = clamp(widthPct * BLEED, MIN_PERCENT, MAX_PERCENT);
-      heightPct = clamp(heightPct * BLEED, MIN_PERCENT, MAX_PERCENT);
-      setDesktopCoverScale({ widthPct, heightPct });
-    };
-
-    computeCover();
-    const observer = new ResizeObserver(computeCover);
-    observer.observe(frame);
-    window.addEventListener("resize", computeCover);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", computeCover);
-    };
-  }, [isActive, isMobilePhoneDevice]);
 
   const stopProgressTimer = useCallback(() => {
     if (progressTimerRef.current) {
@@ -330,6 +290,13 @@ export function ReelCard({
     }
   }, []);
 
+  const clearAutoplayRetryTimer = useCallback(() => {
+    if (autoplayRetryTimerRef.current) {
+      clearTimeout(autoplayRetryTimerRef.current);
+      autoplayRetryTimerRef.current = null;
+    }
+  }, []);
+
   const scheduleSurfaceReveal = useCallback(
     (delayMs: number) => {
       clearRevealTimer();
@@ -359,14 +326,17 @@ export function ReelCard({
       stopProgressTimer();
       clearRevealTimer();
       clearResumeMaskTimer();
+      clearAutoplayRetryTimer();
       destroyPlayerSafely();
     };
-  }, [clearRevealTimer, clearResumeMaskTimer, destroyPlayerSafely, stopProgressTimer]);
+  }, [clearAutoplayRetryTimer, clearRevealTimer, clearResumeMaskTimer, destroyPlayerSafely, stopProgressTimer]);
 
   useEffect(() => {
     stopProgressTimer();
     clearRevealTimer();
     clearResumeMaskTimer();
+    clearAutoplayRetryTimer();
+    autoplayRetryCountRef.current = 0;
     setCurrentSec(0);
     setIsPlaying(false);
     setIsReady(false);
@@ -428,17 +398,47 @@ export function ReelCard({
               if (cancelled) {
                 return;
               }
-              // Mobile browsers commonly block autoplay with sound; start muted reliably.
-              event.target.mute();
-              event.target.seekTo(clipStart, true);
-              event.target.playVideo();
+              const tryAutoplay = () => {
+                if (cancelled || !isActive || didUserInteractRef.current) {
+                  return;
+                }
+                event.target.mute();
+                event.target.seekTo(clipStart, true);
+                event.target.playVideo();
+              };
+              const queueAutoplayRetry = () => {
+                clearAutoplayRetryTimer();
+                if (cancelled || !isActive || didUserInteractRef.current) {
+                  return;
+                }
+                if (autoplayRetryCountRef.current >= AUTOPLAY_MAX_RETRIES) {
+                  return;
+                }
+                autoplayRetryTimerRef.current = setTimeout(() => {
+                  autoplayRetryTimerRef.current = null;
+                  if (cancelled || !isActive || didUserInteractRef.current) {
+                    return;
+                  }
+                  const playerStateValue =
+                    typeof event.target.getPlayerState === "function" ? event.target.getPlayerState() : null;
+                  if (playerStateValue === yt.PlayerState.PLAYING) {
+                    return;
+                  }
+                  autoplayRetryCountRef.current += 1;
+                  tryAutoplay();
+                  queueAutoplayRetry();
+                }, AUTOPLAY_RETRY_DELAY_MS);
+              };
+              // Mobile browsers commonly block autoplay with sound; always start muted and retry.
+              autoplayRetryCountRef.current = 0;
+              tryAutoplay();
               setIsMuted(true);
               setIsReady(true);
-              setIsPlaying(true);
+              setIsPlaying(false);
               setCurrentSec(0);
               setIsSurfaceVisible(true);
               scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
-              startProgressTimer();
+              queueAutoplayRetry();
             },
             onStateChange: (event: any) => {
               if (cancelled) {
@@ -447,6 +447,8 @@ export function ReelCard({
               const state = event.data;
               const playerState = yt.PlayerState;
               if (state === playerState.PLAYING) {
+                clearAutoplayRetryTimer();
+                autoplayRetryCountRef.current = 0;
                 setIsPlaying(true);
                 startProgressTimer();
               } else if (state === playerState.PAUSED) {
@@ -454,7 +456,21 @@ export function ReelCard({
                 setIsResumeMaskVisible(false);
                 stopProgressTimer();
                 syncProgress();
+                if (isActive && !didUserInteractRef.current && autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES) {
+                  clearAutoplayRetryTimer();
+                  autoplayRetryTimerRef.current = setTimeout(() => {
+                    autoplayRetryTimerRef.current = null;
+                    if (cancelled || !isActive || didUserInteractRef.current) {
+                      return;
+                    }
+                    autoplayRetryCountRef.current += 1;
+                    event.target.mute();
+                    event.target.seekTo(clipStart, true);
+                    event.target.playVideo();
+                  }, AUTOPLAY_RETRY_DELAY_MS);
+                }
               } else if (state === playerState.ENDED) {
+                clearAutoplayRetryTimer();
                 event.target.seekTo(clipStart, true);
                 event.target.playVideo();
                 setIsPlaying(true);
@@ -464,6 +480,10 @@ export function ReelCard({
                 startProgressTimer();
               } else if ((state === playerState.UNSTARTED || state === playerState.CUED) && isActive) {
                 // Retry autoplay for devices that initially report cued/unstarted.
+                if (autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES) {
+                  autoplayRetryCountRef.current += 1;
+                }
+                event.target.mute();
                 event.target.playVideo();
               }
             },
@@ -471,6 +491,7 @@ export function ReelCard({
               if (cancelled) {
                 return;
               }
+              clearAutoplayRetryTimer();
               setLoadError("Could not load this YouTube clip");
               setIsSurfaceVisible(false);
               setIsResumeMaskVisible(false);
@@ -491,6 +512,7 @@ export function ReelCard({
       stopProgressTimer();
       clearRevealTimer();
       clearResumeMaskTimer();
+      clearAutoplayRetryTimer();
       destroyPlayerSafely();
       clearHostContainer();
     };
@@ -508,6 +530,7 @@ export function ReelCard({
     syncProgress,
     videoId,
     destroyPlayerSafely,
+    clearAutoplayRetryTimer,
   ]);
 
   useEffect(() => {
@@ -534,6 +557,7 @@ export function ReelCard({
       return;
     }
     didUserInteractRef.current = true;
+    clearAutoplayRetryTimer();
     if (!isPlaying && !mutedPreference) {
       player.unMute();
       setIsMuted(false);
@@ -552,7 +576,18 @@ export function ReelCard({
     player.playVideo();
     setIsPlaying(true);
     startProgressTimer();
-  }, [isMuted, isPlaying, isReady, mutedPreference, scheduleSurfaceReveal, showResumeMask, startProgressTimer, stopProgressTimer, syncProgress]);
+  }, [
+    clearAutoplayRetryTimer,
+    isMuted,
+    isPlaying,
+    isReady,
+    mutedPreference,
+    scheduleSurfaceReveal,
+    showResumeMask,
+    startProgressTimer,
+    stopProgressTimer,
+    syncProgress,
+  ]);
 
   const toggleMute = useCallback(() => {
     const player = playerRef.current;
@@ -560,6 +595,7 @@ export function ReelCard({
       return;
     }
     didUserInteractRef.current = true;
+    clearAutoplayRetryTimer();
     const nextMuted = !isMuted;
     if (nextMuted) {
       player.mute();
@@ -569,7 +605,7 @@ export function ReelCard({
       setIsMuted(false);
     }
     onMutedPreferenceChange(nextMuted);
-  }, [isMuted, isReady, onMutedPreferenceChange]);
+  }, [clearAutoplayRetryTimer, isMuted, isReady, onMutedPreferenceChange]);
 
   const onSeek = useCallback(
     (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -680,17 +716,8 @@ export function ReelCard({
   const controlsChromeClass = isMobilePhoneDevice
     ? "rounded-2xl border border-white/20 bg-black/70 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.38)] backdrop-blur-md"
     : "px-0 py-0";
-  const hostContainerClass = isMobilePhoneDevice
-    ? "pointer-events-none absolute inset-x-0 -top-14 h-[calc(100%+56px)] w-full"
-    : "pointer-events-none absolute left-1/2 top-1/2";
-  const hostContainerStyle = isMobilePhoneDevice
-    ? undefined
-    : ({
-        width: `${desktopCoverScale.widthPct}%`,
-        // Crop fixed-height YouTube chrome that can appear as a black band at the bottom.
-        height: `calc(${desktopCoverScale.heightPct}% + ${DESKTOP_VERTICAL_PLAYER_CROP_PX}px)`,
-        transform: `translate(-50%, calc(-50% - ${DESKTOP_VERTICAL_PLAYER_CROP_PX / 2}px))`,
-      } as const);
+  const hostContainerClass = "pointer-events-none absolute inset-0 h-full w-full";
+  const hostContainerStyle = undefined;
 
   return (
     <section className="relative h-full min-h-full w-full snap-start overflow-hidden rounded-none border-0 bg-transparent lg:rounded-3xl lg:border lg:border-white/20">
@@ -720,7 +747,7 @@ export function ReelCard({
         }`}
       />
 
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-[16] h-10 bg-black/95" />
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-[16] h-16 bg-black/95" />
 
       {isActive ? (
         <button
@@ -767,7 +794,7 @@ export function ReelCard({
                   type="button"
                   data-reel-control="true"
                   onClick={onOpenContent}
-                  className="inline-flex h-8 items-center rounded-full border border-white/28 px-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/92 transition hover:bg-white/10 lg:hidden"
+                  className="inline-flex h-8 items-center rounded-full border-[0.8px] border-white/30 px-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/90 transition hover:bg-white/10 lg:hidden"
                 >
                   Content
                 </button>

@@ -1,10 +1,9 @@
 "use client";
 
-import { type UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type MouseEvent as ReactMouseEvent, type UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { CommunityReelsPanel } from "@/components/CommunityReelsPanel";
-import { HeroGhostSvg } from "@/components/HeroGhostSvg";
 import { UploadPanel } from "@/components/UploadPanel";
 import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
 
@@ -16,6 +15,10 @@ const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const MAX_HISTORY_ITEMS = 120;
 const MOBILE_SIDEBAR_CLOSE_MS = 260;
+const SIDEBAR_INFO_TOOLTIP_DELAY_MS = 1000;
+const SIDEBAR_INFO_TOOLTIP_VISIBLE_MS = 2200;
+const SIDEBAR_INFO_TOOLTIP_FADE_MS = 180;
+const SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS = 24;
 type GenerationMode = "slow" | "fast";
 type SidebarTab = "search" | "community" | "create";
 
@@ -115,10 +118,15 @@ export default function HomePage() {
   const [mobileSidebarClosing, setMobileSidebarClosing] = useState(false);
   const [topChromeOffset, setTopChromeOffset] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
-  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("community");
+  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
+  const [sidebarInfoTooltip, setSidebarInfoTooltip] = useState<{ text: string; left: number; top: number; visible: boolean; align: "left" | "right" } | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const historyRef = useRef<HistoryItem[]>([]);
   const mobileSidebarCloseTimerRef = useRef<number | null>(null);
+  const sidebarInfoTooltipShowTimerRef = useRef<number | null>(null);
+  const sidebarInfoTooltipHideTimerRef = useRef<number | null>(null);
+  const sidebarInfoTooltipDismissTimerRef = useRef<number | null>(null);
+  const sidebarInfoTooltipAnimateInTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -197,6 +205,70 @@ export default function HomePage() {
     }
   }, []);
 
+  const clearSidebarInfoTooltipTimers = useCallback(() => {
+    if (sidebarInfoTooltipShowTimerRef.current !== null) {
+      window.clearTimeout(sidebarInfoTooltipShowTimerRef.current);
+      sidebarInfoTooltipShowTimerRef.current = null;
+    }
+    if (sidebarInfoTooltipHideTimerRef.current !== null) {
+      window.clearTimeout(sidebarInfoTooltipHideTimerRef.current);
+      sidebarInfoTooltipHideTimerRef.current = null;
+    }
+    if (sidebarInfoTooltipDismissTimerRef.current !== null) {
+      window.clearTimeout(sidebarInfoTooltipDismissTimerRef.current);
+      sidebarInfoTooltipDismissTimerRef.current = null;
+    }
+    if (sidebarInfoTooltipAnimateInTimerRef.current !== null) {
+      window.clearTimeout(sidebarInfoTooltipAnimateInTimerRef.current);
+      sidebarInfoTooltipAnimateInTimerRef.current = null;
+    }
+  }, []);
+
+  const onSidebarInfoHoverStart = useCallback(
+    (event: ReactMouseEvent<HTMLElement>, text: string, align: "left" | "right" = "left") => {
+      if (typeof window === "undefined") {
+        return;
+      }
+      const rect = event.currentTarget.getBoundingClientRect();
+      clearSidebarInfoTooltipTimers();
+      setSidebarInfoTooltip(null);
+      sidebarInfoTooltipShowTimerRef.current = window.setTimeout(() => {
+        const left = align === "right"
+          ? Math.min(window.innerWidth - 12, Math.max(232, rect.right))
+          : Math.min(window.innerWidth - 232, Math.max(12, rect.left));
+        const top = Math.min(window.innerHeight - 12, rect.bottom + 8);
+        setSidebarInfoTooltip({ text, left, top, visible: false, align });
+        sidebarInfoTooltipAnimateInTimerRef.current = window.setTimeout(() => {
+          setSidebarInfoTooltip((prev) => (prev ? { ...prev, visible: true } : prev));
+          sidebarInfoTooltipAnimateInTimerRef.current = null;
+        }, SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS);
+        sidebarInfoTooltipShowTimerRef.current = null;
+        sidebarInfoTooltipHideTimerRef.current = window.setTimeout(() => {
+          setSidebarInfoTooltip((prev) => (prev ? { ...prev, visible: false } : prev));
+          sidebarInfoTooltipDismissTimerRef.current = window.setTimeout(() => {
+            setSidebarInfoTooltip(null);
+            sidebarInfoTooltipDismissTimerRef.current = null;
+          }, SIDEBAR_INFO_TOOLTIP_FADE_MS);
+          sidebarInfoTooltipHideTimerRef.current = null;
+        }, SIDEBAR_INFO_TOOLTIP_VISIBLE_MS);
+      }, SIDEBAR_INFO_TOOLTIP_DELAY_MS);
+    },
+    [clearSidebarInfoTooltipTimers],
+  );
+
+  const onSidebarInfoHoverEnd = useCallback(() => {
+    clearSidebarInfoTooltipTimers();
+    setSidebarInfoTooltip((prev) => (prev ? { ...prev, visible: false } : prev));
+    if (typeof window === "undefined") {
+      setSidebarInfoTooltip(null);
+      return;
+    }
+    sidebarInfoTooltipDismissTimerRef.current = window.setTimeout(() => {
+      setSidebarInfoTooltip(null);
+      sidebarInfoTooltipDismissTimerRef.current = null;
+    }, SIDEBAR_INFO_TOOLTIP_FADE_MS);
+  }, [clearSidebarInfoTooltipTimers]);
+
   const openMobileSidebar = useCallback(() => {
     clearMobileSidebarCloseTimer();
     setMobileSidebarClosing(false);
@@ -244,8 +316,9 @@ export default function HomePage() {
   useEffect(() => {
     return () => {
       clearMobileSidebarCloseTimer();
+      clearSidebarInfoTooltipTimers();
     };
-  }, [clearMobileSidebarCloseTimer]);
+  }, [clearMobileSidebarCloseTimer, clearSidebarInfoTooltipTimers]);
 
   const onMainScroll = useCallback((event: UIEvent<HTMLElement>) => {
     const isOffset = event.currentTarget.scrollTop > 2;
@@ -343,16 +416,27 @@ export default function HomePage() {
         >
           R
         </span>
-        <button
-          type="button"
-          onClick={startNewSearch}
-          className="rounded-xl border border-white/15 bg-transparent px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
+        <div
+          className="group relative"
+          onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Start a new search", "right")}
+          onMouseLeave={onSidebarInfoHoverEnd}
         >
-          New Search
-        </button>
+          <button
+            type="button"
+            onClick={startNewSearch}
+            aria-label="Start new search"
+            className="grid h-8 w-8 place-items-center rounded-xl border border-white/15 bg-transparent text-sm font-semibold text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
+          >
+            +
+          </button>
+        </div>
       </div>
 
-      <div className="group relative mt-3">
+      <div
+        className="group relative mt-3"
+        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Start a new chat session")}
+        onMouseLeave={onSidebarInfoHoverEnd}
+      >
         <button
           type="button"
           onClick={startNewSearch}
@@ -361,7 +445,7 @@ export default function HomePage() {
           }`}
         >
           <div className="flex h-full items-center justify-between gap-1.5">
-            <p className="truncate font-semibold leading-none">New Chat</p>
+            <p className="truncate font-semibold leading-none">Search</p>
             <i
               className={`fa-solid fa-magnifying-glass text-[11px] ${
                 activeSidebarTab === "search" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
@@ -370,12 +454,13 @@ export default function HomePage() {
             />
           </div>
         </button>
-        <span className="pointer-events-none absolute left-0 top-full z-20 mt-1.5 translate-y-1 rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-[10px] text-white/92 opacity-0 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-all duration-150 delay-0 group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-700">
-          Start a new chat session
-        </span>
       </div>
 
-      <div className="group relative mt-2">
+      <div
+        className="group relative mt-2"
+        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Curated reel sets from the community")}
+        onMouseLeave={onSidebarInfoHoverEnd}
+      >
         <button
           type="button"
           onClick={() => switchSidebarTab("community")}
@@ -395,12 +480,13 @@ export default function HomePage() {
             />
           </div>
         </button>
-        <span className="pointer-events-none absolute left-0 top-full z-20 mt-1.5 translate-y-1 rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-[10px] text-white/92 opacity-0 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-all duration-150 delay-0 group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-700">
-          Curated reel sets from the community
-        </span>
       </div>
 
-      <div className="group relative mt-2">
+      <div
+        className="group relative mt-2"
+        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Build and publish your own community reel set")}
+        onMouseLeave={onSidebarInfoHoverEnd}
+      >
         <button
           type="button"
           onClick={() => switchSidebarTab("create")}
@@ -418,12 +504,9 @@ export default function HomePage() {
             />
           </div>
         </button>
-        <span className="pointer-events-none absolute left-0 top-full z-20 mt-1.5 translate-y-1 rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-[10px] text-white/92 opacity-0 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-all duration-150 delay-0 group-hover:translate-y-0 group-hover:opacity-100 group-hover:delay-700">
-          Build and publish your own community reel set
-        </span>
       </div>
 
-      <div className="mt-3">
+      <div className="mt-6">
         <input
           value={historyQuery}
           onChange={(event) => setHistoryQuery(event.target.value)}
@@ -449,7 +532,10 @@ export default function HomePage() {
               <p className="text-xs text-white/42">No history yet.</p>
             ) : (
               filteredHistory.map((entry) => (
-                <div key={`history-${entry.materialId}`} className="group relative">
+                <div
+                  key={`history-${entry.materialId}`}
+                  className="group relative"
+                >
                   <button
                     type="button"
                     onClick={() => openMaterialFeed(entry.materialId)}
@@ -526,16 +612,39 @@ export default function HomePage() {
           <VolumetricLightBackground />
         </div>
       ) : null}
-      <div className="home-hero-bg pointer-events-none absolute inset-0 z-0 overflow-hidden">
-        <HeroGhostSvg />
-      </div>
       {isCommunityPanel ? (
-        <div className="pointer-events-none absolute inset-0 z-[3] bg-black" />
+        <div className="pointer-events-none absolute inset-0 z-[3] overflow-hidden">
+          <div className="absolute inset-0 bg-black/30" />
+          <img
+            src="/images/community/80543.jpg"
+            alt=""
+            aria-hidden="true"
+            className="absolute bottom-0 right-0 h-auto w-[82vw] max-w-none rotate-180 object-contain sm:w-[74vw] md:w-[66vw] lg:w-[58vw]"
+            style={{
+              opacity: 0.15,
+              WebkitMaskImage: "linear-gradient(to right, rgba(0, 0, 0, 1) 0%, rgba(0, 0, 0, 1) 90%, rgba(0, 0, 0, 0) 100%)",
+              maskImage: "linear-gradient(to right, rgba(0, 0, 0, 1) 0%, rgba(0, 0, 0, 1) 90%, rgba(0, 0, 0, 0) 100%)",
+              WebkitMaskRepeat: "no-repeat",
+              maskRepeat: "no-repeat",
+              WebkitMaskSize: "100% 100%",
+              maskSize: "100% 100%",
+            }}
+          />
+        </div>
       ) : null}
-
       {error ? (
         <div className="absolute left-0 right-0 top-3 z-30 mx-auto w-fit rounded-full border border-white/25 bg-black/80 px-4 py-2 text-xs text-white">
           {error}
+        </div>
+      ) : null}
+      {sidebarInfoTooltip ? (
+        <div
+          className={`pointer-events-none fixed z-[90] max-w-[220px] rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-left text-[10px] text-white/92 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-[opacity,transform] duration-[220ms] ease-out will-change-[transform,opacity] ${
+            sidebarInfoTooltip.visible ? "translate-y-0 opacity-100" : "-translate-y-1.5 opacity-0"
+          } ${sidebarInfoTooltip.align === "right" ? "origin-top-right -translate-x-full" : "origin-top-left"}`}
+          style={{ left: `${sidebarInfoTooltip.left}px`, top: `${sidebarInfoTooltip.top}px` }}
+        >
+          {sidebarInfoTooltip.text}
         </div>
       ) : null}
 
@@ -545,7 +654,11 @@ export default function HomePage() {
           topChromeOffset && !mobileSidebarOpen ? "opacity-100" : "opacity-0"
         }`}
       >
-        <div className="h-full w-full bg-black/28 backdrop-blur-[28px] backdrop-saturate-180" />
+        <div
+          className={`h-full w-full ${
+            activeSidebarTab === "community" ? "bg-black" : "bg-black/28 backdrop-blur-[28px] backdrop-saturate-180"
+          }`}
+        />
       </div>
 
       <button
@@ -622,7 +735,9 @@ export default function HomePage() {
         </div>
 
         <section
-          className={`relative z-20 min-h-0 w-full overflow-hidden rounded-3xl bg-black/62 lg:my-2 lg:justify-self-end ${
+          className={`relative z-20 h-full min-h-0 w-full overflow-hidden rounded-3xl ${
+            isCommunityPanel ? "bg-transparent" : "bg-black/62"
+          } lg:my-2 lg:justify-self-end ${
             activeSidebarTab === "community"
               ? "translate-x-0 md:translate-x-1 lg:translate-x-2 lg:w-[99%]"
               : "lg:w-[97%]"

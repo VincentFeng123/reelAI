@@ -1,6 +1,7 @@
 "use client";
 
-import { type ChangeEvent, type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { type ChangeEvent, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
 const MAX_USER_SETS = 120;
@@ -9,6 +10,16 @@ const SUPPORTED_PLATFORMS_LABEL = "YouTube, Instagram, TikTok";
 const FEATURED_CAROUSEL_INTERVAL_MS = 5200;
 const FEATURED_CAROUSEL_TRANSITION_MS = 520;
 const FEATURED_CAROUSEL_PAUSE_MS = 200;
+const FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_FALLBACK = 410;
+const FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_TOUCH_FALLBACK = 280;
+const FEATURED_CAROUSEL_BUTTON_BOTTOM_MARGIN_PX = 18;
+const FEATURED_CAROUSEL_IMAGE_BOTTOM_MARGIN_PX = 18;
+const DIRECTORY_DETAIL_TRANSITION_MS = 440;
+const DETAIL_CONTENT_TOP_PADDING_FALLBACK = 420;
+const DETAIL_CONTENT_TOP_PADDING_GUTTER = 16;
+const DETAIL_CONTENT_TOP_PADDING_UPSHIFT_PX = 56;
+const DETAIL_CAROUSEL_VISIBLE_COUNT = 3;
+const DETAIL_BANNER_LEFT_EXPANSION_PX = 10;
 
 type ReelPlatform = "youtube" | "instagram" | "tiktok";
 
@@ -67,10 +78,17 @@ const PLATFORM_ICON: Record<ReelPlatform, string> = {
   tiktok: "fa-brands fa-tiktok",
 };
 
-const USER_SET_THUMBNAILS = [
-  "/images/community/ai-systems.svg",
-  "/images/community/language-story.svg",
-  "/images/community/civics-debate.svg",
+const DETAIL_LOREM_PARAGRAPHS = [
+  "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer luctus, lorem ut porta vehicula, lectus lectus viverra mi, id faucibus turpis est eget augue.",
+  "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Velit euismod in pellentesque massa placerat duis ultricies lacus sed turpis tincidunt id aliquet.",
+  "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Egestas integer eget aliquet nibh praesent tristique magna sit.",
+  "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Cras semper auctor neque vitae tempus quam pellentesque nec nam aliquam.",
+  "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. Convallis aenean et tortor at risus viverra adipiscing at in tellus.",
+  "Nunc consequat interdum varius sit amet mattis vulputate enim nulla aliquet porttitor lacus luctus accumsan tortor posuere ac ut consequat semper viverra nam libero justo.",
+  "Purus gravida quis blandit turpis cursus in hac habitasse platea dictumst quisque sagittis purus sit amet volutpat consequat mauris nunc congue nisi vitae suscipit tellus.",
+  "Aliquet sagittis id consectetur purus ut faucibus pulvinar elementum integer enim neque volutpat ac tincidunt vitae semper quis lectus nulla at volutpat diam ut venenatis.",
+  "Pharetra pharetra massa massa ultricies mi quis hendrerit dolor magna eget est lorem ipsum dolor sit amet consectetur adipiscing elit pellentesque habitant morbi tristique.",
+  "Amet dictum sit amet justo donec enim diam vulputate ut pharetra sit amet aliquam id diam maecenas ultricies mi eget mauris pharetra et ultrices neque ornare aenean.",
 ];
 
 const FEATURED_SETS: CommunitySet[] = [
@@ -402,23 +420,36 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
   const [pendingFeaturedIndex, setPendingFeaturedIndex] = useState<number | null>(null);
   const [featuredTransitionStage, setFeaturedTransitionStage] = useState<FeaturedTransitionStage>("idle");
   const [featuredTransitionDirection, setFeaturedTransitionDirection] = useState<1 | -1>(1);
+  const [featuredCarouselContentHeight, setFeaturedCarouselContentHeight] = useState(FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_FALLBACK);
   const [selectedDirectorySet, setSelectedDirectorySet] = useState<CommunitySet | null>(null);
-  const [isViewingSelectedSet, setIsViewingSelectedSet] = useState(false);
+  const [isDirectoryDetailOpen, setIsDirectoryDetailOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [setTitle, setSetTitle] = useState("");
   const [setDescription, setSetDescription] = useState("");
   const [setTags, setSetTags] = useState("");
   const [thumbnailPreview, setThumbnailPreview] = useState("");
+  const [detailCarouselIndex, setDetailCarouselIndex] = useState(0);
   const [reelInputs, setReelInputs] = useState<DraftReelInput[]>(() => [createDraftReelRow()]);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
   const [userSets, setUserSets] = useState<CommunitySet[]>([]);
   const [storageHydrated, setStorageHydrated] = useState(false);
+  const [portalReady, setPortalReady] = useState(false);
+  const [detailBannerLeft, setDetailBannerLeft] = useState(0);
+  const [detailBannerHeight, setDetailBannerHeight] = useState(0);
+  const [isDetailBannerCompact, setIsDetailBannerCompact] = useState(false);
+  const panelRootRef = useRef<HTMLDivElement | null>(null);
+  const detailBannerRef = useRef<HTMLDivElement | null>(null);
+  const detailContentScrollRef = useRef<HTMLDivElement | null>(null);
+  const communityScrollRef = useRef<HTMLDivElement | null>(null);
+  const activeFeaturedSlideRef = useRef<HTMLDivElement | null>(null);
+  const directoryDetailCloseTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
+    setPortalReady(true);
     setUserSets(parseStoredSets(window.localStorage.getItem(COMMUNITY_SETS_STORAGE_KEY)));
     setStorageHydrated(true);
   }, []);
@@ -430,11 +461,50 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
     window.localStorage.setItem(COMMUNITY_SETS_STORAGE_KEY, JSON.stringify(userSets.slice(0, MAX_USER_SETS)));
   }, [storageHydrated, userSets]);
 
+  const clearDirectoryDetailCloseTimer = useCallback(() => {
+    if (directoryDetailCloseTimerRef.current !== null) {
+      window.clearTimeout(directoryDetailCloseTimerRef.current);
+      directoryDetailCloseTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearDirectoryDetailCloseTimer();
+    };
+  }, [clearDirectoryDetailCloseTimer]);
+
+  const updateDetailBannerGeometry = useCallback(() => {
+    if (!panelRootRef.current) {
+      return;
+    }
+    const panelRect = panelRootRef.current.getBoundingClientRect();
+    const nextLeft = Math.max(0, Math.round(panelRect.left) - DETAIL_BANNER_LEFT_EXPANSION_PX);
+    setDetailBannerLeft((prev) => (prev === nextLeft ? prev : nextLeft));
+
+    if (!detailBannerRef.current) {
+      return;
+    }
+    const nextHeight = Math.round(detailBannerRef.current.getBoundingClientRect().height);
+    setDetailBannerHeight((prev) => (prev === nextHeight ? prev : nextHeight));
+  }, []);
+
   const allSets = useMemo(() => [...userSets, ...DEFAULT_COMMUNITY_SETS], [userSets]);
+  const featuredCarouselSets = useMemo(() => FEATURED_SETS.slice(0, 3), []);
+  const detailCarouselImages = useMemo(() => {
+    if (!selectedDirectorySet) {
+      return [];
+    }
+    const images = Array.from(
+      new Set([selectedDirectorySet.thumbnailUrl, ...DEFAULT_COMMUNITY_SETS.map((set) => set.thumbnailUrl), FALLBACK_THUMBNAIL_URL].filter(Boolean)),
+    );
+    while (images.length < DETAIL_CAROUSEL_VISIBLE_COUNT) {
+      images.push(FALLBACK_THUMBNAIL_URL);
+    }
+    return images;
+  }, [selectedDirectorySet]);
 
-  const featuredSets = useMemo(() => DEFAULT_COMMUNITY_SETS.filter((set) => set.featured), []);
-
-  const filteredSets = useMemo(() => {
+  const filteredDirectorySets = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     if (!normalized) {
       return allSets;
@@ -482,29 +552,28 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
   }, [activeCommunityCategory, communityCategories]);
 
   const categoryFilteredSets = useMemo(() => {
+    const hasQuery = query.trim().length > 0;
+    if (hasQuery) {
+      return filteredDirectorySets;
+    }
+
     if (activeCommunityCategory === "Featured") {
-      const featuredFirst = filteredSets.filter((set) => set.featured);
-      const others = filteredSets.filter((set) => !set.featured);
+      const featuredFirst = filteredDirectorySets.filter((set) => set.featured);
+      const others = filteredDirectorySets.filter((set) => !set.featured);
       return [...featuredFirst, ...others];
     }
-    const key = activeCommunityCategory.trim().toLowerCase();
-    const matched = filteredSets.filter((set) => {
-      if (set.title.toLowerCase().includes(key) || set.description.toLowerCase().includes(key)) {
+
+    const normalizedCategory = activeCommunityCategory.trim().toLowerCase();
+    return filteredDirectorySets.filter((set) => {
+      if (set.title.toLowerCase().includes(normalizedCategory)) {
         return true;
       }
-      return set.tags.some((tag) => tag.toLowerCase().includes(key));
+      if (set.description.toLowerCase().includes(normalizedCategory)) {
+        return true;
+      }
+      return set.tags.some((tag) => tag.toLowerCase().includes(normalizedCategory));
     });
-    return matched.length > 0 ? matched : filteredSets;
-  }, [activeCommunityCategory, filteredSets]);
-
-  const fallbackHeroSet = useMemo(() => categoryFilteredSets[0] ?? filteredSets[0] ?? null, [categoryFilteredSets, filteredSets]);
-
-  const featuredCarouselSets = useMemo(() => {
-    if (featuredSets.length > 0) {
-      return featuredSets.slice(0, 3);
-    }
-    return fallbackHeroSet ? [fallbackHeroSet] : [];
-  }, [fallbackHeroSet, featuredSets]);
+  }, [activeCommunityCategory, filteredDirectorySets, query]);
 
   useEffect(() => {
     if (featuredCarouselSets.length === 0) {
@@ -608,30 +677,80 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
     };
   }, [featuredTransitionStage]);
 
+  const isSearchActive = query.trim().length > 0;
+
   useEffect(() => {
-    if (!selectedDirectorySet) {
+    if (mode !== "community" || isSearchActive || featuredCarouselSets.length === 0) {
       return;
     }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setSelectedDirectorySet(null);
-        setIsViewingSelectedSet(false);
+    const measure = () => {
+      const activeSlide = activeFeaturedSlideRef.current;
+      if (!activeSlide) {
+        return;
       }
+      const slideRect = activeSlide.getBoundingClientRect();
+      const imageTarget = activeSlide.querySelector<HTMLElement>("[data-featured-image-target]");
+      const ctaButton = activeSlide.querySelector<HTMLButtonElement>("[data-featured-view-set-button]");
+      const imageBottom =
+        imageTarget && imageTarget.offsetParent !== null
+          ? imageTarget.getBoundingClientRect().bottom - slideRect.top + FEATURED_CAROUSEL_IMAGE_BOTTOM_MARGIN_PX
+          : 0;
+      const buttonBottom =
+        ctaButton && ctaButton.offsetParent !== null
+          ? ctaButton.getBoundingClientRect().bottom - slideRect.top + FEATURED_CAROUSEL_BUTTON_BOTTOM_MARGIN_PX
+          : 0;
+      const measuredHeight = Math.ceil(activeSlide.scrollHeight);
+      const nextHeight = imageBottom > 0
+        ? Math.max(FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_FALLBACK, Math.ceil(imageBottom))
+        : buttonBottom > 0
+          ? Math.max(FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_TOUCH_FALLBACK, Math.ceil(buttonBottom))
+          : Math.max(FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_FALLBACK, measuredHeight);
+      setFeaturedCarouselContentHeight((prev) => (prev === nextHeight ? prev : nextHeight));
     };
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [selectedDirectorySet]);
+    measure();
+    const rafId = window.requestAnimationFrame(measure);
+    window.addEventListener("resize", measure);
 
-  const activeFeaturedSet = featuredCarouselSets[activeFeaturedIndex] ?? fallbackHeroSet;
-
-  const directorySets = useMemo(() => {
-    if (!activeFeaturedSet) {
-      return categoryFilteredSets;
+    const resizeObserver = typeof ResizeObserver !== "undefined" && activeFeaturedSlideRef.current ? new ResizeObserver(measure) : null;
+    if (resizeObserver && activeFeaturedSlideRef.current) {
+      resizeObserver.observe(activeFeaturedSlideRef.current);
     }
-    return categoryFilteredSets.filter((set) => set.id !== activeFeaturedSet.id);
-  }, [activeFeaturedSet, categoryFilteredSets]);
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.removeEventListener("resize", measure);
+      resizeObserver?.disconnect();
+    };
+  }, [activeFeaturedIndex, featuredCarouselSets.length, featuredTransitionStage, isSearchActive, mode]);
+
+  const directorySets = categoryFilteredSets;
+  const maxDetailCarouselIndex = Math.max(0, detailCarouselImages.length - DETAIL_CAROUSEL_VISIBLE_COUNT);
+
+  const goToPreviousDetailCarousel = useCallback(() => {
+    setDetailCarouselIndex((prev) => Math.max(0, prev - 1));
+  }, []);
+
+  const goToNextDetailCarousel = useCallback(() => {
+    setDetailCarouselIndex((prev) => Math.min(maxDetailCarouselIndex, prev + 1));
+  }, [maxDetailCarouselIndex]);
+
+  const onCommunityCategoryChange = useCallback((category: string) => {
+    if (category === activeCommunityCategory) {
+      return;
+    }
+    const previousScrollTop = communityScrollRef.current?.scrollTop ?? 0;
+    setActiveCommunityCategory(category);
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      const container = communityScrollRef.current;
+      if (!container) {
+        return;
+      }
+      container.scrollTop = Math.min(previousScrollTop, container.scrollHeight - container.clientHeight);
+    });
+  }, [activeCommunityCategory]);
 
   const parsedDraftReels = useMemo<ParsedDraftReel[]>(
     () =>
@@ -759,57 +878,254 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
     setReelInputs((prev) => prev.map((row) => (row.id === rowId ? { ...row, value } : row)));
   };
 
-  const openDirectorySet = (set: CommunitySet) => {
-    setSelectedDirectorySet(set);
-    setIsViewingSelectedSet(false);
-  };
+  const closeDirectorySetModal = useCallback(() => {
+    if (!selectedDirectorySet) {
+      return;
+    }
+    clearDirectoryDetailCloseTimer();
+    setIsDetailBannerCompact(false);
+    setIsDirectoryDetailOpen(false);
+    directoryDetailCloseTimerRef.current = window.setTimeout(() => {
+      setSelectedDirectorySet(null);
+      directoryDetailCloseTimerRef.current = null;
+    }, DIRECTORY_DETAIL_TRANSITION_MS);
+  }, [clearDirectoryDetailCloseTimer, selectedDirectorySet]);
 
-  const closeDirectorySetModal = () => {
-    setSelectedDirectorySet(null);
-    setIsViewingSelectedSet(false);
-  };
+  const openDirectorySet = useCallback(
+    (set: CommunitySet) => {
+      clearDirectoryDetailCloseTimer();
+      updateDetailBannerGeometry();
+      setSelectedDirectorySet(set);
+      setIsDetailBannerCompact(false);
+      if (typeof window === "undefined") {
+        setIsDirectoryDetailOpen(true);
+        return;
+      }
+      window.requestAnimationFrame(() => {
+        setIsDirectoryDetailOpen(true);
+      });
+    },
+    [clearDirectoryDetailCloseTimer, updateDetailBannerGeometry],
+  );
+
+  useEffect(() => {
+    if (!isDirectoryDetailOpen) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        closeDirectorySetModal();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [closeDirectorySetModal, isDirectoryDetailOpen]);
+
+  useEffect(() => {
+    if (!selectedDirectorySet) {
+      setIsDetailBannerCompact(false);
+    }
+  }, [selectedDirectorySet]);
+
+  useEffect(() => {
+    setDetailCarouselIndex(0);
+  }, [selectedDirectorySet?.id]);
+
+  useEffect(() => {
+    setDetailCarouselIndex((prev) => Math.min(prev, maxDetailCarouselIndex));
+  }, [maxDetailCarouselIndex]);
+
+  useEffect(() => {
+    if (!isDirectoryDetailOpen || !selectedDirectorySet) {
+      return;
+    }
+    const el = detailContentScrollRef.current;
+    if (!el) {
+      return;
+    }
+    const onScroll = () => {
+      setIsDetailBannerCompact((prev) => {
+        const next = el.scrollTop > 0;
+        return prev === next ? prev : next;
+      });
+    };
+    onScroll();
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+    };
+  }, [isDirectoryDetailOpen, selectedDirectorySet]);
+
+  useEffect(() => {
+    if (mode !== "community" || !portalReady || !selectedDirectorySet) {
+      return;
+    }
+    const update = () => {
+      updateDetailBannerGeometry();
+    };
+    update();
+    const rafId = window.requestAnimationFrame(update);
+    window.addEventListener("resize", update);
+
+    const resizeObserver = typeof ResizeObserver !== "undefined" ? new ResizeObserver(update) : null;
+    if (resizeObserver && panelRootRef.current) {
+      resizeObserver.observe(panelRootRef.current);
+    }
+    if (resizeObserver && detailBannerRef.current) {
+      resizeObserver.observe(detailBannerRef.current);
+    }
+
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.removeEventListener("resize", update);
+      resizeObserver?.disconnect();
+    };
+  }, [isDirectoryDetailOpen, mode, portalReady, selectedDirectorySet, updateDetailBannerGeometry]);
+
+  const detailContentTopPadding = Math.max(
+    DETAIL_CONTENT_TOP_PADDING_FALLBACK,
+    detailBannerHeight + DETAIL_CONTENT_TOP_PADDING_GUTTER - DETAIL_CONTENT_TOP_PADDING_UPSHIFT_PX,
+  );
+
+  const detailBannerPortal =
+    mode === "community" && portalReady && selectedDirectorySet
+      ? createPortal(
+        <div
+          ref={detailBannerRef}
+          className={`pointer-events-none fixed top-0 z-[96] overflow-hidden border border-[#2b2b2b] bg-white/[0.04] shadow-[0_24px_60px_rgba(3,17,30,0.55),inset_0_1px_0_rgba(255,255,255,0.12)] backdrop-blur-[16px] transition-[opacity,left] duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+            isDirectoryDetailOpen ? "opacity-100" : "opacity-0 pointer-events-none"
+          }`}
+            style={{ left: `${detailBannerLeft}px`, right: 0 }}
+          >
+            <div
+              className="pointer-events-none absolute inset-0 opacity-46"
+              style={{
+                background:
+                  "radial-gradient(circle at 18% 28%, rgba(27, 133, 255, 0.72), transparent 45%), radial-gradient(circle at 84% 38%, rgba(182, 232, 255, 0.62), transparent 54%), linear-gradient(118deg, #0b5f98 0%, #0782cf 44%, #96c7d6 100%)",
+              }}
+            />
+            <div className="pointer-events-none absolute inset-0 bg-white/[0.06]" />
+            <div className="relative z-10 px-4 pt-[calc(max(env(safe-area-inset-top),0px)+24px)] sm:px-6 sm:pt-[calc(max(env(safe-area-inset-top),0px)+28px)] md:px-7 md:pt-[calc(max(env(safe-area-inset-top),0px)+34px)]">
+              <div
+                className={`overflow-hidden transition-[max-height,opacity,transform,padding] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                  isDetailBannerCompact ? "max-h-0 -translate-y-5 opacity-0 pb-0" : "max-h-[920px] translate-y-0 opacity-100 pb-12 sm:pb-14 md:pb-16"
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={closeDirectorySetModal}
+                  className="pointer-events-auto inline-flex items-center gap-2 rounded-full px-2.5 py-2 text-[13px] font-semibold text-white/90 transition hover:text-white sm:text-sm"
+                >
+                  <i className="fa-solid fa-chevron-left text-[11px] sm:text-xs" aria-hidden="true" />
+                  Community Sets
+                </button>
+
+                <div className="mt-12 flex flex-col gap-5 sm:mt-14 sm:gap-6 md:mt-16">
+                  <span className="grid h-12 w-12 place-items-center rounded-2xl bg-black/28 text-white/90 sm:h-14 sm:w-14">
+                    <i className={`${getSetIconClass(selectedDirectorySet)} text-lg sm:text-xl`} aria-hidden="true" />
+                  </span>
+
+                  <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                    <div className="min-w-0">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/70">Community Set</p>
+                      <h3 className="mt-1 text-[1.9rem] font-semibold leading-[1.08] text-white sm:text-[2.2rem] md:text-[2.8rem]">{selectedDirectorySet.title}</h3>
+                      <p className="mt-2 max-w-3xl text-sm leading-relaxed text-white/85 sm:text-[0.98rem] md:text-[1.05rem]">{selectedDirectorySet.description}</p>
+                    </div>
+
+                    <button
+                      type="button"
+                      className="pointer-events-auto inline-flex h-10 items-center justify-center self-start rounded-full bg-white px-5 text-sm font-semibold text-[#06233a] transition hover:bg-[#d9eefb] md:self-center"
+                    >
+                      View Reels
+                    </button>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex flex-wrap items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/80 sm:mt-5 sm:text-[11px]">
+                  <span className="rounded-full bg-black/28 px-2.5 py-1">{getSetReelCount(selectedDirectorySet)} reels</span>
+                  <span className="rounded-full bg-black/28 px-2.5 py-1">{formatCompact(selectedDirectorySet.learners)} learners</span>
+                  <span className="rounded-full bg-black/28 px-2.5 py-1">{formatCompact(selectedDirectorySet.likes)} likes</span>
+                  <span className="rounded-full bg-black/28 px-2.5 py-1">Curated by {selectedDirectorySet.curator}</span>
+                </div>
+              </div>
+
+              <div
+                className={`overflow-hidden ${
+                  isDetailBannerCompact
+                    ? "pointer-events-auto h-16 max-h-16 opacity-100 sm:h-20 sm:max-h-20"
+                    : "pointer-events-none h-0 max-h-0 opacity-0"
+                }`}
+              >
+                <div className="flex h-full items-center justify-between gap-3">
+                  <div className="min-w-0 flex items-center gap-2.5">
+                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-black/28 text-white/90">
+                      <i className={`${getSetIconClass(selectedDirectorySet)} text-sm`} aria-hidden="true" />
+                    </span>
+                    <p className="truncate text-[0.96rem] font-semibold text-white sm:text-[1.02rem]">{selectedDirectorySet.title}</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="pointer-events-auto inline-flex h-9 shrink-0 items-center justify-center rounded-full bg-white px-4 text-xs font-semibold text-[#06233a] transition hover:bg-[#d9eefb] sm:px-5"
+                  >
+                    View Reels
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )
+      : null;
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden px-3 pb-5 pt-14 text-white sm:px-5 sm:pb-6 md:px-7 md:pb-7 md:pt-20 lg:px-8 lg:py-7">
-      <div className="shrink-0">
-        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between md:gap-4">
-          <div className="w-full pl-5 sm:pl-6 md:w-auto md:pl-8 lg:pl-3">
-            <div className="flex items-center justify-center gap-2 md:justify-start">
-              <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">Community Sets</h2>
-              <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
-            </div>
-          </div>
-          {mode === "community" ? (
-            <label className="mx-auto block w-[calc(100%-0.25rem)] self-stretch md:mx-0 md:mr-5 md:w-[20.5rem] md:self-auto lg:mr-3 lg:w-[23rem]">
-              <div className="relative">
-                <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/45" />
-                <input
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder="Search community sets"
-                  className="h-11 w-full rounded-xl border border-white/20 bg-black/35 pl-11 pr-4 text-sm text-white outline-none placeholder:text-white/45 focus:border-white/40 sm:h-12 sm:pl-12"
-                />
+    <div
+      ref={panelRootRef}
+      className="flex h-full min-h-0 flex-col overflow-hidden px-3 pb-5 pt-14 text-white sm:px-5 sm:pb-6 md:px-7 md:pb-7 md:pt-20 lg:px-8 lg:py-7"
+    >
+      {mode === "community" ? (
+        <div className="relative min-h-0 flex-1 overflow-hidden">
+          <div
+            className={`absolute inset-0 flex min-h-0 flex-col transition-opacity duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+              isDirectoryDetailOpen ? "opacity-0 pointer-events-none" : "opacity-100"
+            }`}
+            aria-hidden={isDirectoryDetailOpen}
+          >
+            <div className="shrink-0">
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between md:gap-4">
+                <div className="w-full pl-5 sm:pl-6 md:w-auto md:pl-8 lg:pl-3">
+                  <div className="flex items-center justify-center gap-2 md:justify-start">
+                    <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">Community Sets</h2>
+                    <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
+                  </div>
+                </div>
+                <label className="mx-auto block w-[calc(100%-0.25rem)] self-stretch md:mx-0 md:mr-5 md:w-[20.5rem] md:self-auto lg:mr-3 lg:w-[23rem]">
+                  <div className="relative">
+                    <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/45" />
+                    <input
+                      value={query}
+                      onChange={(event) => setQuery(event.target.value)}
+                      placeholder="Search community sets"
+                      className="h-11 w-full rounded-xl border border-white/20 bg-black/35 pl-11 pr-4 text-sm text-white outline-none placeholder:text-white/45 focus:border-white/40 sm:h-12 sm:pl-12"
+                    />
+                  </div>
+                </label>
               </div>
-            </label>
-          ) : (
-            <p className="max-w-lg text-xs text-white/62">Build a set with unlimited reels and post it to the community feed.</p>
-          )}
-        </div>
-      </div>
+            </div>
 
-      <div className="mt-3 min-h-0 flex-1 overflow-hidden md:mt-4">
-        {mode === "community" ? (
-          <div className="balanced-scroll-gutter h-full min-h-0 space-y-4 overflow-y-auto md:space-y-5">
-            {featuredCarouselSets.length > 0 ? (
-              <section className="group/featured relative min-h-[360px] overflow-hidden rounded-[1.5rem] border border-white/15 p-4 pb-12 max-[380px]:pb-10 sm:min-h-[430px] sm:rounded-[2rem] sm:p-5 sm:pb-14 md:min-h-[500px] md:p-7 md:pb-16 lg:min-h-[520px] lg:p-8">
+            <div className="mt-3 min-h-0 flex-1 overflow-hidden md:mt-4">
+              <div ref={communityScrollRef} className="balanced-scroll-gutter h-full min-h-0 space-y-4 overflow-y-auto md:space-y-5">
+            {!isSearchActive && featuredCarouselSets.length > 0 ? (
+              <section className="group/featured relative overflow-hidden rounded-[1.5rem] border border-[#2b2b2b] bg-white/[0.04] p-4 pb-12 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] backdrop-blur-[16px] max-[380px]:pb-10 sm:rounded-[2rem] sm:p-5 sm:pb-14 md:p-7 md:pb-16 lg:p-8">
                 <div
-                  className="pointer-events-none absolute inset-0 opacity-95"
+                  className="pointer-events-none absolute inset-0 opacity-46"
                   style={{
                     background:
                       "radial-gradient(circle at 18% 28%, rgba(27, 133, 255, 0.72), transparent 45%), radial-gradient(circle at 84% 38%, rgba(182, 232, 255, 0.62), transparent 54%), linear-gradient(118deg, #0b5f98 0%, #0782cf 44%, #96c7d6 100%)",
                   }}
                 />
-                <div className="pointer-events-none absolute inset-0 bg-black/20" />
+                <div className="pointer-events-none absolute inset-0 bg-white/[0.06]" />
 
                 {featuredCarouselSets.length > 1 ? (
                   <>
@@ -824,7 +1140,7 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
                   </>
                 ) : null}
 
-                <div className="relative z-10 min-h-[285px] overflow-hidden sm:min-h-[320px] md:min-h-[410px]">
+                <div className="relative z-10 overflow-hidden" style={{ minHeight: `${featuredCarouselContentHeight}px` }}>
                   {featuredCarouselSets.map((set, index) => {
                     const isLeaving = featuredTransitionStage === "exiting" && index === leavingFeaturedIndex;
                     const isActive = index === activeFeaturedIndex && featuredTransitionStage !== "exiting" && featuredTransitionStage !== "pause";
@@ -833,19 +1149,22 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
                     }
                     const motionClass = isLeaving
                       ? featuredTransitionDirection === 1
-                        ? "animate-featured-slide-exit-forward"
-                        : "animate-featured-slide-exit-backward"
+                        ? "animate-featured-fade-exit animate-featured-slide-exit-forward"
+                        : "animate-featured-fade-exit animate-featured-slide-exit-backward"
                       : featuredTransitionStage === "entering"
                         ? featuredTransitionDirection === 1
-                          ? "animate-featured-slide-enter-forward"
-                          : "animate-featured-slide-enter-backward"
+                          ? "animate-featured-fade-enter animate-featured-slide-enter-forward"
+                          : "animate-featured-fade-enter animate-featured-slide-enter-backward"
                         : "opacity-100";
                     return (
                       <article
                         key={`${set.id}-${isLeaving ? "leaving" : "active"}`}
                         className={`absolute inset-0 ${isLeaving ? "z-10 pointer-events-none" : "z-20"} ${motionClass}`}
                       >
-                        <div className="grid min-h-[285px] gap-5 max-[380px]:gap-4 sm:min-h-[320px] sm:gap-7 md:min-h-[410px] md:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] md:items-center">
+                        <div
+                          ref={isLeaving ? null : activeFeaturedSlideRef}
+                          className="grid min-h-[285px] gap-5 max-[380px]:gap-4 sm:min-h-[320px] sm:gap-7 md:min-h-[410px] md:grid-cols-[minmax(0,1fr)_minmax(0,1.05fr)] md:items-center"
+                        >
                           <div className="flex max-w-2xl flex-col items-start text-left md:pl-2 lg:pl-8">
                             <p className="inline-flex rounded-full bg-white/12 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.1em] text-white/88">
                               Featured Set
@@ -861,6 +1180,7 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
 
                             <button
                               type="button"
+                              data-featured-view-set-button
                               className="mt-8 inline-flex w-full items-center justify-center rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black transition max-[380px]:mt-6 hover:bg-[#f1eee5] sm:mt-7 sm:w-auto sm:px-8 sm:py-3"
                             >
                               View Set
@@ -871,7 +1191,10 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
                             <div className="absolute right-8 top-2 z-20 max-w-[78%] rounded-full border border-white/35 bg-white/20 px-3 py-1.5 text-xs font-semibold text-white/92 backdrop-blur-xl lg:right-16 lg:max-w-[72%] lg:px-4 lg:py-2 lg:text-sm">
                               @{set.curator} trending this week
                             </div>
-                            <div className="absolute bottom-0 right-8 w-[84%] overflow-hidden rounded-[1.4rem] border border-white/25 bg-black/30 lg:right-12 lg:w-[80%] lg:rounded-[1.7rem]">
+                            <div
+                              data-featured-image-target
+                              className="absolute bottom-0 right-8 w-[84%] overflow-hidden rounded-[1.4rem] border border-white/25 bg-black/30 lg:right-12 lg:w-[80%] lg:rounded-[1.7rem]"
+                            >
                               <img
                                 src={set.thumbnailUrl || FALLBACK_THUMBNAIL_URL}
                                 alt={`${set.title} cover`}
@@ -903,32 +1226,40 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
               </section>
             ) : null}
 
+            {!isSearchActive ? (
             <section className="flex items-center gap-2 overflow-x-auto pb-1">
               {communityCategories.map((category) => (
                 <button
                   key={category}
                   type="button"
-                  onClick={() => setActiveCommunityCategory(category)}
+                  onClick={() => onCommunityCategoryChange(category)}
                   className={`whitespace-nowrap rounded-full px-3 py-1.5 text-xs font-medium transition-all duration-200 ease-out sm:px-4 sm:py-2 sm:text-sm ${
                     activeCommunityCategory === category
                       ? "bg-white text-black"
-                      : "bg-black/30 text-white/75 hover:bg-white/10 hover:text-white"
+                      : "bg-black/30 text-white/75 hover:bg-white/20 hover:text-white hover:backdrop-blur-sm"
                   }`}
                 >
                   {category}
                 </button>
               ))}
             </section>
+            ) : null}
 
-            <section>
+            <section className="relative overflow-hidden rounded-2xl bg-transparent px-3 py-3 backdrop-blur-[6px] sm:px-4 sm:py-3.5">
+              <div className="pointer-events-none absolute inset-0 bg-white/[0.08]" />
+              <div className="relative z-10">
               <div className="mb-2 flex items-center justify-between">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/60">Community Directory</p>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/60">
+                  {isSearchActive ? "Search Results" : "Community Directory"}
+                </p>
                 <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-white/45">{directorySets.length} sets</p>
               </div>
               {directorySets.length === 0 ? (
-                <p className="rounded-xl bg-black/40 px-3 py-4 text-sm text-white/65">No sets matched that search.</p>
+                <p className="px-3 py-4 text-sm text-white/65">
+                  {isSearchActive ? "No sets matched your search." : "No sets matched that search."}
+                </p>
               ) : (
-                <div className="grid gap-2.5 md:grid-cols-2 md:gap-x-4 md:gap-y-3 lg:gap-x-10">
+                <div className={isSearchActive ? "flex flex-col gap-2.5" : "grid gap-2.5 md:grid-cols-2 md:gap-x-4 md:gap-y-3 lg:gap-x-10"}>
                   {directorySets.map((set) => {
                     const reelCount = getSetReelCount(set);
                     return (
@@ -936,7 +1267,7 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
                         type="button"
                         key={set.id}
                         onClick={() => openDirectorySet(set)}
-                        className="group relative flex w-full items-center gap-2.5 rounded-xl bg-black/20 px-3 py-3 text-left backdrop-blur-md transition-all duration-200 ease-out hover:bg-white/10 sm:gap-3 sm:rounded-2xl"
+                        className="group relative flex w-full items-center gap-2.5 rounded-xl bg-[#1c1c1c] px-3 py-3 text-left transition-all duration-200 ease-out hover:bg-[#121212] sm:gap-3 sm:rounded-2xl"
                       >
                         <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-black/30 text-white/82 transition-colors duration-200 group-hover:text-white sm:h-10 sm:w-10 sm:rounded-xl">
                           <i className="fa-regular fa-square text-sm sm:text-base" aria-hidden="true" />
@@ -959,10 +1290,117 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
                   })}
                 </div>
               )}
+              </div>
             </section>
+              </div>
+            </div>
           </div>
-        ) : (
-          <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto">
+
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-label={selectedDirectorySet ? `${selectedDirectorySet.title} details` : "Community set details"}
+            className={`absolute inset-0 flex min-h-0 flex-col transition-opacity duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+              isDirectoryDetailOpen ? "opacity-100" : "opacity-0 pointer-events-none"
+            }`}
+          >
+            {selectedDirectorySet ? (
+              <div
+                ref={detailContentScrollRef}
+                className="balanced-scroll-gutter min-h-0 flex-1 overflow-y-auto pb-2"
+                style={{ paddingTop: detailContentTopPadding }}
+              >
+                <div className="px-1 sm:px-2 md:px-3">
+                  <section className="rounded-2xl px-4 py-4 sm:px-5 sm:py-5">
+                    <div className="flex items-center justify-between gap-3">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/65">Set Preview</p>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={goToPreviousDetailCarousel}
+                          disabled={detailCarouselIndex === 0}
+                          aria-label="Previous images"
+                          className="grid h-8 w-8 place-items-center rounded-full bg-black/45 text-white/80 transition hover:bg-black/60 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+                        >
+                          <i className="fa-solid fa-chevron-left text-[10px]" aria-hidden="true" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={goToNextDetailCarousel}
+                          disabled={detailCarouselIndex >= maxDetailCarouselIndex}
+                          aria-label="Next images"
+                          className="grid h-8 w-8 place-items-center rounded-full bg-black/45 text-white/80 transition hover:bg-black/60 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
+                        >
+                          <i className="fa-solid fa-chevron-right text-[10px]" aria-hidden="true" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 overflow-hidden rounded-xl">
+                      <div
+                        className="flex transition-transform duration-300 ease-out"
+                        style={{
+                          width: `${(detailCarouselImages.length / DETAIL_CAROUSEL_VISIBLE_COUNT) * 100}%`,
+                          transform: `translateX(-${(detailCarouselIndex * 100) / detailCarouselImages.length}%)`,
+                        }}
+                      >
+                        {detailCarouselImages.map((image, index) => (
+                          <div
+                            key={`${selectedDirectorySet.id}-detail-carousel-image-${index}`}
+                            className="shrink-0 px-1 py-1"
+                            style={{ width: `${100 / detailCarouselImages.length}%` }}
+                          >
+                            <img
+                              src={image}
+                              alt={`${selectedDirectorySet.title} preview ${index + 1}`}
+                              className="h-[180px] w-full rounded-lg object-cover sm:h-[220px] md:h-[260px]"
+                            />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </section>
+
+                  <section className="mt-4 rounded-2xl px-4 py-4 sm:px-5 sm:py-5">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/65">Information</p>
+                    {selectedDirectorySet.tags.length > 0 ? (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {selectedDirectorySet.tags.map((tag) => (
+                          <span key={`${selectedDirectorySet.id}-tag-${tag}`} className="rounded-full bg-white/10 px-2.5 py-1 text-[11px] text-white/72">
+                            #{tag}
+                          </span>
+                        ))}
+                      </div>
+                    ) : null}
+                    <div className="mt-3 space-y-3">
+                      {DETAIL_LOREM_PARAGRAPHS.map((paragraph, index) => (
+                        <p key={`${selectedDirectorySet.id}-detail-lorem-${index}`} className="text-sm leading-relaxed text-white/78">
+                          {paragraph}
+                        </p>
+                      ))}
+                    </div>
+                  </section>
+                </div>
+              </div>
+            ) : null}
+          </section>
+        </div>
+      ) : (
+        <>
+          <div className="shrink-0">
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between md:gap-4">
+              <div className="w-full pl-5 sm:pl-6 md:w-auto md:pl-8 lg:pl-3">
+                <div className="flex items-center justify-center gap-2 md:justify-start">
+                  <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">Community Sets</h2>
+                  <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
+                </div>
+              </div>
+              <p className="max-w-lg text-xs text-white/62">Build a set with unlimited reels and post it to the community feed.</p>
+            </div>
+          </div>
+
+          <div className="mt-3 min-h-0 flex-1 overflow-hidden md:mt-4">
+            <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto">
             <section className="rounded-3xl p-2 sm:p-4 md:p-6">
               <div className="mb-5">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/68">Create A Set</p>
@@ -1009,7 +1447,7 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
                         className="group relative block h-[120px] w-full max-w-[220px] cursor-pointer overflow-hidden rounded-xl border border-dashed border-white/15 bg-black/55 sm:h-[90px] sm:w-[140px] sm:max-w-none"
                       >
                         <img
-                          src={thumbnailPreview || USER_SET_THUMBNAILS[0] || FALLBACK_THUMBNAIL_URL}
+                          src={thumbnailPreview || FALLBACK_THUMBNAIL_URL}
                           alt="Set thumbnail preview"
                           className={`h-full w-full object-cover transition ${thumbnailPreview ? "opacity-100" : "opacity-55 group-hover:opacity-75"}`}
                         />
@@ -1110,107 +1548,10 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
               </form>
             </section>
           </div>
-        )}
-      </div>
-
-      {selectedDirectorySet ? (
-        <div className="fixed inset-0 z-[120] flex items-end justify-center p-0 sm:p-4 md:items-center md:p-8">
-          <button type="button" aria-label="Close set details" onClick={closeDirectorySetModal} className="absolute inset-0 bg-black/82" />
-          <section
-            role="dialog"
-            aria-modal="true"
-            aria-label={`${selectedDirectorySet.title} details`}
-            className="relative z-10 flex max-h-[92dvh] w-full max-w-3xl flex-col overflow-hidden rounded-t-3xl border border-white/18 bg-black/96 sm:max-h-[88vh] sm:rounded-3xl"
-          >
-            <div className="flex items-start justify-between gap-4 px-4 pb-4 pt-5 sm:px-5 md:px-6 md:pt-6">
-              <div className="min-w-0">
-                <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/58">Community Set</p>
-                <h3 className="mt-1 truncate text-lg font-semibold text-white sm:text-xl md:text-2xl">{selectedDirectorySet.title}</h3>
-              </div>
-              <button
-                type="button"
-                onClick={closeDirectorySetModal}
-                aria-label="Close set details"
-                className="grid h-8 w-8 place-items-center rounded-lg border border-white/20 text-white/78 transition hover:text-white"
-              >
-                <i className="fa-solid fa-xmark text-sm" aria-hidden="true" />
-              </button>
-            </div>
-
-            {!isViewingSelectedSet ? (
-              <div className="balanced-scroll-gutter min-h-0 space-y-4 overflow-y-auto px-4 pb-2 sm:px-5 md:px-6">
-                <div className="grid gap-4 md:grid-cols-[180px_minmax(0,1fr)]">
-                  <div className="h-[180px] overflow-hidden rounded-2xl border border-white/15 bg-black/45 md:h-auto">
-                    <img src={selectedDirectorySet.thumbnailUrl || FALLBACK_THUMBNAIL_URL} alt={`${selectedDirectorySet.title} thumbnail`} className="h-full w-full object-cover" />
-                  </div>
-                  <div className="space-y-3">
-                    <p className="text-sm leading-relaxed text-white/82">{selectedDirectorySet.description}</p>
-                    <div className="flex flex-wrap gap-2 text-[11px] text-white/72">
-                      <span className="rounded-full bg-white/10 px-2.5 py-1">{getSetReelCount(selectedDirectorySet)} reels</span>
-                      <span className="rounded-full bg-white/10 px-2.5 py-1">{formatCompact(selectedDirectorySet.learners)} learners</span>
-                      <span className="rounded-full bg-white/10 px-2.5 py-1">{formatCompact(selectedDirectorySet.likes)} likes</span>
-                      <span className="rounded-full bg-white/10 px-2.5 py-1">Curated by {selectedDirectorySet.curator}</span>
-                    </div>
-                    <p className="text-xs text-white/56">{selectedDirectorySet.updatedLabel}</p>
-                  </div>
-                </div>
-
-                {selectedDirectorySet.tags.length > 0 ? (
-                  <div className="flex flex-wrap gap-2">
-                    {selectedDirectorySet.tags.map((tag) => (
-                      <span key={`${selectedDirectorySet.id}-tag-${tag}`} className="rounded-full bg-black/55 px-2.5 py-1 text-[11px] text-white/68">
-                        #{tag}
-                      </span>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="balanced-scroll-gutter min-h-0 space-y-3 overflow-y-auto px-4 pb-2 sm:px-5 md:px-6">
-                {selectedDirectorySet.reels.length === 0 ? (
-                  <p className="rounded-2xl bg-white/6 px-4 py-5 text-sm text-white/68">No embedded reels were added to this set yet.</p>
-                ) : (
-                  selectedDirectorySet.reels.map((reel) => (
-                    <article key={reel.id} className="overflow-hidden rounded-2xl border border-white/12 bg-black/55">
-                      <div className="flex items-center gap-2 px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/70">
-                        <i className={PLATFORM_ICON[reel.platform]} aria-hidden="true" />
-                        {PLATFORM_LABEL[reel.platform]}
-                      </div>
-                      <iframe
-                        src={reel.embedUrl}
-                        title={`${selectedDirectorySet.title} reel`}
-                        className="h-[200px] w-full border-0 sm:h-[220px]"
-                        loading="lazy"
-                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                        allowFullScreen
-                      />
-                    </article>
-                  ))
-                )}
-              </div>
-            )}
-
-            <div className="mt-3 flex flex-col-reverse gap-2 border-t border-white/10 px-4 py-4 sm:flex-row sm:items-center sm:justify-end sm:px-5 md:px-6">
-              {isViewingSelectedSet ? (
-                <button
-                  type="button"
-                  onClick={() => setIsViewingSelectedSet(false)}
-                  className="inline-flex h-10 w-full items-center justify-center rounded-xl border border-white/20 px-4 text-xs font-semibold uppercase tracking-[0.08em] text-white/85 transition hover:text-white sm:w-auto"
-                >
-                  Back To Details
-                </button>
-              ) : null}
-              <button
-                type="button"
-                onClick={() => setIsViewingSelectedSet(true)}
-                className="inline-flex h-10 w-full items-center justify-center rounded-xl border border-white/20 bg-white px-4 text-xs font-semibold uppercase tracking-[0.08em] text-black transition hover:bg-[#f1eee5] sm:w-auto"
-              >
-                View This Reel Set
-              </button>
-            </div>
-          </section>
         </div>
-      ) : null}
+      </>
+    )}
+      {detailBannerPortal}
     </div>
   );
 }
