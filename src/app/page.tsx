@@ -119,6 +119,7 @@ export default function HomePage() {
   const [mobileSidebarClosing, setMobileSidebarClosing] = useState(false);
   const [topChromeOffset, setTopChromeOffset] = useState(false);
   const [topChromeGestureActive, setTopChromeGestureActive] = useState(false);
+  const [searchPanelScrollable, setSearchPanelScrollable] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
   const [communityDetailOpen, setCommunityDetailOpen] = useState(false);
@@ -220,13 +221,16 @@ export default function HomePage() {
     if (typeof window === "undefined") {
       return;
     }
+    if (activeSidebarTab === "search" && !searchPanelScrollable) {
+      return;
+    }
     clearTopChromeGestureTimer();
     setTopChromeGestureActive(true);
     topChromeGestureTimerRef.current = window.setTimeout(() => {
       setTopChromeGestureActive(false);
       topChromeGestureTimerRef.current = null;
     }, TOP_CHROME_GESTURE_WINDOW_MS);
-  }, [clearTopChromeGestureTimer]);
+  }, [activeSidebarTab, clearTopChromeGestureTimer, searchPanelScrollable]);
 
   const clearSidebarInfoTooltipTimers = useCallback(() => {
     if (sidebarInfoTooltipShowTimerRef.current !== null) {
@@ -377,12 +381,28 @@ export default function HomePage() {
     }
   }, [activeSidebarTab, clearTopChromeGestureTimer]);
 
+  const onSearchPanelScrollabilityChange = useCallback((isScrollable: boolean) => {
+    setSearchPanelScrollable((prev) => (prev === isScrollable ? prev : isScrollable));
+    if (!isScrollable) {
+      setTopChromeOffset(false);
+      clearTopChromeGestureTimer();
+      setTopChromeGestureActive(false);
+    }
+  }, [clearTopChromeGestureTimer]);
+
   useEffect(() => {
     if (activeSidebarTab === "search") {
       setTopChromeOffset(false);
       setTopChromeGestureActive(false);
     }
   }, [activeSidebarTab]);
+
+  const shouldShowTopChromeStrip = !mobileSidebarOpen
+    && (
+      activeSidebarTab === "search"
+        ? searchPanelScrollable && (topChromeOffset || topChromeGestureActive)
+        : topChromeOffset
+    );
 
   const openMaterialFeed = useCallback(
     (materialId: string) => {
@@ -726,7 +746,7 @@ export default function HomePage() {
         className={`pointer-events-none fixed inset-x-0 top-0 z-[68] h-[calc(max(env(safe-area-inset-top),0px)+68px)] ${
           activeSidebarTab === "search" ? "transition-none" : "transition-opacity duration-150"
         } lg:hidden ${
-          (topChromeOffset || topChromeGestureActive) && !mobileSidebarOpen ? "opacity-100" : "opacity-0"
+          shouldShowTopChromeStrip ? "opacity-100" : "opacity-0"
         }`}
       >
         <div
@@ -839,6 +859,7 @@ export default function HomePage() {
               onMaterialCreated={onUploadMaterialCreated}
               onScrollOffsetChange={onSearchPanelScrollOffsetChange}
               onScrollGesture={triggerTopChromeGesture}
+              onScrollabilityChange={onSearchPanelScrollabilityChange}
             />
           </div>
           <div className={activeSidebarTab === "search" ? "hidden h-full min-h-0" : "h-full min-h-0"}>

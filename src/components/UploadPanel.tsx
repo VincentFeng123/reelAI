@@ -119,6 +119,7 @@ type UploadPanelProps = {
   }) => void | Promise<void>;
   onScrollOffsetChange?: (isOffset: boolean) => void;
   onScrollGesture?: () => void;
+  onScrollabilityChange?: (isScrollable: boolean) => void;
 };
 
 function buildMaterialTitle(params: { topic: string; text: string; fileName: string }): string {
@@ -136,9 +137,10 @@ function buildMaterialTitle(params: { topic: string; text: string; fileName: str
   return "New Study Session";
 }
 
-export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollGesture }: UploadPanelProps) {
+export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollGesture, onScrollabilityChange }: UploadPanelProps) {
   const router = useRouter();
   const touchStartYRef = useRef<number | null>(null);
+  const formRef = useRef<HTMLFormElement | null>(null);
   const [topics, setTopics] = useState<string[]>([""]);
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | undefined>();
@@ -287,11 +289,50 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
     }
   };
 
+  const reportScrollability = useCallback(() => {
+    const element = formRef.current;
+    if (!element) {
+      return;
+    }
+    const isScrollable = element.scrollHeight - element.clientHeight > 1;
+    onScrollabilityChange?.(isScrollable);
+    if (!isScrollable) {
+      onScrollOffsetChange?.(false);
+    }
+  }, [onScrollOffsetChange, onScrollabilityChange]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    reportScrollability();
+    const element = formRef.current;
+    if (!element) {
+      return;
+    }
+    const onResize = () => {
+      reportScrollability();
+    };
+    window.addEventListener("resize", onResize);
+    const observer = typeof ResizeObserver !== "undefined" ? new ResizeObserver(onResize) : null;
+    observer?.observe(element);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      observer?.disconnect();
+    };
+  }, [reportScrollability]);
+
+  useEffect(() => {
+    reportScrollability();
+  }, [inputMode, reportScrollability, topics.length, text, selectedFileName, error]);
+
   return (
     <form
+      ref={formRef}
       onSubmit={onSubmit}
       onWheelCapture={(event) => {
-        if (event.deltaY > 0) {
+        const isScrollable = event.currentTarget.scrollHeight - event.currentTarget.clientHeight > 1;
+        if (isScrollable && event.deltaY > 0) {
           onScrollGesture?.();
         }
       }}
@@ -305,7 +346,8 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         if (startY === null || !nextTouch) {
           return;
         }
-        if (startY - nextTouch.clientY > 0) {
+        const isScrollable = event.currentTarget.scrollHeight - event.currentTarget.clientHeight > 1;
+        if (isScrollable && startY - nextTouch.clientY > 0) {
           onScrollGesture?.();
         }
       }}
@@ -313,10 +355,12 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         touchStartYRef.current = null;
       }}
       onScrollCapture={(event) => {
-        onScrollOffsetChange?.(event.currentTarget.scrollTop > 0);
+        const isScrollable = event.currentTarget.scrollHeight - event.currentTarget.clientHeight > 1;
+        onScrollOffsetChange?.(isScrollable && event.currentTarget.scrollTop > 0);
       }}
       onScroll={(event) => {
-        onScrollOffsetChange?.(event.currentTarget.scrollTop > 0);
+        const isScrollable = event.currentTarget.scrollHeight - event.currentTarget.clientHeight > 1;
+        onScrollOffsetChange?.(isScrollable && event.currentTarget.scrollTop > 0);
       }}
       className="flex h-full w-full flex-col justify-center overflow-x-visible overflow-y-auto px-6 py-6 md:overflow-hidden md:px-10 md:py-8 lg:px-5"
     >

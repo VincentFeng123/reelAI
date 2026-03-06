@@ -1005,26 +1005,26 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
           ref={detailBannerRef}
           className={`pointer-events-none fixed top-0 z-[96] overflow-hidden bg-transparent ${
             isDetailBannerCompact ? "backdrop-blur-[10px]" : "backdrop-blur-[4px]"
-          } transition-[opacity,left] duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+          } transition-[opacity,left,backdrop-filter] duration-[560ms] ease-[cubic-bezier(0.25,0.1,0.25,1)] ${
             isDirectoryDetailOpen ? "opacity-100" : "opacity-0 pointer-events-none"
           }`}
             style={{ left: `${detailBannerLeft + 3}px`, right: 0 }}
           >
             <div
-              className={`pointer-events-none absolute inset-0 bg-white/[0.04] transition-opacity duration-[300ms] ${
+              className={`pointer-events-none absolute inset-0 bg-white/[0.04] transition-opacity duration-[420ms] ease-out ${
                 isDetailBannerCompact ? "opacity-0" : "opacity-100"
               }`}
             />
             <div
-              className={`relative z-10 transition-[padding] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+              className={`relative z-10 transition-[padding] duration-[840ms] ease-[cubic-bezier(0.2,0.85,0.25,1)] ${
                 isDetailBannerCompact
                   ? "px-4 pt-4 sm:px-6 sm:pt-4 md:px-7"
                   : "px-4 pt-[calc(max(env(safe-area-inset-top),0px)+24px)] sm:px-6 sm:pt-[calc(max(env(safe-area-inset-top),0px)+28px)] md:px-7 md:pt-[calc(max(env(safe-area-inset-top),0px)+34px)]"
               }`}
             >
               <div
-                className={`overflow-hidden transition-[max-height,opacity,transform,padding] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                  isDetailBannerCompact ? "max-h-0 -translate-y-5 opacity-0 pb-0" : "max-h-[920px] translate-y-0 opacity-100 pb-12 sm:pb-14 md:pb-16"
+                className={`overflow-hidden will-change-[max-height,transform,opacity] transition-[max-height,opacity,transform,padding] duration-[840ms] ease-[cubic-bezier(0.2,0.85,0.25,1)] ${
+                  isDetailBannerCompact ? "max-h-0 -translate-y-3 opacity-0 pb-0" : "max-h-[920px] translate-y-0 opacity-100 pb-12 sm:pb-14 md:pb-16"
                 }`}
               >
                 <button
@@ -1066,10 +1066,10 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
               </div>
 
               <div
-                className={`overflow-hidden ${
+                className={`overflow-hidden transition-[max-height,opacity,transform,backdrop-filter] duration-[640ms] ease-[cubic-bezier(0.2,0.85,0.25,1)] ${
                   isDetailBannerCompact
-                    ? "pointer-events-auto h-16 max-h-16 rounded-2xl border border-white/20 bg-white/[0.03] opacity-100 backdrop-blur-[10px] sm:h-20 sm:max-h-20"
-                    : "pointer-events-none h-0 max-h-0 opacity-0"
+                    ? "pointer-events-auto h-16 max-h-16 translate-y-0 rounded-2xl border border-white/20 bg-white/[0.03] opacity-100 backdrop-blur-[10px] sm:h-20 sm:max-h-20"
+                    : "pointer-events-none h-0 max-h-0 -translate-y-2 opacity-0"
                 }`}
               >
                 <div className="mx-auto flex h-full w-full max-w-none items-center justify-between gap-3 px-3 sm:px-4">
