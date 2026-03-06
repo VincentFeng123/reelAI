@@ -409,11 +409,13 @@ type CommunityReelsPanelMode = "community" | "create";
 
 type CommunityReelsPanelProps = {
   mode?: CommunityReelsPanelMode;
+  isVisible?: boolean;
+  onDetailOpenChange?: (isOpen: boolean) => void;
 };
 
 type FeaturedTransitionStage = "idle" | "exiting" | "pause" | "entering";
 
-export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelProps) {
+export function CommunityReelsPanel({ mode = "community", isVisible = true, onDetailOpenChange }: CommunityReelsPanelProps) {
   const [activeCommunityCategory, setActiveCommunityCategory] = useState("Featured");
   const [activeFeaturedIndex, setActiveFeaturedIndex] = useState(0);
   const [leavingFeaturedIndex, setLeavingFeaturedIndex] = useState<number | null>(null);
@@ -924,6 +926,13 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
   }, [closeDirectorySetModal, isDirectoryDetailOpen]);
 
   useEffect(() => {
+    if (!onDetailOpenChange) {
+      return;
+    }
+    onDetailOpenChange(mode === "community" && isVisible && isDirectoryDetailOpen);
+  }, [isDirectoryDetailOpen, isVisible, mode, onDetailOpenChange]);
+
+  useEffect(() => {
     if (!selectedDirectorySet) {
       setIsDetailBannerCompact(false);
     }
@@ -938,7 +947,7 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
   }, [maxDetailCarouselIndex]);
 
   useEffect(() => {
-    if (!isDirectoryDetailOpen || !selectedDirectorySet) {
+    if (mode !== "community" || !isDirectoryDetailOpen || !selectedDirectorySet) {
       return;
     }
     const el = detailContentScrollRef.current;
@@ -956,7 +965,7 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
     return () => {
       el.removeEventListener("scroll", onScroll);
     };
-  }, [isDirectoryDetailOpen, selectedDirectorySet]);
+  }, [isDirectoryDetailOpen, mode, selectedDirectorySet]);
 
   useEffect(() => {
     if (mode !== "community" || !portalReady || !selectedDirectorySet) {
@@ -990,24 +999,29 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
   );
 
   const detailBannerPortal =
-    mode === "community" && portalReady && selectedDirectorySet
+    mode === "community" && isVisible && portalReady && selectedDirectorySet
       ? createPortal(
         <div
           ref={detailBannerRef}
-          className={`pointer-events-none fixed top-0 z-[96] overflow-hidden border border-[#2b2b2b] bg-white/[0.04] shadow-[0_24px_60px_rgba(3,17,30,0.55),inset_0_1px_0_rgba(255,255,255,0.12)] backdrop-blur-[16px] transition-[opacity,left] duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+          className={`pointer-events-none fixed top-0 z-[96] overflow-hidden bg-transparent ${
+            isDetailBannerCompact ? "backdrop-blur-[10px]" : "backdrop-blur-[4px]"
+          } transition-[opacity,left] duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
             isDirectoryDetailOpen ? "opacity-100" : "opacity-0 pointer-events-none"
           }`}
-            style={{ left: `${detailBannerLeft}px`, right: 0 }}
+            style={{ left: `${detailBannerLeft + 3}px`, right: 0 }}
           >
             <div
-              className="pointer-events-none absolute inset-0 opacity-46"
-              style={{
-                background:
-                  "radial-gradient(circle at 18% 28%, rgba(27, 133, 255, 0.72), transparent 45%), radial-gradient(circle at 84% 38%, rgba(182, 232, 255, 0.62), transparent 54%), linear-gradient(118deg, #0b5f98 0%, #0782cf 44%, #96c7d6 100%)",
-              }}
+              className={`pointer-events-none absolute inset-0 bg-white/[0.04] transition-opacity duration-[300ms] ${
+                isDetailBannerCompact ? "opacity-0" : "opacity-100"
+              }`}
             />
-            <div className="pointer-events-none absolute inset-0 bg-white/[0.06]" />
-            <div className="relative z-10 px-4 pt-[calc(max(env(safe-area-inset-top),0px)+24px)] sm:px-6 sm:pt-[calc(max(env(safe-area-inset-top),0px)+28px)] md:px-7 md:pt-[calc(max(env(safe-area-inset-top),0px)+34px)]">
+            <div
+              className={`relative z-10 transition-[padding] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                isDetailBannerCompact
+                  ? "px-4 pt-4 sm:px-6 sm:pt-4 md:px-7"
+                  : "px-4 pt-[calc(max(env(safe-area-inset-top),0px)+24px)] sm:px-6 sm:pt-[calc(max(env(safe-area-inset-top),0px)+28px)] md:px-7 md:pt-[calc(max(env(safe-area-inset-top),0px)+34px)]"
+              }`}
+            >
               <div
                 className={`overflow-hidden transition-[max-height,opacity,transform,padding] duration-[760ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
                   isDetailBannerCompact ? "max-h-0 -translate-y-5 opacity-0 pb-0" : "max-h-[920px] translate-y-0 opacity-100 pb-12 sm:pb-14 md:pb-16"
@@ -1016,7 +1030,7 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
                 <button
                   type="button"
                   onClick={closeDirectorySetModal}
-                  className="pointer-events-auto inline-flex items-center gap-2 rounded-full px-2.5 py-2 text-[13px] font-semibold text-white/90 transition hover:text-white sm:text-sm"
+                  className="pointer-events-auto mt-1 inline-flex items-center gap-2 rounded-full px-2.5 py-2 text-[13px] font-semibold text-white/90 transition hover:text-white sm:text-sm"
                 >
                   <i className="fa-solid fa-chevron-left text-[11px] sm:text-xs" aria-hidden="true" />
                   Community Sets
@@ -1054,12 +1068,12 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
               <div
                 className={`overflow-hidden ${
                   isDetailBannerCompact
-                    ? "pointer-events-auto h-16 max-h-16 opacity-100 sm:h-20 sm:max-h-20"
+                    ? "pointer-events-auto h-16 max-h-16 rounded-2xl border border-white/20 bg-white/[0.03] opacity-100 backdrop-blur-[10px] sm:h-20 sm:max-h-20"
                     : "pointer-events-none h-0 max-h-0 opacity-0"
                 }`}
               >
-                <div className="flex h-full items-center justify-between gap-3">
-                  <div className="min-w-0 flex items-center gap-2.5">
+                <div className="mx-auto flex h-full w-full max-w-none items-center justify-between gap-3 px-3 sm:px-4">
+                  <div className="ml-1 min-w-0 max-w-[62%] flex items-center gap-2.5 sm:ml-2">
                     <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-black/28 text-white/90">
                       <i className={`${getSetIconClass(selectedDirectorySet)} text-sm`} aria-hidden="true" />
                     </span>
@@ -1067,7 +1081,7 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
                   </div>
                   <button
                     type="button"
-                    className="pointer-events-auto inline-flex h-9 shrink-0 items-center justify-center rounded-full bg-white px-4 text-xs font-semibold text-[#06233a] transition hover:bg-[#d9eefb] sm:px-5"
+                    className="pointer-events-auto mr-2 inline-flex h-9 shrink-0 items-center justify-center rounded-full bg-white px-4 text-xs font-semibold text-[#06233a] transition hover:bg-[#d9eefb] sm:mr-3 sm:px-5"
                   >
                     View Reels
                   </button>
@@ -1117,15 +1131,8 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
             <div className="mt-3 min-h-0 flex-1 overflow-hidden md:mt-4">
               <div ref={communityScrollRef} className="balanced-scroll-gutter h-full min-h-0 space-y-4 overflow-y-auto md:space-y-5">
             {!isSearchActive && featuredCarouselSets.length > 0 ? (
-              <section className="group/featured relative overflow-hidden rounded-[1.5rem] border border-[#2b2b2b] bg-white/[0.04] p-4 pb-12 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] backdrop-blur-[16px] max-[380px]:pb-10 sm:rounded-[2rem] sm:p-5 sm:pb-14 md:p-7 md:pb-16 lg:p-8">
-                <div
-                  className="pointer-events-none absolute inset-0 opacity-46"
-                  style={{
-                    background:
-                      "radial-gradient(circle at 18% 28%, rgba(27, 133, 255, 0.72), transparent 45%), radial-gradient(circle at 84% 38%, rgba(182, 232, 255, 0.62), transparent 54%), linear-gradient(118deg, #0b5f98 0%, #0782cf 44%, #96c7d6 100%)",
-                  }}
-                />
-                <div className="pointer-events-none absolute inset-0 bg-white/[0.06]" />
+              <section className="group/featured relative overflow-hidden rounded-[1.5rem] border border-[#2b2b2b] bg-transparent p-4 pb-12 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] backdrop-blur-[4px] max-[380px]:pb-10 sm:rounded-[2rem] sm:p-5 sm:pb-14 md:p-7 md:pb-16 lg:p-8">
+                <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
 
                 {featuredCarouselSets.length > 1 ? (
                   <>
@@ -1245,8 +1252,8 @@ export function CommunityReelsPanel({ mode = "community" }: CommunityReelsPanelP
             </section>
             ) : null}
 
-            <section className="relative overflow-hidden rounded-2xl bg-transparent px-3 py-3 backdrop-blur-[6px] sm:px-4 sm:py-3.5">
-              <div className="pointer-events-none absolute inset-0 bg-white/[0.08]" />
+            <section className="relative overflow-hidden rounded-2xl bg-transparent px-3 py-3 backdrop-blur-[3px] sm:px-4 sm:py-3.5">
+              <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
               <div className="relative z-10">
               <div className="mb-2 flex items-center justify-between">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/60">

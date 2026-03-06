@@ -15,6 +15,7 @@ const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const MAX_HISTORY_ITEMS = 120;
 const MOBILE_SIDEBAR_CLOSE_MS = 260;
+const TOP_CHROME_GESTURE_WINDOW_MS = 220;
 const SIDEBAR_INFO_TOOLTIP_DELAY_MS = 1000;
 const SIDEBAR_INFO_TOOLTIP_VISIBLE_MS = 2200;
 const SIDEBAR_INFO_TOOLTIP_FADE_MS = 180;
@@ -117,8 +118,10 @@ export default function HomePage() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [mobileSidebarClosing, setMobileSidebarClosing] = useState(false);
   const [topChromeOffset, setTopChromeOffset] = useState(false);
+  const [topChromeGestureActive, setTopChromeGestureActive] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
+  const [communityDetailOpen, setCommunityDetailOpen] = useState(false);
   const [sidebarInfoTooltip, setSidebarInfoTooltip] = useState<{ text: string; left: number; top: number; visible: boolean; align: "left" | "right" } | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const historyRef = useRef<HistoryItem[]>([]);
@@ -127,6 +130,7 @@ export default function HomePage() {
   const sidebarInfoTooltipHideTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipDismissTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipAnimateInTimerRef = useRef<number | null>(null);
+  const topChromeGestureTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -205,6 +209,25 @@ export default function HomePage() {
     }
   }, []);
 
+  const clearTopChromeGestureTimer = useCallback(() => {
+    if (topChromeGestureTimerRef.current !== null) {
+      window.clearTimeout(topChromeGestureTimerRef.current);
+      topChromeGestureTimerRef.current = null;
+    }
+  }, []);
+
+  const triggerTopChromeGesture = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    clearTopChromeGestureTimer();
+    setTopChromeGestureActive(true);
+    topChromeGestureTimerRef.current = window.setTimeout(() => {
+      setTopChromeGestureActive(false);
+      topChromeGestureTimerRef.current = null;
+    }, TOP_CHROME_GESTURE_WINDOW_MS);
+  }, [clearTopChromeGestureTimer]);
+
   const clearSidebarInfoTooltipTimers = useCallback(() => {
     if (sidebarInfoTooltipShowTimerRef.current !== null) {
       window.clearTimeout(sidebarInfoTooltipShowTimerRef.current);
@@ -224,9 +247,21 @@ export default function HomePage() {
     }
   }, []);
 
+  const shouldDisableSidebarTooltips = useCallback(() => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    return window.matchMedia("(max-width: 1023px), (hover: none), (pointer: coarse)").matches;
+  }, []);
+
   const onSidebarInfoHoverStart = useCallback(
     (event: ReactMouseEvent<HTMLElement>, text: string, align: "left" | "right" = "left") => {
       if (typeof window === "undefined") {
+        return;
+      }
+      if (shouldDisableSidebarTooltips()) {
+        clearSidebarInfoTooltipTimers();
+        setSidebarInfoTooltip(null);
         return;
       }
       const rect = event.currentTarget.getBoundingClientRect();
@@ -253,10 +288,15 @@ export default function HomePage() {
         }, SIDEBAR_INFO_TOOLTIP_VISIBLE_MS);
       }, SIDEBAR_INFO_TOOLTIP_DELAY_MS);
     },
-    [clearSidebarInfoTooltipTimers],
+    [clearSidebarInfoTooltipTimers, shouldDisableSidebarTooltips],
   );
 
   const onSidebarInfoHoverEnd = useCallback(() => {
+    if (shouldDisableSidebarTooltips()) {
+      clearSidebarInfoTooltipTimers();
+      setSidebarInfoTooltip(null);
+      return;
+    }
     clearSidebarInfoTooltipTimers();
     setSidebarInfoTooltip((prev) => (prev ? { ...prev, visible: false } : prev));
     if (typeof window === "undefined") {
@@ -267,7 +307,7 @@ export default function HomePage() {
       setSidebarInfoTooltip(null);
       sidebarInfoTooltipDismissTimerRef.current = null;
     }, SIDEBAR_INFO_TOOLTIP_FADE_MS);
-  }, [clearSidebarInfoTooltipTimers]);
+  }, [clearSidebarInfoTooltipTimers, shouldDisableSidebarTooltips]);
 
   const openMobileSidebar = useCallback(() => {
     clearMobileSidebarCloseTimer();
@@ -317,13 +357,32 @@ export default function HomePage() {
     return () => {
       clearMobileSidebarCloseTimer();
       clearSidebarInfoTooltipTimers();
+      clearTopChromeGestureTimer();
     };
-  }, [clearMobileSidebarCloseTimer, clearSidebarInfoTooltipTimers]);
+  }, [clearMobileSidebarCloseTimer, clearSidebarInfoTooltipTimers, clearTopChromeGestureTimer]);
 
   const onMainScroll = useCallback((event: UIEvent<HTMLElement>) => {
-    const isOffset = event.currentTarget.scrollTop > 2;
+    const isOffset = event.currentTarget.scrollTop > 0;
     setTopChromeOffset((prev) => (prev === isOffset ? prev : isOffset));
   }, []);
+
+  const onSearchPanelScrollOffsetChange = useCallback((isOffset: boolean) => {
+    if (activeSidebarTab !== "search") {
+      return;
+    }
+    setTopChromeOffset((prev) => (prev === isOffset ? prev : isOffset));
+    if (!isOffset) {
+      clearTopChromeGestureTimer();
+      setTopChromeGestureActive(false);
+    }
+  }, [activeSidebarTab, clearTopChromeGestureTimer]);
+
+  useEffect(() => {
+    if (activeSidebarTab === "search") {
+      setTopChromeOffset(false);
+      setTopChromeGestureActive(false);
+    }
+  }, [activeSidebarTab]);
 
   const openMaterialFeed = useCallback(
     (materialId: string) => {
@@ -406,10 +465,24 @@ export default function HomePage() {
     [forceCloseMobileSidebar],
   );
   const isCommunityPanel = activeSidebarTab === "community" || activeSidebarTab === "create";
+  const hideMobileTopControls = isCommunityPanel && communityDetailOpen;
+  const [lastCommunityPanelMode, setLastCommunityPanelMode] = useState<"community" | "create">("community");
+
+  useEffect(() => {
+    if (activeSidebarTab === "community" || activeSidebarTab === "create") {
+      setLastCommunityPanelMode(activeSidebarTab);
+    }
+  }, [activeSidebarTab]);
+
+  const communityPanelMode = activeSidebarTab === "search"
+    ? lastCommunityPanelMode
+    : activeSidebarTab === "create"
+      ? "create"
+      : "community";
 
   const sidebarPanelContent = (
     <>
-      <div className="mt-10 flex items-center justify-end gap-2 lg:mt-0 lg:justify-between">
+      <div className="mt-2 flex items-center justify-end gap-2 lg:mt-0 lg:justify-between">
         <span
           aria-hidden="true"
           className="hidden h-8 w-8 -translate-x-2 items-center justify-center text-xl font-black leading-none tracking-tight text-white/58 lg:inline-flex"
@@ -515,7 +588,7 @@ export default function HomePage() {
         />
       </div>
 
-      <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1">
+      <div className="mt-4 min-h-0 pr-1 lg:flex-1 lg:overflow-y-auto">
         <div className="mb-2 flex items-center justify-between">
           <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">History</p>
           <button
@@ -637,7 +710,7 @@ export default function HomePage() {
           {error}
         </div>
       ) : null}
-      {sidebarInfoTooltip ? (
+      {sidebarInfoTooltip && !shouldDisableSidebarTooltips() ? (
         <div
           className={`pointer-events-none fixed z-[90] max-w-[220px] rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-left text-[10px] text-white/92 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-[opacity,transform] duration-[220ms] ease-out will-change-[transform,opacity] ${
             sidebarInfoTooltip.visible ? "translate-y-0 opacity-100" : "-translate-y-1.5 opacity-0"
@@ -650,15 +723,23 @@ export default function HomePage() {
 
       <div
         aria-hidden="true"
-        className={`pointer-events-none fixed inset-x-0 top-0 z-[68] h-[calc(max(env(safe-area-inset-top),0px)+68px)] transition-opacity duration-150 lg:hidden ${
-          topChromeOffset && !mobileSidebarOpen ? "opacity-100" : "opacity-0"
+        className={`pointer-events-none fixed inset-x-0 top-0 z-[68] h-[calc(max(env(safe-area-inset-top),0px)+68px)] ${
+          activeSidebarTab === "search" ? "transition-none" : "transition-opacity duration-150"
+        } lg:hidden ${
+          (topChromeOffset || topChromeGestureActive) && !mobileSidebarOpen ? "opacity-100" : "opacity-0"
         }`}
       >
         <div
           className={`h-full w-full ${
-            activeSidebarTab === "community" ? "bg-black" : "bg-black/28 backdrop-blur-[28px] backdrop-saturate-180"
+            activeSidebarTab === "community"
+              ? "bg-black"
+              : activeSidebarTab === "search"
+                ? "relative overflow-hidden bg-white/[0.05] backdrop-blur-[10px] backdrop-saturate-160"
+                : "bg-black/28 backdrop-blur-[28px] backdrop-saturate-180"
           }`}
-        />
+        >
+          {activeSidebarTab === "search" ? <div className="absolute inset-0 bg-black/45" /> : null}
+        </div>
       </div>
 
       <button
@@ -669,8 +750,8 @@ export default function HomePage() {
           left: "calc(max(env(safe-area-inset-left), 0px) + 10px)",
           top: "calc(max(env(safe-area-inset-top), 0px) + 10px)",
         }}
-        className={`fixed z-[70] grid h-10 w-10 place-items-center text-white/90 transition-opacity hover:text-white md:left-7 md:top-7 lg:hidden ${
-          mobileSidebarOpen ? "pointer-events-none opacity-0" : "opacity-100"
+        className={`fixed z-[110] grid h-10 w-10 place-items-center text-white/90 transition-opacity hover:text-white md:left-7 md:top-7 lg:hidden ${
+          mobileSidebarOpen || hideMobileTopControls ? "pointer-events-none opacity-0" : "opacity-100"
         }`}
       >
         <i className="fa-solid fa-bars text-base" aria-hidden="true" />
@@ -680,8 +761,8 @@ export default function HomePage() {
         style={{
           top: "calc(max(env(safe-area-inset-top), 0px) + 10px)",
         }}
-        className={`pointer-events-none fixed left-1/2 z-[70] flex h-10 -translate-x-1/2 items-center transition-opacity lg:hidden ${
-          mobileSidebarOpen ? "opacity-0" : "opacity-100"
+        className={`pointer-events-none fixed left-1/2 z-[110] flex h-10 -translate-x-1/2 items-center transition-opacity lg:hidden ${
+          mobileSidebarOpen || hideMobileTopControls ? "opacity-0" : "opacity-100"
         }`}
       >
         <img src="/logo.png" alt="" className="h-auto w-[5rem] object-contain opacity-70 md:w-[5.5rem]" />
@@ -702,31 +783,41 @@ export default function HomePage() {
               }
               closeMobileSidebar();
             }}
-            className={`absolute bottom-4 left-4 top-4 w-[min(24rem,calc(100vw-2rem))] rounded-3xl bg-black/30 px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.45)] backdrop-blur-[26px] backdrop-saturate-150 ${
+            className={`absolute bottom-4 left-4 top-6 w-[min(24rem,calc(100vw-2rem))] rounded-3xl bg-black/30 px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.45)] backdrop-blur-[26px] backdrop-saturate-150 ${
               mobileSidebarClosing ? "animate-mobile-sidenav-out" : "animate-mobile-sidenav-in"
             }`}
           >
-            <span
-              aria-hidden="true"
-              className="absolute left-3 top-1 inline-flex h-10 w-10 -translate-x-2 items-center justify-center text-2xl font-black leading-none tracking-tight text-white/58"
-            >
-              R
-            </span>
-            <button
-              type="button"
-              onClick={closeMobileSidebar}
-              aria-label="Close topic menu"
-              className="absolute right-3 top-1.5 p-1 text-white/80 transition hover:text-white"
-            >
-              <i className="fa-solid fa-xmark text-base" aria-hidden="true" />
-            </button>
-            <div className="flex h-full min-h-0 flex-col">{sidebarPanelContent}</div>
+            <div className="flex h-full min-h-0 flex-col">
+              <div className="-mx-3 shrink-0 px-3 pb-2 pt-0.5">
+                <div className="relative flex h-10 items-center justify-between overflow-hidden rounded-2xl px-0.5">
+                  <span
+                    aria-hidden="true"
+                    className="relative z-10 inline-flex h-10 w-10 -translate-x-2 items-center justify-center text-2xl font-black leading-none tracking-tight text-white/58"
+                  >
+                    R
+                  </span>
+                  <button
+                    type="button"
+                    onClick={closeMobileSidebar}
+                    aria-label="Close topic menu"
+                    className="relative z-10 mr-1 -translate-y-0.5 p-1 text-white/80 transition hover:text-white"
+                  >
+                    <i className="fa-solid fa-xmark text-base" aria-hidden="true" />
+                  </button>
+                </div>
+              </div>
+              <div className="min-h-0 flex-1 overflow-y-auto">
+                <div className="rounded-2xl">
+                  {sidebarPanelContent}
+                </div>
+              </div>
+            </div>
           </aside>
         </div>
       ) : null}
 
       <div className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:grid lg:grid-cols-[280px_1px_minmax(0,1fr)]">
-        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-2 text-white lg:mt-7 lg:mb-2 lg:flex lg:px-5">
+        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-2 text-white lg:mt-8 lg:mb-2 lg:flex lg:px-5">
           {sidebarPanelContent}
         </aside>
 
@@ -743,11 +834,20 @@ export default function HomePage() {
               : "lg:w-[97%]"
           }`}
         >
-          {activeSidebarTab === "search" ? (
-            <UploadPanel onMaterialCreated={onUploadMaterialCreated} />
-          ) : (
-            <CommunityReelsPanel mode={activeSidebarTab === "create" ? "create" : "community"} />
-          )}
+          <div className={activeSidebarTab === "search" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
+            <UploadPanel
+              onMaterialCreated={onUploadMaterialCreated}
+              onScrollOffsetChange={onSearchPanelScrollOffsetChange}
+              onScrollGesture={triggerTopChromeGesture}
+            />
+          </div>
+          <div className={activeSidebarTab === "search" ? "hidden h-full min-h-0" : "h-full min-h-0"}>
+            <CommunityReelsPanel
+              mode={communityPanelMode}
+              isVisible={activeSidebarTab !== "search"}
+              onDetailOpenChange={setCommunityDetailOpen}
+            />
+          </div>
         </section>
       </div>
     </main>

@@ -1,6 +1,6 @@
 "use client";
 
-import { type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { uploadMaterial } from "@/lib/api";
@@ -117,6 +117,8 @@ type UploadPanelProps = {
     topic?: string;
     generationMode: GenerationMode;
   }) => void | Promise<void>;
+  onScrollOffsetChange?: (isOffset: boolean) => void;
+  onScrollGesture?: () => void;
 };
 
 function buildMaterialTitle(params: { topic: string; text: string; fileName: string }): string {
@@ -134,8 +136,9 @@ function buildMaterialTitle(params: { topic: string; text: string; fileName: str
   return "New Study Session";
 }
 
-export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
+export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollGesture }: UploadPanelProps) {
   const router = useRouter();
+  const touchStartYRef = useRef<number | null>(null);
   const [topics, setTopics] = useState<string[]>([""]);
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | undefined>();
@@ -287,7 +290,35 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
   return (
     <form
       onSubmit={onSubmit}
-      className="flex h-full w-full flex-col justify-end overflow-x-visible overflow-y-auto px-6 py-6 pb-14 md:overflow-hidden md:px-10 md:py-8 md:pb-8 lg:px-5"
+      onWheelCapture={(event) => {
+        if (event.deltaY > 0) {
+          onScrollGesture?.();
+        }
+      }}
+      onTouchStartCapture={(event) => {
+        const nextTouch = event.touches.item(0);
+        touchStartYRef.current = nextTouch ? nextTouch.clientY : null;
+      }}
+      onTouchMoveCapture={(event) => {
+        const startY = touchStartYRef.current;
+        const nextTouch = event.touches.item(0);
+        if (startY === null || !nextTouch) {
+          return;
+        }
+        if (startY - nextTouch.clientY > 0) {
+          onScrollGesture?.();
+        }
+      }}
+      onTouchEndCapture={() => {
+        touchStartYRef.current = null;
+      }}
+      onScrollCapture={(event) => {
+        onScrollOffsetChange?.(event.currentTarget.scrollTop > 0);
+      }}
+      onScroll={(event) => {
+        onScrollOffsetChange?.(event.currentTarget.scrollTop > 0);
+      }}
+      className="flex h-full w-full flex-col justify-center overflow-x-visible overflow-y-auto px-6 py-6 md:overflow-hidden md:px-10 md:py-8 lg:px-5"
     >
       <header className="relative mb-4 text-center">
         <img
@@ -295,7 +326,7 @@ export function UploadPanel({ onMaterialCreated }: UploadPanelProps) {
           alt="StudyReels logo"
           className="relative z-20 mx-auto hidden h-4 w-[4.75rem] max-w-[26vw] translate-y-16 object-cover opacity-70 md:block"
         />
-        <div className="mt-16 md:mt-20">
+        <div className="mt-8 md:mt-20">
           <h1 className="relative z-[1] text-[clamp(3.2rem,12vw,8.25rem)] font-black leading-[0.9] tracking-tight text-[#e8e6fc]/30">Study Reels</h1>
           <p className="relative z-20 mt-5 text-sm text-white/68">Pick a mode, add your material, and start your short study feed.</p>
         </div>
