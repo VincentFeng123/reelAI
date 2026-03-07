@@ -56,3 +56,27 @@ export type ChatMessage = {
 export type ChatResponse = {
   answer: string;
 };
+
+export type CommunityReelPlatform = "youtube" | "instagram" | "tiktok";
+
+export type CommunityReelEmbed = {
+  id: string;
+  platform: CommunityReelPlatform;
+  sourceUrl: string;
+  embedUrl: string;
+};
+
+export type CommunitySet = {
+  id: string;
+  title: string;
+  description: string;
+  tags: string[];
+  reels: CommunityReelEmbed[];
+  reelCount: number;
+  curator: string;
+  likes: number;
+  learners: number;
+  updatedLabel: string;
+  thumbnailUrl: string;
+  featured: boolean;
+};

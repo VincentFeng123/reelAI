@@ -1,3 +1,4 @@
+import json
 import os
 import uuid
 from typing import Literal
@@ -10,6 +11,10 @@ from .db import dumps_json, fetch_all, get_conn, init_db, now_iso, upsert
 from .models import (
     ChatRequest,
     ChatResponse,
+    CommunityReelOut,
+    CommunitySetCreateRequest,
+    CommunitySetOut,
+    CommunitySetsResponse,
     FeedbackRequest,
     FeedbackResponse,
     FeedResponse,
@@ -49,6 +54,109 @@ embedding_service = EmbeddingService()
 material_intelligence_service = MaterialIntelligenceService()
 youtube_service = YouTubeService()
 reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service)
+
+
+def _normalize_community_tags(raw_tags: list[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_tags:
+        value = str(raw).strip().lower()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        normalized.append(value)
+        if len(normalized) >= 6:
+            break
+    return normalized
+
+
+def _to_int(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_min_relevance(value: float | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(-1.0, min(1.2, parsed))
+
+
+def _filter_reels_by_min_relevance(reels: list[dict], min_relevance: float | None) -> list[dict]:
+    if min_relevance is None:
+        return reels
+    filtered: list[dict] = []
+    for reel in reels:
+        relevance = reel.get("relevance_score")
+        if isinstance(relevance, (int, float)) and float(relevance) < min_relevance:
+            continue
+        filtered.append(reel)
+    return filtered
+
+
+def _serialize_community_set(row: dict) -> CommunitySetOut:
+    tags_raw = row.get("tags_json")
+    reels_raw = row.get("reels_json")
+    try:
+        decoded_tags = json.loads(tags_raw) if isinstance(tags_raw, str) else []
+    except json.JSONDecodeError:
+        decoded_tags = []
+    try:
+        decoded_reels = json.loads(reels_raw) if isinstance(reels_raw, str) else []
+    except json.JSONDecodeError:
+        decoded_reels = []
+
+    tags = _normalize_community_tags(decoded_tags if isinstance(decoded_tags, list) else [])
+    reels: list[CommunityReelOut] = []
+    if isinstance(decoded_reels, list):
+        for index, entry in enumerate(decoded_reels):
+            if not isinstance(entry, dict):
+                continue
+            platform = str(entry.get("platform", "")).strip().lower()
+            if platform not in {"youtube", "instagram", "tiktok"}:
+                continue
+            source_url = str(entry.get("source_url", "")).strip()
+            embed_url = str(entry.get("embed_url", "")).strip()
+            if not source_url or not embed_url:
+                continue
+            reel_id = str(entry.get("id") or f"{row.get('id', 'community-set')}-reel-{index}")
+            reels.append(
+                CommunityReelOut(
+                    id=reel_id,
+                    platform=platform,
+                    source_url=source_url,
+                    embed_url=embed_url,
+                )
+            )
+
+    reel_count = max(len(reels), _to_int(row.get("reel_count"), len(reels)))
+    likes = max(0, _to_int(row.get("likes"), 0))
+    learners = max(0, _to_int(row.get("learners"), 1))
+    updated_label = str(row.get("updated_label") or "Updated just now").strip() or "Updated just now"
+    curator = str(row.get("curator") or "Community member").strip() or "Community member"
+    thumbnail_url = str(row.get("thumbnail_url") or "").strip()
+    if not thumbnail_url:
+        thumbnail_url = "/images/community/ai-systems.svg"
+
+    return CommunitySetOut(
+        id=str(row.get("id") or ""),
+        title=str(row.get("title") or "").strip(),
+        description=str(row.get("description") or "").strip(),
+        tags=tags,
+        reels=reels,
+        reel_count=reel_count,
+        curator=curator,
+        likes=likes,
+        learners=learners,
+        updated_label=updated_label,
+        thumbnail_url=thumbnail_url,
+        featured=bool(_to_int(row.get("featured"), 0)),
+    )
 
 
 @app.on_event("startup")
@@ -181,6 +289,7 @@ async def create_material(
 
 @app.post("/api/reels/generate", response_model=ReelsGenerateResponse)
 def generate_reels(payload: ReelsGenerateRequest):
+    min_relevance = _normalize_min_relevance(payload.min_relevance)
     with get_conn() as conn:
         material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
         if not material:
@@ -197,7 +306,7 @@ def generate_reels(payload: ReelsGenerateRequest):
             )
         except YouTubeApiRequestError as e:
             raise HTTPException(status_code=502, detail=str(e)) from e
-    return {"reels": reels}
+    return {"reels": _filter_reels_by_min_relevance(reels, min_relevance)}
 
 
 @app.get("/api/feed", response_model=FeedResponse)
@@ -209,6 +318,7 @@ def feed(
     prefetch: int = 7,
     creative_commons_only: bool = False,
     generation_mode: Literal["slow", "fast"] = "slow",
+    min_relevance: float | None = None,
 ):
     if page < 1:
         page = 1
@@ -227,13 +337,15 @@ def feed(
             raise HTTPException(status_code=404, detail="material_id not found")
 
         fast_mode = generation_mode == "fast"
+        safe_min_relevance = _normalize_min_relevance(min_relevance)
         ranked = reel_service.ranked_feed(conn, material_id, fast_mode=fast_mode)
+        filtered_ranked = _filter_reels_by_min_relevance(ranked, safe_min_relevance)
         # Auto-expand the feed while users scroll so we can keep serving fresh reels.
         if autofill:
             target_total = page * limit + prefetch
             attempts = 0
-            while len(ranked) < target_total and attempts < 3:
-                need = max(1, target_total - len(ranked))
+            while len(filtered_ranked) < target_total and attempts < 3:
+                need = max(1, target_total - len(filtered_ranked))
                 try:
                     generated = reel_service.generate_reels(
                         conn,
@@ -249,11 +361,14 @@ def feed(
                 if not generated:
                     break
                 ranked = reel_service.ranked_feed(conn, material_id, fast_mode=fast_mode)
+                filtered_ranked = _filter_reels_by_min_relevance(ranked, safe_min_relevance)
+        else:
+            filtered_ranked = _filter_reels_by_min_relevance(ranked, safe_min_relevance)
 
-    total = len(ranked)
+    total = len(filtered_ranked)
     start = (page - 1) * limit
     end = start + limit
-    reels = ranked[start:end]
+    reels = filtered_ranked[start:end]
 
     return {"page": page, "limit": limit, "total": total, "reels": reels}
 
@@ -287,3 +402,121 @@ def feedback(payload: FeedbackRequest):
         )
 
     return {"status": "ok", "reel_id": payload.reel_id}
+
+
+@app.get("/api/community/sets", response_model=CommunitySetsResponse)
+def list_community_sets(limit: int = 160):
+    safe_limit = max(1, min(limit, 300))
+    with get_conn() as conn:
+        rows = fetch_all(
+            conn,
+            """
+            SELECT
+                id,
+                title,
+                description,
+                tags_json,
+                reels_json,
+                reel_count,
+                curator,
+                likes,
+                learners,
+                updated_label,
+                thumbnail_url,
+                featured,
+                created_at
+            FROM community_sets
+            ORDER BY featured DESC, created_at DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        )
+    sets = [_serialize_community_set(row) for row in rows]
+    return {"sets": sets}
+
+
+@app.post("/api/community/sets", response_model=CommunitySetOut, status_code=201)
+def create_community_set(payload: CommunitySetCreateRequest):
+    title = payload.title.strip()
+    description = payload.description.strip()
+    thumbnail_url = payload.thumbnail_url.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Set name is required.")
+    if len(description) < 18:
+        raise HTTPException(status_code=400, detail="Description must be at least 18 characters.")
+    if not thumbnail_url:
+        raise HTTPException(status_code=400, detail="Thumbnail is required.")
+    if not payload.reels:
+        raise HTTPException(status_code=400, detail="Add at least one reel URL.")
+
+    reels_payload: list[dict[str, str]] = []
+    for reel in payload.reels:
+        source_url = reel.source_url.strip()
+        embed_url = reel.embed_url.strip()
+        if not source_url or not embed_url:
+            continue
+        reels_payload.append(
+            {
+                "id": str(uuid.uuid4()),
+                "platform": reel.platform,
+                "source_url": source_url,
+                "embed_url": embed_url,
+            }
+        )
+    if not reels_payload:
+        raise HTTPException(status_code=400, detail="No valid reels found in request.")
+
+    tags = _normalize_community_tags(payload.tags)
+    curator = (payload.curator or "").strip() or "Community member"
+    set_id = f"user-set-{uuid.uuid4()}"
+    created_at = now_iso()
+    updated_label = "Updated just now"
+
+    with get_conn() as conn:
+        upsert(
+            conn,
+            "community_sets",
+            {
+                "id": set_id,
+                "title": title,
+                "description": description,
+                "tags_json": dumps_json(tags),
+                "reels_json": dumps_json(reels_payload),
+                "reel_count": len(reels_payload),
+                "curator": curator,
+                "likes": 0,
+                "learners": 1,
+                "updated_label": updated_label,
+                "thumbnail_url": thumbnail_url,
+                "featured": 0,
+                "created_at": created_at,
+                "updated_at": created_at,
+            },
+        )
+        created_rows = fetch_all(
+            conn,
+            """
+            SELECT
+                id,
+                title,
+                description,
+                tags_json,
+                reels_json,
+                reel_count,
+                curator,
+                likes,
+                learners,
+                updated_label,
+                thumbnail_url,
+                featured
+            FROM community_sets
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (set_id,),
+        )
+
+    if not created_rows:
+        raise HTTPException(status_code=500, detail="Failed to persist community set.")
+
+    return _serialize_community_set(created_rows[0])

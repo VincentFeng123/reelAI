@@ -1,12 +1,15 @@
 "use client";
 
-import { type ChangeEvent, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+
+import { createCommunitySet, fetchCommunitySets } from "@/lib/api";
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
 const MAX_USER_SETS = 120;
 const FALLBACK_THUMBNAIL_URL = "/images/community/ai-systems.svg";
 const SUPPORTED_PLATFORMS_LABEL = "YouTube, Instagram, TikTok";
+const MIN_SET_DESCRIPTION_LENGTH = 18;
 const FEATURED_CAROUSEL_INTERVAL_MS = 5200;
 const FEATURED_CAROUSEL_TRANSITION_MS = 520;
 const FEATURED_CAROUSEL_PAUSE_MS = 200;
@@ -434,12 +437,15 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   const [reelInputs, setReelInputs] = useState<DraftReelInput[]>(() => [createDraftReelRow()]);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
+  const [isPostingSet, setIsPostingSet] = useState(false);
   const [userSets, setUserSets] = useState<CommunitySet[]>([]);
   const [storageHydrated, setStorageHydrated] = useState(false);
   const [portalReady, setPortalReady] = useState(false);
   const [detailBannerLeft, setDetailBannerLeft] = useState(0);
   const [detailBannerHeight, setDetailBannerHeight] = useState(0);
   const [isDetailBannerCompact, setIsDetailBannerCompact] = useState(false);
+  const [isThumbnailDragOver, setIsThumbnailDragOver] = useState(false);
+  const [thumbnailFileName, setThumbnailFileName] = useState("");
   const panelRootRef = useRef<HTMLDivElement | null>(null);
   const detailBannerRef = useRef<HTMLDivElement | null>(null);
   const detailContentScrollRef = useRef<HTMLDivElement | null>(null);
@@ -451,9 +457,25 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     if (typeof window === "undefined") {
       return;
     }
+    let cancelled = false;
     setPortalReady(true);
-    setUserSets(parseStoredSets(window.localStorage.getItem(COMMUNITY_SETS_STORAGE_KEY)));
+    const localSets = parseStoredSets(window.localStorage.getItem(COMMUNITY_SETS_STORAGE_KEY));
+    setUserSets(localSets);
     setStorageHydrated(true);
+    void (async () => {
+      try {
+        const remoteSets = await fetchCommunitySets();
+        if (cancelled) {
+          return;
+        }
+        setUserSets(remoteSets.slice(0, MAX_USER_SETS));
+      } catch {
+        // Keep local cache fallback if backend is unavailable.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -774,9 +796,25 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     () => parsedDraftReels.filter((row) => row.value.trim() && row.parsed !== null).length,
     [parsedDraftReels],
   );
+  const nonEmptyDraftReelCount = useMemo(
+    () => parsedDraftReels.filter((row) => row.value.trim()).length,
+    [parsedDraftReels],
+  );
+  const invalidDraftReelCount = Math.max(0, nonEmptyDraftReelCount - validDraftReelCount);
+  const normalizedSetTitle = setTitle.trim();
+  const normalizedSetDescription = setDescription.trim();
+  const descriptionCharsRemaining = Math.max(0, MIN_SET_DESCRIPTION_LENGTH - normalizedSetDescription.length);
+  const descriptionHasTooFewChars = normalizedSetDescription.length > 0 && descriptionCharsRemaining > 0;
+  const parsedSetTags = useMemo(() => parseTags(setTags), [setTags]);
+  const requiredCompletionCount =
+    (normalizedSetTitle ? 1 : 0) +
+    (normalizedSetDescription.length >= MIN_SET_DESCRIPTION_LENGTH ? 1 : 0) +
+    (thumbnailPreview ? 1 : 0) +
+    (validDraftReelCount > 0 && invalidDraftReelCount === 0 ? 1 : 0);
+  const completionPercent = Math.round((requiredCompletionCount / 4) * 100);
+  const canPostSet = requiredCompletionCount === 4 && !isPostingSet;
 
-  const onThumbnailFileChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
+  const applyThumbnailFile = useCallback((file: File | null | undefined) => {
     if (!file) {
       return;
     }
@@ -789,23 +827,60 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     reader.onload = () => {
       if (typeof reader.result === "string") {
         setThumbnailPreview(reader.result);
+        setThumbnailFileName(file.name);
         setCreateError(null);
       }
     };
     reader.readAsDataURL(file);
+  }, []);
+
+  const onThumbnailFileChange = (event: ChangeEvent<HTMLInputElement>) => {
+    applyThumbnailFile(event.target.files?.[0]);
+    event.target.value = "";
   };
 
-  const onCreateSet = (event: FormEvent<HTMLFormElement>) => {
+  const onThumbnailDragEnter = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsThumbnailDragOver(true);
+  };
+
+  const onThumbnailDragOver = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+    setIsThumbnailDragOver(true);
+  };
+
+  const onThumbnailDragLeave = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const nextTarget = event.relatedTarget as Node | null;
+    if (nextTarget && event.currentTarget.contains(nextTarget)) {
+      return;
+    }
+    setIsThumbnailDragOver(false);
+  };
+
+  const onThumbnailDrop = (event: DragEvent<HTMLLabelElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setIsThumbnailDragOver(false);
+    applyThumbnailFile(event.dataTransfer.files?.[0]);
+  };
+
+  const onCreateSet = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const title = setTitle.trim();
     const description = setDescription.trim();
+    setCreateSuccess(null);
     if (!title) {
       setCreateError("Set name is required.");
       setCreateSuccess(null);
       return;
     }
-    if (description.length < 18) {
-      setCreateError("Add a short description so others know what this set covers.");
+    if (description.length < MIN_SET_DESCRIPTION_LENGTH) {
+      setCreateError(`Description must be at least ${MIN_SET_DESCRIPTION_LENGTH} characters.`);
       setCreateSuccess(null);
       return;
     }
@@ -828,41 +903,41 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
       return;
     }
 
-    const now = Date.now();
     const parsedReels = nonEmptyRows.map((row, index) => {
       const parsed = row.parsed!;
       return {
-        id: `user-reel-${now}-${index}`,
         platform: parsed.platform,
         sourceUrl: parsed.sourceUrl,
         embedUrl: parsed.embedUrl,
-      } as CommunityReelEmbed;
+      };
     });
 
     const tags = parseTags(setTags);
-    const createdSet: CommunitySet = {
-      id: `user-set-${now}`,
-      title,
-      description,
-      tags,
-      reels: parsedReels,
-      reelCount: parsedReels.length,
-      curator: "You",
-      likes: 0,
-      learners: 1,
-      updatedLabel: "Updated just now",
-      thumbnailUrl: thumbnailPreview,
-      featured: false,
-    };
-
-    setUserSets((prev) => [createdSet, ...prev].slice(0, MAX_USER_SETS));
-    setSetTitle("");
-    setSetDescription("");
-    setSetTags("");
-    setThumbnailPreview("");
-    setReelInputs([createDraftReelRow()]);
-    setCreateError(null);
-    setCreateSuccess(`"${title}" posted with ${parsedReels.length} reels.`);
+    setIsPostingSet(true);
+    try {
+      const createdSet = await createCommunitySet({
+        title,
+        description,
+        tags,
+        reels: parsedReels,
+        thumbnailUrl: thumbnailPreview,
+        curator: "You",
+      });
+      setUserSets((prev) => [createdSet, ...prev.filter((item) => item.id !== createdSet.id)].slice(0, MAX_USER_SETS));
+      setSetTitle("");
+      setSetDescription("");
+      setSetTags("");
+      setThumbnailPreview("");
+      setThumbnailFileName("");
+      setReelInputs([createDraftReelRow()]);
+      setCreateError(null);
+      setCreateSuccess(`"${createdSet.title}" posted with ${createdSet.reels.length} reels.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not post community set.";
+      setCreateError(message);
+    } finally {
+      setIsPostingSet(false);
+    }
   };
 
   const addReelInputRow = () => {
@@ -1394,81 +1469,161 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
         </div>
       ) : (
         <>
-          <div className="shrink-0">
-            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between md:gap-4">
-              <div className="w-full pl-5 sm:pl-6 md:w-auto md:pl-8 lg:pl-3">
-                <div className="flex items-center justify-center gap-2 md:justify-start">
-                  <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">Community Sets</h2>
-                  <span className="rounded-full border border-white/20 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
+          <div className="flex min-h-0 flex-1 flex-col pt-1 md:pt-2">
+            <div className="shrink-0">
+              <div className="flex flex-col gap-3 md:-mx-2 md:flex-row md:items-center md:justify-between md:gap-4 lg:-mx-3">
+                <div className="w-full pl-5 sm:pl-6 md:w-auto md:pl-6 lg:pl-2">
+                  <div className="flex items-center justify-center gap-2 md:justify-start">
+                    <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">Create Set</h2>
+                    <span className="rounded-full border border-[#2b2b2b] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
+                  </div>
                 </div>
               </div>
-              <p className="max-w-lg text-xs text-white/62">Build a set with unlimited reels and post it to the community feed.</p>
             </div>
-          </div>
 
-          <div className="mt-3 min-h-0 flex-1 overflow-hidden md:mt-4">
-            <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto">
-            <section className="rounded-3xl p-2 sm:p-4 md:p-6">
-              <div className="mb-5">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/68">Create A Set</p>
-              </div>
+            <div className="mt-3 min-h-0 flex-1 overflow-hidden md:-mx-4 md:mt-4 lg:-mx-5">
+              <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto">
+                <section className="rounded-3xl p-1 sm:p-2 md:p-3">
+                  <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[2px] sm:p-5">
+                  <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                  <div className="relative z-10">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Create Set</p>
+                        <p className="mt-1 text-sm text-white/64">Complete each step to publish your reel set.</p>
+                      </div>
+                      <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/72">
+                        {completionPercent}% complete
+                      </span>
+                    </div>
+                    <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
+                      <div className="h-full rounded-full bg-white transition-[width] duration-300" style={{ width: `${completionPercent}%` }} />
+                    </div>
+                    <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                      <span className={`rounded-lg border border-[#2b2b2b] px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] ${normalizedSetTitle ? "bg-[#74dfb4]/12 text-[#d4ffe9]" : "bg-black/35 text-white/62"}`}>
+                        1. name your set
+                      </span>
+                      <span className={`rounded-lg border border-[#2b2b2b] px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] ${normalizedSetDescription.length >= MIN_SET_DESCRIPTION_LENGTH ? "bg-[#74dfb4]/12 text-[#d4ffe9]" : "bg-black/35 text-white/62"}`}>
+                        2. add description
+                      </span>
+                      <span className={`rounded-lg border border-[#2b2b2b] px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] ${thumbnailPreview ? "bg-[#74dfb4]/12 text-[#d4ffe9]" : "bg-black/35 text-white/62"}`}>
+                        3. upload thumbnail
+                      </span>
+                      <span className={`rounded-lg border border-[#2b2b2b] px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] ${validDraftReelCount > 0 && invalidDraftReelCount === 0 ? "bg-[#74dfb4]/12 text-[#d4ffe9]" : "bg-black/35 text-white/62"}`}>
+                        4. add valid reels
+                      </span>
+                    </div>
+                  </div>
+                </div>
 
-              <form onSubmit={onCreateSet} className="space-y-5 md:space-y-6">
-                <div className="space-y-5">
-                  <label className="block">
-                    <span className="mb-2 block text-xs text-white/72">Set Name</span>
-                    <input
-                      value={setTitle}
-                      onChange={(event) => setSetTitle(event.target.value)}
-                      placeholder="Example: Organic Chemistry Reactions"
-                      className="h-11 w-full rounded-xl border border-white/15 bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/40 focus:border-white/45"
-                    />
-                  </label>
-
-                  <label className="block">
-                    <span className="mb-2 block text-xs text-white/72">Description</span>
-                    <textarea
-                      value={setDescription}
-                      onChange={(event) => setSetDescription(event.target.value)}
-                      placeholder="What does this set cover and who is it for?"
-                      className="h-24 w-full resize-none rounded-xl border border-white/15 bg-black/55 px-3 py-2 text-sm text-white outline-none placeholder:text-white/40 focus:border-white/45 md:h-20"
-                    />
-                  </label>
-
-                  <label className="block">
-                    <span className="mb-2 block text-xs text-white/72">Tags</span>
-                    <input
-                      value={setTags}
-                      onChange={(event) => setSetTags(event.target.value)}
-                      placeholder="chemistry, reaction mechanisms, exam prep"
-                      className="h-11 w-full rounded-xl border border-white/15 bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/40 focus:border-white/45"
-                    />
-                  </label>
-
-                  <div>
-                    <p className="mb-2 block text-xs text-white/72">Thumbnail Image</p>
-                    <input id="community-set-thumbnail" type="file" accept="image/*" className="sr-only" onChange={onThumbnailFileChange} />
-                    <div className="flex flex-col items-start gap-3 sm:flex-row sm:gap-4">
-                      <label
-                        htmlFor="community-set-thumbnail"
-                        className="group relative block h-[120px] w-full max-w-[220px] cursor-pointer overflow-hidden rounded-xl border border-dashed border-white/15 bg-black/55 sm:h-[90px] sm:w-[140px] sm:max-w-none"
-                      >
-                        <img
-                          src={thumbnailPreview || FALLBACK_THUMBNAIL_URL}
-                          alt="Set thumbnail preview"
-                          className={`h-full w-full object-cover transition ${thumbnailPreview ? "opacity-100" : "opacity-55 group-hover:opacity-75"}`}
-                        />
-                        <span className="absolute inset-0 grid place-items-center bg-black/35 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/85">
-                          {thumbnailPreview ? "Change" : "Upload"}
+                <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)] lg:items-start">
+                  <form onSubmit={onCreateSet} className="space-y-4 md:space-y-5">
+                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[2px] sm:p-5">
+                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                      <div className="relative z-10 space-y-5">
+                      <label className="block">
+                        <span className="mb-2 flex items-center justify-between gap-2 text-xs text-white/72">
+                          <span>Set Name</span>
+                          <span className="text-[10px] text-white/45">{normalizedSetTitle.length}/70</span>
                         </span>
+                        <input
+                          value={setTitle}
+                          onChange={(event) => setSetTitle(event.target.value)}
+                          maxLength={70}
+                          placeholder="Example: Organic Chemistry Reactions"
+                          className="h-11 w-full rounded-xl border border-[#2b2b2b] bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/40 transition-colors focus:border-[#2b2b2b]"
+                        />
                       </label>
-                      <div className="w-full space-y-2 sm:w-auto">
-                        <p className="text-[11px] text-white/62">Use a vertical image for better mobile previews.</p>
+
+                      <label className="block">
+                        <span className="mb-2 flex items-center justify-between gap-2 text-xs text-white/72">
+                          <span>Description</span>
+                          <span className={`text-[10px] ${normalizedSetDescription.length >= MIN_SET_DESCRIPTION_LENGTH ? "text-[#9ef8cb]" : "text-white/45"}`}>
+                            {normalizedSetDescription.length} / {MIN_SET_DESCRIPTION_LENGTH} min
+                          </span>
+                        </span>
+                        <textarea
+                          value={setDescription}
+                          onChange={(event) => setSetDescription(event.target.value)}
+                          placeholder="What does this set cover and who is it for?"
+                          className="h-24 w-full resize-none rounded-xl border border-[#2b2b2b] bg-black/55 px-3 py-2 text-sm text-white outline-none placeholder:text-white/40 transition-colors focus:border-[#2b2b2b] md:h-24"
+                        />
+                        {normalizedSetDescription.length === 0 ? (
+                          <p className="mt-1.5 text-[11px] text-white/46">
+                            Description must be at least {MIN_SET_DESCRIPTION_LENGTH} characters.
+                          </p>
+                        ) : descriptionHasTooFewChars ? (
+                          <p className="mt-1.5 text-[11px] text-[#ffb4b4]">
+                            Description must be at least {MIN_SET_DESCRIPTION_LENGTH} characters. Add {descriptionCharsRemaining} more
+                            {descriptionCharsRemaining === 1 ? " character." : " characters."}
+                          </p>
+                        ) : null}
+                      </label>
+
+                      <label className="block">
+                        <span className="mb-2 block text-xs text-white/72">Tags</span>
+                        <input
+                          value={setTags}
+                          onChange={(event) => setSetTags(event.target.value)}
+                          placeholder="chemistry, reaction mechanisms, exam prep"
+                          className="h-11 w-full rounded-xl border border-[#2b2b2b] bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/40 transition-colors focus:border-[#2b2b2b]"
+                        />
+                        <p className="mt-1.5 text-[11px] text-white/46">Add commas to add new tags.</p>
+                        {parsedSetTags.length > 0 ? (
+                          <div className="mt-2 flex flex-wrap gap-1.5">
+                            {parsedSetTags.map((tag) => (
+                              <span key={`create-tag-${tag}`} className="rounded-full border border-[#2b2b2b] bg-white/6 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/75">
+                                #{tag}
+                              </span>
+                            ))}
+                          </div>
+                        ) : null}
+                      </label>
+
+                      <div>
+                        <p className="mb-2 block text-xs text-white/72">Thumbnail Image</p>
+                        <input id="community-set-thumbnail" type="file" accept="image/*" className="sr-only" onChange={onThumbnailFileChange} />
+                        <label
+                          htmlFor="community-set-thumbnail"
+                          onDragEnter={onThumbnailDragEnter}
+                          onDragOver={onThumbnailDragOver}
+                          onDragLeave={onThumbnailDragLeave}
+                          onDrop={onThumbnailDrop}
+                          className={`group relative block h-[220px] w-full cursor-pointer overflow-hidden rounded-xl border border-dashed ${
+                            isThumbnailDragOver ? "border-white/60 bg-white/10" : "border-[#2b2b2b] bg-black/55"
+                          } sm:h-[250px]`}
+                        >
+                          {thumbnailPreview ? (
+                            <img
+                              src={thumbnailPreview}
+                              alt="Set thumbnail preview"
+                              className="h-full w-full object-cover transition opacity-100"
+                            />
+                          ) : (
+                            <div className="grid h-full w-full place-items-center bg-[linear-gradient(145deg,rgba(255,255,255,0.16),rgba(255,255,255,0.04))] text-white/70 transition group-hover:text-white/85">
+                              <i className="fa-regular fa-image -translate-y-6 text-lg sm:-translate-y-7" aria-hidden="true" />
+                            </div>
+                          )}
+                          <span className="absolute inset-0 grid place-items-center bg-black/35 text-white/85">
+                            <span className="flex max-w-[90%] translate-y-5 flex-col items-center text-center sm:translate-y-6">
+                              <span className={`truncate text-sm font-semibold ${thumbnailPreview ? "text-white" : "text-white/85"}`}>
+                                {thumbnailPreview ? thumbnailFileName || "Image selected" : "Drag and drop your image here"}
+                              </span>
+                              <span className="mt-1 text-xs text-white/58">
+                                {thumbnailPreview ? "Click to replace image" : "Or click to browse (PNG, JPG, WEBP)"}
+                              </span>
+                            </span>
+                          </span>
+                        </label>
+                        <p className="mt-2 text-[11px] text-white/62">Use a vertical image for better mobile previews.</p>
                         {thumbnailPreview ? (
                           <button
                             type="button"
-                            onClick={() => setThumbnailPreview("")}
-                            className="inline-flex items-center gap-1 rounded-lg border border-white/15 bg-black/45 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72 transition hover:bg-white/10 hover:text-white"
+                            onClick={() => {
+                              setThumbnailPreview("");
+                              setThumbnailFileName("");
+                            }}
+                            className="mt-2 inline-flex items-center gap-1 rounded-lg border border-[#2b2b2b] bg-black/45 px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72 transition hover:bg-white/10 hover:text-white"
                           >
                             <i className="fa-solid fa-trash text-[9px]" aria-hidden="true" />
                             Remove
@@ -1476,86 +1631,143 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                         ) : null}
                       </div>
                     </div>
-                  </div>
-                </div>
+                    </div>
 
-                <div className="min-h-0 rounded-2xl p-3.5">
-                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-                    <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-white/68">Embed Reels ({SUPPORTED_PLATFORMS_LABEL})</p>
-                    <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/55">{validDraftReelCount} valid</p>
-                  </div>
-                  <div className="balanced-scroll-gutter max-h-[300px] space-y-3 overflow-y-auto">
-                    {parsedDraftReels.map((row, index) => {
-                      const hasInput = Boolean(row.value.trim());
-                      const hasValidEmbed = row.parsed !== null;
-                      return (
-                        <div key={row.id} className="rounded-xl p-3">
-                          <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:gap-3">
-                            <input
-                              value={row.value}
-                              onChange={(event) => updateReelInputRow(row.id, event.target.value)}
-                              placeholder="Paste YouTube, Instagram reel, or TikTok URL"
-                              className="h-10 w-full rounded-lg border border-white/15 bg-black/60 px-2.5 text-xs text-white outline-none placeholder:text-white/40 focus:border-white/45 sm:h-9"
-                            />
-                            <button
-                              type="button"
-                              onClick={() => removeReelInputRow(row.id)}
-                              className="inline-flex h-9 w-full shrink-0 items-center justify-center gap-1 rounded-lg border border-white/15 bg-black/55 text-white/72 transition hover:bg-white/10 hover:text-white sm:grid sm:h-8 sm:w-8 sm:place-items-center"
-                              aria-label={`Remove reel input ${index + 1}`}
-                            >
-                              <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
-                              <span className="text-[10px] font-semibold uppercase tracking-[0.08em] sm:hidden">Remove</span>
-                            </button>
-                          </div>
-
-                          {hasInput && !hasValidEmbed ? (
-                            <p className="mt-2 text-[11px] text-[#ffb4b4]">Invalid URL. Supported: {SUPPORTED_PLATFORMS_LABEL}.</p>
-                          ) : null}
-
-                          {row.parsed ? (
-                            <div className="mt-3 overflow-hidden rounded-lg">
-                              <div className="flex items-center gap-1.5 px-2 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/70">
-                                <i className={PLATFORM_ICON[row.parsed.platform]} aria-hidden="true" />
-                                {PLATFORM_LABEL[row.parsed.platform]} embed
+                    <div className="relative min-h-0 overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-3.5 backdrop-blur-[2px] sm:p-4">
+                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                      <div className="relative z-10">
+                      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-white/68">Embed Reels ({SUPPORTED_PLATFORMS_LABEL})</p>
+                        <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/55">
+                          {validDraftReelCount} valid / {invalidDraftReelCount} invalid
+                        </p>
+                      </div>
+                      <div className="balanced-scroll-gutter max-h-[320px] space-y-3 overflow-y-auto">
+                        {parsedDraftReels.map((row, index) => {
+                          const hasInput = Boolean(row.value.trim());
+                          const hasValidEmbed = row.parsed !== null;
+                          return (
+                            <div key={row.id} className="rounded-xl p-3">
+                              <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:gap-3">
+                                <input
+                                  value={row.value}
+                                  onChange={(event) => updateReelInputRow(row.id, event.target.value)}
+                                  placeholder="Paste YouTube, Instagram reel, or TikTok URL"
+                                  className="h-10 w-full rounded-lg bg-black/60 px-2.5 text-xs text-white outline-none placeholder:text-white/40 sm:h-9"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() => removeReelInputRow(row.id)}
+                                  className="inline-flex h-9 w-full shrink-0 items-center justify-center gap-1 rounded-lg bg-black/55 text-white/72 transition hover:bg-white/10 hover:text-white sm:grid sm:h-8 sm:w-8 sm:place-items-center"
+                                  aria-label={`Remove reel input ${index + 1}`}
+                                >
+                                  <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
+                                  <span className="text-[10px] font-semibold uppercase tracking-[0.08em] sm:hidden">Remove</span>
+                                </button>
                               </div>
-                              <iframe
-                                src={row.parsed.embedUrl}
-                                title={`${PLATFORM_LABEL[row.parsed.platform]} reel preview`}
-                                className="h-[180px] w-full border-0 sm:h-[160px]"
-                                loading="lazy"
-                                allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                                allowFullScreen
-                              />
+
+                              {hasInput && !hasValidEmbed ? (
+                                <p className="mt-2 text-[11px] text-[#ffb4b4]">Invalid URL. Supported: {SUPPORTED_PLATFORMS_LABEL}.</p>
+                              ) : null}
+
+                              {row.parsed ? (
+                                <div className="mt-3 overflow-hidden rounded-lg">
+                                  <div className="flex items-center gap-1.5 px-2 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/70">
+                                    <i className={PLATFORM_ICON[row.parsed.platform]} aria-hidden="true" />
+                                    {PLATFORM_LABEL[row.parsed.platform]} embed
+                                  </div>
+                                  <iframe
+                                    src={row.parsed.embedUrl}
+                                    title={`${PLATFORM_LABEL[row.parsed.platform]} reel preview`}
+                                    className="h-[180px] w-full border-0 sm:h-[160px]"
+                                    loading="lazy"
+                                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                                    allowFullScreen
+                                  />
+                                </div>
+                              ) : null}
                             </div>
-                          ) : null}
+                          );
+                        })}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={addReelInputRow}
+                        className="mt-3 inline-flex items-center gap-1 px-1 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72 transition hover:text-white"
+                      >
+                        <i className="fa-solid fa-plus text-[9px]" aria-hidden="true" />
+                        Add Reels
+                      </button>
+                    </div>
+                    </div>
+
+                    {createError ? <p className="text-xs text-[#ffb4b4]">{createError}</p> : null}
+                    {createSuccess ? <p className="text-xs text-[#9ef8cb]">{createSuccess}</p> : null}
+
+                    <button
+                      type="submit"
+                      disabled={!canPostSet}
+                      className={`inline-flex h-11 w-full items-center justify-center rounded-xl border px-4 text-sm font-semibold transition ${
+                        canPostSet
+                          ? "border-[#2b2b2b] bg-black/55 text-white hover:bg-white hover:text-black"
+                          : "cursor-not-allowed border-[#2b2b2b] bg-black/35 text-white/45"
+                      }`}
+                    >
+                      {isPostingSet ? "Posting..." : "Post Community Set"}
+                    </button>
+                  </form>
+
+                  <aside className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[2px] sm:p-5 lg:sticky lg:top-3">
+                    <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                    <div className="relative z-10">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/62">Live Preview</p>
+                      <div className="mt-3 overflow-hidden rounded-xl border border-[#2b2b2b] bg-black/45">
+                        {thumbnailPreview ? (
+                          <img
+                            src={thumbnailPreview}
+                            alt="Draft set cover"
+                            className="h-[220px] w-full object-cover"
+                          />
+                        ) : (
+                          <div className="grid h-[220px] w-full place-items-center bg-[linear-gradient(145deg,rgba(255,255,255,0.16),rgba(255,255,255,0.04))] text-white/70">
+                            <i className="fa-regular fa-image text-lg" aria-hidden="true" />
+                          </div>
+                        )}
+                      </div>
+                      <h3 className="mt-3 text-lg font-semibold leading-tight text-white">
+                        {normalizedSetTitle || "Your set title"}
+                      </h3>
+                      <p className="mt-2 text-sm leading-relaxed text-white/70">
+                        {normalizedSetDescription || "Add a description to show what learners will get from this set."}
+                      </p>
+                      <div className="mt-3 flex flex-wrap gap-1.5">
+                        {parsedSetTags.length > 0
+                          ? parsedSetTags.map((tag) => (
+                            <span key={`preview-tag-${tag}`} className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72">
+                              #{tag}
+                            </span>
+                          ))
+                          : null}
+                      </div>
+                      <div className="mt-4 grid grid-cols-2 gap-2">
+                        <div className="rounded-lg border border-[#2b2b2b] bg-black/35 px-2.5 py-2">
+                          <p className="text-[10px] uppercase tracking-[0.08em] text-white/52">Reels</p>
+                          <p className="mt-1 text-sm font-semibold text-white">{validDraftReelCount}</p>
                         </div>
-                      );
-                    })}
-                  </div>
+                        <div className="rounded-lg border border-[#2b2b2b] bg-black/35 px-2.5 py-2">
+                          <p className="text-[10px] uppercase tracking-[0.08em] text-white/52">Status</p>
+                          <p className={`mt-1 text-sm font-semibold ${canPostSet ? "text-[#9ef8cb]" : "text-white/76"}`}>
+                            {canPostSet ? "Ready to post" : "Draft"}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  </aside>
                 </div>
-
-                <button
-                  type="button"
-                  onClick={addReelInputRow}
-                  className="inline-flex -mt-2 items-center gap-1 self-start px-0 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72 transition hover:text-white"
-                >
-                  <i className="fa-solid fa-plus text-[9px]" aria-hidden="true" />
-                  Add Reels
-                </button>
-
-                {createError ? <p className="text-xs text-[#ffb4b4]">{createError}</p> : null}
-                {createSuccess ? <p className="text-xs text-[#9ef8cb]">{createSuccess}</p> : null}
-
-                <button
-                  type="submit"
-                  className="inline-flex h-11 w-full items-center justify-center rounded-xl border border-white/15 bg-black/55 px-4 text-sm font-semibold text-white transition hover:bg-white hover:text-black"
-                >
-                  Post Community Set
-                </button>
-              </form>
-            </section>
+              </section>
+            </div>
           </div>
-        </div>
+          </div>
       </>
     )}
       {detailBannerPortal}

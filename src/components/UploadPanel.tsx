@@ -8,6 +8,7 @@ import { uploadMaterial } from "@/lib/api";
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
+const SEARCH_INPUT_MODE_STORAGE_KEY = "studyreels-search-input-mode";
 const MAX_MATERIAL_SEEDS = 120;
 const MAX_MATERIAL_GROUPS = 80;
 const MAX_SEED_TEXT_CHARS = 16000;
@@ -165,8 +166,25 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
     if (typeof window === "undefined") {
       return;
     }
+    const saved = window.localStorage.getItem(SEARCH_INPUT_MODE_STORAGE_KEY);
+    if (saved === "topic" || saved === "source" || saved === "file") {
+      setInputMode(saved);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
     window.localStorage.setItem(GENERATION_MODE_STORAGE_KEY, generationMode);
   }, [generationMode]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.setItem(SEARCH_INPUT_MODE_STORAGE_KEY, inputMode);
+  }, [inputMode]);
 
   const disabled = useMemo(() => {
     if (loading) {

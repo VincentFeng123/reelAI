@@ -112,6 +112,25 @@ CREATE TABLE IF NOT EXISTS reel_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_reel_feedback_reel_id ON reel_feedback(reel_id);
 
+CREATE TABLE IF NOT EXISTS community_sets (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    tags_json TEXT NOT NULL,
+    reels_json TEXT NOT NULL,
+    reel_count INTEGER NOT NULL DEFAULT 0,
+    curator TEXT NOT NULL,
+    likes INTEGER NOT NULL DEFAULT 0,
+    learners INTEGER NOT NULL DEFAULT 1,
+    updated_label TEXT NOT NULL,
+    thumbnail_url TEXT NOT NULL,
+    featured INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_community_sets_featured_created_at ON community_sets(featured DESC, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS search_cache (
     cache_key TEXT PRIMARY KEY,
     response_json TEXT NOT NULL,

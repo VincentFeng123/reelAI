@@ -21,6 +21,7 @@ class ReelsGenerateRequest(BaseModel):
     num_reels: int = Field(default=8, ge=1, le=30)
     creative_commons_only: bool = False
     generation_mode: Literal["slow", "fast"] = "slow"
+    min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
 
 
 class CaptionCue(BaseModel):
@@ -88,3 +89,44 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
+
+
+class CommunityReelIn(BaseModel):
+    platform: Literal["youtube", "instagram", "tiktok"]
+    source_url: str = Field(min_length=1)
+    embed_url: str = Field(min_length=1)
+
+
+class CommunityReelOut(BaseModel):
+    id: str
+    platform: Literal["youtube", "instagram", "tiktok"]
+    source_url: str
+    embed_url: str
+
+
+class CommunitySetCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=140)
+    description: str = Field(min_length=18, max_length=2000)
+    tags: list[str] = Field(default_factory=list)
+    reels: list[CommunityReelIn] = Field(default_factory=list)
+    thumbnail_url: str = Field(min_length=1)
+    curator: str | None = None
+
+
+class CommunitySetOut(BaseModel):
+    id: str
+    title: str
+    description: str
+    tags: list[str] = Field(default_factory=list)
+    reels: list[CommunityReelOut] = Field(default_factory=list)
+    reel_count: int
+    curator: str
+    likes: int
+    learners: int
+    updated_label: str
+    thumbnail_url: str
+    featured: bool
+
+
+class CommunitySetsResponse(BaseModel):
+    sets: list[CommunitySetOut] = Field(default_factory=list)

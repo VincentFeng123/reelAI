@@ -1,6 +1,8 @@
 import type {
   ChatMessage,
   ChatResponse,
+  CommunitySet,
+  CommunityReelPlatform,
   FeedResponse,
   MaterialResponse,
   ReelsGenerateResponse,
@@ -53,6 +55,7 @@ export async function generateReels(params: {
   numReels?: number;
   conceptId?: string;
   generationMode?: "slow" | "fast";
+  minRelevance?: number;
 }): Promise<ReelsGenerateResponse> {
   const res = await safeFetch(apiUrl("/reels/generate"), {
     method: "POST",
@@ -65,6 +68,7 @@ export async function generateReels(params: {
       num_reels: params.numReels ?? 7,
       creative_commons_only: false,
       generation_mode: params.generationMode ?? "slow",
+      min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
     }),
   });
 
@@ -78,6 +82,7 @@ export async function fetchFeed(params: {
   prefetch?: number;
   autofill?: boolean;
   generationMode?: "slow" | "fast";
+  minRelevance?: number;
 }): Promise<FeedResponse> {
   const query = new URLSearchParams({
     material_id: params.materialId,
@@ -88,6 +93,9 @@ export async function fetchFeed(params: {
     creative_commons_only: "false",
     generation_mode: params.generationMode ?? "slow",
   });
+  if (Number.isFinite(params.minRelevance)) {
+    query.set("min_relevance", String(params.minRelevance));
+  }
 
   const res = await safeFetch(`${apiUrl("/feed")}?${query}`, {
     cache: "no-store",
@@ -137,6 +145,128 @@ export async function askStudyChat(params: {
     }),
   });
   return res.json();
+}
+
+type CommunitySetApi = {
+  id: string;
+  title: string;
+  description: string;
+  tags: string[];
+  reels: Array<{
+    id: string;
+    platform: CommunityReelPlatform;
+    source_url: string;
+    embed_url: string;
+  }>;
+  reel_count: number;
+  curator: string;
+  likes: number;
+  learners: number;
+  updated_label: string;
+  thumbnail_url: string;
+  featured: boolean;
+};
+
+function normalizeCommunitySet(raw: unknown): CommunitySet | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const row = raw as Partial<CommunitySetApi>;
+  const title = typeof row.title === "string" ? row.title.trim() : "";
+  const description = typeof row.description === "string" ? row.description.trim() : "";
+  if (!title || !description) {
+    return null;
+  }
+  const reels = Array.isArray(row.reels)
+    ? row.reels
+        .map((reel) => {
+          if (!reel || typeof reel !== "object") {
+            return null;
+          }
+          const platform = reel.platform;
+          if (platform !== "youtube" && platform !== "instagram" && platform !== "tiktok") {
+            return null;
+          }
+          const sourceUrl = typeof reel.source_url === "string" ? reel.source_url.trim() : "";
+          const embedUrl = typeof reel.embed_url === "string" ? reel.embed_url.trim() : "";
+          if (!sourceUrl || !embedUrl) {
+            return null;
+          }
+          return {
+            id: typeof reel.id === "string" && reel.id.trim() ? reel.id.trim() : `community-reel-${Math.random().toString(36).slice(2, 10)}`,
+            platform,
+            sourceUrl,
+            embedUrl,
+          };
+        })
+        .filter(Boolean) as CommunitySet["reels"]
+    : [];
+
+  const tags = Array.isArray(row.tags)
+    ? row.tags.map((tag) => String(tag || "").trim().toLowerCase()).filter(Boolean).slice(0, 6)
+    : [];
+
+  return {
+    id: typeof row.id === "string" && row.id.trim() ? row.id.trim() : `community-set-${Math.random().toString(36).slice(2, 10)}`,
+    title,
+    description,
+    tags,
+    reels,
+    reelCount: Math.max(reels.length, Number(row.reel_count) || 0),
+    curator: typeof row.curator === "string" && row.curator.trim() ? row.curator.trim() : "Community member",
+    likes: Math.max(0, Math.floor(Number(row.likes) || 0)),
+    learners: Math.max(0, Math.floor(Number(row.learners) || 0)),
+    updatedLabel: typeof row.updated_label === "string" && row.updated_label.trim() ? row.updated_label.trim() : "Updated just now",
+    thumbnailUrl: typeof row.thumbnail_url === "string" && row.thumbnail_url.trim() ? row.thumbnail_url.trim() : "/images/community/ai-systems.svg",
+    featured: Boolean(row.featured),
+  };
+}
+
+export async function fetchCommunitySets(): Promise<CommunitySet[]> {
+  const res = await safeFetch(apiUrl("/community/sets"), {
+    cache: "no-store",
+  });
+  const json = await res.json();
+  const rows = Array.isArray(json?.sets) ? json.sets : [];
+  return rows.map(normalizeCommunitySet).filter(Boolean) as CommunitySet[];
+}
+
+export async function createCommunitySet(params: {
+  title: string;
+  description: string;
+  tags: string[];
+  reels: Array<{
+    platform: CommunityReelPlatform;
+    sourceUrl: string;
+    embedUrl: string;
+  }>;
+  thumbnailUrl: string;
+  curator?: string;
+}): Promise<CommunitySet> {
+  const res = await safeFetch(apiUrl("/community/sets"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      title: params.title,
+      description: params.description,
+      tags: params.tags,
+      reels: params.reels.map((reel) => ({
+        platform: reel.platform,
+        source_url: reel.sourceUrl,
+        embed_url: reel.embedUrl,
+      })),
+      thumbnail_url: params.thumbnailUrl,
+      curator: params.curator,
+    }),
+  });
+
+  const created = normalizeCommunitySet(await res.json());
+  if (!created) {
+    throw new Error("Backend returned an invalid community set payload.");
+  }
+  return created;
 }
 
 async function safeFetch(url: string, init?: RequestInit): Promise<Response> {

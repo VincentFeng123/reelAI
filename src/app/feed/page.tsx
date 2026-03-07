@@ -26,11 +26,15 @@ const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
+const MIN_RELEVANCE_STORAGE_KEY = "studyreels-min-relevance-threshold";
 const HISTORY_STORAGE_KEY = "studyreels-material-history";
 const MUTED_STORAGE_KEY = "studyreels-muted";
 const MAX_SAVED_FEED_PROGRESS = 240;
 const MAX_SAVED_FEED_SESSIONS = 24;
 const MAX_REELS_PER_FEED_SESSION = 80;
+const DEFAULT_MIN_RELEVANCE = 0.08;
+const MIN_MIN_RELEVANCE = -1.0;
+const MAX_MIN_RELEVANCE = 1.2;
 type FeedbackAction = "helpful" | "confusing" | "save";
 type GenerationMode = "slow" | "fast";
 
@@ -346,6 +350,17 @@ function FeedPageInner() {
     return materialId ? [materialId] : [];
   }, [materialId]);
 
+  const getMinRelevanceThreshold = useCallback((): number => {
+    if (typeof window === "undefined") {
+      return DEFAULT_MIN_RELEVANCE;
+    }
+    const parsed = Number(window.localStorage.getItem(MIN_RELEVANCE_STORAGE_KEY));
+    if (!Number.isFinite(parsed)) {
+      return DEFAULT_MIN_RELEVANCE;
+    }
+    return Math.max(MIN_MIN_RELEVANCE, Math.min(MAX_MIN_RELEVANCE, parsed));
+  }, []);
+
   const hasMore = reels.length < total;
   const isFastGeneration = generationMode === "fast";
 
@@ -475,6 +490,7 @@ function FeedPageInner() {
       setError(null);
 
       try {
+        const minRelevance = getMinRelevanceThreshold();
         const rows = await Promise.all(
           feedMaterialIds.map(async (id) => {
             try {
@@ -485,6 +501,7 @@ function FeedPageInner() {
                 autofill: options?.autofill ?? false,
                 prefetch: 7,
                 generationMode,
+                minRelevance,
               });
               return { materialId: id, data, error: null };
             } catch (error) {
@@ -539,7 +556,7 @@ function FeedPageInner() {
         isFetchingRef.current = false;
       }
     },
-    [dedupeByIdentity, generationMode, getFeedMaterialIds, interleaveReelBatches, materialId, recoverMissingMaterial],
+    [dedupeByIdentity, generationMode, getFeedMaterialIds, getMinRelevanceThreshold, interleaveReelBatches, materialId, recoverMissingMaterial],
   );
 
   const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
@@ -547,6 +564,7 @@ function FeedPageInner() {
     if (feedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
       return [];
     }
+    const minRelevance = getMinRelevanceThreshold();
     const batchSize = isFastGeneration ? 2 : 7;
     const perTopicBatch = Math.max(1, Math.ceil(batchSize / feedMaterialIds.length));
     isGeneratingRef.current = true;
@@ -562,6 +580,7 @@ function FeedPageInner() {
               materialId: id,
               numReels: perTopicBatch,
               generationMode,
+              minRelevance,
             });
           } catch (e) {
             console.warn(`Background reel generation failed for topic material ${id}:`, e);
@@ -596,7 +615,7 @@ function FeedPageInner() {
       setGeneratingMore(false);
       isGeneratingRef.current = false;
     }
-  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, interleaveReelBatches, isFastGeneration]);
+  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getMinRelevanceThreshold, interleaveReelBatches, isFastGeneration]);
 
   useEffect(() => {
     mutedRestoredFromSnapshotRef.current = false;
@@ -706,6 +725,7 @@ function FeedPageInner() {
     if (feedMaterialIds.length === 0 || generationMode !== "fast" || !canRequestMore || isFastTopUpRef.current || isGeneratingRef.current) {
       return;
     }
+    const minRelevance = getMinRelevanceThreshold();
     const perTopicBatch = Math.max(1, Math.ceil(5 / feedMaterialIds.length));
     isFastTopUpRef.current = true;
     try {
@@ -716,6 +736,7 @@ function FeedPageInner() {
               materialId: id,
               numReels: perTopicBatch,
               generationMode,
+              minRelevance,
             });
           } catch (e) {
             console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
@@ -733,7 +754,7 @@ function FeedPageInner() {
     } finally {
       isFastTopUpRef.current = false;
     }
-  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, interleaveReelBatches]);
+  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getMinRelevanceThreshold, interleaveReelBatches]);
 
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {

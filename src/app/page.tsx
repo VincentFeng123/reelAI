@@ -4,6 +4,7 @@ import { type MouseEvent as ReactMouseEvent, type UIEvent, useCallback, useEffec
 import { useRouter } from "next/navigation";
 
 import { CommunityReelsPanel } from "@/components/CommunityReelsPanel";
+import { SettingsPanel } from "@/components/SettingsPanel";
 import { UploadPanel } from "@/components/UploadPanel";
 import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
 
@@ -21,7 +22,7 @@ const SIDEBAR_INFO_TOOLTIP_VISIBLE_MS = 2200;
 const SIDEBAR_INFO_TOOLTIP_FADE_MS = 180;
 const SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS = 24;
 type GenerationMode = "slow" | "fast";
-type SidebarTab = "search" | "community" | "create";
+type SidebarTab = "search" | "community" | "create" | "settings";
 
 type HistoryItem = {
   materialId: string;
@@ -501,7 +502,7 @@ export default function HomePage() {
       : "community";
 
   const sidebarPanelContent = (
-    <>
+    <div className="flex h-full min-h-0 flex-col">
       <div className="mt-2 flex items-center justify-end gap-2 lg:mt-0 lg:justify-between">
         <span
           aria-hidden="true"
@@ -695,7 +696,35 @@ export default function HomePage() {
           </div>
         </div>
       </div>
-    </>
+
+      <div className="-mt-1">
+        <div
+          className="group relative"
+          onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Configure search defaults and app preferences")}
+          onMouseLeave={onSidebarInfoHoverEnd}
+        >
+          <button
+            type="button"
+            onClick={() => switchSidebarTab("settings")}
+            className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+              activeSidebarTab === "settings"
+                ? "border-white bg-white text-black"
+                : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+            }`}
+          >
+            <div className="flex h-full items-center justify-between gap-1.5">
+              <p className="truncate font-semibold leading-none">Settings</p>
+              <i
+                className={`fa-solid fa-gear text-[11px] ${
+                  activeSidebarTab === "settings" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+                }`}
+                aria-hidden="true"
+              />
+            </div>
+          </button>
+        </div>
+      </div>
+    </div>
   );
 
   return (
@@ -827,7 +856,7 @@ export default function HomePage() {
                 </div>
               </div>
               <div className="min-h-0 flex-1 overflow-y-auto">
-                <div className="rounded-2xl">
+                <div className="h-full rounded-2xl">
                   {sidebarPanelContent}
                 </div>
               </div>
@@ -862,10 +891,13 @@ export default function HomePage() {
               onScrollabilityChange={onSearchPanelScrollabilityChange}
             />
           </div>
-          <div className={activeSidebarTab === "search" ? "hidden h-full min-h-0" : "h-full min-h-0"}>
+          <div className={activeSidebarTab === "settings" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
+            <SettingsPanel onClearSearchData={clearAllHistory} />
+          </div>
+          <div className={activeSidebarTab === "community" || activeSidebarTab === "create" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
             <CommunityReelsPanel
               mode={communityPanelMode}
-              isVisible={activeSidebarTab !== "search"}
+              isVisible={activeSidebarTab === "community" || activeSidebarTab === "create"}
               onDetailOpenChange={setCommunityDetailOpen}
             />
           </div>
