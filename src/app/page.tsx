@@ -604,7 +604,7 @@ export default function HomePage() {
           value={historyQuery}
           onChange={(event) => setHistoryQuery(event.target.value)}
           placeholder="Search history..."
-          className="h-9 w-full rounded-xl border border-white/20 bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/45 focus:border-white/45"
+          className="h-9 w-full rounded-xl border border-white/20 bg-black/55 px-3 text-xs text-white outline-none placeholder:text-white/45 focus:border-white/45"
         />
       </div>
 
@@ -836,21 +836,21 @@ export default function HomePage() {
         </div>
       ) : null}
 
-      <div className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:grid lg:grid-cols-[280px_1px_minmax(0,1fr)]">
-        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-2 text-white lg:mt-8 lg:mb-2 lg:flex lg:px-5">
+      <div className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:mx-0 lg:max-w-none lg:pl-4 lg:grid lg:grid-cols-[280px_1px_minmax(0,1fr)]">
+        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-2 text-white lg:mt-8 lg:mb-2 lg:flex lg:w-[280px] lg:justify-self-start lg:px-5">
           {sidebarPanelContent}
         </aside>
 
-        <div className="relative z-20 hidden h-full items-center justify-center lg:flex lg:translate-x-3">
+        <div className="relative z-20 hidden h-full items-center justify-center lg:flex lg:translate-x-1">
           <span className="h-[80%] w-px rounded-full bg-white/20" />
         </div>
 
         <section
           className={`relative z-20 h-full min-h-0 w-full overflow-hidden rounded-3xl ${
             isCommunityPanel ? "bg-transparent" : "bg-black/62"
-          } lg:my-2 lg:justify-self-end ${
+          } lg:my-2 lg:max-w-[1280px] lg:justify-self-center ${
             activeSidebarTab === "community"
-              ? "translate-x-0 md:translate-x-1 lg:translate-x-2 lg:w-[99%]"
+              ? "translate-x-0 md:translate-x-1 lg:translate-x-0 lg:w-[99%]"
               : "lg:w-[97%]"
           }`}
         >

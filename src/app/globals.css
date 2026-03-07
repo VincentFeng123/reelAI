@@ -22,6 +22,20 @@ body {
   overflow: hidden;
 }
 
+:root {
+  --desktop-ui-scale: 1;
+}
+
+@media (min-width: 1280px) and (hover: hover) and (pointer: fine) {
+  :root {
+    --desktop-ui-scale: clamp(1, calc(100vw / 1440), 1.2);
+  }
+
+  body {
+    zoom: var(--desktop-ui-scale);
+  }
+}
+
 @media (max-width: 767px) {
   html,
   body {
