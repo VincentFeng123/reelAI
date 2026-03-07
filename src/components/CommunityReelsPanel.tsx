@@ -1549,11 +1549,11 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                           className="h-24 w-full resize-none rounded-xl border border-[#2b2b2b] bg-black/55 px-3 py-2 text-sm text-white outline-none placeholder:text-white/40 transition-colors focus:border-[#2b2b2b] md:h-24"
                         />
                         {normalizedSetDescription.length === 0 ? (
-                          <p className="mt-1.5 text-[11px] text-white/46">
+                          <p className="mt-1.5 text-[11px] text-zinc-400">
                             Description must be at least {MIN_SET_DESCRIPTION_LENGTH} characters.
                           </p>
                         ) : descriptionHasTooFewChars ? (
-                          <p className="mt-1.5 text-[11px] text-[#ffb4b4]">
+                          <p className="mt-1.5 text-[11px] text-zinc-400">
                             Description must be at least {MIN_SET_DESCRIPTION_LENGTH} characters. Add {descriptionCharsRemaining} more
                             {descriptionCharsRemaining === 1 ? " character." : " characters."}
                           </p>
@@ -1568,7 +1568,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                           placeholder="chemistry, reaction mechanisms, exam prep"
                           className="h-11 w-full rounded-xl border border-[#2b2b2b] bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/40 transition-colors focus:border-[#2b2b2b]"
                         />
-                        <p className="mt-1.5 text-[11px] text-white/46">Add commas to add new tags.</p>
+                        <p className="mt-1.5 text-[11px] text-zinc-400">Add commas to add new tags.</p>
                         {parsedSetTags.length > 0 ? (
                           <div className="mt-2 flex flex-wrap gap-1.5">
                             {parsedSetTags.map((tag) => (
@@ -1615,7 +1615,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                             </span>
                           </span>
                         </label>
-                        <p className="mt-2 text-[11px] text-white/62">Use a vertical image for better mobile previews.</p>
+                        <p className="mt-2 text-[11px] text-zinc-400">Use a vertical image for better mobile previews.</p>
                         {thumbnailPreview ? (
                           <button
                             type="button"

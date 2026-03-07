@@ -9,12 +9,19 @@ type SettingsPanelProps = {
   onClearSearchData: () => void;
 };
 
+type SavedPreferences = {
+  generationMode: GenerationMode;
+  defaultInputMode: SearchInputMode;
+  minRelevanceThreshold: number;
+  startMuted: boolean;
+};
+
 const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
 const SEARCH_INPUT_MODE_STORAGE_KEY = "studyreels-search-input-mode";
 const MIN_RELEVANCE_STORAGE_KEY = "studyreels-min-relevance-threshold";
 const MUTED_STORAGE_KEY = "studyreels-muted";
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
-const DEFAULT_MIN_RELEVANCE = 0.08;
+const DEFAULT_MIN_RELEVANCE = 0.0;
 const MIN_RELEVANCE = 0.0;
 const MAX_RELEVANCE = 0.6;
 const RELEVANCE_STEP = 0.02;
@@ -30,6 +37,7 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
   const [defaultInputMode, setDefaultInputMode] = useState<SearchInputMode>("source");
   const [minRelevanceThreshold, setMinRelevanceThreshold] = useState(DEFAULT_MIN_RELEVANCE);
   const [startMuted, setStartMuted] = useState(true);
+  const [savedPreferences, setSavedPreferences] = useState<SavedPreferences | null>(null);
   const [settingsHydrated, setSettingsHydrated] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
 
@@ -37,58 +45,44 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
     if (typeof window === "undefined") {
       return;
     }
+    let nextGenerationMode: GenerationMode = "slow";
     const savedMode = window.localStorage.getItem(GENERATION_MODE_STORAGE_KEY);
     if (savedMode === "slow" || savedMode === "fast") {
-      setGenerationMode(savedMode);
+      nextGenerationMode = savedMode;
     }
 
+    let nextInputMode: SearchInputMode = "source";
     const savedInputMode = window.localStorage.getItem(SEARCH_INPUT_MODE_STORAGE_KEY);
     if (savedInputMode === "topic" || savedInputMode === "source" || savedInputMode === "file") {
-      setDefaultInputMode(savedInputMode);
+      nextInputMode = savedInputMode;
     }
 
+    let nextMinRelevance = DEFAULT_MIN_RELEVANCE;
     const savedThreshold = Number(window.localStorage.getItem(MIN_RELEVANCE_STORAGE_KEY));
     if (Number.isFinite(savedThreshold)) {
-      setMinRelevanceThreshold(Math.max(MIN_RELEVANCE, Math.min(MAX_RELEVANCE, savedThreshold)));
+      nextMinRelevance = Math.max(MIN_RELEVANCE, Math.min(MAX_RELEVANCE, savedThreshold));
     }
 
+    let nextStartMuted = true;
     const savedMuted = window.localStorage.getItem(MUTED_STORAGE_KEY);
     if (savedMuted === "0") {
-      setStartMuted(false);
+      nextStartMuted = false;
     } else if (savedMuted === "1") {
-      setStartMuted(true);
+      nextStartMuted = true;
     }
 
+    setGenerationMode(nextGenerationMode);
+    setDefaultInputMode(nextInputMode);
+    setMinRelevanceThreshold(nextMinRelevance);
+    setStartMuted(nextStartMuted);
+    setSavedPreferences({
+      generationMode: nextGenerationMode,
+      defaultInputMode: nextInputMode,
+      minRelevanceThreshold: Number(nextMinRelevance.toFixed(2)),
+      startMuted: nextStartMuted,
+    });
     setSettingsHydrated(true);
   }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || !settingsHydrated) {
-      return;
-    }
-    window.localStorage.setItem(GENERATION_MODE_STORAGE_KEY, generationMode);
-  }, [generationMode, settingsHydrated]);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || !settingsHydrated) {
-      return;
-    }
-    window.localStorage.setItem(SEARCH_INPUT_MODE_STORAGE_KEY, defaultInputMode);
-  }, [defaultInputMode, settingsHydrated]);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || !settingsHydrated) {
-      return;
-    }
-    window.localStorage.setItem(MIN_RELEVANCE_STORAGE_KEY, minRelevanceThreshold.toFixed(2));
-  }, [minRelevanceThreshold, settingsHydrated]);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || !settingsHydrated) {
-      return;
-    }
-    window.localStorage.setItem(MUTED_STORAGE_KEY, startMuted ? "1" : "0");
-  }, [settingsHydrated, startMuted]);
 
   const showNotice = useCallback((message: string) => {
     setNotice(message);
@@ -105,7 +99,7 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
     setDefaultInputMode("source");
     setMinRelevanceThreshold(DEFAULT_MIN_RELEVANCE);
     setStartMuted(true);
-    showNotice("Defaults restored.");
+    showNotice("Defaults loaded. Save to apply.");
   };
 
   const clearCommunitySetsCache = () => {
@@ -121,21 +115,52 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
     return `${speedLabel} mode · ${inputLabel} input · Match ${minRelevanceThreshold.toFixed(2)}+ · ${startMuted ? "Muted" : "Sound on"}`;
   }, [defaultInputMode, generationMode, minRelevanceThreshold, startMuted]);
 
+  const hasUnsavedChanges = useMemo(() => {
+    if (!savedPreferences) {
+      return false;
+    }
+    const currentMinRelevance = Number(minRelevanceThreshold.toFixed(2));
+    return (
+      savedPreferences.generationMode !== generationMode
+      || savedPreferences.defaultInputMode !== defaultInputMode
+      || savedPreferences.minRelevanceThreshold !== currentMinRelevance
+      || savedPreferences.startMuted !== startMuted
+    );
+  }, [defaultInputMode, generationMode, minRelevanceThreshold, savedPreferences, startMuted]);
+
+  const savePreferences = () => {
+    if (typeof window === "undefined" || !settingsHydrated) {
+      return;
+    }
+    const normalizedMinRelevance = Number(minRelevanceThreshold.toFixed(2));
+    window.localStorage.setItem(GENERATION_MODE_STORAGE_KEY, generationMode);
+    window.localStorage.setItem(SEARCH_INPUT_MODE_STORAGE_KEY, defaultInputMode);
+    window.localStorage.setItem(MIN_RELEVANCE_STORAGE_KEY, normalizedMinRelevance.toFixed(2));
+    window.localStorage.setItem(MUTED_STORAGE_KEY, startMuted ? "1" : "0");
+    setSavedPreferences({
+      generationMode,
+      defaultInputMode,
+      minRelevanceThreshold: normalizedMinRelevance,
+      startMuted,
+    });
+    showNotice("Settings saved.");
+  };
+
   return (
-    <div className="flex h-full min-h-0 w-full justify-center overflow-y-auto px-6 py-8 md:px-10 md:py-10 lg:px-10">
+    <div className="flex h-full min-h-0 w-full justify-center overflow-y-auto px-6 pt-6 pb-8 md:px-10 md:pt-8 md:pb-10 lg:px-10">
       <div className="w-full max-w-[980px]">
-        <header className="mx-auto mb-6 w-full max-w-[860px] md:mb-8">
+        <header className="mb-6 md:mb-8">
           <h1 className="text-3xl font-semibold tracking-tight text-white md:text-4xl">Settings</h1>
           <p className="mt-2 text-sm text-white/70">Configure your default search behavior and quickly manage saved app data.</p>
         </header>
 
-        <div className="rounded-3xl bg-black/38 p-4 backdrop-blur-[8px] md:p-6">
+        <div className="rounded-3xl bg-white/[0.07] p-4 backdrop-blur-[2px] md:p-6">
           <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/62">Search Defaults</p>
 
           <div className="mt-4 grid gap-4 md:grid-cols-2">
             <div>
               <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.11em] text-white/62">Generation Speed</label>
-              <div className="relative grid h-12 grid-cols-2 items-center rounded-2xl border border-white/20 bg-black/42 p-1">
+              <div className="relative grid h-12 grid-cols-2 items-center rounded-2xl border border-white/20 bg-white/[0.08] p-1 backdrop-blur-[2px]">
                 <span
                   aria-hidden="true"
                   className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%-4px)] rounded-xl bg-white transition-transform duration-300 ease-out ${
@@ -167,7 +192,7 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
 
             <div>
               <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.11em] text-white/62">Default Input Mode</label>
-              <div className="relative grid h-12 grid-cols-3 items-center rounded-2xl border border-white/20 bg-black/42 p-1">
+              <div className="relative grid h-12 grid-cols-3 items-center rounded-2xl border border-white/20 bg-white/[0.08] p-1 backdrop-blur-[2px]">
                 <span
                   aria-hidden="true"
                   className="pointer-events-none absolute bottom-1 left-1 top-1 w-[calc((100%-8px)/3)] rounded-xl bg-white transition-transform duration-300 ease-out"
@@ -192,7 +217,7 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
             </div>
           </div>
 
-          <div className="mt-4 rounded-2xl bg-black/30 p-3.5 md:p-4">
+          <div className="mt-4 rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[2px] md:p-4">
             <div>
               <div className="flex items-center justify-between gap-3">
                 <p className="text-sm font-semibold text-white/95">Similarity / matching threshold</p>
@@ -226,7 +251,7 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
             </div>
           </div>
 
-          <div className="mt-4 rounded-2xl bg-black/30 p-3.5 md:p-4">
+          <div className="mt-4 rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[2px] md:p-4">
             <div className="flex items-center justify-between gap-4">
               <div>
                 <p className="text-sm font-semibold text-white/95">Start reels muted</p>
@@ -252,7 +277,7 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
           <p className="mt-4 text-xs text-white/52">Current defaults: {settingsSummary}</p>
         </div>
 
-        <div className="mt-4 rounded-3xl bg-black/38 p-4 backdrop-blur-[8px] md:mt-5 md:p-6">
+        <div className="mt-4 rounded-3xl bg-white/[0.07] p-4 backdrop-blur-[2px] md:mt-5 md:p-6">
           <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/62">Utilities</p>
           <p className="mt-2 text-xs text-white/62">Useful maintenance actions for search history and local cache.</p>
 
@@ -283,7 +308,18 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
             </button>
           </div>
 
-          <p className="mt-4 min-h-5 text-xs text-white/72">{notice ?? ""}</p>
+        </div>
+
+        <div className="mt-2 flex items-end justify-between gap-3">
+          <p className="min-h-5 text-left text-xs text-white/72">{notice ?? ""}</p>
+          <button
+            type="button"
+            onClick={savePreferences}
+            disabled={!settingsHydrated || !hasUnsavedChanges}
+            className="inline-flex min-w-[10rem] items-center justify-center whitespace-nowrap rounded-xl border border-white/24 bg-white px-7 py-3 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            Save
+          </button>
         </div>
       </div>
     </div>

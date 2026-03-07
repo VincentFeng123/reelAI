@@ -486,6 +486,7 @@ export default function HomePage() {
     [forceCloseMobileSidebar],
   );
   const isCommunityPanel = activeSidebarTab === "community" || activeSidebarTab === "create";
+  const hasCommunityBackdrop = isCommunityPanel || activeSidebarTab === "settings";
   const hideMobileTopControls = isCommunityPanel && communityDetailOpen;
   const [lastCommunityPanelMode, setLastCommunityPanelMode] = useState<"community" | "create">("community");
 
@@ -609,7 +610,7 @@ export default function HomePage() {
         />
       </div>
 
-      <div className="mt-4 min-h-0 pr-1 lg:flex-1 lg:overflow-y-auto">
+      <div className="mt-4 min-h-0 pr-1 lg:flex-[0.95] lg:overflow-y-auto">
         <div className="mb-2 flex items-center justify-between">
           <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">History</p>
           <button
@@ -623,7 +624,7 @@ export default function HomePage() {
         <div className="relative pb-1">
           <div className="relative space-y-1.5">
             {filteredHistory.length === 0 ? (
-              <p className="text-xs text-white/42">No history yet.</p>
+              <p className="text-xs text-zinc-400">No history yet.</p>
             ) : (
               filteredHistory.map((entry) => (
                 <div
@@ -697,12 +698,8 @@ export default function HomePage() {
         </div>
       </div>
 
-      <div className="-mt-1">
-        <div
-          className="group relative"
-          onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Configure search defaults and app preferences")}
-          onMouseLeave={onSidebarInfoHoverEnd}
-        >
+      <div className="mt-4 mb-0">
+        <div className="group relative">
           <button
             type="button"
             onClick={() => switchSidebarTab("settings")}
@@ -734,7 +731,7 @@ export default function HomePage() {
           <VolumetricLightBackground />
         </div>
       ) : null}
-      {isCommunityPanel ? (
+      {hasCommunityBackdrop ? (
         <div className="pointer-events-none absolute inset-0 z-[3] overflow-hidden">
           <div className="absolute inset-0 bg-black/30" />
           <img
@@ -780,7 +777,7 @@ export default function HomePage() {
       >
         <div
           className={`h-full w-full ${
-            activeSidebarTab === "community"
+            activeSidebarTab === "community" || activeSidebarTab === "settings"
               ? "bg-black"
               : activeSidebarTab === "search"
                 ? "relative overflow-hidden bg-white/[0.05] backdrop-blur-[10px] backdrop-saturate-160"
@@ -876,7 +873,7 @@ export default function HomePage() {
 
         <section
           className={`relative z-20 h-full min-h-0 w-full overflow-hidden rounded-3xl ${
-            isCommunityPanel ? "bg-transparent" : "bg-black/62"
+            hasCommunityBackdrop ? "bg-transparent" : "bg-black/62"
           } lg:my-2 lg:max-w-[1280px] lg:justify-self-center ${
             activeSidebarTab === "community"
               ? "translate-x-0 md:translate-x-1 lg:translate-x-0 lg:w-[99%]"
