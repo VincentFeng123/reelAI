@@ -42,12 +42,12 @@ const CLIP_ENDPOINT_LABEL_VERTICAL_PULL = 0.94;
 const CLIP_ENDPOINT_LABEL_X_OFFSET_PX = -18;
 const CLIP_ENDPOINT_LABEL_MIN_DISTANCE_PX = 34;
 const CLIP_ENDPOINT_LABEL_MAX_PUSH_PX = 24;
-const RELEVANCE_ENDPOINT_LABEL_X_OFFSET_PX = -12;
+const RELEVANCE_ENDPOINT_LABEL_X_OFFSET_PX = -20;
 
 const VIDEO_POOL_OPTIONS: Array<{ value: VideoPoolMode; label: string }> = [
-  { value: "short-first", label: "Short-first" },
+  { value: "short-first", label: "Short" },
   { value: "balanced", label: "Balanced" },
-  { value: "long-form", label: "Long-form" },
+  { value: "long-form", label: "Long" },
 ];
 
 const DURATION_OPTIONS: Array<{ value: PreferredVideoDuration; label: string }> = [
@@ -65,15 +65,35 @@ const durationSummaryLabel: Record<PreferredVideoDuration, string> = {
 };
 
 const poolSummaryLabel: Record<VideoPoolMode, string> = {
-  "short-first": "Short-first",
+  "short-first": "Short",
   balanced: "Balanced",
-  "long-form": "Long-form",
+  "long-form": "Long",
 };
 
 type AvailabilityState = {
   status: "idle" | "checking" | "ok" | "partial" | "blocked" | "none" | "error";
   message: string;
 };
+
+function SettingsInfoTooltip({ text }: { text: string }) {
+  return (
+    <span className="group relative inline-flex shrink-0">
+      <span
+        tabIndex={0}
+        aria-label={text}
+        className="inline-flex h-4 w-4 items-center justify-center rounded-full text-white/55 transition-colors hover:text-white focus-visible:text-white focus-visible:outline-none"
+      >
+        <i className="fa-solid fa-circle-info text-[11px]" aria-hidden="true" />
+      </span>
+      <span
+        role="tooltip"
+        className="pointer-events-none absolute left-1/2 top-full z-30 mt-1.5 w-max max-w-[220px] -translate-x-1/2 rounded-lg bg-black/90 px-3 py-2 text-[10px] font-medium leading-tight text-white/88 opacity-0 shadow-[0_10px_28px_rgba(0,0,0,0.45)] backdrop-blur-sm transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100"
+      >
+        {text}
+      </span>
+    </span>
+  );
+}
 
 function pushPointAwayFromPoint(
   baseX: number,
@@ -158,7 +178,7 @@ function buildHeuristicAvailabilityState(settings: StudyReelsSettings): Availabi
     limitingFactors.push("long source preference");
   }
   if (settings.videoPoolMode === "long-form") {
-    limitingFactors.push("long-form pool mode");
+    limitingFactors.push("long pool mode");
   }
   if (settings.generationMode === "fast") {
     limitingFactors.push("fast generation mode");
@@ -755,14 +775,14 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
             <div className="rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
               <div>
                 <div className="flex items-center justify-between gap-3">
-                  <p className="text-sm font-semibold text-white/95">Similarity threshold</p>
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-sm font-semibold text-white/95">Similarity threshold</p>
+                    <SettingsInfoTooltip text="Higher values keep results tightly related and filter out unrelated content." />
+                  </div>
                   <span className="rounded-md bg-black/35 px-2 py-0.5 text-xs font-semibold text-white/90">
                     {minRelevanceThreshold.toFixed(2)}+
                   </span>
                 </div>
-                <p className="mt-1 text-xs text-white/62">
-                  Higher values keep results tightly related and filter out unrelated content.
-                </p>
                 <div className="mt-3 flex justify-center">
                   <div className="relative h-44 w-44">
                     <svg
@@ -896,12 +916,14 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
             <div className="rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
               <div>
                 <div className="flex items-center justify-between gap-3">
-                  <p className="text-sm font-semibold text-white/95">Clip length range</p>
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-sm font-semibold text-white/95">Clip length range</p>
+                    <SettingsInfoTooltip text="Set hard minimum and maximum clip lengths generated for reels." />
+                  </div>
                   <span className="rounded-md bg-black/35 px-2 py-0.5 text-xs font-semibold text-white/90">
                     {targetClipDurationMinSec}-{targetClipDurationMaxSec}s
                   </span>
                 </div>
-                <p className="mt-1 text-xs text-white/62">Set hard minimum and maximum clip lengths generated for reels.</p>
                 <div className="mt-3 flex justify-center">
                   <div className="relative h-44 w-44">
                     <svg
@@ -1071,8 +1093,10 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
 
           <div className="mt-4 grid gap-4 md:grid-cols-2">
             <div className="rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
-              <p className="text-sm font-semibold text-white/95">Video pool mode</p>
-              <p className="mt-1 text-xs text-white/62">Control how aggressively long-form sources are included.</p>
+              <div className="flex items-center gap-1.5">
+                <p className="text-sm font-semibold text-white/95">Video pool mode</p>
+                <SettingsInfoTooltip text="Control how aggressively long sources are included." />
+              </div>
               <div className="relative mt-3 grid h-11 grid-cols-3 items-center rounded-2xl border border-white/20 bg-white/[0.08] p-1">
                 <span
                   aria-hidden="true"
@@ -1098,8 +1122,10 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
             </div>
 
             <div className="rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
-              <p className="text-sm font-semibold text-white/95">Source video length</p>
-              <p className="mt-1 text-xs text-white/62">Prefer short clips, medium lessons, long-form lectures, or any.</p>
+              <div className="flex items-center gap-1.5">
+                <p className="text-sm font-semibold text-white/95">Source video length</p>
+                <SettingsInfoTooltip text="Prefer short clips, medium lessons, long lectures, or any." />
+              </div>
               <div className="relative mt-3 grid h-11 grid-cols-4 items-center rounded-2xl border border-white/20 bg-white/[0.08] p-1">
                 <span
                   aria-hidden="true"
@@ -1127,9 +1153,9 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
 
           <div className="mt-4 rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
             <div className="flex items-center justify-between gap-4">
-              <div>
+              <div className="flex items-center gap-1.5">
                 <p className="text-sm font-semibold text-white/95">Start reels muted</p>
-                <p className="mt-1 text-xs text-white/62">Controls the default audio state when opening the feed.</p>
+                <SettingsInfoTooltip text="Controls the default audio state when opening the feed." />
               </div>
               <button
                 type="button"
@@ -1152,8 +1178,10 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
         </div>
 
         <div className="mt-4 rounded-3xl bg-white/[0.07] p-4 backdrop-blur-[4px] md:mt-5 md:p-6">
-          <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/62">Utilities</p>
-          <p className="mt-2 text-xs text-white/62">Useful maintenance actions for search history and local cache.</p>
+          <div className="flex items-center gap-1.5">
+            <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/62">Utilities</p>
+            <SettingsInfoTooltip text="Useful maintenance actions for search history and local cache." />
+          </div>
 
           <div className="mt-4 grid gap-2 md:grid-cols-3">
             <button

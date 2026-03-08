@@ -14,6 +14,7 @@ const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
+const ACTIVE_SIDEBAR_TAB_SESSION_KEY = "studyreels-active-sidebar-tab";
 const MAX_HISTORY_ITEMS = 120;
 const MOBILE_SIDEBAR_CLOSE_MS = 260;
 const TOP_CHROME_GESTURE_WINDOW_MS = 220;
@@ -123,6 +124,7 @@ export default function HomePage() {
   const [searchPanelScrollable, setSearchPanelScrollable] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
+  const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
   const [communityDetailOpen, setCommunityDetailOpen] = useState(false);
   const [sidebarInfoTooltip, setSidebarInfoTooltip] = useState<{ text: string; left: number; top: number; visible: boolean; align: "left" | "right" } | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
@@ -145,6 +147,31 @@ export default function HomePage() {
     setHistory(merged);
     window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(merged));
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const navigationEntry = window.performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
+    const shouldRestoreTab = navigationEntry?.type === "reload";
+    if (!shouldRestoreTab) {
+      window.sessionStorage.removeItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY);
+      setSidebarTabHydrated(true);
+      return;
+    }
+    const savedTab = window.sessionStorage.getItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY);
+    if (savedTab === "search" || savedTab === "community" || savedTab === "create" || savedTab === "settings") {
+      setActiveSidebarTab(savedTab as SidebarTab);
+    }
+    setSidebarTabHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !sidebarTabHydrated) {
+      return;
+    }
+    window.sessionStorage.setItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY, activeSidebarTab);
+  }, [activeSidebarTab, sidebarTabHydrated]);
 
   const historySorted = useMemo(
     () =>
@@ -398,14 +425,17 @@ export default function HomePage() {
     }
   }, [activeSidebarTab]);
 
-  const shouldShowTopChromeStrip = !mobileSidebarOpen
+  const visibleSidebarTab = sidebarTabHydrated ? activeSidebarTab : null;
+  const shouldShowTopChromeStrip = sidebarTabHydrated
+    && !mobileSidebarOpen
     && (
-      activeSidebarTab === "settings"
+      visibleSidebarTab === "settings"
         ? true
-        : activeSidebarTab === "search"
+        : visibleSidebarTab === "search"
         ? searchPanelScrollable && (topChromeOffset || topChromeGestureActive)
         : topChromeOffset
     );
+  const shouldInsetSettingsForTopChrome = visibleSidebarTab === "settings" && shouldShowTopChromeStrip;
 
   const openMaterialFeed = useCallback(
     (materialId: string) => {
@@ -487,8 +517,8 @@ export default function HomePage() {
     },
     [forceCloseMobileSidebar],
   );
-  const isCommunityPanel = activeSidebarTab === "community" || activeSidebarTab === "create";
-  const hasCommunityBackdrop = isCommunityPanel || activeSidebarTab === "settings";
+  const isCommunityPanel = visibleSidebarTab === "community" || visibleSidebarTab === "create";
+  const hasCommunityBackdrop = isCommunityPanel || visibleSidebarTab === "settings";
   const hideMobileTopControls = isCommunityPanel && communityDetailOpen;
   const [lastCommunityPanelMode, setLastCommunityPanelMode] = useState<"community" | "create">("community");
 
@@ -498,9 +528,9 @@ export default function HomePage() {
     }
   }, [activeSidebarTab]);
 
-  const communityPanelMode = activeSidebarTab === "search"
+  const communityPanelMode = visibleSidebarTab === "search"
     ? lastCommunityPanelMode
-    : activeSidebarTab === "create"
+    : visibleSidebarTab === "create"
       ? "create"
       : "community";
 
@@ -538,14 +568,14 @@ export default function HomePage() {
           type="button"
           onClick={startNewSearch}
           className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            activeSidebarTab === "search" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+            visibleSidebarTab === "search" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
           }`}
         >
           <div className="flex h-full items-center justify-between gap-1.5">
             <p className="truncate font-semibold leading-none">Search</p>
             <i
               className={`fa-solid fa-magnifying-glass text-[11px] ${
-                activeSidebarTab === "search" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+                visibleSidebarTab === "search" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
               }`}
               aria-hidden="true"
             />
@@ -562,7 +592,7 @@ export default function HomePage() {
           type="button"
           onClick={() => switchSidebarTab("community")}
           className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            activeSidebarTab === "community"
+            visibleSidebarTab === "community"
               ? "border-white bg-white text-black"
               : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
           }`}
@@ -571,7 +601,7 @@ export default function HomePage() {
             <p className="truncate font-semibold leading-none">Community Reels</p>
             <i
               className={`fa-solid fa-users text-[11px] ${
-                activeSidebarTab === "community" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+                visibleSidebarTab === "community" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
               }`}
               aria-hidden="true"
             />
@@ -588,14 +618,14 @@ export default function HomePage() {
           type="button"
           onClick={() => switchSidebarTab("create")}
           className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            activeSidebarTab === "create" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+            visibleSidebarTab === "create" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
           }`}
         >
           <div className="flex h-full items-center justify-between gap-1.5">
             <p className="truncate font-semibold leading-none">Create Set</p>
             <i
               className={`fa-solid fa-plus text-[11px] ${
-                activeSidebarTab === "create" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+                visibleSidebarTab === "create" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
               }`}
               aria-hidden="true"
             />
@@ -612,7 +642,7 @@ export default function HomePage() {
         />
       </div>
 
-      <div className="mt-4 min-h-0 pr-1 lg:flex-[0.95] lg:overflow-y-auto">
+      <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1 lg:flex-[0.95]">
         <div className="mb-2 flex items-center justify-between">
           <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">History</p>
           <button
@@ -700,13 +730,13 @@ export default function HomePage() {
         </div>
       </div>
 
-      <div className="mt-4 mb-0">
+      <div className="mb-0 mt-auto pt-4 lg:mt-4 lg:pt-0">
         <div className="group relative">
           <button
             type="button"
             onClick={() => switchSidebarTab("settings")}
             className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-              activeSidebarTab === "settings"
+              visibleSidebarTab === "settings"
                 ? "border-white bg-white text-black"
                 : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
             }`}
@@ -715,7 +745,7 @@ export default function HomePage() {
               <p className="truncate font-semibold leading-none">Settings</p>
               <i
                 className={`fa-solid fa-gear text-[11px] ${
-                  activeSidebarTab === "settings" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+                  visibleSidebarTab === "settings" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
                 }`}
                 aria-hidden="true"
               />
@@ -728,7 +758,7 @@ export default function HomePage() {
 
   return (
     <main onScroll={onMainScroll} className="home-hero-shell fixed inset-0 h-[100dvh] overflow-x-hidden overflow-y-auto lg:overflow-hidden">
-      {activeSidebarTab === "search" ? (
+      {visibleSidebarTab === "search" ? (
         <div className="absolute -top-[28%] -right-[0%] bottom-0 z-[2] w-[100%]">
           <VolumetricLightBackground />
         </div>
@@ -772,21 +802,21 @@ export default function HomePage() {
       <div
         aria-hidden="true"
         className={`pointer-events-none fixed inset-x-0 top-0 z-[68] h-[calc(max(env(safe-area-inset-top),0px)+68px)] ${
-          activeSidebarTab === "search" ? "transition-none" : "transition-opacity duration-150"
+          visibleSidebarTab === "search" ? "transition-none" : "transition-opacity duration-150"
         } lg:hidden ${
           shouldShowTopChromeStrip ? "opacity-100" : "opacity-0"
         }`}
       >
         <div
           className={`h-full w-full ${
-            activeSidebarTab === "community" || activeSidebarTab === "settings"
+            visibleSidebarTab === "community" || visibleSidebarTab === "settings"
               ? "bg-black"
-              : activeSidebarTab === "search"
+              : visibleSidebarTab === "search"
                 ? "relative overflow-hidden bg-white/[0.05] backdrop-blur-[10px] backdrop-saturate-160"
                 : "bg-black/28 backdrop-blur-[28px] backdrop-saturate-180"
           }`}
         >
-          {activeSidebarTab === "search" ? <div className="absolute inset-0 bg-black/45" /> : null}
+          {visibleSidebarTab === "search" ? <div className="absolute inset-0 bg-black/45" /> : null}
         </div>
       </div>
 
@@ -877,12 +907,12 @@ export default function HomePage() {
           className={`relative z-20 h-full min-h-0 w-full overflow-hidden rounded-3xl ${
             hasCommunityBackdrop ? "bg-transparent" : "bg-black/62"
           } lg:my-2 lg:max-w-[1280px] lg:justify-self-center ${
-            activeSidebarTab === "community"
+            visibleSidebarTab === "community"
               ? "translate-x-0 md:translate-x-1 lg:translate-x-0 lg:w-[99%]"
               : "lg:w-[97%]"
           }`}
         >
-          <div className={activeSidebarTab === "search" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
+          <div className={visibleSidebarTab === "search" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
             <UploadPanel
               onMaterialCreated={onUploadMaterialCreated}
               onScrollOffsetChange={onSearchPanelScrollOffsetChange}
@@ -890,13 +920,19 @@ export default function HomePage() {
               onScrollabilityChange={onSearchPanelScrollabilityChange}
             />
           </div>
-          <div className={activeSidebarTab === "settings" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
+          <div
+            className={
+              visibleSidebarTab === "settings"
+                ? `h-full min-h-0 ${shouldInsetSettingsForTopChrome ? "pt-[calc(max(env(safe-area-inset-top),0px)+0px)] -mt-[10px] md:mt-0 md:pt-[calc(max(env(safe-area-inset-top),0px)+30px)] lg:pt-0" : ""}`
+                : "hidden h-full min-h-0"
+            }
+          >
             <SettingsPanel onClearSearchData={clearAllHistory} />
           </div>
-          <div className={activeSidebarTab === "community" || activeSidebarTab === "create" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
+          <div className={visibleSidebarTab === "community" || visibleSidebarTab === "create" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
             <CommunityReelsPanel
               mode={communityPanelMode}
-              isVisible={activeSidebarTab === "community" || activeSidebarTab === "create"}
+              isVisible={visibleSidebarTab === "community" || visibleSidebarTab === "create"}
               onDetailOpenChange={setCommunityDetailOpen}
             />
           </div>
