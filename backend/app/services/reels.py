@@ -3,6 +3,8 @@ import json
 import re
 import sqlite3
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -21,7 +23,32 @@ from .segmenter import (
 )
 
 
+@dataclass
+class QueryCandidate:
+    text: str
+    strategy: str
+    confidence: float
+    source_terms: list[str] = field(default_factory=list)
+    weight: float = 1.0
+    stage: str = "broad"
+    source_surface: str = "youtube_api"
+
+
+@dataclass
+class RetrievalStagePlan:
+    name: str
+    queries: list[QueryCandidate]
+    budget: int
+    min_good_results: int
+
+
 class ReelService:
+    VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
+    VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
+    DEFAULT_TARGET_CLIP_DURATION_SEC = 55
+    MIN_TARGET_CLIP_DURATION_SEC = 15
+    MAX_TARGET_CLIP_DURATION_SEC = 180
+    MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC = 15
     GENERIC_CONTEXT_TERMS = {
         "basics",
         "basic",
@@ -86,12 +113,55 @@ class ReelService:
         "status",
         "vlog",
     }
+    QUERY_STRATEGY_PRIOR: dict[str, float] = {
+        "literal": 0.78,
+        "paraphrase": 0.72,
+        "scene": 0.84,
+        "object": 0.8,
+        "action": 0.79,
+        "broll": 0.87,
+        "news_doc": 0.73,
+        "tutorial_demo": 0.75,
+        "recovery_adjacent": 0.64,
+    }
+    SOURCE_SURFACE_PRIOR: dict[str, float] = {
+        "youtube_api": 1.0,
+        "youtube_html": 0.94,
+        "duckduckgo_site": 0.87,
+        "bing_site": 0.85,
+        "duckduckgo_quoted": 0.9,
+        "bing_quoted": 0.88,
+        "local_cache": 0.78,
+    }
+    CHANNEL_QUALITY_BONUS: dict[str, float] = {
+        "news": 0.06,
+        "education": 0.06,
+        "tutorial": 0.04,
+        "stock_footage": 0.08,
+        "podcast": -0.03,
+        "low_quality_compilation": -0.11,
+    }
+    CLIPABILITY_PENALTY_TOKENS = {
+        "live stream",
+        "podcast",
+        "full episode",
+        "compilation",
+        "reaction",
+    }
+    QUERY_RETRIEVAL_WORKERS_FAST = 4
+    QUERY_RETRIEVAL_WORKERS_SLOW = 6
+    TRANSCRIPT_FETCH_WORKERS_FAST = 4
+    TRANSCRIPT_FETCH_WORKERS_SLOW = 6
 
     def __init__(self, embedding_service, youtube_service) -> None:
         settings = get_settings()
         self.embedding_service = embedding_service
         self.youtube_service = youtube_service
         self.chat_model = settings.openai_chat_model
+        self.retrieval_engine_v2_enabled = bool(settings.retrieval_engine_v2_enabled)
+        self.retrieval_tier2_enabled = bool(settings.retrieval_tier2_enabled)
+        self.retrieval_debug_logging = bool(settings.retrieval_debug_logging)
+        self._strategy_history_cache: dict[str, float] = {}
         self.openai_client = OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
 
     def generate_reels(
@@ -102,6 +172,12 @@ class ReelService:
         num_reels: int,
         creative_commons_only: bool,
         fast_mode: bool = False,
+        video_pool_mode: str = "short-first",
+        preferred_video_duration: str = "any",
+        target_clip_duration_sec: int = DEFAULT_TARGET_CLIP_DURATION_SEC,
+        target_clip_duration_min_sec: int | None = None,
+        target_clip_duration_max_sec: int | None = None,
+        dry_run: bool = False,
     ) -> list[dict[str, Any]]:
         params: tuple[Any, ...] = (material_id,)
         concept_where = "WHERE material_id = ?"
@@ -148,187 +224,805 @@ class ReelService:
         generated_video_counts: dict[str, int] = {}
         generated_clip_keys: set[str] = set()
         max_segments_per_video = 1 if fast_mode else 3
+        safe_video_pool_mode = self._normalize_video_pool_mode(video_pool_mode)
+        safe_video_duration_pref = self._normalize_preferred_video_duration(preferred_video_duration)
+        max_generation_target = self._generation_target_cap(
+            num_reels=num_reels,
+            preferred_video_duration=safe_video_duration_pref,
+            fast_mode=fast_mode,
+        )
+        clip_min_len, clip_max_len, safe_target_clip_duration = self._resolve_clip_duration_bounds(
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+        )
 
         generated: list[dict[str, Any]] = []
         material = fetch_one(conn, "SELECT subject_tag FROM materials WHERE id = ?", (material_id,))
-        subject_tag = material["subject_tag"] if material else None
+        subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
         material_context_terms = self._build_material_context_terms(concepts=concepts, subject_tag=subject_tag)
-
         for concept in concepts:
-            concept_keywords = json.loads(concept["keywords_json"])
-            concept_embedding = self._get_concept_embedding(conn, concept) if not fast_mode else None
-            concept_terms = [concept["title"], *concept_keywords, concept.get("summary", "")]
+            if self._should_finalize_generation(
+                generated=generated,
+                num_reels=num_reels,
+                preferred_video_duration=safe_video_duration_pref,
+                max_generation_target=max_generation_target,
+            ):
+                break
+
+            concept_keywords = self._parse_keywords_json(concept.get("keywords_json"))
+            concept_summary = str(concept.get("summary") or "")
+            concept_embedding: np.ndarray | None = None
+            if not fast_mode:
+                try:
+                    concept_embedding = self._get_concept_embedding(conn, concept)
+                except Exception:
+                    concept_embedding = None
+
+            concept_terms = [concept["title"], *concept_keywords, concept_summary]
             context_terms = self._context_terms_for_concept(concept_terms, material_context_terms)
             vague_topic = self._is_vague_concept(
                 title=concept["title"],
                 keywords=concept_keywords,
-                summary=concept.get("summary", ""),
+                summary=concept_summary,
             )
-            queries = self._build_query_variants(
-                concept["title"],
-                concept_keywords,
-                subject_tag,
-                context_terms=context_terms,
+            visual_spec = self._derive_visual_scene_spec(
+                title=concept["title"],
+                keywords=concept_keywords,
+                summary=concept_summary,
             )
-            if fast_mode:
-                queries = queries[:2]
-            seen_video_ids: set[str] = set()
+            if self.retrieval_engine_v2_enabled:
+                query_candidates = self._build_query_candidates(
+                    title=concept["title"],
+                    keywords=concept_keywords,
+                    summary=concept_summary,
+                    subject_tag=subject_tag,
+                    context_terms=context_terms,
+                    visual_spec=visual_spec,
+                    fast_mode=fast_mode,
+                )
+            else:
+                query_candidates = [
+                    QueryCandidate(
+                        text=q,
+                        strategy="literal",
+                        confidence=0.7,
+                        source_terms=[concept["title"]],
+                        stage="broad",
+                    )
+                    for q in self._build_query_variants(
+                        concept["title"],
+                        concept_keywords,
+                        subject_tag,
+                        context_terms=context_terms,
+                    )
+                ]
+            retrieval_stages = self._build_retrieval_stage_plan(query_candidates=query_candidates, fast_mode=fast_mode)
+            retrieval_run = self._init_retrieval_debug_run(
+                material_id=material_id,
+                concept_id=str(concept.get("id") or ""),
+                concept_title=str(concept.get("title") or ""),
+            )
 
-            for query in queries:
-                # First pull short-form videos; then broaden to any duration for long-form clipping.
-                durations = ("short", None)
-                for duration in durations:
-                    prefer_short_query = duration == "short"
-                    videos = self.youtube_service.search_videos(
-                        conn,
-                        query=query,
-                        max_results=4 if fast_mode else 12,
+            seen_video_ids: set[str] = set()
+            stage_candidates: list[dict[str, Any]] = []
+            all_query_reports: list[dict[str, Any]] = []
+
+            primary_stages = [stage for stage in retrieval_stages if stage.name == "high_precision"]
+            expansion_stages = [stage for stage in retrieval_stages if stage.name != "high_precision"]
+            pass_groups = [primary_stages, expansion_stages]
+
+            for pass_index, stage_group in enumerate(pass_groups):
+                if not stage_group:
+                    continue
+                if pass_index > 0 and self._fast_pass_is_sufficient(
+                    stage_candidates,
+                    fast_mode=fast_mode,
+                    max_generation_target=max_generation_target,
+                ):
+                    break
+
+                for stage in stage_group:
+                    if self._should_finalize_generation(
+                        generated=generated,
+                        num_reels=num_reels,
+                        preferred_video_duration=safe_video_duration_pref,
+                        max_generation_target=max_generation_target,
+                    ):
+                        break
+
+                    good_results = 0
+                    stage_duration_plan = self._stage_duration_plan(
+                        stage_name=stage.name,
+                        preferred_video_duration=safe_video_duration_pref,
+                        video_pool_mode=safe_video_pool_mode,
+                    )
+                    strict_duration = stage.name == "high_precision" and safe_video_duration_pref in {
+                        "short",
+                        "medium",
+                        "long",
+                    }
+                    allow_unknown_duration = stage.name != "high_precision"
+                    stage_queries = stage.queries[: stage.budget]
+                    stage_query_reports = [
+                        {
+                            "query": query_candidate.text,
+                            "strategy": query_candidate.strategy,
+                            "stage": stage.name,
+                            "source_terms": query_candidate.source_terms,
+                            "weight": float(query_candidate.weight),
+                            "surface": query_candidate.source_surface,
+                            "results": 0,
+                            "kept": 0,
+                        }
+                        for query_candidate in stage_queries
+                    ]
+                    max_results_for_query = self._search_results_budget(
+                        fast_mode=fast_mode,
+                        generated_count=len(generated),
+                        max_generation_target=max_generation_target,
+                    )
+                    search_jobs = self._stage_search_jobs_parallel(
+                        stage_name=stage.name,
+                        stage_queries=stage_queries,
+                        stage_duration_plan=stage_duration_plan,
+                        max_results_for_query=max_results_for_query,
                         creative_commons_only=creative_commons_only,
-                        video_duration=duration,
+                        fast_mode=fast_mode,
                     )
 
-                    for video in videos:
-                        if video["id"] in seen_video_ids:
+                    for query_idx, _duration_idx, query_candidate, _duration, videos in search_jobs:
+                        if query_idx >= len(stage_query_reports):
                             continue
-                        seen_video_ids.add(video["id"])
-                        existing_for_video = existing_video_counts.get(video["id"], 0)
-                        generated_for_video = generated_video_counts.get(video["id"], 0)
-                        if existing_for_video + generated_for_video >= max_segments_per_video:
-                            continue
-                        video_duration = int(video.get("duration_sec") or 0)
+                        query_report = stage_query_reports[query_idx]
+                        query_report["results"] += len(videos)
 
-                        self._upsert_video(conn, video)
-                        video_relevance = self._score_text_relevance(
-                            conn,
-                            text=self._video_metadata_text(video),
+                        for video in videos:
+                            video_id = str(video.get("id") or "").strip()
+                            if not video_id or video_id in seen_video_ids:
+                                continue
+                            seen_video_ids.add(video_id)
+                            existing_for_video = existing_video_counts.get(video_id, 0)
+                            generated_for_video = generated_video_counts.get(video_id, 0)
+                            if existing_for_video + generated_for_video >= max_segments_per_video:
+                                continue
+
+                            video_duration = int(video.get("duration_sec") or 0)
+                            if strict_duration and not self._video_matches_preferred_duration(
+                                video_duration_sec=video_duration,
+                                preferred_video_duration=safe_video_duration_pref,
+                                allow_unknown_duration=allow_unknown_duration,
+                            ):
+                                continue
+
+                            if not dry_run:
+                                self._upsert_video(conn, video)
+
+                            ranking = self._score_video_candidate(
+                                conn,
+                                video=video,
+                                query_candidate=query_candidate,
+                                concept_terms=concept_terms,
+                                context_terms=context_terms,
+                                concept_embedding=concept_embedding,
+                                subject_tag=subject_tag,
+                                visual_spec=visual_spec,
+                                preferred_video_duration=safe_video_duration_pref,
+                                stage_name=stage.name,
+                                require_context=bool(context_terms) and vague_topic,
+                                fast_mode=fast_mode,
+                            )
+                            if not bool(ranking.get("passes", False)):
+                                continue
+                            query_report["kept"] += 1
+                            if float(ranking.get("discovery_score") or 0.0) >= 0.2:
+                                good_results += 1
+
+                            stage_candidates.append(
+                                {
+                                    "video": video,
+                                    "video_id": video_id,
+                                    "video_duration": video_duration,
+                                    "video_relevance": ranking["text_relevance"],
+                                    "ranking": ranking,
+                                    "query_candidate": query_candidate,
+                                    "stage": stage.name,
+                                }
+                            )
+
+                    all_query_reports.extend(stage_query_reports)
+                    if good_results >= stage.min_good_results and len(stage_candidates) >= stage.min_good_results:
+                        break
+
+                if pass_index == 0 and self._fast_pass_is_sufficient(
+                    stage_candidates,
+                    fast_mode=fast_mode,
+                    max_generation_target=max_generation_target,
+                ):
+                    break
+
+            if not stage_candidates:
+                local_candidates = self._recover_candidates_from_local_corpus(
+                    conn,
+                    concept_terms=concept_terms,
+                    context_terms=context_terms,
+                    concept_embedding=concept_embedding,
+                    subject_tag=subject_tag,
+                    visual_spec=visual_spec,
+                    preferred_video_duration=safe_video_duration_pref,
+                    fast_mode=fast_mode,
+                    existing_video_counts=existing_video_counts,
+                    generated_video_counts=generated_video_counts,
+                    max_segments_per_video=max_segments_per_video,
+                    concept_title=str(concept.get("title") or ""),
+                )
+                if local_candidates:
+                    stage_candidates = local_candidates
+                    all_query_reports.append(
+                        {
+                            "query": f"local_cache:{concept.get('title')}",
+                            "strategy": "recovery_adjacent",
+                            "stage": "recovery",
+                            "source_terms": concept_terms[:4],
+                            "weight": 0.5,
+                            "surface": "local_cache",
+                            "results": len(local_candidates),
+                            "kept": len(local_candidates),
+                        }
+                    )
+
+            if not stage_candidates:
+                self._persist_retrieval_debug_run(
+                    conn,
+                    run=retrieval_run,
+                    query_reports=all_query_reports,
+                    candidate_rows=[],
+                    selected=None,
+                    failure_reason="no_candidates_after_retrieval",
+                    dry_run=dry_run,
+                )
+                continue
+
+            if self.retrieval_tier2_enabled:
+                stage_candidates = self._collapse_near_duplicate_candidates(stage_candidates)
+            else:
+                stage_candidates = sorted(
+                    stage_candidates,
+                    key=lambda row: float((row.get("ranking") or {}).get("final_score") or 0.0),
+                    reverse=True,
+                )
+            transcript_budget = min(
+                20,
+                self._transcript_expansion_budget(
+                    fast_mode=fast_mode,
+                    generated_count=len(generated),
+                    max_generation_target=max_generation_target,
+                ),
+            )
+            if self.retrieval_tier2_enabled:
+                ranked_candidates = self._diversify_video_candidates(
+                    stage_candidates,
+                    top_k=max(12, transcript_budget * 2),
+                )
+            else:
+                ranked_candidates = stage_candidates[: max(12, transcript_budget * 2)]
+
+            selected_outcome: dict[str, Any] | None = None
+            candidate_records: list[dict[str, Any]] = []
+            for candidate in ranked_candidates[: max(20, transcript_budget * 2)]:
+                ranking = dict(candidate.get("ranking") or {})
+                candidate_records.append(
+                    {
+                        "video_id": str(candidate.get("video_id") or ""),
+                        "video_title": str((candidate.get("video") or {}).get("title") or ""),
+                        "channel_title": str((candidate.get("video") or {}).get("channel_title") or ""),
+                        "strategy": str((candidate.get("query_candidate") or QueryCandidate("", "", 0.0)).strategy or ""),
+                        "stage": str(candidate.get("stage") or ""),
+                        "query": str((candidate.get("query_candidate") or QueryCandidate("", "", 0.0)).text or ""),
+                        "final_score": float(ranking.get("final_score") or 0.0),
+                        "discovery_score": float(ranking.get("discovery_score") or 0.0),
+                        "clipability_score": float(ranking.get("clipability_score") or 0.0),
+                        "source_surface": str((candidate.get("video") or {}).get("search_source") or ""),
+                        "features": ranking.get("features") or {},
+                    }
+                )
+
+            transcript_candidates = ranked_candidates[:transcript_budget]
+            transcript_prefetch_ids: list[str] = []
+            for candidate in transcript_candidates:
+                video_id = str(candidate.get("video_id") or "")
+                video_duration = int(candidate.get("video_duration") or 0)
+                use_full_short_clip = self._should_use_full_short_clip(
+                    prefer_short_query=self._video_duration_bucket(video_duration) == "short",
+                    video_duration_sec=video_duration,
+                    clip_min_len=clip_min_len,
+                    clip_max_len=clip_max_len,
+                )
+                if not use_full_short_clip:
+                    transcript_prefetch_ids.append(video_id)
+            transcript_cache = self._prefetch_transcripts_parallel(
+                transcript_prefetch_ids,
+                fast_mode=fast_mode,
+            )
+
+            for candidate in transcript_candidates:
+                video = candidate["video"]
+                video_id = str(candidate["video_id"])
+                video_duration = int(candidate["video_duration"])
+                ranking = dict(candidate.get("ranking") or {})
+                query_candidate = candidate.get("query_candidate")
+                if not isinstance(query_candidate, QueryCandidate):
+                    query_candidate = QueryCandidate(text="", strategy="literal", confidence=0.5)
+
+                existing_for_video = existing_video_counts.get(video_id, 0)
+                generated_for_video = generated_video_counts.get(video_id, 0)
+                if existing_for_video + generated_for_video >= max_segments_per_video:
+                    continue
+
+                use_full_short_clip = self._should_use_full_short_clip(
+                    prefer_short_query=self._video_duration_bucket(video_duration) == "short",
+                    video_duration_sec=video_duration,
+                    clip_min_len=clip_min_len,
+                    clip_max_len=clip_max_len,
+                )
+                transcript = [] if use_full_short_clip else list(transcript_cache.get(video_id) or [])
+                if transcript:
+                    transcript_ranking = self._score_transcript_alignment(
+                        conn,
+                        transcript=transcript,
+                        concept_terms=concept_terms,
+                        concept_embedding=concept_embedding,
+                        visual_spec=visual_spec,
+                    )
+                    ranking["discovery_score"] = min(
+                        1.0,
+                        float(ranking.get("discovery_score") or 0.0) + 0.12 * float(transcript_ranking.get("concept_match") or 0.0),
+                    )
+                    ranking["clipability_score"] = min(
+                        1.0,
+                        float(ranking.get("clipability_score") or 0.0)
+                        + 0.18 * float(transcript_ranking.get("clipability_signal") or 0.0),
+                    )
+
+                segments: list[SegmentMatch] = []
+                if transcript:
+                    if fast_mode:
+                        segments = self._fast_segments_from_transcript(
+                            transcript=transcript,
                             concept_terms=concept_terms,
-                            context_terms=context_terms,
-                            concept_embedding=concept_embedding,
-                            subject_tag=subject_tag,
+                            max_segments=2,
                         )
-                        if not self._passes_relevance_gate(
-                            relevance=video_relevance,
-                            require_context=bool(context_terms) and vague_topic,
-                            fast_mode=fast_mode,
-                        ):
-                            continue
-                        video_relevance["passes"] = True
-                        use_full_short_clip = self._should_use_full_short_clip(
-                            prefer_short_query=prefer_short_query,
-                            video_duration_sec=video_duration,
-                        )
-                        transcript = self.youtube_service.get_transcript(conn, video["id"])
-                        segments: list[SegmentMatch] = []
-
-                        if transcript:
-                            if fast_mode:
+                    else:
+                        chunks, chunk_embeddings = self._load_or_create_transcript_chunks(conn, video_id, transcript)
+                        if chunks and len(chunk_embeddings) > 0:
+                            if concept_embedding is not None:
+                                segments = select_segments(
+                                    concept_embedding,
+                                    chunk_embeddings,
+                                    chunks,
+                                    concept_terms=concept_terms,
+                                    top_k=6 if vague_topic else 4,
+                                )
+                            else:
                                 segments = self._fast_segments_from_transcript(
                                     transcript=transcript,
                                     concept_terms=concept_terms,
-                                    max_segments=2,
+                                    max_segments=3,
                                 )
-                            else:
-                                chunks, chunk_embeddings = self._load_or_create_transcript_chunks(conn, video["id"], transcript)
-                                if chunks and len(chunk_embeddings) > 0:
-                                    segments = select_segments(
-                                        concept_embedding,
-                                        chunk_embeddings,
-                                        chunks,
-                                        concept_terms=concept_terms,
-                                        top_k=6 if vague_topic else 4,
-                                    )
-                                    if vague_topic:
-                                        expanded = self._split_video_into_short_segments(
-                                            concept_embedding=concept_embedding,
-                                            chunk_embeddings=chunk_embeddings,
-                                            chunks=chunks,
-                                            concept_terms=concept_terms,
-                                            max_segments=8,
-                                        )
-                                        segments = self._merge_unique_segments([*segments, *expanded], max_items=8)
+                    if not segments:
+                        segments = self._fallback_segments_from_transcript(transcript)
+                else:
+                    metadata_segment = self._fallback_segment_from_video_metadata(
+                        video,
+                        concept_terms,
+                        target_clip_duration_sec=safe_target_clip_duration,
+                    )
+                    if metadata_segment:
+                        segments = [metadata_segment]
+                    elif not use_full_short_clip:
+                        continue
 
-                            if not segments:
-                                segments = self._fallback_segments_from_transcript(transcript)
-                        else:
-                            if not use_full_short_clip:
-                                # Long-form cutting requires transcript timestamps.
-                                continue
-                            metadata_segment = self._fallback_segment_from_video_metadata(video, concept_terms)
-                            if metadata_segment:
-                                segments = [metadata_segment]
-                        if not segments:
-                            continue
-                        segment_candidates = self._rank_segments_by_relevance(
-                            conn,
-                            segments=segments,
-                            concept_terms=concept_terms,
-                            context_terms=context_terms,
-                            concept_embedding=concept_embedding,
-                            subject_tag=subject_tag,
-                            require_context=bool(context_terms) and vague_topic,
-                            fast_mode=fast_mode,
+                if not segments:
+                    continue
+
+                segment_candidates = self._rank_segments_by_relevance(
+                    conn,
+                    segments=segments,
+                    concept_terms=concept_terms,
+                    context_terms=context_terms,
+                    concept_embedding=concept_embedding,
+                    subject_tag=subject_tag,
+                    require_context=bool(context_terms) and vague_topic,
+                    fast_mode=fast_mode,
+                )
+                if not segment_candidates and str(video.get("search_source") or "") == "local_cache" and segments:
+                    # Local-corpus recovery can miss lexical gates for typo/noisy concepts.
+                    seed = dict(candidate.get("video_relevance") or {})
+                    seed["passes"] = True
+                    seed["score"] = max(0.08, float(seed.get("score") or 0.0))
+                    segment_candidates = [(segments[0], seed)]
+                if not segment_candidates:
+                    continue
+
+                for segment, segment_relevance in segment_candidates:
+                    if use_full_short_clip:
+                        clip_window = self._full_short_clip_window(video_duration)
+                    elif transcript:
+                        clip_window = self._refine_clip_window_from_transcript(
+                            transcript=transcript,
+                            proposed_start=segment.t_start,
+                            proposed_end=segment.t_end,
+                            video_duration_sec=video_duration,
+                            min_len=clip_min_len,
+                            max_len=clip_max_len,
                         )
-                        if not segment_candidates:
+                    else:
+                        clip_window = self._normalize_clip_window(
+                            segment.t_start,
+                            segment.t_end,
+                            video_duration,
+                            min_len=clip_min_len,
+                            max_len=clip_max_len,
+                        )
+                    if not clip_window:
+                        continue
+                    start_sec, end_sec = clip_window
+                    clip_key = self._clip_key(video_id, start_sec, end_sec)
+                    if clip_key in existing_clip_keys or clip_key in generated_clip_keys:
+                        continue
+
+                    relevance_context = self._merge_relevance_context(
+                        candidate.get("video_relevance") or {},
+                        segment_relevance,
+                    )
+                    relevance_context["query_strategy"] = query_candidate.strategy
+                    relevance_context["retrieval_stage"] = str(candidate.get("stage") or "")
+                    relevance_context["discovery_score"] = float(ranking.get("discovery_score") or 0.0)
+                    relevance_context["clipability_score"] = float(ranking.get("clipability_score") or 0.0)
+                    relevance_context["source_surface"] = str(video.get("search_source") or "")
+                    relevance_context["score"] = (
+                        0.58 * float(relevance_context.get("score") or 0.0)
+                        + 0.28 * float(ranking.get("discovery_score") or 0.0)
+                        + 0.14 * float(ranking.get("clipability_score") or 0.0)
+                    )
+                    if not bool(relevance_context.get("passes", True)):
+                        continue
+
+                    if dry_run:
+                        preview = self._build_dry_run_reel_preview(
+                            concept=concept,
+                            video=video,
+                            segment=segment,
+                            clip_window=clip_window,
+                            relevance_context=relevance_context,
+                        )
+                        generated.append(preview)
+                    else:
+                        reel = self._create_reel(
+                            conn,
+                            material_id=material_id,
+                            concept=concept,
+                            video=video,
+                            segment=segment,
+                            clip_window=clip_window,
+                            transcript=transcript,
+                            relevance_context=relevance_context,
+                            fast_mode=fast_mode,
+                            target_clip_duration_sec=safe_target_clip_duration,
+                        )
+                        if not reel:
                             continue
+                        generated.append(reel)
 
-                        for segment, segment_relevance in segment_candidates:
-                            if use_full_short_clip:
-                                clip_window = self._full_short_clip_window(video_duration)
-                            elif transcript:
-                                clip_window = self._refine_clip_window_from_transcript(
-                                    transcript=transcript,
-                                    proposed_start=segment.t_start,
-                                    proposed_end=segment.t_end,
-                                    video_duration_sec=video_duration,
-                                )
-                            else:
-                                clip_window = self._normalize_clip_window(
-                                    segment.t_start,
-                                    segment.t_end,
-                                    video_duration,
-                                    min_len=15,
-                                    max_len=60,
-                                )
-                            if not clip_window:
-                                continue
-                            start_sec, end_sec = clip_window
-                            clip_key = self._clip_key(video["id"], start_sec, end_sec)
-                            if clip_key in existing_clip_keys or clip_key in generated_clip_keys:
-                                continue
-                            relevance_context = self._merge_relevance_context(video_relevance, segment_relevance)
-                            if not bool(relevance_context.get("passes", True)):
-                                continue
-                            reel = self._create_reel(
-                                conn,
-                                material_id=material_id,
-                                concept=concept,
-                                video=video,
-                                segment=segment,
-                                clip_window=clip_window,
-                                transcript=transcript,
-                                relevance_context=relevance_context,
-                                fast_mode=fast_mode,
-                            )
-                            if not reel:
-                                continue
-                            generated.append(reel)
-                            generated_clip_keys.add(clip_key)
-                            generated_video_counts[video["id"]] = generated_video_counts.get(video["id"], 0) + 1
+                    generated_clip_keys.add(clip_key)
+                    generated_video_counts[video_id] = generated_video_counts.get(video_id, 0) + 1
+                    selected_outcome = {
+                        "video_id": video_id,
+                        "reasons": [
+                            f"query_strategy:{query_candidate.strategy}",
+                            f"stage:{candidate.get('stage')}",
+                            f"discovery:{round(float(ranking.get('discovery_score') or 0.0), 3)}",
+                            f"clipability:{round(float(ranking.get('clipability_score') or 0.0), 3)}",
+                        ],
+                        "clip_window": {"t_start": start_sec, "t_end": end_sec},
+                    }
 
-                            if len(generated) >= num_reels:
-                                return generated
-                            if existing_for_video + generated_video_counts.get(video["id"], 0) >= max_segments_per_video:
-                                break
+                    if self._should_finalize_generation(
+                        generated=generated,
+                        num_reels=num_reels,
+                        preferred_video_duration=safe_video_duration_pref,
+                        max_generation_target=max_generation_target,
+                    ):
+                        self._persist_retrieval_debug_run(
+                            conn,
+                            run=retrieval_run,
+                            query_reports=all_query_reports,
+                            candidate_rows=candidate_records,
+                            selected=selected_outcome,
+                            failure_reason="",
+                            dry_run=dry_run,
+                        )
+                        return self._finalize_generated_reels(
+                            generated=generated,
+                            num_reels=num_reels,
+                            preferred_video_duration=safe_video_duration_pref,
+                        )
+                    if existing_for_video + generated_video_counts.get(video_id, 0) >= max_segments_per_video:
+                        break
 
-        return generated
+            self._persist_retrieval_debug_run(
+                conn,
+                run=retrieval_run,
+                query_reports=all_query_reports,
+                candidate_rows=candidate_records,
+                selected=selected_outcome,
+                failure_reason="" if selected_outcome else "no_segment_after_rerank",
+                dry_run=dry_run,
+            )
+        return self._finalize_generated_reels(
+            generated=generated,
+            num_reels=num_reels,
+            preferred_video_duration=safe_video_duration_pref,
+        )
+
+    def _normalize_video_pool_mode(self, value: str | None) -> str:
+        if value in self.VALID_VIDEO_POOL_MODES:
+            return str(value)
+        return "short-first"
+
+    def _normalize_preferred_video_duration(self, value: str | None) -> str:
+        if value in self.VALID_VIDEO_DURATION_PREFS:
+            return str(value)
+        return "any"
+
+    def _normalize_target_clip_duration(self, value: int | float | None) -> int:
+        if value is None:
+            return self.DEFAULT_TARGET_CLIP_DURATION_SEC
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return self.DEFAULT_TARGET_CLIP_DURATION_SEC
+        return max(self.MIN_TARGET_CLIP_DURATION_SEC, min(self.MAX_TARGET_CLIP_DURATION_SEC, parsed))
+
+    def _duration_plan(self, video_pool_mode: str, preferred_video_duration: str) -> tuple[str | None, ...]:
+        if preferred_video_duration == "short":
+            return ("short", "medium", "long", None)
+        if preferred_video_duration == "medium":
+            return ("medium", "long", "short", None)
+        if preferred_video_duration == "long":
+            return ("long", "medium", "short", None)
+        if video_pool_mode == "long-form":
+            return ("long", "medium", "short", None)
+        if video_pool_mode == "balanced":
+            return ("short", "long", "medium", None)
+        return ("short", "long", "medium", None)
+
+    def _search_passes(self, video_pool_mode: str, preferred_video_duration: str) -> list[dict[str, Any]]:
+        if preferred_video_duration in {"short", "medium", "long"}:
+            return [
+                {
+                    "duration_plan": (preferred_video_duration,),
+                    "strict_duration": True,
+                    "allow_unknown_duration": False,
+                },
+                {
+                    "duration_plan": self._duration_plan(video_pool_mode, preferred_video_duration),
+                    "strict_duration": False,
+                    "allow_unknown_duration": True,
+                },
+            ]
+        return [
+            {
+                "duration_plan": self._duration_plan(video_pool_mode, preferred_video_duration),
+                "strict_duration": False,
+                "allow_unknown_duration": True,
+            }
+        ]
+
+    def _video_matches_preferred_duration(
+        self,
+        video_duration_sec: int,
+        preferred_video_duration: str,
+        allow_unknown_duration: bool,
+    ) -> bool:
+        if preferred_video_duration not in {"short", "medium", "long"}:
+            return True
+        if video_duration_sec <= 0:
+            return allow_unknown_duration
+        if preferred_video_duration == "short":
+            return video_duration_sec < 4 * 60
+        if preferred_video_duration == "medium":
+            return 4 * 60 <= video_duration_sec <= 20 * 60
+        return video_duration_sec > 20 * 60
+
+    def _video_duration_bucket(self, duration_sec: int | float | None) -> str | None:
+        try:
+            parsed = int(duration_sec or 0)
+        except (TypeError, ValueError):
+            return None
+        if parsed <= 0:
+            return None
+        if parsed < 4 * 60:
+            return "short"
+        if parsed <= 20 * 60:
+            return "medium"
+        return "long"
+
+    def _generation_result_score(self, reel: dict[str, Any]) -> float:
+        relevance = reel.get("relevance_score")
+        if isinstance(relevance, (int, float)):
+            return float(relevance)
+        score = reel.get("score")
+        if isinstance(score, (int, float)):
+            return float(score)
+        return 0.0
+
+    def _has_short_and_long_mix(self, generated: list[dict[str, Any]]) -> bool:
+        has_short = False
+        has_long = False
+        for reel in generated:
+            bucket = self._video_duration_bucket(reel.get("video_duration_sec"))
+            if bucket == "short":
+                has_short = True
+            elif bucket == "long":
+                has_long = True
+            if has_short and has_long:
+                return True
+        return False
+
+    def _generation_target_cap(
+        self,
+        num_reels: int,
+        preferred_video_duration: str,
+        fast_mode: bool,
+    ) -> int:
+        if preferred_video_duration != "any" or num_reels <= 1:
+            return num_reels
+        extra = max(2, min(8, num_reels // 2 + (1 if fast_mode else 2)))
+        return num_reels + extra
+
+    def _search_results_budget(
+        self,
+        *,
+        fast_mode: bool,
+        generated_count: int,
+        max_generation_target: int,
+    ) -> int:
+        remaining = max(1, max_generation_target - max(0, generated_count))
+        if fast_mode:
+            return max(10, min(18, 8 + remaining * 2))
+        return max(18, min(42, 14 + remaining * 4))
+
+    def _transcript_expansion_budget(
+        self,
+        *,
+        fast_mode: bool,
+        generated_count: int,
+        max_generation_target: int,
+    ) -> int:
+        remaining = max(1, max_generation_target - max(0, generated_count))
+        if fast_mode:
+            return max(2, min(6, remaining + 1))
+        return max(4, min(12, remaining * 2))
+
+    def _should_finalize_generation(
+        self,
+        generated: list[dict[str, Any]],
+        num_reels: int,
+        preferred_video_duration: str,
+        max_generation_target: int,
+    ) -> bool:
+        if len(generated) < num_reels:
+            return False
+        if preferred_video_duration != "any" or num_reels <= 1:
+            return True
+        if self._has_short_and_long_mix(generated):
+            return True
+        return len(generated) >= max_generation_target
+
+    def _finalize_generated_reels(
+        self,
+        generated: list[dict[str, Any]],
+        num_reels: int,
+        preferred_video_duration: str,
+    ) -> list[dict[str, Any]]:
+        if not generated or num_reels <= 0:
+            return []
+        if preferred_video_duration != "any" or num_reels <= 1:
+            return generated[:num_reels]
+
+        ranked = sorted(generated, key=self._generation_result_score, reverse=True)
+        short_candidates = [reel for reel in ranked if self._video_duration_bucket(reel.get("video_duration_sec")) == "short"]
+        long_candidates = [reel for reel in ranked if self._video_duration_bucket(reel.get("video_duration_sec")) == "long"]
+
+        selected: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+
+        for candidate in [short_candidates[0] if short_candidates else None, long_candidates[0] if long_candidates else None]:
+            if not candidate:
+                continue
+            reel_id = str(candidate.get("reel_id") or "")
+            if reel_id and reel_id in seen_ids:
+                continue
+            selected.append(candidate)
+            if reel_id:
+                seen_ids.add(reel_id)
+
+        for candidate in ranked:
+            if len(selected) >= num_reels:
+                break
+            reel_id = str(candidate.get("reel_id") or "")
+            if reel_id and reel_id in seen_ids:
+                continue
+            selected.append(candidate)
+            if reel_id:
+                seen_ids.add(reel_id)
+
+        selected = selected[:num_reels]
+        selected.sort(key=self._generation_result_score, reverse=True)
+        return selected
+
+    def _parse_keywords_json(self, value: Any) -> list[str]:
+        raw = str(value or "[]")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = []
+        if not isinstance(parsed, list):
+            return []
+        clean: list[str] = []
+        for item in parsed:
+            token = str(item or "").strip()
+            if not token:
+                continue
+            clean.append(token)
+            if len(clean) >= 12:
+                break
+        return clean
+
+    def _clip_length_bounds(self, target_clip_duration_sec: int) -> tuple[int, int]:
+        safe_target = self._normalize_target_clip_duration(target_clip_duration_sec)
+        min_len = max(10, int(round(safe_target * 0.35)))
+        max_len = max(min_len + self.MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC, safe_target)
+        return min_len, max_len
+
+    def _resolve_clip_duration_bounds(
+        self,
+        target_clip_duration_sec: int,
+        target_clip_duration_min_sec: int | None,
+        target_clip_duration_max_sec: int | None,
+    ) -> tuple[int, int, int]:
+        safe_target = self._normalize_target_clip_duration(target_clip_duration_sec)
+        default_min, default_max = self._clip_length_bounds(safe_target)
+
+        if target_clip_duration_min_sec is None and target_clip_duration_max_sec is None:
+            return default_min, default_max, safe_target
+
+        safe_min = default_min if target_clip_duration_min_sec is None else self._normalize_target_clip_duration(
+            target_clip_duration_min_sec
+        )
+        safe_max = default_max if target_clip_duration_max_sec is None else self._normalize_target_clip_duration(
+            target_clip_duration_max_sec
+        )
+        if safe_min > safe_max:
+            safe_min, safe_max = safe_max, safe_min
+        if safe_max - safe_min < self.MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC:
+            expanded_max = min(self.MAX_TARGET_CLIP_DURATION_SEC, safe_min + self.MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC)
+            if expanded_max - safe_min >= self.MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC:
+                safe_max = expanded_max
+            else:
+                safe_min = max(self.MIN_TARGET_CLIP_DURATION_SEC, safe_max - self.MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC)
+        safe_target = max(safe_min, min(safe_max, safe_target))
+        return safe_min, safe_max, safe_target
 
     def _get_concept_embedding(self, conn, concept: dict[str, Any]) -> np.ndarray:
         if concept.get("embedding_json"):
             return np.array(json.loads(concept["embedding_json"]), dtype=np.float32)
 
+        parsed_keywords = self._parse_keywords_json(concept.get("keywords_json"))
         concept_text = (
             f"{concept['title']}. "
-            f"Keywords: {' '.join(json.loads(concept['keywords_json']))}. "
+            f"Keywords: {' '.join(parsed_keywords)}. "
             f"Summary: {concept['summary']}"
         )
         embedding = self.embedding_service.embed_texts(conn, [concept_text])[0]
@@ -354,6 +1048,979 @@ class ReelService:
         )
         return embedding
 
+    def _init_retrieval_debug_run(self, material_id: str, concept_id: str, concept_title: str) -> dict[str, Any]:
+        return {
+            "run_id": str(uuid.uuid4()),
+            "material_id": material_id,
+            "concept_id": concept_id,
+            "concept_title": concept_title,
+        }
+
+    def _persist_retrieval_debug_run(
+        self,
+        conn,
+        run: dict[str, Any],
+        query_reports: list[dict[str, Any]],
+        candidate_rows: list[dict[str, Any]],
+        selected: dict[str, Any] | None,
+        failure_reason: str,
+        dry_run: bool,
+    ) -> None:
+        if not self.retrieval_debug_logging:
+            return
+        run_id = str(run.get("run_id") or "").strip()
+        if not run_id:
+            return
+
+        upsert(
+            conn,
+            "retrieval_runs",
+            {
+                "id": run_id,
+                "material_id": str(run.get("material_id") or ""),
+                "concept_id": str(run.get("concept_id") or ""),
+                "concept_title": str(run.get("concept_title") or ""),
+                "selected_video_id": str((selected or {}).get("video_id") or ""),
+                "failure_reason": failure_reason.strip(),
+                "debug_json": dumps_json(
+                    {
+                        "selected": selected,
+                        "query_count": len(query_reports),
+                        "candidate_count": len(candidate_rows),
+                        "dry_run": bool(dry_run),
+                    }
+                ),
+                "created_at": now_iso(),
+            },
+        )
+
+        for idx, row in enumerate(query_reports[:240]):
+            upsert(
+                conn,
+                "retrieval_queries",
+                {
+                    "id": str(uuid.uuid4()),
+                    "run_id": run_id,
+                    "query_text": str(row.get("query") or ""),
+                    "strategy": str(row.get("strategy") or ""),
+                    "stage": str(row.get("stage") or ""),
+                    "source_surface": str(row.get("surface") or ""),
+                    "source_terms_json": dumps_json(row.get("source_terms") or []),
+                    "weight": float(row.get("weight") or 0.0),
+                    "result_count": int(row.get("results") or 0),
+                    "kept_count": int(row.get("kept") or 0),
+                    "position": idx,
+                    "created_at": now_iso(),
+                },
+            )
+
+        for idx, row in enumerate(candidate_rows[:320]):
+            upsert(
+                conn,
+                "retrieval_candidates",
+                {
+                    "id": str(uuid.uuid4()),
+                    "run_id": run_id,
+                    "video_id": str(row.get("video_id") or ""),
+                    "video_title": str(row.get("video_title") or ""),
+                    "channel_title": str(row.get("channel_title") or ""),
+                    "strategy": str(row.get("strategy") or ""),
+                    "stage": str(row.get("stage") or ""),
+                    "query_text": str(row.get("query") or ""),
+                    "source_surface": str(row.get("source_surface") or ""),
+                    "discovery_score": float(row.get("discovery_score") or 0.0),
+                    "clipability_score": float(row.get("clipability_score") or 0.0),
+                    "final_score": float(row.get("final_score") or 0.0),
+                    "feature_json": dumps_json(row.get("features") or {}),
+                    "position": idx,
+                    "created_at": now_iso(),
+                },
+            )
+
+        if selected:
+            selected_video_id = str(selected.get("video_id") or "")
+            can_write_outcome = not dry_run
+            if not can_write_outcome and selected_video_id:
+                can_write_outcome = bool(fetch_one(conn, "SELECT id FROM videos WHERE id = ?", (selected_video_id,)))
+            if not can_write_outcome:
+                return
+            clip_window = selected.get("clip_window") or {}
+            upsert(
+                conn,
+                "retrieval_outcomes",
+                {
+                    "id": str(uuid.uuid4()),
+                    "run_id": run_id,
+                    "video_id": selected_video_id,
+                    "t_start": float(clip_window.get("t_start") or 0.0),
+                    "t_end": float(clip_window.get("t_end") or 0.0),
+                    "reason_json": dumps_json(selected.get("reasons") or []),
+                    "created_at": now_iso(),
+                },
+            )
+
+    def _derive_visual_scene_spec(self, title: str, keywords: list[str], summary: str) -> dict[str, list[str]]:
+        raw = " ".join([title, summary, *keywords]).strip().lower()
+        noun_like = [t for t in normalize_terms([raw]) if len(t) >= 4][:18]
+        actions: list[str] = []
+        for token in noun_like:
+            if token.endswith("ing") or token in {"show", "build", "explain", "demo", "review"}:
+                actions.append(token)
+        if not actions:
+            actions = ["showing", "demonstration"]
+
+        return {
+            "environment": noun_like[:5],
+            "subjects": noun_like[5:10],
+            "objects": noun_like[10:16],
+            "actions": actions[:5],
+            "camera": ["close up", "b-roll", "cinematic"],
+            "mood": ["clean", "focused"],
+        }
+
+    def _build_query_candidates(
+        self,
+        title: str,
+        keywords: list[str],
+        summary: str,
+        subject_tag: str | None,
+        context_terms: list[str],
+        visual_spec: dict[str, list[str]],
+        fast_mode: bool,
+    ) -> list[QueryCandidate]:
+        clean_title = " ".join(str(title or "").split()).strip()
+        if not clean_title:
+            return []
+
+        subject = " ".join(str(subject_tag or "").split()).strip()
+        keyword_terms = [k.strip() for k in keywords if k.strip()][:8]
+        context_terms = [t.strip() for t in context_terms if t.strip()][:8]
+        primary_terms = [clean_title, *keyword_terms[:4], *context_terms[:3]]
+
+        scene_terms = [
+            *visual_spec.get("environment", []),
+            *visual_spec.get("subjects", []),
+            *visual_spec.get("objects", []),
+        ]
+        action_terms = visual_spec.get("actions", [])
+
+        candidates: list[QueryCandidate] = []
+
+        def add_candidate(
+            text: str,
+            strategy: str,
+            confidence: float,
+            source_terms: list[str],
+            stage: str,
+            weight: float = 1.0,
+            source_surface: str = "youtube_api",
+        ) -> None:
+            cleaned = " ".join(text.split()).strip()
+            if not cleaned:
+                return
+            candidates.append(
+                QueryCandidate(
+                    text=cleaned,
+                    strategy=strategy,
+                    confidence=max(0.0, min(1.0, confidence)),
+                    source_terms=source_terms[:8],
+                    weight=max(0.05, float(weight)),
+                    stage=stage,
+                    source_surface=source_surface,
+                )
+            )
+
+        core = " ".join(part for part in [subject, clean_title] if part).strip()
+        add_candidate(core, "literal", 0.96, [clean_title, subject], "high_precision", 1.0)
+        if keyword_terms:
+            add_candidate(f"{core} {' '.join(keyword_terms[:2])}", "literal", 0.9, keyword_terms[:2], "high_precision", 0.95)
+
+        paraphrases = self._expand_controlled_synonyms([clean_title, *keyword_terms[:3]])
+        for phrase in paraphrases[: (3 if fast_mode else 8)]:
+            add_candidate(f"{subject} {phrase}".strip(), "paraphrase", 0.74, [phrase], "broad", 0.84)
+
+        if scene_terms:
+            add_candidate(
+                f"{' '.join(scene_terms[:3])} footage",
+                "scene",
+                0.86,
+                scene_terms[:3],
+                "high_precision",
+                0.95,
+            )
+            add_candidate(
+                f"{' '.join(scene_terms[:3])} b-roll cinematic 4k",
+                "broll",
+                0.88,
+                scene_terms[:3],
+                "high_precision",
+                0.98,
+            )
+
+        if action_terms:
+            add_candidate(
+                f"{' '.join(action_terms[:2])} {' '.join(scene_terms[:2])} footage",
+                "action",
+                0.77,
+                [*action_terms[:2], *scene_terms[:2]],
+                "broad",
+                0.82,
+            )
+
+        if scene_terms:
+            add_candidate(
+                f"{' '.join(scene_terms[:3])} report interview coverage archive",
+                "news_doc",
+                0.69,
+                scene_terms[:3],
+                "broad",
+                0.74,
+            )
+            add_candidate(
+                f"{clean_title} how it works demonstration example",
+                "tutorial_demo",
+                0.72,
+                [clean_title],
+                "broad",
+                0.76,
+            )
+
+        if self.retrieval_tier2_enabled:
+            for recovery in self._decompose_concept_for_recovery(clean_title, summary, keyword_terms)[: (3 if fast_mode else 7)]:
+                add_candidate(
+                    f"{recovery} footage scene",
+                    "recovery_adjacent",
+                    0.62,
+                    [recovery],
+                    "recovery",
+                    0.66,
+                    source_surface="duckduckgo_site",
+                )
+                add_candidate(
+                    f"\"{recovery}\" site:youtube.com/watch",
+                    "recovery_adjacent",
+                    0.6,
+                    [recovery],
+                    "recovery",
+                    0.62,
+                    source_surface="duckduckgo_quoted",
+                )
+
+        deduped: list[QueryCandidate] = []
+        seen: set[str] = set()
+        ordered = sorted(
+            candidates,
+            key=lambda item: (item.stage != "high_precision", -(item.confidence * item.weight), len(item.text)),
+        )
+        for item in ordered:
+            key = item.text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+            if len(deduped) >= (18 if fast_mode else 42):
+                break
+        return deduped
+
+    def _build_retrieval_stage_plan(
+        self,
+        query_candidates: list[QueryCandidate],
+        fast_mode: bool,
+    ) -> list[RetrievalStagePlan]:
+        stage_map: dict[str, list[QueryCandidate]] = {"high_precision": [], "broad": [], "recovery": []}
+        for item in query_candidates:
+            stage = item.stage if item.stage in stage_map else "broad"
+            stage_map[stage].append(item)
+
+        plans = [
+            RetrievalStagePlan(
+                name="high_precision",
+                queries=sorted(stage_map["high_precision"], key=lambda q: -(q.confidence * q.weight)),
+                budget=3 if fast_mode else 5,
+                min_good_results=6 if fast_mode else 8,
+            ),
+            RetrievalStagePlan(
+                name="broad",
+                queries=sorted(stage_map["broad"], key=lambda q: -(q.confidence * q.weight)),
+                budget=8 if fast_mode else 14,
+                min_good_results=9 if fast_mode else 12,
+            ),
+            RetrievalStagePlan(
+                name="recovery",
+                queries=sorted(stage_map["recovery"], key=lambda q: -(q.confidence * q.weight)),
+                budget=5 if fast_mode else 8,
+                min_good_results=4 if fast_mode else 6,
+            ),
+        ]
+        return [plan for plan in plans if plan.queries and plan.budget > 0]
+
+    def _fast_pass_is_sufficient(
+        self,
+        stage_candidates: list[dict[str, Any]],
+        *,
+        fast_mode: bool,
+        max_generation_target: int,
+    ) -> bool:
+        if not stage_candidates:
+            return False
+        target = max(8, min(26 if fast_mode else 40, max_generation_target * (2 if fast_mode else 3)))
+        if len(stage_candidates) < target:
+            return False
+        strong = sum(
+            1
+            for candidate in stage_candidates
+            if float((candidate.get("ranking") or {}).get("discovery_score") or 0.0) >= 0.2
+        )
+        return strong >= max(4, target // 3)
+
+    def _stage_search_jobs_parallel(
+        self,
+        *,
+        stage_name: str,
+        stage_queries: list[QueryCandidate],
+        stage_duration_plan: tuple[str | None, ...],
+        max_results_for_query: int,
+        creative_commons_only: bool,
+        fast_mode: bool,
+    ) -> list[tuple[int, int, QueryCandidate, str | None, list[dict[str, Any]]]]:
+        jobs: list[tuple[int, int, QueryCandidate, str | None]] = []
+        for query_idx, query_candidate in enumerate(stage_queries):
+            for duration_idx, duration in enumerate(stage_duration_plan):
+                jobs.append((query_idx, duration_idx, query_candidate, duration))
+        if not jobs:
+            return []
+
+        workers_limit = self.QUERY_RETRIEVAL_WORKERS_FAST if fast_mode else self.QUERY_RETRIEVAL_WORKERS_SLOW
+        workers = max(1, min(workers_limit, len(jobs)))
+        if workers == 1:
+            output: list[tuple[int, int, QueryCandidate, str | None, list[dict[str, Any]]]] = []
+            for query_idx, duration_idx, query_candidate, duration in jobs:
+                videos = self.youtube_service.search_videos(
+                    None,
+                    query=query_candidate.text,
+                    max_results=max_results_for_query,
+                    creative_commons_only=creative_commons_only,
+                    video_duration=duration,
+                    retrieval_strategy=query_candidate.strategy,
+                    retrieval_stage=stage_name,
+                    source_surface=query_candidate.source_surface,
+                )
+                output.append((query_idx, duration_idx, query_candidate, duration, videos))
+            return output
+
+        output: list[tuple[int, int, QueryCandidate, str | None, list[dict[str, Any]]]] = []
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(
+                    self.youtube_service.search_videos,
+                    None,
+                    query_candidate.text,
+                    max_results_for_query,
+                    creative_commons_only,
+                    duration,
+                    query_candidate.strategy,
+                    stage_name,
+                    query_candidate.source_surface,
+                ): (query_idx, duration_idx, query_candidate, duration)
+                for query_idx, duration_idx, query_candidate, duration in jobs
+            }
+            for future in as_completed(future_map):
+                query_idx, duration_idx, query_candidate, duration = future_map[future]
+                try:
+                    videos = future.result()
+                except Exception:
+                    videos = []
+                output.append((query_idx, duration_idx, query_candidate, duration, videos))
+
+        output.sort(key=lambda row: (row[0], row[1]))
+        return output
+
+    def _prefetch_transcripts_parallel(
+        self,
+        video_ids: list[str],
+        *,
+        fast_mode: bool,
+    ) -> dict[str, list[dict[str, Any]]]:
+        unique_ids = [str(video_id).strip() for video_id in dict.fromkeys(video_ids) if str(video_id).strip()]
+        if not unique_ids:
+            return {}
+
+        workers_limit = self.TRANSCRIPT_FETCH_WORKERS_FAST if fast_mode else self.TRANSCRIPT_FETCH_WORKERS_SLOW
+        workers = max(1, min(workers_limit, len(unique_ids)))
+        if workers == 1:
+            return {video_id: self.youtube_service.get_transcript(None, video_id) for video_id in unique_ids}
+
+        transcripts: dict[str, list[dict[str, Any]]] = {}
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(self.youtube_service.get_transcript, None, video_id): video_id for video_id in unique_ids
+            }
+            for future in as_completed(future_map):
+                video_id = future_map[future]
+                try:
+                    transcript = future.result()
+                except Exception:
+                    transcript = []
+                transcripts[video_id] = transcript
+        return transcripts
+
+    def _stage_duration_plan(
+        self,
+        stage_name: str,
+        preferred_video_duration: str,
+        video_pool_mode: str,
+    ) -> tuple[str | None, ...]:
+        if stage_name == "high_precision":
+            if preferred_video_duration in {"short", "medium", "long"}:
+                return (preferred_video_duration,)
+            return ("short", None)
+        if stage_name == "broad":
+            return self._duration_plan(video_pool_mode, preferred_video_duration)
+        return (None, "short", "medium", "long")
+
+    def _score_video_candidate(
+        self,
+        conn,
+        video: dict[str, Any],
+        query_candidate: QueryCandidate,
+        concept_terms: list[str],
+        context_terms: list[str],
+        concept_embedding: np.ndarray | None,
+        subject_tag: str | None,
+        visual_spec: dict[str, list[str]],
+        preferred_video_duration: str,
+        stage_name: str,
+        require_context: bool,
+        fast_mode: bool,
+    ) -> dict[str, Any]:
+        title = str(video.get("title") or "")
+        description = str(video.get("description") or "")
+        metadata_text = self._video_metadata_text(video)
+        text_relevance = self._score_text_relevance(
+            conn,
+            text=metadata_text,
+            concept_terms=concept_terms,
+            context_terms=context_terms,
+            concept_embedding=concept_embedding,
+            subject_tag=subject_tag,
+        )
+
+        semantic_title = self._semantic_similarity(
+            conn,
+            text=title,
+            concept_terms=concept_terms,
+            concept_embedding=concept_embedding,
+        )
+        semantic_description = self._semantic_similarity(
+            conn,
+            text=description,
+            concept_terms=concept_terms,
+            concept_embedding=concept_embedding,
+        )
+        strategy_prior = float(self.QUERY_STRATEGY_PRIOR.get(query_candidate.strategy, 0.66))
+        strategy_prior *= self._learned_strategy_factor(conn, query_candidate.strategy)
+        stage_prior = 0.1 if stage_name == "high_precision" else (0.05 if stage_name == "broad" else 0.0)
+        duration_fit = self._duration_fit_score(
+            duration_sec=int(video.get("duration_sec") or 0),
+            preferred_video_duration=preferred_video_duration,
+        )
+        freshness_fit = self._freshness_fit_score(video.get("published_at"))
+        channel_quality = self._channel_quality_score(video)
+        visual_intent_match = lexical_overlap_score(
+            f"{title} {description}",
+            [
+                *visual_spec.get("environment", []),
+                *visual_spec.get("objects", []),
+                *visual_spec.get("actions", []),
+            ],
+        )
+        source_prior = float(self.SOURCE_SURFACE_PRIOR.get(str(video.get("search_source") or ""), 0.82))
+        clipability = self._score_clipability_from_metadata(video, strategy=query_candidate.strategy)
+        engagement_fit = self._engagement_fit_score(video.get("view_count"))
+        discovery = (
+            0.28 * semantic_title
+            + 0.18 * semantic_description
+            + 0.10 * strategy_prior
+            + 0.09 * duration_fit
+            + 0.08 * freshness_fit
+            + 0.08 * channel_quality
+            + 0.09 * engagement_fit
+            + 0.10 * visual_intent_match
+            + stage_prior
+        )
+        discovery *= source_prior
+        discovery = float(max(0.0, min(1.0, discovery)))
+
+        text_pass = self._passes_relevance_gate(
+            relevance=text_relevance,
+            require_context=require_context,
+            fast_mode=fast_mode,
+        )
+        min_discovery = 0.14 if fast_mode else 0.16
+        passes = text_pass and discovery >= min_discovery
+
+        final_score = 0.74 * discovery + 0.26 * clipability
+        text_relevance = dict(text_relevance)
+        text_relevance["passes"] = passes
+        return {
+            "passes": passes,
+            "final_score": float(final_score),
+            "discovery_score": discovery,
+            "clipability_score": float(clipability),
+            "text_relevance": text_relevance,
+            "features": {
+                "semantic_title": float(semantic_title),
+                "semantic_description": float(semantic_description),
+                "strategy_prior": strategy_prior,
+                "duration_fit": float(duration_fit),
+                "freshness_fit": float(freshness_fit),
+                "channel_quality": float(channel_quality),
+                "engagement_fit": float(engagement_fit),
+                "visual_intent_match": float(visual_intent_match),
+                "source_prior": float(source_prior),
+            },
+        }
+
+    def _engagement_fit_score(self, view_count: Any) -> float:
+        try:
+            views = int(view_count or 0)
+        except (TypeError, ValueError):
+            views = 0
+        if views <= 0:
+            return 0.55
+        if views >= 5_000_000:
+            return 0.95
+        if views >= 1_000_000:
+            return 0.9
+        if views >= 300_000:
+            return 0.84
+        if views >= 100_000:
+            return 0.78
+        if views >= 30_000:
+            return 0.7
+        if views >= 10_000:
+            return 0.64
+        return 0.58
+
+    def _semantic_similarity(
+        self,
+        conn,
+        text: str,
+        concept_terms: list[str],
+        concept_embedding: np.ndarray | None,
+    ) -> float:
+        cleaned = " ".join(str(text or "").split()).strip()
+        if not cleaned:
+            return 0.0
+        lexical = lexical_overlap_score(cleaned, concept_terms)
+        if concept_embedding is None:
+            return float(lexical)
+        try:
+            text_embedding = self.embedding_service.embed_texts(conn, [cleaned])[0]
+            semantic = float(text_embedding @ concept_embedding.astype(np.float32))
+        except Exception:
+            semantic = 0.0
+        return float(max(0.0, min(1.0, 0.82 * max(0.0, semantic) + 0.18 * lexical)))
+
+    def _duration_fit_score(self, duration_sec: int, preferred_video_duration: str) -> float:
+        if duration_sec <= 0:
+            return 0.55
+        bucket = self._video_duration_bucket(duration_sec)
+        if preferred_video_duration in {"short", "medium", "long"}:
+            return 0.95 if bucket == preferred_video_duration else 0.35
+        if bucket == "short":
+            return 0.88
+        if bucket == "medium":
+            return 0.72
+        return 0.5
+
+    def _freshness_fit_score(self, published_at: Any) -> float:
+        published = str(published_at or "").strip()
+        if not published:
+            return 0.58
+        try:
+            year = int(published[:4])
+        except (TypeError, ValueError):
+            return 0.58
+        if year >= 2024:
+            return 0.84
+        if year >= 2020:
+            return 0.72
+        if year >= 2015:
+            return 0.6
+        return 0.46
+
+    def _channel_quality_score(self, video: dict[str, Any]) -> float:
+        title = str(video.get("title") or "").lower()
+        channel = str(video.get("channel_title") or "").lower()
+        bucket = self._infer_channel_tier(channel=channel, title=title)
+        bonus = float(self.CHANNEL_QUALITY_BONUS.get(bucket, 0.0))
+        return float(max(0.0, min(1.0, 0.6 + bonus)))
+
+    def _learned_strategy_factor(self, conn, strategy: str) -> float:
+        key = str(strategy or "").strip().lower() or "literal"
+        cached = self._strategy_history_cache.get(key)
+        if cached is not None:
+            return cached
+
+        try:
+            row = fetch_one(
+                conn,
+                """
+                SELECT
+                    AVG(CASE WHEN result_count > 0 THEN CAST(kept_count AS REAL) / result_count ELSE 0 END) AS kept_ratio
+                FROM (
+                    SELECT result_count, kept_count
+                    FROM retrieval_queries
+                    WHERE strategy = ?
+                    ORDER BY created_at DESC
+                    LIMIT 240
+                ) q
+                """,
+                (key,),
+            )
+        except Exception:
+            row = None
+
+        kept_ratio = float((row or {}).get("kept_ratio") or 0.0)
+        # Map historical keep ratio into a soft multiplicative factor.
+        factor = max(0.85, min(1.18, 0.9 + 0.45 * kept_ratio))
+        self._strategy_history_cache[key] = factor
+        return factor
+
+    def _infer_channel_tier(self, channel: str, title: str) -> str:
+        hay = f"{channel} {title}"
+        if any(token in hay for token in ["news", "times", "bbc", "cnn", "reuters", "al jazeera", "pbs"]):
+            return "news"
+        if any(token in hay for token in ["academy", "course", "university", "education", "science", "explained"]):
+            return "education"
+        if any(token in hay for token in ["stock", "footage", "cinematic", "film", "camera"]):
+            return "stock_footage"
+        if any(token in hay for token in ["tutorial", "how to", "walkthrough", "demo"]):
+            return "tutorial"
+        if any(token in hay for token in ["compilation", "best moments", "reaction", "clips"]):
+            return "low_quality_compilation"
+        if "podcast" in hay:
+            return "podcast"
+        return "tutorial"
+
+    def _score_clipability_from_metadata(self, video: dict[str, Any], strategy: str) -> float:
+        duration_sec = int(video.get("duration_sec") or 0)
+        title = str(video.get("title") or "").lower()
+        description = str(video.get("description") or "").lower()
+
+        if duration_sec <= 0:
+            duration_score = 0.58
+        elif duration_sec <= 75:
+            duration_score = 0.9
+        elif duration_sec <= 6 * 60:
+            duration_score = 0.82
+        elif duration_sec <= 18 * 60:
+            duration_score = 0.7
+        else:
+            duration_score = 0.5
+
+        penalty = 0.0
+        metadata_text = f"{title} {description}"
+        for token in self.CLIPABILITY_PENALTY_TOKENS:
+            if token in metadata_text:
+                penalty += 0.07
+        strategy_boost = 0.08 if strategy in {"scene", "action", "broll"} else 0.0
+        return float(max(0.0, min(1.0, duration_score + strategy_boost - penalty)))
+
+    def _score_transcript_alignment(
+        self,
+        conn,
+        transcript: list[dict[str, Any]],
+        concept_terms: list[str],
+        concept_embedding: np.ndarray | None,
+        visual_spec: dict[str, list[str]],
+    ) -> dict[str, float]:
+        if not transcript:
+            return {"concept_match": 0.0, "clipability_signal": 0.0}
+
+        excerpt_parts: list[str] = []
+        first_window = []
+        for entry in transcript[:120]:
+            text = str(entry.get("text") or "").replace("\n", " ").strip()
+            if not text:
+                continue
+            excerpt_parts.append(text)
+            if float(entry.get("start") or 0.0) <= 70:
+                first_window.append(text)
+            if len(excerpt_parts) >= 80:
+                break
+        excerpt = " ".join(excerpt_parts).strip()
+        early_excerpt = " ".join(first_window).strip()
+
+        concept_match = self._semantic_similarity(
+            conn,
+            text=excerpt,
+            concept_terms=concept_terms,
+            concept_embedding=concept_embedding,
+        )
+        early_signal = lexical_overlap_score(early_excerpt, concept_terms) if early_excerpt else 0.0
+        visual_match = lexical_overlap_score(
+            excerpt,
+            [
+                *visual_spec.get("environment", []),
+                *visual_spec.get("objects", []),
+                *visual_spec.get("actions", []),
+            ],
+        )
+        dense_segments = 0
+        for entry in transcript[:120]:
+            text = str(entry.get("text") or "").strip()
+            if len(text.split()) >= 4:
+                dense_segments += 1
+        density = min(1.0, dense_segments / max(1, min(60, len(transcript))))
+        clipability_signal = 0.5 * density + 0.25 * early_signal + 0.25 * visual_match
+        return {
+            "concept_match": float(max(0.0, min(1.0, concept_match))),
+            "clipability_signal": float(max(0.0, min(1.0, clipability_signal))),
+        }
+
+    def _collapse_near_duplicate_candidates(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        ordered = sorted(
+            candidates,
+            key=lambda row: float((row.get("ranking") or {}).get("final_score") or 0.0),
+            reverse=True,
+        )
+        kept: list[dict[str, Any]] = []
+        for row in ordered:
+            duplicate = False
+            for prev in kept:
+                if self._video_candidates_near_duplicate(row, prev):
+                    duplicate = True
+                    break
+            if duplicate:
+                continue
+            kept.append(row)
+        return kept
+
+    def _video_candidates_near_duplicate(self, left: dict[str, Any], right: dict[str, Any]) -> bool:
+        lv = left.get("video") or {}
+        rv = right.get("video") or {}
+        lt = self._normalize_title_for_similarity(str(lv.get("title") or ""))
+        rt = self._normalize_title_for_similarity(str(rv.get("title") or ""))
+        if not lt or not rt:
+            return False
+        title_sim = self._token_jaccard(lt, rt)
+        ld = int(lv.get("duration_sec") or 0)
+        rd = int(rv.get("duration_sec") or 0)
+        close_duration = ld > 0 and rd > 0 and abs(ld - rd) <= 5
+        same_channel = str(lv.get("channel_title") or "").strip().lower() == str(rv.get("channel_title") or "").strip().lower()
+        return title_sim >= 0.86 or (title_sim >= 0.72 and close_duration and same_channel)
+
+    def _normalize_title_for_similarity(self, text: str) -> set[str]:
+        tokens = normalize_terms([text])
+        return {t for t in tokens if t not in {"video", "official", "footage", "clip", "shorts"}}
+
+    def _token_jaccard(self, left: set[str], right: set[str]) -> float:
+        if not left or not right:
+            return 0.0
+        overlap = len(left.intersection(right))
+        union = len(left.union(right))
+        return float(overlap / max(1, union))
+
+    def _diversify_video_candidates(self, candidates: list[dict[str, Any]], top_k: int) -> list[dict[str, Any]]:
+        if not candidates:
+            return []
+        remaining = sorted(
+            candidates,
+            key=lambda row: float((row.get("ranking") or {}).get("final_score") or 0.0),
+            reverse=True,
+        )
+        selected: list[dict[str, Any]] = []
+        while remaining and len(selected) < top_k:
+            best_idx = 0
+            best_score = -1.0
+            for idx, cand in enumerate(remaining):
+                relevance = float((cand.get("ranking") or {}).get("final_score") or 0.0)
+                diversity_penalty = 0.0
+                for prev in selected:
+                    diversity_penalty = max(diversity_penalty, self._candidate_similarity(cand, prev))
+                    if str((cand.get("video") or {}).get("channel_title") or "").strip().lower() == str(
+                        (prev.get("video") or {}).get("channel_title") or ""
+                    ).strip().lower():
+                        diversity_penalty = max(diversity_penalty, 0.24)
+                mmr = 0.78 * relevance - 0.22 * diversity_penalty
+                if mmr > best_score:
+                    best_score = mmr
+                    best_idx = idx
+            selected.append(remaining.pop(best_idx))
+        return selected
+
+    def _candidate_similarity(self, left: dict[str, Any], right: dict[str, Any]) -> float:
+        lv = left.get("video") or {}
+        rv = right.get("video") or {}
+        title_sim = self._token_jaccard(
+            self._normalize_title_for_similarity(str(lv.get("title") or "")),
+            self._normalize_title_for_similarity(str(rv.get("title") or "")),
+        )
+        strategy_left = str((left.get("query_candidate") or QueryCandidate("", "literal", 0.5)).strategy or "")
+        strategy_right = str((right.get("query_candidate") or QueryCandidate("", "literal", 0.5)).strategy or "")
+        strategy_bonus = 0.08 if strategy_left == strategy_right else 0.0
+        return float(max(0.0, min(1.0, title_sim + strategy_bonus)))
+
+    def _expand_controlled_synonyms(self, terms: list[str]) -> list[str]:
+        expansions: list[str] = []
+        seen: set[str] = set()
+        synonym_map: dict[str, list[str]] = {
+            "ai": ["artificial intelligence", "machine intelligence", "automated systems"],
+            "hospital": ["medical center", "clinic", "healthcare facility"],
+            "car crash": ["car accident", "vehicle collision", "dashcam crash"],
+            "climate change": ["global warming", "wildfire smoke", "flooding street", "drought footage"],
+            "economy": ["financial markets", "inflation", "cost of living"],
+            "burnout": ["work stress", "overwork fatigue", "mental exhaustion"],
+        }
+        for raw in terms:
+            value = " ".join(str(raw or "").lower().split()).strip()
+            if not value:
+                continue
+            candidates = [value]
+            for key, mapped in synonym_map.items():
+                if key in value:
+                    candidates.extend(mapped)
+            if value.endswith("s"):
+                candidates.append(value[:-1])
+            else:
+                candidates.append(f"{value}s")
+            for token in value.split():
+                if len(token) <= 4:
+                    continue
+                candidates.append(token)
+
+            for item in candidates:
+                cleaned = " ".join(item.split()).strip()
+                if not cleaned:
+                    continue
+                if cleaned in seen:
+                    continue
+                seen.add(cleaned)
+                expansions.append(cleaned)
+        return expansions[:40]
+
+    def _decompose_concept_for_recovery(self, title: str, summary: str, keywords: list[str]) -> list[str]:
+        lowered = f"{title} {summary}".lower()
+        decomposed = []
+        if any(token in lowered for token in {"anxiety", "isolation", "burnout", "stress", "hope", "failure"}):
+            decomposed.extend(
+                [
+                    "person worried at desk bills",
+                    "close up hands typing late night",
+                    "office at night tired expression",
+                    "stock market red screen",
+                    "empty wallet close up",
+                ]
+            )
+        decomposed.extend(keywords[:4])
+        decomposed.append(title)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in decomposed:
+            clean = " ".join(str(item or "").split()).strip().lower()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            deduped.append(clean)
+        return deduped[:20]
+
+    def _recover_candidates_from_local_corpus(
+        self,
+        conn,
+        concept_terms: list[str],
+        context_terms: list[str],
+        concept_embedding: np.ndarray | None,
+        subject_tag: str | None,
+        visual_spec: dict[str, list[str]],
+        preferred_video_duration: str,
+        fast_mode: bool,
+        existing_video_counts: dict[str, int],
+        generated_video_counts: dict[str, int],
+        max_segments_per_video: int,
+        concept_title: str,
+    ) -> list[dict[str, Any]]:
+        rows = fetch_all(
+            conn,
+            """
+            SELECT id, title, channel_title, description, duration_sec, COALESCE(view_count, 0) AS view_count, is_creative_commons, created_at
+            FROM videos
+            ORDER BY created_at DESC
+            LIMIT 320
+            """,
+        )
+        if not rows:
+            return []
+
+        query_candidate = QueryCandidate(
+            text=f"local cache {concept_title}".strip(),
+            strategy="recovery_adjacent",
+            confidence=0.45,
+            source_terms=[concept_title],
+            weight=0.55,
+            stage="recovery",
+            source_surface="local_cache",
+        )
+
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            video_id = str(row.get("id") or "").strip()
+            if not video_id:
+                continue
+            existing_for_video = existing_video_counts.get(video_id, 0)
+            generated_for_video = generated_video_counts.get(video_id, 0)
+            if existing_for_video + generated_for_video >= max_segments_per_video:
+                continue
+            video = {
+                "id": video_id,
+                "title": str(row.get("title") or ""),
+                "channel_title": str(row.get("channel_title") or ""),
+                "description": str(row.get("description") or ""),
+                "duration_sec": int(row.get("duration_sec") or 0),
+                "view_count": int(row.get("view_count") or 0),
+                "is_creative_commons": bool(row.get("is_creative_commons")),
+                "published_at": "",
+                "search_source": "local_cache",
+                "query_strategy": "recovery_adjacent",
+                "query_stage": "recovery",
+                "search_query": "local_cache",
+            }
+            ranking = self._score_video_candidate(
+                conn,
+                video=video,
+                query_candidate=query_candidate,
+                concept_terms=concept_terms,
+                context_terms=context_terms,
+                concept_embedding=concept_embedding,
+                subject_tag=subject_tag,
+                visual_spec=visual_spec,
+                preferred_video_duration=preferred_video_duration,
+                stage_name="recovery",
+                require_context=False,
+                fast_mode=fast_mode,
+            )
+            discovery = float(ranking.get("discovery_score") or 0.0)
+            text_score = float((ranking.get("text_relevance") or {}).get("score") or 0.0)
+            if discovery < 0.11 and text_score < 0.08:
+                continue
+            candidates.append(
+                {
+                    "video": video,
+                    "video_id": video_id,
+                    "video_duration": int(video.get("duration_sec") or 0),
+                    "video_relevance": ranking.get("text_relevance") or {},
+                    "ranking": ranking,
+                    "query_candidate": query_candidate,
+                    "stage": "recovery",
+                }
+            )
+
+        candidates.sort(key=lambda row: float((row.get("ranking") or {}).get("final_score") or 0.0), reverse=True)
+        return candidates[: (18 if fast_mode else 36)]
+
     def _build_query_variants(
         self,
         title: str,
@@ -362,7 +2029,7 @@ class ReelService:
         context_terms: list[str] | None = None,
     ) -> list[str]:
         short_keywords = [k.strip() for k in keywords if k.strip()][:3]
-        disambiguators = [term for term in (context_terms or []) if term.strip()][:2]
+        disambiguators = [term for term in (context_terms or []) if term.strip()][:3]
         subject = subject_tag.strip() if subject_tag else ""
         core = " ".join(part for part in [subject, title] if part).strip()
         context_hint = " ".join(disambiguators).strip()
@@ -374,7 +2041,19 @@ class ReelService:
             f"{core} {keyword_hint} full lecture",
             f"{core} {context_hint} worked examples",
             f"{core} {keyword_hint} study guide",
+            f"{core} {keyword_hint} crash course",
+            f"{core} {keyword_hint} deep dive",
+            f"{core} {keyword_hint} shorts",
+            f"{core} {keyword_hint} short explanation",
+            f"{core} {keyword_hint} quick tutorial",
+            f"{core} {keyword_hint} complete class",
+            f"{core} {keyword_hint} full tutorial",
+            f"{core} {context_hint} practice problems",
+            f"{core} {keyword_hint} concept review",
+            f"{core} {context_hint} exam prep",
+            f"{core} {keyword_hint} foundations",
             f"{core} explained",
+            f"{core} {keyword_hint}",
         ]
         seen = set()
         deduped: list[str] = []
@@ -385,6 +2064,8 @@ class ReelService:
                 continue
             seen.add(key)
             deduped.append(cleaned)
+            if len(deduped) >= 18:
+                break
         return deduped
 
     def _build_material_context_terms(
@@ -715,6 +2396,7 @@ class ReelService:
                 "channel_title": video.get("channel_title", ""),
                 "description": video.get("description", ""),
                 "duration_sec": int(video.get("duration_sec") or 0),
+                "view_count": int(video.get("view_count") or 0),
                 "is_creative_commons": 1 if video.get("is_creative_commons") else 0,
                 "created_at": now_iso(),
             },
@@ -958,6 +2640,7 @@ class ReelService:
         self,
         video: dict[str, Any],
         concept_terms: list[str],
+        target_clip_duration_sec: int,
     ) -> SegmentMatch | None:
         title = str(video.get("title") or "").strip()
         description = str(video.get("description") or "").strip()
@@ -966,14 +2649,19 @@ class ReelService:
             return None
 
         duration_sec = int(video.get("duration_sec") or 0)
+        desired_clip_len = self._normalize_target_clip_duration(target_clip_duration_sec)
 
         if duration_sec > 0:
-            clip_len = min(45, max(15, duration_sec // 2 if duration_sec < 90 else 35))
-            start = max(0.0, min(10.0, float(duration_sec - clip_len)))
+            clip_len = min(desired_clip_len, max(15, duration_sec))
+            if duration_sec <= clip_len:
+                start = 0.0
+            else:
+                # Skip very early intro content when we must fall back to metadata-only clipping.
+                start = max(0.0, min(float(duration_sec - clip_len), float(duration_sec) * 0.18))
             end = min(float(duration_sec), start + float(clip_len))
         else:
             start = 0.0
-            end = 35.0
+            end = float(desired_clip_len)
 
         if end - start < 15:
             end = start + 15.0
@@ -987,6 +2675,48 @@ class ReelService:
             score=0.04 + 0.08 * lexical,
         )
 
+    def _build_dry_run_reel_preview(
+        self,
+        concept: dict[str, Any],
+        video: dict[str, Any],
+        segment: SegmentMatch,
+        clip_window: tuple[int, int],
+        relevance_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        start_sec, end_sec = clip_window
+        video_id = str(video.get("id") or "").strip()
+        video_url = f"https://www.youtube.com/embed/{video_id}?start={start_sec}&end={end_sec}" if video_id else ""
+        matched_terms = [
+            str(term).strip()
+            for term in (relevance_context or {}).get("matched_terms", [])
+            if str(term).strip()
+        ][:8]
+        return {
+            "reel_id": f"dry-run-{video_id}-{start_sec}-{end_sec}",
+            "concept_id": str(concept.get("id") or ""),
+            "concept_title": str(concept.get("title") or ""),
+            "video_title": str(video.get("title") or "").strip(),
+            "video_description": self._clean_video_description(str(video.get("description") or "")),
+            "ai_summary": "",
+            "video_url": video_url,
+            "t_start": float(start_sec),
+            "t_end": float(end_sec),
+            "transcript_snippet": str(segment.text or "")[:700],
+            "takeaways": [],
+            "captions": [],
+            "score": float(segment.score),
+            "relevance_score": float((relevance_context or {}).get("score") or segment.score),
+            "discovery_score": float((relevance_context or {}).get("discovery_score") or 0.0),
+            "clipability_score": float((relevance_context or {}).get("clipability_score") or 0.0),
+            "query_strategy": str((relevance_context or {}).get("query_strategy") or ""),
+            "retrieval_stage": str((relevance_context or {}).get("retrieval_stage") or ""),
+            "source_surface": str((relevance_context or {}).get("source_surface") or ""),
+            "matched_terms": matched_terms,
+            "relevance_reason": str((relevance_context or {}).get("reason") or "").strip(),
+            "video_duration_sec": int(video.get("duration_sec") or 0),
+            "clip_duration_sec": float(max(0.0, end_sec - start_sec)),
+        }
+
     def _create_reel(
         self,
         conn,
@@ -998,13 +2728,23 @@ class ReelService:
         transcript: list[dict[str, Any]] | None = None,
         relevance_context: dict[str, Any] | None = None,
         fast_mode: bool = False,
+        target_clip_duration_sec: int = DEFAULT_TARGET_CLIP_DURATION_SEC,
+        target_clip_duration_min_sec: int | None = None,
+        target_clip_duration_max_sec: int | None = None,
     ) -> dict[str, Any] | None:
         reel_id = str(uuid.uuid4())
+        clip_min_len, clip_max_len, _ = self._resolve_clip_duration_bounds(
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+        )
         if clip_window is None:
             clip_window = self._normalize_clip_window(
                 segment.t_start,
                 segment.t_end,
                 int(video.get("duration_sec") or 0),
+                min_len=clip_min_len,
+                max_len=clip_max_len,
             )
         if not clip_window:
             return None
@@ -1079,8 +2819,15 @@ class ReelService:
             "captions": captions,
             "score": float(segment.score),
             "relevance_score": relevance_score,
+            "discovery_score": float((relevance_context or {}).get("discovery_score") or 0.0),
+            "clipability_score": float((relevance_context or {}).get("clipability_score") or 0.0),
+            "query_strategy": str((relevance_context or {}).get("query_strategy") or ""),
+            "retrieval_stage": str((relevance_context or {}).get("retrieval_stage") or ""),
+            "source_surface": str((relevance_context or {}).get("source_surface") or ""),
             "matched_terms": matched_terms,
             "relevance_reason": relevance_reason,
+            "video_duration_sec": int(video.get("duration_sec") or 0),
+            "clip_duration_sec": float(max(0.0, end_sec - start_sec)),
         }
 
     def _clean_video_description(self, description: str, max_chars: int = 7000) -> str:
@@ -1247,10 +2994,20 @@ class ReelService:
             return None
         return (start_sec, end_sec)
 
-    def _should_use_full_short_clip(self, prefer_short_query: bool, video_duration_sec: int) -> bool:
+    def _should_use_full_short_clip(
+        self,
+        prefer_short_query: bool,
+        video_duration_sec: int,
+        clip_min_len: int,
+        clip_max_len: int,
+    ) -> bool:
         if not prefer_short_query:
             return False
         if video_duration_sec <= 0:
+            return False
+        if clip_max_len > 0 and video_duration_sec > clip_max_len:
+            return False
+        if clip_min_len > 0 and video_duration_sec < max(8, int(round(clip_min_len * 0.55))):
             return False
         # Shorts are currently up to ~3 minutes; keep full playback for these.
         return video_duration_sec <= 185
@@ -1272,6 +3029,8 @@ class ReelService:
         proposed_start: float,
         proposed_end: float,
         video_duration_sec: int,
+        min_len: int = 15,
+        max_len: int = 60,
     ) -> tuple[int, int] | None:
         entries: list[dict[str, Any]] = []
         for entry in transcript:
@@ -1302,8 +3061,8 @@ class ReelService:
                 proposed_start,
                 proposed_end,
                 video_duration_sec,
-                min_len=15,
-                max_len=60,
+                min_len=min_len,
+                max_len=max_len,
             )
 
         desired_start = max(0.0, float(proposed_start))
@@ -1324,8 +3083,8 @@ class ReelService:
                 refined_start_idx = i
 
         refined_start = float(entries[refined_start_idx]["start"])
-        min_end = refined_start + 15.0
-        max_end = refined_start + 60.0
+        min_end = refined_start + float(min_len)
+        max_end = refined_start + float(max_len)
 
         best_sentence_end: float | None = None
         best_sentence_cost = float("inf")
@@ -1357,8 +3116,8 @@ class ReelService:
             refined_start,
             refined_end,
             video_duration_sec,
-            min_len=15,
-            max_len=60,
+            min_len=min_len,
+            max_len=max_len,
         )
 
     def _is_sentence_end(self, text: str) -> bool:
@@ -1472,6 +3231,7 @@ class ReelService:
                 c.embedding_json AS concept_embedding_json,
                 v.title AS video_title,
                 COALESCE(v.description, '') AS video_description,
+                COALESCE(v.duration_sec, 0) AS video_duration_sec,
                 r.video_url,
                 r.t_start,
                 r.t_end,
@@ -1640,10 +3400,17 @@ class ReelService:
                     ),
                     "score": score,
                     "relevance_score": float(relevance_context.get("score") or 0.0),
+                    "discovery_score": float(relevance_context.get("score") or 0.0),
+                    "clipability_score": float(self._score_clipability_from_metadata({"duration_sec": row.get("video_duration_sec")}, strategy="literal")),
+                    "query_strategy": "",
+                    "retrieval_stage": "",
+                    "source_surface": "",
                     "matched_terms": relevance_context.get("matched_terms", []),
                     "relevance_reason": str(relevance_context.get("reason") or ""),
                     "concept_position": concept_order.get(row["concept_id"]),
                     "total_concepts": total_concepts,
+                    "video_duration_sec": int(row.get("video_duration_sec") or 0),
+                    "clip_duration_sec": round(max(0.0, float(row["t_end"]) - float(row["t_start"])), 2),
                     "created_at": row["created_at"],
                 }
             )

@@ -29,6 +29,8 @@ export type Reel = {
   relevance_reason?: string;
   concept_position?: number;
   total_concepts?: number;
+  video_duration_sec?: number;
+  clip_duration_sec?: number;
 };
 
 export type CaptionCue = {
@@ -39,6 +41,29 @@ export type CaptionCue = {
 
 export type ReelsGenerateResponse = {
   reels: Reel[];
+};
+
+export type ReelsCanGenerateResponse = {
+  can_generate: boolean;
+  blocked_by_settings: boolean;
+  estimated_success_rate: number;
+  total_probed: number;
+  passed_all_filters: number;
+  primary_bottleneck: string;
+  message: string;
+};
+
+export type ReelsCanGenerateAnyResponse = {
+  can_generate_any: boolean;
+  topics_checked: number;
+  topics_can_generate: number;
+  blocked_by_settings_topics: number;
+  no_source_topics: number;
+  estimated_success_rate: number;
+  total_probed: number;
+  passed_all_filters: number;
+  primary_bottleneck: string;
+  message: string;
 };
 
 export type FeedResponse = {

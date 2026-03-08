@@ -22,6 +22,24 @@ body {
   overflow: hidden;
 }
 
+html,
+body,
+body * {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  user-select: none;
+}
+
+input,
+textarea,
+[role="textbox"],
+[contenteditable=""],
+[contenteditable="true"] {
+  -webkit-user-select: text;
+  -moz-user-select: text;
+  user-select: text;
+}
+
 :root {
   --desktop-ui-scale: 1;
 }
@@ -169,6 +187,49 @@ textarea:-webkit-autofill:focus {
   border-radius: 999px;
   background: #ffffff;
   border: 1px solid rgba(0, 0, 0, 0.28);
+}
+
+.dual-range-input {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  outline: none;
+  pointer-events: none;
+}
+
+.dual-range-input::-webkit-slider-runnable-track {
+  height: 32px;
+  background: transparent;
+}
+
+.dual-range-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  pointer-events: all;
+  width: 18px;
+  height: 18px;
+  margin-top: 7px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.28);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.18);
+  cursor: pointer;
+}
+
+.dual-range-input::-moz-range-track {
+  height: 32px;
+  background: transparent;
+}
+
+.dual-range-input::-moz-range-thumb {
+  pointer-events: all;
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.28);
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.18);
+  cursor: pointer;
 }
 
 .volumetric-glow-canvas {

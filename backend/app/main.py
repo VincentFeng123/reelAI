@@ -1,6 +1,7 @@
 import json
 import os
 import uuid
+from dataclasses import dataclass, field
 from typing import Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -19,6 +20,9 @@ from .models import (
     FeedbackResponse,
     FeedResponse,
     MaterialResponse,
+    ReelsCanGenerateAnyRequest,
+    ReelsCanGenerateAnyResponse,
+    ReelsCanGenerateResponse,
     ReelsGenerateRequest,
     ReelsGenerateResponse,
 )
@@ -55,6 +59,13 @@ material_intelligence_service = MaterialIntelligenceService()
 youtube_service = YouTubeService()
 reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service)
 
+VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
+VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
+DEFAULT_TARGET_CLIP_DURATION_SEC = 55
+MIN_TARGET_CLIP_DURATION_SEC = 15
+MAX_TARGET_CLIP_DURATION_SEC = 180
+MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC = 15
+
 
 def _normalize_community_tags(raw_tags: list[str]) -> list[str]:
     normalized: list[str] = []
@@ -87,6 +98,69 @@ def _normalize_min_relevance(value: float | None) -> float | None:
     return max(-1.0, min(1.2, parsed))
 
 
+def _normalize_video_pool_mode(value: str | None) -> Literal["short-first", "balanced", "long-form"]:
+    if value in VALID_VIDEO_POOL_MODES:
+        return value
+    return "short-first"
+
+
+def _normalize_preferred_video_duration(value: str | None) -> Literal["any", "short", "medium", "long"]:
+    if value in VALID_VIDEO_DURATION_PREFS:
+        return value
+    return "any"
+
+
+def _normalize_target_clip_duration_sec(value: int | float | None) -> int:
+    if value is None:
+        return DEFAULT_TARGET_CLIP_DURATION_SEC
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_TARGET_CLIP_DURATION_SEC
+    return max(MIN_TARGET_CLIP_DURATION_SEC, min(MAX_TARGET_CLIP_DURATION_SEC, parsed))
+
+
+def _resolve_target_clip_duration_bounds(
+    target_clip_duration_sec: int | float | None,
+    target_clip_duration_min_sec: int | float | None,
+    target_clip_duration_max_sec: int | float | None,
+) -> tuple[int, int, int]:
+    safe_target = _normalize_target_clip_duration_sec(target_clip_duration_sec)
+    default_min = max(10, int(round(safe_target * 0.35)))
+    default_max = max(default_min + MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC, safe_target)
+
+    safe_min = default_min if target_clip_duration_min_sec is None else _normalize_target_clip_duration_sec(
+        target_clip_duration_min_sec
+    )
+    safe_max = default_max if target_clip_duration_max_sec is None else _normalize_target_clip_duration_sec(
+        target_clip_duration_max_sec
+    )
+    if safe_min > safe_max:
+        safe_min, safe_max = safe_max, safe_min
+    if safe_max - safe_min < MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC:
+        expanded_max = min(MAX_TARGET_CLIP_DURATION_SEC, safe_min + MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC)
+        if expanded_max - safe_min >= MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC:
+            safe_max = expanded_max
+        else:
+            safe_min = max(MIN_TARGET_CLIP_DURATION_SEC, safe_max - MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC)
+    safe_target = max(safe_min, min(safe_max, safe_target))
+    return safe_target, safe_min, safe_max
+
+
+def _video_duration_bucket(duration_sec: object) -> Literal["short", "medium", "long"] | None:
+    try:
+        parsed = int(duration_sec)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    if parsed < 4 * 60:
+        return "short"
+    if parsed <= 20 * 60:
+        return "medium"
+    return "long"
+
+
 def _filter_reels_by_min_relevance(reels: list[dict], min_relevance: float | None) -> list[dict]:
     if min_relevance is None:
         return reels
@@ -96,6 +170,44 @@ def _filter_reels_by_min_relevance(reels: list[dict], min_relevance: float | Non
         if isinstance(relevance, (int, float)) and float(relevance) < min_relevance:
             continue
         filtered.append(reel)
+    return filtered
+
+
+def _filter_reels_by_video_preferences(
+    reels: list[dict],
+    preferred_video_duration: Literal["any", "short", "medium", "long"],
+    target_clip_duration_sec: int,
+    target_clip_duration_min_sec: int | None = None,
+    target_clip_duration_max_sec: int | None = None,
+) -> list[dict]:
+    safe_duration_pref = _normalize_preferred_video_duration(preferred_video_duration)
+    _, clip_min, clip_max = _resolve_target_clip_duration_bounds(
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
+
+    filtered: list[dict] = []
+    for reel in reels:
+        if safe_duration_pref != "any":
+            bucket = _video_duration_bucket(reel.get("video_duration_sec"))
+            if bucket != safe_duration_pref:
+                continue
+
+        clip_duration = reel.get("clip_duration_sec")
+        if not isinstance(clip_duration, (int, float)):
+            try:
+                clip_duration = float(reel.get("t_end") or 0) - float(reel.get("t_start") or 0)
+            except (TypeError, ValueError):
+                clip_duration = 0.0
+        clip_duration_value = float(clip_duration or 0.0)
+        if clip_duration_value > 0 and (clip_duration_value < clip_min or clip_duration_value > clip_max):
+            continue
+
+        normalized = dict(reel)
+        if clip_duration_value > 0:
+            normalized["clip_duration_sec"] = round(clip_duration_value, 2)
+        filtered.append(normalized)
     return filtered
 
 
@@ -290,23 +402,429 @@ async def create_material(
 @app.post("/api/reels/generate", response_model=ReelsGenerateResponse)
 def generate_reels(payload: ReelsGenerateRequest):
     min_relevance = _normalize_min_relevance(payload.min_relevance)
+    safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
+    safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
+    safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
+        target_clip_duration_sec=payload.target_clip_duration_sec,
+        target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
+        target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+    )
+    reels: list[dict] = []
+    filtered: list[dict] = []
+    with get_conn() as conn:
+        material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
+        if not material:
+            raise HTTPException(status_code=404, detail="material_id not found")
+
+        attempts = 0
+        while attempts < 4 and len(filtered) < payload.num_reels:
+            need = max(1, payload.num_reels - len(filtered))
+            target_batch = min(30, max(need + 2, payload.num_reels if attempts == 0 else need))
+            try:
+                batch = reel_service.generate_reels(
+                    conn,
+                    material_id=payload.material_id,
+                    concept_id=payload.concept_id,
+                    num_reels=target_batch,
+                    creative_commons_only=payload.creative_commons_only,
+                    fast_mode=payload.generation_mode == "fast",
+                    video_pool_mode=safe_video_pool_mode,
+                    preferred_video_duration=safe_video_duration_pref,
+                    target_clip_duration_sec=safe_target_clip_duration_sec,
+                    target_clip_duration_min_sec=safe_target_clip_min_sec,
+                    target_clip_duration_max_sec=safe_target_clip_max_sec,
+                )
+            except YouTubeApiRequestError as e:
+                raise HTTPException(status_code=502, detail=str(e)) from e
+            attempts += 1
+            if not batch:
+                break
+            reels.extend(batch)
+            filtered = _filter_reels_by_min_relevance(reels, min_relevance)
+            filtered = _filter_reels_by_video_preferences(
+                filtered,
+                preferred_video_duration=safe_video_duration_pref,
+                target_clip_duration_sec=safe_target_clip_duration_sec,
+                target_clip_duration_min_sec=safe_target_clip_min_sec,
+                target_clip_duration_max_sec=safe_target_clip_max_sec,
+            )
+    return {"reels": filtered[: payload.num_reels]}
+
+
+@dataclass
+class ProbeResult:
+    can_generate: bool = False
+    blocked_by_settings: bool = False
+    total_probed: int = 0
+    passed_relevance: int = 0
+    passed_duration_pref: int = 0
+    passed_clip_range: int = 0
+    passed_all: int = 0
+
+
+def _filter_reels_by_relevance_only(reels: list[dict], min_relevance: float | None) -> list[dict]:
+    if min_relevance is None:
+        return list(reels)
+    return [
+        r for r in reels
+        if not (isinstance(r.get("relevance_score"), (int, float)) and float(r["relevance_score"]) < min_relevance)
+    ]
+
+
+def _filter_reels_by_duration_pref_only(
+    reels: list[dict],
+    preferred_video_duration: Literal["any", "short", "medium", "long"],
+) -> list[dict]:
+    safe_pref = _normalize_preferred_video_duration(preferred_video_duration)
+    if safe_pref == "any":
+        return list(reels)
+    return [
+        r for r in reels
+        if _video_duration_bucket(r.get("video_duration_sec")) == safe_pref
+    ]
+
+
+def _filter_reels_by_clip_range_only(
+    reels: list[dict],
+    target_clip_duration_sec: int,
+    target_clip_duration_min_sec: int | None,
+    target_clip_duration_max_sec: int | None,
+) -> list[dict]:
+    _, clip_min, clip_max = _resolve_target_clip_duration_bounds(
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
+    filtered: list[dict] = []
+    for reel in reels:
+        clip_duration = reel.get("clip_duration_sec")
+        if not isinstance(clip_duration, (int, float)):
+            try:
+                clip_duration = float(reel.get("t_end") or 0) - float(reel.get("t_start") or 0)
+            except (TypeError, ValueError):
+                clip_duration = 0.0
+        val = float(clip_duration or 0.0)
+        if val > 0 and (val < clip_min or val > clip_max):
+            continue
+        filtered.append(reel)
+    return filtered
+
+
+def _determine_primary_bottleneck(
+    total: int,
+    passed_relevance: int,
+    passed_duration_pref: int,
+    passed_clip_range: int,
+) -> str:
+    if total == 0:
+        return "no_source"
+    dropped_by_relevance = total - passed_relevance
+    dropped_by_duration = total - passed_duration_pref
+    dropped_by_clip = total - passed_clip_range
+    if dropped_by_relevance == 0 and dropped_by_duration == 0 and dropped_by_clip == 0:
+        return ""
+    worst = max(dropped_by_relevance, dropped_by_duration, dropped_by_clip)
+    if worst == 0:
+        return ""
+    if dropped_by_relevance == worst:
+        return "relevance"
+    if dropped_by_duration == worst:
+        return "video_duration"
+    return "clip_range"
+
+
+def _probe_material_viability(
+    conn,
+    *,
+    material_id: str,
+    concept_id: str | None,
+    creative_commons_only: bool,
+    fast_mode: bool,
+    min_relevance: float | None,
+    video_pool_mode: Literal["short-first", "balanced", "long-form"],
+    preferred_video_duration: Literal["any", "short", "medium", "long"],
+    target_clip_duration_sec: int,
+    target_clip_duration_min_sec: int | None,
+    target_clip_duration_max_sec: int | None,
+) -> ProbeResult:
+    probe: list[dict] = []
+    batch = reel_service.generate_reels(
+        conn,
+        material_id=material_id,
+        concept_id=concept_id,
+        num_reels=4,
+        creative_commons_only=creative_commons_only,
+        fast_mode=fast_mode,
+        video_pool_mode=video_pool_mode,
+        preferred_video_duration=preferred_video_duration,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+        dry_run=True,
+    )
+    if batch:
+        probe.extend(batch)
+
+    total_probed = len(probe)
+
+    # Apply each filter independently to measure per-filter pass rates
+    after_relevance = _filter_reels_by_relevance_only(probe, min_relevance)
+    after_duration = _filter_reels_by_duration_pref_only(probe, preferred_video_duration)
+    after_clip = _filter_reels_by_clip_range_only(
+        probe,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
+
+    # Apply all filters combined
+    all_filtered = _filter_reels_by_min_relevance(probe, min_relevance)
+    all_filtered = _filter_reels_by_video_preferences(
+        all_filtered,
+        preferred_video_duration=preferred_video_duration,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
+
+    passed_relevance = len(after_relevance)
+    passed_duration = len(after_duration)
+    passed_clip = len(after_clip)
+    passed_all = len(all_filtered)
+
+    if passed_all > 0:
+        return ProbeResult(
+            can_generate=True,
+            blocked_by_settings=False,
+            total_probed=total_probed,
+            passed_relevance=passed_relevance,
+            passed_duration_pref=passed_duration,
+            passed_clip_range=passed_clip,
+            passed_all=passed_all,
+        )
+
+    # Relaxed probe to determine if settings are the blocker
+    relaxed_probe = reel_service.generate_reels(
+        conn,
+        material_id=material_id,
+        concept_id=concept_id,
+        num_reels=1,
+        creative_commons_only=creative_commons_only,
+        fast_mode=fast_mode,
+        video_pool_mode="balanced",
+        preferred_video_duration="any",
+        target_clip_duration_sec=DEFAULT_TARGET_CLIP_DURATION_SEC,
+        target_clip_duration_min_sec=MIN_TARGET_CLIP_DURATION_SEC,
+        target_clip_duration_max_sec=MAX_TARGET_CLIP_DURATION_SEC,
+        dry_run=True,
+    )
+
+    blocked = bool(relaxed_probe)
+    return ProbeResult(
+        can_generate=False,
+        blocked_by_settings=blocked,
+        total_probed=total_probed,
+        passed_relevance=passed_relevance,
+        passed_duration_pref=passed_duration,
+        passed_clip_range=passed_clip,
+        passed_all=0,
+    )
+
+
+@app.post("/api/reels/can-generate", response_model=ReelsCanGenerateResponse)
+def can_generate_reels(payload: ReelsGenerateRequest):
+    min_relevance = _normalize_min_relevance(payload.min_relevance)
+    safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
+    safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
+    safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
+        target_clip_duration_sec=payload.target_clip_duration_sec,
+        target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
+        target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+    )
+
     with get_conn() as conn:
         material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
         if not material:
             raise HTTPException(status_code=404, detail="material_id not found")
 
         try:
-            reels = reel_service.generate_reels(
+            result = _probe_material_viability(
                 conn,
                 material_id=payload.material_id,
                 concept_id=payload.concept_id,
-                num_reels=payload.num_reels,
                 creative_commons_only=payload.creative_commons_only,
                 fast_mode=payload.generation_mode == "fast",
+                min_relevance=min_relevance,
+                video_pool_mode=safe_video_pool_mode,
+                preferred_video_duration=safe_video_duration_pref,
+                target_clip_duration_sec=safe_target_clip_duration_sec,
+                target_clip_duration_min_sec=safe_target_clip_min_sec,
+                target_clip_duration_max_sec=safe_target_clip_max_sec,
             )
         except YouTubeApiRequestError as e:
             raise HTTPException(status_code=502, detail=str(e)) from e
-    return {"reels": _filter_reels_by_min_relevance(reels, min_relevance)}
+
+    success_rate = result.passed_all / result.total_probed if result.total_probed > 0 else 0.0
+    bottleneck = _determine_primary_bottleneck(
+        result.total_probed, result.passed_relevance, result.passed_duration_pref, result.passed_clip_range,
+    )
+    base = {
+        "estimated_success_rate": round(success_rate, 4),
+        "total_probed": result.total_probed,
+        "passed_all_filters": result.passed_all,
+        "primary_bottleneck": bottleneck,
+    }
+
+    if result.can_generate:
+        return {
+            **base,
+            "can_generate": True,
+            "blocked_by_settings": False,
+            "message": "Current settings can generate reels for this material.",
+        }
+
+    if result.blocked_by_settings:
+        return {
+            **base,
+            "can_generate": False,
+            "blocked_by_settings": True,
+            "message": "This configuration is too strict for the current material.",
+        }
+
+    return {
+        **base,
+        "can_generate": False,
+        "blocked_by_settings": False,
+        "message": "No matching source videos were found for this material right now.",
+    }
+
+
+@app.post("/api/reels/can-generate-any", response_model=ReelsCanGenerateAnyResponse)
+def can_generate_reels_any(payload: ReelsCanGenerateAnyRequest):
+    min_relevance = _normalize_min_relevance(payload.min_relevance)
+    safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
+    safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
+    safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
+        target_clip_duration_sec=payload.target_clip_duration_sec,
+        target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
+        target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+    )
+
+    with get_conn() as conn:
+        requested_ids: list[str] = []
+        seen_requested: set[str] = set()
+        for raw in payload.material_ids:
+            material_id = str(raw or "").strip()
+            if not material_id or material_id in seen_requested:
+                continue
+            seen_requested.add(material_id)
+            requested_ids.append(material_id)
+
+        if requested_ids:
+            placeholders = ",".join(["?"] * len(requested_ids))
+            rows = fetch_all(
+                conn,
+                f"SELECT id FROM materials WHERE id IN ({placeholders})",
+                tuple(requested_ids),
+            )
+            existing = {str(row.get("id") or "").strip() for row in rows if str(row.get("id") or "").strip()}
+            material_ids = [material_id for material_id in requested_ids if material_id in existing]
+        else:
+            rows = fetch_all(conn, "SELECT id FROM materials ORDER BY created_at DESC LIMIT 5", tuple())
+            material_ids = [str(row.get("id") or "").strip() for row in rows if str(row.get("id") or "").strip()]
+
+        # Cap to avoid timeout from too many external API calls per probe
+        material_ids = material_ids[:5]
+
+        if not material_ids:
+            return {
+                "can_generate_any": False,
+                "topics_checked": 0,
+                "topics_can_generate": 0,
+                "blocked_by_settings_topics": 0,
+                "no_source_topics": 0,
+                "estimated_success_rate": 0.0,
+                "total_probed": 0,
+                "passed_all_filters": 0,
+                "primary_bottleneck": "",
+                "message": "No study topics are available to validate.",
+            }
+
+        can_count = 0
+        blocked_count = 0
+        none_count = 0
+        agg_total_probed = 0
+        agg_passed_relevance = 0
+        agg_passed_duration = 0
+        agg_passed_clip = 0
+        agg_passed_all = 0
+        for material_id in material_ids:
+            try:
+                result = _probe_material_viability(
+                    conn,
+                    material_id=material_id,
+                    concept_id=None,
+                    creative_commons_only=payload.creative_commons_only,
+                    fast_mode=payload.generation_mode == "fast",
+                    min_relevance=min_relevance,
+                    video_pool_mode=safe_video_pool_mode,
+                    preferred_video_duration=safe_video_duration_pref,
+                    target_clip_duration_sec=safe_target_clip_duration_sec,
+                    target_clip_duration_min_sec=safe_target_clip_min_sec,
+                    target_clip_duration_max_sec=safe_target_clip_max_sec,
+                )
+            except YouTubeApiRequestError as e:
+                raise HTTPException(status_code=502, detail=str(e)) from e
+            agg_total_probed += result.total_probed
+            agg_passed_relevance += result.passed_relevance
+            agg_passed_duration += result.passed_duration_pref
+            agg_passed_clip += result.passed_clip_range
+            agg_passed_all += result.passed_all
+            if result.can_generate:
+                can_count += 1
+            elif result.blocked_by_settings:
+                blocked_count += 1
+            else:
+                none_count += 1
+
+    checked_count = len(material_ids)
+    estimated_rate = round(agg_passed_all / agg_total_probed, 4) if agg_total_probed > 0 else 0.0
+    bottleneck = _determine_primary_bottleneck(
+        agg_total_probed, agg_passed_relevance, agg_passed_duration, agg_passed_clip,
+    )
+    base = {
+        "topics_checked": checked_count,
+        "topics_can_generate": can_count,
+        "blocked_by_settings_topics": blocked_count,
+        "no_source_topics": none_count,
+        "estimated_success_rate": estimated_rate,
+        "total_probed": agg_total_probed,
+        "passed_all_filters": agg_passed_all,
+        "primary_bottleneck": bottleneck,
+    }
+
+    rate_pct = round(estimated_rate * 100)
+    if can_count > 0:
+        bottleneck_hint = f" Bottleneck: {bottleneck}." if bottleneck and bottleneck != "no_source" and can_count < checked_count else ""
+        return {
+            **base,
+            "can_generate_any": True,
+            "message": f"Estimated success rate: {rate_pct}% ({agg_passed_all}/{agg_total_probed} probed reels pass). {can_count}/{checked_count} topics can generate.{bottleneck_hint}",
+        }
+
+    if blocked_count > 0:
+        bottleneck_hint = f" Primary bottleneck: {bottleneck}." if bottleneck and bottleneck != "no_source" else ""
+        return {
+            **base,
+            "can_generate_any": False,
+            "message": f"Estimated success rate: 0% (0/{agg_total_probed} probed reels pass). Settings too strict for {blocked_count}/{checked_count} topics.{bottleneck_hint}",
+        }
+
+    return {
+        **base,
+        "can_generate_any": False,
+        "message": f"Estimated success rate: 0%. No matching source videos found across {checked_count} topics.",
+    }
 
 
 @app.get("/api/feed", response_model=FeedResponse)
@@ -319,6 +837,11 @@ def feed(
     creative_commons_only: bool = False,
     generation_mode: Literal["slow", "fast"] = "slow",
     min_relevance: float | None = None,
+    video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first",
+    preferred_video_duration: Literal["any", "short", "medium", "long"] = "any",
+    target_clip_duration_sec: int = DEFAULT_TARGET_CLIP_DURATION_SEC,
+    target_clip_duration_min_sec: int | None = None,
+    target_clip_duration_max_sec: int | None = None,
 ):
     if page < 1:
         page = 1
@@ -338,22 +861,43 @@ def feed(
 
         fast_mode = generation_mode == "fast"
         safe_min_relevance = _normalize_min_relevance(min_relevance)
+        safe_video_pool_mode = _normalize_video_pool_mode(video_pool_mode)
+        safe_video_duration_pref = _normalize_preferred_video_duration(preferred_video_duration)
+        safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+        )
         ranked = reel_service.ranked_feed(conn, material_id, fast_mode=fast_mode)
         filtered_ranked = _filter_reels_by_min_relevance(ranked, safe_min_relevance)
+        filtered_ranked = _filter_reels_by_video_preferences(
+            filtered_ranked,
+            preferred_video_duration=safe_video_duration_pref,
+            target_clip_duration_sec=safe_target_clip_duration_sec,
+            target_clip_duration_min_sec=safe_target_clip_min_sec,
+            target_clip_duration_max_sec=safe_target_clip_max_sec,
+        )
         # Auto-expand the feed while users scroll so we can keep serving fresh reels.
         if autofill:
-            target_total = page * limit + prefetch
+            target_total = page * limit + prefetch + (10 if fast_mode else 6)
             attempts = 0
-            while len(filtered_ranked) < target_total and attempts < 3:
+            max_attempts = 5 if fast_mode else 4
+            max_batch = 18 if fast_mode else 14
+            while len(filtered_ranked) < target_total and attempts < max_attempts:
                 need = max(1, target_total - len(filtered_ranked))
                 try:
                     generated = reel_service.generate_reels(
                         conn,
                         material_id=material_id,
                         concept_id=None,
-                        num_reels=min(12, need + 2),
+                        num_reels=min(max_batch, max(need + 4, limit + 4)),
                         creative_commons_only=creative_commons_only,
                         fast_mode=fast_mode,
+                        video_pool_mode=safe_video_pool_mode,
+                        preferred_video_duration=safe_video_duration_pref,
+                        target_clip_duration_sec=safe_target_clip_duration_sec,
+                        target_clip_duration_min_sec=safe_target_clip_min_sec,
+                        target_clip_duration_max_sec=safe_target_clip_max_sec,
                     )
                 except YouTubeApiRequestError:
                     break
@@ -362,8 +906,22 @@ def feed(
                     break
                 ranked = reel_service.ranked_feed(conn, material_id, fast_mode=fast_mode)
                 filtered_ranked = _filter_reels_by_min_relevance(ranked, safe_min_relevance)
+                filtered_ranked = _filter_reels_by_video_preferences(
+                    filtered_ranked,
+                    preferred_video_duration=safe_video_duration_pref,
+                    target_clip_duration_sec=safe_target_clip_duration_sec,
+                    target_clip_duration_min_sec=safe_target_clip_min_sec,
+                    target_clip_duration_max_sec=safe_target_clip_max_sec,
+                )
         else:
             filtered_ranked = _filter_reels_by_min_relevance(ranked, safe_min_relevance)
+            filtered_ranked = _filter_reels_by_video_preferences(
+                filtered_ranked,
+                preferred_video_duration=safe_video_duration_pref,
+                target_clip_duration_sec=safe_target_clip_duration_sec,
+                target_clip_duration_min_sec=safe_target_clip_min_sec,
+                target_clip_duration_max_sec=safe_target_clip_max_sec,
+            )
 
     total = len(filtered_ranked)
     start = (page - 1) * limit

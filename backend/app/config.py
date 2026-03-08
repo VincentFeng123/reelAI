@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     openai_embed_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
     youtube_api_key: str = ""
+    retrieval_engine_v2_enabled: bool = True
+    retrieval_tier2_enabled: bool = False
+    retrieval_debug_logging: bool = True
 
     s3_bucket: str = ""
     s3_region: str = "us-east-1"

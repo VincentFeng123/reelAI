@@ -5,8 +5,11 @@ import type {
   CommunityReelPlatform,
   FeedResponse,
   MaterialResponse,
+  ReelsCanGenerateAnyResponse,
+  ReelsCanGenerateResponse,
   ReelsGenerateResponse,
 } from "@/lib/types";
+import type { PreferredVideoDuration, VideoPoolMode } from "@/lib/settings";
 
 const RAW_API_BASE = (
   process.env.NEXT_PUBLIC_API_BASE || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "")
@@ -56,6 +59,11 @@ export async function generateReels(params: {
   conceptId?: string;
   generationMode?: "slow" | "fast";
   minRelevance?: number;
+  videoPoolMode?: VideoPoolMode;
+  preferredVideoDuration?: PreferredVideoDuration;
+  targetClipDurationSec?: number;
+  targetClipDurationMinSec?: number;
+  targetClipDurationMaxSec?: number;
 }): Promise<ReelsGenerateResponse> {
   const res = await safeFetch(apiUrl("/reels/generate"), {
     method: "POST",
@@ -69,9 +77,92 @@ export async function generateReels(params: {
       creative_commons_only: false,
       generation_mode: params.generationMode ?? "slow",
       min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
+      video_pool_mode: params.videoPoolMode ?? "short-first",
+      preferred_video_duration: params.preferredVideoDuration ?? "any",
+      target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : undefined,
+      target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
+        ? Math.round(params.targetClipDurationMinSec as number)
+        : undefined,
+      target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
+        ? Math.round(params.targetClipDurationMaxSec as number)
+        : undefined,
     }),
   });
 
+  return res.json();
+}
+
+export async function checkReelsCanGenerate(params: {
+  materialId: string;
+  conceptId?: string;
+  generationMode?: "slow" | "fast";
+  minRelevance?: number;
+  videoPoolMode?: VideoPoolMode;
+  preferredVideoDuration?: PreferredVideoDuration;
+  targetClipDurationSec?: number;
+  targetClipDurationMinSec?: number;
+  targetClipDurationMaxSec?: number;
+}): Promise<ReelsCanGenerateResponse> {
+  const res = await safeFetch(apiUrl("/reels/can-generate"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      material_id: params.materialId,
+      concept_id: params.conceptId,
+      num_reels: 1,
+      creative_commons_only: false,
+      generation_mode: params.generationMode ?? "slow",
+      min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
+      video_pool_mode: params.videoPoolMode ?? "short-first",
+      preferred_video_duration: params.preferredVideoDuration ?? "any",
+      target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : undefined,
+      target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
+        ? Math.round(params.targetClipDurationMinSec as number)
+        : undefined,
+      target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
+        ? Math.round(params.targetClipDurationMaxSec as number)
+        : undefined,
+    }),
+  });
+  return res.json();
+}
+
+export async function checkReelsCanGenerateAny(params: {
+  materialIds?: string[];
+  generationMode?: "slow" | "fast";
+  minRelevance?: number;
+  videoPoolMode?: VideoPoolMode;
+  preferredVideoDuration?: PreferredVideoDuration;
+  targetClipDurationSec?: number;
+  targetClipDurationMinSec?: number;
+  targetClipDurationMaxSec?: number;
+}): Promise<ReelsCanGenerateAnyResponse> {
+  const materialIds = Array.isArray(params.materialIds)
+    ? params.materialIds.map((id) => String(id || "").trim()).filter(Boolean)
+    : [];
+  const res = await safeFetch(apiUrl("/reels/can-generate-any"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      material_ids: materialIds,
+      creative_commons_only: false,
+      generation_mode: params.generationMode ?? "slow",
+      min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
+      video_pool_mode: params.videoPoolMode ?? "short-first",
+      preferred_video_duration: params.preferredVideoDuration ?? "any",
+      target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : undefined,
+      target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
+        ? Math.round(params.targetClipDurationMinSec as number)
+        : undefined,
+      target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
+        ? Math.round(params.targetClipDurationMaxSec as number)
+        : undefined,
+    }),
+  });
   return res.json();
 }
 
@@ -83,6 +174,11 @@ export async function fetchFeed(params: {
   autofill?: boolean;
   generationMode?: "slow" | "fast";
   minRelevance?: number;
+  videoPoolMode?: VideoPoolMode;
+  preferredVideoDuration?: PreferredVideoDuration;
+  targetClipDurationSec?: number;
+  targetClipDurationMinSec?: number;
+  targetClipDurationMaxSec?: number;
 }): Promise<FeedResponse> {
   const query = new URLSearchParams({
     material_id: params.materialId,
@@ -92,7 +188,18 @@ export async function fetchFeed(params: {
     prefetch: String(params.prefetch ?? 7),
     creative_commons_only: "false",
     generation_mode: params.generationMode ?? "slow",
+    video_pool_mode: params.videoPoolMode ?? "short-first",
+    preferred_video_duration: params.preferredVideoDuration ?? "any",
+    target_clip_duration_sec: String(
+      Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : 55,
+    ),
   });
+  if (Number.isFinite(params.targetClipDurationMinSec)) {
+    query.set("target_clip_duration_min_sec", String(Math.round(params.targetClipDurationMinSec as number)));
+  }
+  if (Number.isFinite(params.targetClipDurationMaxSec)) {
+    query.set("target_clip_duration_max_sec", String(Math.round(params.targetClipDurationMaxSec as number)));
+  }
   if (Number.isFinite(params.minRelevance)) {
     query.set("min_relevance", String(params.minRelevance));
   }

@@ -23,6 +23,7 @@ const DETAIL_CONTENT_TOP_PADDING_GUTTER = 16;
 const DETAIL_CONTENT_TOP_PADDING_UPSHIFT_PX = 56;
 const DETAIL_CAROUSEL_VISIBLE_COUNT = 3;
 const DETAIL_BANNER_LEFT_EXPANSION_PX = 10;
+const DETAIL_BANNER_LEFT_INSET_PX = 8;
 
 type ReelPlatform = "youtube" | "instagram" | "tiktok";
 
@@ -442,6 +443,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   const [storageHydrated, setStorageHydrated] = useState(false);
   const [portalReady, setPortalReady] = useState(false);
   const [detailBannerLeft, setDetailBannerLeft] = useState(0);
+  const [detailBannerRight, setDetailBannerRight] = useState(0);
   const [detailBannerHeight, setDetailBannerHeight] = useState(0);
   const [isDetailBannerCompact, setIsDetailBannerCompact] = useState(false);
   const [isThumbnailDragOver, setIsThumbnailDragOver] = useState(false);
@@ -449,6 +451,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   const panelRootRef = useRef<HTMLDivElement | null>(null);
   const detailBannerRef = useRef<HTMLDivElement | null>(null);
   const detailContentScrollRef = useRef<HTMLDivElement | null>(null);
+  const detailReelsSectionRef = useRef<HTMLElement | null>(null);
   const communityScrollRef = useRef<HTMLDivElement | null>(null);
   const activeFeaturedSlideRef = useRef<HTMLDivElement | null>(null);
   const directoryDetailCloseTimerRef = useRef<number | null>(null);
@@ -503,8 +506,14 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
       return;
     }
     const panelRect = panelRootRef.current.getBoundingClientRect();
+    if (panelRect.width < 40 || panelRect.height < 40) {
+      // Skip geometry updates while the panel is hidden/off-layout.
+      return;
+    }
     const nextLeft = Math.max(0, Math.round(panelRect.left) - DETAIL_BANNER_LEFT_EXPANSION_PX);
     setDetailBannerLeft((prev) => (prev === nextLeft ? prev : nextLeft));
+    const nextRight = Math.max(0, Math.round(window.innerWidth - panelRect.right) - DETAIL_BANNER_LEFT_EXPANSION_PX);
+    setDetailBannerRight((prev) => (prev === nextRight ? prev : nextRight));
 
     if (!detailBannerRef.current) {
       return;
@@ -1043,7 +1052,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   }, [isDirectoryDetailOpen, mode, selectedDirectorySet]);
 
   useEffect(() => {
-    if (mode !== "community" || !portalReady || !selectedDirectorySet) {
+    if (mode !== "community" || !isVisible || !portalReady || !selectedDirectorySet) {
       return;
     }
     const update = () => {
@@ -1066,30 +1075,44 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
       window.removeEventListener("resize", update);
       resizeObserver?.disconnect();
     };
-  }, [isDirectoryDetailOpen, mode, portalReady, selectedDirectorySet, updateDetailBannerGeometry]);
+  }, [isDirectoryDetailOpen, isVisible, mode, portalReady, selectedDirectorySet, updateDetailBannerGeometry]);
 
   const detailContentTopPadding = Math.max(
     DETAIL_CONTENT_TOP_PADDING_FALLBACK,
     detailBannerHeight + DETAIL_CONTENT_TOP_PADDING_GUTTER - DETAIL_CONTENT_TOP_PADDING_UPSHIFT_PX,
   );
+  const selectedDirectorySetHasReels = (selectedDirectorySet?.reels.length ?? 0) > 0;
+
+  const scrollToDetailReels = useCallback(() => {
+    const container = detailContentScrollRef.current;
+    const reelsSection = detailReelsSectionRef.current;
+    if (!container || !reelsSection) {
+      return;
+    }
+    const containerRect = container.getBoundingClientRect();
+    const sectionRect = reelsSection.getBoundingClientRect();
+    const nextTop = sectionRect.top - containerRect.top + container.scrollTop - 12;
+    container.scrollTo({
+      top: Math.max(0, nextTop),
+      behavior: "smooth",
+    });
+  }, []);
 
   const detailBannerPortal =
     mode === "community" && isVisible && portalReady && selectedDirectorySet
       ? createPortal(
         <div
           ref={detailBannerRef}
-          className={`pointer-events-none fixed top-0 z-[96] overflow-hidden bg-transparent ${
-            isDetailBannerCompact ? "backdrop-blur-[10px]" : "backdrop-blur-[4px]"
-          } transition-[opacity,left,backdrop-filter] duration-[560ms] ease-[cubic-bezier(0.25,0.1,0.25,1)] ${
+          className={`pointer-events-none fixed top-0 z-[96] overflow-hidden ${
+            isDetailBannerCompact ? "bg-transparent backdrop-blur-[10px]" : "bg-white/[0.04] backdrop-blur-[4px]"
+          } transition-[opacity,backdrop-filter] duration-[560ms] ease-[cubic-bezier(0.25,0.1,0.25,1)] ${
             isDirectoryDetailOpen ? "opacity-100" : "opacity-0 pointer-events-none"
           }`}
-            style={{ left: `${detailBannerLeft + 3}px`, right: 0 }}
+            style={{
+              left: `${detailBannerLeft + DETAIL_BANNER_LEFT_INSET_PX}px`,
+              right: `${detailBannerRight}px`,
+            }}
           >
-            <div
-              className={`pointer-events-none absolute inset-0 bg-white/[0.04] transition-opacity duration-[420ms] ease-out ${
-                isDetailBannerCompact ? "opacity-0" : "opacity-100"
-              }`}
-            />
             <div
               className={`relative z-10 transition-[padding] duration-[840ms] ease-[cubic-bezier(0.2,0.85,0.25,1)] ${
                 isDetailBannerCompact
@@ -1112,8 +1135,12 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                 </button>
 
                 <div className="mt-12 flex flex-col gap-5 sm:mt-14 sm:gap-6 md:mt-16">
-                  <span className="grid h-12 w-12 place-items-center rounded-2xl bg-black/28 text-white/90 sm:h-14 sm:w-14">
-                    <i className={`${getSetIconClass(selectedDirectorySet)} text-lg sm:text-xl`} aria-hidden="true" />
+                  <span className="grid h-12 w-12 shrink-0 overflow-hidden rounded-2xl bg-black/28 text-white/90 sm:h-14 sm:w-14">
+                    {selectedDirectorySet.thumbnailUrl ? (
+                      <img src={selectedDirectorySet.thumbnailUrl} alt="" aria-hidden="true" className="h-full w-full object-cover" />
+                    ) : (
+                      <i className={`${getSetIconClass(selectedDirectorySet)} text-lg sm:text-xl`} aria-hidden="true" />
+                    )}
                   </span>
 
                   <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
@@ -1125,7 +1152,13 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
 
                     <button
                       type="button"
-                      className="pointer-events-auto inline-flex h-10 items-center justify-center self-start rounded-full bg-white px-5 text-sm font-semibold text-[#06233a] transition hover:bg-[#d9eefb] md:self-center"
+                      onClick={scrollToDetailReels}
+                      disabled={!selectedDirectorySetHasReels}
+                      className={`pointer-events-auto inline-flex h-10 items-center justify-center self-start rounded-full px-5 text-sm font-semibold transition md:self-center ${
+                        selectedDirectorySetHasReels
+                          ? "bg-white text-[#06233a] hover:bg-[#d9eefb]"
+                          : "cursor-not-allowed bg-white/45 text-[#06233a]/70"
+                      }`}
                     >
                       View Reels
                     </button>
@@ -1143,20 +1176,30 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
               <div
                 className={`overflow-hidden transition-[max-height,opacity,transform,backdrop-filter] duration-[640ms] ease-[cubic-bezier(0.2,0.85,0.25,1)] ${
                   isDetailBannerCompact
-                    ? "pointer-events-auto h-16 max-h-16 translate-y-0 rounded-2xl border border-white/20 bg-white/[0.03] opacity-100 backdrop-blur-[10px] sm:h-20 sm:max-h-20"
+                    ? "pointer-events-auto h-16 max-h-16 translate-y-0 rounded-2xl border border-[#8d8d8d]/35 bg-black/30 opacity-100 backdrop-blur-[12px] sm:h-20 sm:max-h-20"
                     : "pointer-events-none h-0 max-h-0 -translate-y-2 opacity-0"
                 }`}
               >
                 <div className="mx-auto flex h-full w-full max-w-none items-center justify-between gap-3 px-3 sm:px-4">
                   <div className="ml-1 min-w-0 max-w-[62%] flex items-center gap-2.5 sm:ml-2">
-                    <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-black/28 text-white/90">
-                      <i className={`${getSetIconClass(selectedDirectorySet)} text-sm`} aria-hidden="true" />
+                    <span className="grid h-9 w-9 shrink-0 overflow-hidden rounded-xl bg-black/28 text-white/90">
+                      {selectedDirectorySet.thumbnailUrl ? (
+                        <img src={selectedDirectorySet.thumbnailUrl} alt="" aria-hidden="true" className="h-full w-full object-cover" />
+                      ) : (
+                        <i className={`${getSetIconClass(selectedDirectorySet)} text-sm`} aria-hidden="true" />
+                      )}
                     </span>
                     <p className="truncate text-[0.96rem] font-semibold text-white sm:text-[1.02rem]">{selectedDirectorySet.title}</p>
                   </div>
                   <button
                     type="button"
-                    className="pointer-events-auto mr-2 inline-flex h-9 shrink-0 items-center justify-center rounded-full bg-white px-4 text-xs font-semibold text-[#06233a] transition hover:bg-[#d9eefb] sm:mr-3 sm:px-5"
+                    onClick={scrollToDetailReels}
+                    disabled={!selectedDirectorySetHasReels}
+                    className={`pointer-events-auto mr-2 inline-flex h-9 shrink-0 items-center justify-center rounded-full px-4 text-xs font-semibold transition sm:mr-3 sm:px-5 ${
+                      selectedDirectorySetHasReels
+                        ? "bg-white text-[#06233a] hover:bg-[#d9eefb]"
+                        : "cursor-not-allowed bg-white/45 text-[#06233a]/70"
+                    }`}
                   >
                     View Reels
                   </button>
@@ -1351,8 +1394,12 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                         onClick={() => openDirectorySet(set)}
                         className="group relative flex w-full items-center gap-2.5 rounded-xl bg-[#1c1c1c] px-3 py-3 text-left transition-all duration-200 ease-out hover:bg-[#121212] sm:gap-3 sm:rounded-2xl"
                       >
-                        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-lg bg-black/30 text-white/82 transition-colors duration-200 group-hover:text-white sm:h-10 sm:w-10 sm:rounded-xl">
-                          <i className="fa-regular fa-square text-sm sm:text-base" aria-hidden="true" />
+                        <span className="grid h-[3.75rem] w-[3.75rem] shrink-0 overflow-hidden rounded-lg bg-black/30 text-white/82 transition-colors duration-200 group-hover:text-white sm:h-16 sm:w-16 sm:rounded-xl">
+                          {set.thumbnailUrl ? (
+                            <img src={set.thumbnailUrl} alt="" aria-hidden="true" className="h-full w-full object-cover" />
+                          ) : (
+                            <i className="fa-regular fa-square text-sm sm:text-base" aria-hidden="true" />
+                          )}
                         </span>
                         <div className="min-w-0 flex-1 text-left">
                           <p className="w-full truncate text-[0.97rem] font-medium text-white transition-colors duration-200 group-hover:text-white sm:text-[1.02rem]">{set.title}</p>
@@ -1462,6 +1509,42 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                       ))}
                     </div>
                   </section>
+
+                  <section ref={detailReelsSectionRef} className="mt-4 rounded-2xl px-4 py-4 sm:px-5 sm:py-5">
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/65">Reels</p>
+                    {selectedDirectorySet.reels.length === 0 ? (
+                      <p className="mt-3 text-sm text-white/65">No reels uploaded for this set yet.</p>
+                    ) : (
+                      <div className="mt-3 grid gap-3 md:grid-cols-2">
+                        {selectedDirectorySet.reels.map((reel) => (
+                          <article key={`${selectedDirectorySet.id}-detail-reel-${reel.id}`} className="overflow-hidden rounded-xl bg-black/35">
+                            <div className="flex items-center justify-between gap-2 px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72">
+                              <span className="inline-flex items-center gap-1.5">
+                                <i className={PLATFORM_ICON[reel.platform]} aria-hidden="true" />
+                                {PLATFORM_LABEL[reel.platform]}
+                              </span>
+                              <a
+                                href={reel.sourceUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="text-white/75 transition hover:text-white"
+                              >
+                                Open
+                              </a>
+                            </div>
+                            <iframe
+                              src={reel.embedUrl}
+                              title={`${selectedDirectorySet.title} reel`}
+                              className="h-[270px] w-full border-0"
+                              loading="lazy"
+                              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                              allowFullScreen
+                            />
+                          </article>
+                        ))}
+                      </div>
+                    )}
+                  </section>
                 </div>
               </div>
             ) : null}
@@ -1484,7 +1567,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
             <div className="mt-3 min-h-0 flex-1 overflow-hidden md:-mx-4 md:mt-4 lg:-mx-5">
               <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto">
                 <section className="rounded-3xl p-1 sm:p-2 md:p-3">
-                  <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[2px] sm:p-5">
+                  <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[4px] sm:p-5">
                   <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
                   <div className="relative z-10">
                     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1518,7 +1601,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
 
                 <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)] lg:items-start">
                   <form onSubmit={onCreateSet} className="space-y-4 md:space-y-5">
-                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[2px] sm:p-5">
+                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[4px] sm:p-5">
                       <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
                       <div className="relative z-10 space-y-5">
                       <label className="block">
@@ -1633,7 +1716,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                     </div>
                     </div>
 
-                    <div className="relative min-h-0 overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-3.5 backdrop-blur-[2px] sm:p-4">
+                    <div className="relative min-h-0 overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-3.5 backdrop-blur-[4px] sm:p-4">
                       <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
                       <div className="relative z-10">
                       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -1717,7 +1800,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                     </button>
                   </form>
 
-                  <aside className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[2px] sm:p-5 lg:sticky lg:top-3">
+                  <aside className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[4px] sm:p-5 lg:sticky lg:top-3">
                     <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
                     <div className="relative z-10">
                       <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/62">Live Preview</p>

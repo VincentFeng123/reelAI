@@ -400,7 +400,9 @@ export default function HomePage() {
 
   const shouldShowTopChromeStrip = !mobileSidebarOpen
     && (
-      activeSidebarTab === "search"
+      activeSidebarTab === "settings"
+        ? true
+        : activeSidebarTab === "search"
         ? searchPanelScrollable && (topChromeOffset || topChromeGestureActive)
         : topChromeOffset
     );

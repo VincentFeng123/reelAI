@@ -22,6 +22,11 @@ class ReelsGenerateRequest(BaseModel):
     creative_commons_only: bool = False
     generation_mode: Literal["slow", "fast"] = "slow"
     min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
+    video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first"
+    preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
+    target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
+    target_clip_duration_min_sec: int | None = Field(default=None, ge=15, le=180)
+    target_clip_duration_max_sec: int | None = Field(default=None, ge=15, le=180)
 
 
 class CaptionCue(BaseModel):
@@ -45,14 +50,56 @@ class ReelOut(BaseModel):
     captions: list[CaptionCue] = Field(default_factory=list)
     score: float
     relevance_score: float | None = None
+    discovery_score: float | None = None
+    clipability_score: float | None = None
+    query_strategy: str = ""
+    retrieval_stage: str = ""
+    source_surface: str = ""
     matched_terms: list[str] = Field(default_factory=list)
     relevance_reason: str = ""
     concept_position: int | None = None
     total_concepts: int | None = None
+    video_duration_sec: int | None = None
+    clip_duration_sec: float | None = None
 
 
 class ReelsGenerateResponse(BaseModel):
     reels: list[ReelOut]
+
+
+class ReelsCanGenerateResponse(BaseModel):
+    can_generate: bool
+    blocked_by_settings: bool = False
+    estimated_success_rate: float = 0.0
+    total_probed: int = 0
+    passed_all_filters: int = 0
+    primary_bottleneck: str = ""
+    message: str = ""
+
+
+class ReelsCanGenerateAnyRequest(BaseModel):
+    material_ids: list[str] = Field(default_factory=list)
+    creative_commons_only: bool = False
+    generation_mode: Literal["slow", "fast"] = "slow"
+    min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
+    video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first"
+    preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
+    target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
+    target_clip_duration_min_sec: int | None = Field(default=None, ge=15, le=180)
+    target_clip_duration_max_sec: int | None = Field(default=None, ge=15, le=180)
+
+
+class ReelsCanGenerateAnyResponse(BaseModel):
+    can_generate_any: bool
+    topics_checked: int = 0
+    topics_can_generate: int = 0
+    blocked_by_settings_topics: int = 0
+    no_source_topics: int = 0
+    estimated_success_rate: float = 0.0
+    total_probed: int = 0
+    passed_all_filters: int = 0
+    primary_bottleneck: str = ""
+    message: str = ""
 
 
 class FeedResponse(BaseModel):

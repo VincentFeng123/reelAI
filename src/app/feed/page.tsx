@@ -6,6 +6,14 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { LoadingFlappyMiniGame } from "@/components/LoadingFlappyMiniGame";
 import { ReelCard } from "@/components/ReelCard";
 import { askStudyChat, fetchFeed, generateReels, sendFeedback, uploadMaterial } from "@/lib/api";
+import {
+  type GenerationMode,
+  type PreferredVideoDuration,
+  type VideoPoolMode,
+  GENERATION_MODE_STORAGE_KEY,
+  MUTED_STORAGE_KEY,
+  readStudyReelsSettings,
+} from "@/lib/settings";
 import type { ChatMessage, Reel } from "@/lib/types";
 
 const PAGE_SIZE = 5;
@@ -22,21 +30,23 @@ const RIGHT_TOP_MIN_PX = 220;
 const RIGHT_BOTTOM_MIN_PX = 180;
 const MOBILE_DETAILS_CLOSE_MS = 240;
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
-const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
-const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
-const MIN_RELEVANCE_STORAGE_KEY = "studyreels-min-relevance-threshold";
 const HISTORY_STORAGE_KEY = "studyreels-material-history";
-const MUTED_STORAGE_KEY = "studyreels-muted";
 const MAX_SAVED_FEED_PROGRESS = 240;
 const MAX_SAVED_FEED_SESSIONS = 24;
 const MAX_REELS_PER_FEED_SESSION = 80;
-const DEFAULT_MIN_RELEVANCE = 0.0;
-const MIN_MIN_RELEVANCE = -1.0;
-const MAX_MIN_RELEVANCE = 1.2;
+const MAX_EMPTY_GENERATION_STREAK = 10;
 type FeedbackAction = "helpful" | "confusing" | "save";
-type GenerationMode = "slow" | "fast";
+
+type FeedTuningSettings = {
+  minRelevance: number;
+  videoPoolMode: VideoPoolMode;
+  preferredVideoDuration: PreferredVideoDuration;
+  targetClipDurationSec: number;
+  targetClipDurationMinSec: number;
+  targetClipDurationMaxSec: number;
+};
 
 type ReelFeedbackState = {
   helpful?: boolean;
@@ -48,12 +58,6 @@ type ReelFeedbackState = {
 type MaterialSeed = {
   topic?: string;
   text?: string;
-  title?: string;
-  updatedAt?: number;
-};
-
-type MaterialGroup = {
-  materialIds?: string[];
   title?: string;
   updatedAt?: number;
 };
@@ -87,44 +91,6 @@ function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
       return {};
     }
     return parsed as Record<string, MaterialSeed>;
-  } catch {
-    return {};
-  }
-}
-
-function parseMaterialGroups(raw: string | null): Record<string, MaterialGroup> {
-  if (!raw) {
-    return {};
-  }
-  try {
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      return {};
-    }
-    const result: Record<string, MaterialGroup> = {};
-    for (const [materialId, value] of Object.entries(parsed as Record<string, unknown>)) {
-      if (!materialId || typeof materialId !== "string") {
-        continue;
-      }
-      if (!value || typeof value !== "object" || Array.isArray(value)) {
-        continue;
-      }
-      const row = value as Record<string, unknown>;
-      const materialIds = Array.isArray(row.materialIds)
-        ? row.materialIds
-            .map((id) => String(id || "").trim())
-            .filter(Boolean)
-        : [];
-      if (materialIds.length === 0) {
-        continue;
-      }
-      result[materialId] = {
-        materialIds: Array.from(new Set(materialIds)),
-        title: typeof row.title === "string" && row.title.trim() ? row.title.trim() : undefined,
-        updatedAt: Number(row.updatedAt) || 0,
-      };
-    }
-    return result;
   } catch {
     return {};
   }
@@ -350,15 +316,16 @@ function FeedPageInner() {
     return materialId ? [materialId] : [];
   }, [materialId]);
 
-  const getMinRelevanceThreshold = useCallback((): number => {
-    if (typeof window === "undefined") {
-      return DEFAULT_MIN_RELEVANCE;
-    }
-    const parsed = Number(window.localStorage.getItem(MIN_RELEVANCE_STORAGE_KEY));
-    if (!Number.isFinite(parsed)) {
-      return DEFAULT_MIN_RELEVANCE;
-    }
-    return Math.max(MIN_MIN_RELEVANCE, Math.min(MAX_MIN_RELEVANCE, parsed));
+  const getFeedTuningSettings = useCallback((): FeedTuningSettings => {
+    const settings = readStudyReelsSettings();
+    return {
+      minRelevance: settings.minRelevanceThreshold,
+      videoPoolMode: settings.videoPoolMode,
+      preferredVideoDuration: settings.preferredVideoDuration,
+      targetClipDurationSec: settings.targetClipDurationSec,
+      targetClipDurationMinSec: settings.targetClipDurationMinSec,
+      targetClipDurationMaxSec: settings.targetClipDurationMaxSec,
+    };
   }, []);
 
   const hasMore = reels.length < total;
@@ -382,7 +349,6 @@ function FeedPageInner() {
     if (typeof window === "undefined") {
       return;
     }
-    window.localStorage.setItem(GENERATION_MODE_STORAGE_KEY, generationMode);
     if (!materialId) {
       return;
     }
@@ -490,7 +456,7 @@ function FeedPageInner() {
       setError(null);
 
       try {
-        const minRelevance = getMinRelevanceThreshold();
+        const tuning = getFeedTuningSettings();
         const rows = await Promise.all(
           feedMaterialIds.map(async (id) => {
             try {
@@ -498,10 +464,15 @@ function FeedPageInner() {
                 materialId: id,
                 page: targetPage,
                 limit: PAGE_SIZE,
-                autofill: options?.autofill ?? false,
-                prefetch: 7,
+                autofill: options?.autofill ?? true,
+                prefetch: generationMode === "fast" ? 18 : 12,
                 generationMode,
-                minRelevance,
+                minRelevance: tuning.minRelevance,
+                videoPoolMode: tuning.videoPoolMode,
+                preferredVideoDuration: tuning.preferredVideoDuration,
+                targetClipDurationSec: tuning.targetClipDurationSec,
+                targetClipDurationMinSec: tuning.targetClipDurationMinSec,
+                targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
               });
               return { materialId: id, data, error: null };
             } catch (error) {
@@ -556,7 +527,7 @@ function FeedPageInner() {
         isFetchingRef.current = false;
       }
     },
-    [dedupeByIdentity, generationMode, getFeedMaterialIds, getMinRelevanceThreshold, interleaveReelBatches, materialId, recoverMissingMaterial],
+    [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, materialId, recoverMissingMaterial],
   );
 
   const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
@@ -564,8 +535,8 @@ function FeedPageInner() {
     if (feedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
       return [];
     }
-    const minRelevance = getMinRelevanceThreshold();
-    const batchSize = isFastGeneration ? 2 : 7;
+    const tuning = getFeedTuningSettings();
+    const batchSize = isFastGeneration ? 10 : 14;
     const perTopicBatch = Math.max(1, Math.ceil(batchSize / feedMaterialIds.length));
     isGeneratingRef.current = true;
     setGeneratingMore(true);
@@ -580,7 +551,12 @@ function FeedPageInner() {
               materialId: id,
               numReels: perTopicBatch,
               generationMode,
-              minRelevance,
+              minRelevance: tuning.minRelevance,
+              videoPoolMode: tuning.videoPoolMode,
+              preferredVideoDuration: tuning.preferredVideoDuration,
+              targetClipDurationSec: tuning.targetClipDurationSec,
+              targetClipDurationMinSec: tuning.targetClipDurationMinSec,
+              targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
             });
           } catch (e) {
             console.warn(`Background reel generation failed for topic material ${id}:`, e);
@@ -591,7 +567,7 @@ function FeedPageInner() {
       const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row?.reels ?? [])));
       if (generated.length === 0) {
         emptyGenerateStreakRef.current += 1;
-        if (emptyGenerateStreakRef.current >= 4) {
+        if (emptyGenerateStreakRef.current >= MAX_EMPTY_GENERATION_STREAK) {
           setCanRequestMore(false);
         }
         if (options?.surfaceError) {
@@ -604,7 +580,7 @@ function FeedPageInner() {
     } catch (e) {
       console.warn("Background reel generation failed:", e);
       emptyGenerateStreakRef.current += 1;
-      if (emptyGenerateStreakRef.current >= 3) {
+      if (emptyGenerateStreakRef.current >= MAX_EMPTY_GENERATION_STREAK) {
         setCanRequestMore(false);
       }
       if (options?.surfaceError) {
@@ -615,7 +591,7 @@ function FeedPageInner() {
       setGeneratingMore(false);
       isGeneratingRef.current = false;
     }
-  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getMinRelevanceThreshold, interleaveReelBatches, isFastGeneration]);
+  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration]);
 
   useEffect(() => {
     mutedRestoredFromSnapshotRef.current = false;
@@ -636,18 +612,17 @@ function FeedPageInner() {
     setSessionHydrated(false);
     let resumeTarget: FeedProgressEntry | null = null;
     let restoredSession: FeedSessionSnapshot | null = null;
-    let feedMaterialIds = [materialId];
+    const feedMaterialIds = [materialId];
     if (typeof window !== "undefined") {
       const allProgress = parseFeedProgress(window.localStorage.getItem(FEED_PROGRESS_STORAGE_KEY));
       resumeTarget = allProgress[materialId] ?? null;
+      // Force fresh single-topic feed by dropping any previously saved session snapshot.
       const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));
-      restoredSession = allSessions[materialId] ?? null;
-      const allGroups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
-      const groupedIds = allGroups[materialId]?.materialIds ?? [];
-      if (groupedIds.length > 0) {
-        const normalized = groupedIds.map((id) => id.trim()).filter(Boolean);
-        feedMaterialIds = normalized.includes(materialId) ? normalized : [materialId, ...normalized];
+      if (allSessions[materialId]) {
+        delete allSessions[materialId];
+        window.localStorage.setItem(FEED_SESSION_STORAGE_KEY, JSON.stringify(allSessions));
       }
+      restoredSession = allSessions[materialId] ?? null;
     }
     materialIdsForFeedRef.current = Array.from(new Set(feedMaterialIds));
     pendingResumeRef.current = resumeTarget;
@@ -692,7 +667,7 @@ function FeedPageInner() {
       setSessionHydrated(true);
     }
     if (!restoredSession || restoredSession.reels.length === 0) {
-      void loadPage(1, { autofill: false });
+      void loadPage(1, { autofill: true });
     }
   }, [dedupeByIdentity, generationModeParam, materialId, loadPage]);
 
@@ -725,8 +700,8 @@ function FeedPageInner() {
     if (feedMaterialIds.length === 0 || generationMode !== "fast" || !canRequestMore || isFastTopUpRef.current || isGeneratingRef.current) {
       return;
     }
-    const minRelevance = getMinRelevanceThreshold();
-    const perTopicBatch = Math.max(1, Math.ceil(5 / feedMaterialIds.length));
+    const tuning = getFeedTuningSettings();
+    const perTopicBatch = Math.max(1, Math.ceil(12 / feedMaterialIds.length));
     isFastTopUpRef.current = true;
     try {
       const generatedRows = await Promise.all(
@@ -736,7 +711,12 @@ function FeedPageInner() {
               materialId: id,
               numReels: perTopicBatch,
               generationMode,
-              minRelevance,
+              minRelevance: tuning.minRelevance,
+              videoPoolMode: tuning.videoPoolMode,
+              preferredVideoDuration: tuning.preferredVideoDuration,
+              targetClipDurationSec: tuning.targetClipDurationSec,
+              targetClipDurationMinSec: tuning.targetClipDurationMinSec,
+              targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
             });
           } catch (e) {
             console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
@@ -754,7 +734,7 @@ function FeedPageInner() {
     } finally {
       isFastTopUpRef.current = false;
     }
-  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getMinRelevanceThreshold, interleaveReelBatches]);
+  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches]);
 
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {
@@ -788,7 +768,7 @@ function FeedPageInner() {
       return;
     }
     if (hasMore) {
-      loadPage(page + 1, { autofill: false });
+      loadPage(page + 1, { autofill: true });
       return;
     }
     if (canRequestMore && !isGeneratingRef.current) {
@@ -854,7 +834,7 @@ function FeedPageInner() {
 
     if (hasMore) {
       resumeLoadingRef.current = true;
-      void loadPage(page + 1, { autofill: false }).finally(() => {
+      void loadPage(page + 1, { autofill: true }).finally(() => {
         resumeLoadingRef.current = false;
       });
       return;
@@ -983,13 +963,6 @@ function FeedPageInner() {
       setMutedPreference(true);
     }
   }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    window.localStorage.setItem(MUTED_STORAGE_KEY, mutedPreference ? "1" : "0");
-  }, [mutedPreference]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !materialId || !sessionHydrated) {
@@ -1585,8 +1558,11 @@ function FeedPageInner() {
         {renderGenerationModeToggle("shadow-[0_8px_24px_rgba(0,0,0,0.35)]")}
       </div>
       {error ? (
-        <div className="absolute left-0 right-0 top-3 z-30 mx-auto w-fit rounded-full border border-white/25 bg-black/75 px-4 py-2 text-xs text-white">
-          {error}
+        <div className="absolute left-0 right-0 top-3 z-[2147483647] mx-auto w-fit">
+          <div className="relative overflow-hidden rounded-xl border border-gray-300/45 bg-white/10 px-4 py-2 text-xs text-white shadow-[0_12px_28px_rgba(0,0,0,0.35)] backdrop-blur-xl backdrop-saturate-150">
+            <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-black/45" />
+            <span className="relative">{error}</span>
+          </div>
         </div>
       ) : null}
 

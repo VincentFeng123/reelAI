@@ -4,16 +4,14 @@ import { type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useRef
 import { useRouter } from "next/navigation";
 
 import { uploadMaterial } from "@/lib/api";
+import { type GenerationMode, type SearchInputMode, readStudyReelsSettings, subscribeToStudyReelsSettings } from "@/lib/settings";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
-const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
-const SEARCH_INPUT_MODE_STORAGE_KEY = "studyreels-search-input-mode";
 const MAX_MATERIAL_SEEDS = 120;
 const MAX_MATERIAL_GROUPS = 80;
 const MAX_SEED_TEXT_CHARS = 16000;
-type GenerationMode = "slow" | "fast";
-type InputMode = "topic" | "source" | "file";
+type InputMode = SearchInputMode;
 
 const INPUT_MODE_OPTIONS: Array<{ value: InputMode; label: string }> = [
   { value: "topic", label: "Topic" },
@@ -153,38 +151,14 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
   const selectedFileName = file?.name ?? "";
 
   useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    const saved = window.localStorage.getItem(GENERATION_MODE_STORAGE_KEY);
-    if (saved === "fast" || saved === "slow") {
-      setGenerationMode(saved);
-    }
+    const saved = readStudyReelsSettings();
+    setGenerationMode(saved.generationMode);
+    setInputMode(saved.defaultInputMode);
+    return subscribeToStudyReelsSettings((next) => {
+      setGenerationMode(next.generationMode);
+      setInputMode(next.defaultInputMode);
+    });
   }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    const saved = window.localStorage.getItem(SEARCH_INPUT_MODE_STORAGE_KEY);
-    if (saved === "topic" || saved === "source" || saved === "file") {
-      setInputMode(saved);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    window.localStorage.setItem(GENERATION_MODE_STORAGE_KEY, generationMode);
-  }, [generationMode]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    window.localStorage.setItem(SEARCH_INPUT_MODE_STORAGE_KEY, inputMode);
-  }, [inputMode]);
 
   const disabled = useMemo(() => {
     if (loading) {

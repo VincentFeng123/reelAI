@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Iterable
@@ -52,6 +53,7 @@ CREATE TABLE IF NOT EXISTS videos (
     channel_title TEXT,
     description TEXT,
     duration_sec INTEGER,
+    view_count INTEGER DEFAULT 0,
     is_creative_commons INTEGER DEFAULT 0,
     created_at TEXT NOT NULL
 );
@@ -112,6 +114,74 @@ CREATE TABLE IF NOT EXISTS reel_feedback (
 
 CREATE INDEX IF NOT EXISTS idx_reel_feedback_reel_id ON reel_feedback(reel_id);
 
+CREATE TABLE IF NOT EXISTS retrieval_runs (
+    id TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    concept_id TEXT NOT NULL,
+    concept_title TEXT NOT NULL,
+    selected_video_id TEXT,
+    failure_reason TEXT NOT NULL DEFAULT '',
+    debug_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(material_id) REFERENCES materials(id),
+    FOREIGN KEY(concept_id) REFERENCES concepts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_runs_material_concept ON retrieval_runs(material_id, concept_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS retrieval_queries (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    query_text TEXT NOT NULL,
+    strategy TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    source_surface TEXT NOT NULL DEFAULT '',
+    source_terms_json TEXT NOT NULL DEFAULT '[]',
+    weight REAL NOT NULL DEFAULT 0.0,
+    result_count INTEGER NOT NULL DEFAULT 0,
+    kept_count INTEGER NOT NULL DEFAULT 0,
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES retrieval_runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_queries_run_stage ON retrieval_queries(run_id, stage, strategy);
+
+CREATE TABLE IF NOT EXISTS retrieval_candidates (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    video_title TEXT NOT NULL DEFAULT '',
+    channel_title TEXT NOT NULL DEFAULT '',
+    strategy TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL DEFAULT '',
+    query_text TEXT NOT NULL DEFAULT '',
+    source_surface TEXT NOT NULL DEFAULT '',
+    discovery_score REAL NOT NULL DEFAULT 0.0,
+    clipability_score REAL NOT NULL DEFAULT 0.0,
+    final_score REAL NOT NULL DEFAULT 0.0,
+    feature_json TEXT NOT NULL DEFAULT '{}',
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES retrieval_runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_candidates_run_position ON retrieval_candidates(run_id, position);
+
+CREATE TABLE IF NOT EXISTS retrieval_outcomes (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    t_start REAL NOT NULL DEFAULT 0,
+    t_end REAL NOT NULL DEFAULT 0,
+    reason_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES retrieval_runs(id),
+    FOREIGN KEY(video_id) REFERENCES videos(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_retrieval_outcomes_run ON retrieval_outcomes(run_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS community_sets (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -170,6 +240,11 @@ def init_db() -> None:
     global _db_ready
     with sqlite3.connect(_db_path()) as conn:
         conn.executescript(SCHEMA)
+        # Lightweight schema migrations for existing local databases.
+        try:
+            conn.execute("ALTER TABLE videos ADD COLUMN view_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
     _db_ready = True
 
@@ -209,7 +284,16 @@ def upsert(conn: sqlite3.Connection, table: str, data: dict[str, Any], pk: str =
         f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
         f"ON CONFLICT({pk}) DO UPDATE SET {assignments}"
     )
-    conn.execute(sql, [data[c] for c in cols])
+    values = [data[c] for c in cols]
+    for attempt in range(4):
+        try:
+            conn.execute(sql, values)
+            return
+        except sqlite3.OperationalError as exc:
+            # WAL can transiently lock under concurrent writes; retry quickly.
+            if "locked" not in str(exc).lower() or attempt >= 3:
+                raise
+            time.sleep(0.03 * (attempt + 1))
 
 
 def fetch_all(conn: sqlite3.Connection, query: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
