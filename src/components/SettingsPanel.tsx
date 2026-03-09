@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 
 import {
   type PreferredVideoDuration,
@@ -18,12 +18,20 @@ import {
 
 type SettingsPanelProps = {
   onClearSearchData: () => void;
+  onUnsavedChangesChange?: (hasUnsavedChanges: boolean) => void;
+  onAvailabilityModalClose?: (source: "close-button" | "backdrop") => void;
 };
 
 type SavedPreferences = StudyReelsSettings;
+export type SettingsPanelHandle = {
+  savePreferences: () => void;
+  discardUnsavedChanges: () => void;
+  hasUnsavedChanges: () => boolean;
+};
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
 const RELEVANCE_STEP = 0.02;
+const LOW_RELEVANCE_WARNING_THRESHOLD = 0.12;
 const CLIP_DURATION_STEP = 5;
 const CLIP_DURATION_MIN_GAP = TARGET_CLIP_DURATION_MIN_GAP;
 const CLIP_DURATION_SPAN = TARGET_CLIP_DURATION_MAX - TARGET_CLIP_DURATION_MIN;
@@ -73,6 +81,7 @@ const poolSummaryLabel: Record<VideoPoolMode, string> = {
 type AvailabilityState = {
   status: "idle" | "checking" | "ok" | "partial" | "blocked" | "none" | "error";
   message: string;
+  limitingFactors: string[];
 };
 
 function SettingsInfoTooltip({ text }: { text: string }) {
@@ -184,26 +193,31 @@ function buildHeuristicAvailabilityState(settings: StudyReelsSettings): Availabi
     limitingFactors.push("fast generation mode");
   }
 
-  const notes = limitingFactors.length ? ` Main limits: ${limitingFactors.join(", ")}.` : "";
   if (ratePct >= 78) {
     return {
       status: "ok",
-      message: `Heuristic success estimate: ${ratePct}%.${notes}`,
+      message: `Heuristic success estimate: ${ratePct}%.`,
+      limitingFactors,
     };
   }
   if (ratePct >= 52) {
     return {
       status: "partial",
-      message: `Heuristic success estimate: ${ratePct}%.${notes}`,
+      message: `Heuristic success estimate: ${ratePct}%.`,
+      limitingFactors,
     };
   }
   return {
     status: "blocked",
-    message: `Heuristic success estimate: ${ratePct}%.${notes}`,
+    message: `Heuristic success estimate: ${ratePct}%.`,
+    limitingFactors,
   };
 }
 
-export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
+export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>(function SettingsPanel(
+  { onClearSearchData, onUnsavedChangesChange, onAvailabilityModalClose }: SettingsPanelProps,
+  ref,
+) {
   const [minRelevanceThreshold, setMinRelevanceThreshold] = useState(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
   const [startMuted, setStartMuted] = useState(DEFAULT_STUDY_REELS_SETTINGS.startMuted);
   const [videoPoolMode, setVideoPoolMode] = useState<VideoPoolMode>(DEFAULT_STUDY_REELS_SETTINGS.videoPoolMode);
@@ -221,9 +235,11 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [isAvailabilityModalMounted, setIsAvailabilityModalMounted] = useState(false);
   const [isAvailabilityModalVisible, setIsAvailabilityModalVisible] = useState(false);
+  const [showLowRelevanceWarning, setShowLowRelevanceWarning] = useState(false);
   const [availabilityState, setAvailabilityState] = useState<AvailabilityState>({
     status: "idle",
     message: "Save settings to estimate success rate from configuration heuristics.",
+    limitingFactors: [],
   });
   const availabilityRequestRef = useRef(0);
   const availabilityModalCloseTimerRef = useRef<number | null>(null);
@@ -632,7 +648,9 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
     setAvailabilityState({
       status: "checking",
       message: "Estimating success rate from configuration heuristics...",
+      limitingFactors: [],
     });
+    setShowLowRelevanceWarning(settings.minRelevanceThreshold <= LOW_RELEVANCE_WARNING_THRESHOLD);
 
     if (typeof window === "undefined") {
       if (availabilityRequestRef.current !== requestId) {
@@ -654,10 +672,11 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
     }, 260);
   }, [settingsHydrated]);
 
-  const closeAvailabilityModal = useCallback(() => {
+  const closeAvailabilityModal = useCallback((source: "close-button" | "backdrop") => {
     setIsAvailabilityModalVisible(false);
     if (typeof window === "undefined") {
       setIsAvailabilityModalMounted(false);
+      onAvailabilityModalClose?.(source);
       return;
     }
     if (availabilityModalCloseTimerRef.current !== null) {
@@ -667,7 +686,8 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
       setIsAvailabilityModalMounted(false);
       availabilityModalCloseTimerRef.current = null;
     }, 220);
-  }, []);
+    onAvailabilityModalClose?.(source);
+  }, [onAvailabilityModalClose]);
 
   useEffect(() => {
     return () => {
@@ -740,7 +760,7 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
     videoPoolMode,
   ]);
 
-  const savePreferences = () => {
+  const savePreferences = useCallback(() => {
     if (!settingsHydrated) {
       return;
     }
@@ -758,7 +778,47 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
     setSavedPreferences(saved);
     showNotice("Settings saved and applied.");
     void runAvailabilityCheck(saved);
-  };
+  }, [
+    defaultInputModeForSave,
+    generationModeForChecks,
+    minRelevanceThreshold,
+    preferredVideoDuration,
+    runAvailabilityCheck,
+    settingsHydrated,
+    showNotice,
+    startMuted,
+    targetClipDurationMaxSec,
+    targetClipDurationMinSec,
+    targetClipDurationSec,
+    videoPoolMode,
+  ]);
+  const discardUnsavedChanges = useCallback(() => {
+    const saved = savedPreferences ?? readStudyReelsSettings();
+    setMinRelevanceThreshold(saved.minRelevanceThreshold);
+    setStartMuted(saved.startMuted);
+    setVideoPoolMode(saved.videoPoolMode);
+    setPreferredVideoDuration(saved.preferredVideoDuration);
+    setTargetClipDurationMinSec(saved.targetClipDurationMinSec);
+    setTargetClipDurationMaxSec(saved.targetClipDurationMaxSec);
+    setSavedPreferences(saved);
+  }, [savedPreferences]);
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      savePreferences,
+      discardUnsavedChanges,
+      hasUnsavedChanges: () => settingsHydrated && hasUnsavedChanges,
+    }),
+    [discardUnsavedChanges, hasUnsavedChanges, savePreferences, settingsHydrated],
+  );
+
+  useEffect(() => {
+    if (!onUnsavedChangesChange) {
+      return;
+    }
+    onUnsavedChangesChange(settingsHydrated && hasUnsavedChanges);
+  }, [hasUnsavedChanges, onUnsavedChangesChange, settingsHydrated]);
 
   return (
     <div className="flex h-full min-h-0 w-full justify-center overflow-y-auto px-6 pt-20 pb-8 md:px-10 md:pt-8 md:pb-10 lg:px-10">
@@ -1229,7 +1289,7 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
             isAvailabilityModalVisible ? "opacity-100" : "pointer-events-none opacity-0"
           }`}
           role="presentation"
-          onClick={closeAvailabilityModal}
+          onClick={() => closeAvailabilityModal("backdrop")}
         >
           <div
             role="dialog"
@@ -1249,7 +1309,7 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
               </div>
               <button
                 type="button"
-                onClick={closeAvailabilityModal}
+                onClick={() => closeAvailabilityModal("close-button")}
                 aria-label="Close"
                 className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
               >
@@ -1274,11 +1334,31 @@ export function SettingsPanel({ onClearSearchData }: SettingsPanelProps) {
                   : "border-white/24 bg-white/[0.06] text-white/88"
               }`}
             >
-              {availabilityState.message}
+              <p>{availabilityState.message}</p>
+              {availabilityState.limitingFactors.length > 0 ? (
+                <div className="mt-2 border-t border-white/20 pt-2 text-xs">
+                  <p className="font-semibold">
+                  {availabilityState.limitingFactors.length > 1 ? "Main limits:" : "Main limit:"}
+                  </p>
+                  <ul className="mt-1.5 space-y-1">
+                    {availabilityState.limitingFactors.map((factor) => (
+                      <li key={factor} className="flex items-start gap-1.5">
+                        <span aria-hidden="true" className="leading-[1.2] opacity-80">•</span>
+                        <span className="leading-[1.2]">{factor}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
             </div>
+            {showLowRelevanceWarning ? (
+              <div className="mt-3 rounded-2xl border border-amber-300/45 bg-amber-500/16 px-4 py-3 text-sm text-amber-100">
+                Warning: Videos unrelated to the topic may appear when similarity threshold is too low.
+              </div>
+            ) : null}
           </div>
         </div>
       ) : null}
     </div>
   );
-}
+});

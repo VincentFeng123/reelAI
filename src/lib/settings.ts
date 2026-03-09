@@ -37,7 +37,7 @@ export const TARGET_CLIP_DURATION_MIN_GAP = 15;
 export const DEFAULT_STUDY_REELS_SETTINGS: StudyReelsSettings = {
   generationMode: "slow",
   defaultInputMode: "source",
-  minRelevanceThreshold: 0.0,
+  minRelevanceThreshold: 0.3,
   startMuted: true,
   videoPoolMode: "short-first",
   preferredVideoDuration: "any",

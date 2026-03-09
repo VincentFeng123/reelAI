@@ -4,7 +4,7 @@ import { type MouseEvent as ReactMouseEvent, type UIEvent, useCallback, useEffec
 import { useRouter } from "next/navigation";
 
 import { CommunityReelsPanel } from "@/components/CommunityReelsPanel";
-import { SettingsPanel } from "@/components/SettingsPanel";
+import { type SettingsPanelHandle, SettingsPanel } from "@/components/SettingsPanel";
 import { UploadPanel } from "@/components/UploadPanel";
 import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
 
@@ -24,6 +24,10 @@ const SIDEBAR_INFO_TOOLTIP_FADE_MS = 180;
 const SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS = 24;
 type GenerationMode = "slow" | "fast";
 type SidebarTab = "search" | "community" | "create" | "settings";
+type SidebarSwitchIntent = {
+  tab: SidebarTab;
+  clearHistoryQuery?: boolean;
+};
 
 type HistoryItem = {
   materialId: string;
@@ -125,10 +129,15 @@ export default function HomePage() {
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
   const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
+  const [hasUnsavedSettingsChanges, setHasUnsavedSettingsChanges] = useState(false);
+  const [showUnsavedSettingsModal, setShowUnsavedSettingsModal] = useState(false);
+  const [pendingSidebarSwitchIntent, setPendingSidebarSwitchIntent] = useState<SidebarSwitchIntent | null>(null);
+  const [pendingSaveSwitchUntilHeuristicClose, setPendingSaveSwitchUntilHeuristicClose] = useState(false);
   const [communityDetailOpen, setCommunityDetailOpen] = useState(false);
   const [sidebarInfoTooltip, setSidebarInfoTooltip] = useState<{ text: string; left: number; top: number; visible: boolean; align: "left" | "right" } | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const historyRef = useRef<HistoryItem[]>([]);
+  const settingsPanelRef = useRef<SettingsPanelHandle | null>(null);
   const mobileSidebarCloseTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipShowTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipHideTimerRef = useRef<number | null>(null);
@@ -366,13 +375,32 @@ export default function HomePage() {
     setMobileSidebarOpen(false);
   }, [clearMobileSidebarCloseTimer]);
 
-  const startNewSearch = useCallback(() => {
-    setActiveSidebarTab("search");
-    setHistoryQuery("");
+  const applySidebarSwitchIntent = useCallback((intent: SidebarSwitchIntent) => {
+    setActiveSidebarTab(intent.tab);
     setError(null);
     setActiveHistoryMenuId(null);
+    if (intent.clearHistoryQuery) {
+      setHistoryQuery("");
+    }
     forceCloseMobileSidebar();
   }, [forceCloseMobileSidebar]);
+
+  const requestSidebarSwitch = useCallback(
+    (intent: SidebarSwitchIntent) => {
+      const hasPendingUnsavedSettings = hasUnsavedSettingsChanges || Boolean(settingsPanelRef.current?.hasUnsavedChanges());
+      if (activeSidebarTab === "settings" && intent.tab !== "settings" && hasPendingUnsavedSettings) {
+        setPendingSidebarSwitchIntent(intent);
+        setShowUnsavedSettingsModal(true);
+        return;
+      }
+      applySidebarSwitchIntent(intent);
+    },
+    [activeSidebarTab, applySidebarSwitchIntent, hasUnsavedSettingsChanges],
+  );
+
+  const startNewSearch = useCallback(() => {
+    requestSidebarSwitch({ tab: "search", clearHistoryQuery: true });
+  }, [requestSidebarSwitch]);
 
   const isSidebarInteractiveTarget = useCallback((target: EventTarget | null): boolean => {
     if (!(target instanceof Element)) {
@@ -510,12 +538,60 @@ export default function HomePage() {
 
   const switchSidebarTab = useCallback(
     (tab: SidebarTab) => {
-      setActiveSidebarTab(tab);
-      setActiveHistoryMenuId(null);
-      setError(null);
-      forceCloseMobileSidebar();
+      requestSidebarSwitch({ tab });
     },
-    [forceCloseMobileSidebar],
+    [requestSidebarSwitch],
+  );
+  const closeUnsavedSettingsModal = useCallback(() => {
+    setShowUnsavedSettingsModal(false);
+    setPendingSidebarSwitchIntent(null);
+    setPendingSaveSwitchUntilHeuristicClose(false);
+  }, []);
+  const discardSettingsAndContinue = useCallback(() => {
+    const intent = pendingSidebarSwitchIntent;
+    if (!intent) {
+      closeUnsavedSettingsModal();
+      return;
+    }
+    settingsPanelRef.current?.discardUnsavedChanges();
+    setHasUnsavedSettingsChanges(false);
+    setShowUnsavedSettingsModal(false);
+    setPendingSidebarSwitchIntent(null);
+    applySidebarSwitchIntent(intent);
+  }, [applySidebarSwitchIntent, closeUnsavedSettingsModal, pendingSidebarSwitchIntent]);
+  const saveSettingsAndContinue = useCallback(() => {
+    const intent = pendingSidebarSwitchIntent;
+    if (!intent) {
+      closeUnsavedSettingsModal();
+      return;
+    }
+    const settingsPanel = settingsPanelRef.current;
+    if (!settingsPanel) {
+      setHasUnsavedSettingsChanges(false);
+      setShowUnsavedSettingsModal(false);
+      setPendingSidebarSwitchIntent(null);
+      applySidebarSwitchIntent(intent);
+      return;
+    }
+    settingsPanel.savePreferences();
+    setHasUnsavedSettingsChanges(false);
+    setShowUnsavedSettingsModal(false);
+    setPendingSaveSwitchUntilHeuristicClose(true);
+  }, [applySidebarSwitchIntent, closeUnsavedSettingsModal, pendingSidebarSwitchIntent]);
+  const onSettingsAvailabilityModalClose = useCallback(
+    (source: "close-button" | "backdrop") => {
+      if (!pendingSaveSwitchUntilHeuristicClose) {
+        return;
+      }
+      const intent = pendingSidebarSwitchIntent;
+      setPendingSaveSwitchUntilHeuristicClose(false);
+      setPendingSidebarSwitchIntent(null);
+      if (source !== "close-button" || !intent) {
+        return;
+      }
+      applySidebarSwitchIntent(intent);
+    },
+    [applySidebarSwitchIntent, pendingSaveSwitchUntilHeuristicClose, pendingSidebarSwitchIntent],
   );
   const isCommunityPanel = visibleSidebarTab === "community" || visibleSidebarTab === "create";
   const hasCommunityBackdrop = isCommunityPanel || visibleSidebarTab === "settings";
@@ -927,7 +1003,12 @@ export default function HomePage() {
                 : "hidden h-full min-h-0"
             }
           >
-            <SettingsPanel onClearSearchData={clearAllHistory} />
+            <SettingsPanel
+              ref={settingsPanelRef}
+              onClearSearchData={clearAllHistory}
+              onUnsavedChangesChange={setHasUnsavedSettingsChanges}
+              onAvailabilityModalClose={onSettingsAvailabilityModalClose}
+            />
           </div>
           <div className={visibleSidebarTab === "community" || visibleSidebarTab === "create" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
             <CommunityReelsPanel
@@ -938,6 +1019,57 @@ export default function HomePage() {
           </div>
         </section>
       </div>
+      {showUnsavedSettingsModal ? (
+        <div
+          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+          role="presentation"
+          onClick={closeUnsavedSettingsModal}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Unsaved settings changes"
+            className="w-full max-w-xl rounded-3xl border border-white/25 bg-white/[0.12] p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
+                <h3 className="mt-2 text-lg font-semibold text-white">Save settings before leaving?</h3>
+              </div>
+              <button
+                type="button"
+                onClick={closeUnsavedSettingsModal}
+                aria-label="Close"
+                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+              You changed settings. Save to apply them, or discard these edits and continue.
+            </p>
+            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={discardSettingsAndContinue}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
+              >
+                Discard
+              </button>
+              <button
+                type="button"
+                onClick={saveSettingsAndContinue}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
+              >
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
