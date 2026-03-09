@@ -212,7 +212,7 @@ function FeedPageInner() {
   const [chatError, setChatError] = useState<string | null>(null);
   const [rightPanelWidthPx, setRightPanelWidthPx] = useState(360);
   const [rightTopRatio, setRightTopRatio] = useState(0.62);
-  const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("fast");
   const [captionsPreference, setCaptionsPreference] = useState(false);
   const [sessionHydrated, setSessionHydrated] = useState(false);
 

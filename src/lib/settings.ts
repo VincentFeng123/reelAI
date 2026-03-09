@@ -35,7 +35,7 @@ export const TARGET_CLIP_DURATION_MAX = 180;
 export const TARGET_CLIP_DURATION_MIN_GAP = 15;
 
 export const DEFAULT_STUDY_REELS_SETTINGS: StudyReelsSettings = {
-  generationMode: "slow",
+  generationMode: "fast",
   defaultInputMode: "source",
   minRelevanceThreshold: 0.3,
   startMuted: true,
@@ -59,7 +59,7 @@ type StudyReelsSettingsInput = {
 };
 
 function toGenerationMode(value: string | null | undefined): GenerationMode {
-  return value === "fast" ? "fast" : "slow";
+  return value === "slow" ? "slow" : "fast";
 }
 
 function toInputMode(value: string | null | undefined): SearchInputMode {

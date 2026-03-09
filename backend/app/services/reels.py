@@ -149,9 +149,9 @@ class ReelService:
         "compilation",
         "reaction",
     }
-    QUERY_RETRIEVAL_WORKERS_FAST = 4
+    QUERY_RETRIEVAL_WORKERS_FAST = 6
     QUERY_RETRIEVAL_WORKERS_SLOW = 6
-    TRANSCRIPT_FETCH_WORKERS_FAST = 4
+    TRANSCRIPT_FETCH_WORKERS_FAST = 6
     TRANSCRIPT_FETCH_WORKERS_SLOW = 6
 
     def __init__(self, embedding_service, youtube_service) -> None:
@@ -350,6 +350,7 @@ class ReelService:
                         stage_name=stage.name,
                         preferred_video_duration=safe_video_duration_pref,
                         video_pool_mode=safe_video_pool_mode,
+                        fast_mode=fast_mode,
                     )
                     strict_duration = stage.name == "high_precision" and safe_video_duration_pref in {
                         "short",
@@ -906,7 +907,7 @@ class ReelService:
         if self.serverless_mode:
             return max(6, min(10, 4 + remaining))
         if fast_mode:
-            return max(10, min(18, 8 + remaining * 2))
+            return max(6, min(12, 5 + remaining))
         return max(18, min(42, 14 + remaining * 4))
 
     def _transcript_expansion_budget(
@@ -920,7 +921,7 @@ class ReelService:
         if self.serverless_mode:
             return max(1, min(3, remaining))
         if fast_mode:
-            return max(2, min(6, remaining + 1))
+            return max(2, min(4, remaining))
         return max(4, min(12, remaining * 2))
 
     def _should_finalize_generation(
@@ -1359,11 +1360,11 @@ class ReelService:
             recovery_min = 1
         else:
             high_precision_budget = 3 if fast_mode else 5
-            high_precision_min = 6 if fast_mode else 8
-            broad_budget = 8 if fast_mode else 14
-            broad_min = 9 if fast_mode else 12
-            recovery_budget = 5 if fast_mode else 8
-            recovery_min = 4 if fast_mode else 6
+            high_precision_min = 3 if fast_mode else 8
+            broad_budget = 5 if fast_mode else 14
+            broad_min = 4 if fast_mode else 12
+            recovery_budget = 3 if fast_mode else 8
+            recovery_min = 2 if fast_mode else 6
 
         plans = [
             RetrievalStagePlan(
@@ -1396,7 +1397,10 @@ class ReelService:
     ) -> bool:
         if not stage_candidates:
             return False
-        target = max(8, min(26 if fast_mode else 40, max_generation_target * (2 if fast_mode else 3)))
+        if fast_mode:
+            target = max(6, min(14, max_generation_target + 2))
+        else:
+            target = max(8, min(40, max_generation_target * 3))
         if len(stage_candidates) < target:
             return False
         strong = sum(
@@ -1404,7 +1408,7 @@ class ReelService:
             for candidate in stage_candidates
             if float((candidate.get("ranking") or {}).get("discovery_score") or 0.0) >= 0.2
         )
-        return strong >= max(4, target // 3)
+        return strong >= (max(2, target // 4) if fast_mode else max(4, target // 3))
 
     def _stage_search_jobs_parallel(
         self,
@@ -1506,13 +1510,26 @@ class ReelService:
         stage_name: str,
         preferred_video_duration: str,
         video_pool_mode: str,
+        fast_mode: bool,
     ) -> tuple[str | None, ...]:
         if stage_name == "high_precision":
             if preferred_video_duration in {"short", "medium", "long"}:
                 return (preferred_video_duration,)
             return ("short", None)
         if stage_name == "broad":
+            if fast_mode:
+                if preferred_video_duration in {"short", "medium", "long"}:
+                    return (preferred_video_duration, None)
+                if video_pool_mode == "long-form":
+                    return ("long", None)
+                if video_pool_mode == "balanced":
+                    return ("short", "long")
+                return ("short", None)
             return self._duration_plan(video_pool_mode, preferred_video_duration)
+        if fast_mode:
+            if preferred_video_duration in {"short", "medium", "long"}:
+                return (preferred_video_duration, None)
+            return (None, "short")
         return (None, "short", "medium", "long")
 
     def _score_video_candidate(

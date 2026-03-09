@@ -870,7 +870,7 @@ def feed(
     autofill: bool = True,
     prefetch: int = 7,
     creative_commons_only: bool = False,
-    generation_mode: Literal["slow", "fast"] = "slow",
+    generation_mode: Literal["slow", "fast"] = "fast",
     min_relevance: float | None = None,
     video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first",
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any",

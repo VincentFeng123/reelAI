@@ -53,7 +53,7 @@ function parseMaterialHistory(raw: string | null): HistoryItem[] {
         title: String(item.title).trim() || "New Study Session",
         updatedAt: Number(item.updatedAt) || 0,
         starred: Boolean(item.starred),
-        generationMode: item.generationMode === "fast" ? "fast" : "slow",
+        generationMode: item.generationMode === "slow" ? "slow" : "fast",
       }))
       .slice(0, MAX_HISTORY_ITEMS);
   } catch {
@@ -84,7 +84,7 @@ function parseLegacyTopicHistory(raw: string | null): HistoryItem[] {
         title: String(item.topic).trim(),
         updatedAt: Number(item.updatedAt) || 0,
         starred: false,
-        generationMode: "slow",
+        generationMode: "fast",
       }))
       .slice(0, MAX_HISTORY_ITEMS);
   } catch {
@@ -104,14 +104,14 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
       map.set(item.materialId, {
         ...item,
         starred: item.starred || existing.starred,
-        generationMode: item.generationMode || existing.generationMode || "slow",
+        generationMode: item.generationMode || existing.generationMode || "fast",
       });
       continue;
     }
     map.set(item.materialId, {
       ...existing,
       starred: existing.starred || item.starred,
-      generationMode: existing.generationMode || item.generationMode || "slow",
+      generationMode: existing.generationMode || item.generationMode || "fast",
     });
   }
   return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_HISTORY_ITEMS);
@@ -216,7 +216,7 @@ export default function HomePage() {
         title: entry.title,
         updatedAt: entry.updatedAt,
         starred: entry.starred ?? existing?.starred ?? false,
-        generationMode: entry.generationMode ?? existing?.generationMode ?? "slow",
+        generationMode: entry.generationMode ?? existing?.generationMode ?? "fast",
       };
       const next = [merged, ...historyRef.current.filter((item) => item.materialId !== merged.materialId)].slice(0, MAX_HISTORY_ITEMS);
       persistHistory(next);
@@ -473,7 +473,7 @@ export default function HomePage() {
       }
       setActiveHistoryMenuId(null);
       forceCloseMobileSidebar();
-      const mode = existing?.generationMode ?? "slow";
+      const mode = existing?.generationMode ?? "fast";
       router.push(`/feed?material_id=${materialId}&generation_mode=${mode}`);
     },
     [forceCloseMobileSidebar, router, upsertHistory],
