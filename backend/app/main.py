@@ -6,6 +6,7 @@ from typing import Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.routing import APIRoute
 
 from .config import get_settings
 from .db import dumps_json, fetch_all, get_conn, init_db, now_iso, upsert
@@ -37,17 +38,37 @@ from .services.youtube import YouTubeApiRequestError, YouTubeService
 settings = get_settings()
 app = FastAPI(title="StudyReels API", version="0.1.0")
 
-allowed_origins = [
-    settings.frontend_origin,
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:3001",
-    "http://127.0.0.1:3001",
-]
+def _build_allowed_origins() -> list[str]:
+    local_defaults = [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
+    ]
+    env_origins = [
+        origin.strip()
+        for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
+    candidates = [settings.frontend_origin, *local_defaults, *env_origins]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for origin in candidates:
+        clean = str(origin or "").strip().rstrip("/")
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        normalized.append(clean)
+    return normalized
+
+
+allowed_origins = _build_allowed_origins()
+allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", r"https?://.*")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1101,3 +1122,47 @@ def create_community_set(payload: CommunitySetCreateRequest):
         raise HTTPException(status_code=500, detail="Failed to persist community set.")
 
     return _serialize_community_set(created_rows[0])
+
+
+def _register_non_api_route_aliases() -> None:
+    # Some deployments mount this ASGI app under `/api` already. Registering
+    # unprefixed aliases prevents 404s when upstream strips that prefix.
+    existing: set[tuple[str, frozenset[str]]] = set()
+    for route in app.routes:
+        if isinstance(route, APIRoute):
+            existing.add((route.path, frozenset(route.methods or set())))
+
+    for route in list(app.routes):
+        if not isinstance(route, APIRoute):
+            continue
+        if not route.path.startswith("/api/"):
+            continue
+        alias_path = route.path[len("/api"):]
+        methods = frozenset(route.methods or set())
+        key = (alias_path, methods)
+        if key in existing:
+            continue
+        app.add_api_route(
+            alias_path,
+            route.endpoint,
+            methods=list(methods),
+            name=f"{route.name}__alias",
+            include_in_schema=False,
+            response_model=route.response_model,
+            status_code=route.status_code,
+            response_description=route.response_description,
+            responses=route.responses,
+            deprecated=route.deprecated,
+            summary=route.summary,
+            description=route.description,
+            response_model_include=route.response_model_include,
+            response_model_exclude=route.response_model_exclude,
+            response_model_by_alias=route.response_model_by_alias,
+            response_model_exclude_unset=route.response_model_exclude_unset,
+            response_model_exclude_defaults=route.response_model_exclude_defaults,
+            response_model_exclude_none=route.response_model_exclude_none,
+        )
+        existing.add(key)
+
+
+_register_non_api_route_aliases()

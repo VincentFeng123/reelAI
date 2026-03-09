@@ -9,6 +9,15 @@ from typing import Any, Iterable
 
 from .config import get_settings
 
+try:
+    import psycopg
+    from psycopg import errors as pg_errors
+    from psycopg.rows import dict_row
+except Exception:  # pragma: no cover - optional dependency at runtime
+    psycopg = None
+    pg_errors = None
+    dict_row = None
+
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -236,11 +245,63 @@ def _db_path() -> str:
     return os.path.join(settings.data_dir, "studyreels.db")
 
 
+def _database_url() -> str:
+    settings = get_settings()
+    raw = (settings.database_url or "").strip() or os.getenv("DATABASE_URL", "").strip()
+    if raw.startswith("postgres://"):
+        raw = "postgresql://" + raw[len("postgres://") :]
+    return raw
+
+
+def _is_postgres_configured() -> bool:
+    url = _database_url()
+    return url.startswith("postgresql://")
+
+
+def _is_postgres_conn(conn: Any) -> bool:
+    if psycopg is None:
+        return False
+    return conn.__class__.__module__.startswith("psycopg")
+
+
+def _adapt_query_for_postgres(query: str) -> str:
+    return query.replace("?", "%s")
+
+
+def _postgres_schema_statements() -> list[str]:
+    statements: list[str] = []
+    for chunk in SCHEMA.split(";"):
+        raw_stmt = chunk.strip()
+        if not raw_stmt:
+            continue
+        upper = raw_stmt.upper()
+        if upper.startswith("PRAGMA "):
+            continue
+        if "ROWID" in upper:
+            continue
+        lines = [line for line in raw_stmt.splitlines() if not line.strip().startswith("--")]
+        stmt = "\n".join(lines).strip()
+        if stmt:
+            statements.append(stmt)
+    return statements
+
+
 def init_db() -> None:
     global _db_ready
+    if _is_postgres_configured():
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL is set to PostgreSQL, but psycopg is not installed.")
+        with psycopg.connect(_database_url(), connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                for statement in _postgres_schema_statements():
+                    cur.execute(statement)
+            conn.commit()
+        _db_ready = True
+        return
+
     with sqlite3.connect(_db_path()) as conn:
         conn.executescript(SCHEMA)
-        # Lightweight schema migrations for existing local databases.
+        # Lightweight schema migration for existing local databases.
         try:
             conn.execute("ALTER TABLE videos ADD COLUMN view_count INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
@@ -262,11 +323,30 @@ def ensure_db_initialized() -> None:
 @contextmanager
 def get_conn():
     ensure_db_initialized()
+    if _is_postgres_configured():
+        if psycopg is None:
+            raise RuntimeError("DATABASE_URL is set to PostgreSQL, but psycopg is not installed.")
+        conn = psycopg.connect(_database_url(), connect_timeout=15)
+        try:
+            yield conn
+        except Exception:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        finally:
+            conn.close()
+        return
+
     conn = sqlite3.connect(_db_path(), timeout=30.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout = 30000;")
     try:
         yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
         conn.commit()
     finally:
         conn.close()
@@ -276,33 +356,67 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def upsert(conn: sqlite3.Connection, table: str, data: dict[str, Any], pk: str = "id") -> None:
+def _is_unique_violation(exc: Exception) -> bool:
+    if pg_errors is not None and isinstance(exc, pg_errors.UniqueViolation):
+        return True
+    return getattr(exc, "sqlstate", "") == "23505"
+
+
+def upsert(conn: Any, table: str, data: dict[str, Any], pk: str = "id") -> None:
     cols = list(data.keys())
     placeholders = ", ".join(["?"] * len(cols))
     assignments = ", ".join([f"{c}=excluded.{c}" for c in cols if c != pk])
-    sql = (
-        f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
-        f"ON CONFLICT({pk}) DO UPDATE SET {assignments}"
-    )
+    if assignments:
+        sql = (
+            f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
+            f"ON CONFLICT({pk}) DO UPDATE SET {assignments}"
+        )
+    else:
+        sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) ON CONFLICT({pk}) DO NOTHING"
+
     values = [data[c] for c in cols]
+    is_pg = _is_postgres_conn(conn)
+    query = _adapt_query_for_postgres(sql) if is_pg else sql
+
     for attempt in range(4):
         try:
-            conn.execute(sql, values)
+            if is_pg:
+                with conn.cursor() as cur:
+                    cur.execute(query, values)
+            else:
+                conn.execute(query, values)
             return
         except sqlite3.OperationalError as exc:
             # WAL can transiently lock under concurrent writes; retry quickly.
             if "locked" not in str(exc).lower() or attempt >= 3:
                 raise
             time.sleep(0.03 * (attempt + 1))
+        except Exception as exc:
+            if is_pg and _is_unique_violation(exc):
+                conn.rollback()
+                raise sqlite3.IntegrityError(str(exc)) from exc
+            raise
 
 
-def fetch_all(conn: sqlite3.Connection, query: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
-    rows = conn.execute(query, params).fetchall()
+def fetch_all(conn: Any, query: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
+    if _is_postgres_conn(conn):
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(_adapt_query_for_postgres(query), tuple(params))
+            rows = cur.fetchall()
+        return [dict(r) for r in rows]
+
+    rows = conn.execute(query, tuple(params)).fetchall()
     return [dict(r) for r in rows]
 
 
-def fetch_one(conn: sqlite3.Connection, query: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
-    row = conn.execute(query, params).fetchone()
+def fetch_one(conn: Any, query: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
+    if _is_postgres_conn(conn):
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(_adapt_query_for_postgres(query), tuple(params))
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    row = conn.execute(query, tuple(params)).fetchone()
     return dict(row) if row else None
 
 

@@ -39,7 +39,7 @@ The MVP uses timestamp-based YouTube embed playback (no local download of full Y
     -> affects future feed rank
         |
         v
-[SQLite]
+[SQLite (default) or PostgreSQL via `DATABASE_URL`]
   materials, concepts, chunks, reels, feedback, caches
 
 [Storage Layer]
@@ -47,7 +47,7 @@ The MVP uses timestamp-based YouTube embed playback (no local download of full Y
   - S3-compatible adapter (prod)
 ```
 
-## 2) DB schema (SQLite)
+## 2) DB schema
 
 Core tables:
 - `materials(id, subject_tag, raw_text, source_type, source_path, created_at)`
@@ -271,9 +271,11 @@ From repo root:
 3. Add environment variables:
    - `APP_ENV=prod`
    - `FRONTEND_ORIGIN=https://<your-project-domain>`
+   - `FRONTEND_ORIGINS=https://<your-project-domain>[,https://preview-domain]` (recommended)
    - `OPENAI_ENABLED=0` (set `1` only if you intentionally want OpenAI calls)
    - `OPENAI_API_KEY=...`
    - `YOUTUBE_API_KEY=...`
+   - `DATABASE_URL=postgresql://...` (recommended for hosted durable data, e.g. Railway)
    - Optional: S3 variables if using object storage.
 4. Optional frontend variable:
    - `NEXT_PUBLIC_API_BASE` (leave unset for same-origin `/api`; set only if pointing to a different backend URL)
@@ -302,7 +304,7 @@ Known limitations:
 - No user auth/multi-user separation yet.
 - Ranking is heuristic and not personalized beyond immediate feedback.
 - FAISS index is built at query-time from persisted vectors (no persistent ANN index file yet).
-- Vercel serverless storage is ephemeral; SQLite data under `/tmp` is not durable across cold starts.
+- If `DATABASE_URL` is unset, Vercel serverless storage is ephemeral and SQLite data under `/tmp` is not durable across cold starts.
 
 High-impact next steps:
 - Add concept-level spaced repetition scheduling and mastery tracking.

@@ -13,7 +13,8 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 ## Notes
 
-- Uses SQLite + FAISS (with brute-force fallback if FAISS import fails).
+- Uses SQLite by default, or PostgreSQL when `DATABASE_URL` is set (Railway-compatible).
+- Uses FAISS (with brute-force fallback if FAISS import fails).
 - Uses timestamp-based YouTube embed playback; no local video download.
 - Reel segments are forced to 20-60s and are selected from transcript-aligned timestamps.
 - Searches both short-form and long-form videos, then cuts matching transcript windows.
@@ -29,7 +30,9 @@ Deploy the repo as a single project from root (`.`).
 - Set env vars in Vercel:
   - `APP_ENV=prod`
   - `FRONTEND_ORIGIN=https://<your-project-domain>`
+  - `FRONTEND_ORIGINS=https://<your-frontend-domain>[,https://another-domain]` (recommended)
   - `OPENAI_ENABLED=0` (set `1` only if you want to enable OpenAI calls)
   - `OPENAI_API_KEY=...`
   - `YOUTUBE_API_KEY=...`
-- `DATA_DIR` defaults to `/tmp/studyreels-data` on Vercel.
+- `DATABASE_URL=postgresql://...` (recommended for durable hosted data, e.g. Railway)
+- `DATA_DIR` defaults to `/tmp/studyreels-data` on Vercel and is ephemeral.

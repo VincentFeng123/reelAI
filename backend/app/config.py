@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     backend_port: int = 8000
     frontend_origin: str = "http://localhost:3000"
     data_dir: str = Field(default_factory=_default_data_dir)
+    database_url: str = ""
 
     openai_enabled: bool = False
     openai_api_key: str = ""
