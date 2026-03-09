@@ -29,6 +29,7 @@ Deploy the repo as a single project from root (`.`).
 - Set env vars in Vercel:
   - `APP_ENV=prod`
   - `FRONTEND_ORIGIN=https://<your-project-domain>`
+  - `OPENAI_ENABLED=0` (set `1` only if you want to enable OpenAI calls)
   - `OPENAI_API_KEY=...`
   - `YOUTUBE_API_KEY=...`
 - `DATA_DIR` defaults to `/tmp/studyreels-data` on Vercel.

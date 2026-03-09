@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:3000"
     data_dir: str = Field(default_factory=_default_data_dir)
 
+    openai_enabled: bool = False
     openai_api_key: str = ""
     openai_embed_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"

@@ -20,7 +20,11 @@ class EmbeddingService:
         self.model = settings.openai_embed_model
         serverless_mode = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
         allow_openai_serverless = os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1"
-        can_use_openai = bool(settings.openai_api_key) and (not serverless_mode or allow_openai_serverless)
+        can_use_openai = (
+            bool(settings.openai_enabled)
+            and bool(settings.openai_api_key)
+            and (not serverless_mode or allow_openai_serverless)
+        )
         self.client = OpenAI(api_key=settings.openai_api_key, timeout=8.0) if can_use_openai else None
         self.dim = 1536 if self.client else 256
 

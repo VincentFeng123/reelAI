@@ -271,6 +271,7 @@ From repo root:
 3. Add environment variables:
    - `APP_ENV=prod`
    - `FRONTEND_ORIGIN=https://<your-project-domain>`
+   - `OPENAI_ENABLED=0` (set `1` only if you intentionally want OpenAI calls)
    - `OPENAI_API_KEY=...`
    - `YOUTUBE_API_KEY=...`
    - Optional: S3 variables if using object storage.
