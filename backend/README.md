@@ -36,3 +36,4 @@ Deploy the repo as a single project from root (`.`).
   - `YOUTUBE_API_KEY=...`
 - `DATABASE_URL=postgresql://...` (recommended for durable hosted data, e.g. Railway)
 - `DATA_DIR` defaults to `/tmp/studyreels-data` on Vercel and is ephemeral.
+- If you intentionally stay on SQLite in hosted mode, tune lock waits with `SQLITE_BUSY_TIMEOUT_MS` (default `120000`).

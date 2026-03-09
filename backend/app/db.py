@@ -237,12 +237,24 @@ CREATE TABLE IF NOT EXISTS llm_cache (
 
 _db_init_lock = threading.Lock()
 _db_ready = False
+DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 120000
 
 
 def _db_path() -> str:
     settings = get_settings()
     os.makedirs(settings.data_dir, exist_ok=True)
     return os.path.join(settings.data_dir, "studyreels.db")
+
+
+def _sqlite_busy_timeout_ms() -> int:
+    raw = os.getenv("SQLITE_BUSY_TIMEOUT_MS", "").strip()
+    if not raw:
+        return DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return DEFAULT_SQLITE_BUSY_TIMEOUT_MS
+    return max(1000, min(600000, parsed))
 
 
 def _database_url() -> str:
@@ -338,9 +350,16 @@ def get_conn():
             conn.close()
         return
 
-    conn = sqlite3.connect(_db_path(), timeout=30.0)
+    busy_timeout_ms = _sqlite_busy_timeout_ms()
+    conn = sqlite3.connect(
+        _db_path(),
+        timeout=max(1.0, busy_timeout_ms / 1000.0),
+        isolation_level=None,  # autocommit to avoid long-lived write locks
+    )
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000;")
+    conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms};")
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     try:
         yield conn
     except Exception:
@@ -378,7 +397,7 @@ def upsert(conn: Any, table: str, data: dict[str, Any], pk: str = "id") -> None:
     is_pg = _is_postgres_conn(conn)
     query = _adapt_query_for_postgres(sql) if is_pg else sql
 
-    for attempt in range(4):
+    for attempt in range(8):
         try:
             if is_pg:
                 with conn.cursor() as cur:
@@ -388,9 +407,14 @@ def upsert(conn: Any, table: str, data: dict[str, Any], pk: str = "id") -> None:
             return
         except sqlite3.OperationalError as exc:
             # WAL can transiently lock under concurrent writes; retry quickly.
-            if "locked" not in str(exc).lower() or attempt >= 3:
+            if "locked" not in str(exc).lower() or attempt >= 7:
                 raise
-            time.sleep(0.03 * (attempt + 1))
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            # Exponential-ish backoff helps during concurrent material ingestion.
+            time.sleep(min(2.0, 0.05 * (2 ** attempt)))
         except Exception as exc:
             if is_pg and _is_unique_violation(exc):
                 conn.rollback()
