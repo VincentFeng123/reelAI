@@ -1,10 +1,11 @@
 import json
+import ipaddress
 import os
 import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -67,7 +68,7 @@ def _build_allowed_origins() -> list[str]:
 
 
 allowed_origins = _build_allowed_origins()
-allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", r"https?://.*")
+allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
 
 app.add_middleware(
     CORSMiddleware,
@@ -93,6 +94,77 @@ MAX_TARGET_CLIP_DURATION_SEC = 180
 MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC = 15
 MAX_COMMUNITY_REEL_DURATION_SEC = 8 * 60 * 60
 COMMUNITY_REEL_DURATION_TIMEOUT_SEC = 6.0
+PRIVATE_HOST_SUFFIXES = (".localhost", ".local", ".internal")
+
+
+def _host_matches(host: str, domain: str) -> bool:
+    return host == domain or host.endswith(f".{domain}")
+
+
+def _is_public_host(host: str) -> bool:
+    safe_host = host.strip().strip(".").lower()
+    if not safe_host:
+        return False
+    if safe_host == "localhost" or safe_host.endswith(PRIVATE_HOST_SUFFIXES):
+        return False
+    try:
+        ip = ipaddress.ip_address(safe_host)
+    except ValueError:
+        return True
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _normalize_public_http_url(raw_url: str, field_name: str) -> str:
+    normalized = str(raw_url or "").strip()
+    parsed = urlparse(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be an absolute http(s) URL.")
+    host = (parsed.hostname or "").lower()
+    if not _is_public_host(host):
+        raise HTTPException(status_code=400, detail=f"{field_name} host is not allowed.")
+    return urlunparse(parsed._replace(fragment=""))
+
+
+def _validate_community_reel_urls(
+    *,
+    platform: Literal["youtube", "instagram", "tiktok"],
+    source_url: str,
+    embed_url: str,
+) -> tuple[str, str]:
+    safe_source = _normalize_public_http_url(source_url, "source_url")
+    safe_embed = _normalize_public_http_url(embed_url, "embed_url")
+    source_parsed = urlparse(safe_source)
+    embed_parsed = urlparse(safe_embed)
+    source_host = (source_parsed.hostname or "").lower()
+    embed_host = (embed_parsed.hostname or "").lower()
+    embed_path = (embed_parsed.path or "").lower()
+
+    if platform == "youtube":
+        if not (_host_matches(source_host, "youtube.com") or source_host == "youtu.be"):
+            raise HTTPException(status_code=400, detail="source_url host must be a YouTube URL for platform=youtube.")
+        if not _host_matches(embed_host, "youtube.com") or not embed_path.startswith("/embed/"):
+            raise HTTPException(status_code=400, detail="embed_url must be a YouTube embed URL for platform=youtube.")
+        return safe_source, safe_embed
+
+    if platform == "instagram":
+        if not _host_matches(source_host, "instagram.com"):
+            raise HTTPException(status_code=400, detail="source_url host must be an Instagram URL for platform=instagram.")
+        if not _host_matches(embed_host, "instagram.com") or "/embed" not in embed_path:
+            raise HTTPException(status_code=400, detail="embed_url must be an Instagram embed URL for platform=instagram.")
+        return safe_source, safe_embed
+
+    if not _host_matches(source_host, "tiktok.com"):
+        raise HTTPException(status_code=400, detail="source_url host must be a TikTok URL for platform=tiktok.")
+    if not _host_matches(embed_host, "tiktok.com") or "/embed/" not in embed_path:
+        raise HTTPException(status_code=400, detail="embed_url must be a TikTok embed URL for platform=tiktok.")
+    return safe_source, safe_embed
 
 
 def _normalize_duration_seconds(value: object) -> float | None:
@@ -151,6 +223,7 @@ def _fetch_duration_from_source_page(source_url: str) -> float | None:
     try:
         response = requests.get(
             source_url,
+            allow_redirects=False,
             timeout=COMMUNITY_REEL_DURATION_TIMEOUT_SEC,
             headers={
                 "User-Agent": (
@@ -360,6 +433,14 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
             source_url = str(entry.get("source_url", "")).strip()
             embed_url = str(entry.get("embed_url", "")).strip()
             if not source_url or not embed_url:
+                continue
+            try:
+                source_url, embed_url = _validate_community_reel_urls(
+                    platform=platform,  # type: ignore[arg-type]
+                    source_url=source_url,
+                    embed_url=embed_url,
+                )
+            except HTTPException:
                 continue
             reel_id = str(entry.get("id") or f"{row.get('id', 'community-set')}-reel-{index}")
             t_start_sec = _normalize_clip_seconds(entry.get("t_start_sec"))
@@ -1120,9 +1201,7 @@ def get_community_reel_duration(source_url: str):
     normalized_url = source_url.strip()
     if not normalized_url:
         raise HTTPException(status_code=400, detail="source_url is required.")
-    parsed = urlparse(normalized_url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail="source_url must be an absolute http(s) URL.")
+    normalized_url = _normalize_public_http_url(normalized_url, "source_url")
 
     duration_sec = _resolve_community_reel_duration_sec(normalized_url)
     return {"duration_sec": duration_sec}
@@ -1179,6 +1258,11 @@ def create_community_set(payload: CommunitySetCreateRequest):
         embed_url = reel.embed_url.strip()
         if not source_url or not embed_url:
             continue
+        source_url, embed_url = _validate_community_reel_urls(
+            platform=reel.platform,
+            source_url=source_url,
+            embed_url=embed_url,
+        )
         t_start_sec = _normalize_clip_seconds(reel.t_start_sec)
         t_end_sec = _normalize_clip_seconds(reel.t_end_sec)
         if t_end_sec is not None:
@@ -1280,6 +1364,11 @@ def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
         embed_url = reel.embed_url.strip()
         if not source_url or not embed_url:
             continue
+        source_url, embed_url = _validate_community_reel_urls(
+            platform=reel.platform,
+            source_url=source_url,
+            embed_url=embed_url,
+        )
         t_start_sec = _normalize_clip_seconds(reel.t_start_sec)
         t_end_sec = _normalize_clip_seconds(reel.t_end_sec)
         if t_end_sec is not None:

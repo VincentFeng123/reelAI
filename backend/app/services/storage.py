@@ -1,10 +1,17 @@
 import os
+import re
 import uuid
 from abc import ABC, abstractmethod
 
 import boto3
 
 from ..config import get_settings
+
+
+def _safe_filename(filename: str) -> str:
+    base = os.path.basename(str(filename or "").strip()) or "upload"
+    clean = re.sub(r"[^A-Za-z0-9._-]", "_", base).strip("._")
+    return clean[:120] or "upload"
 
 
 class Storage(ABC):
@@ -19,7 +26,7 @@ class LocalStorage(Storage):
         os.makedirs(self.root, exist_ok=True)
 
     def save_bytes(self, content: bytes, filename: str) -> str:
-        safe_name = f"{uuid.uuid4()}_{filename}"
+        safe_name = f"{uuid.uuid4()}_{_safe_filename(filename)}"
         path = os.path.join(self.root, safe_name)
         with open(path, "wb") as f:
             f.write(content)
@@ -39,7 +46,7 @@ class S3Storage(Storage):
         )
 
     def save_bytes(self, content: bytes, filename: str) -> str:
-        key = f"uploads/{uuid.uuid4()}_{filename}"
+        key = f"uploads/{uuid.uuid4()}_{_safe_filename(filename)}"
         self.client.put_object(Bucket=self.bucket, Key=key, Body=content)
         return f"s3://{self.bucket}/{key}"
 

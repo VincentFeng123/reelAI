@@ -1,6 +1,6 @@
 "use client";
 
-import { type MouseEvent as ReactMouseEvent, type UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, type MouseEvent as ReactMouseEvent, type UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { CommunityReelsPanel } from "@/components/CommunityReelsPanel";
@@ -124,7 +124,7 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
   return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_HISTORY_ITEMS);
 }
 
-export default function HomePage() {
+function HomePageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const forcedSidebarTab = useMemo(() => normalizeSidebarTab(searchParams.get("tab")), [searchParams]);
@@ -1126,5 +1126,13 @@ export default function HomePage() {
         </div>
       ) : null}
     </main>
+  );
+}
+
+export default function HomePage() {
+  return (
+    <Suspense fallback={<main className="fixed inset-0 bg-black" />}>
+      <HomePageContent />
+    </Suspense>
   );
 }
