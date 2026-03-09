@@ -14,6 +14,9 @@ import type { PreferredVideoDuration, VideoPoolMode } from "@/lib/settings";
 const RAW_API_BASE = (
   process.env.NEXT_PUBLIC_API_BASE || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "")
 ).replace(/\/$/, "");
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const FEED_REQUEST_TIMEOUT_MS = 45_000;
+const GENERATE_REQUEST_TIMEOUT_MS = 90_000;
 const BACKEND_DOWN_ERROR = RAW_API_BASE
   ? `Cannot reach backend at ${RAW_API_BASE}. Make sure the backend server is running.`
   : "Cannot reach backend. Check your deployment and API routes.";
@@ -67,6 +70,7 @@ export async function generateReels(params: {
 }): Promise<ReelsGenerateResponse> {
   const res = await safeFetch(apiUrl("/reels/generate"), {
     method: "POST",
+    timeoutMs: GENERATE_REQUEST_TIMEOUT_MS,
     headers: {
       "Content-Type": "application/json",
     },
@@ -105,6 +109,7 @@ export async function checkReelsCanGenerate(params: {
 }): Promise<ReelsCanGenerateResponse> {
   const res = await safeFetch(apiUrl("/reels/can-generate"), {
     method: "POST",
+    timeoutMs: FEED_REQUEST_TIMEOUT_MS,
     headers: {
       "Content-Type": "application/json",
     },
@@ -144,6 +149,7 @@ export async function checkReelsCanGenerateAny(params: {
     : [];
   const res = await safeFetch(apiUrl("/reels/can-generate-any"), {
     method: "POST",
+    timeoutMs: FEED_REQUEST_TIMEOUT_MS,
     headers: {
       "Content-Type": "application/json",
     },
@@ -206,6 +212,7 @@ export async function fetchFeed(params: {
 
   const res = await safeFetch(`${apiUrl("/feed")}?${query}`, {
     cache: "no-store",
+    timeoutMs: FEED_REQUEST_TIMEOUT_MS,
   });
 
   return res.json();
@@ -220,6 +227,7 @@ export async function sendFeedback(params: {
 }): Promise<void> {
   await safeFetch(apiUrl("/reels/feedback"), {
     method: "POST",
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
     headers: {
       "Content-Type": "application/json",
     },
@@ -241,6 +249,7 @@ export async function askStudyChat(params: {
 }): Promise<ChatResponse> {
   const res = await safeFetch(apiUrl("/chat"), {
     method: "POST",
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
     headers: {
       "Content-Type": "application/json",
     },
@@ -332,6 +341,7 @@ function normalizeCommunitySet(raw: unknown): CommunitySet | null {
 export async function fetchCommunitySets(): Promise<CommunitySet[]> {
   const res = await safeFetch(apiUrl("/community/sets"), {
     cache: "no-store",
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
   });
   const json = await res.json();
   const rows = Array.isArray(json?.sets) ? json.sets : [];
@@ -352,6 +362,7 @@ export async function createCommunitySet(params: {
 }): Promise<CommunitySet> {
   const res = await safeFetch(apiUrl("/community/sets"), {
     method: "POST",
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
     headers: {
       "Content-Type": "application/json",
     },
@@ -376,12 +387,39 @@ export async function createCommunitySet(params: {
   return created;
 }
 
-async function safeFetch(url: string, init?: RequestInit): Promise<Response> {
+type SafeFetchInit = RequestInit & {
+  timeoutMs?: number;
+};
+
+async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
+  const timeoutMs = Math.max(1_000, Number(init?.timeoutMs) || DEFAULT_REQUEST_TIMEOUT_MS);
+  const upstreamSignal = init?.signal;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  if (upstreamSignal) {
+    if (upstreamSignal.aborted) {
+      controller.abort();
+    } else {
+      upstreamSignal.addEventListener("abort", () => controller.abort(), { once: true });
+    }
+  }
+
   let response: Response;
   try {
-    response = await fetch(url, init);
-  } catch {
+    const requestInit: RequestInit = {
+      ...init,
+      signal: controller.signal,
+    };
+    delete (requestInit as SafeFetchInit).timeoutMs;
+    response = await fetch(url, requestInit);
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s.`);
+    }
     throw new Error(BACKEND_DOWN_ERROR);
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   if (!response.ok) {

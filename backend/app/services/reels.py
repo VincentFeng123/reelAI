@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import uuid
@@ -161,6 +162,9 @@ class ReelService:
         self.retrieval_engine_v2_enabled = bool(settings.retrieval_engine_v2_enabled)
         self.retrieval_tier2_enabled = bool(settings.retrieval_tier2_enabled)
         self.retrieval_debug_logging = bool(settings.retrieval_debug_logging)
+        self.serverless_mode = bool(
+            os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
+        )
         self._strategy_history_cache: dict[str, float] = {}
         self.openai_client = OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
 
@@ -196,7 +200,9 @@ class ReelService:
         if not concepts:
             return []
         concepts = self._order_concepts(conn, material_id, concepts)
-        if fast_mode:
+        if self.serverless_mode:
+            concepts = concepts[:1]
+        elif fast_mode:
             concepts = concepts[:4]
 
         existing_clip_keys = {
@@ -231,6 +237,8 @@ class ReelService:
             preferred_video_duration=safe_video_duration_pref,
             fast_mode=fast_mode,
         )
+        if self.serverless_mode:
+            max_generation_target = min(max_generation_target, max(3, num_reels))
         clip_min_len, clip_max_len, safe_target_clip_duration = self._resolve_clip_duration_bounds(
             target_clip_duration_sec=target_clip_duration_sec,
             target_clip_duration_min_sec=target_clip_duration_min_sec,
@@ -889,6 +897,8 @@ class ReelService:
         max_generation_target: int,
     ) -> int:
         remaining = max(1, max_generation_target - max(0, generated_count))
+        if self.serverless_mode:
+            return max(6, min(10, 4 + remaining))
         if fast_mode:
             return max(10, min(18, 8 + remaining * 2))
         return max(18, min(42, 14 + remaining * 4))
@@ -901,6 +911,8 @@ class ReelService:
         max_generation_target: int,
     ) -> int:
         remaining = max(1, max_generation_target - max(0, generated_count))
+        if self.serverless_mode:
+            return max(1, min(3, remaining))
         if fast_mode:
             return max(2, min(6, remaining + 1))
         return max(4, min(12, remaining * 2))
@@ -1332,24 +1344,39 @@ class ReelService:
             stage = item.stage if item.stage in stage_map else "broad"
             stage_map[stage].append(item)
 
+        if self.serverless_mode:
+            high_precision_budget = 2
+            high_precision_min = 2
+            broad_budget = 2
+            broad_min = 2
+            recovery_budget = 1
+            recovery_min = 1
+        else:
+            high_precision_budget = 3 if fast_mode else 5
+            high_precision_min = 6 if fast_mode else 8
+            broad_budget = 8 if fast_mode else 14
+            broad_min = 9 if fast_mode else 12
+            recovery_budget = 5 if fast_mode else 8
+            recovery_min = 4 if fast_mode else 6
+
         plans = [
             RetrievalStagePlan(
                 name="high_precision",
                 queries=sorted(stage_map["high_precision"], key=lambda q: -(q.confidence * q.weight)),
-                budget=3 if fast_mode else 5,
-                min_good_results=6 if fast_mode else 8,
+                budget=high_precision_budget,
+                min_good_results=high_precision_min,
             ),
             RetrievalStagePlan(
                 name="broad",
                 queries=sorted(stage_map["broad"], key=lambda q: -(q.confidence * q.weight)),
-                budget=8 if fast_mode else 14,
-                min_good_results=9 if fast_mode else 12,
+                budget=broad_budget,
+                min_good_results=broad_min,
             ),
             RetrievalStagePlan(
                 name="recovery",
                 queries=sorted(stage_map["recovery"], key=lambda q: -(q.confidence * q.weight)),
-                budget=5 if fast_mode else 8,
-                min_good_results=4 if fast_mode else 6,
+                budget=recovery_budget,
+                min_good_results=recovery_min,
             ),
         ]
         return [plan for plan in plans if plan.queries and plan.budget > 0]
@@ -1391,6 +1418,8 @@ class ReelService:
             return []
 
         workers_limit = self.QUERY_RETRIEVAL_WORKERS_FAST if fast_mode else self.QUERY_RETRIEVAL_WORKERS_SLOW
+        if self.serverless_mode:
+            workers_limit = min(workers_limit, 2)
         workers = max(1, min(workers_limit, len(jobs)))
         if workers == 1:
             output: list[tuple[int, int, QueryCandidate, str | None, list[dict[str, Any]]]] = []
@@ -1446,6 +1475,8 @@ class ReelService:
             return {}
 
         workers_limit = self.TRANSCRIPT_FETCH_WORKERS_FAST if fast_mode else self.TRANSCRIPT_FETCH_WORKERS_SLOW
+        if self.serverless_mode:
+            workers_limit = min(workers_limit, 2)
         workers = max(1, min(workers_limit, len(unique_ids)))
         if workers == 1:
             return {video_id: self.youtube_service.get_transcript(None, video_id) for video_id in unique_ids}

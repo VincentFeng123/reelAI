@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -63,6 +64,11 @@ class YouTubeService:
         self.transcript_api = YouTubeTranscriptApi()
         self.empty_transcript_ttl_sec = 6 * 60 * 60
         self._network_backoff_until = 0.0
+        self.serverless_mode = bool(
+            os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
+        )
+        self.search_time_budget_sec = 6.0 if self.serverless_mode else self.SEARCH_TIME_BUDGET_SEC
+        self.request_timeout_sec = 5.0 if self.serverless_mode else self.REQUEST_TIMEOUT_SEC
 
     def search_videos(
         self,
@@ -131,7 +137,7 @@ class YouTubeService:
         if self._network_backoff_active():
             return []
 
-        deadline = time.monotonic() + self.SEARCH_TIME_BUDGET_SEC
+        deadline = time.monotonic() + self.search_time_budget_sec
         videos: list[dict[str, Any]] = []
         fast_non_api_enabled = not creative_commons_only
         futures: list[tuple[str, Any]] = []
@@ -1172,11 +1178,11 @@ class YouTubeService:
 
     def _request_timeout(self, deadline: float | None) -> float:
         if deadline is None:
-            return self.REQUEST_TIMEOUT_SEC
+            return self.request_timeout_sec
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return 0.2
-        return max(0.2, min(self.REQUEST_TIMEOUT_SEC, remaining))
+        return max(0.2, min(self.request_timeout_sec, remaining))
 
     def _network_backoff_active(self) -> bool:
         return time.monotonic() < self._network_backoff_until

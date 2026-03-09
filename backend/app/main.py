@@ -58,6 +58,7 @@ embedding_service = EmbeddingService()
 material_intelligence_service = MaterialIntelligenceService()
 youtube_service = YouTubeService()
 reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service)
+SERVERLESS_MODE = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
 
 VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
@@ -409,6 +410,11 @@ def generate_reels(payload: ReelsGenerateRequest):
         target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
         target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
     )
+    requested_num_reels = max(1, int(payload.num_reels))
+    if SERVERLESS_MODE:
+        # Keep hosted/serverless requests within function time limits.
+        requested_num_reels = min(requested_num_reels, 6)
+
     reels: list[dict] = []
     filtered: list[dict] = []
     with get_conn() as conn:
@@ -417,9 +423,14 @@ def generate_reels(payload: ReelsGenerateRequest):
             raise HTTPException(status_code=404, detail="material_id not found")
 
         attempts = 0
-        while attempts < 4 and len(filtered) < payload.num_reels:
-            need = max(1, payload.num_reels - len(filtered))
-            target_batch = min(30, max(need + 2, payload.num_reels if attempts == 0 else need))
+        max_attempts = 1 if SERVERLESS_MODE else 4
+        effective_fast_mode = True if SERVERLESS_MODE else payload.generation_mode == "fast"
+        while attempts < max_attempts and len(filtered) < requested_num_reels:
+            need = max(1, requested_num_reels - len(filtered))
+            if SERVERLESS_MODE:
+                target_batch = min(8, max(need, 3))
+            else:
+                target_batch = min(30, max(need + 2, requested_num_reels if attempts == 0 else need))
             try:
                 batch = reel_service.generate_reels(
                     conn,
@@ -427,7 +438,7 @@ def generate_reels(payload: ReelsGenerateRequest):
                     concept_id=payload.concept_id,
                     num_reels=target_batch,
                     creative_commons_only=payload.creative_commons_only,
-                    fast_mode=payload.generation_mode == "fast",
+                    fast_mode=effective_fast_mode,
                     video_pool_mode=safe_video_pool_mode,
                     preferred_video_duration=safe_video_duration_pref,
                     target_clip_duration_sec=safe_target_clip_duration_sec,
@@ -448,7 +459,7 @@ def generate_reels(payload: ReelsGenerateRequest):
                 target_clip_duration_min_sec=safe_target_clip_min_sec,
                 target_clip_duration_max_sec=safe_target_clip_max_sec,
             )
-    return {"reels": filtered[: payload.num_reels]}
+    return {"reels": filtered[:requested_num_reels]}
 
 
 @dataclass
@@ -860,6 +871,10 @@ def feed(
             raise HTTPException(status_code=404, detail="material_id not found")
 
         fast_mode = generation_mode == "fast"
+        if SERVERLESS_MODE:
+            # Hosted/serverless: force fast retrieval profile to avoid request timeouts.
+            fast_mode = True
+            prefetch = min(prefetch, 6)
         safe_min_relevance = _normalize_min_relevance(min_relevance)
         safe_video_pool_mode = _normalize_video_pool_mode(video_pool_mode)
         safe_video_duration_pref = _normalize_preferred_video_duration(preferred_video_duration)
@@ -879,10 +894,15 @@ def feed(
         )
         # Auto-expand the feed while users scroll so we can keep serving fresh reels.
         if autofill:
-            target_total = page * limit + prefetch + (10 if fast_mode else 6)
+            if SERVERLESS_MODE:
+                target_total = page * limit + prefetch + 2
+                max_attempts = 1
+                max_batch = 6
+            else:
+                target_total = page * limit + prefetch + (10 if fast_mode else 6)
+                max_attempts = 5 if fast_mode else 4
+                max_batch = 18 if fast_mode else 14
             attempts = 0
-            max_attempts = 5 if fast_mode else 4
-            max_batch = 18 if fast_mode else 14
             while len(filtered_ranked) < target_total and attempts < max_attempts:
                 need = max(1, target_total - len(filtered_ranked))
                 try:
