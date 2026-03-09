@@ -20,9 +20,12 @@ type YouTubePlayer = {
   playVideo: () => void;
   seekTo: (seconds: number, allowSeekAhead: boolean) => void;
   getCurrentTime: () => number;
+  getDuration?: () => number;
   mute: () => void;
   unMute: () => void;
 };
+
+type VideoProvider = "youtube" | "external";
 
 const YOUTUBE_SCRIPT_ID = "studyreels-youtube-iframe-api";
 const PLAYER_REVEAL_DELAY_MS = 0;
@@ -116,6 +119,19 @@ function extractVideoId(urlValue: string): string | null {
   return null;
 }
 
+function detectVideoProvider(urlValue: string): VideoProvider {
+  try {
+    const url = new URL(urlValue);
+    const host = url.hostname.toLowerCase();
+    if (host.includes("youtube.com") || host.includes("youtu.be")) {
+      return "youtube";
+    }
+  } catch {
+    return "external";
+  }
+  return "external";
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -151,13 +167,48 @@ export function ReelCard({
   const [isSurfaceVisible, setIsSurfaceVisible] = useState(false);
   const [isResumeMaskVisible, setIsResumeMaskVisible] = useState(false);
   const [currentSec, setCurrentSec] = useState(0);
+  const [detectedDurationSec, setDetectedDurationSec] = useState<number | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isTouchLikeDevice, setIsTouchLikeDevice] = useState(false);
   const [isMobilePhoneDevice, setIsMobilePhoneDevice] = useState(false);
 
   const videoId = useMemo(() => extractVideoId(reel.video_url), [reel.video_url]);
-  const clipStart = Math.max(0, Math.floor(reel.t_start));
-  const clipEnd = Math.max(clipStart + 1, Math.ceil(reel.t_end));
+  const videoProvider = useMemo(() => detectVideoProvider(reel.video_url), [reel.video_url]);
+  const isYouTubeVideo = videoProvider === "youtube";
+  const isCommunityImported = (reel.relevance_reason || "").trim() === "Opened from a community set.";
+  const clipStartRaw = Number(reel.t_start);
+  const clipEndRaw = Number(reel.t_end);
+  const clipStart = Number.isFinite(clipStartRaw) && clipStartRaw >= 0 ? clipStartRaw : 0;
+  const configuredClipEnd =
+    Number.isFinite(clipEndRaw) && clipEndRaw > clipStart
+      ? clipEndRaw
+      : clipStart + 1;
+  const configuredClipDuration = Math.max(0, configuredClipEnd - clipStart);
+  const hasClipDurationMetadata = Number.isFinite(reel.clip_duration_sec) && Number(reel.clip_duration_sec) > 0;
+  const hasExplicitEndFlag = reel.community_has_explicit_end === true;
+  const looksLikeFallbackWindow = Math.abs(configuredClipDuration - 180) < 0.25;
+  const hasCreatorClipRange =
+    hasExplicitEndFlag ||
+    hasClipDurationMetadata ||
+    (isCommunityImported && configuredClipDuration > 0.5 && !looksLikeFallbackWindow);
+  const detectedClipEnd =
+    detectedDurationSec !== null && detectedDurationSec > clipStart
+      ? detectedDurationSec
+      : null;
+  const shouldUseDetectedDurationAsMax = isCommunityImported && !hasCreatorClipRange;
+  const shouldAutoExtendNearFullClip =
+    isCommunityImported &&
+    hasCreatorClipRange &&
+    detectedClipEnd !== null &&
+    clipStart <= 0.25 &&
+    configuredClipEnd < detectedClipEnd &&
+    configuredClipEnd >= detectedClipEnd * 0.93;
+  const clipEnd =
+    detectedClipEnd === null
+      ? configuredClipEnd
+      : shouldUseDetectedDurationAsMax || shouldAutoExtendNearFullClip
+      ? detectedClipEnd
+      : Math.max(clipStart + 1, Math.min(configuredClipEnd, detectedClipEnd));
   const clipDuration = Math.max(1, clipEnd - clipStart);
   const showCaptions = captionsEnabled;
   const captionCues = useMemo(
@@ -167,6 +218,14 @@ export function ReelCard({
         .sort((a, b) => a.start - b.start),
     [reel.captions],
   );
+
+  useEffect(() => {
+    setDetectedDurationSec(null);
+  }, [reel.reel_id]);
+
+  useEffect(() => {
+    setCurrentSec((prev) => clamp(prev, 0, clipDuration));
+  }, [clipDuration]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -247,15 +306,27 @@ export function ReelCard({
     }
   }, []);
 
+  const syncDetectedDurationFromPlayer = useCallback((player: YouTubePlayer | null) => {
+    if (!isYouTubeVideo || !shouldUseDetectedDurationAsMax || detectedDurationSec !== null || !player) {
+      return;
+    }
+    const raw = Number(player.getDuration?.());
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return;
+    }
+    setDetectedDurationSec(raw);
+  }, [detectedDurationSec, isYouTubeVideo, shouldUseDetectedDurationAsMax]);
+
   const syncProgress = useCallback(() => {
     const player = playerRef.current;
     if (!player) {
       return;
     }
+    syncDetectedDurationFromPlayer(player);
     const now = clamp(player.getCurrentTime(), clipStart, clipEnd);
     const rel = clamp(now - clipStart, 0, clipDuration);
     setCurrentSec(rel);
-  }, [clipDuration, clipEnd, clipStart]);
+  }, [clipDuration, clipEnd, clipStart, syncDetectedDurationFromPlayer]);
 
   const startProgressTimer = useCallback(() => {
     stopProgressTimer();
@@ -264,6 +335,7 @@ export function ReelCard({
       if (!player) {
         return;
       }
+      syncDetectedDurationFromPlayer(player);
       const now = clamp(player.getCurrentTime(), clipStart, clipEnd);
       if (now >= clipEnd - 0.15) {
         player.seekTo(clipStart, true);
@@ -274,7 +346,17 @@ export function ReelCard({
       const rel = clamp(now - clipStart, 0, clipDuration);
       setCurrentSec(rel);
     }, 160);
-  }, [clipDuration, clipEnd, clipStart, isActive, stopProgressTimer]);
+  }, [clipDuration, clipEnd, clipStart, isActive, stopProgressTimer, syncDetectedDurationFromPlayer]);
+
+  useEffect(() => {
+    if (!isYouTubeVideo || !isActive || !isReady || !isPlaying) {
+      return;
+    }
+    startProgressTimer();
+    return () => {
+      stopProgressTimer();
+    };
+  }, [clipDuration, clipEnd, clipStart, isActive, isPlaying, isReady, isYouTubeVideo, startProgressTimer, stopProgressTimer]);
 
   const clearRevealTimer = useCallback(() => {
     if (revealTimerRef.current) {
@@ -351,6 +433,15 @@ export function ReelCard({
     if (!isActive) {
       return;
     }
+    if (!isYouTubeVideo) {
+      setIsReady(true);
+      setIsPlaying(true);
+      setCurrentSec(0);
+      setIsSurfaceVisible(true);
+      setIsResumeMaskVisible(false);
+      setLoadError(null);
+      return;
+    }
     if (!videoId) {
       setLoadError("Invalid YouTube clip URL");
       return;
@@ -388,7 +479,6 @@ export function ReelCard({
             iv_load_policy: 3,
             modestbranding: 1,
             start: clipStart,
-            end: clipEnd,
             mute: 1,
             enablejsapi: 1,
             origin: window.location.origin,
@@ -398,11 +488,13 @@ export function ReelCard({
               if (cancelled) {
                 return;
               }
+              syncDetectedDurationFromPlayer(event.target as YouTubePlayer);
               const tryAutoplay = () => {
                 if (cancelled || !isActive || didUserInteractRef.current) {
                   return;
                 }
                 event.target.mute();
+                setIsMuted(true);
                 event.target.seekTo(clipStart, true);
                 event.target.playVideo();
               };
@@ -444,6 +536,7 @@ export function ReelCard({
               if (cancelled) {
                 return;
               }
+              syncDetectedDurationFromPlayer(event.target as YouTubePlayer);
               const state = event.data;
               const playerState = yt.PlayerState;
               if (state === playerState.PLAYING) {
@@ -465,6 +558,7 @@ export function ReelCard({
                     }
                     autoplayRetryCountRef.current += 1;
                     event.target.mute();
+                    setIsMuted(true);
                     event.target.seekTo(clipStart, true);
                     event.target.playVideo();
                   }, AUTOPLAY_RETRY_DELAY_MS);
@@ -484,6 +578,7 @@ export function ReelCard({
                   autoplayRetryCountRef.current += 1;
                 }
                 event.target.mute();
+                setIsMuted(true);
                 event.target.playVideo();
               }
             },
@@ -520,7 +615,6 @@ export function ReelCard({
     clearHostContainer,
     clearRevealTimer,
     clearResumeMaskTimer,
-    clipEnd,
     clipStart,
     isActive,
     scheduleSurfaceReveal,
@@ -528,13 +622,18 @@ export function ReelCard({
     startProgressTimer,
     stopProgressTimer,
     syncProgress,
+    syncDetectedDurationFromPlayer,
     videoId,
+    isYouTubeVideo,
     destroyPlayerSafely,
     clearAutoplayRetryTimer,
   ]);
 
   useEffect(() => {
     setIsMuted(mutedPreference);
+    if (!isYouTubeVideo) {
+      return;
+    }
     const player = playerRef.current;
     if (!player || !isActive || !isReady) {
       return;
@@ -549,9 +648,12 @@ export function ReelCard({
     } else {
       player.unMute();
     }
-  }, [isActive, isReady, mutedPreference, isTouchLikeDevice]);
+  }, [isActive, isPlaying, isReady, mutedPreference, isTouchLikeDevice, isYouTubeVideo]);
 
   const togglePlayPause = useCallback(() => {
+    if (!isYouTubeVideo) {
+      return;
+    }
     const player = playerRef.current;
     if (!player || !isReady) {
       return;
@@ -581,6 +683,7 @@ export function ReelCard({
     isMuted,
     isPlaying,
     isReady,
+    isYouTubeVideo,
     mutedPreference,
     scheduleSurfaceReveal,
     showResumeMask,
@@ -590,6 +693,9 @@ export function ReelCard({
   ]);
 
   const toggleMute = useCallback(() => {
+    if (!isYouTubeVideo) {
+      return;
+    }
     const player = playerRef.current;
     if (!player || !isReady) {
       return;
@@ -605,10 +711,13 @@ export function ReelCard({
       setIsMuted(false);
     }
     onMutedPreferenceChange(nextMuted);
-  }, [clearAutoplayRetryTimer, isMuted, isReady, onMutedPreferenceChange]);
+  }, [clearAutoplayRetryTimer, isMuted, isReady, isYouTubeVideo, onMutedPreferenceChange]);
 
   const onSeek = useCallback(
     (event: React.ChangeEvent<HTMLInputElement>) => {
+      if (!isYouTubeVideo) {
+        return;
+      }
       const player = playerRef.current;
       if (!player || !isReady) {
         return;
@@ -625,7 +734,7 @@ export function ReelCard({
         startProgressTimer();
       }
     },
-    [clipDuration, clipStart, isActive, isPlaying, isReady, scheduleSurfaceReveal, showResumeMask, startProgressTimer],
+    [clipDuration, clipStart, isActive, isPlaying, isReady, isYouTubeVideo, scheduleSurfaceReveal, showResumeMask, startProgressTimer],
   );
 
   const stopFeedGesturePropagation = useCallback((event: React.SyntheticEvent<HTMLElement>) => {
@@ -680,11 +789,11 @@ export function ReelCard({
     };
   }, [isActive, toggleCaptions, toggleMute, togglePlayPause]);
 
-  const hidePlayerSurface = isActive && (!isReady || !isPlaying || !isSurfaceVisible || Boolean(loadError));
-  const showTransitionMask = isActive && isResumeMaskVisible;
-  const canToggleFromSurface = isActive && isReady && !loadError;
+  const hidePlayerSurface = isActive && isYouTubeVideo && (!isReady || !isPlaying || !isSurfaceVisible || Boolean(loadError));
+  const showTransitionMask = isActive && isYouTubeVideo && isResumeMaskVisible;
+  const canToggleFromSurface = isYouTubeVideo && isActive && isReady && !loadError;
   const surfaceAriaLabel = isPlaying ? "Pause clip" : "Play clip";
-  const controlsEnabled = isReady && isActive;
+  const controlsEnabled = isReady && isActive && isYouTubeVideo;
   const activeCaptionText = useMemo(() => {
     if (!showCaptions) {
       return "";
@@ -716,18 +825,26 @@ export function ReelCard({
   const controlsChromeClass = isMobilePhoneDevice
     ? "rounded-2xl border border-white/20 bg-black/70 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.38)] backdrop-blur-md"
     : "px-0 py-0";
-  const hostContainerClass = "pointer-events-none absolute inset-0 h-full w-full";
-  const hostContainerStyle = undefined;
 
   return (
     <section className="relative h-full min-h-full w-full snap-start overflow-hidden rounded-none border-0 bg-transparent lg:rounded-3xl lg:border lg:border-white/20">
       {isActive ? (
         <div className="absolute inset-0 overflow-hidden">
-          <div
-            ref={hostContainerRef}
-            className={hostContainerClass}
-            style={hostContainerStyle}
-          />
+          {isYouTubeVideo ? (
+            <div
+              ref={hostContainerRef}
+              className="pointer-events-none absolute inset-0 h-full w-full"
+            />
+          ) : (
+            <iframe
+              src={reel.video_url}
+              title={reel.video_title || reel.concept_title || "Community reel"}
+              className="absolute inset-0 h-full w-full border-0"
+              loading="eager"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+              allowFullScreen
+            />
+          )}
         </div>
       ) : (
         <div className="flex h-full w-full items-center justify-center bg-black/70 text-xs uppercase tracking-[0.12em] text-white/55">
@@ -749,7 +866,7 @@ export function ReelCard({
 
       <div className="pointer-events-none absolute inset-x-0 top-0 z-[16] h-16 bg-black/95" />
 
-      {isActive ? (
+      {isActive && isYouTubeVideo ? (
         <button
           type="button"
           aria-label={surfaceAriaLabel}
@@ -759,7 +876,7 @@ export function ReelCard({
         />
       ) : null}
 
-      {isActive && isReady && !isPlaying && !loadError ? (
+      {isActive && isYouTubeVideo && isReady && !isPlaying && !loadError ? (
         <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
           <div className="grid h-14 w-14 place-items-center rounded-full border border-white/28 bg-black/78 text-white/90">
             <i className="fa-solid fa-play text-base" aria-hidden="true" />
@@ -776,7 +893,7 @@ export function ReelCard({
         className="absolute inset-x-0 bottom-0 z-20 p-3"
       >
         <div className={controlsChromeClass}>
-          {showCaptions && activeCaptionText ? (
+          {isYouTubeVideo && showCaptions && activeCaptionText ? (
             <div className="mb-2 flex justify-center px-1">
               <p className={captionClass}>
                 {activeCaptionText}
@@ -787,7 +904,7 @@ export function ReelCard({
           <div className="mb-2 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <div className="inline-flex h-9 items-center rounded-full border border-white/30 bg-black/82 px-3 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/92">
-                {formatClock(currentSec)} / {formatClock(clipDuration)}
+                {isYouTubeVideo ? `${formatClock(currentSec)} / ${formatClock(clipDuration)}` : "Embedded Reel"}
               </div>
               {onOpenContent ? (
                 <button
@@ -801,52 +918,69 @@ export function ReelCard({
               ) : null}
             </div>
             <div className="flex items-center gap-2">
-              <button
-                type="button"
-                data-reel-control="true"
-                onClick={togglePlayPause}
-                className={controlButtonClass(Boolean(isPlaying))}
-                disabled={!controlsEnabled}
-                aria-label={isPlaying ? "Pause" : "Play"}
-                title={isPlaying ? "Pause" : "Play"}
-              >
-                <i className={`fa-solid ${isPlaying ? "fa-pause" : "fa-play"}`} aria-hidden="true" />
-              </button>
-              <button
-                type="button"
-                data-reel-control="true"
-                onClick={toggleMute}
-                className={controlButtonClass(!isMuted)}
-                disabled={!controlsEnabled}
-                aria-label={isMuted ? "Unmute" : "Mute"}
-              >
-                <i className={`fa-solid ${isMuted ? "fa-volume-xmark" : "fa-volume-high"}`} aria-hidden="true" />
-              </button>
-              <button
-                type="button"
-                data-reel-control="true"
-                onClick={toggleCaptions}
-                className={controlButtonClass(showCaptions)}
-                disabled={!controlsEnabled}
-                aria-label={showCaptions ? "Hide captions" : "Show captions"}
-                title={showCaptions ? "Hide captions" : "Show captions"}
-              >
-                <i className="fa-regular fa-closed-captioning" aria-hidden="true" />
-              </button>
+              {isYouTubeVideo ? (
+                <>
+                  <button
+                    type="button"
+                    data-reel-control="true"
+                    onClick={togglePlayPause}
+                    className={controlButtonClass(Boolean(isPlaying))}
+                    disabled={!controlsEnabled}
+                    aria-label={isPlaying ? "Pause" : "Play"}
+                    title={isPlaying ? "Pause" : "Play"}
+                  >
+                    <i className={`fa-solid ${isPlaying ? "fa-pause" : "fa-play"}`} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    data-reel-control="true"
+                    onClick={toggleMute}
+                    className={controlButtonClass(!isMuted)}
+                    disabled={!controlsEnabled}
+                    aria-label={isMuted ? "Unmute" : "Mute"}
+                  >
+                    <i className={`fa-solid ${isMuted ? "fa-volume-xmark" : "fa-volume-high"}`} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    data-reel-control="true"
+                    onClick={toggleCaptions}
+                    className={controlButtonClass(showCaptions)}
+                    disabled={!controlsEnabled}
+                    aria-label={showCaptions ? "Hide captions" : "Show captions"}
+                    title={showCaptions ? "Hide captions" : "Show captions"}
+                  >
+                    <i className="fa-regular fa-closed-captioning" aria-hidden="true" />
+                  </button>
+                </>
+              ) : (
+                <a
+                  href={reel.video_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex h-8 items-center rounded-full border-[0.8px] border-white/30 px-3 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/90 transition hover:bg-white/10"
+                >
+                  Open
+                </a>
+              )}
             </div>
           </div>
 
-          <input
-            data-reel-control="true"
-            type="range"
-            min={0}
-            max={clipDuration}
-            step={0.1}
-            value={currentSec}
-            onChange={onSeek}
-            className="reel-range h-1.5 w-full cursor-pointer disabled:opacity-40"
-            disabled={!controlsEnabled}
-          />
+          {isYouTubeVideo ? (
+            <input
+              data-reel-control="true"
+              type="range"
+              min={0}
+              max={clipDuration}
+              step={0.1}
+              value={currentSec}
+              onChange={onSeek}
+              className="reel-range h-1.5 w-full cursor-pointer disabled:opacity-40"
+              disabled={!controlsEnabled}
+            />
+          ) : (
+            <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/60">Platform-managed playback</p>
+          )}
 
           {loadError ? <p className="mt-2 inline-flex rounded-full bg-black/76 px-3 py-1 text-xs text-white/78">{loadError}</p> : null}
         </div>

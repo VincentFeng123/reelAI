@@ -142,6 +142,8 @@ class CommunityReelIn(BaseModel):
     platform: Literal["youtube", "instagram", "tiktok"]
     source_url: str = Field(min_length=1)
     embed_url: str = Field(min_length=1)
+    t_start_sec: float | None = Field(default=None, ge=0)
+    t_end_sec: float | None = Field(default=None, ge=0)
 
 
 class CommunityReelOut(BaseModel):
@@ -149,9 +151,20 @@ class CommunityReelOut(BaseModel):
     platform: Literal["youtube", "instagram", "tiktok"]
     source_url: str
     embed_url: str
+    t_start_sec: float | None = None
+    t_end_sec: float | None = None
 
 
 class CommunitySetCreateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=140)
+    description: str = Field(min_length=18, max_length=2000)
+    tags: list[str] = Field(default_factory=list)
+    reels: list[CommunityReelIn] = Field(default_factory=list)
+    thumbnail_url: str = Field(min_length=1)
+    curator: str | None = None
+
+
+class CommunitySetUpdateRequest(BaseModel):
     title: str = Field(min_length=1, max_length=140)
     description: str = Field(min_length=18, max_length=2000)
     tags: list[str] = Field(default_factory=list)

@@ -264,6 +264,8 @@ type CommunitySetApi = {
     platform: CommunityReelPlatform;
     source_url: string;
     embed_url: string;
+    t_start_sec?: number;
+    t_end_sec?: number;
   }>;
   reel_count: number;
   curator: string;
@@ -299,11 +301,19 @@ function normalizeCommunitySet(raw: unknown): CommunitySet | null {
           if (!sourceUrl || !embedUrl) {
             return null;
           }
+          const tStartRaw = Number(reel.t_start_sec);
+          const tEndRaw = Number(reel.t_end_sec);
+          const hasStart = Number.isFinite(tStartRaw) && tStartRaw >= 0;
+          const hasEnd = Number.isFinite(tEndRaw) && tEndRaw > 0;
+          const tStartSec = hasStart ? tStartRaw : undefined;
+          const tEndSec = hasEnd && (!hasStart || tEndRaw > tStartRaw) ? tEndRaw : undefined;
           return {
             id: typeof reel.id === "string" && reel.id.trim() ? reel.id.trim() : `community-reel-${Math.random().toString(36).slice(2, 10)}`,
             platform,
             sourceUrl,
             embedUrl,
+            tStartSec,
+            tEndSec,
           };
         })
         .filter(Boolean) as CommunitySet["reels"]
@@ -346,6 +356,8 @@ export async function createCommunitySet(params: {
     platform: CommunityReelPlatform;
     sourceUrl: string;
     embedUrl: string;
+    tStartSec?: number;
+    tEndSec?: number;
   }>;
   thumbnailUrl: string;
   curator?: string;
@@ -363,6 +375,8 @@ export async function createCommunitySet(params: {
         platform: reel.platform,
         source_url: reel.sourceUrl,
         embed_url: reel.embedUrl,
+        ...(Number.isFinite(reel.tStartSec) ? { t_start_sec: Number(reel.tStartSec) } : {}),
+        ...(Number.isFinite(reel.tEndSec) ? { t_end_sec: Number(reel.tEndSec) } : {}),
       })),
       thumbnail_url: params.thumbnailUrl,
       curator: params.curator,
@@ -374,6 +388,73 @@ export async function createCommunitySet(params: {
     throw new Error("Backend returned an invalid community set payload.");
   }
   return created;
+}
+
+export async function updateCommunitySet(params: {
+  setId: string;
+  title: string;
+  description: string;
+  tags: string[];
+  reels: Array<{
+    platform: CommunityReelPlatform;
+    sourceUrl: string;
+    embedUrl: string;
+    tStartSec?: number;
+    tEndSec?: number;
+  }>;
+  thumbnailUrl: string;
+  curator?: string;
+}): Promise<CommunitySet> {
+  const setId = params.setId.trim();
+  if (!setId) {
+    throw new Error("setId is required.");
+  }
+
+  const res = await safeFetch(apiUrl(`/community/sets/${encodeURIComponent(setId)}`), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      title: params.title,
+      description: params.description,
+      tags: params.tags,
+      reels: params.reels.map((reel) => ({
+        platform: reel.platform,
+        source_url: reel.sourceUrl,
+        embed_url: reel.embedUrl,
+        ...(Number.isFinite(reel.tStartSec) ? { t_start_sec: Number(reel.tStartSec) } : {}),
+        ...(Number.isFinite(reel.tEndSec) ? { t_end_sec: Number(reel.tEndSec) } : {}),
+      })),
+      thumbnail_url: params.thumbnailUrl,
+      curator: params.curator,
+    }),
+  });
+
+  const updated = normalizeCommunitySet(await res.json());
+  if (!updated) {
+    throw new Error("Backend returned an invalid community set payload.");
+  }
+  return updated;
+}
+
+export async function fetchCommunityReelDuration(params: {
+  sourceUrl: string;
+}): Promise<number | null> {
+  const sourceUrl = params.sourceUrl.trim();
+  if (!sourceUrl) {
+    return null;
+  }
+  const query = new URLSearchParams({ source_url: sourceUrl });
+  const res = await safeFetch(`${apiUrl("/community/reels/duration")}?${query.toString()}`, {
+    cache: "no-store",
+  });
+  const json = await res.json();
+  const durationRaw = Number(json?.duration_sec);
+  if (!Number.isFinite(durationRaw) || durationRaw <= 0) {
+    return null;
+  }
+  return durationRaw;
 }
 
 type SafeFetchInit = RequestInit & {

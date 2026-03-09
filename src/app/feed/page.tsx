@@ -37,6 +37,7 @@ const MAX_SAVED_FEED_PROGRESS = 240;
 const MAX_SAVED_FEED_SESSIONS = 24;
 const MAX_REELS_PER_FEED_SESSION = 80;
 const MAX_EMPTY_GENERATION_STREAK = 10;
+const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
 type FeedbackAction = "helpful" | "confusing" | "save";
 
 type FeedTuningSettings = {
@@ -79,6 +80,20 @@ type FeedSessionSnapshot = {
   activeIndex: number;
   activeReelId?: string;
   updatedAt: number;
+};
+
+type CommunityFeedHandoffPayload = {
+  setId: string;
+  setTitle: string;
+  selectedReelId?: string;
+  reels: Array<{
+    id: string;
+    platform: string;
+    sourceUrl: string;
+    embedUrl: string;
+    tStartSec?: number;
+    tEndSec?: number;
+  }>;
 };
 
 function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
@@ -182,8 +197,181 @@ function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapsh
   }
 }
 
+function parseCommunityFeedHandoff(raw: string | null): CommunityFeedHandoffPayload | null {
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    const row = parsed as Record<string, unknown>;
+    const setId = typeof row.setId === "string" ? row.setId.trim() : "";
+    const setTitle = typeof row.setTitle === "string" ? row.setTitle.trim() : "";
+    const selectedReelId = typeof row.selectedReelId === "string" ? row.selectedReelId.trim() : "";
+    const reelsRaw = Array.isArray(row.reels) ? row.reels : [];
+    const reels = reelsRaw
+      .map((entry) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          return null;
+        }
+        const reel = entry as Record<string, unknown>;
+        const id = typeof reel.id === "string" ? reel.id.trim() : "";
+        const platform = typeof reel.platform === "string" ? reel.platform.trim().toLowerCase() : "";
+        const sourceUrl = typeof reel.sourceUrl === "string" ? reel.sourceUrl.trim() : "";
+        const embedUrl = typeof reel.embedUrl === "string" ? reel.embedUrl.trim() : "";
+        if (!id || !platform || !sourceUrl || !embedUrl) {
+          return null;
+        }
+        const tStartRaw = Number(reel.tStartSec);
+        const tEndRaw = Number(reel.tEndSec);
+        const tStartSec = Number.isFinite(tStartRaw) && tStartRaw >= 0 ? tStartRaw : undefined;
+        const tEndSec = Number.isFinite(tEndRaw) && tEndRaw > 0 ? tEndRaw : undefined;
+        return { id, platform, sourceUrl, embedUrl, tStartSec, tEndSec };
+      })
+      .filter(Boolean) as CommunityFeedHandoffPayload["reels"];
+
+    if (!setId || reels.length === 0) {
+      return null;
+    }
+    return {
+      setId,
+      setTitle: setTitle || "Community Reel",
+      selectedReelId: selectedReelId || undefined,
+      reels,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+function sanitizeAbsoluteUrl(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
+  try {
+    return new URL(trimmed).toString();
+  } catch {
+    return "";
+  }
+}
+
+function getCommunityPlatformLabel(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "youtube") {
+    return "YouTube";
+  }
+  if (normalized === "instagram") {
+    return "Instagram";
+  }
+  if (normalized === "tiktok") {
+    return "TikTok";
+  }
+  return "Community";
+}
+
+function buildCommunityFeedReelId(setId: string, reelId: string): string {
+  return `community:${encodeURIComponent(setId)}:${encodeURIComponent(reelId)}`;
+}
+
+function normalizeClipRange(startRaw: unknown, endRaw: unknown): { start: number; end: number; hasExplicitEnd: boolean } {
+  const parsedStart = Number(startRaw);
+  const parsedEnd = Number(endRaw);
+  const hasStart = Number.isFinite(parsedStart) && parsedStart >= 0;
+  const hasEnd = Number.isFinite(parsedEnd) && parsedEnd > 0;
+  const start = hasStart ? parsedStart : 0;
+  const end = hasEnd && parsedEnd > start ? parsedEnd : start + 180;
+  const hasExplicitEnd = hasEnd && parsedEnd > start;
+  return { start, end, hasExplicitEnd };
+}
+
+function buildCommunityFeedReel(params: {
+  setId: string;
+  setTitle: string;
+  reelId: string;
+  platform: string;
+  reelUrl: string;
+  sourceUrl: string;
+  tStartSec?: unknown;
+  tEndSec?: unknown;
+}): Reel | null {
+  const videoUrl = sanitizeAbsoluteUrl(params.reelUrl) || sanitizeAbsoluteUrl(params.sourceUrl);
+  if (!videoUrl) {
+    return null;
+  }
+  const sourceUrl = sanitizeAbsoluteUrl(params.sourceUrl);
+  const safeSetId = params.setId.trim() || "community-set";
+  const normalizedReelId = params.reelId.trim() || videoUrl;
+  const title = params.setTitle.trim() || "Community Reel";
+  const platformLabel = getCommunityPlatformLabel(params.platform);
+  const sourceSnippet = sourceUrl || "Opened from Community Reels.";
+  const clipRange = normalizeClipRange(params.tStartSec, params.tEndSec);
+  const clipDurationSec = clipRange.hasExplicitEnd ? Math.max(0, clipRange.end - clipRange.start) : undefined;
+
+  return {
+    reel_id: buildCommunityFeedReelId(safeSetId, normalizedReelId),
+    concept_id: safeSetId,
+    concept_title: title,
+    video_title: `${title} (${platformLabel})`,
+    video_description: sourceUrl ? `Source: ${sourceUrl}` : `${platformLabel} reel`,
+    ai_summary: "Imported from Community Reels.",
+    video_url: videoUrl,
+    t_start: clipRange.start,
+    t_end: clipRange.end,
+    ...(Number.isFinite(clipDurationSec) && Number(clipDurationSec) > 0 ? { clip_duration_sec: clipDurationSec } : {}),
+    community_has_explicit_end: clipRange.hasExplicitEnd,
+    transcript_snippet: sourceSnippet,
+    takeaways: [],
+    score: 1,
+    relevance_score: 1,
+    matched_terms: [],
+    relevance_reason: "Opened from a community set.",
+  };
+}
+
+function buildCommunityPreviewReel(params: {
+  setId: string;
+  setTitle: string;
+  reelId: string;
+  platform: string;
+  reelUrl: string;
+  sourceUrl: string;
+  tStartSec?: string;
+  tEndSec?: string;
+}): Reel | null {
+  return buildCommunityFeedReel({
+    setId: params.setId,
+    setTitle: params.setTitle,
+    reelId: params.reelId,
+    platform: params.platform,
+    reelUrl: params.reelUrl,
+    sourceUrl: params.sourceUrl,
+    tStartSec: params.tStartSec,
+    tEndSec: params.tEndSec,
+  });
+}
+
+function buildCommunityFeedReelsFromHandoff(payload: CommunityFeedHandoffPayload): Reel[] {
+  return payload.reels
+    .map((reel) =>
+      buildCommunityFeedReel({
+        setId: payload.setId,
+        setTitle: payload.setTitle,
+        reelId: reel.id,
+        platform: reel.platform,
+        reelUrl: reel.embedUrl || reel.sourceUrl,
+        sourceUrl: reel.sourceUrl,
+        tStartSec: reel.tStartSec,
+        tEndSec: reel.tEndSec,
+      }),
+    )
+    .filter(Boolean) as Reel[];
 }
 
 function FeedPageInner() {
@@ -191,6 +379,41 @@ function FeedPageInner() {
   const router = useRouter();
   const materialId = params.get("material_id") || "";
   const generationModeParam = params.get("generation_mode");
+  const communitySetIdParam = params.get("community_set_id") || "";
+  const communitySetTitleParam = params.get("community_set_title") || "";
+  const communityReelIdParam = params.get("community_reel_id") || "";
+  const communityReelPlatformParam = params.get("community_reel_platform") || "";
+  const communityReelUrlParam = params.get("community_reel_url") || "";
+  const communityReelSourceUrlParam = params.get("community_reel_source_url") || "";
+  const communityStartSecParam = params.get("community_t_start_sec") || "";
+  const communityEndSecParam = params.get("community_t_end_sec") || "";
+  const communityHandoffIdParam = params.get("community_handoff_id") || "";
+  const returnTabParam = params.get("return_tab") || "";
+  const returnCommunitySetIdParam = params.get("return_community_set_id") || "";
+
+  const communityPreviewReel = useMemo(
+    () =>
+      buildCommunityPreviewReel({
+        setId: communitySetIdParam,
+        setTitle: communitySetTitleParam,
+        reelId: communityReelIdParam,
+        platform: communityReelPlatformParam,
+        reelUrl: communityReelUrlParam,
+        sourceUrl: communityReelSourceUrlParam,
+        tStartSec: communityStartSecParam,
+        tEndSec: communityEndSecParam,
+      }),
+    [
+      communityEndSecParam,
+      communityReelIdParam,
+      communityReelPlatformParam,
+      communityReelSourceUrlParam,
+      communityReelUrlParam,
+      communityStartSecParam,
+      communitySetIdParam,
+      communitySetTitleParam,
+    ],
+  );
 
   const [reels, setReels] = useState<Reel[]>([]);
   const [page, setPage] = useState(1);
@@ -602,6 +825,48 @@ function FeedPageInner() {
       pendingResumeRef.current = null;
       resumeAppliedRef.current = false;
       resumeLoadingRef.current = false;
+      let communityRows = communityPreviewReel ? [communityPreviewReel] : [];
+      let preferredCommunityReelId = communityPreviewReel?.reel_id || "";
+      if (typeof window !== "undefined" && communityHandoffIdParam) {
+        const storageKey = `${COMMUNITY_SET_FEED_HANDOFF_PREFIX}${communityHandoffIdParam}`;
+        const handoffPayload = parseCommunityFeedHandoff(window.sessionStorage.getItem(storageKey));
+        if (handoffPayload) {
+          const handoffRows = buildCommunityFeedReelsFromHandoff(handoffPayload);
+          if (handoffRows.length > 0) {
+            communityRows = handoffRows;
+            const selectedReelId = handoffPayload.selectedReelId?.trim();
+            preferredCommunityReelId =
+              selectedReelId
+                ? buildCommunityFeedReelId(handoffPayload.setId, selectedReelId)
+                : handoffRows[0].reel_id;
+          }
+        }
+        window.sessionStorage.removeItem(storageKey);
+      }
+      setReels(communityRows);
+      setPage(1);
+      setTotal(communityRows.length);
+      setCanRequestMore(false);
+      if (communityRows.length === 0) {
+        setActiveIndex(0);
+      } else if (preferredCommunityReelId) {
+        const preferredIndex = communityRows.findIndex((reel) => reel.reel_id === preferredCommunityReelId);
+        setActiveIndex(preferredIndex >= 0 ? preferredIndex : 0);
+      } else {
+        setActiveIndex(0);
+      }
+      setFeedbackByReel({});
+      setPendingAction(null);
+      setChatByReel({});
+      setChatInput("");
+      setChatLoading(false);
+      setChatError(null);
+      setError(null);
+      setMobileDetailsOpen(false);
+      setBootstrappingFirstReels(false);
+      setGeneratingMore(false);
+      emptyGenerateStreakRef.current = 0;
+      bootstrapAttemptedRef.current = false;
       setLoading(false);
       return;
     }
@@ -616,12 +881,7 @@ function FeedPageInner() {
     if (typeof window !== "undefined") {
       const allProgress = parseFeedProgress(window.localStorage.getItem(FEED_PROGRESS_STORAGE_KEY));
       resumeTarget = allProgress[materialId] ?? null;
-      // Force fresh single-topic feed by dropping any previously saved session snapshot.
       const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));
-      if (allSessions[materialId]) {
-        delete allSessions[materialId];
-        window.localStorage.setItem(FEED_SESSION_STORAGE_KEY, JSON.stringify(allSessions));
-      }
       restoredSession = allSessions[materialId] ?? null;
     }
     materialIdsForFeedRef.current = Array.from(new Set(feedMaterialIds));
@@ -669,7 +929,7 @@ function FeedPageInner() {
     if (!restoredSession || restoredSession.reels.length === 0) {
       void loadPage(1, { autofill: true });
     }
-  }, [dedupeByIdentity, generationModeParam, materialId, loadPage]);
+  }, [communityHandoffIdParam, communityPreviewReel, dedupeByIdentity, generationModeParam, materialId, loadPage]);
 
   useEffect(() => {
     if (!materialId || sessionHydrated || loading) {
@@ -1525,16 +1785,64 @@ function FeedPageInner() {
     </button>
   );
   const rightTopPercent = Math.round(rightTopRatio * 1000) / 10;
+  const feedFallbackPath = useMemo(() => {
+    if (returnTabParam === "search") {
+      return "/?tab=search";
+    }
+    if (returnTabParam === "community") {
+      const nextParams = new URLSearchParams();
+      nextParams.set("tab", "community");
+      const returnSetId = returnCommunitySetIdParam.trim() || communitySetIdParam;
+      if (returnSetId) {
+        nextParams.set("community_set_id", returnSetId);
+      }
+      return `/?${nextParams.toString()}`;
+    }
+    if (communitySetIdParam || communityPreviewReel || communityHandoffIdParam) {
+      const nextParams = new URLSearchParams();
+      nextParams.set("tab", "community");
+      if (communitySetIdParam) {
+        nextParams.set("community_set_id", communitySetIdParam);
+      }
+      return `/?${nextParams.toString()}`;
+    }
+    return "/?tab=search";
+  }, [communityHandoffIdParam, communityPreviewReel, communitySetIdParam, returnCommunitySetIdParam, returnTabParam]);
 
-  if (!materialId) {
+  const navigateBackToPreviousPage = useCallback(() => {
+    if (returnTabParam === "search" || returnTabParam === "community") {
+      router.push(feedFallbackPath);
+      return;
+    }
+    if (typeof window !== "undefined") {
+      const hasHistory = window.history.length > 1;
+      let hasSameOriginReferrer = false;
+      try {
+        if (!document.referrer) {
+          hasSameOriginReferrer = true;
+        } else {
+          hasSameOriginReferrer = new URL(document.referrer).origin === window.location.origin;
+        }
+      } catch {
+        hasSameOriginReferrer = false;
+      }
+      if (hasHistory && hasSameOriginReferrer) {
+        router.back();
+        return;
+      }
+    }
+    router.push(feedFallbackPath);
+  }, [feedFallbackPath, returnTabParam, router]);
+
+  if (!materialId && !communityPreviewReel && !communityHandoffIdParam) {
     return (
       <main className="fixed inset-0 px-6 md:inset-4">
         <div className="flex h-full items-center justify-center">
           <div className="rounded-3xl border border-white/25 bg-black/60 p-6 text-center text-white backdrop-blur-sm">
-            <p className="text-sm">Missing material_id.</p>
+            <p className="text-sm">Missing material_id or community reel selection.</p>
             <button
               className="mt-4 rounded-2xl border border-white/25 bg-white px-4 py-2 text-xs font-semibold text-black"
-              onClick={() => router.push("/")}
+              onClick={navigateBackToPreviousPage}
             >
               Back to Upload
             </button>
@@ -1548,7 +1856,7 @@ function FeedPageInner() {
     <main className="fixed inset-0 overflow-visible md:inset-4 md:overflow-hidden">
       <button
         type="button"
-        onClick={() => router.push("/")}
+        onClick={navigateBackToPreviousPage}
         aria-label="Back to main page"
         className="absolute left-3 top-3 z-[9999] grid h-9 w-9 place-items-center rounded-xl border border-white/20 bg-black/50 text-white shadow-[0_8px_24px_rgba(0,0,0,0.35)] backdrop-blur-md transition hover:bg-white/12"
       >

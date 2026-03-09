@@ -1,7 +1,7 @@
 "use client";
 
 import { type MouseEvent as ReactMouseEvent, type UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 
 import { CommunityReelsPanel } from "@/components/CommunityReelsPanel";
 import { type SettingsPanelHandle, SettingsPanel } from "@/components/SettingsPanel";
@@ -23,7 +23,7 @@ const SIDEBAR_INFO_TOOLTIP_VISIBLE_MS = 2200;
 const SIDEBAR_INFO_TOOLTIP_FADE_MS = 180;
 const SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS = 24;
 type GenerationMode = "slow" | "fast";
-type SidebarTab = "search" | "community" | "create" | "settings";
+type SidebarTab = "search" | "community" | "create" | "edit" | "settings";
 type SidebarSwitchIntent = {
   tab: SidebarTab;
   clearHistoryQuery?: boolean;
@@ -36,6 +36,13 @@ type HistoryItem = {
   starred: boolean;
   generationMode: GenerationMode;
 };
+
+function normalizeSidebarTab(value: string | null): SidebarTab | null {
+  if (value === "search" || value === "community" || value === "create" || value === "edit" || value === "settings") {
+    return value;
+  }
+  return null;
+}
 
 function parseMaterialHistory(raw: string | null): HistoryItem[] {
   if (!raw) {
@@ -119,6 +126,16 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
 
 export default function HomePage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const forcedSidebarTab = useMemo(() => normalizeSidebarTab(searchParams.get("tab")), [searchParams]);
+  const forcedCommunitySetId = useMemo(() => {
+    const raw = searchParams.get("community_set_id");
+    if (!raw) {
+      return null;
+    }
+    const trimmed = raw.trim();
+    return trimmed || null;
+  }, [searchParams]);
   const [historyQuery, setHistoryQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -161,6 +178,11 @@ export default function HomePage() {
     if (typeof window === "undefined") {
       return;
     }
+    if (forcedSidebarTab) {
+      setActiveSidebarTab(forcedSidebarTab);
+      setSidebarTabHydrated(true);
+      return;
+    }
     const navigationEntry = window.performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
     const shouldRestoreTab = navigationEntry?.type === "reload";
     if (!shouldRestoreTab) {
@@ -169,11 +191,11 @@ export default function HomePage() {
       return;
     }
     const savedTab = window.sessionStorage.getItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY);
-    if (savedTab === "search" || savedTab === "community" || savedTab === "create" || savedTab === "settings") {
+    if (savedTab === "search" || savedTab === "community" || savedTab === "create" || savedTab === "edit" || savedTab === "settings") {
       setActiveSidebarTab(savedTab as SidebarTab);
     }
     setSidebarTabHydrated(true);
-  }, []);
+  }, [forcedSidebarTab]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !sidebarTabHydrated) {
@@ -474,9 +496,15 @@ export default function HomePage() {
       setActiveHistoryMenuId(null);
       forceCloseMobileSidebar();
       const mode = existing?.generationMode ?? "fast";
-      router.push(`/feed?material_id=${materialId}&generation_mode=${mode}`);
+      const returnTab = activeSidebarTab === "community" || activeSidebarTab === "create" || activeSidebarTab === "edit" ? "community" : "search";
+      const nextParams = new URLSearchParams({
+        material_id: materialId,
+        generation_mode: mode,
+        return_tab: returnTab,
+      });
+      router.push(`/feed?${nextParams.toString()}`);
     },
-    [forceCloseMobileSidebar, router, upsertHistory],
+    [activeSidebarTab, forceCloseMobileSidebar, router, upsertHistory],
   );
 
   const toggleHistoryStar = useCallback(
@@ -593,13 +621,13 @@ export default function HomePage() {
     },
     [applySidebarSwitchIntent, pendingSaveSwitchUntilHeuristicClose, pendingSidebarSwitchIntent],
   );
-  const isCommunityPanel = visibleSidebarTab === "community" || visibleSidebarTab === "create";
+  const isCommunityPanel = visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit";
   const hasCommunityBackdrop = isCommunityPanel || visibleSidebarTab === "settings";
   const hideMobileTopControls = isCommunityPanel && communityDetailOpen;
-  const [lastCommunityPanelMode, setLastCommunityPanelMode] = useState<"community" | "create">("community");
+  const [lastCommunityPanelMode, setLastCommunityPanelMode] = useState<"community" | "create" | "edit">("community");
 
   useEffect(() => {
-    if (activeSidebarTab === "community" || activeSidebarTab === "create") {
+    if (activeSidebarTab === "community" || activeSidebarTab === "create" || activeSidebarTab === "edit") {
       setLastCommunityPanelMode(activeSidebarTab);
     }
   }, [activeSidebarTab]);
@@ -608,6 +636,8 @@ export default function HomePage() {
     ? lastCommunityPanelMode
     : visibleSidebarTab === "create"
       ? "create"
+      : visibleSidebarTab === "edit"
+        ? "edit"
       : "community";
 
   const sidebarPanelContent = (
@@ -702,6 +732,30 @@ export default function HomePage() {
             <i
               className={`fa-solid fa-plus text-[11px] ${
                 visibleSidebarTab === "create" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+              }`}
+              aria-hidden="true"
+            />
+          </div>
+        </button>
+      </div>
+
+      <div
+        className="group relative mt-2"
+        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Edit community sets you already created")}
+        onMouseLeave={onSidebarInfoHoverEnd}
+      >
+        <button
+          type="button"
+          onClick={() => switchSidebarTab("edit")}
+          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+            visibleSidebarTab === "edit" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+          }`}
+        >
+          <div className="flex h-full items-center justify-between gap-1.5">
+            <p className="truncate font-semibold leading-none">Edit Sets</p>
+            <i
+              className={`fa-solid fa-pen-to-square text-[11px] ${
+                visibleSidebarTab === "edit" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
               }`}
               aria-hidden="true"
             />
@@ -877,7 +931,7 @@ export default function HomePage() {
 
       <div
         aria-hidden="true"
-        className={`pointer-events-none fixed inset-x-0 top-0 z-[68] h-[calc(max(env(safe-area-inset-top),0px)+68px)] ${
+          className={`pointer-events-none fixed inset-x-0 top-0 z-[68] h-[calc(max(env(safe-area-inset-top),0px)+68px)] ${
           visibleSidebarTab === "search" ? "transition-none" : "transition-opacity duration-150"
         } lg:hidden ${
           shouldShowTopChromeStrip ? "opacity-100" : "opacity-0"
@@ -885,7 +939,7 @@ export default function HomePage() {
       >
         <div
           className={`h-full w-full ${
-            visibleSidebarTab === "community" || visibleSidebarTab === "settings"
+            visibleSidebarTab === "community" || visibleSidebarTab === "edit" || visibleSidebarTab === "settings"
               ? "bg-black"
               : visibleSidebarTab === "search"
                 ? "relative overflow-hidden bg-white/[0.05] backdrop-blur-[10px] backdrop-saturate-160"
@@ -1010,11 +1064,12 @@ export default function HomePage() {
               onAvailabilityModalClose={onSettingsAvailabilityModalClose}
             />
           </div>
-          <div className={visibleSidebarTab === "community" || visibleSidebarTab === "create" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
+          <div className={visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
             <CommunityReelsPanel
               mode={communityPanelMode}
-              isVisible={visibleSidebarTab === "community" || visibleSidebarTab === "create"}
+              isVisible={visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit"}
               onDetailOpenChange={setCommunityDetailOpen}
+              initialOpenSetId={forcedCommunitySetId}
             />
           </div>
         </section>

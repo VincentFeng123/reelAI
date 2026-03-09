@@ -31,6 +31,7 @@ export type Reel = {
   total_concepts?: number;
   video_duration_sec?: number;
   clip_duration_sec?: number;
+  community_has_explicit_end?: boolean;
 };
 
 export type CaptionCue = {
@@ -89,6 +90,8 @@ export type CommunityReelEmbed = {
   platform: CommunityReelPlatform;
   sourceUrl: string;
   embedUrl: string;
+  tStartSec?: number;
+  tEndSec?: number;
 };
 
 export type CommunitySet = {

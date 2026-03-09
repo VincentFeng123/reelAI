@@ -264,7 +264,12 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
           generationMode,
         });
       }
-      router.push(`/feed?material_id=${primaryMaterialId}&generation_mode=${generationMode}`);
+      const nextParams = new URLSearchParams({
+        material_id: primaryMaterialId,
+        generation_mode: generationMode,
+        return_tab: "search",
+      });
+      router.push(`/feed?${nextParams.toString()}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something failed");
     } finally {

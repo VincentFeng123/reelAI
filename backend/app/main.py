@@ -1,9 +1,12 @@
 import json
 import os
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Literal
+from urllib.parse import urlparse
 
+import requests
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
@@ -16,6 +19,7 @@ from .models import (
     CommunityReelOut,
     CommunitySetCreateRequest,
     CommunitySetOut,
+    CommunitySetUpdateRequest,
     CommunitySetsResponse,
     FeedbackRequest,
     FeedbackResponse,
@@ -33,7 +37,7 @@ from .services.parsers import ParseError, extract_text_from_file
 from .services.reels import ReelService
 from .services.storage import get_storage
 from .services.text_utils import chunk_text, normalize_whitespace
-from .services.youtube import YouTubeApiRequestError, YouTubeService
+from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8601_duration
 
 settings = get_settings()
 app = FastAPI(title="StudyReels API", version="0.1.0")
@@ -87,6 +91,95 @@ DEFAULT_TARGET_CLIP_DURATION_SEC = 55
 MIN_TARGET_CLIP_DURATION_SEC = 15
 MAX_TARGET_CLIP_DURATION_SEC = 180
 MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC = 15
+MAX_COMMUNITY_REEL_DURATION_SEC = 8 * 60 * 60
+COMMUNITY_REEL_DURATION_TIMEOUT_SEC = 6.0
+
+
+def _normalize_duration_seconds(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    if parsed > MAX_COMMUNITY_REEL_DURATION_SEC:
+        return None
+    return round(parsed, 1)
+
+
+def _extract_duration_from_html(html: str) -> float | None:
+    if not html:
+        return None
+
+    meta_duration_patterns = [
+        r'<meta[^>]*property=["\']video:duration["\'][^>]*content=["\'](\d+(?:\.\d+)?)["\'][^>]*>',
+        r'<meta[^>]*content=["\'](\d+(?:\.\d+)?)["\'][^>]*property=["\']video:duration["\'][^>]*>',
+        r'<meta[^>]*name=["\']video:duration["\'][^>]*content=["\'](\d+(?:\.\d+)?)["\'][^>]*>',
+        r'<meta[^>]*content=["\'](\d+(?:\.\d+)?)["\'][^>]*name=["\']video:duration["\'][^>]*>',
+    ]
+    for pattern in meta_duration_patterns:
+        match = re.search(pattern, html, flags=re.IGNORECASE)
+        if not match:
+            continue
+        duration = _normalize_duration_seconds(match.group(1))
+        if duration is not None:
+            return duration
+
+    length_seconds_match = re.search(r'"lengthSeconds"\s*:\s*"(\d{1,7})"', html)
+    if length_seconds_match:
+        duration = _normalize_duration_seconds(length_seconds_match.group(1))
+        if duration is not None:
+            return duration
+
+    json_ld_duration = re.search(r'"duration"\s*:\s*"((?:P|PT)[^"]+)"', html, flags=re.IGNORECASE)
+    if json_ld_duration:
+        iso_duration = parse_iso8601_duration(json_ld_duration.group(1))
+        duration = _normalize_duration_seconds(iso_duration)
+        if duration is not None:
+            return duration
+
+    generic_numeric_duration = re.search(r'"duration"\s*:\s*([0-9]{1,7}(?:\.[0-9]+)?)', html)
+    if generic_numeric_duration:
+        duration = _normalize_duration_seconds(generic_numeric_duration.group(1))
+        if duration is not None:
+            return duration
+
+    return None
+
+
+def _fetch_duration_from_source_page(source_url: str) -> float | None:
+    try:
+        response = requests.get(
+            source_url,
+            timeout=COMMUNITY_REEL_DURATION_TIMEOUT_SEC,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return None
+    html = response.text[:900_000]
+    return _extract_duration_from_html(html)
+
+
+def _resolve_community_reel_duration_sec(source_url: str) -> float | None:
+    parsed = urlparse(source_url)
+    host = (parsed.hostname or "").lower()
+
+    if "youtube.com" in host or "youtu.be" in host:
+        video_id = youtube_service._extract_video_id_from_url(source_url)  # noqa: SLF001
+        if video_id:
+            details = youtube_service._video_details([video_id])  # noqa: SLF001
+            duration = _normalize_duration_seconds((details.get(video_id) or {}).get("duration_sec"))
+            if duration is not None:
+                return duration
+
+    return _fetch_duration_from_source_page(source_url)
 
 
 def _normalize_community_tags(raw_tags: list[str]) -> list[str]:
@@ -108,6 +201,16 @@ def _to_int(value: object, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _normalize_clip_seconds(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed < 0:
+        return None
+    return round(parsed, 3)
 
 
 def _normalize_min_relevance(value: float | None) -> float | None:
@@ -259,12 +362,18 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
             if not source_url or not embed_url:
                 continue
             reel_id = str(entry.get("id") or f"{row.get('id', 'community-set')}-reel-{index}")
+            t_start_sec = _normalize_clip_seconds(entry.get("t_start_sec"))
+            t_end_sec = _normalize_clip_seconds(entry.get("t_end_sec"))
+            if t_end_sec is not None and t_start_sec is not None and t_end_sec <= t_start_sec:
+                t_end_sec = None
             reels.append(
                 CommunityReelOut(
                     id=reel_id,
                     platform=platform,
                     source_url=source_url,
                     embed_url=embed_url,
+                    t_start_sec=t_start_sec,
+                    t_end_sec=t_end_sec,
                 )
             )
 
@@ -1006,6 +1115,19 @@ def feedback(payload: FeedbackRequest):
     return {"status": "ok", "reel_id": payload.reel_id}
 
 
+@app.get("/api/community/reels/duration")
+def get_community_reel_duration(source_url: str):
+    normalized_url = source_url.strip()
+    if not normalized_url:
+        raise HTTPException(status_code=400, detail="source_url is required.")
+    parsed = urlparse(normalized_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="source_url must be an absolute http(s) URL.")
+
+    duration_sec = _resolve_community_reel_duration_sec(normalized_url)
+    return {"duration_sec": duration_sec}
+
+
 @app.get("/api/community/sets", response_model=CommunitySetsResponse)
 def list_community_sets(limit: int = 160):
     safe_limit = max(1, min(limit, 300))
@@ -1051,18 +1173,26 @@ def create_community_set(payload: CommunitySetCreateRequest):
     if not payload.reels:
         raise HTTPException(status_code=400, detail="Add at least one reel URL.")
 
-    reels_payload: list[dict[str, str]] = []
+    reels_payload: list[dict[str, object]] = []
     for reel in payload.reels:
         source_url = reel.source_url.strip()
         embed_url = reel.embed_url.strip()
         if not source_url or not embed_url:
             continue
+        t_start_sec = _normalize_clip_seconds(reel.t_start_sec)
+        t_end_sec = _normalize_clip_seconds(reel.t_end_sec)
+        if t_end_sec is not None:
+            start_for_validation = t_start_sec if t_start_sec is not None else 0.0
+            if t_end_sec <= start_for_validation:
+                raise HTTPException(status_code=400, detail="Clip end time must be greater than start time.")
         reels_payload.append(
             {
                 "id": str(uuid.uuid4()),
                 "platform": reel.platform,
                 "source_url": source_url,
                 "embed_url": embed_url,
+                **({"t_start_sec": t_start_sec} if t_start_sec is not None else {}),
+                **({"t_end_sec": t_end_sec} if t_end_sec is not None else {}),
             }
         )
     if not reels_payload:
@@ -1122,6 +1252,131 @@ def create_community_set(payload: CommunitySetCreateRequest):
         raise HTTPException(status_code=500, detail="Failed to persist community set.")
 
     return _serialize_community_set(created_rows[0])
+
+
+@app.put("/api/community/sets/{set_id}", response_model=CommunitySetOut)
+def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
+    normalized_set_id = set_id.strip()
+    if not normalized_set_id:
+        raise HTTPException(status_code=400, detail="set_id is required.")
+    if not normalized_set_id.startswith("user-set-"):
+        raise HTTPException(status_code=403, detail="Only user-created sets can be edited.")
+
+    title = payload.title.strip()
+    description = payload.description.strip()
+    thumbnail_url = payload.thumbnail_url.strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="Set name is required.")
+    if len(description) < 18:
+        raise HTTPException(status_code=400, detail="Description must be at least 18 characters.")
+    if not thumbnail_url:
+        raise HTTPException(status_code=400, detail="Thumbnail is required.")
+    if not payload.reels:
+        raise HTTPException(status_code=400, detail="Add at least one reel URL.")
+
+    reels_payload: list[dict[str, object]] = []
+    for reel in payload.reels:
+        source_url = reel.source_url.strip()
+        embed_url = reel.embed_url.strip()
+        if not source_url or not embed_url:
+            continue
+        t_start_sec = _normalize_clip_seconds(reel.t_start_sec)
+        t_end_sec = _normalize_clip_seconds(reel.t_end_sec)
+        if t_end_sec is not None:
+            start_for_validation = t_start_sec if t_start_sec is not None else 0.0
+            if t_end_sec <= start_for_validation:
+                raise HTTPException(status_code=400, detail="Clip end time must be greater than start time.")
+        reels_payload.append(
+            {
+                "id": str(uuid.uuid4()),
+                "platform": reel.platform,
+                "source_url": source_url,
+                "embed_url": embed_url,
+                **({"t_start_sec": t_start_sec} if t_start_sec is not None else {}),
+                **({"t_end_sec": t_end_sec} if t_end_sec is not None else {}),
+            }
+        )
+    if not reels_payload:
+        raise HTTPException(status_code=400, detail="No valid reels found in request.")
+
+    tags = _normalize_community_tags(payload.tags)
+    updated_at = now_iso()
+    updated_label = "Updated just now"
+
+    with get_conn() as conn:
+        existing_rows = fetch_all(
+            conn,
+            """
+            SELECT
+                id,
+                curator,
+                likes,
+                learners,
+                featured,
+                created_at
+            FROM community_sets
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (normalized_set_id,),
+        )
+        if not existing_rows:
+            raise HTTPException(status_code=404, detail="Community set not found.")
+        existing = existing_rows[0]
+        if _to_int(existing.get("featured"), 0) != 0:
+            raise HTTPException(status_code=403, detail="Featured sets cannot be edited.")
+
+        existing_curator = str(existing.get("curator") or "").strip()
+        curator = (payload.curator or "").strip() or existing_curator or "Community member"
+        created_at = str(existing.get("created_at") or "").strip() or updated_at
+
+        upsert(
+            conn,
+            "community_sets",
+            {
+                "id": normalized_set_id,
+                "title": title,
+                "description": description,
+                "tags_json": dumps_json(tags),
+                "reels_json": dumps_json(reels_payload),
+                "reel_count": len(reels_payload),
+                "curator": curator,
+                "likes": max(0, _to_int(existing.get("likes"), 0)),
+                "learners": max(0, _to_int(existing.get("learners"), 1)),
+                "updated_label": updated_label,
+                "thumbnail_url": thumbnail_url,
+                "featured": 0,
+                "created_at": created_at,
+                "updated_at": updated_at,
+            },
+        )
+        updated_rows = fetch_all(
+            conn,
+            """
+            SELECT
+                id,
+                title,
+                description,
+                tags_json,
+                reels_json,
+                reel_count,
+                curator,
+                likes,
+                learners,
+                updated_label,
+                thumbnail_url,
+                featured
+            FROM community_sets
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (normalized_set_id,),
+        )
+
+    if not updated_rows:
+        raise HTTPException(status_code=500, detail="Failed to persist community set changes.")
+
+    return _serialize_community_set(updated_rows[0])
 
 
 def _register_non_api_route_aliases() -> None:

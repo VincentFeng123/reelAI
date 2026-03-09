@@ -1,11 +1,15 @@
 "use client";
 
-import { type ChangeEvent, type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ChangeEvent, type DragEvent, type FormEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useRouter } from "next/navigation";
 
-import { createCommunitySet, fetchCommunitySets } from "@/lib/api";
+import { createCommunitySet, fetchCommunityReelDuration, fetchCommunitySets, updateCommunitySet } from "@/lib/api";
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
+const COMMUNITY_CREATE_DRAFT_STORAGE_KEY = "studyreels-community-create-draft";
+const COMMUNITY_EDIT_DRAFT_PREFIX = "studyreels-community-edit-draft-";
+const USER_CREATED_SET_ID_PREFIX = "user-set-";
 const MAX_USER_SETS = 120;
 const FALLBACK_THUMBNAIL_URL = "/images/community/ai-systems.svg";
 const SUPPORTED_PLATFORMS_LABEL = "YouTube, Instagram, TikTok";
@@ -21,9 +25,17 @@ const DIRECTORY_DETAIL_TRANSITION_MS = 440;
 const DETAIL_CONTENT_TOP_PADDING_FALLBACK = 420;
 const DETAIL_CONTENT_TOP_PADDING_GUTTER = 16;
 const DETAIL_CONTENT_TOP_PADDING_UPSHIFT_PX = 56;
-const DETAIL_CAROUSEL_VISIBLE_COUNT = 3;
+const DETAIL_REEL_CAROUSEL_INTERVAL_MS = 5200;
 const DETAIL_BANNER_LEFT_EXPANSION_PX = 10;
 const DETAIL_BANNER_LEFT_INSET_PX = 8;
+const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
+const COMMUNITY_SET_RETURN_SNAPSHOT_PREFIX = "studyreels-community-return-set-";
+const CLIP_SLIDER_DEFAULT_MAX_SEC = 60;
+const CLIP_SLIDER_MIN_GAP_SEC = 0.1;
+const CLIP_SLIDER_STEP_SEC = 0.1;
+const YOUTUBE_IFRAME_API_SCRIPT_ID = "studyreels-youtube-iframe-api";
+const YOUTUBE_DURATION_POLL_INTERVAL_MS = 220;
+const YOUTUBE_DURATION_TIMEOUT_MS = 8_000;
 
 type ReelPlatform = "youtube" | "instagram" | "tiktok";
 
@@ -32,17 +44,60 @@ type CommunityReelEmbed = {
   platform: ReelPlatform;
   sourceUrl: string;
   embedUrl: string;
+  tStartSec?: number;
+  tEndSec?: number;
 };
 
 type DraftReelInput = {
   id: string;
   value: string;
+  tStartSec: string;
+  tEndSec: string;
 };
 
 type ParsedDraftReel = {
   id: string;
   value: string;
+  tStartSec: string;
+  tEndSec: string;
+  clipStartSec: number | null;
+  clipEndSec: number | null;
+  hasClipRangeError: boolean;
   parsed: Omit<CommunityReelEmbed, "id"> | null;
+};
+
+type ReelDurationState = {
+  sourceUrl: string;
+  durationSec: number | null;
+  loading: boolean;
+};
+
+type YouTubeDurationPlayer = {
+  getDuration?: () => number;
+  cueVideoById?: (videoId: string) => void;
+  destroy?: () => void;
+};
+
+type YouTubeIframeApi = {
+  Player: new (
+    element: HTMLElement | string,
+    options: {
+      height?: string | number;
+      width?: string | number;
+      videoId?: string;
+      playerVars?: Record<string, string | number>;
+      events?: {
+        onReady?: (event: { target: YouTubeDurationPlayer }) => void;
+        onStateChange?: (event: { target: YouTubeDurationPlayer }) => void;
+        onError?: () => void;
+      };
+    },
+  ) => YouTubeDurationPlayer;
+};
+
+type YouTubeIframeWindow = Window & typeof globalThis & {
+  YT?: YouTubeIframeApi;
+  onYouTubeIframeAPIReady?: () => void;
 };
 
 type CommunitySet = {
@@ -60,13 +115,29 @@ type CommunitySet = {
   featured: boolean;
 };
 
-let draftRowCounter = 0;
+type StoredSetDraft = {
+  title: string;
+  description: string;
+  tags: string;
+  thumbnailPreview: string;
+  thumbnailFileName: string;
+  reelInputs: Array<{
+    value: string;
+    tStartSec: string;
+    tEndSec: string;
+  }>;
+};
 
-function createDraftReelRow(value = ""): DraftReelInput {
+let draftRowCounter = 0;
+let youtubeIframeApiLoadPromise: Promise<void> | null = null;
+
+function createDraftReelRow(value = "", tStartSec = "0", tEndSec = "60"): DraftReelInput {
   draftRowCounter += 1;
   return {
     id: `draft-reel-${draftRowCounter}`,
     value,
+    tStartSec,
+    tEndSec,
   };
 }
 
@@ -252,6 +323,163 @@ function extractYouTubeVideoId(url: URL): string | null {
   return null;
 }
 
+function loadYouTubeIframeApi(): Promise<void> {
+  if (typeof window === "undefined") {
+    return Promise.resolve();
+  }
+  const globalWindow = window as YouTubeIframeWindow;
+  if (globalWindow.YT?.Player) {
+    return Promise.resolve();
+  }
+  if (youtubeIframeApiLoadPromise) {
+    return youtubeIframeApiLoadPromise;
+  }
+
+  youtubeIframeApiLoadPromise = new Promise<void>((resolve, reject) => {
+    const existingScript = document.getElementById(YOUTUBE_IFRAME_API_SCRIPT_ID) as HTMLScriptElement | null;
+    const previousReady = globalWindow.onYouTubeIframeAPIReady;
+    globalWindow.onYouTubeIframeAPIReady = () => {
+      if (typeof previousReady === "function") {
+        previousReady();
+      }
+      resolve();
+    };
+
+    if (existingScript) {
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.id = YOUTUBE_IFRAME_API_SCRIPT_ID;
+    script.src = "https://www.youtube.com/iframe_api";
+    script.async = true;
+    script.onerror = () => reject(new Error("Failed to load YouTube IFrame API."));
+    document.body.appendChild(script);
+  }).catch((error) => {
+    youtubeIframeApiLoadPromise = null;
+    throw error;
+  });
+
+  return youtubeIframeApiLoadPromise;
+}
+
+function parseDetectedDuration(value: unknown): number | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= CLIP_SLIDER_MIN_GAP_SEC) {
+    return null;
+  }
+  return parsed;
+}
+
+async function detectYouTubeDurationWithIframeApi(sourceUrl: string): Promise<number | null> {
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    return null;
+  }
+  const parsedUrl = toAbsoluteUrl(sourceUrl);
+  if (!parsedUrl) {
+    return null;
+  }
+  const videoId = extractYouTubeVideoId(parsedUrl);
+  if (!videoId) {
+    return null;
+  }
+
+  try {
+    await loadYouTubeIframeApi();
+  } catch {
+    return null;
+  }
+
+  const globalWindow = window as YouTubeIframeWindow;
+  const api = globalWindow.YT;
+  if (!api?.Player) {
+    return null;
+  }
+
+  return await new Promise<number | null>((resolve) => {
+    const host = document.createElement("div");
+    host.style.position = "fixed";
+    host.style.left = "-9999px";
+    host.style.top = "-9999px";
+    host.style.width = "1px";
+    host.style.height = "1px";
+    host.style.opacity = "0";
+    host.setAttribute("aria-hidden", "true");
+    document.body.appendChild(host);
+
+    let settled = false;
+    let player: YouTubeDurationPlayer | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const cleanup = (value: number | null) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (pollTimer !== null) {
+        clearInterval(pollTimer);
+      }
+      if (timeoutTimer !== null) {
+        clearTimeout(timeoutTimer);
+      }
+      try {
+        player?.destroy?.();
+      } catch {
+        // Ignore player teardown failures.
+      }
+      host.remove();
+      resolve(value);
+    };
+
+    const maybeResolveDuration = () => {
+      const duration = parseDetectedDuration(player?.getDuration?.());
+      if (duration !== null) {
+        cleanup(duration);
+      }
+    };
+
+    timeoutTimer = setTimeout(() => cleanup(null), YOUTUBE_DURATION_TIMEOUT_MS);
+
+    try {
+      player = new api.Player(host, {
+        height: 1,
+        width: 1,
+        videoId,
+        playerVars: {
+          autoplay: 0,
+          controls: 0,
+          rel: 0,
+          fs: 0,
+          playsinline: 1,
+          origin: window.location.origin,
+        },
+        events: {
+          onReady: (event) => {
+            player = event.target;
+            try {
+              event.target.cueVideoById?.(videoId);
+            } catch {
+              // cueVideoById is best-effort; polling still handles detection if unsupported.
+            }
+            maybeResolveDuration();
+            pollTimer = setInterval(maybeResolveDuration, YOUTUBE_DURATION_POLL_INTERVAL_MS);
+          },
+          onStateChange: (event) => {
+            player = event.target;
+            maybeResolveDuration();
+          },
+          onError: () => {
+            cleanup(null);
+          },
+        },
+      });
+    } catch {
+      cleanup(null);
+    }
+  });
+}
+
 function parseReelUrl(input: string): Omit<CommunityReelEmbed, "id"> | null {
   const url = toAbsoluteUrl(input);
   if (!url) {
@@ -314,6 +542,10 @@ function parseStoredReels(raw: unknown): CommunityReelEmbed[] {
     const platform = row.platform;
     const sourceUrl = typeof row.sourceUrl === "string" ? row.sourceUrl.trim() : "";
     const embedUrl = typeof row.embedUrl === "string" ? row.embedUrl.trim() : "";
+    const tStartRaw = Number(row.tStartSec);
+    const tEndRaw = Number(row.tEndSec);
+    const tStartSec = Number.isFinite(tStartRaw) && tStartRaw >= 0 ? tStartRaw : undefined;
+    const tEndSec = Number.isFinite(tEndRaw) && tEndRaw > 0 && (tStartSec == null || tEndRaw > tStartRaw) ? tEndRaw : undefined;
     if (!sourceUrl || !embedUrl) {
       continue;
     }
@@ -325,6 +557,8 @@ function parseStoredReels(raw: unknown): CommunityReelEmbed[] {
       platform,
       sourceUrl,
       embedUrl,
+      tStartSec,
+      tEndSec,
     });
   }
   return parsed;
@@ -379,6 +613,68 @@ function parseStoredSets(raw: string | null): CommunitySet[] {
   }
 }
 
+function parseStoredSetSnapshot(raw: string | null): CommunitySet | null {
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    const normalized = parseStoredSets(JSON.stringify([parsed]));
+    return normalized[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function parseStoredSetDraft(raw: string | null): StoredSetDraft | null {
+  if (!raw) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return null;
+    }
+    const row = parsed as Record<string, unknown>;
+    const reelInputsRaw = Array.isArray(row.reelInputs) ? row.reelInputs : [];
+    const reelInputs = reelInputsRaw
+      .map((entry) => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+          return null;
+        }
+        const reelRow = entry as Record<string, unknown>;
+        return {
+          value: typeof reelRow.value === "string" ? reelRow.value : "",
+          tStartSec: typeof reelRow.tStartSec === "string" ? reelRow.tStartSec : "0",
+          tEndSec: typeof reelRow.tEndSec === "string" ? reelRow.tEndSec : "60",
+        };
+      })
+      .filter(Boolean) as StoredSetDraft["reelInputs"];
+    return {
+      title: typeof row.title === "string" ? row.title : "",
+      description: typeof row.description === "string" ? row.description : "",
+      tags: typeof row.tags === "string" ? row.tags : "",
+      thumbnailPreview: typeof row.thumbnailPreview === "string" ? row.thumbnailPreview : "",
+      thumbnailFileName: typeof row.thumbnailFileName === "string" ? row.thumbnailFileName : "",
+      reelInputs: reelInputs.length > 0 ? reelInputs : [{ value: "", tStartSec: "0", tEndSec: "60" }],
+    };
+  } catch {
+    return null;
+  }
+}
+
+function draftRowsFromReels(reels: CommunityReelEmbed[]): DraftReelInput[] {
+  if (reels.length === 0) {
+    return [createDraftReelRow()];
+  }
+  return reels.map((reel) => {
+    const start = Number.isFinite(reel.tStartSec) ? Number(reel.tStartSec) : 0;
+    const endCandidate = Number(reel.tEndSec);
+    const end = Number.isFinite(endCandidate) && endCandidate > start ? endCandidate : Math.max(start + 60, 60);
+    return createDraftReelRow(reel.sourceUrl, formatClipSecondsInputValue(start), formatClipSecondsInputValue(end));
+  });
+}
+
 function getSetReelCount(set: CommunitySet): number {
   return set.reels.length > 0 ? set.reels.length : set.reelCount;
 }
@@ -409,17 +705,48 @@ function getSetIconClass(set: CommunitySet): string {
   return "fa-solid fa-layer-group";
 }
 
-type CommunityReelsPanelMode = "community" | "create";
+function parseClipSecondsInput(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return parsed;
+}
+
+function formatClipSecondsInputValue(value: number): string {
+  if (!Number.isFinite(value)) {
+    return "0";
+  }
+  const rounded = Math.round(value * 10) / 10;
+  return rounded.toFixed(1).replace(/\.0$/, "");
+}
+
+function formatClipRangeLabel(reel: CommunityReelEmbed): string | null {
+  const start = Number(reel.tStartSec);
+  const end = Number(reel.tEndSec);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+    return null;
+  }
+  return `${start.toFixed(1).replace(/\.0$/, "")}s - ${end.toFixed(1).replace(/\.0$/, "")}s`;
+}
+
+type CommunityReelsPanelMode = "community" | "create" | "edit";
 
 type CommunityReelsPanelProps = {
   mode?: CommunityReelsPanelMode;
   isVisible?: boolean;
   onDetailOpenChange?: (isOpen: boolean) => void;
+  initialOpenSetId?: string | null;
 };
 
 type FeaturedTransitionStage = "idle" | "exiting" | "pause" | "entering";
 
-export function CommunityReelsPanel({ mode = "community", isVisible = true, onDetailOpenChange }: CommunityReelsPanelProps) {
+export function CommunityReelsPanel({ mode = "community", isVisible = true, onDetailOpenChange, initialOpenSetId = null }: CommunityReelsPanelProps) {
+  const router = useRouter();
   const [activeCommunityCategory, setActiveCommunityCategory] = useState("Featured");
   const [activeFeaturedIndex, setActiveFeaturedIndex] = useState(0);
   const [leavingFeaturedIndex, setLeavingFeaturedIndex] = useState<number | null>(null);
@@ -435,10 +762,13 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   const [setTags, setSetTags] = useState("");
   const [thumbnailPreview, setThumbnailPreview] = useState("");
   const [detailCarouselIndex, setDetailCarouselIndex] = useState(0);
+  const [selectedDetailReelId, setSelectedDetailReelId] = useState<string | null>(null);
   const [reelInputs, setReelInputs] = useState<DraftReelInput[]>(() => [createDraftReelRow()]);
+  const [reelDurationByRow, setReelDurationByRow] = useState<Record<string, ReelDurationState>>({});
   const [createError, setCreateError] = useState<string | null>(null);
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
   const [isPostingSet, setIsPostingSet] = useState(false);
+  const [activeEditSetId, setActiveEditSetId] = useState<string | null>(null);
   const [userSets, setUserSets] = useState<CommunitySet[]>([]);
   const [storageHydrated, setStorageHydrated] = useState(false);
   const [portalReady, setPortalReady] = useState(false);
@@ -446,15 +776,19 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   const [detailBannerRight, setDetailBannerRight] = useState(0);
   const [detailBannerHeight, setDetailBannerHeight] = useState(0);
   const [isDetailBannerCompact, setIsDetailBannerCompact] = useState(false);
+  const [skipDetailTransitionOnce, setSkipDetailTransitionOnce] = useState(false);
   const [isThumbnailDragOver, setIsThumbnailDragOver] = useState(false);
   const [thumbnailFileName, setThumbnailFileName] = useState("");
   const panelRootRef = useRef<HTMLDivElement | null>(null);
   const detailBannerRef = useRef<HTMLDivElement | null>(null);
   const detailContentScrollRef = useRef<HTMLDivElement | null>(null);
-  const detailReelsSectionRef = useRef<HTMLElement | null>(null);
   const communityScrollRef = useRef<HTMLDivElement | null>(null);
   const activeFeaturedSlideRef = useRef<HTMLDivElement | null>(null);
   const directoryDetailCloseTimerRef = useRef<number | null>(null);
+  const reelDurationCacheRef = useRef<Record<string, number | null>>({});
+  const consumedInitialSetIdRef = useRef<string | null>(null);
+  const didRestoreCreateDraftRef = useRef(false);
+  const loadedEditSetIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -522,20 +856,23 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     setDetailBannerHeight((prev) => (prev === nextHeight ? prev : nextHeight));
   }, []);
 
+  const isEditMode = mode === "edit";
   const allSets = useMemo(() => [...userSets, ...DEFAULT_COMMUNITY_SETS], [userSets]);
+  const editableSets = useMemo(
+    () =>
+      userSets.filter((set) => {
+        const id = set.id.trim();
+        const curator = set.curator.trim().toLowerCase();
+        return id.startsWith(USER_CREATED_SET_ID_PREFIX) || curator === "you";
+      }),
+    [userSets],
+  );
+  const activeEditableSet = useMemo(
+    () => editableSets.find((set) => set.id === activeEditSetId) ?? null,
+    [activeEditSetId, editableSets],
+  );
   const featuredCarouselSets = useMemo(() => FEATURED_SETS.slice(0, 3), []);
-  const detailCarouselImages = useMemo(() => {
-    if (!selectedDirectorySet) {
-      return [];
-    }
-    const images = Array.from(
-      new Set([selectedDirectorySet.thumbnailUrl, ...DEFAULT_COMMUNITY_SETS.map((set) => set.thumbnailUrl), FALLBACK_THUMBNAIL_URL].filter(Boolean)),
-    );
-    while (images.length < DETAIL_CAROUSEL_VISIBLE_COUNT) {
-      images.push(FALLBACK_THUMBNAIL_URL);
-    }
-    return images;
-  }, [selectedDirectorySet]);
+  const detailCarouselReels = useMemo(() => selectedDirectorySet?.reels ?? [], [selectedDirectorySet]);
 
   const filteredDirectorySets = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -757,15 +1094,27 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   }, [activeFeaturedIndex, featuredCarouselSets.length, featuredTransitionStage, isSearchActive, mode]);
 
   const directorySets = categoryFilteredSets;
-  const maxDetailCarouselIndex = Math.max(0, detailCarouselImages.length - DETAIL_CAROUSEL_VISIBLE_COUNT);
+  const detailCarouselCount = detailCarouselReels.length;
+  const maxDetailCarouselIndex = Math.max(0, detailCarouselCount - 1);
+  const activeDetailCarouselReel = detailCarouselReels[detailCarouselIndex] ?? null;
 
   const goToPreviousDetailCarousel = useCallback(() => {
-    setDetailCarouselIndex((prev) => Math.max(0, prev - 1));
-  }, []);
+    setDetailCarouselIndex((prev) => {
+      if (detailCarouselCount <= 1) {
+        return 0;
+      }
+      return (prev - 1 + detailCarouselCount) % detailCarouselCount;
+    });
+  }, [detailCarouselCount]);
 
   const goToNextDetailCarousel = useCallback(() => {
-    setDetailCarouselIndex((prev) => Math.min(maxDetailCarouselIndex, prev + 1));
-  }, [maxDetailCarouselIndex]);
+    setDetailCarouselIndex((prev) => {
+      if (detailCarouselCount <= 1) {
+        return 0;
+      }
+      return (prev + 1) % detailCarouselCount;
+    });
+  }, [detailCarouselCount]);
 
   const onCommunityCategoryChange = useCallback((category: string) => {
     if (category === activeCommunityCategory) {
@@ -785,25 +1134,240 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     });
   }, [activeCommunityCategory]);
 
+  const applyDraftToForm = useCallback((draft: StoredSetDraft) => {
+    setSetTitle(draft.title);
+    setSetDescription(draft.description);
+    setSetTags(draft.tags);
+    setThumbnailPreview(draft.thumbnailPreview);
+    setThumbnailFileName(draft.thumbnailFileName);
+    const nextRows = draft.reelInputs.length > 0
+      ? draft.reelInputs.map((row) => createDraftReelRow(row.value, row.tStartSec, row.tEndSec))
+      : [createDraftReelRow()];
+    setReelInputs(nextRows);
+    setReelDurationByRow({});
+    setCreateError(null);
+    setCreateSuccess(null);
+  }, []);
+
+  const applySetToForm = useCallback((set: CommunitySet) => {
+    setSetTitle(set.title);
+    setSetDescription(set.description);
+    setSetTags(set.tags.join(", "));
+    setThumbnailPreview(set.thumbnailUrl || "");
+    setThumbnailFileName(set.thumbnailUrl ? "Current thumbnail" : "");
+    setReelInputs(draftRowsFromReels(set.reels));
+    setReelDurationByRow({});
+    setCreateError(null);
+    setCreateSuccess(null);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || didRestoreCreateDraftRef.current) {
+      return;
+    }
+    const storedDraft = parseStoredSetDraft(window.localStorage.getItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY));
+    if (storedDraft) {
+      applyDraftToForm(storedDraft);
+    }
+    didRestoreCreateDraftRef.current = true;
+  }, [applyDraftToForm]);
+
+  useEffect(() => {
+    if (!isEditMode) {
+      loadedEditSetIdRef.current = null;
+      return;
+    }
+    if (editableSets.length === 0) {
+      setActiveEditSetId(null);
+      return;
+    }
+    setActiveEditSetId((prev) => {
+      if (prev && editableSets.some((set) => set.id === prev)) {
+        return prev;
+      }
+      return editableSets[0].id;
+    });
+  }, [editableSets, isEditMode]);
+
+  useEffect(() => {
+    if (!isEditMode || typeof window === "undefined" || !activeEditSetId) {
+      return;
+    }
+    if (loadedEditSetIdRef.current === activeEditSetId) {
+      return;
+    }
+    const selectedSet = editableSets.find((set) => set.id === activeEditSetId);
+    if (!selectedSet) {
+      return;
+    }
+    const storedDraft = parseStoredSetDraft(window.localStorage.getItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${activeEditSetId}`));
+    if (storedDraft) {
+      applyDraftToForm(storedDraft);
+    } else {
+      applySetToForm(selectedSet);
+    }
+    loadedEditSetIdRef.current = activeEditSetId;
+  }, [activeEditSetId, applyDraftToForm, applySetToForm, editableSets, isEditMode]);
+
   const parsedDraftReels = useMemo<ParsedDraftReel[]>(
     () =>
       reelInputs.map((row) => {
         const trimmed = row.value.trim();
+        const clipStartSec = parseClipSecondsInput(row.tStartSec);
+        const clipEndSec = parseClipSecondsInput(row.tEndSec);
+        const hasClipRangeError = clipStartSec === null || clipEndSec === null || clipEndSec <= clipStartSec;
         if (!trimmed) {
-          return { id: row.id, value: row.value, parsed: null };
+          return {
+            id: row.id,
+            value: row.value,
+            tStartSec: row.tStartSec,
+            tEndSec: row.tEndSec,
+            clipStartSec,
+            clipEndSec,
+            hasClipRangeError,
+            parsed: null,
+          };
         }
         return {
           id: row.id,
           value: row.value,
+          tStartSec: row.tStartSec,
+          tEndSec: row.tEndSec,
+          clipStartSec,
+          clipEndSec,
+          hasClipRangeError,
           parsed: parseReelUrl(trimmed),
         };
       }),
     [reelInputs],
   );
 
+  useEffect(() => {
+    if (mode !== "create" && mode !== "edit") {
+      return;
+    }
+    let cancelled = false;
+    const activeRows = parsedDraftReels.filter((row) => row.parsed && row.value.trim());
+
+    setReelDurationByRow((prev) => {
+      const next: Record<string, ReelDurationState> = {};
+      for (const row of activeRows) {
+        const sourceUrl = row.parsed!.sourceUrl;
+        const existing = prev[row.id];
+        if (existing && existing.sourceUrl === sourceUrl) {
+          next[row.id] = existing;
+          continue;
+        }
+        if (Object.prototype.hasOwnProperty.call(reelDurationCacheRef.current, sourceUrl)) {
+          next[row.id] = {
+            sourceUrl,
+            durationSec: reelDurationCacheRef.current[sourceUrl],
+            loading: false,
+          };
+          continue;
+        }
+        next[row.id] = {
+          sourceUrl,
+          durationSec: null,
+          loading: true,
+        };
+      }
+      return next;
+    });
+
+    for (const row of activeRows) {
+      const sourceUrl = row.parsed!.sourceUrl;
+      if (Object.prototype.hasOwnProperty.call(reelDurationCacheRef.current, sourceUrl)) {
+        continue;
+      }
+      void (async () => {
+        let durationSec: number | null = null;
+        try {
+          durationSec = await fetchCommunityReelDuration({ sourceUrl });
+        } catch {
+          durationSec = null;
+        }
+        if (row.parsed?.platform === "youtube") {
+          const iframeDuration = await detectYouTubeDurationWithIframeApi(sourceUrl);
+          if (iframeDuration !== null) {
+            durationSec = durationSec === null ? iframeDuration : Math.max(durationSec, iframeDuration);
+          }
+        }
+        reelDurationCacheRef.current[sourceUrl] = durationSec;
+        if (cancelled) {
+          return;
+        }
+        setReelDurationByRow((prev) => {
+          const existing = prev[row.id];
+          if (!existing || existing.sourceUrl !== sourceUrl) {
+            return prev;
+          }
+          if (!existing.loading && existing.durationSec === durationSec) {
+            return prev;
+          }
+          return {
+            ...prev,
+            [row.id]: {
+              sourceUrl,
+              durationSec,
+              loading: false,
+            },
+          };
+        });
+      })();
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, parsedDraftReels]);
+
+  useEffect(() => {
+    if (mode !== "create" && mode !== "edit") {
+      return;
+    }
+    setReelInputs((prev) => {
+      let changed = false;
+      const next = prev.map((row) => {
+        const durationSec = reelDurationByRow[row.id]?.durationSec;
+        if (!Number.isFinite(durationSec) || Number(durationSec) <= CLIP_SLIDER_MIN_GAP_SEC) {
+          return row;
+        }
+        const sliderMaxSec = Math.max(CLIP_SLIDER_MIN_GAP_SEC * 2, Number(durationSec));
+        const currentStart = parseClipSecondsInput(row.tStartSec) ?? 0;
+        const currentEnd = parseClipSecondsInput(row.tEndSec) ?? Math.min(sliderMaxSec, CLIP_SLIDER_DEFAULT_MAX_SEC);
+        const nextStart = Math.min(Math.max(0, currentStart), sliderMaxSec - CLIP_SLIDER_MIN_GAP_SEC);
+        const nextEnd = Math.min(sliderMaxSec, Math.max(nextStart + CLIP_SLIDER_MIN_GAP_SEC, currentEnd));
+        const formattedStart = formatClipSecondsInputValue(nextStart);
+        const formattedEnd = formatClipSecondsInputValue(nextEnd);
+        if (formattedStart === row.tStartSec && formattedEnd === row.tEndSec) {
+          return row;
+        }
+        changed = true;
+        return {
+          ...row,
+          tStartSec: formattedStart,
+          tEndSec: formattedEnd,
+        };
+      });
+      return changed ? next : prev;
+    });
+  }, [mode, reelDurationByRow]);
+
+  const hasDetectedDurationForRow = useCallback(
+    (rowId: string) => {
+      const durationSec = reelDurationByRow[rowId]?.durationSec;
+      return Number.isFinite(durationSec) && Number(durationSec) > CLIP_SLIDER_MIN_GAP_SEC;
+    },
+    [reelDurationByRow],
+  );
+
   const validDraftReelCount = useMemo(
-    () => parsedDraftReels.filter((row) => row.value.trim() && row.parsed !== null).length,
-    [parsedDraftReels],
+    () =>
+      parsedDraftReels.filter(
+        (row) => row.value.trim() && row.parsed !== null && !row.hasClipRangeError && hasDetectedDurationForRow(row.id),
+      ).length,
+    [hasDetectedDurationForRow, parsedDraftReels],
   );
   const nonEmptyDraftReelCount = useMemo(
     () => parsedDraftReels.filter((row) => row.value.trim()).length,
@@ -821,7 +1385,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     (thumbnailPreview ? 1 : 0) +
     (validDraftReelCount > 0 && invalidDraftReelCount === 0 ? 1 : 0);
   const completionPercent = Math.round((requiredCompletionCount / 4) * 100);
-  const canPostSet = requiredCompletionCount === 4 && !isPostingSet;
+  const canPostSet = requiredCompletionCount === 4 && !isPostingSet && (!isEditMode || Boolean(activeEditableSet));
 
   const applyThumbnailFile = useCallback((file: File | null | undefined) => {
     if (!file) {
@@ -882,6 +1446,11 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     event.preventDefault();
     const title = setTitle.trim();
     const description = setDescription.trim();
+    if (isEditMode && !activeEditableSet) {
+      setCreateError("Pick a set to edit first.");
+      setCreateSuccess(null);
+      return;
+    }
     setCreateSuccess(null);
     if (!title) {
       setCreateError("Set name is required.");
@@ -905,64 +1474,180 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
       setCreateSuccess(null);
       return;
     }
-    const firstInvalid = nonEmptyRows.find((row) => row.parsed === null);
+    const firstInvalid = nonEmptyRows.find(
+      (row) => row.parsed === null || row.hasClipRangeError || !hasDetectedDurationForRow(row.id),
+    );
     if (firstInvalid) {
-      setCreateError(`One or more reel links are invalid. Supported: ${SUPPORTED_PLATFORMS_LABEL}.`);
+      if (firstInvalid.parsed === null) {
+        setCreateError(`One or more reel links are invalid. Supported: ${SUPPORTED_PLATFORMS_LABEL}.`);
+      } else if (!hasDetectedDurationForRow(firstInvalid.id)) {
+        setCreateError("Wait until each valid reel's video length is detected before posting.");
+      } else {
+        setCreateError("Each reel needs a valid clip range (start >= 0 and end > start).");
+      }
       setCreateSuccess(null);
       return;
     }
 
-    const parsedReels = nonEmptyRows.map((row, index) => {
+    const parsedReels = nonEmptyRows.map((row) => {
       const parsed = row.parsed!;
       return {
         platform: parsed.platform,
         sourceUrl: parsed.sourceUrl,
         embedUrl: parsed.embedUrl,
+        tStartSec: row.clipStartSec ?? undefined,
+        tEndSec: row.clipEndSec ?? undefined,
       };
     });
 
     const tags = parseTags(setTags);
     setIsPostingSet(true);
     try {
-      const createdSet = await createCommunitySet({
-        title,
-        description,
-        tags,
-        reels: parsedReels,
-        thumbnailUrl: thumbnailPreview,
-        curator: "You",
-      });
-      setUserSets((prev) => [createdSet, ...prev.filter((item) => item.id !== createdSet.id)].slice(0, MAX_USER_SETS));
-      setSetTitle("");
-      setSetDescription("");
-      setSetTags("");
-      setThumbnailPreview("");
-      setThumbnailFileName("");
-      setReelInputs([createDraftReelRow()]);
-      setCreateError(null);
-      setCreateSuccess(`"${createdSet.title}" posted with ${createdSet.reels.length} reels.`);
+      if (isEditMode && activeEditableSet) {
+        const updatedSet = await updateCommunitySet({
+          setId: activeEditableSet.id,
+          title,
+          description,
+          tags,
+          reels: parsedReels,
+          thumbnailUrl: thumbnailPreview,
+          curator: activeEditableSet.curator || "You",
+        });
+        setUserSets((prev) => [updatedSet, ...prev.filter((item) => item.id !== updatedSet.id)].slice(0, MAX_USER_SETS));
+        if (typeof window !== "undefined") {
+          window.localStorage.removeItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${updatedSet.id}`);
+        }
+        setCreateError(null);
+        setCreateSuccess(`Saved changes to "${updatedSet.title}".`);
+      } else {
+        const createdSet = await createCommunitySet({
+          title,
+          description,
+          tags,
+          reels: parsedReels,
+          thumbnailUrl: thumbnailPreview,
+          curator: "You",
+        });
+        setUserSets((prev) => [createdSet, ...prev.filter((item) => item.id !== createdSet.id)].slice(0, MAX_USER_SETS));
+        setSetTitle("");
+        setSetDescription("");
+        setSetTags("");
+        setThumbnailPreview("");
+        setThumbnailFileName("");
+        setReelInputs([createDraftReelRow()]);
+        setReelDurationByRow({});
+        if (typeof window !== "undefined") {
+          window.localStorage.removeItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY);
+        }
+        setCreateError(null);
+        setCreateSuccess(`"${createdSet.title}" posted with ${createdSet.reels.length} reels.`);
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Could not post community set.";
+      const message = error instanceof Error ? error.message : isEditMode ? "Could not update community set." : "Could not post community set.";
       setCreateError(message);
     } finally {
       setIsPostingSet(false);
     }
   };
 
+  const onSaveDraftProgress = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const draftPayload: StoredSetDraft = {
+      title: setTitle,
+      description: setDescription,
+      tags: setTags,
+      thumbnailPreview,
+      thumbnailFileName,
+      reelInputs: reelInputs.map((row) => ({
+        value: row.value,
+        tStartSec: row.tStartSec,
+        tEndSec: row.tEndSec,
+      })),
+    };
+    if (isEditMode) {
+      if (!activeEditableSet) {
+        setCreateError("Pick a set to edit before saving draft progress.");
+        setCreateSuccess(null);
+        return;
+      }
+      window.localStorage.setItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${activeEditableSet.id}`, JSON.stringify(draftPayload));
+      setCreateError(null);
+      setCreateSuccess("Draft progress saved for this set.");
+      return;
+    }
+    window.localStorage.setItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY, JSON.stringify(draftPayload));
+    setCreateError(null);
+    setCreateSuccess("Draft progress saved.");
+  }, [activeEditableSet, isEditMode, reelInputs, setDescription, setTags, setTitle, thumbnailFileName, thumbnailPreview]);
+
   const addReelInputRow = () => {
     setReelInputs((prev) => [...prev, createDraftReelRow()]);
   };
+
+  const onEditSetSelectionChange = useCallback((nextSetId: string) => {
+    const normalized = nextSetId.trim();
+    loadedEditSetIdRef.current = null;
+    setActiveEditSetId(normalized || null);
+  }, []);
 
   const removeReelInputRow = (rowId: string) => {
     setReelInputs((prev) => {
       const next = prev.filter((row) => row.id !== rowId);
       return next.length > 0 ? next : [createDraftReelRow()];
     });
+    setReelDurationByRow((prev) => {
+      if (!(rowId in prev)) {
+        return prev;
+      }
+      const next = { ...prev };
+      delete next[rowId];
+      return next;
+    });
   };
 
   const updateReelInputRow = (rowId: string, value: string) => {
     setReelInputs((prev) => prev.map((row) => (row.id === rowId ? { ...row, value } : row)));
   };
+
+  const updateReelClipStartFromSlider = useCallback((rowId: string, value: number, sliderMaxSec: number) => {
+    const normalizedMax = Math.max(CLIP_SLIDER_MIN_GAP_SEC * 2, sliderMaxSec);
+    setReelInputs((prev) =>
+      prev.map((row) => {
+        if (row.id !== rowId) {
+          return row;
+        }
+        const currentEnd = parseClipSecondsInput(row.tEndSec) ?? Math.min(normalizedMax, CLIP_SLIDER_DEFAULT_MAX_SEC);
+        const nextStart = Math.min(Math.max(0, value), normalizedMax - CLIP_SLIDER_MIN_GAP_SEC);
+        const nextEnd = Math.min(normalizedMax, Math.max(nextStart + CLIP_SLIDER_MIN_GAP_SEC, currentEnd));
+        return {
+          ...row,
+          tStartSec: formatClipSecondsInputValue(nextStart),
+          tEndSec: formatClipSecondsInputValue(nextEnd),
+        };
+      }),
+    );
+  }, []);
+
+  const updateReelClipEndFromSlider = useCallback((rowId: string, value: number, sliderMaxSec: number) => {
+    const normalizedMax = Math.max(CLIP_SLIDER_MIN_GAP_SEC * 2, sliderMaxSec);
+    setReelInputs((prev) =>
+      prev.map((row) => {
+        if (row.id !== rowId) {
+          return row;
+        }
+        const currentStart = parseClipSecondsInput(row.tStartSec) ?? 0;
+        const nextStart = Math.min(Math.max(0, currentStart), normalizedMax - CLIP_SLIDER_MIN_GAP_SEC);
+        const nextEnd = Math.min(normalizedMax, Math.max(nextStart + CLIP_SLIDER_MIN_GAP_SEC, value));
+        return {
+          ...row,
+          tStartSec: formatClipSecondsInputValue(nextStart),
+          tEndSec: formatClipSecondsInputValue(nextEnd),
+        };
+      }),
+    );
+  }, []);
 
   const closeDirectorySetModal = useCallback(() => {
     if (!selectedDirectorySet) {
@@ -978,12 +1663,15 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   }, [clearDirectoryDetailCloseTimer, selectedDirectorySet]);
 
   const openDirectorySet = useCallback(
-    (set: CommunitySet) => {
+    (set: CommunitySet, options?: { immediate?: boolean; skipTransition?: boolean }) => {
       clearDirectoryDetailCloseTimer();
       updateDetailBannerGeometry();
       setSelectedDirectorySet(set);
       setIsDetailBannerCompact(false);
-      if (typeof window === "undefined") {
+      if (options?.skipTransition) {
+        setSkipDetailTransitionOnce(true);
+      }
+      if (options?.immediate || typeof window === "undefined") {
         setIsDirectoryDetailOpen(true);
         return;
       }
@@ -993,6 +1681,65 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     },
     [clearDirectoryDetailCloseTimer, updateDetailBannerGeometry],
   );
+
+  useLayoutEffect(() => {
+    if (mode !== "community" || !isVisible) {
+      return;
+    }
+    const targetSetId = initialOpenSetId?.trim() || "";
+    if (!targetSetId || consumedInitialSetIdRef.current === targetSetId) {
+      return;
+    }
+    if (typeof window === "undefined") {
+      return;
+    }
+    const snapshot = parseStoredSetSnapshot(window.sessionStorage.getItem(`${COMMUNITY_SET_RETURN_SNAPSHOT_PREFIX}${targetSetId}`));
+    if (!snapshot) {
+      return;
+    }
+    setSkipDetailTransitionOnce(true);
+    clearDirectoryDetailCloseTimer();
+    setSelectedDirectorySet(snapshot);
+    setIsDetailBannerCompact(false);
+    setIsDirectoryDetailOpen(true);
+    consumedInitialSetIdRef.current = targetSetId;
+  }, [clearDirectoryDetailCloseTimer, initialOpenSetId, isVisible, mode]);
+
+  useLayoutEffect(() => {
+    if (mode !== "community" || !isVisible) {
+      return;
+    }
+    const targetSetId = initialOpenSetId?.trim() || "";
+    if (!targetSetId) {
+      consumedInitialSetIdRef.current = null;
+      return;
+    }
+    if (consumedInitialSetIdRef.current === targetSetId) {
+      return;
+    }
+    const targetSet = allSets.find((set) => set.id === targetSetId);
+    if (!targetSet) {
+      return;
+    }
+    openDirectorySet(targetSet, { immediate: true, skipTransition: true });
+    consumedInitialSetIdRef.current = targetSetId;
+  }, [allSets, initialOpenSetId, isVisible, mode, openDirectorySet]);
+
+  useEffect(() => {
+    if (!skipDetailTransitionOnce || !isDirectoryDetailOpen) {
+      return;
+    }
+    if (typeof window === "undefined") {
+      setSkipDetailTransitionOnce(false);
+      return;
+    }
+    const rafId = window.requestAnimationFrame(() => {
+      setSkipDetailTransitionOnce(false);
+    });
+    return () => {
+      window.cancelAnimationFrame(rafId);
+    };
+  }, [isDirectoryDetailOpen, skipDetailTransitionOnce]);
 
   useEffect(() => {
     if (!isDirectoryDetailOpen) {
@@ -1027,8 +1774,34 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   }, [selectedDirectorySet?.id]);
 
   useEffect(() => {
+    if (!selectedDirectorySet || selectedDirectorySet.reels.length === 0) {
+      setSelectedDetailReelId(null);
+      return;
+    }
+    const boundedIndex = Math.min(detailCarouselIndex, selectedDirectorySet.reels.length - 1);
+    const reel = selectedDirectorySet.reels[boundedIndex];
+    if (!reel) {
+      setSelectedDetailReelId(null);
+      return;
+    }
+    setSelectedDetailReelId((prev) => (prev === reel.id ? prev : reel.id));
+  }, [detailCarouselIndex, selectedDirectorySet]);
+
+  useEffect(() => {
     setDetailCarouselIndex((prev) => Math.min(prev, maxDetailCarouselIndex));
   }, [maxDetailCarouselIndex]);
+
+  useEffect(() => {
+    if (mode !== "community" || !isVisible || !isDirectoryDetailOpen || detailCarouselReels.length <= 1) {
+      return;
+    }
+    const intervalId = window.setInterval(() => {
+      setDetailCarouselIndex((prev) => (prev + 1) % detailCarouselReels.length);
+    }, DETAIL_REEL_CAROUSEL_INTERVAL_MS);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [detailCarouselReels.length, isDirectoryDetailOpen, isVisible, mode]);
 
   useEffect(() => {
     if (mode !== "community" || !isDirectoryDetailOpen || !selectedDirectorySet) {
@@ -1083,20 +1856,72 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   );
   const selectedDirectorySetHasReels = (selectedDirectorySet?.reels.length ?? 0) > 0;
 
-  const scrollToDetailReels = useCallback(() => {
-    const container = detailContentScrollRef.current;
-    const reelsSection = detailReelsSectionRef.current;
-    if (!container || !reelsSection) {
+  const openCommunityReelInFeed = useCallback(
+    (set: CommunitySet, reel: CommunityReelEmbed) => {
+      const nextParams = new URLSearchParams({
+        community_set_id: set.id,
+        community_set_title: set.title,
+        community_reel_id: reel.id,
+        community_reel_platform: reel.platform,
+        community_reel_url: reel.embedUrl || reel.sourceUrl,
+        community_reel_source_url: reel.sourceUrl,
+      });
+      if (Number.isFinite(reel.tStartSec) && Number(reel.tStartSec) >= 0) {
+        nextParams.set("community_t_start_sec", String(reel.tStartSec));
+      }
+      if (Number.isFinite(reel.tEndSec) && Number(reel.tEndSec) > 0) {
+        nextParams.set("community_t_end_sec", String(reel.tEndSec));
+      }
+      if (typeof window !== "undefined") {
+        try {
+          const returnUrl = new URL(window.location.href);
+          returnUrl.searchParams.set("tab", "community");
+          returnUrl.searchParams.set("community_set_id", set.id);
+          window.history.replaceState(window.history.state, "", `${returnUrl.pathname}?${returnUrl.searchParams.toString()}`);
+        } catch {
+          // Ignore URL rewrite failures.
+        }
+        try {
+          window.sessionStorage.setItem(`${COMMUNITY_SET_RETURN_SNAPSHOT_PREFIX}${set.id}`, JSON.stringify(set));
+        } catch {
+          // Ignore snapshot persistence failures.
+        }
+        const handoffId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+        try {
+          window.sessionStorage.setItem(
+            `${COMMUNITY_SET_FEED_HANDOFF_PREFIX}${handoffId}`,
+            JSON.stringify({
+              setId: set.id,
+              setTitle: set.title,
+              selectedReelId: reel.id,
+              reels: set.reels.map((row) => ({
+                id: row.id,
+                platform: row.platform,
+                sourceUrl: row.sourceUrl,
+                embedUrl: row.embedUrl,
+                tStartSec: row.tStartSec,
+                tEndSec: row.tEndSec,
+              })),
+            }),
+          );
+          nextParams.set("community_handoff_id", handoffId);
+        } catch {
+          // Ignore storage failures and fall back to URL payload only.
+        }
+      }
+      router.push(`/feed?${nextParams.toString()}`);
+    },
+    [router],
+  );
+
+  const openSelectedSetReelsInFeed = useCallback(() => {
+    if (!selectedDirectorySet || selectedDirectorySet.reels.length === 0) {
       return;
     }
-    const containerRect = container.getBoundingClientRect();
-    const sectionRect = reelsSection.getBoundingClientRect();
-    const nextTop = sectionRect.top - containerRect.top + container.scrollTop - 12;
-    container.scrollTo({
-      top: Math.max(0, nextTop),
-      behavior: "smooth",
-    });
-  }, []);
+    const selectedReel =
+      selectedDirectorySet.reels.find((reel) => reel.id === selectedDetailReelId) ?? selectedDirectorySet.reels[0];
+    openCommunityReelInFeed(selectedDirectorySet, selectedReel);
+  }, [openCommunityReelInFeed, selectedDetailReelId, selectedDirectorySet]);
 
   const detailBannerPortal =
     mode === "community" && isVisible && portalReady && selectedDirectorySet
@@ -1152,7 +1977,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
 
                     <button
                       type="button"
-                      onClick={scrollToDetailReels}
+                      onClick={openSelectedSetReelsInFeed}
                       disabled={!selectedDirectorySetHasReels}
                       className={`pointer-events-auto inline-flex h-10 items-center justify-center self-start rounded-full px-5 text-sm font-semibold transition md:self-center ${
                         selectedDirectorySetHasReels
@@ -1193,7 +2018,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                   </div>
                   <button
                     type="button"
-                    onClick={scrollToDetailReels}
+                    onClick={openSelectedSetReelsInFeed}
                     disabled={!selectedDirectorySetHasReels}
                     className={`pointer-events-auto mr-2 inline-flex h-9 shrink-0 items-center justify-center rounded-full px-4 text-xs font-semibold transition sm:mr-3 sm:px-5 ${
                       selectedDirectorySetHasReels
@@ -1306,6 +2131,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                             <button
                               type="button"
                               data-featured-view-set-button
+                              onClick={() => openDirectorySet(set)}
                               className="mt-8 inline-flex w-full items-center justify-center rounded-full bg-white px-6 py-2.5 text-sm font-semibold text-black transition max-[380px]:mt-6 hover:bg-[#f1eee5] sm:mt-7 sm:w-auto sm:px-8 sm:py-3"
                             >
                               View Set
@@ -1429,7 +2255,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
             role="dialog"
             aria-modal="true"
             aria-label={selectedDirectorySet ? `${selectedDirectorySet.title} details` : "Community set details"}
-            className={`absolute inset-0 flex min-h-0 flex-col transition-opacity duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+            className={`absolute inset-0 flex min-h-0 flex-col ${skipDetailTransitionOnce ? "" : "transition-opacity duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)]"} ${
               isDirectoryDetailOpen ? "opacity-100" : "opacity-0 pointer-events-none"
             }`}
           >
@@ -1442,13 +2268,13 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                 <div className="px-1 sm:px-2 md:px-3">
                   <section className="rounded-2xl px-4 py-4 sm:px-5 sm:py-5">
                     <div className="flex items-center justify-between gap-3">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/65">Set Preview</p>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/65">Reel Preview</p>
                       <div className="flex items-center gap-1.5">
                         <button
                           type="button"
                           onClick={goToPreviousDetailCarousel}
-                          disabled={detailCarouselIndex === 0}
-                          aria-label="Previous images"
+                          disabled={detailCarouselCount <= 1}
+                          aria-label="Previous reel"
                           className="grid h-8 w-8 place-items-center rounded-full bg-black/45 text-white/80 transition hover:bg-black/60 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
                         >
                           <i className="fa-solid fa-chevron-left text-[10px]" aria-hidden="true" />
@@ -1456,8 +2282,8 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                         <button
                           type="button"
                           onClick={goToNextDetailCarousel}
-                          disabled={detailCarouselIndex >= maxDetailCarouselIndex}
-                          aria-label="Next images"
+                          disabled={detailCarouselCount <= 1}
+                          aria-label="Next reel"
                           className="grid h-8 w-8 place-items-center rounded-full bg-black/45 text-white/80 transition hover:bg-black/60 hover:text-white disabled:cursor-not-allowed disabled:opacity-35"
                         >
                           <i className="fa-solid fa-chevron-right text-[10px]" aria-hidden="true" />
@@ -1465,28 +2291,32 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                       </div>
                     </div>
 
-                    <div className="mt-3 overflow-hidden rounded-xl">
-                      <div
-                        className="flex transition-transform duration-300 ease-out"
-                        style={{
-                          width: `${(detailCarouselImages.length / DETAIL_CAROUSEL_VISIBLE_COUNT) * 100}%`,
-                          transform: `translateX(-${(detailCarouselIndex * 100) / detailCarouselImages.length}%)`,
-                        }}
-                      >
-                        {detailCarouselImages.map((image, index) => (
-                          <div
-                            key={`${selectedDirectorySet.id}-detail-carousel-image-${index}`}
-                            className="shrink-0 px-1 py-1"
-                            style={{ width: `${100 / detailCarouselImages.length}%` }}
-                          >
-                            <img
-                              src={image}
-                              alt={`${selectedDirectorySet.title} preview ${index + 1}`}
-                              className="h-[180px] w-full rounded-lg object-cover sm:h-[220px] md:h-[260px]"
-                            />
+                    <div className="mt-3">
+                      {activeDetailCarouselReel ? (
+                        <>
+                          <iframe
+                            src={activeDetailCarouselReel.embedUrl}
+                            title={`${selectedDirectorySet.title} reel preview`}
+                            className="h-[270px] w-full border-0 sm:h-[360px] md:h-[440px]"
+                            loading="lazy"
+                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                            allowFullScreen
+                          />
+                          <div className="mt-2 flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/62">
+                            <span className="inline-flex items-center gap-1.5">
+                              <i className={PLATFORM_ICON[activeDetailCarouselReel.platform]} aria-hidden="true" />
+                              {PLATFORM_LABEL[activeDetailCarouselReel.platform]}
+                            </span>
+                            {formatClipRangeLabel(activeDetailCarouselReel) ? (
+                              <span>Clip {formatClipRangeLabel(activeDetailCarouselReel)}</span>
+                            ) : (
+                              <span>{detailCarouselIndex + 1} / {detailCarouselCount}</span>
+                            )}
                           </div>
-                        ))}
-                      </div>
+                        </>
+                      ) : (
+                        <p className="rounded-xl bg-black/30 px-3 py-6 text-sm text-white/65">No reels uploaded for this set yet.</p>
+                      )}
                     </div>
                   </section>
 
@@ -1510,41 +2340,6 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                     </div>
                   </section>
 
-                  <section ref={detailReelsSectionRef} className="mt-4 rounded-2xl px-4 py-4 sm:px-5 sm:py-5">
-                    <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/65">Reels</p>
-                    {selectedDirectorySet.reels.length === 0 ? (
-                      <p className="mt-3 text-sm text-white/65">No reels uploaded for this set yet.</p>
-                    ) : (
-                      <div className="mt-3 grid gap-3 md:grid-cols-2">
-                        {selectedDirectorySet.reels.map((reel) => (
-                          <article key={`${selectedDirectorySet.id}-detail-reel-${reel.id}`} className="overflow-hidden rounded-xl bg-black/35">
-                            <div className="flex items-center justify-between gap-2 px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/72">
-                              <span className="inline-flex items-center gap-1.5">
-                                <i className={PLATFORM_ICON[reel.platform]} aria-hidden="true" />
-                                {PLATFORM_LABEL[reel.platform]}
-                              </span>
-                              <a
-                                href={reel.sourceUrl}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="text-white/75 transition hover:text-white"
-                              >
-                                Open
-                              </a>
-                            </div>
-                            <iframe
-                              src={reel.embedUrl}
-                              title={`${selectedDirectorySet.title} reel`}
-                              className="h-[270px] w-full border-0"
-                              loading="lazy"
-                              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                              allowFullScreen
-                            />
-                          </article>
-                        ))}
-                      </div>
-                    )}
-                  </section>
                 </div>
               </div>
             ) : null}
@@ -1557,7 +2352,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
               <div className="flex flex-col gap-3 md:-mx-2 md:flex-row md:items-center md:justify-between md:gap-4 lg:-mx-3">
                 <div className="w-full pl-5 sm:pl-6 md:w-auto md:pl-6 lg:pl-2">
                   <div className="flex items-center justify-center gap-2 md:justify-start">
-                    <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">Create Set</h2>
+                    <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">{isEditMode ? "Edit Sets" : "Create Set"}</h2>
                     <span className="rounded-full border border-[#2b2b2b] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
                   </div>
                 </div>
@@ -1572,8 +2367,10 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                   <div className="relative z-10">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div>
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Create Set</p>
-                        <p className="mt-1 text-sm text-white/64">Complete each step to publish your reel set.</p>
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">{isEditMode ? "Edit Current Set" : "Create Set"}</p>
+                        <p className="mt-1 text-sm text-white/64">
+                          {isEditMode ? "Pick one of your sets, update it, then save changes." : "Complete each step to publish your reel set."}
+                        </p>
                       </div>
                       <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/72">
                         {completionPercent}% complete
@@ -1598,6 +2395,44 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                     </div>
                   </div>
                 </div>
+
+                {isEditMode ? (
+                  <div className="mt-4 rounded-2xl border border-[#2b2b2b] bg-black/30 p-4">
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-white/62">Select Your Set</p>
+                    {editableSets.length > 0 ? (
+                      <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+                        <select
+                          value={activeEditSetId ?? ""}
+                          onChange={(event) => onEditSetSelectionChange(event.target.value)}
+                          className="h-10 w-full rounded-xl border border-[#2b2b2b] bg-black/55 px-3 text-sm text-white outline-none"
+                        >
+                          {editableSets.map((set) => (
+                            <option key={`edit-set-option-${set.id}`} value={set.id}>
+                              {set.title}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!activeEditableSet) {
+                              return;
+                            }
+                            loadedEditSetIdRef.current = null;
+                            applySetToForm(activeEditableSet);
+                          }}
+                          className="inline-flex h-10 items-center justify-center rounded-xl border border-[#2b2b2b] px-3 text-xs font-semibold uppercase tracking-[0.08em] text-white/75 transition hover:bg-white/10 hover:text-white"
+                        >
+                          Reset to Saved
+                        </button>
+                      </div>
+                    ) : (
+                      <p className="mt-2 text-sm text-white/66">
+                        No editable sets yet. Create a set first, then come back to edit it.
+                      </p>
+                    )}
+                  </div>
+                ) : null}
 
                 <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)] lg:items-start">
                   <form onSubmit={onCreateSet} className="space-y-4 md:space-y-5">
@@ -1729,6 +2564,33 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                         {parsedDraftReels.map((row, index) => {
                           const hasInput = Boolean(row.value.trim());
                           const hasValidEmbed = row.parsed !== null;
+                          const hasValidRange = !row.hasClipRangeError;
+                          const durationState = reelDurationByRow[row.id];
+                          const detectedDurationSec = durationState?.durationSec;
+                          const hasDetectedDuration =
+                            Number.isFinite(detectedDurationSec) && Number(detectedDurationSec) > CLIP_SLIDER_MIN_GAP_SEC;
+                          const sliderMaxSec = hasDetectedDuration ? Number(detectedDurationSec) : null;
+                          const sliderStartSec =
+                            sliderMaxSec === null
+                              ? 0
+                              : Math.min(
+                                  Math.max(0, row.clipStartSec ?? 0),
+                                  Math.max(0, sliderMaxSec - CLIP_SLIDER_MIN_GAP_SEC),
+                                );
+                          const sliderEndSec =
+                            sliderMaxSec === null
+                              ? 0
+                              : Math.min(
+                                  sliderMaxSec,
+                                  Math.max(
+                                    sliderStartSec + CLIP_SLIDER_MIN_GAP_SEC,
+                                    row.clipEndSec ?? Math.min(sliderMaxSec, CLIP_SLIDER_DEFAULT_MAX_SEC),
+                                  ),
+                                );
+                          const sliderStartPercent = sliderMaxSec === null ? 0 : (sliderStartSec / sliderMaxSec) * 100;
+                          const sliderEndPercent = sliderMaxSec === null ? 0 : (sliderEndSec / sliderMaxSec) * 100;
+                          const shouldShowSlider = hasInput && hasValidEmbed && sliderMaxSec !== null;
+                          const isDurationLoading = hasInput && hasValidEmbed && (durationState?.loading ?? true);
                           return (
                             <div key={row.id} className="rounded-xl p-3">
                               <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:gap-3">
@@ -1749,8 +2611,64 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                                 </button>
                               </div>
 
+                              {shouldShowSlider ? (
+                                <div className="mt-2">
+                                  <div className="flex items-center justify-between gap-2 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/58">
+                                    <span>Clip Range</span>
+                                    <span>
+                                      {formatClipSecondsInputValue(sliderStartSec)}s - {formatClipSecondsInputValue(sliderEndSec)}s
+                                    </span>
+                                  </div>
+                                  <div className="relative mt-1.5 h-8">
+                                    <div className="pointer-events-none absolute left-0 right-0 top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-white/25" />
+                                    <div
+                                      className="pointer-events-none absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full bg-white"
+                                      style={{
+                                        left: `${sliderStartPercent}%`,
+                                        width: `${Math.max(0, sliderEndPercent - sliderStartPercent)}%`,
+                                      }}
+                                    />
+                                    <input
+                                      type="range"
+                                      min={0}
+                                      max={sliderMaxSec}
+                                      step={CLIP_SLIDER_STEP_SEC}
+                                      value={sliderStartSec}
+                                      onChange={(event) => updateReelClipStartFromSlider(row.id, Number(event.target.value), sliderMaxSec)}
+                                      className="dual-range-input absolute inset-0 h-8 w-full"
+                                      aria-label={`Clip start for reel ${index + 1}`}
+                                    />
+                                    <input
+                                      type="range"
+                                      min={0}
+                                      max={sliderMaxSec}
+                                      step={CLIP_SLIDER_STEP_SEC}
+                                      value={sliderEndSec}
+                                      onChange={(event) => updateReelClipEndFromSlider(row.id, Number(event.target.value), sliderMaxSec)}
+                                      className="dual-range-input absolute inset-0 h-8 w-full"
+                                      aria-label={`Clip end for reel ${index + 1}`}
+                                    />
+                                  </div>
+                                  <div className="mt-1 flex items-center justify-between text-[10px] text-white/50">
+                                    <span>0s</span>
+                                    <span>{formatClipSecondsInputValue(sliderMaxSec)}s</span>
+                                  </div>
+                                </div>
+                              ) : null}
+                              {isDurationLoading ? (
+                                <p className="mt-2 text-[10px] text-white/55">Detecting video length...</p>
+                              ) : null}
+                              {hasInput && hasValidEmbed && !isDurationLoading && !hasDetectedDuration ? (
+                                <p className="mt-2 text-[10px] text-[#ffb4b4]">
+                                  Could not detect video length for this link yet. Slider appears after detection.
+                                </p>
+                              ) : null}
+
                               {hasInput && !hasValidEmbed ? (
                                 <p className="mt-2 text-[11px] text-[#ffb4b4]">Invalid URL. Supported: {SUPPORTED_PLATFORMS_LABEL}.</p>
+                              ) : null}
+                              {hasInput && hasValidEmbed && !hasValidRange ? (
+                                <p className="mt-2 text-[11px] text-[#ffb4b4]">Invalid clip range. End must be greater than start.</p>
                               ) : null}
 
                               {row.parsed ? (
@@ -1758,6 +2676,11 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                                   <div className="flex items-center gap-1.5 px-2 py-1.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/70">
                                     <i className={PLATFORM_ICON[row.parsed.platform]} aria-hidden="true" />
                                     {PLATFORM_LABEL[row.parsed.platform]} embed
+                                    {hasValidRange ? (
+                                      <span className="ml-1 text-white/55">
+                                        ({row.clipStartSec?.toFixed(1).replace(/\.0$/, "")}s - {row.clipEndSec?.toFixed(1).replace(/\.0$/, "")}s)
+                                      </span>
+                                    ) : null}
                                   </div>
                                   <iframe
                                     src={row.parsed.embedUrl}
@@ -1787,17 +2710,26 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                     {createError ? <p className="text-xs text-[#ffb4b4]">{createError}</p> : null}
                     {createSuccess ? <p className="text-xs text-[#9ef8cb]">{createSuccess}</p> : null}
 
-                    <button
-                      type="submit"
-                      disabled={!canPostSet}
-                      className={`inline-flex h-11 w-full items-center justify-center rounded-xl border px-4 text-sm font-semibold transition ${
-                        canPostSet
-                          ? "border-[#2b2b2b] bg-black/55 text-white hover:bg-white hover:text-black"
-                          : "cursor-not-allowed border-[#2b2b2b] bg-black/35 text-white/45"
-                      }`}
-                    >
-                      {isPostingSet ? "Posting..." : "Post Community Set"}
-                    </button>
+                    <div className="grid gap-2 sm:grid-cols-2">
+                      <button
+                        type="button"
+                        onClick={onSaveDraftProgress}
+                        className="inline-flex h-11 w-full items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
+                      >
+                        Save Progress
+                      </button>
+                      <button
+                        type="submit"
+                        disabled={!canPostSet}
+                        className={`inline-flex h-11 w-full items-center justify-center rounded-xl border px-4 text-sm font-semibold transition ${
+                          canPostSet
+                            ? "border-[#2b2b2b] bg-black/55 text-white hover:bg-white hover:text-black"
+                            : "cursor-not-allowed border-[#2b2b2b] bg-black/35 text-white/45"
+                        }`}
+                      >
+                        {isPostingSet ? (isEditMode ? "Saving..." : "Posting...") : isEditMode ? "Save Set Changes" : "Post Community Set"}
+                      </button>
+                    </div>
                   </form>
 
                   <aside className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[4px] sm:p-5 lg:sticky lg:top-3">
