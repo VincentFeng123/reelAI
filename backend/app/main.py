@@ -325,18 +325,21 @@ async def create_material(
         raise HTTPException(status_code=400, detail="Input is too short")
 
     chunks = chunk_text(raw_text)
+    if SERVERLESS_MODE and len(chunks) > 64:
+        chunks = chunks[:64]
 
     material_id = str(uuid.uuid4())
     created_at = now_iso()
 
     with get_conn() as conn:
+        concept_limit = 6 if SERVERLESS_MODE else 12
         concepts, objectives = material_intelligence_service.extract_concepts_and_objectives(
             conn,
             raw_text,
             subject_tag=subject_tag,
-            max_concepts=12,
+            max_concepts=concept_limit,
         )
-        if objectives and not any(c["title"].lower() == "learning objectives" for c in concepts):
+        if objectives and len(concepts) < concept_limit and not any(c["title"].lower() == "learning objectives" for c in concepts):
             concepts.append(
                 {
                     "id": str(uuid.uuid4()),

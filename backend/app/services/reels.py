@@ -166,7 +166,9 @@ class ReelService:
             os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
         )
         self._strategy_history_cache: dict[str, float] = {}
-        self.openai_client = OpenAI(api_key=settings.openai_api_key) if settings.openai_api_key else None
+        allow_openai_serverless = os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1"
+        can_use_openai = bool(settings.openai_api_key) and (not self.serverless_mode or allow_openai_serverless)
+        self.openai_client = OpenAI(api_key=settings.openai_api_key, timeout=8.0) if can_use_openai else None
 
     def generate_reels(
         self,

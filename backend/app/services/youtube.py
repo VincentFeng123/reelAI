@@ -67,8 +67,8 @@ class YouTubeService:
         self.serverless_mode = bool(
             os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
         )
-        self.search_time_budget_sec = 6.0 if self.serverless_mode else self.SEARCH_TIME_BUDGET_SEC
-        self.request_timeout_sec = 5.0 if self.serverless_mode else self.REQUEST_TIMEOUT_SEC
+        self.search_time_budget_sec = 3.5 if self.serverless_mode else self.SEARCH_TIME_BUDGET_SEC
+        self.request_timeout_sec = 2.5 if self.serverless_mode else self.REQUEST_TIMEOUT_SEC
 
     def search_videos(
         self,
