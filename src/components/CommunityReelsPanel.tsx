@@ -2438,14 +2438,14 @@ export function CommunityReelsPanel({
     if (!unsavedDraftExitModal) {
       return;
     }
+    const pendingAction = unsavedDraftExitModal.action;
+    setUnsavedDraftExitModal(null);
     const didSave = isFormEditMode
       ? await submitSet()
       : saveCurrentDraftProgress({ showSuccessMessage: false });
     if (!didSave) {
       return;
     }
-    const pendingAction = unsavedDraftExitModal.action;
-    setUnsavedDraftExitModal(null);
     if (pendingAction === "back-to-grid") {
       backToEditSetGrid();
     }

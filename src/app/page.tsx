@@ -4,7 +4,12 @@ import { Suspense, type MouseEvent as ReactMouseEvent, type UIEvent, useCallback
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { type CommunityDraftExitActions, CommunityReelsPanel } from "@/components/CommunityReelsPanel";
-import { type SettingsPanelHandle, SettingsPanel } from "@/components/SettingsPanel";
+import {
+  type SettingsAvailabilityModalSnapshot,
+  type SettingsAvailabilityState,
+  type SettingsPanelHandle,
+  SettingsPanel,
+} from "@/components/SettingsPanel";
 import { UploadPanel } from "@/components/UploadPanel";
 import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
 
@@ -29,6 +34,12 @@ type SidebarSwitchIntent = {
   tab: SidebarTab;
   clearHistoryQuery?: boolean;
   resetCommunityView?: boolean;
+};
+
+const DEFAULT_SETTINGS_AVAILABILITY_STATE: SettingsAvailabilityState = {
+  status: "checking",
+  message: "Estimating success rate from configuration heuristics...",
+  limitingFactors: [],
 };
 
 type HistoryItem = {
@@ -180,7 +191,8 @@ function HomePageContent() {
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
   const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
   const [hasUnsavedSettingsChanges, setHasUnsavedSettingsChanges] = useState(false);
-  const [showUnsavedSettingsModal, setShowUnsavedSettingsModal] = useState(false);
+  const [settingsModalView, setSettingsModalView] = useState<null | "unsaved" | "availability">(null);
+  const [settingsAvailabilityModalSnapshot, setSettingsAvailabilityModalSnapshot] = useState<SettingsAvailabilityModalSnapshot | null>(null);
   const [hasUnsavedCommunityDraftChanges, setHasUnsavedCommunityDraftChanges] = useState(false);
   const [showUnsavedCommunityDraftModal, setShowUnsavedCommunityDraftModal] = useState(false);
   const [pendingSidebarSwitchIntent, setPendingSidebarSwitchIntent] = useState<SidebarSwitchIntent | null>(null);
@@ -480,7 +492,7 @@ function HomePageContent() {
       const hasPendingUnsavedSettings = hasUnsavedSettingsChanges || Boolean(settingsPanelRef.current?.hasUnsavedChanges());
       if (activeSidebarTab === "settings" && intent.tab !== "settings" && hasPendingUnsavedSettings) {
         setPendingSidebarSwitchIntent(intent);
-        setShowUnsavedSettingsModal(true);
+        setSettingsModalView("unsaved");
         return;
       }
       const leavingCommunityDraftForm = (activeSidebarTab === "create" || activeSidebarTab === "edit")
@@ -718,11 +730,15 @@ function HomePageContent() {
     // Clearing it here would incorrectly mark the form clean during effect cleanups.
     communityDraftExitActionsRef.current = actions;
   }, []);
-  const closeUnsavedSettingsModal = useCallback(() => {
-    setShowUnsavedSettingsModal(false);
+  const closeSettingsModal = useCallback((source: "close-button" | "backdrop" = "close-button") => {
+    if (settingsModalView === "availability") {
+      settingsPanelRef.current?.dismissAvailabilityModal(source);
+      return;
+    }
+    setSettingsModalView(null);
     setPendingSidebarSwitchIntent(null);
     setPendingSaveSwitchUntilHeuristicClose(false);
-  }, []);
+  }, [settingsModalView]);
   const closeUnsavedCommunityDraftModal = useCallback(() => {
     setShowUnsavedCommunityDraftModal(false);
     setPendingCommunityDraftSwitchIntent(null);
@@ -730,36 +746,36 @@ function HomePageContent() {
   const discardSettingsAndContinue = useCallback(() => {
     const intent = pendingSidebarSwitchIntent;
     if (!intent) {
-      closeUnsavedSettingsModal();
+      closeSettingsModal();
       return;
     }
     settingsPanelRef.current?.discardUnsavedChanges();
     setHasUnsavedSettingsChanges(false);
-    setShowUnsavedSettingsModal(false);
+    setSettingsModalView(null);
     setPendingSidebarSwitchIntent(null);
     setPendingSaveSwitchUntilHeuristicClose(false);
     applySidebarSwitchIntent(intent);
-  }, [applySidebarSwitchIntent, closeUnsavedSettingsModal, pendingSidebarSwitchIntent]);
+  }, [applySidebarSwitchIntent, closeSettingsModal, pendingSidebarSwitchIntent]);
   const saveSettingsAndContinue = useCallback(() => {
     const intent = pendingSidebarSwitchIntent;
     if (!intent) {
-      closeUnsavedSettingsModal();
+      closeSettingsModal();
       return;
     }
     const settingsPanel = settingsPanelRef.current;
     if (!settingsPanel) {
       setHasUnsavedSettingsChanges(false);
-      setShowUnsavedSettingsModal(false);
+      setSettingsModalView(null);
       setPendingSidebarSwitchIntent(null);
       setPendingSaveSwitchUntilHeuristicClose(false);
       applySidebarSwitchIntent(intent);
       return;
     }
+    setSettingsModalView("availability");
+    setPendingSaveSwitchUntilHeuristicClose(true);
     settingsPanel.savePreferences();
     setHasUnsavedSettingsChanges(false);
-    setShowUnsavedSettingsModal(false);
-    setPendingSaveSwitchUntilHeuristicClose(true);
-  }, [applySidebarSwitchIntent, closeUnsavedSettingsModal, pendingSidebarSwitchIntent]);
+  }, [applySidebarSwitchIntent, closeSettingsModal, pendingSidebarSwitchIntent]);
   const discardCommunityDraftAndContinue = useCallback(() => {
     const intent = pendingCommunityDraftSwitchIntent;
     if (!intent) {
@@ -778,17 +794,18 @@ function HomePageContent() {
       closeUnsavedCommunityDraftModal();
       return;
     }
+    setShowUnsavedCommunityDraftModal(false);
+    setPendingCommunityDraftSwitchIntent(null);
     const didSave = communityDraftExitActionsRef.current?.saveDraftProgress() ?? true;
     if (!didSave) {
       return;
     }
     setHasUnsavedCommunityDraftChanges(false);
-    setShowUnsavedCommunityDraftModal(false);
-    setPendingCommunityDraftSwitchIntent(null);
     applySidebarSwitchIntent(intent);
   }, [applySidebarSwitchIntent, closeUnsavedCommunityDraftModal, pendingCommunityDraftSwitchIntent]);
   const onSettingsAvailabilityModalClose = useCallback(
     (source: "close-button" | "backdrop") => {
+      setSettingsModalView(null);
       if (!pendingSaveSwitchUntilHeuristicClose) {
         return;
       }
@@ -819,7 +836,8 @@ function HomePageContent() {
       ? "create"
       : visibleSidebarTab === "edit"
         ? "edit"
-      : "community";
+        : "community";
+  const activeSettingsAvailabilityState = settingsAvailabilityModalSnapshot?.state ?? DEFAULT_SETTINGS_AVAILABILITY_STATE;
 
   const sidebarPanelContent = (
     <div className="flex h-full min-h-0 flex-col">
@@ -1233,6 +1251,8 @@ function HomePageContent() {
               onClearSearchData={clearAllHistory}
               onUnsavedChangesChange={setHasUnsavedSettingsChanges}
               onAvailabilityModalClose={onSettingsAvailabilityModalClose}
+              availabilityModalMode={settingsModalView === "availability" || Boolean(settingsAvailabilityModalSnapshot?.mounted) ? "inline" : "overlay"}
+              onAvailabilityModalStateChange={setSettingsAvailabilityModalSnapshot}
             />
           </div>
           <div className={visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
@@ -1300,27 +1320,35 @@ function HomePageContent() {
           </div>
         </div>
       ) : null}
-      {showUnsavedSettingsModal ? (
+      {settingsModalView ? (
         <div
           className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
           role="presentation"
-          onClick={closeUnsavedSettingsModal}
+          onClick={() => closeSettingsModal("backdrop")}
         >
           <div
             role="dialog"
             aria-modal="true"
-            aria-label="Unsaved settings changes"
+            aria-label={settingsModalView === "availability" ? "Configuration success rate" : "Unsaved settings changes"}
             className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-start justify-between gap-4">
               <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">Save settings before leaving?</h3>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">
+                  {settingsModalView === "availability" ? "Configuration check" : "Unsaved changes"}
+                </p>
+                <h3 className="mt-2 text-lg font-semibold text-white">
+                  {settingsModalView === "availability"
+                    ? activeSettingsAvailabilityState.status === "checking"
+                      ? "Checking success rate..."
+                      : "Success rate result"
+                    : "Save settings before leaving?"}
+                </h3>
               </div>
               <button
                 type="button"
-                onClick={closeUnsavedSettingsModal}
+                onClick={() => closeSettingsModal("close-button")}
                 aria-label="Close"
                 className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
               >
@@ -1329,25 +1357,73 @@ function HomePageContent() {
                 </svg>
               </button>
             </div>
-            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-              You changed settings. Save to apply them, or discard these edits and continue.
-            </p>
-            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={discardSettingsAndContinue}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
-              >
-                Discard
-              </button>
-              <button
-                type="button"
-                onClick={saveSettingsAndContinue}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
-              >
-                Save
-              </button>
-            </div>
+            {settingsModalView === "availability" ? (
+              <>
+                <div
+                  className={`mt-4 rounded-2xl border px-4 py-3 text-sm ${
+                    activeSettingsAvailabilityState.status === "ok"
+                      ? "border-emerald-300/45 bg-emerald-500/14 text-emerald-100"
+                      : activeSettingsAvailabilityState.status === "partial"
+                      ? "border-sky-300/45 bg-sky-500/14 text-sky-100"
+                      : activeSettingsAvailabilityState.status === "blocked"
+                      ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
+                      : activeSettingsAvailabilityState.status === "none"
+                      ? "border-amber-300/45 bg-amber-500/16 text-amber-100"
+                      : activeSettingsAvailabilityState.status === "error"
+                      ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
+                      : "border-white/24 bg-white/[0.06] text-white/88"
+                  }`}
+                >
+                  <p>{activeSettingsAvailabilityState.message}</p>
+                  {activeSettingsAvailabilityState.limitingFactors.length > 0 ? (
+                    <div className="mt-2 border-t border-white/20 pt-2 text-xs">
+                      <p className="font-semibold">
+                        {activeSettingsAvailabilityState.limitingFactors.length > 1 ? "Main limits:" : "Main limit:"}
+                      </p>
+                      <ul className="mt-1.5 space-y-1">
+                        {activeSettingsAvailabilityState.limitingFactors.map((factor) => (
+                          <li key={factor} className="flex items-start gap-1.5">
+                            <span aria-hidden="true" className="leading-[1.2] opacity-80">•</span>
+                            <span>{factor}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="mt-4 flex items-center justify-end">
+                  <button
+                    type="button"
+                    onClick={() => closeSettingsModal("close-button")}
+                    className="inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
+                  >
+                    OK
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+                  You changed settings. Save to apply them, or discard these edits and continue.
+                </p>
+                <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={discardSettingsAndContinue}
+                    className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
+                  >
+                    Discard
+                  </button>
+                  <button
+                    type="button"
+                    onClick={saveSettingsAndContinue}
+                    className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
+                  >
+                    Save
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       ) : null}

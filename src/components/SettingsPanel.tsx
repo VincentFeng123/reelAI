@@ -20,6 +20,8 @@ type SettingsPanelProps = {
   onClearSearchData: () => void;
   onUnsavedChangesChange?: (hasUnsavedChanges: boolean) => void;
   onAvailabilityModalClose?: (source: "close-button" | "backdrop") => void;
+  availabilityModalMode?: "overlay" | "inline";
+  onAvailabilityModalStateChange?: (snapshot: SettingsAvailabilityModalSnapshot | null) => void;
 };
 
 type SavedPreferences = StudyReelsSettings;
@@ -27,6 +29,7 @@ export type SettingsPanelHandle = {
   savePreferences: () => void;
   discardUnsavedChanges: () => void;
   hasUnsavedChanges: () => boolean;
+  dismissAvailabilityModal: (source: "close-button" | "backdrop") => void;
 };
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
@@ -78,10 +81,16 @@ const poolSummaryLabel: Record<VideoPoolMode, string> = {
   "long-form": "Long",
 };
 
-type AvailabilityState = {
+export type SettingsAvailabilityState = {
   status: "idle" | "checking" | "ok" | "partial" | "blocked" | "none" | "error";
   message: string;
   limitingFactors: string[];
+};
+
+export type SettingsAvailabilityModalSnapshot = {
+  mounted: boolean;
+  visible: boolean;
+  state: SettingsAvailabilityState;
 };
 
 function SettingsInfoTooltip({ text }: { text: string }) {
@@ -126,7 +135,7 @@ function pushPointAwayFromPoint(
   };
 }
 
-function buildHeuristicAvailabilityState(settings: StudyReelsSettings): AvailabilityState {
+function buildHeuristicAvailabilityState(settings: StudyReelsSettings): SettingsAvailabilityState {
   const relevanceRatio = Math.max(0, Math.min(1, settings.minRelevanceThreshold / MAX_RELEVANCE));
   const clipWidth = settings.targetClipDurationMaxSec - settings.targetClipDurationMinSec;
   const midpoint = (settings.targetClipDurationMinSec + settings.targetClipDurationMaxSec) / 2;
@@ -215,7 +224,13 @@ function buildHeuristicAvailabilityState(settings: StudyReelsSettings): Availabi
 }
 
 export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>(function SettingsPanel(
-  { onClearSearchData, onUnsavedChangesChange, onAvailabilityModalClose }: SettingsPanelProps,
+  {
+    onClearSearchData,
+    onUnsavedChangesChange,
+    onAvailabilityModalClose,
+    availabilityModalMode = "overlay",
+    onAvailabilityModalStateChange,
+  }: SettingsPanelProps,
   ref,
 ) {
   const [minRelevanceThreshold, setMinRelevanceThreshold] = useState(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
@@ -236,7 +251,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   const [isAvailabilityModalMounted, setIsAvailabilityModalMounted] = useState(false);
   const [isAvailabilityModalVisible, setIsAvailabilityModalVisible] = useState(false);
   const [showLowRelevanceWarning, setShowLowRelevanceWarning] = useState(false);
-  const [availabilityState, setAvailabilityState] = useState<AvailabilityState>({
+  const [availabilityState, setAvailabilityState] = useState<SettingsAvailabilityState>({
     status: "idle",
     message: "Save settings to estimate success rate from configuration heuristics.",
     limitingFactors: [],
@@ -690,6 +705,21 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   }, [onAvailabilityModalClose]);
 
   useEffect(() => {
+    if (!onAvailabilityModalStateChange) {
+      return;
+    }
+    if (!isAvailabilityModalMounted) {
+      onAvailabilityModalStateChange(null);
+      return;
+    }
+    onAvailabilityModalStateChange({
+      mounted: isAvailabilityModalMounted,
+      visible: isAvailabilityModalVisible,
+      state: availabilityState,
+    });
+  }, [availabilityState, isAvailabilityModalMounted, isAvailabilityModalVisible, onAvailabilityModalStateChange]);
+
+  useEffect(() => {
     return () => {
       if (typeof window === "undefined") {
         return;
@@ -809,8 +839,9 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
       savePreferences,
       discardUnsavedChanges,
       hasUnsavedChanges: () => settingsHydrated && hasUnsavedChanges,
+      dismissAvailabilityModal: closeAvailabilityModal,
     }),
-    [discardUnsavedChanges, hasUnsavedChanges, savePreferences, settingsHydrated],
+    [closeAvailabilityModal, discardUnsavedChanges, hasUnsavedChanges, savePreferences, settingsHydrated],
   );
 
   useEffect(() => {
@@ -1285,7 +1316,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
           </button>
         </div>
       </div>
-      {isAvailabilityModalMounted ? (
+      {isAvailabilityModalMounted && availabilityModalMode === "overlay" ? (
         <div
           className={`fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out ${
             isAvailabilityModalVisible ? "opacity-100" : "pointer-events-none opacity-0"
