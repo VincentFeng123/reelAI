@@ -3010,7 +3010,7 @@ export function CommunityReelsPanel({
                       disabled={!selectedDirectorySetHasReels}
                       className={`pointer-events-auto inline-flex h-10 items-center justify-center self-start rounded-full px-5 text-sm font-semibold transition md:self-center ${
                         selectedDirectorySetHasReels
-                          ? "bg-white text-[#06233a] hover:bg-[#d9eefb]"
+                          ? "bg-white text-[#06233a] hover:bg-[#e6e6e6]"
                           : "cursor-not-allowed bg-white/45 text-[#06233a]/70"
                       }`}
                     >
@@ -3051,7 +3051,7 @@ export function CommunityReelsPanel({
                     disabled={!selectedDirectorySetHasReels}
                     className={`pointer-events-auto mr-2 inline-flex h-9 shrink-0 items-center justify-center rounded-full px-4 text-xs font-semibold transition sm:mr-3 sm:px-5 ${
                       selectedDirectorySetHasReels
-                        ? "bg-white text-[#06233a] hover:bg-[#d9eefb]"
+                        ? "bg-white text-[#06233a] hover:bg-[#e6e6e6]"
                         : "cursor-not-allowed bg-white/45 text-[#06233a]/70"
                     }`}
                   >
