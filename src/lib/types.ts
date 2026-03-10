@@ -105,6 +105,8 @@ export type CommunitySet = {
   likes: number;
   learners: number;
   updatedLabel: string;
+  updatedAt?: string | null;
+  createdAt?: string | null;
   thumbnailUrl: string;
   featured: boolean;
 };

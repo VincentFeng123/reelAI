@@ -872,7 +872,7 @@ export function ReelCard({
           aria-label={surfaceAriaLabel}
           onClick={togglePlayPause}
           disabled={!canToggleFromSurface}
-          className="absolute inset-0 z-[15] cursor-pointer bg-transparent disabled:cursor-not-allowed"
+          className="absolute inset-0 z-[15] cursor-default bg-transparent disabled:cursor-not-allowed"
         />
       ) : null}
 

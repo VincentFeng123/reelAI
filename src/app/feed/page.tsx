@@ -1789,20 +1789,12 @@ function FeedPageInner() {
     if (returnTabParam === "search") {
       return "/?tab=search";
     }
-    if (returnTabParam === "community") {
+    const returnSetId = (returnCommunitySetIdParam.trim() || communitySetIdParam.trim());
+    if (returnTabParam === "community" || returnSetId || communityPreviewReel || communityHandoffIdParam) {
       const nextParams = new URLSearchParams();
       nextParams.set("tab", "community");
-      const returnSetId = returnCommunitySetIdParam.trim() || communitySetIdParam;
       if (returnSetId) {
         nextParams.set("community_set_id", returnSetId);
-      }
-      return `/?${nextParams.toString()}`;
-    }
-    if (communitySetIdParam || communityPreviewReel || communityHandoffIdParam) {
-      const nextParams = new URLSearchParams();
-      nextParams.set("tab", "community");
-      if (communitySetIdParam) {
-        nextParams.set("community_set_id", communitySetIdParam);
       }
       return `/?${nextParams.toString()}`;
     }

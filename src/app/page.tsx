@@ -3,7 +3,7 @@
 import { Suspense, type MouseEvent as ReactMouseEvent, type UIEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
-import { CommunityReelsPanel } from "@/components/CommunityReelsPanel";
+import { type CommunityDraftExitActions, CommunityReelsPanel } from "@/components/CommunityReelsPanel";
 import { type SettingsPanelHandle, SettingsPanel } from "@/components/SettingsPanel";
 import { UploadPanel } from "@/components/UploadPanel";
 import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
@@ -23,10 +23,12 @@ const SIDEBAR_INFO_TOOLTIP_VISIBLE_MS = 2200;
 const SIDEBAR_INFO_TOOLTIP_FADE_MS = 180;
 const SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS = 24;
 type GenerationMode = "slow" | "fast";
+type HistorySource = "search" | "community";
 type SidebarTab = "search" | "community" | "create" | "edit" | "settings";
 type SidebarSwitchIntent = {
   tab: SidebarTab;
   clearHistoryQuery?: boolean;
+  resetCommunityView?: boolean;
 };
 
 type HistoryItem = {
@@ -35,13 +37,34 @@ type HistoryItem = {
   updatedAt: number;
   starred: boolean;
   generationMode: GenerationMode;
+  source: HistorySource;
+  feedQuery?: string;
 };
 
 function normalizeSidebarTab(value: string | null): SidebarTab | null {
-  if (value === "search" || value === "community" || value === "create" || value === "edit" || value === "settings") {
+  if (value === "create" || value === "edit") {
+    return "edit";
+  }
+  if (value === "search" || value === "community" || value === "settings") {
     return value;
   }
   return null;
+}
+
+function parseCommunitySetIdFromHistoryMaterialId(materialId: string): string | null {
+  const prefix = "community:";
+  if (!materialId.startsWith(prefix)) {
+    return null;
+  }
+  const raw = materialId.slice(prefix.length).trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
 }
 
 function parseMaterialHistory(raw: string | null): HistoryItem[] {
@@ -61,6 +84,8 @@ function parseMaterialHistory(raw: string | null): HistoryItem[] {
         updatedAt: Number(item.updatedAt) || 0,
         starred: Boolean(item.starred),
         generationMode: item.generationMode === "slow" ? "slow" : "fast",
+        source: item.source === "community" ? "community" : "search",
+        feedQuery: typeof item.feedQuery === "string" && item.feedQuery.trim() ? item.feedQuery.trim() : undefined,
       }))
       .slice(0, MAX_HISTORY_ITEMS);
   } catch {
@@ -92,6 +117,8 @@ function parseLegacyTopicHistory(raw: string | null): HistoryItem[] {
         updatedAt: Number(item.updatedAt) || 0,
         starred: false,
         generationMode: "fast",
+        source: "search",
+        feedQuery: undefined,
       }))
       .slice(0, MAX_HISTORY_ITEMS);
   } catch {
@@ -112,6 +139,8 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
         ...item,
         starred: item.starred || existing.starred,
         generationMode: item.generationMode || existing.generationMode || "fast",
+        source: item.source || existing.source || "search",
+        feedQuery: item.feedQuery ?? existing.feedQuery,
       });
       continue;
     }
@@ -119,6 +148,8 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
       ...existing,
       starred: existing.starred || item.starred,
       generationMode: existing.generationMode || item.generationMode || "fast",
+      source: existing.source || item.source || "search",
+      feedQuery: existing.feedQuery ?? item.feedQuery,
     });
   }
   return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_HISTORY_ITEMS);
@@ -129,7 +160,9 @@ function HomePageContent() {
   const searchParams = useSearchParams();
   const forcedSidebarTab = useMemo(() => normalizeSidebarTab(searchParams.get("tab")), [searchParams]);
   const forcedCommunitySetId = useMemo(() => {
-    const raw = searchParams.get("community_set_id");
+    const fromCommunitySet = searchParams.get("community_set_id");
+    const fromReturnSet = searchParams.get("return_community_set_id");
+    const raw = fromCommunitySet || fromReturnSet;
     if (!raw) {
       return null;
     }
@@ -148,19 +181,27 @@ function HomePageContent() {
   const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
   const [hasUnsavedSettingsChanges, setHasUnsavedSettingsChanges] = useState(false);
   const [showUnsavedSettingsModal, setShowUnsavedSettingsModal] = useState(false);
+  const [hasUnsavedCommunityDraftChanges, setHasUnsavedCommunityDraftChanges] = useState(false);
+  const [showUnsavedCommunityDraftModal, setShowUnsavedCommunityDraftModal] = useState(false);
+  const [pendingSettingsRefresh, setPendingSettingsRefresh] = useState(false);
+  const [pendingCommunityDraftRefresh, setPendingCommunityDraftRefresh] = useState(false);
   const [pendingSidebarSwitchIntent, setPendingSidebarSwitchIntent] = useState<SidebarSwitchIntent | null>(null);
+  const [pendingCommunityDraftSwitchIntent, setPendingCommunityDraftSwitchIntent] = useState<SidebarSwitchIntent | null>(null);
   const [pendingSaveSwitchUntilHeuristicClose, setPendingSaveSwitchUntilHeuristicClose] = useState(false);
   const [communityDetailOpen, setCommunityDetailOpen] = useState(false);
+  const [communityResetSignal, setCommunityResetSignal] = useState(0);
   const [sidebarInfoTooltip, setSidebarInfoTooltip] = useState<{ text: string; left: number; top: number; visible: boolean; align: "left" | "right" } | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const historyRef = useRef<HistoryItem[]>([]);
   const settingsPanelRef = useRef<SettingsPanelHandle | null>(null);
+  const communityDraftExitActionsRef = useRef<CommunityDraftExitActions | null>(null);
   const mobileSidebarCloseTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipShowTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipHideTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipDismissTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipAnimateInTimerRef = useRef<number | null>(null);
   const topChromeGestureTimerRef = useRef<number | null>(null);
+  const allowNextBeforeUnloadRef = useRef(false);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -178,21 +219,18 @@ function HomePageContent() {
     if (typeof window === "undefined") {
       return;
     }
+    const savedTab = normalizeSidebarTab(window.sessionStorage.getItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY));
     if (forcedSidebarTab) {
-      setActiveSidebarTab(forcedSidebarTab);
+      const nextTab =
+        forcedSidebarTab === "search" && savedTab && savedTab !== "search"
+          ? savedTab
+          : forcedSidebarTab;
+      setActiveSidebarTab(nextTab);
       setSidebarTabHydrated(true);
       return;
     }
-    const navigationEntry = window.performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
-    const shouldRestoreTab = navigationEntry?.type === "reload";
-    if (!shouldRestoreTab) {
-      window.sessionStorage.removeItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY);
-      setSidebarTabHydrated(true);
-      return;
-    }
-    const savedTab = window.sessionStorage.getItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY);
-    if (savedTab === "search" || savedTab === "community" || savedTab === "create" || savedTab === "edit" || savedTab === "settings") {
-      setActiveSidebarTab(savedTab as SidebarTab);
+    if (savedTab) {
+      setActiveSidebarTab(savedTab);
     }
     setSidebarTabHydrated(true);
   }, [forcedSidebarTab]);
@@ -231,7 +269,15 @@ function HomePageContent() {
   }, []);
 
   const upsertHistory = useCallback(
-    (entry: { materialId: string; title: string; updatedAt: number; starred?: boolean; generationMode?: GenerationMode }) => {
+    (entry: {
+      materialId: string;
+      title: string;
+      updatedAt: number;
+      starred?: boolean;
+      generationMode?: GenerationMode;
+      source?: HistorySource;
+      feedQuery?: string;
+    }) => {
       const existing = historyRef.current.find((item) => item.materialId === entry.materialId);
       const merged: HistoryItem = {
         materialId: entry.materialId,
@@ -239,6 +285,8 @@ function HomePageContent() {
         updatedAt: entry.updatedAt,
         starred: entry.starred ?? existing?.starred ?? false,
         generationMode: entry.generationMode ?? existing?.generationMode ?? "fast",
+        source: entry.source ?? existing?.source ?? "search",
+        feedQuery: entry.feedQuery ?? existing?.feedQuery,
       };
       const next = [merged, ...historyRef.current.filter((item) => item.materialId !== merged.materialId)].slice(0, MAX_HISTORY_ITEMS);
       persistHistory(next);
@@ -397,15 +445,39 @@ function HomePageContent() {
     setMobileSidebarOpen(false);
   }, [clearMobileSidebarCloseTimer]);
 
+  const clearCommunitySelectionFromUrl = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    try {
+      const nextUrl = new URL(window.location.href);
+      const keys = Array.from(nextUrl.searchParams.keys());
+      for (const key of keys) {
+        if (key.startsWith("community_")) {
+          nextUrl.searchParams.delete(key);
+        }
+      }
+      const nextSearch = nextUrl.searchParams.toString();
+      const nextPath = nextSearch ? `${nextUrl.pathname}?${nextSearch}` : nextUrl.pathname;
+      window.history.replaceState(window.history.state, "", `${nextPath}${nextUrl.hash}`);
+    } catch {
+      // Ignore URL rewrite failures.
+    }
+  }, []);
+
   const applySidebarSwitchIntent = useCallback((intent: SidebarSwitchIntent) => {
     setActiveSidebarTab(intent.tab);
+    if (intent.tab === "community" && intent.resetCommunityView && activeSidebarTab === "community") {
+      setCommunityResetSignal((prev) => prev + 1);
+      clearCommunitySelectionFromUrl();
+    }
     setError(null);
     setActiveHistoryMenuId(null);
     if (intent.clearHistoryQuery) {
       setHistoryQuery("");
     }
     forceCloseMobileSidebar();
-  }, [forceCloseMobileSidebar]);
+  }, [activeSidebarTab, clearCommunitySelectionFromUrl, forceCloseMobileSidebar]);
 
   const requestSidebarSwitch = useCallback(
     (intent: SidebarSwitchIntent) => {
@@ -415,14 +487,101 @@ function HomePageContent() {
         setShowUnsavedSettingsModal(true);
         return;
       }
+      const leavingCommunityDraftForm = (activeSidebarTab === "create" || activeSidebarTab === "edit")
+        && intent.tab !== activeSidebarTab
+        && hasUnsavedCommunityDraftChanges;
+      if (leavingCommunityDraftForm) {
+        setPendingCommunityDraftSwitchIntent(intent);
+        setShowUnsavedCommunityDraftModal(true);
+        return;
+      }
       applySidebarSwitchIntent(intent);
     },
-    [activeSidebarTab, applySidebarSwitchIntent, hasUnsavedSettingsChanges],
+    [activeSidebarTab, applySidebarSwitchIntent, hasUnsavedCommunityDraftChanges, hasUnsavedSettingsChanges],
   );
+
+  const performConfirmedRefresh = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    allowNextBeforeUnloadRef.current = true;
+    window.setTimeout(() => {
+      allowNextBeforeUnloadRef.current = false;
+    }, 5_000);
+    window.location.reload();
+  }, []);
+
+  const requestRefreshWithUnsavedGuard = useCallback((): boolean => {
+    const hasPendingUnsavedSettings = activeSidebarTab === "settings"
+      && (hasUnsavedSettingsChanges || Boolean(settingsPanelRef.current?.hasUnsavedChanges()));
+    if (hasPendingUnsavedSettings) {
+      setPendingSidebarSwitchIntent(null);
+      setPendingSaveSwitchUntilHeuristicClose(false);
+      setPendingSettingsRefresh(true);
+      setShowUnsavedSettingsModal(true);
+      return true;
+    }
+    const hasPendingUnsavedCommunityDraft = (activeSidebarTab === "create" || activeSidebarTab === "edit")
+      && hasUnsavedCommunityDraftChanges;
+    if (hasPendingUnsavedCommunityDraft) {
+      setPendingCommunityDraftSwitchIntent(null);
+      setPendingCommunityDraftRefresh(true);
+      setShowUnsavedCommunityDraftModal(true);
+      return true;
+    }
+    return false;
+  }, [activeSidebarTab, hasUnsavedCommunityDraftChanges, hasUnsavedSettingsChanges]);
 
   const startNewSearch = useCallback(() => {
     requestSidebarSwitch({ tab: "search", clearHistoryQuery: true });
   }, [requestSidebarSwitch]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      const isRefreshKey = event.key === "F5";
+      const isShortcutRefresh = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "r";
+      if (!isRefreshKey && !isShortcutRefresh) {
+        return;
+      }
+      const blocked = requestRefreshWithUnsavedGuard();
+      if (!blocked) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [requestRefreshWithUnsavedGuard]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const hasPendingUnsavedSettings = activeSidebarTab === "settings"
+      && (hasUnsavedSettingsChanges || Boolean(settingsPanelRef.current?.hasUnsavedChanges()));
+    const hasPendingUnsavedCommunityDraft = (activeSidebarTab === "create" || activeSidebarTab === "edit")
+      && hasUnsavedCommunityDraftChanges;
+    if (!hasPendingUnsavedSettings && !hasPendingUnsavedCommunityDraft) {
+      return;
+    }
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (allowNextBeforeUnloadRef.current) {
+        return;
+      }
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => {
+      window.removeEventListener("beforeunload", onBeforeUnload);
+    };
+  }, [activeSidebarTab, hasUnsavedCommunityDraftChanges, hasUnsavedSettingsChanges]);
 
   const isSidebarInteractiveTarget = useCallback((target: EventTarget | null): boolean => {
     if (!(target instanceof Element)) {
@@ -475,6 +634,16 @@ function HomePageContent() {
     }
   }, [activeSidebarTab]);
 
+  useEffect(() => {
+    if (activeSidebarTab !== "community") {
+      return;
+    }
+    setCommunityResetSignal((prev) => prev + 1);
+    if (!forcedCommunitySetId) {
+      clearCommunitySelectionFromUrl();
+    }
+  }, [activeSidebarTab, clearCommunitySelectionFromUrl, forcedCommunitySetId]);
+
   const visibleSidebarTab = sidebarTabHydrated ? activeSidebarTab : null;
   const shouldShowTopChromeStrip = sidebarTabHydrated
     && !mobileSidebarOpen
@@ -495,6 +664,22 @@ function HomePageContent() {
       }
       setActiveHistoryMenuId(null);
       forceCloseMobileSidebar();
+      if (existing?.source === "community") {
+        const savedFeedQuery = (existing.feedQuery || "").trim();
+        if (savedFeedQuery) {
+          router.push(`/feed?${savedFeedQuery}`);
+          return;
+        }
+        const fallbackSetId = parseCommunitySetIdFromHistoryMaterialId(materialId);
+        if (fallbackSetId) {
+          const fallbackParams = new URLSearchParams({
+            tab: "community",
+            community_set_id: fallbackSetId,
+          });
+          router.push(`/?${fallbackParams.toString()}`);
+          return;
+        }
+      }
       const mode = existing?.generationMode ?? "fast";
       const returnTab = activeSidebarTab === "community" || activeSidebarTab === "create" || activeSidebarTab === "edit" ? "community" : "search";
       const nextParams = new URLSearchParams({
@@ -559,14 +744,34 @@ function HomePageContent() {
         title: nextTitle,
         updatedAt: Date.now(),
         generationMode: params.generationMode,
+        source: "search",
+      });
+    },
+    [upsertHistory],
+  );
+
+  const onCommunityReelFeedOpened = useCallback(
+    (payload: { setId: string; setTitle: string; selectedReelId: string; feedQuery: string }) => {
+      const normalizedSetId = payload.setId.trim();
+      if (!normalizedSetId) {
+        return;
+      }
+      const title = payload.setTitle.trim() || "Community Reel Set";
+      upsertHistory({
+        materialId: `community:${encodeURIComponent(normalizedSetId)}`,
+        title,
+        updatedAt: Date.now(),
+        generationMode: "fast",
+        source: "community",
+        feedQuery: payload.feedQuery.trim() || undefined,
       });
     },
     [upsertHistory],
   );
 
   const switchSidebarTab = useCallback(
-    (tab: SidebarTab) => {
-      requestSidebarSwitch({ tab });
+    (tab: SidebarTab, options?: { resetCommunityView?: boolean }) => {
+      requestSidebarSwitch({ tab, resetCommunityView: options?.resetCommunityView });
     },
     [requestSidebarSwitch],
   );
@@ -574,10 +779,17 @@ function HomePageContent() {
     setShowUnsavedSettingsModal(false);
     setPendingSidebarSwitchIntent(null);
     setPendingSaveSwitchUntilHeuristicClose(false);
+    setPendingSettingsRefresh(false);
+  }, []);
+  const closeUnsavedCommunityDraftModal = useCallback(() => {
+    setShowUnsavedCommunityDraftModal(false);
+    setPendingCommunityDraftSwitchIntent(null);
+    setPendingCommunityDraftRefresh(false);
   }, []);
   const discardSettingsAndContinue = useCallback(() => {
+    const shouldRefresh = pendingSettingsRefresh;
     const intent = pendingSidebarSwitchIntent;
-    if (!intent) {
+    if (!intent && !shouldRefresh) {
       closeUnsavedSettingsModal();
       return;
     }
@@ -585,11 +797,27 @@ function HomePageContent() {
     setHasUnsavedSettingsChanges(false);
     setShowUnsavedSettingsModal(false);
     setPendingSidebarSwitchIntent(null);
-    applySidebarSwitchIntent(intent);
-  }, [applySidebarSwitchIntent, closeUnsavedSettingsModal, pendingSidebarSwitchIntent]);
-  const saveSettingsAndContinue = useCallback(() => {
-    const intent = pendingSidebarSwitchIntent;
+    setPendingSaveSwitchUntilHeuristicClose(false);
+    setPendingSettingsRefresh(false);
+    if (shouldRefresh) {
+      performConfirmedRefresh();
+      return;
+    }
     if (!intent) {
+      return;
+    }
+    applySidebarSwitchIntent(intent);
+  }, [
+    applySidebarSwitchIntent,
+    closeUnsavedSettingsModal,
+    pendingSettingsRefresh,
+    pendingSidebarSwitchIntent,
+    performConfirmedRefresh,
+  ]);
+  const saveSettingsAndContinue = useCallback(() => {
+    const shouldRefresh = pendingSettingsRefresh;
+    const intent = pendingSidebarSwitchIntent;
+    if (!intent && !shouldRefresh) {
       closeUnsavedSettingsModal();
       return;
     }
@@ -598,14 +826,95 @@ function HomePageContent() {
       setHasUnsavedSettingsChanges(false);
       setShowUnsavedSettingsModal(false);
       setPendingSidebarSwitchIntent(null);
+      setPendingSaveSwitchUntilHeuristicClose(false);
+      setPendingSettingsRefresh(false);
+      if (shouldRefresh) {
+        performConfirmedRefresh();
+        return;
+      }
+      if (!intent) {
+        return;
+      }
       applySidebarSwitchIntent(intent);
       return;
     }
     settingsPanel.savePreferences();
     setHasUnsavedSettingsChanges(false);
     setShowUnsavedSettingsModal(false);
+    if (shouldRefresh) {
+      setPendingSidebarSwitchIntent(null);
+      setPendingSaveSwitchUntilHeuristicClose(false);
+      setPendingSettingsRefresh(false);
+      window.setTimeout(() => {
+        performConfirmedRefresh();
+      }, 80);
+      return;
+    }
     setPendingSaveSwitchUntilHeuristicClose(true);
-  }, [applySidebarSwitchIntent, closeUnsavedSettingsModal, pendingSidebarSwitchIntent]);
+  }, [
+    applySidebarSwitchIntent,
+    closeUnsavedSettingsModal,
+    pendingSettingsRefresh,
+    pendingSidebarSwitchIntent,
+    performConfirmedRefresh,
+  ]);
+  const discardCommunityDraftAndContinue = useCallback(() => {
+    const shouldRefresh = pendingCommunityDraftRefresh;
+    const intent = pendingCommunityDraftSwitchIntent;
+    if (!intent && !shouldRefresh) {
+      closeUnsavedCommunityDraftModal();
+      return;
+    }
+    communityDraftExitActionsRef.current?.discardDraftChanges();
+    setHasUnsavedCommunityDraftChanges(false);
+    setShowUnsavedCommunityDraftModal(false);
+    setPendingCommunityDraftSwitchIntent(null);
+    setPendingCommunityDraftRefresh(false);
+    if (shouldRefresh) {
+      performConfirmedRefresh();
+      return;
+    }
+    if (!intent) {
+      return;
+    }
+    applySidebarSwitchIntent(intent);
+  }, [
+    applySidebarSwitchIntent,
+    closeUnsavedCommunityDraftModal,
+    pendingCommunityDraftRefresh,
+    pendingCommunityDraftSwitchIntent,
+    performConfirmedRefresh,
+  ]);
+  const saveCommunityDraftAndContinue = useCallback(() => {
+    const shouldRefresh = pendingCommunityDraftRefresh;
+    const intent = pendingCommunityDraftSwitchIntent;
+    if (!intent && !shouldRefresh) {
+      closeUnsavedCommunityDraftModal();
+      return;
+    }
+    const didSave = communityDraftExitActionsRef.current?.saveDraftProgress() ?? true;
+    if (!didSave) {
+      return;
+    }
+    setHasUnsavedCommunityDraftChanges(false);
+    setShowUnsavedCommunityDraftModal(false);
+    setPendingCommunityDraftSwitchIntent(null);
+    setPendingCommunityDraftRefresh(false);
+    if (shouldRefresh) {
+      performConfirmedRefresh();
+      return;
+    }
+    if (!intent) {
+      return;
+    }
+    applySidebarSwitchIntent(intent);
+  }, [
+    applySidebarSwitchIntent,
+    closeUnsavedCommunityDraftModal,
+    pendingCommunityDraftRefresh,
+    pendingCommunityDraftSwitchIntent,
+    performConfirmedRefresh,
+  ]);
   const onSettingsAvailabilityModalClose = useCallback(
     (source: "close-button" | "backdrop") => {
       if (!pendingSaveSwitchUntilHeuristicClose) {
@@ -660,7 +969,7 @@ function HomePageContent() {
             aria-label="Start new search"
             className="grid h-8 w-8 place-items-center rounded-xl border border-white/15 bg-transparent text-sm font-semibold text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
           >
-            +
+            <span className="translate-x-[0.5px] -translate-y-[0.5px] leading-none">+</span>
           </button>
         </div>
       </div>
@@ -696,7 +1005,7 @@ function HomePageContent() {
       >
         <button
           type="button"
-          onClick={() => switchSidebarTab("community")}
+          onClick={() => switchSidebarTab("community", { resetCommunityView: true })}
           className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
             visibleSidebarTab === "community"
               ? "border-white bg-white text-black"
@@ -717,45 +1026,25 @@ function HomePageContent() {
 
       <div
         className="group relative mt-2"
-        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Build and publish your own community reel set")}
-        onMouseLeave={onSidebarInfoHoverEnd}
-      >
-        <button
-          type="button"
-          onClick={() => switchSidebarTab("create")}
-          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            visibleSidebarTab === "create" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
-          }`}
-        >
-          <div className="flex h-full items-center justify-between gap-1.5">
-            <p className="truncate font-semibold leading-none">Create Set</p>
-            <i
-              className={`fa-solid fa-plus text-[11px] ${
-                visibleSidebarTab === "create" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
-              }`}
-              aria-hidden="true"
-            />
-          </div>
-        </button>
-      </div>
-
-      <div
-        className="group relative mt-2"
-        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Edit community sets you already created")}
+        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Create and edit your community sets")}
         onMouseLeave={onSidebarInfoHoverEnd}
       >
         <button
           type="button"
           onClick={() => switchSidebarTab("edit")}
           className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            visibleSidebarTab === "edit" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+            visibleSidebarTab === "edit" || visibleSidebarTab === "create"
+              ? "border-white bg-white text-black"
+              : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
           }`}
         >
           <div className="flex h-full items-center justify-between gap-1.5">
-            <p className="truncate font-semibold leading-none">Edit Sets</p>
+            <p className="truncate font-semibold leading-none">Your Sets</p>
             <i
               className={`fa-solid fa-pen-to-square text-[11px] ${
-                visibleSidebarTab === "edit" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+                visibleSidebarTab === "edit" || visibleSidebarTab === "create"
+                  ? "text-black/80"
+                  : "text-white/74 transition-colors duration-200 group-hover:text-white"
               }`}
               aria-hidden="true"
             />
@@ -801,9 +1090,15 @@ function HomePageContent() {
                     <div className="flex items-center gap-1.5">
                       {entry.starred ? <i className="fa-solid fa-star text-[10px] text-white/75 transition-colors group-hover:text-white" aria-hidden="true" /> : null}
                       <p className="truncate font-semibold leading-none transition-colors group-hover:text-white">{entry.title}</p>
-                      <span className="shrink-0 rounded-md bg-black/55 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/68 transition-colors group-hover:text-white">
-                        {entry.generationMode}
-                      </span>
+                      {entry.source === "community" ? (
+                        <span className="shrink-0 rounded-md bg-white/16 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/92 transition-colors group-hover:bg-white/22 group-hover:text-white">
+                          Community
+                        </span>
+                      ) : (
+                        <span className="shrink-0 rounded-md bg-black/55 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-white/68 transition-colors group-hover:text-white">
+                          {entry.generationMode}
+                        </span>
+                      )}
                     </div>
                   </button>
 
@@ -1025,7 +1320,7 @@ function HomePageContent() {
       ) : null}
 
       <div className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:mx-0 lg:max-w-none lg:pl-4 lg:grid lg:grid-cols-[280px_1px_minmax(0,1fr)]">
-        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-2 text-white lg:mt-8 lg:mb-2 lg:flex lg:w-[280px] lg:justify-self-start lg:px-5">
+        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-3 text-white lg:mt-8 lg:mb-2 lg:flex lg:w-[280px] lg:justify-self-start lg:px-5">
           {sidebarPanelContent}
         </aside>
 
@@ -1036,8 +1331,12 @@ function HomePageContent() {
         <section
           className={`relative z-20 h-full min-h-0 w-full overflow-hidden rounded-3xl ${
             hasCommunityBackdrop ? "bg-transparent" : "bg-black/62"
-          } lg:my-2 lg:max-w-[1280px] lg:justify-self-center ${
-            visibleSidebarTab === "community"
+          } ${
+            visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit"
+              ? "lg:mt-2 lg:mb-0"
+              : "lg:my-2"
+          } lg:max-w-[1280px] lg:justify-self-center ${
+            visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit"
               ? "translate-x-0 md:translate-x-1 lg:translate-x-0 lg:w-[99%]"
               : "lg:w-[97%]"
           }`}
@@ -1070,10 +1369,74 @@ function HomePageContent() {
               isVisible={visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit"}
               onDetailOpenChange={setCommunityDetailOpen}
               initialOpenSetId={forcedCommunitySetId}
+              communityResetSignal={communityResetSignal}
+              onOpenCommunityReelInFeed={onCommunityReelFeedOpened}
+              onDraftUnsavedChangesChange={setHasUnsavedCommunityDraftChanges}
+              onDraftExitActionsChange={(actions) => {
+                communityDraftExitActionsRef.current = actions;
+                if (!actions) {
+                  setHasUnsavedCommunityDraftChanges(false);
+                }
+              }}
             />
           </div>
         </section>
       </div>
+      {showUnsavedCommunityDraftModal ? (
+        <div
+          className="fixed inset-0 z-[121] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+          role="presentation"
+          onClick={closeUnsavedCommunityDraftModal}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Unsaved set draft changes"
+            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
+                <h3 className="mt-2 text-lg font-semibold text-white">
+                  {pendingCommunityDraftRefresh ? "Save set changes before refresh?" : "Save set changes before leaving?"}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={closeUnsavedCommunityDraftModal}
+                aria-label="Close"
+                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+              {pendingCommunityDraftRefresh
+                ? "Save to keep your draft progress, or discard these edits and refresh."
+                : "Save to keep your draft progress, or discard these edits and continue."}
+            </p>
+            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={discardCommunityDraftAndContinue}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
+              >
+                {pendingCommunityDraftRefresh ? "Discard & Refresh" : "Discard"}
+              </button>
+              <button
+                type="button"
+                onClick={saveCommunityDraftAndContinue}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
+              >
+                {pendingCommunityDraftRefresh ? "Save & Refresh" : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
       {showUnsavedSettingsModal ? (
         <div
           className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
@@ -1084,13 +1447,15 @@ function HomePageContent() {
             role="dialog"
             aria-modal="true"
             aria-label="Unsaved settings changes"
-            className="w-full max-w-xl rounded-3xl border border-white/25 bg-white/[0.12] p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
             onClick={(event) => event.stopPropagation()}
           >
             <div className="flex items-start justify-between gap-4">
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">Save settings before leaving?</h3>
+                <h3 className="mt-2 text-lg font-semibold text-white">
+                  {pendingSettingsRefresh ? "Save settings before refresh?" : "Save settings before leaving?"}
+                </h3>
               </div>
               <button
                 type="button"
@@ -1104,7 +1469,9 @@ function HomePageContent() {
               </button>
             </div>
             <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-              You changed settings. Save to apply them, or discard these edits and continue.
+              {pendingSettingsRefresh
+                ? "You changed settings. Save to apply them, or discard these edits and refresh."
+                : "You changed settings. Save to apply them, or discard these edits and continue."}
             </p>
             <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
               <button
@@ -1112,14 +1479,14 @@ function HomePageContent() {
                 onClick={discardSettingsAndContinue}
                 className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
               >
-                Discard
+                {pendingSettingsRefresh ? "Discard & Refresh" : "Discard"}
               </button>
               <button
                 type="button"
                 onClick={saveSettingsAndContinue}
                 className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
               >
-                Save
+                {pendingSettingsRefresh ? "Save & Refresh" : "Save"}
               </button>
             </div>
           </div>

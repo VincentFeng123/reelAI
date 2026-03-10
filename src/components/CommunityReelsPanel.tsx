@@ -4,7 +4,7 @@ import { type ChangeEvent, type DragEvent, type FormEvent, useCallback, useEffec
 import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 
-import { createCommunitySet, fetchCommunityReelDuration, fetchCommunitySets, updateCommunitySet } from "@/lib/api";
+import { createCommunitySet, deleteCommunitySet, fetchCommunityReelDuration, fetchCommunitySets, updateCommunitySet } from "@/lib/api";
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
 const COMMUNITY_CREATE_DRAFT_STORAGE_KEY = "studyreels-community-create-draft";
@@ -14,6 +14,7 @@ const MAX_USER_SETS = 120;
 const FALLBACK_THUMBNAIL_URL = "/images/community/ai-systems.svg";
 const SUPPORTED_PLATFORMS_LABEL = "YouTube, Instagram, TikTok";
 const MIN_SET_DESCRIPTION_LENGTH = 18;
+const MAX_SET_TAGS = 6;
 const FEATURED_CAROUSEL_INTERVAL_MS = 5200;
 const FEATURED_CAROUSEL_TRANSITION_MS = 520;
 const FEATURED_CAROUSEL_PAUSE_MS = 200;
@@ -30,12 +31,21 @@ const DETAIL_BANNER_LEFT_EXPANSION_PX = 10;
 const DETAIL_BANNER_LEFT_INSET_PX = 8;
 const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
 const COMMUNITY_SET_RETURN_SNAPSHOT_PREFIX = "studyreels-community-return-set-";
-const CLIP_SLIDER_DEFAULT_MAX_SEC = 60;
+const COMMUNITY_STARRED_SET_IDS_STORAGE_KEY = "studyreels-community-starred-set-ids";
+const COMMUNITY_CREATE_DRAFT_CONTEXT_KEY = "create";
 const CLIP_SLIDER_MIN_GAP_SEC = 0.1;
 const CLIP_SLIDER_STEP_SEC = 0.1;
 const YOUTUBE_IFRAME_API_SCRIPT_ID = "studyreels-youtube-iframe-api";
 const YOUTUBE_DURATION_POLL_INTERVAL_MS = 220;
 const YOUTUBE_DURATION_TIMEOUT_MS = 8_000;
+const LAST_EDITED_REFRESH_INTERVAL_MS = 60_000;
+const SECOND_MS = 1_000;
+const MINUTE_MS = 60 * SECOND_MS;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+const WEEK_MS = 7 * DAY_MS;
+const MONTH_MS = 30 * DAY_MS;
+const YEAR_MS = 365 * DAY_MS;
 
 type ReelPlatform = "youtube" | "instagram" | "tiktok";
 
@@ -111,6 +121,8 @@ type CommunitySet = {
   likes: number;
   learners: number;
   updatedLabel: string;
+  updatedAt?: string | null;
+  createdAt?: string | null;
   thumbnailUrl: string;
   featured: boolean;
 };
@@ -128,10 +140,41 @@ type StoredSetDraft = {
   }>;
 };
 
+type PublishResultModalState = {
+  status: "success" | "error";
+  title: string;
+  message: string;
+  label?: string;
+  thumbnailUrl?: string;
+  thumbnailAlt?: string;
+};
+
+type DeleteSetConfirmModalState = {
+  setId: string;
+  title: string;
+};
+
+type UnsavedDraftExitModalState = {
+  action: "back-to-grid";
+};
+
+type DraftActionConfirmModalState = {
+  action: "save-progress" | "clear-progress" | "save-set-changes";
+  label: string;
+  title: string;
+  message: string;
+  confirmLabel: string;
+};
+
+export type CommunityDraftExitActions = {
+  saveDraftProgress: () => boolean;
+  discardDraftChanges: () => void;
+};
+
 let draftRowCounter = 0;
 let youtubeIframeApiLoadPromise: Promise<void> | null = null;
 
-function createDraftReelRow(value = "", tStartSec = "0", tEndSec = "60"): DraftReelInput {
+function createDraftReelRow(value = "", tStartSec = "0", tEndSec = ""): DraftReelInput {
   draftRowCounter += 1;
   return {
     id: `draft-reel-${draftRowCounter}`,
@@ -166,6 +209,10 @@ const DETAIL_LOREM_PARAGRAPHS = [
   "Amet dictum sit amet justo donec enim diam vulputate ut pharetra sit amet aliquam id diam maecenas ultricies mi eget mauris pharetra et ultrices neque ornare aenean.",
 ];
 
+function daysAgoToIso(daysAgo: number): string {
+  return new Date(Date.now() - Math.max(0, daysAgo) * DAY_MS).toISOString();
+}
+
 const FEATURED_SETS: CommunitySet[] = [
   {
     id: "featured-kinematics-visuals",
@@ -177,7 +224,8 @@ const FEATURED_SETS: CommunitySet[] = [
     curator: "Dr. Ramos",
     likes: 2840,
     learners: 12100,
-    updatedLabel: "Updated 2 days ago",
+    updatedLabel: "Last Edited: 2 days ago",
+    updatedAt: daysAgoToIso(2),
     thumbnailUrl: "/images/community/physics-grid.svg",
     featured: true,
   },
@@ -191,7 +239,8 @@ const FEATURED_SETS: CommunitySet[] = [
     curator: "MedSchool Crew",
     likes: 1970,
     learners: 8700,
-    updatedLabel: "Updated yesterday",
+    updatedLabel: "Last Edited: 1 day ago",
+    updatedAt: daysAgoToIso(1),
     thumbnailUrl: "/images/community/bio-lab.svg",
     featured: true,
   },
@@ -205,7 +254,8 @@ const FEATURED_SETS: CommunitySet[] = [
     curator: "Math Forge",
     likes: 2230,
     learners: 9400,
-    updatedLabel: "Updated 4 days ago",
+    updatedLabel: "Last Edited: 4 days ago",
+    updatedAt: daysAgoToIso(4),
     thumbnailUrl: "/images/community/calculus-flow.svg",
     featured: true,
   },
@@ -222,7 +272,8 @@ const COMMUNITY_LIBRARY_SETS: CommunitySet[] = [
     curator: "Timeline Lab",
     likes: 960,
     learners: 4100,
-    updatedLabel: "Updated 6 days ago",
+    updatedLabel: "Last Edited: 6 days ago",
+    updatedAt: daysAgoToIso(6),
     thumbnailUrl: "/images/community/civics-debate.svg",
     featured: false,
   },
@@ -236,7 +287,8 @@ const COMMUNITY_LIBRARY_SETS: CommunitySet[] = [
     curator: "Lingua Spark",
     likes: 1180,
     learners: 5300,
-    updatedLabel: "Updated 3 days ago",
+    updatedLabel: "Last Edited: 3 days ago",
+    updatedAt: daysAgoToIso(3),
     thumbnailUrl: "/images/community/language-story.svg",
     featured: false,
   },
@@ -250,7 +302,8 @@ const COMMUNITY_LIBRARY_SETS: CommunitySet[] = [
     curator: "Data Guild",
     likes: 1450,
     learners: 6200,
-    updatedLabel: "Updated 1 week ago",
+    updatedLabel: "Last Edited: 1 week ago",
+    updatedAt: daysAgoToIso(7),
     thumbnailUrl: "/images/community/ai-systems.svg",
     featured: false,
   },
@@ -268,7 +321,166 @@ function formatCompact(value: number): string {
   return String(value);
 }
 
-function parseTags(value: string): string[] {
+function parseTimestampMs(value: unknown): number | null {
+  if (typeof value === "number") {
+    if (Number.isFinite(value) && value > 0) {
+      return value;
+    }
+    return null;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    if (/^\d+$/.test(trimmed)) {
+      const numeric = Number(trimmed);
+      if (Number.isFinite(numeric) && numeric > 0) {
+        return numeric >= 1_000_000_000_000 ? numeric : numeric * 1000;
+      }
+    }
+    const directParsed = Date.parse(trimmed);
+    if (Number.isFinite(directParsed)) {
+      return directParsed;
+    }
+    const normalized = trimmed.replace(" ", "T");
+    let candidate = normalized;
+    if (/[+-]\d{4}$/.test(candidate)) {
+      candidate = `${candidate.slice(0, -5)}${candidate.slice(-5, -2)}:${candidate.slice(-2)}`;
+    } else if (/[+-]\d{2}$/.test(candidate)) {
+      candidate = `${candidate}:00`;
+    } else if (!/(?:z|[+-]\d{2}:\d{2})$/i.test(candidate) && /\d{2}:\d{2}:\d{2}/.test(candidate)) {
+      // Treat DB timestamps without timezone as UTC to avoid local-time drift.
+      candidate = `${candidate}Z`;
+    }
+    const normalizedParsed = Date.parse(candidate);
+    return Number.isFinite(normalizedParsed) ? normalizedParsed : null;
+  }
+  return null;
+}
+
+function normalizeUpdatedAt(value: unknown): string | null {
+  const parsedMs = parseTimestampMs(value);
+  if (parsedMs == null) {
+    return null;
+  }
+  return new Date(parsedMs).toISOString();
+}
+
+function normalizeLastEditedRaw(value: string): string {
+  return value
+    .trim()
+    .replace(/^last\s+edited\s*:\s*/i, "")
+    .replace(/^updated\s*[:\-]?\s*/i, "")
+    .trim();
+}
+
+function isRelativeNowLastEditedLabel(value: string): boolean {
+  const normalized = normalizeLastEditedRaw(value).toLowerCase();
+  return normalized === "today" || normalized === "just now" || normalized === "less than 1 minute ago";
+}
+
+function inferUpdatedAtFromLastEditedLabel(value: string, nowMs: number): string | null {
+  const normalizedRaw = normalizeLastEditedRaw(value);
+  if (!normalizedRaw) {
+    return null;
+  }
+  const normalized = normalizedRaw.toLowerCase();
+  if (normalized === "today" || normalized === "just now" || normalized === "less than 1 minute ago") {
+    return null;
+  }
+  if (normalized === "yesterday") {
+    return new Date(nowMs - DAY_MS).toISOString();
+  }
+  const match = normalized.match(/^(\d+|an?|one)\s+(second|minute|hour|day|week|month|year)s?(?:\s+ago)?$/i);
+  if (!match) {
+    return null;
+  }
+  const amountToken = match[1].toLowerCase();
+  const amount = amountToken === "a" || amountToken === "an" || amountToken === "one" ? 1 : Number(amountToken);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return null;
+  }
+  const unit = match[2].toLowerCase();
+  const unitMs =
+    unit === "second"
+      ? SECOND_MS
+      : unit === "minute"
+        ? MINUTE_MS
+        : unit === "hour"
+          ? HOUR_MS
+          : unit === "day"
+            ? DAY_MS
+            : unit === "week"
+              ? WEEK_MS
+              : unit === "month"
+                ? MONTH_MS
+                : YEAR_MS;
+  return new Date(nowMs - amount * unitMs).toISOString();
+}
+
+function normalizeLastEditedLabel(value: string): string {
+  const normalizedRaw = normalizeLastEditedRaw(value);
+  if (!normalizedRaw) {
+    return "Last Edited: unknown";
+  }
+  const normalized = normalizedRaw.toLowerCase();
+  if (normalized === "today") {
+    return "Last Edited: today";
+  }
+  if (normalized === "just now") {
+    return "Last Edited: just now";
+  }
+  if (normalized === "yesterday") {
+    return "Last Edited: 1 day ago";
+  }
+  if (/^(\d+|an?|one)\s+(second|minute|hour|day|week|month|year)s?$/i.test(normalizedRaw)) {
+    return `Last Edited: ${normalizedRaw} ago`;
+  }
+  if (/ago$/i.test(normalizedRaw)) {
+    return `Last Edited: ${normalizedRaw}`;
+  }
+  return `Last Edited: ${normalizedRaw}`;
+}
+
+function formatRelativeElapsed(elapsedMs: number): string {
+  const safeElapsedMs = Math.max(0, elapsedMs);
+  const minutes = Math.floor(safeElapsedMs / MINUTE_MS);
+  if (minutes < 1) {
+    return "less than 1 minute ago";
+  }
+  if (minutes < 60) {
+    return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  }
+  const hours = Math.floor(safeElapsedMs / HOUR_MS);
+  if (hours < 24) {
+    return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  }
+  const days = Math.floor(safeElapsedMs / DAY_MS);
+  if (days < 7) {
+    return `${days} day${days === 1 ? "" : "s"} ago`;
+  }
+  const weeks = Math.floor(safeElapsedMs / WEEK_MS);
+  if (days < 30) {
+    return `${weeks} week${weeks === 1 ? "" : "s"} ago`;
+  }
+  const months = Math.floor(safeElapsedMs / MONTH_MS);
+  if (days < 365) {
+    return `${months} month${months === 1 ? "" : "s"} ago`;
+  }
+  const years = Math.floor(safeElapsedMs / YEAR_MS);
+  return `${years} year${years === 1 ? "" : "s"} ago`;
+}
+
+function formatLastEditedLabel(set: Pick<CommunitySet, "updatedAt" | "updatedLabel">, nowMs: number): string {
+  const updatedMs = parseTimestampMs(set.updatedAt);
+  if (updatedMs != null) {
+    return `Last Edited: ${formatRelativeElapsed(nowMs - updatedMs)}`;
+  }
+  return normalizeLastEditedLabel(set.updatedLabel);
+}
+
+function parseAllTags(value: string): string[] {
   return Array.from(
     new Set(
       value
@@ -276,7 +488,11 @@ function parseTags(value: string): string[] {
         .map((part) => part.trim().toLowerCase())
         .filter(Boolean),
     ),
-  ).slice(0, 6);
+  );
+}
+
+function parseTags(value: string): string[] {
+  return parseAllTags(value).slice(0, MAX_SET_TAGS);
 }
 
 function toAbsoluteUrl(value: string): URL | null {
@@ -573,6 +789,7 @@ function parseStoredSets(raw: string | null): CommunitySet[] {
     if (!Array.isArray(parsed)) {
       return [];
     }
+    const nowMs = Date.now();
     return parsed
       .filter((item) => item && typeof item === "object" && !Array.isArray(item))
       .map((item) => item as Partial<CommunitySet>)
@@ -587,6 +804,15 @@ function parseStoredSets(raw: string | null): CommunitySet[] {
       .map((item) => {
         const reels = parseStoredReels(item.reels);
         const reelCount = Math.max(reels.length, Math.max(0, Math.floor(Number(item.reelCount) || 0)));
+        const fallbackUpdatedLabel =
+          typeof item.updatedLabel === "string" && item.updatedLabel.trim() ? item.updatedLabel.trim() : "Last Edited: unknown";
+        const normalizedCreatedAt = normalizeUpdatedAt(item.createdAt);
+        const normalizedUpdatedAt =
+          normalizeUpdatedAt(item.updatedAt) ?? normalizedCreatedAt ?? inferUpdatedAtFromLastEditedLabel(fallbackUpdatedLabel, nowMs);
+        const normalizedUpdatedLabel =
+          normalizedUpdatedAt == null && isRelativeNowLastEditedLabel(fallbackUpdatedLabel)
+            ? "Last Edited: unknown"
+            : normalizeLastEditedLabel(fallbackUpdatedLabel);
         return {
           id: item.id!.trim(),
           title: item.title!.trim(),
@@ -595,14 +821,16 @@ function parseStoredSets(raw: string | null): CommunitySet[] {
             ? item.tags
                 .map((tag) => String(tag || "").trim().toLowerCase())
                 .filter(Boolean)
-                .slice(0, 6)
+                .slice(0, MAX_SET_TAGS)
             : [],
           reels,
           reelCount,
           curator: typeof item.curator === "string" && item.curator.trim() ? item.curator.trim() : "Community member",
           likes: Math.max(0, Math.floor(Number(item.likes) || 0)),
           learners: Math.max(0, Math.floor(Number(item.learners) || 0)),
-          updatedLabel: typeof item.updatedLabel === "string" && item.updatedLabel.trim() ? item.updatedLabel.trim() : "Updated just now",
+          updatedLabel: normalizedUpdatedLabel,
+          updatedAt: normalizedUpdatedAt,
+          createdAt: normalizedCreatedAt,
           thumbnailUrl: typeof item.thumbnailUrl === "string" && item.thumbnailUrl.trim() ? item.thumbnailUrl.trim() : FALLBACK_THUMBNAIL_URL,
           featured: false,
         } as CommunitySet;
@@ -646,7 +874,7 @@ function parseStoredSetDraft(raw: string | null): StoredSetDraft | null {
         return {
           value: typeof reelRow.value === "string" ? reelRow.value : "",
           tStartSec: typeof reelRow.tStartSec === "string" ? reelRow.tStartSec : "0",
-          tEndSec: typeof reelRow.tEndSec === "string" ? reelRow.tEndSec : "60",
+          tEndSec: typeof reelRow.tEndSec === "string" ? reelRow.tEndSec : "",
         };
       })
       .filter(Boolean) as StoredSetDraft["reelInputs"];
@@ -656,7 +884,7 @@ function parseStoredSetDraft(raw: string | null): StoredSetDraft | null {
       tags: typeof row.tags === "string" ? row.tags : "",
       thumbnailPreview: typeof row.thumbnailPreview === "string" ? row.thumbnailPreview : "",
       thumbnailFileName: typeof row.thumbnailFileName === "string" ? row.thumbnailFileName : "",
-      reelInputs: reelInputs.length > 0 ? reelInputs : [{ value: "", tStartSec: "0", tEndSec: "60" }],
+      reelInputs: reelInputs.length > 0 ? reelInputs : [{ value: "", tStartSec: "0", tEndSec: "" }],
     };
   } catch {
     return null;
@@ -670,8 +898,12 @@ function draftRowsFromReels(reels: CommunityReelEmbed[]): DraftReelInput[] {
   return reels.map((reel) => {
     const start = Number.isFinite(reel.tStartSec) ? Number(reel.tStartSec) : 0;
     const endCandidate = Number(reel.tEndSec);
-    const end = Number.isFinite(endCandidate) && endCandidate > start ? endCandidate : Math.max(start + 60, 60);
-    return createDraftReelRow(reel.sourceUrl, formatClipSecondsInputValue(start), formatClipSecondsInputValue(end));
+    const hasExplicitEnd = Number.isFinite(endCandidate) && endCandidate > start;
+    return createDraftReelRow(
+      reel.sourceUrl,
+      formatClipSecondsInputValue(start),
+      hasExplicitEnd ? formatClipSecondsInputValue(endCandidate) : "",
+    );
   });
 }
 
@@ -741,11 +973,24 @@ type CommunityReelsPanelProps = {
   isVisible?: boolean;
   onDetailOpenChange?: (isOpen: boolean) => void;
   initialOpenSetId?: string | null;
+  communityResetSignal?: number;
+  onDraftUnsavedChangesChange?: (hasUnsavedChanges: boolean) => void;
+  onDraftExitActionsChange?: (actions: CommunityDraftExitActions | null) => void;
+  onOpenCommunityReelInFeed?: (payload: { setId: string; setTitle: string; selectedReelId: string; feedQuery: string }) => void;
 };
 
 type FeaturedTransitionStage = "idle" | "exiting" | "pause" | "entering";
 
-export function CommunityReelsPanel({ mode = "community", isVisible = true, onDetailOpenChange, initialOpenSetId = null }: CommunityReelsPanelProps) {
+export function CommunityReelsPanel({
+  mode = "community",
+  isVisible = true,
+  onDetailOpenChange,
+  initialOpenSetId = null,
+  communityResetSignal = 0,
+  onDraftUnsavedChangesChange,
+  onDraftExitActionsChange,
+  onOpenCommunityReelInFeed,
+}: CommunityReelsPanelProps) {
   const router = useRouter();
   const [activeCommunityCategory, setActiveCommunityCategory] = useState("Featured");
   const [activeFeaturedIndex, setActiveFeaturedIndex] = useState(0);
@@ -765,13 +1010,25 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   const [selectedDetailReelId, setSelectedDetailReelId] = useState<string | null>(null);
   const [reelInputs, setReelInputs] = useState<DraftReelInput[]>(() => [createDraftReelRow()]);
   const [reelDurationByRow, setReelDurationByRow] = useState<Record<string, ReelDurationState>>({});
-  const [createError, setCreateError] = useState<string | null>(null);
+  const [, setCreateError] = useState<string | null>(null);
   const [createSuccess, setCreateSuccess] = useState<string | null>(null);
+  const [tagLimitError, setTagLimitError] = useState(false);
+  const [publishResultModal, setPublishResultModal] = useState<PublishResultModalState | null>(null);
+  const [deleteSetConfirmModal, setDeleteSetConfirmModal] = useState<DeleteSetConfirmModalState | null>(null);
+  const [unsavedDraftExitModal, setUnsavedDraftExitModal] = useState<UnsavedDraftExitModalState | null>(null);
+  const [draftActionConfirmModal, setDraftActionConfirmModal] = useState<DraftActionConfirmModalState | null>(null);
   const [isPostingSet, setIsPostingSet] = useState(false);
   const [activeEditSetId, setActiveEditSetId] = useState<string | null>(null);
+  const [isEditSetEditorOpen, setIsEditSetEditorOpen] = useState(false);
+  const [isCreateSetEditorOpen, setIsCreateSetEditorOpen] = useState(false);
+  const [starredSetIds, setStarredSetIds] = useState<string[]>([]);
+  const [starredSetsHydrated, setStarredSetsHydrated] = useState(false);
+  const [activeSetActionsMenuId, setActiveSetActionsMenuId] = useState<string | null>(null);
+  const [deletingSetId, setDeletingSetId] = useState<string | null>(null);
   const [userSets, setUserSets] = useState<CommunitySet[]>([]);
   const [storageHydrated, setStorageHydrated] = useState(false);
   const [portalReady, setPortalReady] = useState(false);
+  const [relativeTimeNowMs, setRelativeTimeNowMs] = useState(() => Date.now());
   const [detailBannerLeft, setDetailBannerLeft] = useState(0);
   const [detailBannerRight, setDetailBannerRight] = useState(0);
   const [detailBannerHeight, setDetailBannerHeight] = useState(0);
@@ -787,8 +1044,10 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   const directoryDetailCloseTimerRef = useRef<number | null>(null);
   const reelDurationCacheRef = useRef<Record<string, number | null>>({});
   const consumedInitialSetIdRef = useRef<string | null>(null);
-  const didRestoreCreateDraftRef = useRef(false);
   const loadedEditSetIdRef = useRef<string | null>(null);
+  const lastCommunityResetSignalRef = useRef(communityResetSignal);
+  const draftBaselinesByContextRef = useRef<Record<string, string>>({});
+  const [draftBaselineVersion, setDraftBaselineVersion] = useState(0);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -798,6 +1057,22 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     setPortalReady(true);
     const localSets = parseStoredSets(window.localStorage.getItem(COMMUNITY_SETS_STORAGE_KEY));
     setUserSets(localSets);
+    const starredSetIdsRaw = window.localStorage.getItem(COMMUNITY_STARRED_SET_IDS_STORAGE_KEY);
+    if (starredSetIdsRaw) {
+      try {
+        const parsed = JSON.parse(starredSetIdsRaw);
+        if (Array.isArray(parsed)) {
+          setStarredSetIds(
+            parsed
+              .map((value) => String(value || "").trim())
+              .filter(Boolean),
+          );
+        }
+      } catch {
+        // Ignore malformed starred set storage values.
+      }
+    }
+    setStarredSetsHydrated(true);
     setStorageHydrated(true);
     void (async () => {
       try {
@@ -816,11 +1091,71 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   }, []);
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setRelativeTimeNowMs(Date.now());
+    }, LAST_EDITED_REFRESH_INTERVAL_MS);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  useEffect(() => {
     if (typeof window === "undefined" || !storageHydrated) {
       return;
     }
     window.localStorage.setItem(COMMUNITY_SETS_STORAGE_KEY, JSON.stringify(userSets.slice(0, MAX_USER_SETS)));
   }, [storageHydrated, userSets]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !starredSetsHydrated) {
+      return;
+    }
+    window.localStorage.setItem(COMMUNITY_STARRED_SET_IDS_STORAGE_KEY, JSON.stringify(starredSetIds));
+  }, [starredSetIds, starredSetsHydrated]);
+
+  useEffect(() => {
+    if (!starredSetsHydrated) {
+      return;
+    }
+    const editableSetIdSet = new Set(
+      userSets
+        .filter((set) => {
+          const id = set.id.trim();
+          const curator = set.curator.trim().toLowerCase();
+          return id.startsWith(USER_CREATED_SET_ID_PREFIX) || curator === "you";
+        })
+        .map((set) => set.id),
+    );
+    setStarredSetIds((prev) => {
+      const next = prev.filter((setId) => editableSetIdSet.has(setId));
+      if (next.length === prev.length) {
+        return prev;
+      }
+      return next;
+    });
+  }, [starredSetsHydrated, userSets]);
+
+  useEffect(() => {
+    if (!activeSetActionsMenuId) {
+      return;
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      if (!(event.target instanceof Element)) {
+        return;
+      }
+      if (event.target.closest("[data-your-set-actions='true']")) {
+        return;
+      }
+      setActiveSetActionsMenuId(null);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+    };
+  }, [activeSetActionsMenuId]);
 
   const clearDirectoryDetailCloseTimer = useCallback(() => {
     if (directoryDetailCloseTimerRef.current !== null) {
@@ -856,7 +1191,12 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     setDetailBannerHeight((prev) => (prev === nextHeight ? prev : nextHeight));
   }, []);
 
-  const isEditMode = mode === "edit";
+  const isYourSetsMode = mode === "edit";
+  const isStandaloneCreateMode = mode === "create";
+  const isFormEditMode = isYourSetsMode && isEditSetEditorOpen;
+  const isFormCreateMode = isStandaloneCreateMode || (isYourSetsMode && isCreateSetEditorOpen);
+  const shouldShowEditSetGrid = isYourSetsMode && !isEditSetEditorOpen && !isCreateSetEditorOpen;
+  const shouldShowEditSetForm = isFormEditMode || isFormCreateMode;
   const allSets = useMemo(() => [...userSets, ...DEFAULT_COMMUNITY_SETS], [userSets]);
   const editableSets = useMemo(
     () =>
@@ -867,12 +1207,37 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
       }),
     [userSets],
   );
+  const starredSetIdSet = useMemo(() => new Set(starredSetIds), [starredSetIds]);
+  const orderedEditableSets = useMemo(() => {
+    const starred: CommunitySet[] = [];
+    const regular: CommunitySet[] = [];
+    for (const set of editableSets) {
+      if (starredSetIdSet.has(set.id)) {
+        starred.push(set);
+      } else {
+        regular.push(set);
+      }
+    }
+    return [...starred, ...regular];
+  }, [editableSets, starredSetIdSet]);
   const activeEditableSet = useMemo(
     () => editableSets.find((set) => set.id === activeEditSetId) ?? null,
     [activeEditSetId, editableSets],
   );
   const featuredCarouselSets = useMemo(() => FEATURED_SETS.slice(0, 3), []);
   const detailCarouselReels = useMemo(() => selectedDirectorySet?.reels ?? [], [selectedDirectorySet]);
+
+  useEffect(() => {
+    if (mode === "edit") {
+      setIsEditSetEditorOpen(false);
+      setIsCreateSetEditorOpen(false);
+      setCreateError(null);
+      setCreateSuccess(null);
+      return;
+    }
+    setIsEditSetEditorOpen(false);
+    setIsCreateSetEditorOpen(false);
+  }, [mode]);
 
   const filteredDirectorySets = useMemo(() => {
     const normalized = query.trim().toLowerCase();
@@ -1134,50 +1499,192 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     });
   }, [activeCommunityCategory]);
 
-  const applyDraftToForm = useCallback((draft: StoredSetDraft) => {
-    setSetTitle(draft.title);
-    setSetDescription(draft.description);
-    setSetTags(draft.tags);
-    setThumbnailPreview(draft.thumbnailPreview);
-    setThumbnailFileName(draft.thumbnailFileName);
-    const nextRows = draft.reelInputs.length > 0
-      ? draft.reelInputs.map((row) => createDraftReelRow(row.value, row.tStartSec, row.tEndSec))
+  const formDraftContextKey = useMemo(() => {
+    if (isFormEditMode && activeEditableSet) {
+      return `edit:${activeEditableSet.id}`;
+    }
+    if (isFormCreateMode) {
+      return COMMUNITY_CREATE_DRAFT_CONTEXT_KEY;
+    }
+    return null;
+  }, [activeEditableSet, isFormCreateMode, isFormEditMode]);
+
+  const normalizeStoredDraft = useCallback((draft: StoredSetDraft): StoredSetDraft => {
+    const reelInputs = Array.isArray(draft.reelInputs) && draft.reelInputs.length > 0
+      ? draft.reelInputs.map((row) => ({
+          value: String(row.value ?? ""),
+          tStartSec: String(row.tStartSec ?? "0"),
+          tEndSec: String(row.tEndSec ?? ""),
+        }))
+      : [{ value: "", tStartSec: "0", tEndSec: "" }];
+    return {
+      title: String(draft.title ?? ""),
+      description: String(draft.description ?? ""),
+      tags: String(draft.tags ?? ""),
+      thumbnailPreview: String(draft.thumbnailPreview ?? ""),
+      thumbnailFileName: String(draft.thumbnailFileName ?? ""),
+      reelInputs,
+    };
+  }, []);
+
+  const setDraftBaselineForContext = useCallback((contextKey: string, draft: StoredSetDraft) => {
+    const normalizedDraft = normalizeStoredDraft(draft);
+    draftBaselinesByContextRef.current[contextKey] = JSON.stringify(normalizedDraft);
+    setDraftBaselineVersion((prev) => prev + 1);
+  }, [normalizeStoredDraft]);
+
+  const buildCurrentDraftPayload = useCallback((): StoredSetDraft => {
+    return normalizeStoredDraft({
+      title: setTitle,
+      description: setDescription,
+      tags: setTags,
+      thumbnailPreview,
+      thumbnailFileName,
+      reelInputs: reelInputs.map((row) => ({
+        value: row.value,
+        tStartSec: row.tStartSec,
+        tEndSec: row.tEndSec,
+      })),
+    });
+  }, [normalizeStoredDraft, reelInputs, setDescription, setTags, setTitle, thumbnailFileName, thumbnailPreview]);
+
+  const buildCanonicalDraftForUnsavedComparison = useCallback((draft: StoredSetDraft): StoredSetDraft => {
+    const normalizedDraft = normalizeStoredDraft(draft);
+    const normalizedReelInputs = normalizedDraft.reelInputs.map((row) => {
+      const normalizedValue = row.value;
+      const sourceUrl = normalizedValue.trim();
+      const durationState = Object.values(reelDurationByRow).find((entry) => entry.sourceUrl === sourceUrl);
+      const durationSec = durationState?.durationSec;
+      const hasDetectedDuration = Number.isFinite(durationSec) && Number(durationSec) > CLIP_SLIDER_MIN_GAP_SEC;
+      const maxSec = hasDetectedDuration ? Math.max(CLIP_SLIDER_MIN_GAP_SEC * 2, Number(durationSec)) : null;
+      let nextStart = parseClipSecondsInput(row.tStartSec) ?? 0;
+      let nextEnd = parseClipSecondsInput(row.tEndSec);
+      if (maxSec !== null) {
+        nextStart = Math.min(Math.max(0, nextStart), maxSec - CLIP_SLIDER_MIN_GAP_SEC);
+        if (nextEnd !== null) {
+          nextEnd = Math.min(maxSec, Math.max(nextStart + CLIP_SLIDER_MIN_GAP_SEC, nextEnd));
+        }
+      }
+      return {
+        value: normalizedValue,
+        tStartSec: formatClipSecondsInputValue(nextStart),
+        tEndSec: nextEnd === null ? "" : formatClipSecondsInputValue(nextEnd),
+      };
+    });
+    return {
+      ...normalizedDraft,
+      reelInputs: normalizedReelInputs,
+    };
+  }, [normalizeStoredDraft, reelDurationByRow]);
+
+  const applyDraftToForm = useCallback((draft: StoredSetDraft, contextKey?: string) => {
+    const normalizedDraft = normalizeStoredDraft(draft);
+    setSetTitle(normalizedDraft.title);
+    setSetDescription(normalizedDraft.description);
+    setSetTags(normalizedDraft.tags);
+    setThumbnailPreview(normalizedDraft.thumbnailPreview);
+    setThumbnailFileName(normalizedDraft.thumbnailFileName);
+    const nextRows = normalizedDraft.reelInputs.length > 0
+      ? normalizedDraft.reelInputs.map((row) => createDraftReelRow(row.value, row.tStartSec, row.tEndSec))
       : [createDraftReelRow()];
     setReelInputs(nextRows);
     setReelDurationByRow({});
+    reelDurationCacheRef.current = {};
     setCreateError(null);
     setCreateSuccess(null);
-  }, []);
+    if (contextKey) {
+      setDraftBaselineForContext(contextKey, normalizedDraft);
+    }
+  }, [normalizeStoredDraft, setDraftBaselineForContext]);
 
   const applySetToForm = useCallback((set: CommunitySet) => {
-    setSetTitle(set.title);
-    setSetDescription(set.description);
-    setSetTags(set.tags.join(", "));
-    setThumbnailPreview(set.thumbnailUrl || "");
-    setThumbnailFileName(set.thumbnailUrl ? "Current thumbnail" : "");
-    setReelInputs(draftRowsFromReels(set.reels));
+    const nextDraft = normalizeStoredDraft({
+      title: set.title,
+      description: set.description,
+      tags: set.tags.join(", "),
+      thumbnailPreview: set.thumbnailUrl || "",
+      thumbnailFileName: set.thumbnailUrl ? "Current thumbnail" : "",
+      reelInputs: draftRowsFromReels(set.reels).map((row) => ({
+        value: row.value,
+        tStartSec: row.tStartSec,
+        tEndSec: row.tEndSec,
+      })),
+    });
+    setSetTitle(nextDraft.title);
+    setSetDescription(nextDraft.description);
+    setSetTags(nextDraft.tags);
+    setThumbnailPreview(nextDraft.thumbnailPreview);
+    setThumbnailFileName(nextDraft.thumbnailFileName);
+    setReelInputs(nextDraft.reelInputs.map((row) => createDraftReelRow(row.value, row.tStartSec, row.tEndSec)));
     setReelDurationByRow({});
+    reelDurationCacheRef.current = {};
     setCreateError(null);
     setCreateSuccess(null);
+    setDraftBaselineForContext(`edit:${set.id}`, nextDraft);
+  }, [normalizeStoredDraft, setDraftBaselineForContext]);
+
+  const clearCreateSetDraftProgress = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    window.localStorage.removeItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY);
   }, []);
 
+  const resetCreateSetForm = useCallback(() => {
+    const nextDraft = normalizeStoredDraft({
+      title: "",
+      description: "",
+      tags: "",
+      thumbnailPreview: "",
+      thumbnailFileName: "",
+      reelInputs: [{ value: "", tStartSec: "0", tEndSec: "" }],
+    });
+    setSetTitle(nextDraft.title);
+    setSetDescription(nextDraft.description);
+    setSetTags(nextDraft.tags);
+    setThumbnailPreview(nextDraft.thumbnailPreview);
+    setThumbnailFileName(nextDraft.thumbnailFileName);
+    setReelInputs(nextDraft.reelInputs.map((row) => createDraftReelRow(row.value, row.tStartSec, row.tEndSec)));
+    setReelDurationByRow({});
+    reelDurationCacheRef.current = {};
+    setCreateError(null);
+    setCreateSuccess(null);
+    setDraftBaselineForContext(COMMUNITY_CREATE_DRAFT_CONTEXT_KEY, nextDraft);
+  }, [normalizeStoredDraft, setDraftBaselineForContext]);
+
+  const currentDraftPayload = useMemo(() => buildCurrentDraftPayload(), [buildCurrentDraftPayload]);
+  const hasUnsavedDraftChanges = useMemo(() => {
+    if (!formDraftContextKey || !shouldShowEditSetForm) {
+      return false;
+    }
+    const baseline = draftBaselinesByContextRef.current[formDraftContextKey];
+    if (typeof baseline !== "string") {
+      return false;
+    }
+    const baselineDraft = parseStoredSetDraft(baseline);
+    if (!baselineDraft) {
+      return false;
+    }
+    const baselineSerialized = JSON.stringify(buildCanonicalDraftForUnsavedComparison(baselineDraft));
+    const currentSerialized = JSON.stringify(buildCanonicalDraftForUnsavedComparison(currentDraftPayload));
+    return baselineSerialized !== currentSerialized;
+  }, [buildCanonicalDraftForUnsavedComparison, currentDraftPayload, draftBaselineVersion, formDraftContextKey, shouldShowEditSetForm]);
+
   useEffect(() => {
-    if (typeof window === "undefined" || didRestoreCreateDraftRef.current) {
+    if (mode !== "create" || typeof window === "undefined") {
       return;
     }
     const storedDraft = parseStoredSetDraft(window.localStorage.getItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY));
     if (storedDraft) {
-      applyDraftToForm(storedDraft);
-    }
-    didRestoreCreateDraftRef.current = true;
-  }, [applyDraftToForm]);
-
-  useEffect(() => {
-    if (!isEditMode) {
-      loadedEditSetIdRef.current = null;
+      applyDraftToForm(storedDraft, COMMUNITY_CREATE_DRAFT_CONTEXT_KEY);
       return;
     }
-    if (editableSets.length === 0) {
+    resetCreateSetForm();
+  }, [applyDraftToForm, mode, resetCreateSetForm]);
+
+  useEffect(() => {
+    if (!isYourSetsMode) {
+      loadedEditSetIdRef.current = null;
       setActiveEditSetId(null);
       return;
     }
@@ -1185,12 +1692,21 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
       if (prev && editableSets.some((set) => set.id === prev)) {
         return prev;
       }
-      return editableSets[0].id;
+      return null;
     });
-  }, [editableSets, isEditMode]);
+  }, [editableSets, isYourSetsMode]);
 
   useEffect(() => {
-    if (!isEditMode || typeof window === "undefined" || !activeEditSetId) {
+    if (!isYourSetsMode) {
+      return;
+    }
+    if (isEditSetEditorOpen && !activeEditableSet) {
+      setIsEditSetEditorOpen(false);
+    }
+  }, [activeEditableSet, isYourSetsMode, isEditSetEditorOpen]);
+
+  useEffect(() => {
+    if (!isYourSetsMode || !isEditSetEditorOpen || typeof window === "undefined" || !activeEditSetId) {
       return;
     }
     if (loadedEditSetIdRef.current === activeEditSetId) {
@@ -1202,12 +1718,12 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     }
     const storedDraft = parseStoredSetDraft(window.localStorage.getItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${activeEditSetId}`));
     if (storedDraft) {
-      applyDraftToForm(storedDraft);
+      applyDraftToForm(storedDraft, `edit:${activeEditSetId}`);
     } else {
       applySetToForm(selectedSet);
     }
     loadedEditSetIdRef.current = activeEditSetId;
-  }, [activeEditSetId, applyDraftToForm, applySetToForm, editableSets, isEditMode]);
+  }, [activeEditSetId, applyDraftToForm, applySetToForm, editableSets, isEditSetEditorOpen, isYourSetsMode]);
 
   const parsedDraftReels = useMemo<ParsedDraftReel[]>(
     () =>
@@ -1215,7 +1731,8 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
         const trimmed = row.value.trim();
         const clipStartSec = parseClipSecondsInput(row.tStartSec);
         const clipEndSec = parseClipSecondsInput(row.tEndSec);
-        const hasClipRangeError = clipStartSec === null || clipEndSec === null || clipEndSec <= clipStartSec;
+        const hasClipRangeError =
+          clipStartSec === null || (clipEndSec !== null && clipEndSec <= clipStartSec);
         if (!trimmed) {
           return {
             id: row.id,
@@ -1335,11 +1852,15 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
         }
         const sliderMaxSec = Math.max(CLIP_SLIDER_MIN_GAP_SEC * 2, Number(durationSec));
         const currentStart = parseClipSecondsInput(row.tStartSec) ?? 0;
-        const currentEnd = parseClipSecondsInput(row.tEndSec) ?? Math.min(sliderMaxSec, CLIP_SLIDER_DEFAULT_MAX_SEC);
+        const parsedEnd = parseClipSecondsInput(row.tEndSec);
+        const hasExplicitEnd = parsedEnd !== null;
         const nextStart = Math.min(Math.max(0, currentStart), sliderMaxSec - CLIP_SLIDER_MIN_GAP_SEC);
-        const nextEnd = Math.min(sliderMaxSec, Math.max(nextStart + CLIP_SLIDER_MIN_GAP_SEC, currentEnd));
         const formattedStart = formatClipSecondsInputValue(nextStart);
-        const formattedEnd = formatClipSecondsInputValue(nextEnd);
+        const formattedEnd = hasExplicitEnd
+          ? formatClipSecondsInputValue(
+              Math.min(sliderMaxSec, Math.max(nextStart + CLIP_SLIDER_MIN_GAP_SEC, parsedEnd)),
+            )
+          : "";
         if (formattedStart === row.tStartSec && formattedEnd === row.tEndSec) {
           return row;
         }
@@ -1377,23 +1898,77 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   const normalizedSetTitle = setTitle.trim();
   const normalizedSetDescription = setDescription.trim();
   const descriptionCharsRemaining = Math.max(0, MIN_SET_DESCRIPTION_LENGTH - normalizedSetDescription.length);
-  const descriptionHasTooFewChars = normalizedSetDescription.length > 0 && descriptionCharsRemaining > 0;
+  const descriptionHasTooFewChars = descriptionCharsRemaining > 0;
   const parsedSetTags = useMemo(() => parseTags(setTags), [setTags]);
+  const hasMaxTags = parsedSetTags.length >= MAX_SET_TAGS;
   const requiredCompletionCount =
     (normalizedSetTitle ? 1 : 0) +
     (normalizedSetDescription.length >= MIN_SET_DESCRIPTION_LENGTH ? 1 : 0) +
     (thumbnailPreview ? 1 : 0) +
     (validDraftReelCount > 0 && invalidDraftReelCount === 0 ? 1 : 0);
   const completionPercent = Math.round((requiredCompletionCount / 4) * 100);
-  const canPostSet = requiredCompletionCount === 4 && !isPostingSet && (!isEditMode || Boolean(activeEditableSet));
+  const progressPercent = Math.min(100, Math.max(0, completionPercent));
+  const progressRadius = 34;
+  const progressCircumference = 2 * Math.PI * progressRadius;
+  const progressOffset = progressCircumference * (1 - progressPercent / 100);
+  const canPostSet = requiredCompletionCount === 4 && !isPostingSet && (!isFormEditMode || Boolean(activeEditableSet));
+  const remainingPreviewRequirements = useMemo(() => {
+    const items: string[] = [];
+    if (!normalizedSetTitle) {
+      items.push("Add a set name");
+    }
+    if (normalizedSetDescription.length < MIN_SET_DESCRIPTION_LENGTH) {
+      items.push(`Write a description (${MIN_SET_DESCRIPTION_LENGTH}+ characters)`);
+    }
+    if (!thumbnailPreview) {
+      items.push("Upload a thumbnail image");
+    }
+    if (nonEmptyDraftReelCount === 0) {
+      items.push("Add at least one reel link");
+    } else if (invalidDraftReelCount > 0) {
+      items.push("Fix invalid reel links or clip ranges");
+    } else if (validDraftReelCount === 0) {
+      items.push("Wait for reel duration detection");
+    }
+    return items;
+  }, [
+    invalidDraftReelCount,
+    nonEmptyDraftReelCount,
+    normalizedSetDescription.length,
+    normalizedSetTitle,
+    thumbnailPreview,
+    validDraftReelCount,
+  ]);
+
+  const onSetTagsChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const nextValue = event.target.value;
+    const allNextTags = parseAllTags(nextValue);
+    if (allNextTags.length > MAX_SET_TAGS) {
+      setTagLimitError(true);
+      return;
+    }
+    setTagLimitError(false);
+    setSetTags(nextValue);
+  }, []);
+
+  const onRemoveSetTag = useCallback((tagToRemove: string) => {
+    const remainingTags = parseTags(setTags).filter((tag) => tag !== tagToRemove);
+    setTagLimitError(false);
+    setSetTags(remainingTags.join(", "));
+  }, [setTags]);
 
   const applyThumbnailFile = useCallback((file: File | null | undefined) => {
     if (!file) {
       return;
     }
     if (!file.type.startsWith("image/")) {
-      setCreateError("Thumbnail must be an image file.");
       setCreateSuccess(null);
+      setPublishResultModal({
+        status: "error",
+        label: isFormEditMode ? "Save Set Changes" : "Post Community Set",
+        title: "Invalid Thumbnail",
+        message: "Thumbnail must be an image file.",
+      });
       return;
     }
     const reader = new FileReader();
@@ -1405,7 +1980,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
       }
     };
     reader.readAsDataURL(file);
-  }, []);
+  }, [isFormEditMode]);
 
   const onThumbnailFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     applyThumbnailFile(event.target.files?.[0]);
@@ -1442,51 +2017,87 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     applyThumbnailFile(event.dataTransfer.files?.[0]);
   };
 
-  const onCreateSet = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  const submitSet = useCallback(async (): Promise<boolean> => {
+    const actionLabel = isFormEditMode ? "Save Set Changes" : "Post Community Set";
     const title = setTitle.trim();
     const description = setDescription.trim();
-    if (isEditMode && !activeEditableSet) {
-      setCreateError("Pick a set to edit first.");
+    const editSetId = activeEditableSet?.id?.trim() || activeEditSetId?.trim() || "";
+    if (isFormEditMode && !editSetId) {
       setCreateSuccess(null);
-      return;
+      setPublishResultModal({
+        status: "error",
+        label: actionLabel,
+        title: "No Set Selected",
+        message: "Pick a set to edit first.",
+      });
+      return false;
     }
     setCreateSuccess(null);
     if (!title) {
-      setCreateError("Set name is required.");
-      setCreateSuccess(null);
-      return;
+      setPublishResultModal({
+        status: "error",
+        label: actionLabel,
+        title: "Missing Set Name",
+        message: "Set name is required.",
+      });
+      return false;
     }
     if (description.length < MIN_SET_DESCRIPTION_LENGTH) {
-      setCreateError(`Description must be at least ${MIN_SET_DESCRIPTION_LENGTH} characters.`);
-      setCreateSuccess(null);
-      return;
+      setPublishResultModal({
+        status: "error",
+        label: actionLabel,
+        title: "Description Too Short",
+        message: `Description must be at least ${MIN_SET_DESCRIPTION_LENGTH} characters.`,
+      });
+      return false;
     }
     if (!thumbnailPreview) {
-      setCreateError("Add a thumbnail image before posting.");
-      setCreateSuccess(null);
-      return;
+      setPublishResultModal({
+        status: "error",
+        label: actionLabel,
+        title: "Missing Thumbnail",
+        message: "Add a thumbnail image before posting.",
+      });
+      return false;
     }
 
     const nonEmptyRows = parsedDraftReels.filter((row) => row.value.trim());
     if (nonEmptyRows.length === 0) {
-      setCreateError("Add at least one reel URL to post this set.");
-      setCreateSuccess(null);
-      return;
+      setPublishResultModal({
+        status: "error",
+        label: actionLabel,
+        title: "Missing Reels",
+        message: "Add at least one reel URL to post this set.",
+      });
+      return false;
     }
     const firstInvalid = nonEmptyRows.find(
       (row) => row.parsed === null || row.hasClipRangeError || !hasDetectedDurationForRow(row.id),
     );
     if (firstInvalid) {
       if (firstInvalid.parsed === null) {
-        setCreateError(`One or more reel links are invalid. Supported: ${SUPPORTED_PLATFORMS_LABEL}.`);
+        setPublishResultModal({
+          status: "error",
+          label: actionLabel,
+          title: "Invalid Reel Link",
+          message: `One or more reel links are invalid. Supported: ${SUPPORTED_PLATFORMS_LABEL}.`,
+        });
       } else if (!hasDetectedDurationForRow(firstInvalid.id)) {
-        setCreateError("Wait until each valid reel's video length is detected before posting.");
+        setPublishResultModal({
+          status: "error",
+          label: actionLabel,
+          title: "Duration Not Ready",
+          message: "Wait until each valid reel's video length is detected before posting.",
+        });
       } else {
-        setCreateError("Each reel needs a valid clip range (start >= 0 and end > start).");
+        setPublishResultModal({
+          status: "error",
+          label: actionLabel,
+          title: "Invalid Clip Range",
+          message: "Each reel needs a valid clip range (start >= 0 and optional end > start).",
+        });
       }
-      setCreateSuccess(null);
-      return;
+      return false;
     }
 
     const parsedReels = nonEmptyRows.map((row) => {
@@ -1501,24 +2112,27 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
     });
 
     const tags = parseTags(setTags);
+    setPublishResultModal(null);
     setIsPostingSet(true);
     try {
-      if (isEditMode && activeEditableSet) {
+      if (isFormEditMode && editSetId) {
         const updatedSet = await updateCommunitySet({
-          setId: activeEditableSet.id,
+          setId: editSetId,
           title,
           description,
           tags,
           reels: parsedReels,
           thumbnailUrl: thumbnailPreview,
-          curator: activeEditableSet.curator || "You",
+          curator: activeEditableSet?.curator || "You",
         });
         setUserSets((prev) => [updatedSet, ...prev.filter((item) => item.id !== updatedSet.id)].slice(0, MAX_USER_SETS));
         if (typeof window !== "undefined") {
           window.localStorage.removeItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${updatedSet.id}`);
         }
+        setDraftBaselineForContext(`edit:${updatedSet.id}`, buildCurrentDraftPayload());
         setCreateError(null);
         setCreateSuccess(`Saved changes to "${updatedSet.title}".`);
+        return true;
       } else {
         const createdSet = await createCommunitySet({
           title,
@@ -1529,68 +2143,423 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
           curator: "You",
         });
         setUserSets((prev) => [createdSet, ...prev.filter((item) => item.id !== createdSet.id)].slice(0, MAX_USER_SETS));
-        setSetTitle("");
-        setSetDescription("");
-        setSetTags("");
-        setThumbnailPreview("");
-        setThumbnailFileName("");
-        setReelInputs([createDraftReelRow()]);
-        setReelDurationByRow({});
-        if (typeof window !== "undefined") {
-          window.localStorage.removeItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY);
-        }
-        setCreateError(null);
-        setCreateSuccess(`"${createdSet.title}" posted with ${createdSet.reels.length} reels.`);
+        clearCreateSetDraftProgress();
+        resetCreateSetForm();
+        setPublishResultModal({
+          status: "success",
+          title: "Published Successfully",
+          message: `"${createdSet.title}" is now live with ${createdSet.reels.length} reel${createdSet.reels.length === 1 ? "" : "s"}.`,
+          thumbnailUrl: createdSet.thumbnailUrl || thumbnailPreview || undefined,
+          thumbnailAlt: `${createdSet.title} thumbnail`,
+        });
+        return true;
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : isEditMode ? "Could not update community set." : "Could not post community set.";
-      setCreateError(message);
+      const message = error instanceof Error ? error.message : isFormEditMode ? "Could not update community set." : "Could not post community set.";
+      setCreateError(null);
+      setPublishResultModal({
+        status: "error",
+        label: actionLabel,
+        title: isFormEditMode ? "Save Failed" : "Publish Failed",
+        message,
+      });
+      return false;
     } finally {
       setIsPostingSet(false);
     }
-  };
+  }, [
+    activeEditSetId,
+    activeEditableSet,
+    buildCurrentDraftPayload,
+    clearCreateSetDraftProgress,
+    hasDetectedDurationForRow,
+    isFormEditMode,
+    parsedDraftReels,
+    resetCreateSetForm,
+    setDraftBaselineForContext,
+    setTags,
+    setDescription,
+    setTitle,
+    thumbnailPreview,
+    setUserSets,
+  ]);
+
+  const onCreateSet = useCallback((event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (isFormEditMode) {
+      const targetTitle = activeEditableSet?.title?.trim() || "this set";
+      setDraftActionConfirmModal({
+        action: "save-set-changes",
+        label: "Update Set",
+        title: `Save changes to "${targetTitle}"?`,
+        message: "Your edits will replace the currently published version of this set.",
+        confirmLabel: "Save Set Changes",
+      });
+      return;
+    }
+    void submitSet();
+  }, [activeEditableSet, isFormEditMode, submitSet]);
+
+  const persistDraftPayload = useCallback((storageKey: string, draftPayload: StoredSetDraft): { ok: boolean; warning?: string; error?: string } => {
+    if (typeof window === "undefined") {
+      return { ok: false, error: "Draft storage is unavailable in this environment." };
+    }
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(draftPayload));
+      return { ok: true };
+    } catch {
+      // If storage quota is tight (large thumbnail previews), retry with a compact draft.
+      const compactDraft: StoredSetDraft = {
+        ...draftPayload,
+        thumbnailPreview: "",
+        thumbnailFileName: draftPayload.thumbnailFileName || "",
+      };
+      try {
+        window.localStorage.setItem(storageKey, JSON.stringify(compactDraft));
+        return {
+          ok: true,
+          warning: "Draft saved without thumbnail preview due browser storage limits.",
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Could not save draft progress.";
+        return { ok: false, error: message };
+      }
+    }
+  }, []);
+
+  const saveCurrentDraftProgress = useCallback((options?: { showSuccessMessage?: boolean }): boolean => {
+    if (typeof window === "undefined") {
+      return false;
+    }
+    const showSuccessMessage = options?.showSuccessMessage ?? true;
+    const draftPayload = buildCurrentDraftPayload();
+    if (isFormEditMode) {
+      const editSetId = activeEditableSet?.id?.trim() || activeEditSetId?.trim() || "";
+      if (!editSetId) {
+        setCreateSuccess(null);
+        setPublishResultModal({
+          status: "error",
+          label: "Save Progress",
+          title: "Save Failed",
+          message: "Pick a set to edit before saving draft progress.",
+        });
+        return false;
+      }
+      const persistResult = persistDraftPayload(`${COMMUNITY_EDIT_DRAFT_PREFIX}${editSetId}`, draftPayload);
+      if (!persistResult.ok) {
+        setCreateSuccess(null);
+        setPublishResultModal({
+          status: "error",
+          label: "Save Progress",
+          title: "Save Failed",
+          message: persistResult.error || "Could not save draft progress.",
+        });
+        return false;
+      }
+      setDraftBaselineForContext(`edit:${editSetId}`, draftPayload);
+      setCreateError(null);
+      if (showSuccessMessage) {
+        setCreateSuccess(persistResult.warning || "Draft progress saved for this set.");
+      } else {
+        setCreateSuccess(null);
+      }
+      return true;
+    }
+    const persistResult = persistDraftPayload(COMMUNITY_CREATE_DRAFT_STORAGE_KEY, draftPayload);
+    if (!persistResult.ok) {
+      setCreateSuccess(null);
+      setPublishResultModal({
+        status: "error",
+        label: "Save Progress",
+        title: "Save Failed",
+        message: persistResult.error || "Could not save draft progress.",
+      });
+      return false;
+    }
+    setDraftBaselineForContext(COMMUNITY_CREATE_DRAFT_CONTEXT_KEY, draftPayload);
+    setCreateError(null);
+    if (showSuccessMessage) {
+      setCreateSuccess(persistResult.warning || "Draft progress saved.");
+    } else {
+      setCreateSuccess(null);
+    }
+    return true;
+  }, [activeEditSetId, activeEditableSet, buildCurrentDraftPayload, isFormEditMode, persistDraftPayload, setDraftBaselineForContext]);
+
+  const discardCurrentDraftChanges = useCallback(() => {
+    if (!formDraftContextKey) {
+      return;
+    }
+    const baselineRaw = draftBaselinesByContextRef.current[formDraftContextKey];
+    const baselineDraft = parseStoredSetDraft(baselineRaw ?? null);
+    if (baselineDraft) {
+      applyDraftToForm(baselineDraft, formDraftContextKey);
+      return;
+    }
+    if (formDraftContextKey === COMMUNITY_CREATE_DRAFT_CONTEXT_KEY) {
+      resetCreateSetForm();
+      return;
+    }
+    if (activeEditableSet) {
+      applySetToForm(activeEditableSet);
+      return;
+    }
+    setCreateError(null);
+    setCreateSuccess(null);
+  }, [activeEditableSet, applyDraftToForm, applySetToForm, formDraftContextKey, resetCreateSetForm]);
+
+  const clearCreateSetProgress = useCallback(() => {
+    try {
+      if (typeof window !== "undefined") {
+        window.localStorage.removeItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY);
+      }
+      resetCreateSetForm();
+      setCreateSuccess("Create set progress cleared.");
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not clear create set progress.";
+      setPublishResultModal({
+        status: "error",
+        label: "Clear Progress",
+        title: "Clear Failed",
+        message,
+      });
+      return false;
+    }
+  }, [resetCreateSetForm]);
 
   const onSaveDraftProgress = useCallback(() => {
-    if (typeof window === "undefined") {
+    setDraftActionConfirmModal({
+      action: "save-progress",
+      label: "Save Draft",
+      title: "Save your create-set draft?",
+      message: "Your current fields and reel links will be stored so you can continue later.",
+      confirmLabel: "Save Progress",
+    });
+  }, []);
+
+  const onClearCreateProgress = useCallback(() => {
+    setDraftActionConfirmModal({
+      action: "clear-progress",
+      label: "Clear Draft",
+      title: "Clear all create-set progress?",
+      message: "This resets the current create form and removes the saved draft from local storage.",
+      confirmLabel: "Clear Progress",
+    });
+  }, []);
+
+  const closeDraftActionConfirmModal = useCallback(() => {
+    if (isPostingSet) {
       return;
     }
-    const draftPayload: StoredSetDraft = {
-      title: setTitle,
-      description: setDescription,
-      tags: setTags,
-      thumbnailPreview,
-      thumbnailFileName,
-      reelInputs: reelInputs.map((row) => ({
-        value: row.value,
-        tStartSec: row.tStartSec,
-        tEndSec: row.tEndSec,
-      })),
-    };
-    if (isEditMode) {
-      if (!activeEditableSet) {
-        setCreateError("Pick a set to edit before saving draft progress.");
-        setCreateSuccess(null);
-        return;
-      }
-      window.localStorage.setItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${activeEditableSet.id}`, JSON.stringify(draftPayload));
-      setCreateError(null);
-      setCreateSuccess("Draft progress saved for this set.");
+    setDraftActionConfirmModal(null);
+  }, [isPostingSet]);
+
+  const confirmDraftAction = useCallback(() => {
+    if (!draftActionConfirmModal) {
       return;
     }
-    window.localStorage.setItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY, JSON.stringify(draftPayload));
-    setCreateError(null);
-    setCreateSuccess("Draft progress saved.");
-  }, [activeEditableSet, isEditMode, reelInputs, setDescription, setTags, setTitle, thumbnailFileName, thumbnailPreview]);
+    const action = draftActionConfirmModal.action;
+    setDraftActionConfirmModal(null);
+    if (action === "save-progress") {
+      saveCurrentDraftProgress({ showSuccessMessage: true });
+      return;
+    }
+    if (action === "clear-progress") {
+      clearCreateSetProgress();
+      return;
+    }
+    void submitSet();
+  }, [clearCreateSetProgress, draftActionConfirmModal, saveCurrentDraftProgress, submitSet]);
 
   const addReelInputRow = () => {
     setReelInputs((prev) => [...prev, createDraftReelRow()]);
   };
 
-  const onEditSetSelectionChange = useCallback((nextSetId: string) => {
-    const normalized = nextSetId.trim();
+  const onOpenCreateSetFromGrid = useCallback(() => {
+    setIsEditSetEditorOpen(false);
+    setIsCreateSetEditorOpen(true);
+    setActiveEditSetId(null);
     loadedEditSetIdRef.current = null;
-    setActiveEditSetId(normalized || null);
+    if (typeof window !== "undefined") {
+      const storedDraft = parseStoredSetDraft(window.localStorage.getItem(COMMUNITY_CREATE_DRAFT_STORAGE_KEY));
+      if (storedDraft) {
+        applyDraftToForm(storedDraft, COMMUNITY_CREATE_DRAFT_CONTEXT_KEY);
+      } else {
+        resetCreateSetForm();
+      }
+    } else {
+      resetCreateSetForm();
+    }
+    setCreateError(null);
+    setCreateSuccess(null);
+  }, [applyDraftToForm, resetCreateSetForm]);
+
+  useEffect(() => {
+    onDraftUnsavedChangesChange?.(hasUnsavedDraftChanges);
+  }, [hasUnsavedDraftChanges, onDraftUnsavedChangesChange]);
+
+  useEffect(() => {
+    if (!onDraftExitActionsChange) {
+      return;
+    }
+    if (!shouldShowEditSetForm) {
+      onDraftExitActionsChange(null);
+      return;
+    }
+    onDraftExitActionsChange({
+      saveDraftProgress: () => saveCurrentDraftProgress({ showSuccessMessage: false }),
+      discardDraftChanges: discardCurrentDraftChanges,
+    });
+    return () => {
+      onDraftExitActionsChange(null);
+    };
+  }, [discardCurrentDraftChanges, onDraftExitActionsChange, saveCurrentDraftProgress, shouldShowEditSetForm]);
+
+  const onOpenEditableSet = useCallback((setId: string) => {
+    const normalized = setId.trim();
+    if (!normalized) {
+      return;
+    }
+    loadedEditSetIdRef.current = null;
+    setActiveEditSetId(normalized);
+    setIsEditSetEditorOpen(true);
+    setIsCreateSetEditorOpen(false);
+    setCreateError(null);
+    setCreateSuccess(null);
   }, []);
+
+  const backToEditSetGrid = useCallback(() => {
+    setIsEditSetEditorOpen(false);
+    setIsCreateSetEditorOpen(false);
+    setCreateError(null);
+    setCreateSuccess(null);
+  }, []);
+
+  const onBackToEditSetGrid = useCallback(() => {
+    if (hasUnsavedDraftChanges) {
+      setUnsavedDraftExitModal({ action: "back-to-grid" });
+      return;
+    }
+    backToEditSetGrid();
+  }, [backToEditSetGrid, hasUnsavedDraftChanges]);
+
+  const closeUnsavedDraftExitModal = useCallback(() => {
+    setUnsavedDraftExitModal(null);
+  }, []);
+
+  const confirmUnsavedDraftExitSave = useCallback(async () => {
+    if (!unsavedDraftExitModal) {
+      return;
+    }
+    const didSave = isFormEditMode
+      ? await submitSet()
+      : saveCurrentDraftProgress({ showSuccessMessage: false });
+    if (!didSave) {
+      return;
+    }
+    const pendingAction = unsavedDraftExitModal.action;
+    setUnsavedDraftExitModal(null);
+    if (pendingAction === "back-to-grid") {
+      backToEditSetGrid();
+    }
+  }, [backToEditSetGrid, isFormEditMode, saveCurrentDraftProgress, submitSet, unsavedDraftExitModal]);
+
+  const confirmUnsavedDraftExitDiscard = useCallback(() => {
+    if (!unsavedDraftExitModal) {
+      return;
+    }
+    const pendingAction = unsavedDraftExitModal.action;
+    discardCurrentDraftChanges();
+    setUnsavedDraftExitModal(null);
+    if (pendingAction === "back-to-grid") {
+      backToEditSetGrid();
+    }
+  }, [backToEditSetGrid, discardCurrentDraftChanges, unsavedDraftExitModal]);
+
+  useEffect(() => {
+    if (shouldShowEditSetForm || !unsavedDraftExitModal) {
+      return;
+    }
+    setUnsavedDraftExitModal(null);
+  }, [shouldShowEditSetForm, unsavedDraftExitModal]);
+
+  useEffect(() => {
+    if (shouldShowEditSetForm || !draftActionConfirmModal) {
+      return;
+    }
+    setDraftActionConfirmModal(null);
+  }, [draftActionConfirmModal, shouldShowEditSetForm]);
+
+  const onToggleSetStar = useCallback((setId: string) => {
+    const normalized = setId.trim();
+    if (!normalized) {
+      return;
+    }
+    setStarredSetIds((prev) => {
+      if (prev.includes(normalized)) {
+        return prev.filter((id) => id !== normalized);
+      }
+      return [normalized, ...prev];
+    });
+    setActiveSetActionsMenuId(null);
+  }, []);
+
+  const onRequestDeleteEditableSet = useCallback((setId: string) => {
+    const normalized = setId.trim();
+    if (!normalized || deletingSetId) {
+      return;
+    }
+    const target = editableSets.find((set) => set.id === normalized);
+    const targetTitle = target?.title?.trim() || "this set";
+    setActiveSetActionsMenuId(null);
+    setDeleteSetConfirmModal({ setId: normalized, title: targetTitle });
+  }, [deletingSetId, editableSets]);
+
+  const closeDeleteSetConfirmModal = useCallback(() => {
+    if (deletingSetId) {
+      return;
+    }
+    setDeleteSetConfirmModal(null);
+  }, [deletingSetId]);
+
+  const onDeleteEditableSet = useCallback(async (setId: string) => {
+    const normalized = setId.trim();
+    if (!normalized || deletingSetId) {
+      return;
+    }
+    const target = editableSets.find((set) => set.id === normalized);
+    const targetTitle = target?.title || "this set";
+    setDeleteSetConfirmModal(null);
+    setPublishResultModal(null);
+    setDeletingSetId(normalized);
+    try {
+      await deleteCommunitySet({ setId: normalized });
+      setUserSets((prev) => prev.filter((set) => set.id !== normalized));
+      setStarredSetIds((prev) => prev.filter((id) => id !== normalized));
+      if (typeof window !== "undefined") {
+        window.localStorage.removeItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${normalized}`);
+      }
+      if (activeEditSetId === normalized) {
+        loadedEditSetIdRef.current = null;
+        setActiveEditSetId(null);
+        setIsEditSetEditorOpen(false);
+      }
+      setCreateError(null);
+      setCreateSuccess(`Deleted "${targetTitle}".`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Could not delete this set.";
+      setPublishResultModal({
+        status: "error",
+        label: "Your Sets",
+        title: "Delete Failed",
+        message,
+      });
+    } finally {
+      setDeletingSetId(null);
+      setActiveSetActionsMenuId(null);
+    }
+  }, [activeEditSetId, deletingSetId, editableSets]);
 
   const removeReelInputRow = (rowId: string) => {
     setReelInputs((prev) => {
@@ -1618,13 +2587,16 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
         if (row.id !== rowId) {
           return row;
         }
-        const currentEnd = parseClipSecondsInput(row.tEndSec) ?? Math.min(normalizedMax, CLIP_SLIDER_DEFAULT_MAX_SEC);
+        const parsedEnd = parseClipSecondsInput(row.tEndSec);
+        const hasExplicitEnd = parsedEnd !== null;
         const nextStart = Math.min(Math.max(0, value), normalizedMax - CLIP_SLIDER_MIN_GAP_SEC);
-        const nextEnd = Math.min(normalizedMax, Math.max(nextStart + CLIP_SLIDER_MIN_GAP_SEC, currentEnd));
+        const nextEnd = hasExplicitEnd
+          ? Math.min(normalizedMax, Math.max(nextStart + CLIP_SLIDER_MIN_GAP_SEC, parsedEnd))
+          : null;
         return {
           ...row,
           tStartSec: formatClipSecondsInputValue(nextStart),
-          tEndSec: formatClipSecondsInputValue(nextEnd),
+          tEndSec: nextEnd === null ? "" : formatClipSecondsInputValue(nextEnd),
         };
       }),
     );
@@ -1661,6 +2633,38 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
       directoryDetailCloseTimerRef.current = null;
     }, DIRECTORY_DETAIL_TRANSITION_MS);
   }, [clearDirectoryDetailCloseTimer, selectedDirectorySet]);
+
+  useEffect(() => {
+    if (mode === "community" && isVisible) {
+      return;
+    }
+    clearDirectoryDetailCloseTimer();
+    setIsDetailBannerCompact(false);
+    setSkipDetailTransitionOnce(false);
+    setIsDirectoryDetailOpen(false);
+    setSelectedDirectorySet(null);
+    setSelectedDetailReelId(null);
+    setDetailCarouselIndex(0);
+    consumedInitialSetIdRef.current = null;
+  }, [clearDirectoryDetailCloseTimer, isVisible, mode]);
+
+  useEffect(() => {
+    if (lastCommunityResetSignalRef.current === communityResetSignal) {
+      return;
+    }
+    lastCommunityResetSignalRef.current = communityResetSignal;
+    if (mode !== "community" || !isVisible) {
+      return;
+    }
+    clearDirectoryDetailCloseTimer();
+    setIsDetailBannerCompact(false);
+    setSkipDetailTransitionOnce(false);
+    setIsDirectoryDetailOpen(false);
+    setSelectedDirectorySet(null);
+    setSelectedDetailReelId(null);
+    setDetailCarouselIndex(0);
+    consumedInitialSetIdRef.current = initialOpenSetId?.trim() || null;
+  }, [clearDirectoryDetailCloseTimer, communityResetSignal, initialOpenSetId, isVisible, mode]);
 
   const openDirectorySet = useCallback(
     (set: CommunitySet, options?: { immediate?: boolean; skipTransition?: boolean }) => {
@@ -1865,6 +2869,8 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
         community_reel_platform: reel.platform,
         community_reel_url: reel.embedUrl || reel.sourceUrl,
         community_reel_source_url: reel.sourceUrl,
+        return_tab: "community",
+        return_community_set_id: set.id,
       });
       if (Number.isFinite(reel.tStartSec) && Number(reel.tStartSec) >= 0) {
         nextParams.set("community_t_start_sec", String(reel.tStartSec));
@@ -1873,14 +2879,6 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
         nextParams.set("community_t_end_sec", String(reel.tEndSec));
       }
       if (typeof window !== "undefined") {
-        try {
-          const returnUrl = new URL(window.location.href);
-          returnUrl.searchParams.set("tab", "community");
-          returnUrl.searchParams.set("community_set_id", set.id);
-          window.history.replaceState(window.history.state, "", `${returnUrl.pathname}?${returnUrl.searchParams.toString()}`);
-        } catch {
-          // Ignore URL rewrite failures.
-        }
         try {
           window.sessionStorage.setItem(`${COMMUNITY_SET_RETURN_SNAPSHOT_PREFIX}${set.id}`, JSON.stringify(set));
         } catch {
@@ -1909,9 +2907,16 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
           // Ignore storage failures and fall back to URL payload only.
         }
       }
-      router.push(`/feed?${nextParams.toString()}`);
+      const feedQuery = nextParams.toString();
+      onOpenCommunityReelInFeed?.({
+        setId: set.id,
+        setTitle: set.title,
+        selectedReelId: reel.id,
+        feedQuery,
+      });
+      router.push(`/feed?${feedQuery}`);
     },
-    [router],
+    [onOpenCommunityReelInFeed, router],
   );
 
   const openSelectedSetReelsInFeed = useCallback(() => {
@@ -2039,7 +3044,11 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
   return (
     <div
       ref={panelRootRef}
-      className="flex h-full min-h-0 flex-col overflow-hidden px-3 pb-5 pt-14 text-white sm:px-5 sm:pb-6 md:px-7 md:pb-7 md:pt-20 lg:px-8 lg:py-7"
+      className={`flex h-full min-h-0 flex-col overflow-hidden text-white ${
+        mode === "community"
+          ? "px-3 pb-0 pt-14 sm:px-5 sm:pb-0 md:px-7 md:pb-0 md:pt-20 lg:px-8 lg:pt-7 lg:pb-0"
+          : "px-3 pb-0 pt-14 sm:px-5 sm:pb-0 md:px-7 md:pb-0 md:pt-20 lg:px-8 lg:pt-7 lg:pb-0"
+      }`}
     >
       {mode === "community" ? (
         <div className="relative min-h-0 flex-1 overflow-hidden">
@@ -2072,9 +3081,9 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
             </div>
 
             <div className="mt-3 min-h-0 flex-1 overflow-hidden md:mt-4">
-              <div ref={communityScrollRef} className="balanced-scroll-gutter h-full min-h-0 space-y-4 overflow-y-auto md:space-y-5">
+              <div ref={communityScrollRef} className="balanced-scroll-gutter h-full min-h-0 space-y-4 overflow-y-auto pb-6 md:space-y-5 md:pb-8 lg:pb-10">
             {!isSearchActive && featuredCarouselSets.length > 0 ? (
-              <section className="group/featured relative overflow-hidden rounded-[1.5rem] border border-[#2b2b2b] bg-transparent p-4 pb-12 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] backdrop-blur-[4px] max-[380px]:pb-10 sm:rounded-[2rem] sm:p-5 sm:pb-14 md:p-7 md:pb-16 lg:p-8">
+              <section className="group/featured relative overflow-hidden rounded-[1.5rem] border border-[#2b2b2b] bg-transparent p-4 pb-12 backdrop-blur-[4px] max-[380px]:pb-10 sm:rounded-[2rem] sm:p-5 sm:pb-14 md:p-7 md:pb-16 lg:p-8">
                 <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
 
                 {featuredCarouselSets.length > 1 ? (
@@ -2196,7 +3205,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
             </section>
             ) : null}
 
-            <section className="relative overflow-hidden rounded-2xl bg-transparent px-3 py-3 backdrop-blur-[3px] sm:px-4 sm:py-3.5">
+            <section className="relative overflow-hidden rounded-2xl bg-transparent px-3 pt-3 pb-3 backdrop-blur-[3px] sm:px-4 sm:pt-3.5 sm:pb-4">
               <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
               <div className="relative z-10">
               <div className="mb-2 flex items-center justify-between">
@@ -2262,7 +3271,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
             {selectedDirectorySet ? (
               <div
                 ref={detailContentScrollRef}
-                className="balanced-scroll-gutter min-h-0 flex-1 overflow-y-auto pb-2"
+                className="balanced-scroll-gutter min-h-0 flex-1 overflow-y-auto pb-6 md:pb-8 lg:pb-10"
                 style={{ paddingTop: detailContentTopPadding }}
               >
                 <div className="px-1 sm:px-2 md:px-3">
@@ -2352,91 +3361,172 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
               <div className="flex flex-col gap-3 md:-mx-2 md:flex-row md:items-center md:justify-between md:gap-4 lg:-mx-3">
                 <div className="w-full pl-5 sm:pl-6 md:w-auto md:pl-6 lg:pl-2">
                   <div className="flex items-center justify-center gap-2 md:justify-start">
-                    <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">{isEditMode ? "Edit Sets" : "Create Set"}</h2>
+                    {isYourSetsMode && shouldShowEditSetForm ? (
+                      <button
+                        type="button"
+                        onClick={onBackToEditSetGrid}
+                        aria-label="Back to all sets"
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-[#2b2b2b] text-white/80 transition hover:bg-white/10 hover:text-white"
+                      >
+                        <i className="fa-solid fa-chevron-left text-[11px]" aria-hidden="true" />
+                      </button>
+                    ) : null}
+                    <h2 className="text-xl font-semibold tracking-tight text-white sm:text-2xl md:text-[1.9rem]">
+                      {isYourSetsMode
+                        ? shouldShowEditSetForm
+                          ? isFormEditMode
+                            ? `Editing "${activeEditableSet?.title ?? "Set"}"`
+                            : "Create Set"
+                          : "Your Sets"
+                        : "Create Set"}
+                    </h2>
                     <span className="rounded-full border border-[#2b2b2b] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
                   </div>
                 </div>
+                {isYourSetsMode && shouldShowEditSetGrid ? (
+                  <div className="flex items-center justify-center pr-5 sm:pr-6 md:justify-end md:pr-6 lg:pr-2">
+                    <button
+                      type="button"
+                      onClick={onOpenCreateSetFromGrid}
+                      className="inline-flex h-10 min-w-[8.25rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-xs font-semibold uppercase tracking-[0.08em] text-white/80 backdrop-blur-md transition hover:bg-white/10 hover:text-white"
+                    >
+                      Create Set
+                    </button>
+                  </div>
+                ) : null}
               </div>
             </div>
 
             <div className="mt-3 min-h-0 flex-1 overflow-hidden md:-mx-4 md:mt-4 lg:-mx-5">
-              <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto">
-                <section className="rounded-3xl p-1 sm:p-2 md:p-3">
-                  <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[4px] sm:p-5">
-                  <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
-                  <div className="relative z-10">
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <div>
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">{isEditMode ? "Edit Current Set" : "Create Set"}</p>
-                        <p className="mt-1 text-sm text-white/64">
-                          {isEditMode ? "Pick one of your sets, update it, then save changes." : "Complete each step to publish your reel set."}
-                        </p>
+              <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto pb-0">
+                {shouldShowEditSetGrid ? (
+                  <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
+                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6">
+                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                      <div className="relative z-10">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Your Created Sets</p>
+                          </div>
+                          <div className="flex items-center">
+                            <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/72">
+                              {editableSets.length} set{editableSets.length === 1 ? "" : "s"}
+                            </span>
+                          </div>
+                        </div>
+                        {orderedEditableSets.length > 0 ? (
+                          <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+                            {orderedEditableSets.map((set) => {
+                              const reelCount = getSetReelCount(set);
+                              const isStarred = starredSetIdSet.has(set.id);
+                              const isDeleting = deletingSetId === set.id;
+                              const isActionsMenuOpen = activeSetActionsMenuId === set.id;
+                              return (
+                                <div
+                                  key={`edit-set-grid-${set.id}`}
+                                  className="group relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-black/35 text-left transition hover:border-white/35 hover:bg-black/55"
+                                >
+                                  <div
+                                    data-your-set-actions="true"
+                                    className={`absolute right-2 top-2 z-20 transition-opacity ${
+                                      isActionsMenuOpen
+                                        ? "opacity-100 pointer-events-auto"
+                                        : "opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto"
+                                    }`}
+                                  >
+                                    <button
+                                      type="button"
+                                      onClick={(event) => {
+                                        event.preventDefault();
+                                        event.stopPropagation();
+                                        setActiveSetActionsMenuId((prev) => (prev === set.id ? null : set.id));
+                                      }}
+                                      aria-label={`Actions for ${set.title}`}
+                                      className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#2b2b2b] bg-black text-white/80 transition hover:bg-black hover:text-white"
+                                    >
+                                      <i className="fa-solid fa-ellipsis text-xs" aria-hidden="true" />
+                                    </button>
+                                    {isActionsMenuOpen ? (
+                                      <div className="absolute right-0 top-full mt-1 w-36">
+                                        <div className="relative rounded-xl border border-[#2b2b2b] bg-black p-1">
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              onOpenEditableSet(set.id);
+                                              setActiveSetActionsMenuId(null);
+                                            }}
+                                            className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-white/90 transition hover:bg-white/10"
+                                          >
+                                            <i className="fa-solid fa-pen-to-square text-[11px] text-white/80" aria-hidden="true" />
+                                            Edit
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => onToggleSetStar(set.id)}
+                                            className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-white/90 transition hover:bg-white/10"
+                                          >
+                                            <i className={`fa-${isStarred ? "solid" : "regular"} fa-star text-[11px] text-white/80`} aria-hidden="true" />
+                                            {isStarred ? "Unstar" : "Star"}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              onRequestDeleteEditableSet(set.id);
+                                            }}
+                                            disabled={isDeleting}
+                                            className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-white/90 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
+                                          >
+                                            <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
+                                            {isDeleting ? "Deleting..." : "Delete"}
+                                          </button>
+                                        </div>
+                                      </div>
+                                    ) : null}
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => onOpenEditableSet(set.id)}
+                                    className="w-full text-left"
+                                  >
+                                    <div className="h-32 w-full overflow-hidden bg-black/45">
+                                      {set.thumbnailUrl ? (
+                                        <img src={set.thumbnailUrl} alt="" aria-hidden="true" className="h-full w-full object-cover transition duration-300 group-hover:scale-[1.03]" />
+                                      ) : (
+                                        <div className="grid h-full w-full place-items-center text-white/68">
+                                          <i className={`${getSetIconClass(set)} text-base`} aria-hidden="true" />
+                                        </div>
+                                      )}
+                                    </div>
+                                    <div className="space-y-2 px-3 py-3">
+                                      <div className="flex items-center gap-1.5">
+                                        {isStarred ? <i className="fa-solid fa-star shrink-0 text-[11px] text-white" aria-hidden="true" /> : null}
+                                        <p className="truncate text-sm font-semibold text-white">{set.title}</p>
+                                      </div>
+                                      <p className="line-clamp-2 text-xs leading-relaxed text-white/62">{set.description}</p>
+                                      <div className="flex items-center justify-between text-[10px] font-semibold uppercase tracking-[0.08em] text-white/58">
+                                        <span>{reelCount} reels</span>
+                                        <span>{formatLastEditedLabel(set, relativeTimeNowMs)}</span>
+                                      </div>
+                                    </div>
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ) : (
+                          <p className="mt-4 rounded-xl border border-[#2b2b2b] bg-black/35 px-3 py-4 text-sm text-white/66">
+                            No sets yet. Use Create Set to publish your first one.
+                          </p>
+                        )}
                       </div>
-                      <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/72">
-                        {completionPercent}% complete
-                      </span>
                     </div>
-                    <div className="mt-4 h-1.5 w-full overflow-hidden rounded-full bg-white/10">
-                      <div className="h-full rounded-full bg-white transition-[width] duration-300" style={{ width: `${completionPercent}%` }} />
-                    </div>
-                    <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                      <span className={`rounded-lg border border-[#2b2b2b] px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] ${normalizedSetTitle ? "bg-[#74dfb4]/12 text-[#d4ffe9]" : "bg-black/35 text-white/62"}`}>
-                        1. name your set
-                      </span>
-                      <span className={`rounded-lg border border-[#2b2b2b] px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] ${normalizedSetDescription.length >= MIN_SET_DESCRIPTION_LENGTH ? "bg-[#74dfb4]/12 text-[#d4ffe9]" : "bg-black/35 text-white/62"}`}>
-                        2. add description
-                      </span>
-                      <span className={`rounded-lg border border-[#2b2b2b] px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] ${thumbnailPreview ? "bg-[#74dfb4]/12 text-[#d4ffe9]" : "bg-black/35 text-white/62"}`}>
-                        3. upload thumbnail
-                      </span>
-                      <span className={`rounded-lg border border-[#2b2b2b] px-2.5 py-2 text-[10px] font-semibold uppercase tracking-[0.08em] ${validDraftReelCount > 0 && invalidDraftReelCount === 0 ? "bg-[#74dfb4]/12 text-[#d4ffe9]" : "bg-black/35 text-white/62"}`}>
-                        4. add valid reels
-                      </span>
-                    </div>
-                  </div>
-                </div>
-
-                {isEditMode ? (
-                  <div className="mt-4 rounded-2xl border border-[#2b2b2b] bg-black/30 p-4">
-                    <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-white/62">Select Your Set</p>
-                    {editableSets.length > 0 ? (
-                      <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:items-center">
-                        <select
-                          value={activeEditSetId ?? ""}
-                          onChange={(event) => onEditSetSelectionChange(event.target.value)}
-                          className="h-10 w-full rounded-xl border border-[#2b2b2b] bg-black/55 px-3 text-sm text-white outline-none"
-                        >
-                          {editableSets.map((set) => (
-                            <option key={`edit-set-option-${set.id}`} value={set.id}>
-                              {set.title}
-                            </option>
-                          ))}
-                        </select>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (!activeEditableSet) {
-                              return;
-                            }
-                            loadedEditSetIdRef.current = null;
-                            applySetToForm(activeEditableSet);
-                          }}
-                          className="inline-flex h-10 items-center justify-center rounded-xl border border-[#2b2b2b] px-3 text-xs font-semibold uppercase tracking-[0.08em] text-white/75 transition hover:bg-white/10 hover:text-white"
-                        >
-                          Reset to Saved
-                        </button>
-                      </div>
-                    ) : (
-                      <p className="mt-2 text-sm text-white/66">
-                        No editable sets yet. Create a set first, then come back to edit it.
-                      </p>
-                    )}
-                  </div>
+                  </section>
                 ) : null}
-
-                <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)] lg:items-start">
+                {shouldShowEditSetForm ? (
+                <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
+                <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)] lg:items-start">
                   <form onSubmit={onCreateSet} className="space-y-4 md:space-y-5">
-                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[4px] sm:p-5">
+                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6">
                       <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
                       <div className="relative z-10 space-y-5">
                       <label className="block">
@@ -2456,7 +3546,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                       <label className="block">
                         <span className="mb-2 flex items-center justify-between gap-2 text-xs text-white/72">
                           <span>Description</span>
-                          <span className={`text-[10px] ${normalizedSetDescription.length >= MIN_SET_DESCRIPTION_LENGTH ? "text-[#9ef8cb]" : "text-white/45"}`}>
+                          <span className={`text-[10px] ${descriptionHasTooFewChars ? "text-[#ff8f8f]" : "text-[#9ef8cb]"}`}>
                             {normalizedSetDescription.length} / {MIN_SET_DESCRIPTION_LENGTH} min
                           </span>
                         </span>
@@ -2464,14 +3554,12 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                           value={setDescription}
                           onChange={(event) => setSetDescription(event.target.value)}
                           placeholder="What does this set cover and who is it for?"
-                          className="h-24 w-full resize-none rounded-xl border border-[#2b2b2b] bg-black/55 px-3 py-2 text-sm text-white outline-none placeholder:text-white/40 transition-colors focus:border-[#2b2b2b] md:h-24"
+                          className={`h-24 w-full resize-none rounded-xl border bg-black/55 px-3 py-2 text-sm text-white outline-none placeholder:text-white/40 transition-colors md:h-24 ${
+                            descriptionHasTooFewChars ? "border-[#ff8f8f]/70 focus:border-[#ff8f8f]" : "border-[#2b2b2b] focus:border-[#2b2b2b]"
+                          }`}
                         />
-                        {normalizedSetDescription.length === 0 ? (
-                          <p className="mt-1.5 text-[11px] text-zinc-400">
-                            Description must be at least {MIN_SET_DESCRIPTION_LENGTH} characters.
-                          </p>
-                        ) : descriptionHasTooFewChars ? (
-                          <p className="mt-1.5 text-[11px] text-zinc-400">
+                        {descriptionHasTooFewChars ? (
+                          <p className="mt-1.5 text-[11px] text-[#ff8f8f]">
                             Description must be at least {MIN_SET_DESCRIPTION_LENGTH} characters. Add {descriptionCharsRemaining} more
                             {descriptionCharsRemaining === 1 ? " character." : " characters."}
                           </p>
@@ -2479,20 +3567,42 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                       </label>
 
                       <label className="block">
-                        <span className="mb-2 block text-xs text-white/72">Tags</span>
+                        <span className="mb-2 flex items-center justify-between gap-2 text-xs text-white/72">
+                          <span>Tags</span>
+                          <span className={`text-[10px] ${tagLimitError ? "text-[#ff8f8f]" : "text-white/45"}`}>
+                            {parsedSetTags.length}/{MAX_SET_TAGS}
+                          </span>
+                        </span>
                         <input
                           value={setTags}
-                          onChange={(event) => setSetTags(event.target.value)}
-                          placeholder="chemistry, reaction mechanisms, exam prep"
-                          className="h-11 w-full rounded-xl border border-[#2b2b2b] bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/40 transition-colors focus:border-[#2b2b2b]"
+                          onChange={onSetTagsChange}
+                          placeholder={hasMaxTags ? "Max tags reached. Edit or remove one to add another." : "chemistry, reaction mechanisms, exam prep"}
+                          className={`h-11 w-full rounded-xl border bg-black/55 px-3 text-sm text-white outline-none placeholder:text-white/40 transition-colors ${
+                            tagLimitError
+                              ? "border-[#ff8f8f]/70 focus:border-[#ff8f8f]"
+                              : "border-[#2b2b2b] focus:border-[#2b2b2b]"
+                          }`}
                         />
-                        <p className="mt-1.5 text-[11px] text-zinc-400">Add commas to add new tags.</p>
+                        <p className={`mt-1.5 text-[11px] ${tagLimitError ? "text-[#ff8f8f]" : "text-zinc-400"}`}>
+                          {tagLimitError
+                            ? `You can add up to ${MAX_SET_TAGS} tags. Remove one to add another.`
+                            : hasMaxTags
+                              ? `Max tags reached (${MAX_SET_TAGS}). Edit existing tags or remove one to add another.`
+                              : "Add commas to add new tags."}
+                        </p>
                         {parsedSetTags.length > 0 ? (
                           <div className="mt-2 flex flex-wrap gap-1.5">
                             {parsedSetTags.map((tag) => (
-                              <span key={`create-tag-${tag}`} className="rounded-full border border-[#2b2b2b] bg-white/6 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/75">
-                                #{tag}
-                              </span>
+                              <button
+                                key={`create-tag-${tag}`}
+                                type="button"
+                                onClick={() => onRemoveSetTag(tag)}
+                                className="inline-flex items-center gap-1 rounded-full border border-[#2b2b2b] bg-white/6 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/75 transition hover:bg-white/10 hover:text-white"
+                                aria-label={`Remove tag ${tag}`}
+                              >
+                                <span>#{tag}</span>
+                                <i className="fa-solid fa-xmark text-[8px]" aria-hidden="true" />
+                              </button>
                             ))}
                           </div>
                         ) : null}
@@ -2551,7 +3661,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                     </div>
                     </div>
 
-                    <div className="relative min-h-0 overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-3.5 backdrop-blur-[4px] sm:p-4">
+                    <div className="relative min-h-0 overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-3.5 pb-4 backdrop-blur-[4px] sm:p-4 sm:pb-5">
                       <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
                       <div className="relative z-10">
                       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -2584,7 +3694,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                                   sliderMaxSec,
                                   Math.max(
                                     sliderStartSec + CLIP_SLIDER_MIN_GAP_SEC,
-                                    row.clipEndSec ?? Math.min(sliderMaxSec, CLIP_SLIDER_DEFAULT_MAX_SEC),
+                                    row.clipEndSec ?? sliderMaxSec,
                                   ),
                                 );
                           const sliderStartPercent = sliderMaxSec === null ? 0 : (sliderStartSec / sliderMaxSec) * 100;
@@ -2668,7 +3778,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                                 <p className="mt-2 text-[11px] text-[#ffb4b4]">Invalid URL. Supported: {SUPPORTED_PLATFORMS_LABEL}.</p>
                               ) : null}
                               {hasInput && hasValidEmbed && !hasValidRange ? (
-                                <p className="mt-2 text-[11px] text-[#ffb4b4]">Invalid clip range. End must be greater than start.</p>
+                                <p className="mt-2 text-[11px] text-[#ffb4b4]">Invalid clip range. If set, end must be greater than start.</p>
                               ) : null}
 
                               {row.parsed ? (
@@ -2678,7 +3788,9 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                                     {PLATFORM_LABEL[row.parsed.platform]} embed
                                     {hasValidRange ? (
                                       <span className="ml-1 text-white/55">
-                                        ({row.clipStartSec?.toFixed(1).replace(/\.0$/, "")}s - {row.clipEndSec?.toFixed(1).replace(/\.0$/, "")}s)
+                                        {row.clipEndSec !== null
+                                          ? `(${row.clipStartSec?.toFixed(1).replace(/\.0$/, "")}s - ${row.clipEndSec?.toFixed(1).replace(/\.0$/, "")}s)`
+                                          : `(${row.clipStartSec?.toFixed(1).replace(/\.0$/, "")}s - full video)`}
                                       </span>
                                     ) : null}
                                   </div>
@@ -2707,32 +3819,52 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                     </div>
                     </div>
 
-                    {createError ? <p className="text-xs text-[#ffb4b4]">{createError}</p> : null}
-                    {createSuccess ? <p className="text-xs text-[#9ef8cb]">{createSuccess}</p> : null}
-
-                    <div className="grid gap-2 sm:grid-cols-2">
-                      <button
-                        type="button"
-                        onClick={onSaveDraftProgress}
-                        className="inline-flex h-11 w-full items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
-                      >
-                        Save Progress
-                      </button>
-                      <button
-                        type="submit"
-                        disabled={!canPostSet}
-                        className={`inline-flex h-11 w-full items-center justify-center rounded-xl border px-4 text-sm font-semibold transition ${
-                          canPostSet
-                            ? "border-[#2b2b2b] bg-black/55 text-white hover:bg-white hover:text-black"
-                            : "cursor-not-allowed border-[#2b2b2b] bg-black/35 text-white/45"
-                        }`}
-                      >
-                        {isPostingSet ? (isEditMode ? "Saving..." : "Posting...") : isEditMode ? "Save Set Changes" : "Post Community Set"}
-                      </button>
-                    </div>
+                    {isFormEditMode ? (
+                      <div className="grid gap-2">
+                        <button
+                          type="submit"
+                          disabled={!canPostSet}
+                          className={`inline-flex h-11 w-full items-center justify-center rounded-xl border px-4 text-sm font-semibold transition ${
+                            canPostSet
+                              ? "border-[#2b2b2b] bg-black/55 text-white hover:bg-white hover:text-black"
+                              : "cursor-not-allowed border-[#2b2b2b] bg-black/35 text-white/45"
+                          }`}
+                        >
+                          {isPostingSet ? "Saving..." : "Save Set Changes"}
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="grid gap-2 sm:grid-cols-3">
+                        <button
+                          type="button"
+                          onClick={onClearCreateProgress}
+                          className="inline-flex h-11 w-full items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
+                        >
+                          Clear Progress
+                        </button>
+                        <button
+                          type="button"
+                          onClick={onSaveDraftProgress}
+                          className="inline-flex h-11 w-full items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
+                        >
+                          Save Progress
+                        </button>
+                        <button
+                          type="submit"
+                          disabled={!canPostSet}
+                          className={`inline-flex h-11 w-full items-center justify-center rounded-xl border px-4 text-sm font-semibold transition ${
+                            canPostSet
+                              ? "border-[#2b2b2b] bg-black/55 text-white hover:bg-white hover:text-black"
+                              : "cursor-not-allowed border-[#2b2b2b] bg-black/35 text-white/45"
+                          }`}
+                        >
+                          {isPostingSet ? "Posting..." : "Post Community Set"}
+                        </button>
+                      </div>
+                    )}
                   </form>
 
-                  <aside className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 backdrop-blur-[4px] sm:p-5 lg:sticky lg:top-3">
+                  <aside className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6 lg:sticky lg:top-3">
                     <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
                     <div className="relative z-10">
                       <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/62">Live Preview</p>
@@ -2764,7 +3896,55 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                           ))
                           : null}
                       </div>
-                      <div className="mt-4 grid grid-cols-2 gap-2">
+                      <div className="mt-3 rounded-xl border border-[#2b2b2b] bg-black/35 px-3 py-3">
+                        <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-4">
+                          <div className="flex flex-col items-center">
+                            <div className="relative h-[86px] w-[86px]">
+                              <svg viewBox="0 0 88 88" className="h-full w-full -rotate-90" aria-hidden="true">
+                                <circle cx="44" cy="44" r={progressRadius} stroke="rgba(255,255,255,0.14)" strokeWidth="7" fill="none" />
+                                <circle
+                                  cx="44"
+                                  cy="44"
+                                  r={progressRadius}
+                                  stroke="#ffffff"
+                                  strokeWidth="7"
+                                  strokeLinecap="round"
+                                  fill="none"
+                                  strokeDasharray={progressCircumference}
+                                  strokeDashoffset={progressOffset}
+                                  style={{
+                                    transition: "stroke-dashoffset 420ms cubic-bezier(0.22, 1, 0.36, 1)",
+                                  }}
+                                />
+                              </svg>
+                              <div className="absolute inset-0 flex flex-col items-center justify-center">
+                                <span className="text-base font-semibold leading-none text-white">{progressPercent}%</span>
+                              </div>
+                            </div>
+                            <p className="mt-2 text-center text-[10px] font-semibold uppercase tracking-[0.08em] text-white/62">
+                              {requiredCompletionCount}/4 done
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/58">
+                              {isFormEditMode ? "Still needed to save" : "Still needed to post"}
+                            </p>
+                            {remainingPreviewRequirements.length > 0 ? (
+                              <ul className="mt-2 space-y-1.5">
+                                {remainingPreviewRequirements.map((item) => (
+                                  <li key={`remaining-requirement-${item}`} className="flex items-start gap-2 text-xs text-white/80">
+                                    <i className="fa-regular fa-circle text-[8px] text-white/55 mt-[4px]" aria-hidden="true" />
+                                    <span>{item}</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p className="mt-2 text-xs text-[#9ef8cb]">All required items completed.</p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-3 grid grid-cols-2 gap-2">
                         <div className="rounded-lg border border-[#2b2b2b] bg-black/35 px-2.5 py-2">
                           <p className="text-[10px] uppercase tracking-[0.08em] text-white/52">Reels</p>
                           <p className="mt-1 text-sm font-semibold text-white">{validDraftReelCount}</p>
@@ -2772,7 +3952,7 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                         <div className="rounded-lg border border-[#2b2b2b] bg-black/35 px-2.5 py-2">
                           <p className="text-[10px] uppercase tracking-[0.08em] text-white/52">Status</p>
                           <p className={`mt-1 text-sm font-semibold ${canPostSet ? "text-[#9ef8cb]" : "text-white/76"}`}>
-                            {canPostSet ? "Ready to post" : "Draft"}
+                            {canPostSet ? (isFormEditMode ? "Ready to save" : "Ready to post") : "Draft"}
                           </p>
                         </div>
                       </div>
@@ -2780,12 +3960,237 @@ export function CommunityReelsPanel({ mode = "community", isVisible = true, onDe
                   </aside>
                 </div>
               </section>
+                ) : null}
             </div>
           </div>
           </div>
       </>
     )}
       {detailBannerPortal}
+      {draftActionConfirmModal ? (
+        <div
+          className="fixed inset-0 z-[128] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+          role="presentation"
+          onClick={closeDraftActionConfirmModal}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Draft action confirmation"
+            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">{draftActionConfirmModal.label}</p>
+                <h3 className="mt-2 text-lg font-semibold text-white">{draftActionConfirmModal.title}</h3>
+              </div>
+              <button
+                type="button"
+                onClick={closeDraftActionConfirmModal}
+                aria-label="Close"
+                disabled={isPostingSet}
+                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+              {draftActionConfirmModal.message}
+            </p>
+            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeDraftActionConfirmModal}
+                disabled={isPostingSet}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-55"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmDraftAction}
+                disabled={isPostingSet}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {isPostingSet && draftActionConfirmModal.action === "save-set-changes"
+                  ? "Saving..."
+                  : draftActionConfirmModal.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {unsavedDraftExitModal ? (
+        <div
+          className="fixed inset-0 z-[127] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+          role="presentation"
+          onClick={closeUnsavedDraftExitModal}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Unsaved set draft changes"
+            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
+                <h3 className="mt-2 text-lg font-semibold text-white">Save set changes before leaving?</h3>
+              </div>
+              <button
+                type="button"
+                onClick={closeUnsavedDraftExitModal}
+                aria-label="Close"
+                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+              {isFormEditMode
+                ? "Save to update this set, or discard these edits and continue."
+                : "Save to keep your draft progress, or discard these edits and continue."}
+            </p>
+            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={confirmUnsavedDraftExitDiscard}
+                disabled={isPostingSet}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Discard
+              </button>
+              <button
+                type="button"
+                onClick={confirmUnsavedDraftExitSave}
+                disabled={isPostingSet}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {isPostingSet ? "Saving..." : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {deleteSetConfirmModal ? (
+        <div
+          className="fixed inset-0 z-[126] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+          role="presentation"
+          onClick={closeDeleteSetConfirmModal}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Delete set confirmation"
+            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Delete Set</p>
+                <h3 className="mt-2 text-lg font-semibold text-white">Delete "{deleteSetConfirmModal.title}"?</h3>
+              </div>
+              <button
+                type="button"
+                onClick={closeDeleteSetConfirmModal}
+                aria-label="Close"
+                disabled={Boolean(deletingSetId)}
+                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+              This action cannot be undone.
+            </p>
+            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={closeDeleteSetConfirmModal}
+                disabled={Boolean(deletingSetId)}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-55"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  void onDeleteEditableSet(deleteSetConfirmModal.setId);
+                }}
+                disabled={Boolean(deletingSetId)}
+                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
+              >
+                {deletingSetId === deleteSetConfirmModal.setId ? "Deleting..." : "Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+      {publishResultModal ? (
+        <div
+          className="fixed inset-0 z-[125] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px]"
+          role="presentation"
+          onClick={() => setPublishResultModal(null)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Publish result"
+            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl md:p-6"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">{publishResultModal.label ?? "Post Set"}</p>
+                <h3 className="mt-2 text-lg font-semibold text-white">{publishResultModal.title}</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setPublishResultModal(null)}
+                aria-label="Close publish result"
+                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+              >
+                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                </svg>
+              </button>
+            </div>
+            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+              {publishResultModal.message}
+            </p>
+            {publishResultModal.status === "success" && publishResultModal.thumbnailUrl ? (
+              <div className="mt-4 overflow-hidden rounded-2xl border border-white/15 bg-black/45">
+                <img
+                  src={publishResultModal.thumbnailUrl}
+                  alt={publishResultModal.thumbnailAlt || "Published set thumbnail"}
+                  className="h-52 w-full object-cover"
+                />
+              </div>
+            ) : null}
+            <div className="mt-4 flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => setPublishResultModal(null)}
+                className={`inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl px-5 py-2.5 text-sm font-semibold transition-colors ${
+                  publishResultModal.status === "success"
+                    ? "bg-white text-black hover:bg-white/90"
+                    : "bg-black/35 text-white hover:bg-white/10"
+                }`}
+              >
+                OK
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -307,6 +307,9 @@ def init_db() -> None:
             with conn.cursor() as cur:
                 for statement in _postgres_schema_statements():
                     cur.execute(statement)
+                # Lightweight schema migration for older community_sets tables.
+                cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS updated_at TEXT")
+                cur.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR BTRIM(updated_at) = ''")
             conn.commit()
         _db_ready = True
         return
@@ -316,6 +319,14 @@ def init_db() -> None:
         # Lightweight schema migration for existing local databases.
         try:
             conn.execute("ALTER TABLE videos ADD COLUMN view_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_sets ADD COLUMN updated_at TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR TRIM(updated_at) = ''")
         except sqlite3.OperationalError:
             pass
         conn.commit()

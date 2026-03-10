@@ -184,6 +184,8 @@ class CommunitySetOut(BaseModel):
     likes: int
     learners: int
     updated_label: str
+    updated_at: str | None = None
+    created_at: str | None = None
     thumbnail_url: str
     featured: bool
 

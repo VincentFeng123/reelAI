@@ -821,7 +821,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   }, [hasUnsavedChanges, onUnsavedChangesChange, settingsHydrated]);
 
   return (
-    <div className="flex h-full min-h-0 w-full justify-center overflow-y-auto px-6 pt-20 pb-8 md:px-10 md:pt-8 md:pb-10 lg:px-10">
+    <div className="flex h-full min-h-0 w-full justify-center overflow-y-auto px-6 pt-20 pb-6 md:px-10 md:pt-8 md:pb-10 lg:px-10">
       <div className="w-full max-w-[980px]">
         <header className="mb-6 md:mb-8">
           <h1 className="text-3xl font-semibold tracking-tight text-white md:text-4xl">Settings</h1>
@@ -1295,7 +1295,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
             role="dialog"
             aria-modal="true"
             aria-label="Configuration success rate"
-            className={`w-full max-w-xl rounded-3xl border border-white/25 bg-white/[0.12] p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out md:p-6 ${
+            className={`w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out md:p-6 ${
               isAvailabilityModalVisible ? "opacity-100" : "opacity-0"
             }`}
             onClick={(event) => event.stopPropagation()}

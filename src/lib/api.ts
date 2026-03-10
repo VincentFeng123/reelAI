@@ -272,9 +272,105 @@ type CommunitySetApi = {
   likes: number;
   learners: number;
   updated_label: string;
+  updated_at?: string | null;
+  created_at?: string | null;
   thumbnail_url: string;
   featured: boolean;
 };
+
+function parseApiTimestampMs(value: unknown): number | null {
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^\d+$/.test(trimmed)) {
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric >= 1_000_000_000_000 ? numeric : numeric * 1000;
+    }
+  }
+  const directParsed = Date.parse(trimmed);
+  if (Number.isFinite(directParsed)) {
+    return directParsed;
+  }
+  const normalized = trimmed.replace(" ", "T");
+  let candidate = normalized;
+  if (/[+-]\d{4}$/.test(candidate)) {
+    candidate = `${candidate.slice(0, -5)}${candidate.slice(-5, -2)}:${candidate.slice(-2)}`;
+  } else if (/[+-]\d{2}$/.test(candidate)) {
+    candidate = `${candidate}:00`;
+  } else if (!/(?:z|[+-]\d{2}:\d{2})$/i.test(candidate) && /\d{2}:\d{2}:\d{2}/.test(candidate)) {
+    candidate = `${candidate}Z`;
+  }
+  const normalizedParsed = Date.parse(candidate);
+  return Number.isFinite(normalizedParsed) ? normalizedParsed : null;
+}
+
+function isRelativeNowUpdatedLabel(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const raw = value
+    .trim()
+    .replace(/^last\s+edited\s*:\s*/i, "")
+    .replace(/^updated\s*[:\-]?\s*/i, "")
+    .trim()
+    .toLowerCase();
+  return raw === "today" || raw === "just now" || raw === "less than 1 minute ago";
+}
+
+function inferUpdatedAtIsoFromLabel(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const raw = value
+    .trim()
+    .replace(/^last\s+edited\s*:\s*/i, "")
+    .replace(/^updated\s*[:\-]?\s*/i, "")
+    .trim()
+    .toLowerCase();
+  if (!raw) {
+    return null;
+  }
+  const nowMs = Date.now();
+  if (raw === "today" || raw === "just now" || raw === "less than 1 minute ago") {
+    return null;
+  }
+  if (raw === "yesterday") {
+    return new Date(nowMs - 24 * 60 * 60 * 1000).toISOString();
+  }
+  const match = raw.match(/^(\d+|an?|one)\s+(second|minute|hour|day|week|month|year)s?(?:\s+ago)?$/i);
+  if (!match) {
+    return null;
+  }
+  const amountToken = match[1].toLowerCase();
+  const amount = amountToken === "a" || amountToken === "an" || amountToken === "one" ? 1 : Number(amountToken);
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return null;
+  }
+  const unit = match[2].toLowerCase();
+  const unitMs =
+    unit === "second"
+      ? 1000
+      : unit === "minute"
+        ? 60 * 1000
+        : unit === "hour"
+          ? 60 * 60 * 1000
+          : unit === "day"
+            ? 24 * 60 * 60 * 1000
+            : unit === "week"
+              ? 7 * 24 * 60 * 60 * 1000
+              : unit === "month"
+                ? 30 * 24 * 60 * 60 * 1000
+                : 365 * 24 * 60 * 60 * 1000;
+  return new Date(nowMs - amount * unitMs).toISOString();
+}
 
 function normalizeCommunitySet(raw: unknown): CommunitySet | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
@@ -322,6 +418,16 @@ function normalizeCommunitySet(raw: unknown): CommunitySet | null {
   const tags = Array.isArray(row.tags)
     ? row.tags.map((tag) => String(tag || "").trim().toLowerCase()).filter(Boolean).slice(0, 6)
     : [];
+  const createdAtRaw = typeof row.created_at === "string" ? row.created_at.trim() : row.created_at;
+  const createdAtMs = parseApiTimestampMs(createdAtRaw);
+  const createdAt = createdAtMs != null ? new Date(createdAtMs).toISOString() : null;
+  const updatedAtRaw = typeof row.updated_at === "string" ? row.updated_at.trim() : row.updated_at;
+  const updatedAtMs = parseApiTimestampMs(updatedAtRaw);
+  const updatedAt = updatedAtMs != null
+    ? new Date(updatedAtMs).toISOString()
+    : createdAt ?? inferUpdatedAtIsoFromLabel(row.updated_label);
+  const rawUpdatedLabel = typeof row.updated_label === "string" && row.updated_label.trim() ? row.updated_label.trim() : "Last Edited: unknown";
+  const safeUpdatedLabel = updatedAt == null && isRelativeNowUpdatedLabel(rawUpdatedLabel) ? "Last Edited: unknown" : rawUpdatedLabel;
 
   return {
     id: typeof row.id === "string" && row.id.trim() ? row.id.trim() : `community-set-${Math.random().toString(36).slice(2, 10)}`,
@@ -333,7 +439,9 @@ function normalizeCommunitySet(raw: unknown): CommunitySet | null {
     curator: typeof row.curator === "string" && row.curator.trim() ? row.curator.trim() : "Community member",
     likes: Math.max(0, Math.floor(Number(row.likes) || 0)),
     learners: Math.max(0, Math.floor(Number(row.learners) || 0)),
-    updatedLabel: typeof row.updated_label === "string" && row.updated_label.trim() ? row.updated_label.trim() : "Updated just now",
+    updatedLabel: safeUpdatedLabel,
+    updatedAt,
+    createdAt,
     thumbnailUrl: typeof row.thumbnail_url === "string" && row.thumbnail_url.trim() ? row.thumbnail_url.trim() : "/images/community/ai-systems.svg",
     featured: Boolean(row.featured),
   };
@@ -436,6 +544,30 @@ export async function updateCommunitySet(params: {
     throw new Error("Backend returned an invalid community set payload.");
   }
   return updated;
+}
+
+export async function deleteCommunitySet(params: { setId: string }): Promise<void> {
+  const setId = params.setId.trim();
+  if (!setId) {
+    throw new Error("setId is required.");
+  }
+  const encodedSetId = encodeURIComponent(setId);
+  try {
+    await safeFetch(apiUrl(`/community/sets/${encodedSetId}`), {
+      method: "DELETE",
+    });
+    return;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    const isMethodNotAllowed = /method not allowed/i.test(message) || message.includes("(405)");
+    if (!isMethodNotAllowed) {
+      throw error;
+    }
+  }
+
+  await safeFetch(apiUrl(`/community/sets/${encodedSetId}/delete`), {
+    method: "POST",
+  });
 }
 
 export async function fetchCommunityReelDuration(params: {

@@ -4,11 +4,12 @@ import os
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Literal
 from urllib.parse import urlparse, urlunparse
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 
@@ -409,6 +410,24 @@ def _filter_reels_by_video_preferences(
     return filtered
 
 
+def _normalize_datetime_for_api(value: object) -> str | None:
+    if isinstance(value, datetime):
+        normalized_dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return normalized_dt.astimezone(timezone.utc).isoformat()
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace(" ", "T")
+    if re.search(r"[+-]\d{4}$", normalized):
+        normalized = f"{normalized[:-5]}{normalized[-5:-2]}:{normalized[-2:]}"
+    elif re.search(r"[+-]\d{2}$", normalized):
+        normalized = f"{normalized}:00"
+    elif re.search(r"\d{2}:\d{2}:\d{2}", normalized) and not re.search(r"(?:Z|[+-]\d{2}:\d{2})$", normalized, re.IGNORECASE):
+        # Treat timezone-less DB timestamps as UTC.
+        normalized = f"{normalized}Z"
+    return normalized
+
+
 def _serialize_community_set(row: dict) -> CommunitySetOut:
     tags_raw = row.get("tags_json")
     reels_raw = row.get("reels_json")
@@ -461,7 +480,9 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
     reel_count = max(len(reels), _to_int(row.get("reel_count"), len(reels)))
     likes = max(0, _to_int(row.get("likes"), 0))
     learners = max(0, _to_int(row.get("learners"), 1))
-    updated_label = str(row.get("updated_label") or "Updated just now").strip() or "Updated just now"
+    updated_label = str(row.get("updated_label") or "Last Edited: just now").strip() or "Last Edited: just now"
+    created_at = _normalize_datetime_for_api(row.get("created_at"))
+    updated_at = _normalize_datetime_for_api(row.get("updated_at")) or created_at
     curator = str(row.get("curator") or "Community member").strip() or "Community member"
     thumbnail_url = str(row.get("thumbnail_url") or "").strip()
     if not thumbnail_url:
@@ -478,6 +499,8 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
         likes=likes,
         learners=learners,
         updated_label=updated_label,
+        updated_at=updated_at,
+        created_at=created_at,
         thumbnail_url=thumbnail_url,
         featured=bool(_to_int(row.get("featured"), 0)),
     )
@@ -1225,11 +1248,12 @@ def list_community_sets(limit: int = 160):
                 likes,
                 learners,
                 updated_label,
+                updated_at,
                 thumbnail_url,
                 featured,
                 created_at
             FROM community_sets
-            ORDER BY featured DESC, created_at DESC
+            ORDER BY featured DESC, COALESCE(NULLIF(updated_at, ''), created_at) DESC
             LIMIT ?
             """,
             (safe_limit,),
@@ -1286,7 +1310,7 @@ def create_community_set(payload: CommunitySetCreateRequest):
     curator = (payload.curator or "").strip() or "Community member"
     set_id = f"user-set-{uuid.uuid4()}"
     created_at = now_iso()
-    updated_label = "Updated just now"
+    updated_label = "Last Edited: just now"
 
     with get_conn() as conn:
         upsert(
@@ -1323,6 +1347,8 @@ def create_community_set(payload: CommunitySetCreateRequest):
                 likes,
                 learners,
                 updated_label,
+                updated_at,
+                created_at,
                 thumbnail_url,
                 featured
             FROM community_sets
@@ -1390,7 +1416,7 @@ def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
 
     tags = _normalize_community_tags(payload.tags)
     updated_at = now_iso()
-    updated_label = "Updated just now"
+    updated_label = "Last Edited: just now"
 
     with get_conn() as conn:
         existing_rows = fetch_all(
@@ -1453,6 +1479,8 @@ def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
                 likes,
                 learners,
                 updated_label,
+                updated_at,
+                created_at,
                 thumbnail_url,
                 featured
             FROM community_sets
@@ -1466,6 +1494,69 @@ def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
         raise HTTPException(status_code=500, detail="Failed to persist community set changes.")
 
     return _serialize_community_set(updated_rows[0])
+
+
+def _delete_community_set_impl(set_id: str) -> Response:
+    normalized_set_id = set_id.strip()
+    if not normalized_set_id:
+        raise HTTPException(status_code=400, detail="set_id is required.")
+    if not normalized_set_id.startswith("user-set-"):
+        raise HTTPException(status_code=403, detail="Only user-created sets can be deleted.")
+
+    with get_conn() as conn:
+        existing_rows = fetch_all(
+            conn,
+            """
+            SELECT
+                id,
+                featured
+            FROM community_sets
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (normalized_set_id,),
+        )
+        if not existing_rows:
+            raise HTTPException(status_code=404, detail="Community set not found.")
+        existing = existing_rows[0]
+        if _to_int(existing.get("featured"), 0) != 0:
+            raise HTTPException(status_code=403, detail="Featured sets cannot be deleted.")
+
+        deleted_count = 0
+        if conn.__class__.__module__.startswith("psycopg"):
+            with conn.cursor() as cur:  # type: ignore[attr-defined]
+                cur.execute("DELETE FROM community_sets WHERE id = %s", (normalized_set_id,))
+                deleted_count = int(cur.rowcount or 0)
+        else:
+            cursor = conn.execute("DELETE FROM community_sets WHERE id = ?", (normalized_set_id,))  # type: ignore[attr-defined]
+            deleted_count = int(getattr(cursor, "rowcount", 0) or 0)
+
+        if deleted_count <= 0:
+            still_exists = fetch_all(
+                conn,
+                """
+                SELECT id
+                FROM community_sets
+                WHERE id = ?
+                LIMIT 1
+                """,
+                (normalized_set_id,),
+            )
+            if still_exists:
+                raise HTTPException(status_code=404, detail="Community set not found.")
+
+    return Response(status_code=204)
+
+
+@app.delete("/api/community/sets/{set_id}", status_code=204)
+def delete_community_set(set_id: str):
+    return _delete_community_set_impl(set_id)
+
+
+@app.post("/api/community/sets/{set_id}/delete", status_code=204)
+def delete_community_set_via_post(set_id: str):
+    # Fallback for deployments/proxies that block DELETE with 405.
+    return _delete_community_set_impl(set_id)
 
 
 def _register_non_api_route_aliases() -> None:
