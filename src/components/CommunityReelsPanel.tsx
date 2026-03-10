@@ -2650,7 +2650,9 @@ export function CommunityReelsPanel({
     setSelectedDirectorySet(null);
     setSelectedDetailReelId(null);
     setDetailCarouselIndex(0);
-    consumedInitialSetIdRef.current = initialOpenSetId?.trim() || null;
+    // Allow the follow-up initial-open effect to restore the targeted set detail
+    // after returning from the feed back button.
+    consumedInitialSetIdRef.current = null;
   }, [clearDirectoryDetailCloseTimer, communityResetSignal, initialOpenSetId, isVisible, mode]);
 
   const openDirectorySet = useCallback(
