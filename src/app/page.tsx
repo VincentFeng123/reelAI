@@ -20,6 +20,7 @@ const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const ACTIVE_SIDEBAR_TAB_SESSION_KEY = "studyreels-active-sidebar-tab";
+const ACTIVE_COMMUNITY_SET_ID_SESSION_KEY = "studyreels-active-community-set-id";
 const MAX_HISTORY_ITEMS = 120;
 const MOBILE_SIDEBAR_CLOSE_MS = 260;
 const TOP_CHROME_GESTURE_WINDOW_MS = 220;
@@ -188,8 +189,9 @@ function HomePageContent() {
   const [topChromeGestureActive, setTopChromeGestureActive] = useState(false);
   const [searchPanelScrollable, setSearchPanelScrollable] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
-  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>(() => forcedSidebarTab ?? "search");
-  const [sidebarTabHydrated, setSidebarTabHydrated] = useState(() => forcedSidebarTab !== null);
+  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
+  const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
+  const [activeCommunitySetId, setActiveCommunitySetId] = useState<string | null>(null);
   const [hasUnsavedSettingsChanges, setHasUnsavedSettingsChanges] = useState(false);
   const [settingsModalView, setSettingsModalView] = useState<null | "unsaved" | "availability">(null);
   const [settingsAvailabilityModalSnapshot, setSettingsAvailabilityModalSnapshot] = useState<SettingsAvailabilityModalSnapshot | null>(null);
@@ -205,6 +207,7 @@ function HomePageContent() {
   const historyRef = useRef<HistoryItem[]>([]);
   const settingsPanelRef = useRef<SettingsPanelHandle | null>(null);
   const communityDraftExitActionsRef = useRef<CommunityDraftExitActions | null>(null);
+  const hasProcessedInitialSidebarHydrationRef = useRef(false);
   const mobileSidebarCloseTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipShowTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipHideTimerRef = useRef<number | null>(null);
@@ -228,20 +231,34 @@ function HomePageContent() {
       return;
     }
     const savedTab = normalizeSidebarTab(window.sessionStorage.getItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY));
-    if (forcedSidebarTab) {
-      const nextTab =
-        forcedSidebarTab === "search" && savedTab && savedTab !== "search"
-          ? savedTab
-          : forcedSidebarTab;
-      setActiveSidebarTab(nextTab);
-      setSidebarTabHydrated(true);
+    const savedCommunitySetIdRaw = window.sessionStorage.getItem(ACTIVE_COMMUNITY_SET_ID_SESSION_KEY);
+    const savedCommunitySetId = savedCommunitySetIdRaw?.trim() || null;
+    const nextTab = savedTab ?? forcedSidebarTab ?? (forcedCommunitySetId ? "community" : "search");
+    setActiveSidebarTab(nextTab);
+    setActiveCommunitySetId(savedCommunitySetId ?? (!savedTab ? forcedCommunitySetId : null));
+    setSidebarTabHydrated(true);
+  }, [forcedCommunitySetId, forcedSidebarTab]);
+
+  useEffect(() => {
+    if (!sidebarTabHydrated) {
       return;
     }
-    if (savedTab) {
-      setActiveSidebarTab(savedTab);
+    if (!hasProcessedInitialSidebarHydrationRef.current) {
+      hasProcessedInitialSidebarHydrationRef.current = true;
+      return;
     }
-    setSidebarTabHydrated(true);
-  }, [forcedSidebarTab]);
+    if (!forcedSidebarTab && !forcedCommunitySetId) {
+      return;
+    }
+    if (forcedCommunitySetId) {
+      setActiveCommunitySetId(forcedCommunitySetId);
+      setActiveSidebarTab(forcedSidebarTab ?? "community");
+      return;
+    }
+    if (forcedSidebarTab) {
+      setActiveSidebarTab(forcedSidebarTab);
+    }
+  }, [forcedCommunitySetId, forcedSidebarTab, sidebarTabHydrated]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !sidebarTabHydrated) {
@@ -249,6 +266,17 @@ function HomePageContent() {
     }
     window.sessionStorage.setItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY, activeSidebarTab);
   }, [activeSidebarTab, sidebarTabHydrated]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !sidebarTabHydrated) {
+      return;
+    }
+    if (activeCommunitySetId) {
+      window.sessionStorage.setItem(ACTIVE_COMMUNITY_SET_ID_SESSION_KEY, activeCommunitySetId);
+      return;
+    }
+    window.sessionStorage.removeItem(ACTIVE_COMMUNITY_SET_ID_SESSION_KEY);
+  }, [activeCommunitySetId, sidebarTabHydrated]);
 
   const historySorted = useMemo(
     () =>
@@ -1260,11 +1288,12 @@ function HomePageContent() {
               mode={communityPanelMode}
               isVisible={visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit"}
               onDetailOpenChange={setCommunityDetailOpen}
-              initialOpenSetId={forcedCommunitySetId}
+              initialOpenSetId={activeCommunitySetId}
               communityResetSignal={communityResetSignal}
               onOpenCommunityReelInFeed={onCommunityReelFeedOpened}
               onDraftUnsavedChangesChange={setHasUnsavedCommunityDraftChanges}
               onDraftExitActionsChange={onCommunityDraftExitActionsChange}
+              onActiveCommunitySetChange={setActiveCommunitySetId}
             />
           </div>
         </section>

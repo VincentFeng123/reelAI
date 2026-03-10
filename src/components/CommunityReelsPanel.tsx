@@ -940,6 +940,7 @@ type CommunityReelsPanelProps = {
   mode?: CommunityReelsPanelMode;
   isVisible?: boolean;
   onDetailOpenChange?: (isOpen: boolean) => void;
+  onActiveCommunitySetChange?: (setId: string | null) => void;
   initialOpenSetId?: string | null;
   communityResetSignal?: number;
   onDraftUnsavedChangesChange?: (hasUnsavedChanges: boolean) => void;
@@ -953,6 +954,7 @@ export function CommunityReelsPanel({
   mode = "community",
   isVisible = true,
   onDetailOpenChange,
+  onActiveCommunitySetChange,
   initialOpenSetId = null,
   communityResetSignal = 0,
   onDraftUnsavedChangesChange,
@@ -2790,6 +2792,17 @@ export function CommunityReelsPanel({
     }
     onDetailOpenChange(mode === "community" && isVisible && isDirectoryDetailOpen);
   }, [isDirectoryDetailOpen, isVisible, mode, onDetailOpenChange]);
+
+  useEffect(() => {
+    if (!onActiveCommunitySetChange) {
+      return;
+    }
+    const nextSetId =
+      mode === "community" && isVisible && isDirectoryDetailOpen && selectedDirectorySet
+        ? selectedDirectorySet.id
+        : null;
+    onActiveCommunitySetChange(nextSetId);
+  }, [isDirectoryDetailOpen, isVisible, mode, onActiveCommunitySetChange, selectedDirectorySet]);
 
   useEffect(() => {
     if (!selectedDirectorySet) {
