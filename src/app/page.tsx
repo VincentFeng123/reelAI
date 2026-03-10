@@ -188,8 +188,8 @@ function HomePageContent() {
   const [topChromeGestureActive, setTopChromeGestureActive] = useState(false);
   const [searchPanelScrollable, setSearchPanelScrollable] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
-  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
-  const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
+  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>(() => forcedSidebarTab ?? "search");
+  const [sidebarTabHydrated, setSidebarTabHydrated] = useState(() => forcedSidebarTab !== null);
   const [hasUnsavedSettingsChanges, setHasUnsavedSettingsChanges] = useState(false);
   const [settingsModalView, setSettingsModalView] = useState<null | "unsaved" | "availability">(null);
   const [settingsAvailabilityModalSnapshot, setSettingsAvailabilityModalSnapshot] = useState<SettingsAvailabilityModalSnapshot | null>(null);
