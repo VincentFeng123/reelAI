@@ -2798,11 +2798,23 @@ export function CommunityReelsPanel({
       return;
     }
     const nextSetId =
-      mode === "community" && isVisible && isDirectoryDetailOpen && selectedDirectorySet
-        ? selectedDirectorySet.id
+      mode === "community" && isVisible
+        ? isDirectoryDetailOpen && selectedDirectorySet
+          ? selectedDirectorySet.id
+          : isInitialDetailRestorePending && normalizedInitialOpenSetId
+            ? normalizedInitialOpenSetId
+            : null
         : null;
     onActiveCommunitySetChange(nextSetId);
-  }, [isDirectoryDetailOpen, isVisible, mode, onActiveCommunitySetChange, selectedDirectorySet]);
+  }, [
+    isDirectoryDetailOpen,
+    isInitialDetailRestorePending,
+    isVisible,
+    mode,
+    normalizedInitialOpenSetId,
+    onActiveCommunitySetChange,
+    selectedDirectorySet,
+  ]);
 
   useEffect(() => {
     if (!selectedDirectorySet) {
