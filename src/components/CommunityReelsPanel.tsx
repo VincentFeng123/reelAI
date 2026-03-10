@@ -1003,6 +1003,9 @@ export function CommunityReelsPanel({
   const [detailBannerHeight, setDetailBannerHeight] = useState(0);
   const [isDetailBannerCompact, setIsDetailBannerCompact] = useState(false);
   const [skipDetailTransitionOnce, setSkipDetailTransitionOnce] = useState(false);
+  const [isInitialDetailRestorePending, setIsInitialDetailRestorePending] = useState(
+    () => mode === "community" && Boolean(initialOpenSetId?.trim()),
+  );
   const [isThumbnailDragOver, setIsThumbnailDragOver] = useState(false);
   const [thumbnailFileName, setThumbnailFileName] = useState("");
   const panelRootRef = useRef<HTMLDivElement | null>(null);
@@ -1176,6 +1179,9 @@ export function CommunityReelsPanel({
   const isFormCreateMode = isStandaloneCreateMode || (isYourSetsMode && isCreateSetEditorOpen);
   const shouldShowEditSetGrid = isYourSetsMode && !isEditSetEditorOpen && !isCreateSetEditorOpen;
   const shouldShowEditSetForm = isFormEditMode || isFormCreateMode;
+  const normalizedInitialOpenSetId = initialOpenSetId?.trim() || "";
+  const shouldSuppressDirectoryDuringRestore =
+    mode === "community" && isVisible && Boolean(normalizedInitialOpenSetId) && isInitialDetailRestorePending;
   const allSets = useMemo(() => [...userSets, ...DEFAULT_COMMUNITY_SETS], [userSets]);
   const ownedSetIdSet = useMemo(() => new Set(ownedSetIds), [ownedSetIds]);
   const editableSets = useMemo(
@@ -2633,7 +2639,34 @@ export function CommunityReelsPanel({
     setSelectedDetailReelId(null);
     setDetailCarouselIndex(0);
     consumedInitialSetIdRef.current = null;
+    setIsInitialDetailRestorePending(false);
   }, [clearDirectoryDetailCloseTimer, isVisible, mode]);
+
+  useEffect(() => {
+    if (mode === "community" && isVisible && normalizedInitialOpenSetId) {
+      setIsInitialDetailRestorePending(true);
+      return;
+    }
+    setIsInitialDetailRestorePending(false);
+  }, [isVisible, mode, normalizedInitialOpenSetId]);
+
+  useEffect(() => {
+    if (!normalizedInitialOpenSetId || mode !== "community" || !isVisible) {
+      setIsInitialDetailRestorePending(false);
+      return;
+    }
+    if (isDirectoryDetailOpen && selectedDirectorySet?.id === normalizedInitialOpenSetId) {
+      setIsInitialDetailRestorePending(false);
+      return;
+    }
+    if (!storageHydrated) {
+      return;
+    }
+    const targetExists = allSets.some((set) => set.id === normalizedInitialOpenSetId);
+    if (!targetExists) {
+      setIsInitialDetailRestorePending(false);
+    }
+  }, [allSets, isDirectoryDetailOpen, isVisible, mode, normalizedInitialOpenSetId, selectedDirectorySet?.id, storageHydrated]);
 
   useEffect(() => {
     if (lastCommunityResetSignalRef.current === communityResetSignal) {
@@ -2695,6 +2728,7 @@ export function CommunityReelsPanel({
     setSelectedDirectorySet(snapshot);
     setIsDetailBannerCompact(false);
     setIsDirectoryDetailOpen(true);
+    setIsInitialDetailRestorePending(false);
     consumedInitialSetIdRef.current = targetSetId;
   }, [clearDirectoryDetailCloseTimer, initialOpenSetId, isVisible, mode]);
 
@@ -2715,6 +2749,7 @@ export function CommunityReelsPanel({
       return;
     }
     openDirectorySet(targetSet, { immediate: true, skipTransition: true });
+    setIsInitialDetailRestorePending(false);
     consumedInitialSetIdRef.current = targetSetId;
   }, [allSets, initialOpenSetId, isVisible, mode, openDirectorySet]);
 
@@ -3043,7 +3078,7 @@ export function CommunityReelsPanel({
         <div className="relative min-h-0 flex-1 overflow-hidden">
           <div
             className={`absolute inset-0 flex min-h-0 flex-col transition-opacity duration-[440ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
-              isDirectoryDetailOpen ? "opacity-0 pointer-events-none" : "opacity-100"
+              isDirectoryDetailOpen || shouldSuppressDirectoryDuringRestore ? "opacity-0 pointer-events-none" : "opacity-100"
             }`}
             aria-hidden={isDirectoryDetailOpen}
           >
