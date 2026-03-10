@@ -942,6 +942,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                           ? "cursor-grabbing focus-visible:ring-0 focus-visible:ring-offset-0"
                           : "cursor-grab focus-visible:ring-2 focus-visible:ring-white/70 focus-visible:ring-offset-2 focus-visible:ring-offset-black/70"
                       }`}
+                      style={{ touchAction: "none" }}
                     >
                       <span
                         aria-hidden="true"
@@ -1081,6 +1082,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                       className={`absolute inset-0 rounded-full outline-none focus:outline-none ${
                         clipDialDragHandle ? "cursor-grabbing" : "cursor-grab"
                       }`}
+                      style={{ touchAction: "none" }}
                     >
                       <span
                         aria-hidden="true"
