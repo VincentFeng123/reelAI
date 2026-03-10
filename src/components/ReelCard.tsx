@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { Reel } from "@/lib/types";
+import { loadYouTubeIframeApi } from "@/lib/youtubeIframeApi";
 
 type Props = {
   reel: Reel;
@@ -27,12 +28,10 @@ type YouTubePlayer = {
 
 type VideoProvider = "youtube" | "external";
 
-const YOUTUBE_SCRIPT_ID = "studyreels-youtube-iframe-api";
 const PLAYER_REVEAL_DELAY_MS = 0;
 const RESUME_MASK_MS = 480;
 const AUTOPLAY_RETRY_DELAY_MS = 320;
 const AUTOPLAY_MAX_RETRIES = 5;
-let youtubeApiLoadPromise: Promise<void> | null = null;
 
 function detectTouchLikeDevice(): boolean {
   if (typeof window === "undefined") {
@@ -57,44 +56,6 @@ function detectMobilePhoneDevice(): boolean {
   const isPhoneUa = /iPhone|iPod|Android.+Mobile|Windows Phone|Mobile/i.test(ua);
   const narrowTouchViewport = (window.matchMedia?.("(max-width: 767px)").matches ?? false) && detectTouchLikeDevice();
   return !isIpadLike && !isTabletUa && (isPhoneUa || narrowTouchViewport);
-}
-
-function loadYouTubeIframeApi(): Promise<void> {
-  if (typeof window === "undefined") {
-    return Promise.resolve();
-  }
-  const readyYT = (window as any).YT;
-  if (readyYT?.Player) {
-    return Promise.resolve();
-  }
-
-  if (youtubeApiLoadPromise) {
-    return youtubeApiLoadPromise;
-  }
-
-  youtubeApiLoadPromise = new Promise<void>((resolve, reject) => {
-    const existing = document.getElementById(YOUTUBE_SCRIPT_ID) as HTMLScriptElement | null;
-    const previousReady = (window as any).onYouTubeIframeAPIReady;
-    (window as any).onYouTubeIframeAPIReady = () => {
-      if (typeof previousReady === "function") {
-        previousReady();
-      }
-      resolve();
-    };
-
-    if (existing) {
-      return;
-    }
-
-    const script = document.createElement("script");
-    script.id = YOUTUBE_SCRIPT_ID;
-    script.src = "https://www.youtube.com/iframe_api";
-    script.async = true;
-    script.onerror = () => reject(new Error("Failed to load YouTube player API"));
-    document.body.appendChild(script);
-  });
-
-  return youtubeApiLoadPromise;
 }
 
 function extractVideoId(urlValue: string): string | null {
@@ -680,7 +641,6 @@ export function ReelCard({
     startProgressTimer();
   }, [
     clearAutoplayRetryTimer,
-    isMuted,
     isPlaying,
     isReady,
     isYouTubeVideo,
@@ -839,12 +799,13 @@ export function ReelCard({
             <iframe
               src={reel.video_url}
               title={reel.video_title || reel.concept_title || "Community reel"}
-              className="absolute inset-0 h-full w-full border-0"
-              loading="eager"
-              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-              allowFullScreen
-            />
-          )}
+            className="absolute inset-0 h-full w-full border-0"
+            loading="eager"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-presentation"
+            allowFullScreen
+          />
+        )}
         </div>
       ) : (
         <div className="flex h-full w-full items-center justify-center bg-black/70 text-xs uppercase tracking-[0.12em] text-white/55">

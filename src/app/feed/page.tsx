@@ -30,6 +30,7 @@ const RIGHT_TOP_MIN_PX = 220;
 const RIGHT_BOTTOM_MIN_PX = 180;
 const MOBILE_DETAILS_CLOSE_MS = 240;
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
+const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const HISTORY_STORAGE_KEY = "studyreels-material-history";
@@ -59,6 +60,12 @@ type ReelFeedbackState = {
 type MaterialSeed = {
   topic?: string;
   text?: string;
+  title?: string;
+  updatedAt?: number;
+};
+
+type MaterialGroup = {
+  materialIds: string[];
   title?: string;
   updatedAt?: number;
 };
@@ -106,6 +113,42 @@ function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
       return {};
     }
     return parsed as Record<string, MaterialSeed>;
+  } catch {
+    return {};
+  }
+}
+
+function parseMaterialGroups(raw: string | null): Record<string, MaterialGroup> {
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {};
+    }
+    const result: Record<string, MaterialGroup> = {};
+    for (const [materialId, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!materialId || typeof materialId !== "string") {
+        continue;
+      }
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      const row = value as Record<string, unknown>;
+      const materialIds = Array.isArray(row.materialIds)
+        ? Array.from(new Set(row.materialIds.map((id) => String(id || "").trim()).filter(Boolean)))
+        : [];
+      if (materialIds.length === 0) {
+        continue;
+      }
+      result[materialId] = {
+        materialIds,
+        title: typeof row.title === "string" && row.title.trim() ? row.title.trim() : undefined,
+        updatedAt: Number(row.updatedAt) || 0,
+      };
+    }
+    return result;
   } catch {
     return {};
   }
@@ -183,7 +226,7 @@ function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapsh
         page,
         total,
         canRequestMore: row.canRequestMore !== false,
-        generationMode: row.generationMode === "fast" ? "fast" : "slow",
+        generationMode: row.generationMode === "slow" ? "slow" : "fast",
         mutedPreference: row.mutedPreference !== false,
         captionsPreference: Boolean(row.captionsPreference),
         activeIndex,
@@ -256,7 +299,12 @@ function sanitizeAbsoluteUrl(value: string): string {
     return "";
   }
   try {
-    return new URL(trimmed).toString();
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return "";
+    }
+    parsed.hash = "";
+    return parsed.toString();
   } catch {
     return "";
   }
@@ -467,13 +515,21 @@ function FeedPageInner() {
   const hydratedMaterialIdRef = useRef<string | null>(null);
   const materialIdsForFeedRef = useRef<string[]>([]);
 
+  const normalizeClipKeyTime = useCallback((value: unknown): string => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) {
+      return "0.00";
+    }
+    return (Math.round(parsed * 100) / 100).toFixed(2);
+  }, []);
+
   const reelClipKey = useCallback((reel: Reel): string => {
     const match = reel.video_url.match(/\/embed\/([^?&/]+)/);
     const videoId = match?.[1] || reel.video_url;
-    const start = Math.floor(Number(reel.t_start) || 0);
-    const end = Math.floor(Number(reel.t_end) || 0);
+    const start = normalizeClipKeyTime(reel.t_start);
+    const end = normalizeClipKeyTime(reel.t_end);
     return `${videoId}:${start}:${end}`;
-  }, []);
+  }, [normalizeClipKeyTime]);
 
   const dedupeByIdentity = useCallback(
     (rows: Reel[], existing: Reel[] = []): Reel[] => {
@@ -657,7 +713,27 @@ function FeedPageInner() {
         };
         delete seeds[missingMaterialId];
         window.localStorage.setItem(MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(seeds));
-        router.replace(`/feed?material_id=${rebuiltId}`);
+        const groups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
+        const nextGroups: Record<string, MaterialGroup> = {};
+        for (const [groupId, group] of Object.entries(groups)) {
+          const nextMaterialIds = Array.from(
+            new Set(group.materialIds.map((id) => (id === missingMaterialId ? rebuiltId : id)).filter(Boolean)),
+          );
+          if (nextMaterialIds.length === 0) {
+            continue;
+          }
+          const nextGroupId = groupId === missingMaterialId ? rebuiltId : groupId;
+          nextGroups[nextGroupId] = {
+            ...group,
+            materialIds: nextMaterialIds,
+            updatedAt: Date.now(),
+          };
+        }
+        window.localStorage.setItem(MATERIAL_GROUPS_STORAGE_KEY, JSON.stringify(nextGroups));
+
+        const nextParams = new URLSearchParams(params.toString());
+        nextParams.set("material_id", rebuiltId);
+        router.replace(`/feed?${nextParams.toString()}`);
         return true;
       } catch (e) {
         setError(e instanceof Error ? e.message : "Could not rebuild material.");
@@ -666,7 +742,7 @@ function FeedPageInner() {
         isRecoveringMissingMaterialRef.current = false;
       }
     },
-    [router],
+    [params, router],
   );
 
   const loadPage = useCallback(
@@ -729,7 +805,11 @@ function FeedPageInner() {
         const fetchedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data!.total) || 0), 0);
 
         setPage(targetPage);
-        setTotal(Math.max(fetchedTotal, fetchedReels.length));
+        if (targetPage === 1) {
+          setTotal(Math.max(fetchedTotal, fetchedReels.length));
+        } else {
+          setTotal((prevTotal) => Math.max(prevTotal, fetchedTotal, fetchedReels.length));
+        }
 
         if (targetPage === 1) {
           setReels(fetchedReels);
@@ -877,8 +957,11 @@ function FeedPageInner() {
     setSessionHydrated(false);
     let resumeTarget: FeedProgressEntry | null = null;
     let restoredSession: FeedSessionSnapshot | null = null;
-    const feedMaterialIds = [materialId];
+    let feedMaterialIds = [materialId];
     if (typeof window !== "undefined") {
+      const allGroups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
+      const groupedMaterialIds = allGroups[materialId]?.materialIds ?? [];
+      feedMaterialIds = Array.from(new Set([materialId, ...groupedMaterialIds].map((id) => id.trim()).filter(Boolean)));
       const allProgress = parseFeedProgress(window.localStorage.getItem(FEED_PROGRESS_STORAGE_KEY));
       resumeTarget = allProgress[materialId] ?? null;
       const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));

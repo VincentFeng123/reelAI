@@ -17,6 +17,9 @@ const RAW_API_BASE = (
 const BACKEND_DOWN_ERROR = RAW_API_BASE
   ? `Cannot reach backend at ${RAW_API_BASE}. Make sure the backend server is running.`
   : "Cannot reach backend. Check your deployment and API routes.";
+const COMMUNITY_OWNER_KEY_STORAGE_KEY = "studyreels-community-owner-key";
+export const COMMUNITY_OWNED_SET_IDS_STORAGE_KEY = "studyreels-community-owned-set-ids";
+const COMMUNITY_OWNER_HEADER = "X-StudyReels-Owner-Key";
 
 function apiUrl(path: string): string {
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
@@ -28,6 +31,90 @@ function apiUrl(path: string): string {
     return `${cleanBase}${cleanPath}`;
   }
   return `${cleanBase}/api${cleanPath}`;
+}
+
+function normalizeOwnedCommunitySetIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const value of raw) {
+    const id = String(value || "").trim();
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    normalized.push(id);
+  }
+  return normalized;
+}
+
+function createCommunityOwnerKey(): string {
+  if (typeof crypto !== "undefined") {
+    if (typeof crypto.randomUUID === "function") {
+      return `${crypto.randomUUID()}-${crypto.randomUUID()}`;
+    }
+    if (typeof crypto.getRandomValues === "function") {
+      const bytes = new Uint8Array(24);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    }
+  }
+  return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
+}
+
+function getCommunityOwnerKey(): string | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const existing = window.localStorage.getItem(COMMUNITY_OWNER_KEY_STORAGE_KEY);
+    if (existing && existing.trim().length >= 24) {
+      return existing.trim();
+    }
+    const next = createCommunityOwnerKey();
+    window.localStorage.setItem(COMMUNITY_OWNER_KEY_STORAGE_KEY, next);
+    return next;
+  } catch {
+    return null;
+  }
+}
+
+function communityOwnerHeaders(): HeadersInit {
+  const ownerKey = getCommunityOwnerKey();
+  return ownerKey ? { [COMMUNITY_OWNER_HEADER]: ownerKey } : {};
+}
+
+export function readOwnedCommunitySetIds(): string[] {
+  if (typeof window === "undefined") {
+    return [];
+  }
+  try {
+    return normalizeOwnedCommunitySetIds(JSON.parse(window.localStorage.getItem(COMMUNITY_OWNED_SET_IDS_STORAGE_KEY) || "[]"));
+  } catch {
+    return [];
+  }
+}
+
+export function saveOwnedCommunitySetIds(nextIds: string[]): string[] {
+  const normalized = normalizeOwnedCommunitySetIds(nextIds);
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.setItem(COMMUNITY_OWNED_SET_IDS_STORAGE_KEY, JSON.stringify(normalized));
+    } catch {
+      // Ignore storage failures and keep in-memory state.
+    }
+  }
+  return normalized;
+}
+
+async function parseJsonResponse<T>(response: Response): Promise<T> {
+  try {
+    return await response.json() as T;
+  } catch {
+    throw new Error("Backend returned an invalid JSON response.");
+  }
 }
 
 export async function uploadMaterial(params: {
@@ -50,7 +137,7 @@ export async function uploadMaterial(params: {
     method: "POST",
     body: form,
   });
-  return res.json();
+  return parseJsonResponse<MaterialResponse>(res);
 }
 
 export async function generateReels(params: {
@@ -89,7 +176,7 @@ export async function generateReels(params: {
     }),
   });
 
-  return res.json();
+  return parseJsonResponse<ReelsGenerateResponse>(res);
 }
 
 export async function checkReelsCanGenerate(params: {
@@ -126,7 +213,7 @@ export async function checkReelsCanGenerate(params: {
         : undefined,
     }),
   });
-  return res.json();
+  return parseJsonResponse<ReelsCanGenerateResponse>(res);
 }
 
 export async function checkReelsCanGenerateAny(params: {
@@ -163,7 +250,7 @@ export async function checkReelsCanGenerateAny(params: {
         : undefined,
     }),
   });
-  return res.json();
+  return parseJsonResponse<ReelsCanGenerateAnyResponse>(res);
 }
 
 export async function fetchFeed(params: {
@@ -208,7 +295,7 @@ export async function fetchFeed(params: {
     cache: "no-store",
   });
 
-  return res.json();
+  return parseJsonResponse<FeedResponse>(res);
 }
 
 export async function sendFeedback(params: {
@@ -251,7 +338,7 @@ export async function askStudyChat(params: {
       history: params.history ?? [],
     }),
   });
-  return res.json();
+  return parseJsonResponse<ChatResponse>(res);
 }
 
 type CommunitySetApi = {
@@ -451,7 +538,7 @@ export async function fetchCommunitySets(): Promise<CommunitySet[]> {
   const res = await safeFetch(apiUrl("/community/sets"), {
     cache: "no-store",
   });
-  const json = await res.json();
+  const json = await parseJsonResponse<{ sets?: unknown[] }>(res);
   const rows = Array.isArray(json?.sets) ? json.sets : [];
   return rows.map(normalizeCommunitySet).filter(Boolean) as CommunitySet[];
 }
@@ -474,6 +561,7 @@ export async function createCommunitySet(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
     },
     body: JSON.stringify({
       title: params.title,
@@ -491,7 +579,7 @@ export async function createCommunitySet(params: {
     }),
   });
 
-  const created = normalizeCommunitySet(await res.json());
+  const created = normalizeCommunitySet(await parseJsonResponse<unknown>(res));
   if (!created) {
     throw new Error("Backend returned an invalid community set payload.");
   }
@@ -522,6 +610,7 @@ export async function updateCommunitySet(params: {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
     },
     body: JSON.stringify({
       title: params.title,
@@ -539,7 +628,7 @@ export async function updateCommunitySet(params: {
     }),
   });
 
-  const updated = normalizeCommunitySet(await res.json());
+  const updated = normalizeCommunitySet(await parseJsonResponse<unknown>(res));
   if (!updated) {
     throw new Error("Backend returned an invalid community set payload.");
   }
@@ -555,6 +644,7 @@ export async function deleteCommunitySet(params: { setId: string }): Promise<voi
   try {
     await safeFetch(apiUrl(`/community/sets/${encodedSetId}`), {
       method: "DELETE",
+      headers: communityOwnerHeaders(),
     });
     return;
   } catch (error) {
@@ -567,6 +657,7 @@ export async function deleteCommunitySet(params: { setId: string }): Promise<voi
 
   await safeFetch(apiUrl(`/community/sets/${encodedSetId}/delete`), {
     method: "POST",
+    headers: communityOwnerHeaders(),
   });
 }
 
@@ -581,7 +672,7 @@ export async function fetchCommunityReelDuration(params: {
   const res = await safeFetch(`${apiUrl("/community/reels/duration")}?${query.toString()}`, {
     cache: "no-store",
   });
-  const json = await res.json();
+  const json = await parseJsonResponse<{ duration_sec?: unknown }>(res);
   const durationRaw = Number(json?.duration_sec);
   if (!Number.isFinite(durationRaw) || durationRaw <= 0) {
     return null;
@@ -599,12 +690,13 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
   const upstreamSignal = init?.signal;
   const controller = new AbortController();
   const timeoutId = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  const onUpstreamAbort = () => controller.abort();
 
   if (upstreamSignal) {
     if (upstreamSignal.aborted) {
       controller.abort();
     } else {
-      upstreamSignal.addEventListener("abort", () => controller.abort(), { once: true });
+      upstreamSignal.addEventListener("abort", onUpstreamAbort, { once: true });
     }
   }
 
@@ -624,6 +716,9 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
   } finally {
     if (timeoutId) {
       clearTimeout(timeoutId);
+    }
+    if (upstreamSignal) {
+      upstreamSignal.removeEventListener("abort", onUpstreamAbort);
     }
   }
 

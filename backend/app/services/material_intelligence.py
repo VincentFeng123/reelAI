@@ -292,10 +292,18 @@ class MaterialIntelligenceService:
             return cleaned
 
         head = cleaned[: int(max_chars * 0.45)]
+        if " " in head:
+            head = head.rsplit(" ", 1)[0]
         mid_start = max(0, len(cleaned) // 2 - int(max_chars * 0.1))
         mid_end = min(len(cleaned), mid_start + int(max_chars * 0.2))
-        middle = cleaned[mid_start:mid_end]
+        middle = cleaned[mid_start:mid_end].strip()
+        if mid_start > 0 and mid_start < len(cleaned) and not cleaned[mid_start - 1].isspace() and " " in middle:
+            middle = middle.split(" ", 1)[1]
+        if mid_end < len(cleaned) and mid_end > 0 and not cleaned[mid_end - 1].isspace() and " " in middle:
+            middle = middle.rsplit(" ", 1)[0]
         tail = cleaned[-int(max_chars * 0.35) :]
+        if " " in tail:
+            tail = tail.split(" ", 1)[1]
         return normalize_whitespace(f"{head}\n\n{middle}\n\n{tail}")[:max_chars]
 
     def _cache_key(self, text: str, subject_tag: str | None, max_concepts: int) -> str:

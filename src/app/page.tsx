@@ -183,8 +183,6 @@ function HomePageContent() {
   const [showUnsavedSettingsModal, setShowUnsavedSettingsModal] = useState(false);
   const [hasUnsavedCommunityDraftChanges, setHasUnsavedCommunityDraftChanges] = useState(false);
   const [showUnsavedCommunityDraftModal, setShowUnsavedCommunityDraftModal] = useState(false);
-  const [pendingSettingsRefresh, setPendingSettingsRefresh] = useState(false);
-  const [pendingCommunityDraftRefresh, setPendingCommunityDraftRefresh] = useState(false);
   const [pendingSidebarSwitchIntent, setPendingSidebarSwitchIntent] = useState<SidebarSwitchIntent | null>(null);
   const [pendingCommunityDraftSwitchIntent, setPendingCommunityDraftSwitchIntent] = useState<SidebarSwitchIntent | null>(null);
   const [pendingSaveSwitchUntilHeuristicClose, setPendingSaveSwitchUntilHeuristicClose] = useState(false);
@@ -201,8 +199,6 @@ function HomePageContent() {
   const sidebarInfoTooltipDismissTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipAnimateInTimerRef = useRef<number | null>(null);
   const topChromeGestureTimerRef = useRef<number | null>(null);
-  const allowNextBeforeUnloadRef = useRef(false);
-
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
@@ -500,64 +496,9 @@ function HomePageContent() {
     [activeSidebarTab, applySidebarSwitchIntent, hasUnsavedCommunityDraftChanges, hasUnsavedSettingsChanges],
   );
 
-  const performConfirmedRefresh = useCallback(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    allowNextBeforeUnloadRef.current = true;
-    window.setTimeout(() => {
-      allowNextBeforeUnloadRef.current = false;
-    }, 5_000);
-    window.location.reload();
-  }, []);
-
-  const requestRefreshWithUnsavedGuard = useCallback((): boolean => {
-    const hasPendingUnsavedSettings = activeSidebarTab === "settings"
-      && (hasUnsavedSettingsChanges || Boolean(settingsPanelRef.current?.hasUnsavedChanges()));
-    if (hasPendingUnsavedSettings) {
-      setPendingSidebarSwitchIntent(null);
-      setPendingSaveSwitchUntilHeuristicClose(false);
-      setPendingSettingsRefresh(true);
-      setShowUnsavedSettingsModal(true);
-      return true;
-    }
-    const hasPendingUnsavedCommunityDraft = (activeSidebarTab === "create" || activeSidebarTab === "edit")
-      && hasUnsavedCommunityDraftChanges;
-    if (hasPendingUnsavedCommunityDraft) {
-      setPendingCommunityDraftSwitchIntent(null);
-      setPendingCommunityDraftRefresh(true);
-      setShowUnsavedCommunityDraftModal(true);
-      return true;
-    }
-    return false;
-  }, [activeSidebarTab, hasUnsavedCommunityDraftChanges, hasUnsavedSettingsChanges]);
-
   const startNewSearch = useCallback(() => {
     requestSidebarSwitch({ tab: "search", clearHistoryQuery: true });
   }, [requestSidebarSwitch]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    const onKeyDown = (event: KeyboardEvent) => {
-      const isRefreshKey = event.key === "F5";
-      const isShortcutRefresh = (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "r";
-      if (!isRefreshKey && !isShortcutRefresh) {
-        return;
-      }
-      const blocked = requestRefreshWithUnsavedGuard();
-      if (!blocked) {
-        return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown, true);
-    };
-  }, [requestRefreshWithUnsavedGuard]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -571,9 +512,6 @@ function HomePageContent() {
       return;
     }
     const onBeforeUnload = (event: BeforeUnloadEvent) => {
-      if (allowNextBeforeUnloadRef.current) {
-        return;
-      }
       event.preventDefault();
       event.returnValue = "";
     };
@@ -775,21 +713,23 @@ function HomePageContent() {
     },
     [requestSidebarSwitch],
   );
+  const onCommunityDraftExitActionsChange = useCallback((actions: CommunityDraftExitActions | null) => {
+    // Unsaved draft state is owned by the panel's explicit dirty-state callback.
+    // Clearing it here would incorrectly mark the form clean during effect cleanups.
+    communityDraftExitActionsRef.current = actions;
+  }, []);
   const closeUnsavedSettingsModal = useCallback(() => {
     setShowUnsavedSettingsModal(false);
     setPendingSidebarSwitchIntent(null);
     setPendingSaveSwitchUntilHeuristicClose(false);
-    setPendingSettingsRefresh(false);
   }, []);
   const closeUnsavedCommunityDraftModal = useCallback(() => {
     setShowUnsavedCommunityDraftModal(false);
     setPendingCommunityDraftSwitchIntent(null);
-    setPendingCommunityDraftRefresh(false);
   }, []);
   const discardSettingsAndContinue = useCallback(() => {
-    const shouldRefresh = pendingSettingsRefresh;
     const intent = pendingSidebarSwitchIntent;
-    if (!intent && !shouldRefresh) {
+    if (!intent) {
       closeUnsavedSettingsModal();
       return;
     }
@@ -798,26 +738,11 @@ function HomePageContent() {
     setShowUnsavedSettingsModal(false);
     setPendingSidebarSwitchIntent(null);
     setPendingSaveSwitchUntilHeuristicClose(false);
-    setPendingSettingsRefresh(false);
-    if (shouldRefresh) {
-      performConfirmedRefresh();
-      return;
-    }
-    if (!intent) {
-      return;
-    }
     applySidebarSwitchIntent(intent);
-  }, [
-    applySidebarSwitchIntent,
-    closeUnsavedSettingsModal,
-    pendingSettingsRefresh,
-    pendingSidebarSwitchIntent,
-    performConfirmedRefresh,
-  ]);
+  }, [applySidebarSwitchIntent, closeUnsavedSettingsModal, pendingSidebarSwitchIntent]);
   const saveSettingsAndContinue = useCallback(() => {
-    const shouldRefresh = pendingSettingsRefresh;
     const intent = pendingSidebarSwitchIntent;
-    if (!intent && !shouldRefresh) {
+    if (!intent) {
       closeUnsavedSettingsModal();
       return;
     }
@@ -827,41 +752,17 @@ function HomePageContent() {
       setShowUnsavedSettingsModal(false);
       setPendingSidebarSwitchIntent(null);
       setPendingSaveSwitchUntilHeuristicClose(false);
-      setPendingSettingsRefresh(false);
-      if (shouldRefresh) {
-        performConfirmedRefresh();
-        return;
-      }
-      if (!intent) {
-        return;
-      }
       applySidebarSwitchIntent(intent);
       return;
     }
     settingsPanel.savePreferences();
     setHasUnsavedSettingsChanges(false);
     setShowUnsavedSettingsModal(false);
-    if (shouldRefresh) {
-      setPendingSidebarSwitchIntent(null);
-      setPendingSaveSwitchUntilHeuristicClose(false);
-      setPendingSettingsRefresh(false);
-      window.setTimeout(() => {
-        performConfirmedRefresh();
-      }, 80);
-      return;
-    }
     setPendingSaveSwitchUntilHeuristicClose(true);
-  }, [
-    applySidebarSwitchIntent,
-    closeUnsavedSettingsModal,
-    pendingSettingsRefresh,
-    pendingSidebarSwitchIntent,
-    performConfirmedRefresh,
-  ]);
+  }, [applySidebarSwitchIntent, closeUnsavedSettingsModal, pendingSidebarSwitchIntent]);
   const discardCommunityDraftAndContinue = useCallback(() => {
-    const shouldRefresh = pendingCommunityDraftRefresh;
     const intent = pendingCommunityDraftSwitchIntent;
-    if (!intent && !shouldRefresh) {
+    if (!intent) {
       closeUnsavedCommunityDraftModal();
       return;
     }
@@ -869,26 +770,11 @@ function HomePageContent() {
     setHasUnsavedCommunityDraftChanges(false);
     setShowUnsavedCommunityDraftModal(false);
     setPendingCommunityDraftSwitchIntent(null);
-    setPendingCommunityDraftRefresh(false);
-    if (shouldRefresh) {
-      performConfirmedRefresh();
-      return;
-    }
-    if (!intent) {
-      return;
-    }
     applySidebarSwitchIntent(intent);
-  }, [
-    applySidebarSwitchIntent,
-    closeUnsavedCommunityDraftModal,
-    pendingCommunityDraftRefresh,
-    pendingCommunityDraftSwitchIntent,
-    performConfirmedRefresh,
-  ]);
+  }, [applySidebarSwitchIntent, closeUnsavedCommunityDraftModal, pendingCommunityDraftSwitchIntent]);
   const saveCommunityDraftAndContinue = useCallback(() => {
-    const shouldRefresh = pendingCommunityDraftRefresh;
     const intent = pendingCommunityDraftSwitchIntent;
-    if (!intent && !shouldRefresh) {
+    if (!intent) {
       closeUnsavedCommunityDraftModal();
       return;
     }
@@ -899,22 +785,8 @@ function HomePageContent() {
     setHasUnsavedCommunityDraftChanges(false);
     setShowUnsavedCommunityDraftModal(false);
     setPendingCommunityDraftSwitchIntent(null);
-    setPendingCommunityDraftRefresh(false);
-    if (shouldRefresh) {
-      performConfirmedRefresh();
-      return;
-    }
-    if (!intent) {
-      return;
-    }
     applySidebarSwitchIntent(intent);
-  }, [
-    applySidebarSwitchIntent,
-    closeUnsavedCommunityDraftModal,
-    pendingCommunityDraftRefresh,
-    pendingCommunityDraftSwitchIntent,
-    performConfirmedRefresh,
-  ]);
+  }, [applySidebarSwitchIntent, closeUnsavedCommunityDraftModal, pendingCommunityDraftSwitchIntent]);
   const onSettingsAvailabilityModalClose = useCallback(
     (source: "close-button" | "backdrop") => {
       if (!pendingSaveSwitchUntilHeuristicClose) {
@@ -1372,12 +1244,7 @@ function HomePageContent() {
               communityResetSignal={communityResetSignal}
               onOpenCommunityReelInFeed={onCommunityReelFeedOpened}
               onDraftUnsavedChangesChange={setHasUnsavedCommunityDraftChanges}
-              onDraftExitActionsChange={(actions) => {
-                communityDraftExitActionsRef.current = actions;
-                if (!actions) {
-                  setHasUnsavedCommunityDraftChanges(false);
-                }
-              }}
+              onDraftExitActionsChange={onCommunityDraftExitActionsChange}
             />
           </div>
         </section>
@@ -1398,9 +1265,7 @@ function HomePageContent() {
             <div className="flex items-start justify-between gap-4">
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">
-                  {pendingCommunityDraftRefresh ? "Save set changes before refresh?" : "Save set changes before leaving?"}
-                </h3>
+                <h3 className="mt-2 text-lg font-semibold text-white">Save set changes before leaving?</h3>
               </div>
               <button
                 type="button"
@@ -1414,9 +1279,7 @@ function HomePageContent() {
               </button>
             </div>
             <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-              {pendingCommunityDraftRefresh
-                ? "Save to keep your draft progress, or discard these edits and refresh."
-                : "Save to keep your draft progress, or discard these edits and continue."}
+              Save to keep your draft progress, or discard these edits and continue.
             </p>
             <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
               <button
@@ -1424,14 +1287,14 @@ function HomePageContent() {
                 onClick={discardCommunityDraftAndContinue}
                 className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
               >
-                {pendingCommunityDraftRefresh ? "Discard & Refresh" : "Discard"}
+                Discard
               </button>
               <button
                 type="button"
                 onClick={saveCommunityDraftAndContinue}
                 className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
               >
-                {pendingCommunityDraftRefresh ? "Save & Refresh" : "Save"}
+                Save
               </button>
             </div>
           </div>
@@ -1453,9 +1316,7 @@ function HomePageContent() {
             <div className="flex items-start justify-between gap-4">
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">
-                  {pendingSettingsRefresh ? "Save settings before refresh?" : "Save settings before leaving?"}
-                </h3>
+                <h3 className="mt-2 text-lg font-semibold text-white">Save settings before leaving?</h3>
               </div>
               <button
                 type="button"
@@ -1469,9 +1330,7 @@ function HomePageContent() {
               </button>
             </div>
             <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-              {pendingSettingsRefresh
-                ? "You changed settings. Save to apply them, or discard these edits and refresh."
-                : "You changed settings. Save to apply them, or discard these edits and continue."}
+              You changed settings. Save to apply them, or discard these edits and continue.
             </p>
             <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
               <button
@@ -1479,14 +1338,14 @@ function HomePageContent() {
                 onClick={discardSettingsAndContinue}
                 className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
               >
-                {pendingSettingsRefresh ? "Discard & Refresh" : "Discard"}
+                Discard
               </button>
               <button
                 type="button"
                 onClick={saveSettingsAndContinue}
                 className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
               >
-                {pendingSettingsRefresh ? "Save & Refresh" : "Save"}
+                Save
               </button>
             </div>
           </div>

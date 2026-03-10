@@ -6,12 +6,20 @@ except Exception:  # pragma: no cover
     faiss = None
 
 
+def _normalize_rows(vectors: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    safe_norms = np.where(norms == 0, 1.0, norms)
+    return vectors / safe_norms
+
+
 def top_k_cosine(query_vec: np.ndarray, candidate_vecs: np.ndarray, top_k: int = 5) -> list[tuple[int, float]]:
     if len(candidate_vecs) == 0:
         return []
 
-    q = query_vec.astype(np.float32)
+    q = query_vec.astype(np.float32).reshape(1, -1)
     c = candidate_vecs.astype(np.float32)
+    q = _normalize_rows(q)[0]
+    c = _normalize_rows(c)
 
     if faiss is not None:
         index = faiss.IndexFlatIP(c.shape[1])

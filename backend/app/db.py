@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -17,6 +18,10 @@ except Exception:  # pragma: no cover - optional dependency at runtime
     psycopg = None
     pg_errors = None
     dict_row = None
+
+
+class DatabaseIntegrityError(Exception):
+    pass
 
 
 SCHEMA = """
@@ -100,15 +105,6 @@ CREATE TABLE IF NOT EXISTS reels (
 
 CREATE INDEX IF NOT EXISTS idx_reels_material_id ON reels(material_id);
 CREATE INDEX IF NOT EXISTS idx_reels_concept_id ON reels(concept_id);
--- Keep only one reel per exact (material, video, clip window) and enforce it going forward.
-DELETE FROM reels
-WHERE rowid NOT IN (
-    SELECT MIN(rowid)
-    FROM reels
-    GROUP BY material_id, video_id, CAST(t_start AS INTEGER), CAST(t_end AS INTEGER)
-);
-DROP INDEX IF EXISTS idx_reels_material_video_unique;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique ON reels(material_id, video_id, t_start, t_end);
 
 CREATE TABLE IF NOT EXISTS reel_feedback (
     id TEXT PRIMARY KEY,
@@ -203,6 +199,7 @@ CREATE TABLE IF NOT EXISTS community_sets (
     learners INTEGER NOT NULL DEFAULT 1,
     updated_label TEXT NOT NULL,
     thumbnail_url TEXT NOT NULL,
+    owner_key_hash TEXT,
     featured INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -238,6 +235,7 @@ CREATE TABLE IF NOT EXISTS llm_cache (
 _db_init_lock = threading.Lock()
 _db_ready = False
 DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 120000
+_SAFE_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _db_path() -> str:
@@ -277,25 +275,150 @@ def _is_postgres_conn(conn: Any) -> bool:
 
 
 def _adapt_query_for_postgres(query: str) -> str:
-    return query.replace("?", "%s")
+    result: list[str] = []
+    i = 0
+    in_single_quote = False
+    in_double_quote = False
+    in_line_comment = False
+    in_block_comment = False
+    while i < len(query):
+        char = query[i]
+        nxt = query[i + 1] if i + 1 < len(query) else ""
+
+        if in_line_comment:
+            result.append(char)
+            if char == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            result.append(char)
+            if char == "*" and nxt == "/":
+                result.append(nxt)
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if not in_single_quote and not in_double_quote:
+            if char == "-" and nxt == "-":
+                result.append(char)
+                result.append(nxt)
+                in_line_comment = True
+                i += 2
+                continue
+            if char == "/" and nxt == "*":
+                result.append(char)
+                result.append(nxt)
+                in_block_comment = True
+                i += 2
+                continue
+            if char == "?":
+                result.append("%s")
+                i += 1
+                continue
+
+        result.append(char)
+        if char == "'" and not in_double_quote:
+            if in_single_quote and nxt == "'":
+                result.append(nxt)
+                i += 2
+                continue
+            in_single_quote = not in_single_quote
+        elif char == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+        i += 1
+    return "".join(result)
+
+
+def _strip_sql_line_comments(statement: str) -> str:
+    lines = [line for line in statement.splitlines() if not line.strip().startswith("--")]
+    return "\n".join(lines).strip()
 
 
 def _postgres_schema_statements() -> list[str]:
     statements: list[str] = []
     for chunk in SCHEMA.split(";"):
-        raw_stmt = chunk.strip()
-        if not raw_stmt:
+        stmt = _strip_sql_line_comments(chunk)
+        if not stmt:
             continue
-        upper = raw_stmt.upper()
+        upper = stmt.upper()
         if upper.startswith("PRAGMA "):
             continue
-        if "ROWID" in upper:
+        if re.search(r"\bROWID\b", upper):
             continue
-        lines = [line for line in raw_stmt.splitlines() if not line.strip().startswith("--")]
-        stmt = "\n".join(lines).strip()
-        if stmt:
-            statements.append(stmt)
+        statements.append(stmt)
     return statements
+
+
+def _migrate_reel_feedback_uniqueness_sqlite(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        DELETE FROM reel_feedback
+        WHERE EXISTS (
+            SELECT 1
+            FROM reel_feedback AS newer
+            WHERE newer.reel_id = reel_feedback.reel_id
+              AND (
+                  newer.created_at > reel_feedback.created_at
+                  OR (newer.created_at = reel_feedback.created_at AND newer.rowid > reel_feedback.rowid)
+              )
+        )
+        """
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_reel_feedback_reel_id")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_feedback_reel_id_unique ON reel_feedback(reel_id)")
+
+
+def _migrate_reel_feedback_uniqueness_postgres(conn: Any) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM reel_feedback AS older
+            USING reel_feedback AS newer
+            WHERE older.reel_id = newer.reel_id
+              AND (
+                  older.created_at < newer.created_at
+                  OR (older.created_at = newer.created_at AND older.ctid < newer.ctid)
+              )
+            """
+        )
+        cur.execute("DROP INDEX IF EXISTS idx_reel_feedback_reel_id")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_feedback_reel_id_unique ON reel_feedback(reel_id)")
+
+
+def _migrate_reels_unique_clip_index_sqlite(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        DELETE FROM reels
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM reels
+            GROUP BY material_id, video_id, t_start, t_end
+        )
+        """
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_reels_material_video_unique")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique ON reels(material_id, video_id, t_start, t_end)")
+
+
+def _migrate_reels_unique_clip_index_postgres(conn: Any) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM reels AS older
+            USING reels AS newer
+            WHERE older.material_id = newer.material_id
+              AND older.video_id = newer.video_id
+              AND older.t_start = newer.t_start
+              AND older.t_end = newer.t_end
+              AND older.ctid < newer.ctid
+            """
+        )
+        cur.execute("DROP INDEX IF EXISTS idx_reels_material_video_unique")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique ON reels(material_id, video_id, t_start, t_end)")
 
 
 def init_db() -> None:
@@ -309,7 +432,10 @@ def init_db() -> None:
                     cur.execute(statement)
                 # Lightweight schema migration for older community_sets tables.
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS updated_at TEXT")
+                cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS owner_key_hash TEXT")
                 cur.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR BTRIM(updated_at) = ''")
+            _migrate_reels_unique_clip_index_postgres(conn)
+            _migrate_reel_feedback_uniqueness_postgres(conn)
             conn.commit()
         _db_ready = True
         return
@@ -326,9 +452,15 @@ def init_db() -> None:
         except sqlite3.OperationalError:
             pass
         try:
+            conn.execute("ALTER TABLE community_sets ADD COLUMN owner_key_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR TRIM(updated_at) = ''")
         except sqlite3.OperationalError:
             pass
+        _migrate_reels_unique_clip_index_sqlite(conn)
+        _migrate_reel_feedback_uniqueness_sqlite(conn)
         conn.commit()
     _db_ready = True
 
@@ -344,7 +476,7 @@ def ensure_db_initialized() -> None:
 
 
 @contextmanager
-def get_conn():
+def get_conn(*, transactional: bool = False):
     ensure_db_initialized()
     if _is_postgres_configured():
         if psycopg is None:
@@ -365,7 +497,7 @@ def get_conn():
     conn = sqlite3.connect(
         _db_path(),
         timeout=max(1.0, busy_timeout_ms / 1000.0),
-        isolation_level=None,  # autocommit to avoid long-lived write locks
+        isolation_level="" if transactional else None,
     )
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms};")
@@ -374,10 +506,12 @@ def get_conn():
     try:
         yield conn
     except Exception:
-        conn.rollback()
+        if transactional:
+            conn.rollback()
         raise
     else:
-        conn.commit()
+        if transactional:
+            conn.commit()
     finally:
         conn.close()
 
@@ -393,7 +527,14 @@ def _is_unique_violation(exc: Exception) -> bool:
 
 
 def upsert(conn: Any, table: str, data: dict[str, Any], pk: str = "id") -> None:
+    if not _SAFE_SQL_IDENTIFIER_RE.fullmatch(table):
+        raise ValueError(f"Unsafe table name: {table!r}")
+    if not _SAFE_SQL_IDENTIFIER_RE.fullmatch(pk):
+        raise ValueError(f"Unsafe primary key name: {pk!r}")
     cols = list(data.keys())
+    for col in cols:
+        if not _SAFE_SQL_IDENTIFIER_RE.fullmatch(col):
+            raise ValueError(f"Unsafe column name: {col!r}")
     placeholders = ", ".join(["?"] * len(cols))
     assignments = ", ".join([f"{c}=excluded.{c}" for c in cols if c != pk])
     if assignments:
@@ -412,7 +553,18 @@ def upsert(conn: Any, table: str, data: dict[str, Any], pk: str = "id") -> None:
         try:
             if is_pg:
                 with conn.cursor() as cur:
-                    cur.execute(query, values)
+                    if getattr(conn, "autocommit", False):
+                        cur.execute(query, values)
+                    else:
+                        cur.execute("SAVEPOINT studyreels_upsert")
+                        try:
+                            cur.execute(query, values)
+                        except Exception:
+                            cur.execute("ROLLBACK TO SAVEPOINT studyreels_upsert")
+                            cur.execute("RELEASE SAVEPOINT studyreels_upsert")
+                            raise
+                        else:
+                            cur.execute("RELEASE SAVEPOINT studyreels_upsert")
             else:
                 conn.execute(query, values)
             return
@@ -428,8 +580,7 @@ def upsert(conn: Any, table: str, data: dict[str, Any], pk: str = "id") -> None:
             time.sleep(min(2.0, 0.05 * (2 ** attempt)))
         except Exception as exc:
             if is_pg and _is_unique_violation(exc):
-                conn.rollback()
-                raise sqlite3.IntegrityError(str(exc)) from exc
+                raise DatabaseIntegrityError(str(exc)) from exc
             raise
 
 

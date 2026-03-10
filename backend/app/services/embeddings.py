@@ -36,17 +36,21 @@ class EmbeddingService:
         hashes = [self._hash_text(t) for t in text_list]
         embeddings: list[np.ndarray | None] = [None] * len(text_list)
         missing_indices: list[int] = []
+        persist_generated_indices: set[int] = set()
 
         for i, h in enumerate(hashes):
             row = fetch_one(conn, "SELECT embedding_json FROM embedding_cache WHERE text_hash = ?", (h,))
             if row:
-                vec = np.array(json.loads(row["embedding_json"]), dtype=np.float32)
-                if vec.ndim == 1 and vec.size == self.dim:
-                    embeddings[i] = self._normalize(vec)
+                cached_vec, should_persist_replacement = self._load_cached_embedding(row.get("embedding_json"))
+                if cached_vec is not None:
+                    embeddings[i] = cached_vec
                 else:
                     missing_indices.append(i)
+                    if should_persist_replacement:
+                        persist_generated_indices.add(i)
             else:
                 missing_indices.append(i)
+                persist_generated_indices.add(i)
 
         if missing_indices:
             missing_texts = [text_list[i] for i in missing_indices]
@@ -63,6 +67,8 @@ class EmbeddingService:
             for local_i, global_i in enumerate(missing_indices):
                 vec = self._normalize(fetched[local_i])
                 embeddings[global_i] = vec
+                if global_i not in persist_generated_indices:
+                    continue
                 upsert(
                     conn,
                     "embedding_cache",
@@ -74,8 +80,28 @@ class EmbeddingService:
                     pk="text_hash",
                 )
 
+        if any(embedding is None for embedding in embeddings):
+            raise RuntimeError("Failed to build embeddings for every input text.")
         result = np.vstack([e for e in embeddings if e is not None]).astype(np.float32)
         return result
+
+    def should_persist_replacement(self, raw_value: object) -> bool:
+        _, should_persist_replacement = self._load_cached_embedding(raw_value)
+        return should_persist_replacement
+
+    def _load_cached_embedding(self, raw_value: object) -> tuple[np.ndarray | None, bool]:
+        if raw_value in (None, ""):
+            return None, True
+        try:
+            vec = np.array(json.loads(str(raw_value)), dtype=np.float32)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None, True
+        if vec.ndim != 1:
+            return None, True
+        if vec.size == self.dim:
+            return self._normalize(vec), True
+        # Preserve higher-dimensional cached vectors when OpenAI is temporarily unavailable.
+        return None, self.client is not None
 
     def _embed_openai(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
         vectors: list[list[float]] = []

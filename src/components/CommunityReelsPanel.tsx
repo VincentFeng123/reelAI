@@ -4,7 +4,16 @@ import { type ChangeEvent, type DragEvent, type FormEvent, useCallback, useEffec
 import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 
-import { createCommunitySet, deleteCommunitySet, fetchCommunityReelDuration, fetchCommunitySets, updateCommunitySet } from "@/lib/api";
+import {
+  createCommunitySet,
+  deleteCommunitySet,
+  fetchCommunityReelDuration,
+  fetchCommunitySets,
+  readOwnedCommunitySetIds,
+  saveOwnedCommunitySetIds,
+  updateCommunitySet,
+} from "@/lib/api";
+import { loadYouTubeIframeApi } from "@/lib/youtubeIframeApi";
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
 const COMMUNITY_CREATE_DRAFT_STORAGE_KEY = "studyreels-community-create-draft";
@@ -35,7 +44,7 @@ const COMMUNITY_STARRED_SET_IDS_STORAGE_KEY = "studyreels-community-starred-set-
 const COMMUNITY_CREATE_DRAFT_CONTEXT_KEY = "create";
 const CLIP_SLIDER_MIN_GAP_SEC = 0.1;
 const CLIP_SLIDER_STEP_SEC = 0.1;
-const YOUTUBE_IFRAME_API_SCRIPT_ID = "studyreels-youtube-iframe-api";
+const MAX_THUMBNAIL_FILE_BYTES = 1_500_000;
 const YOUTUBE_DURATION_POLL_INTERVAL_MS = 220;
 const YOUTUBE_DURATION_TIMEOUT_MS = 8_000;
 const LAST_EDITED_REFRESH_INTERVAL_MS = 60_000;
@@ -172,7 +181,6 @@ export type CommunityDraftExitActions = {
 };
 
 let draftRowCounter = 0;
-let youtubeIframeApiLoadPromise: Promise<void> | null = null;
 
 function createDraftReelRow(value = "", tStartSec = "0", tEndSec = ""): DraftReelInput {
   draftRowCounter += 1;
@@ -539,46 +547,6 @@ function extractYouTubeVideoId(url: URL): string | null {
   return null;
 }
 
-function loadYouTubeIframeApi(): Promise<void> {
-  if (typeof window === "undefined") {
-    return Promise.resolve();
-  }
-  const globalWindow = window as YouTubeIframeWindow;
-  if (globalWindow.YT?.Player) {
-    return Promise.resolve();
-  }
-  if (youtubeIframeApiLoadPromise) {
-    return youtubeIframeApiLoadPromise;
-  }
-
-  youtubeIframeApiLoadPromise = new Promise<void>((resolve, reject) => {
-    const existingScript = document.getElementById(YOUTUBE_IFRAME_API_SCRIPT_ID) as HTMLScriptElement | null;
-    const previousReady = globalWindow.onYouTubeIframeAPIReady;
-    globalWindow.onYouTubeIframeAPIReady = () => {
-      if (typeof previousReady === "function") {
-        previousReady();
-      }
-      resolve();
-    };
-
-    if (existingScript) {
-      return;
-    }
-
-    const script = document.createElement("script");
-    script.id = YOUTUBE_IFRAME_API_SCRIPT_ID;
-    script.src = "https://www.youtube.com/iframe_api";
-    script.async = true;
-    script.onerror = () => reject(new Error("Failed to load YouTube IFrame API."));
-    document.body.appendChild(script);
-  }).catch((error) => {
-    youtubeIframeApiLoadPromise = null;
-    throw error;
-  });
-
-  return youtubeIframeApiLoadPromise;
-}
-
 function parseDetectedDuration(value: unknown): number | null {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed <= CLIP_SLIDER_MIN_GAP_SEC) {
@@ -601,7 +569,7 @@ async function detectYouTubeDurationWithIframeApi(sourceUrl: string): Promise<nu
   }
 
   try {
-    await loadYouTubeIframeApi();
+    await loadYouTubeIframeApi(YOUTUBE_DURATION_TIMEOUT_MS);
   } catch {
     return null;
   }
@@ -1026,6 +994,7 @@ export function CommunityReelsPanel({
   const [activeSetActionsMenuId, setActiveSetActionsMenuId] = useState<string | null>(null);
   const [deletingSetId, setDeletingSetId] = useState<string | null>(null);
   const [userSets, setUserSets] = useState<CommunitySet[]>([]);
+  const [ownedSetIds, setOwnedSetIds] = useState<string[]>([]);
   const [storageHydrated, setStorageHydrated] = useState(false);
   const [portalReady, setPortalReady] = useState(false);
   const [relativeTimeNowMs, setRelativeTimeNowMs] = useState(() => Date.now());
@@ -1056,7 +1025,18 @@ export function CommunityReelsPanel({
     let cancelled = false;
     setPortalReady(true);
     const localSets = parseStoredSets(window.localStorage.getItem(COMMUNITY_SETS_STORAGE_KEY));
+    const seededOwnedSetIds = saveOwnedCommunitySetIds([
+      ...readOwnedCommunitySetIds(),
+      ...localSets
+        .filter((set) => {
+          const id = set.id.trim();
+          const curator = set.curator.trim().toLowerCase();
+          return id.startsWith(USER_CREATED_SET_ID_PREFIX) || curator === "you";
+        })
+        .map((set) => set.id),
+    ]);
     setUserSets(localSets);
+    setOwnedSetIds(seededOwnedSetIds);
     const starredSetIdsRaw = window.localStorage.getItem(COMMUNITY_STARRED_SET_IDS_STORAGE_KEY);
     if (starredSetIdsRaw) {
       try {
@@ -1110,6 +1090,13 @@ export function CommunityReelsPanel({
   }, [storageHydrated, userSets]);
 
   useEffect(() => {
+    if (typeof window === "undefined" || !storageHydrated) {
+      return;
+    }
+    saveOwnedCommunitySetIds(ownedSetIds);
+  }, [ownedSetIds, storageHydrated]);
+
+  useEffect(() => {
     if (typeof window === "undefined" || !starredSetsHydrated) {
       return;
     }
@@ -1120,15 +1107,7 @@ export function CommunityReelsPanel({
     if (!starredSetsHydrated) {
       return;
     }
-    const editableSetIdSet = new Set(
-      userSets
-        .filter((set) => {
-          const id = set.id.trim();
-          const curator = set.curator.trim().toLowerCase();
-          return id.startsWith(USER_CREATED_SET_ID_PREFIX) || curator === "you";
-        })
-        .map((set) => set.id),
-    );
+    const editableSetIdSet = new Set(ownedSetIds);
     setStarredSetIds((prev) => {
       const next = prev.filter((setId) => editableSetIdSet.has(setId));
       if (next.length === prev.length) {
@@ -1136,7 +1115,7 @@ export function CommunityReelsPanel({
       }
       return next;
     });
-  }, [starredSetsHydrated, userSets]);
+  }, [ownedSetIds, starredSetsHydrated]);
 
   useEffect(() => {
     if (!activeSetActionsMenuId) {
@@ -1198,14 +1177,10 @@ export function CommunityReelsPanel({
   const shouldShowEditSetGrid = isYourSetsMode && !isEditSetEditorOpen && !isCreateSetEditorOpen;
   const shouldShowEditSetForm = isFormEditMode || isFormCreateMode;
   const allSets = useMemo(() => [...userSets, ...DEFAULT_COMMUNITY_SETS], [userSets]);
+  const ownedSetIdSet = useMemo(() => new Set(ownedSetIds), [ownedSetIds]);
   const editableSets = useMemo(
-    () =>
-      userSets.filter((set) => {
-        const id = set.id.trim();
-        const curator = set.curator.trim().toLowerCase();
-        return id.startsWith(USER_CREATED_SET_ID_PREFIX) || curator === "you";
-      }),
-    [userSets],
+    () => userSets.filter((set) => ownedSetIdSet.has(set.id)),
+    [ownedSetIdSet, userSets],
   );
   const starredSetIdSet = useMemo(() => new Set(starredSetIds), [starredSetIds]);
   const orderedEditableSets = useMemo(() => {
@@ -1971,6 +1946,16 @@ export function CommunityReelsPanel({
       });
       return;
     }
+    if (file.size > MAX_THUMBNAIL_FILE_BYTES) {
+      setCreateSuccess(null);
+      setPublishResultModal({
+        status: "error",
+        label: isFormEditMode ? "Save Set Changes" : "Post Community Set",
+        title: "Thumbnail Too Large",
+        message: "Thumbnail image must be 1.5 MB or smaller.",
+      });
+      return;
+    }
     const reader = new FileReader();
     reader.onload = () => {
       if (typeof reader.result === "string") {
@@ -2142,6 +2127,7 @@ export function CommunityReelsPanel({
           thumbnailUrl: thumbnailPreview,
           curator: "You",
         });
+        setOwnedSetIds((prev) => (prev.includes(createdSet.id) ? prev : [createdSet.id, ...prev]));
         setUserSets((prev) => [createdSet, ...prev.filter((item) => item.id !== createdSet.id)].slice(0, MAX_USER_SETS));
         clearCreateSetDraftProgress();
         resetCreateSetForm();
@@ -2536,6 +2522,7 @@ export function CommunityReelsPanel({
     try {
       await deleteCommunitySet({ setId: normalized });
       setUserSets((prev) => prev.filter((set) => set.id !== normalized));
+      setOwnedSetIds((prev) => prev.filter((id) => id !== normalized));
       setStarredSetIds((prev) => prev.filter((id) => id !== normalized));
       if (typeof window !== "undefined") {
         window.localStorage.removeItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${normalized}`);
@@ -3358,9 +3345,23 @@ export function CommunityReelsPanel({
         <>
           <div className="flex min-h-0 flex-1 flex-col pt-1 md:pt-2">
             <div className="shrink-0">
-              <div className="flex flex-col gap-3 md:-mx-2 md:flex-row md:items-center md:justify-between md:gap-4 lg:-mx-3">
-                <div className="w-full pl-5 sm:pl-6 md:w-auto md:pl-6 lg:pl-2">
-                  <div className="flex items-center justify-center gap-2 md:justify-start">
+              <div
+                className={`flex gap-3 md:-mx-2 md:flex-row md:items-center md:justify-between md:gap-4 lg:-mx-3 ${
+                  isYourSetsMode && shouldShowEditSetGrid ? "flex-row items-center justify-between" : "flex-col"
+                }`}
+              >
+                <div
+                  className={
+                    isYourSetsMode && shouldShowEditSetGrid
+                      ? "min-w-0 flex-1 pl-2 md:w-auto md:pl-2 lg:pl-2"
+                      : "w-full pl-5 sm:pl-6 md:w-auto md:pl-6 lg:pl-2"
+                  }
+                >
+                  <div
+                    className={`flex items-center gap-2 md:justify-start ${
+                      isYourSetsMode && shouldShowEditSetGrid ? "justify-start" : "justify-center"
+                    }`}
+                  >
                     {isYourSetsMode && shouldShowEditSetForm ? (
                       <button
                         type="button"
@@ -3384,7 +3385,7 @@ export function CommunityReelsPanel({
                   </div>
                 </div>
                 {isYourSetsMode && shouldShowEditSetGrid ? (
-                  <div className="flex items-center justify-center pr-5 sm:pr-6 md:justify-end md:pr-6 lg:pr-2">
+                  <div className="flex items-center justify-center pr-2 sm:pr-2 md:justify-end md:pr-2 lg:pr-2">
                     <button
                       type="button"
                       onClick={onOpenCreateSetFromGrid}
@@ -3514,7 +3515,7 @@ export function CommunityReelsPanel({
                             })}
                           </div>
                         ) : (
-                          <p className="mt-4 rounded-xl border border-[#2b2b2b] bg-black/35 px-3 py-4 text-sm text-white/66">
+                          <p className="mt-4 text-sm text-white/66">
                             No sets yet. Use Create Set to publish your first one.
                           </p>
                         )}

@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -32,13 +33,14 @@ def _cache_key(*parts: str) -> str:
 def parse_iso8601_duration(value: str) -> int:
     if not value:
         return 0
-    match = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", value)
+    match = re.match(r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$", value)
     if not match:
         return 0
-    hours = int(match.group(1) or 0)
-    minutes = int(match.group(2) or 0)
-    seconds = int(match.group(3) or 0)
-    return hours * 3600 + minutes * 60 + seconds
+    days = int(match.group(1) or 0)
+    hours = int(match.group(2) or 0)
+    minutes = int(match.group(3) or 0)
+    seconds = int(match.group(4) or 0)
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
 class YouTubeService:
@@ -64,6 +66,7 @@ class YouTubeService:
         self.transcript_api = YouTubeTranscriptApi()
         self.empty_transcript_ttl_sec = 6 * 60 * 60
         self._network_backoff_until = 0.0
+        self._network_backoff_lock = threading.Lock()
         self.serverless_mode = bool(
             os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
         )
@@ -1107,6 +1110,9 @@ class YouTubeService:
 
         return None
 
+    def extract_video_id_from_url(self, value: str) -> str | None:
+        return self._extract_video_id_from_url(value)
+
     def _video_details(self, video_ids: list[str], deadline: float | None = None) -> dict[str, dict[str, Any]]:
         if not self.api_key or not video_ids:
             return {}
@@ -1134,6 +1140,9 @@ class YouTubeService:
                 if payload:
                     result.update(payload)
         return result
+
+    def video_details(self, video_ids: list[str], deadline: float | None = None) -> dict[str, dict[str, Any]]:
+        return self._video_details(video_ids, deadline=deadline)
 
     def _video_details_batch(self, batch: list[str], deadline: float | None) -> dict[str, dict[str, Any]]:
         if not batch or self._deadline_exceeded(deadline) or self._network_backoff_active():
@@ -1185,16 +1194,18 @@ class YouTubeService:
         return max(0.2, min(self.request_timeout_sec, remaining))
 
     def _network_backoff_active(self) -> bool:
-        return time.monotonic() < self._network_backoff_until
+        with self._network_backoff_lock:
+            return time.monotonic() < self._network_backoff_until
 
     def _note_request_failure(self, exc: requests.RequestException) -> None:
         # Treat transport-level failures (DNS/connect/timeouts) as transient outages.
         if getattr(exc, "response", None) is not None:
             return
-        self._network_backoff_until = max(
-            self._network_backoff_until,
-            time.monotonic() + self.NETWORK_BACKOFF_SEC,
-        )
+        with self._network_backoff_lock:
+            self._network_backoff_until = max(
+                self._network_backoff_until,
+                time.monotonic() + self.NETWORK_BACKOFF_SEC,
+            )
 
     def get_transcript(self, conn, video_id: str) -> list[dict[str, Any]]:
         if conn is None:

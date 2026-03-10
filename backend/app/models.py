@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ConceptOut(BaseModel):
@@ -123,7 +123,7 @@ class FeedbackResponse(BaseModel):
 
 
 class ChatMessageIn(BaseModel):
-    role: str
+    role: Literal["user", "assistant"]
     content: str
 
 
@@ -144,6 +144,14 @@ class CommunityReelIn(BaseModel):
     embed_url: str = Field(min_length=1)
     t_start_sec: float | None = Field(default=None, ge=0)
     t_end_sec: float | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def validate_clip_range(self) -> "CommunityReelIn":
+        if self.t_end_sec is not None:
+            start = self.t_start_sec if self.t_start_sec is not None else 0.0
+            if self.t_end_sec <= start:
+                raise ValueError("t_end_sec must be greater than t_start_sec.")
+        return self
 
 
 class CommunityReelOut(BaseModel):

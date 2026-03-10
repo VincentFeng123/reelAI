@@ -41,8 +41,27 @@ def chunk_transcript(entries: list[dict], target_sec: int = 22, min_sec: int = 1
 
         if start is None:
             start = t0
-        end = t1
-        texts.append(text)
+            end = t1
+            texts.append(text)
+        else:
+            current_length = (end - start) if end is not None else 0.0
+            next_length = t1 - start
+            if texts and next_length > max_sec and current_length >= min_sec:
+                chunks.append(
+                    TranscriptChunk(
+                        chunk_index=idx,
+                        t_start=float(start),
+                        t_end=float(end),
+                        text=" ".join(texts),
+                    )
+                )
+                idx += 1
+                start = t0
+                end = t1
+                texts = [text]
+            else:
+                end = t1
+                texts.append(text)
 
         length = (end - start) if start is not None and end is not None else 0.0
         if length >= target_sec or length >= max_sec:
@@ -130,12 +149,21 @@ def merge_adjacent(matches: list[SegmentMatch], max_total_sec: int = 60) -> list
 
     bounded: list[SegmentMatch] = []
     for m in merged:
-        length = m.t_end - m.t_start
+        adjusted_end = m.t_end
+        length = adjusted_end - m.t_start
         if length < 15:
-            m.t_end = m.t_start + 15
-        if m.t_end - m.t_start > 60:
-            m.t_end = m.t_start + 60
-        bounded.append(m)
+            adjusted_end = m.t_start + 15
+        if adjusted_end - m.t_start > 60:
+            adjusted_end = m.t_start + 60
+        bounded.append(
+            SegmentMatch(
+                chunk_index=m.chunk_index,
+                t_start=m.t_start,
+                t_end=adjusted_end,
+                text=m.text,
+                score=m.score,
+            )
+        )
     return bounded
 
 

@@ -3,16 +3,18 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import numpy as np
 from openai import OpenAI
 
 from ..config import get_settings
-from ..db import dumps_json, fetch_all, fetch_one, now_iso, upsert
+from ..db import DatabaseIntegrityError, dumps_json, fetch_all, fetch_one, now_iso, upsert
 from .concepts import build_takeaways
 from .segmenter import (
     SegmentMatch,
@@ -166,6 +168,7 @@ class ReelService:
             os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
         )
         self._strategy_history_cache: dict[str, float] = {}
+        self._strategy_history_cache_lock = threading.Lock()
         allow_openai_serverless = os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1"
         can_use_openai = (
             bool(settings.openai_enabled)
@@ -1034,9 +1037,21 @@ class ReelService:
         safe_target = max(safe_min, min(safe_max, safe_target))
         return safe_min, safe_max, safe_target
 
+    def _parse_embedding_vector(self, raw_value: object) -> np.ndarray | None:
+        if not raw_value:
+            return None
+        try:
+            vector = np.array(json.loads(str(raw_value)), dtype=np.float32)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if vector.ndim != 1 or vector.size != self.embedding_service.dim:
+            return None
+        return vector
+
     def _get_concept_embedding(self, conn, concept: dict[str, Any]) -> np.ndarray:
-        if concept.get("embedding_json"):
-            return np.array(json.loads(concept["embedding_json"]), dtype=np.float32)
+        parsed_embedding = self._parse_embedding_vector(concept.get("embedding_json"))
+        if parsed_embedding is not None:
+            return parsed_embedding
 
         parsed_keywords = self._parse_keywords_json(concept.get("keywords_json"))
         concept_text = (
@@ -1052,19 +1067,20 @@ class ReelService:
         )
         if not existing:
             raise ValueError(f"Concept not found: {concept['id']}")
-        upsert(
-            conn,
-            "concepts",
-            {
-                "id": concept["id"],
-                "material_id": existing["material_id"],
-                "title": concept["title"],
-                "keywords_json": concept["keywords_json"],
-                "summary": concept["summary"],
-                "embedding_json": dumps_json(embedding.tolist()),
-                "created_at": existing["created_at"],
-            },
-        )
+        if self.embedding_service.should_persist_replacement(concept.get("embedding_json")):
+            upsert(
+                conn,
+                "concepts",
+                {
+                    "id": concept["id"],
+                    "material_id": existing["material_id"],
+                    "title": concept["title"],
+                    "keywords_json": concept["keywords_json"],
+                    "summary": concept["summary"],
+                    "embedding_json": dumps_json(embedding.tolist()),
+                    "created_at": existing["created_at"],
+                },
+            )
         return embedding
 
     def _init_retrieval_debug_run(self, material_id: str, concept_id: str, concept_title: str) -> dict[str, Any]:
@@ -1713,7 +1729,8 @@ class ReelService:
 
     def _learned_strategy_factor(self, conn, strategy: str) -> float:
         key = str(strategy or "").strip().lower() or "literal"
-        cached = self._strategy_history_cache.get(key)
+        with self._strategy_history_cache_lock:
+            cached = self._strategy_history_cache.get(key)
         if cached is not None:
             return cached
 
@@ -1739,8 +1756,12 @@ class ReelService:
         kept_ratio = float((row or {}).get("kept_ratio") or 0.0)
         # Map historical keep ratio into a soft multiplicative factor.
         factor = max(0.85, min(1.18, 0.9 + 0.45 * kept_ratio))
-        self._strategy_history_cache[key] = factor
-        return factor
+        with self._strategy_history_cache_lock:
+            existing = self._strategy_history_cache.get(key)
+            if existing is not None:
+                return existing
+            self._strategy_history_cache[key] = factor
+            return factor
 
     def _infer_channel_tier(self, channel: str, title: str) -> str:
         hay = f"{channel} {title}"
@@ -2390,7 +2411,9 @@ class ReelService:
         return min(0.42, penalty)
 
     def _clip_key(self, video_id: str, t_start: float, t_end: float) -> str:
-        return f"{video_id}:{int(float(t_start))}:{int(float(t_end))}"
+        start = Decimal(str(float(t_start))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        end = Decimal(str(float(t_end))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return f"{video_id}:{start}:{end}"
 
     def _order_concepts(self, conn, material_id: str, concepts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         concept_counts = {
@@ -2464,10 +2487,10 @@ class ReelService:
     ) -> tuple[list[TranscriptChunk], np.ndarray]:
         rows = fetch_all(
             conn,
-            "SELECT chunk_index, t_start, t_end, text, embedding_json FROM transcript_chunks WHERE video_id = ? ORDER BY chunk_index ASC",
+            "SELECT id, chunk_index, t_start, t_end, text, embedding_json, created_at FROM transcript_chunks WHERE video_id = ? ORDER BY chunk_index ASC",
             (video_id,),
         )
-        if rows and all(row.get("embedding_json") for row in rows):
+        if rows:
             chunks = [
                 TranscriptChunk(
                     chunk_index=int(r["chunk_index"]),
@@ -2477,7 +2500,30 @@ class ReelService:
                 )
                 for r in rows
             ]
-            embeddings = np.array([json.loads(r["embedding_json"]) for r in rows], dtype=np.float32)
+            parsed_embeddings = [self._parse_embedding_vector(r.get("embedding_json")) for r in rows]
+            if all(embedding is not None for embedding in parsed_embeddings):
+                embeddings = np.array(parsed_embeddings, dtype=np.float32)
+                return chunks, embeddings
+
+            texts = [chunk.text for chunk in chunks]
+            embeddings = self.embedding_service.embed_texts(conn, texts)
+            for row, chunk, emb in zip(rows, chunks, embeddings):
+                if not self.embedding_service.should_persist_replacement(row.get("embedding_json")):
+                    continue
+                upsert(
+                    conn,
+                    "transcript_chunks",
+                    {
+                        "id": str(row["id"]),
+                        "video_id": video_id,
+                        "chunk_index": chunk.chunk_index,
+                        "t_start": chunk.t_start,
+                        "t_end": chunk.t_end,
+                        "text": chunk.text,
+                        "embedding_json": dumps_json(emb.tolist()),
+                        "created_at": str(row.get("created_at") or now_iso()),
+                    },
+                )
             return chunks, embeddings
 
         chunks = chunk_transcript(transcript)
@@ -2854,7 +2900,7 @@ class ReelService:
                     "created_at": now_iso(),
                 },
             )
-        except sqlite3.IntegrityError:
+        except (sqlite3.IntegrityError, DatabaseIntegrityError):
             # DB-level uniqueness guard: skip duplicates safely if concurrent generation races.
             return None
 
@@ -3254,11 +3300,12 @@ class ReelService:
         rating: int | None,
         saved: bool,
     ) -> None:
+        existing = fetch_one(conn, "SELECT id FROM reel_feedback WHERE reel_id = ?", (reel_id,))
         upsert(
             conn,
             "reel_feedback",
             {
-                "id": str(uuid.uuid4()),
+                "id": str((existing or {}).get("id") or uuid.uuid4()),
                 "reel_id": reel_id,
                 "helpful": 1 if helpful else 0,
                 "confusing": 1 if confusing else 0,
@@ -3266,6 +3313,7 @@ class ReelService:
                 "saved": 1 if saved else 0,
                 "created_at": now_iso(),
             },
+            pk="reel_id",
         )
 
     def ranked_feed(self, conn, material_id: str, fast_mode: bool = False) -> list[dict[str, Any]]:
@@ -3303,7 +3351,24 @@ class ReelService:
             LEFT JOIN reel_feedback f ON f.reel_id = r.id
             WHERE r.material_id = ?
               AND (r.t_end - r.t_start) >= 1
-            GROUP BY r.id, c.title, c.keywords_json, c.summary, c.embedding_json, v.title, v.description
+            GROUP BY
+                r.id,
+                r.concept_id,
+                r.video_id,
+                c.title,
+                c.keywords_json,
+                c.summary,
+                c.embedding_json,
+                v.title,
+                v.description,
+                v.duration_sec,
+                r.video_url,
+                r.t_start,
+                r.t_end,
+                r.transcript_snippet,
+                r.takeaways_json,
+                r.base_score,
+                r.created_at
             """,
             (material_id,),
         )
@@ -3385,10 +3450,7 @@ class ReelService:
                     or ""
                 )
                 if embedding_json:
-                    try:
-                        concept_embedding = np.array(json.loads(embedding_json), dtype=np.float32)
-                    except (TypeError, json.JSONDecodeError):
-                        concept_embedding = None
+                    concept_embedding = self._parse_embedding_vector(embedding_json)
 
             relevance = self._score_text_relevance(
                 conn,

@@ -1,15 +1,19 @@
+import hashlib
 import json
 import ipaddress
 import os
 import re
+import threading
+import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 
@@ -44,6 +48,58 @@ from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8
 settings = get_settings()
 app = FastAPI(title="StudyReels API", version="0.1.0")
 
+
+def _normalize_origin_candidate(raw_origin: str) -> str | None:
+    clean = str(raw_origin or "").strip().rstrip("/")
+    if not clean:
+        return None
+    if "://" not in clean:
+        clean = f"https://{clean}"
+    parsed = urlparse(clean)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
+
+
+def _iter_configured_origin_candidates() -> list[str]:
+    candidates: list[str] = []
+    raw_frontend_origins = os.getenv("FRONTEND_ORIGINS", "")
+    if raw_frontend_origins:
+        candidates.extend(origin.strip() for origin in raw_frontend_origins.split(","))
+    for env_name in (
+        "NEXT_PUBLIC_SITE_URL",
+        "NEXT_PUBLIC_APP_URL",
+        "NEXT_PUBLIC_WEB_URL",
+        "PUBLIC_URL",
+        "APP_URL",
+        "SITE_URL",
+        "WEB_URL",
+        "FRONTEND_URL",
+        "VERCEL_URL",
+        "VERCEL_BRANCH_URL",
+        "VERCEL_PROJECT_PRODUCTION_URL",
+        "RAILWAY_PUBLIC_DOMAIN",
+        "RAILWAY_STATIC_URL",
+    ):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            candidates.append(value)
+    return candidates
+
+
+def _is_hosted_runtime() -> bool:
+    app_env = settings.app_env.strip().lower()
+    return bool(
+        os.getenv("VERCEL")
+        or os.getenv("VERCEL_URL")
+        or os.getenv("RAILWAY_ENVIRONMENT")
+        or os.getenv("RAILWAY_PUBLIC_DOMAIN")
+        or os.getenv("RAILWAY_STATIC_URL")
+        or os.getenv("K_SERVICE")
+        or app_env in {"prod", "production", "staging"}
+    )
+
+
 def _build_allowed_origins() -> list[str]:
     local_defaults = [
         "http://localhost:3000",
@@ -51,16 +107,11 @@ def _build_allowed_origins() -> list[str]:
         "http://localhost:3001",
         "http://127.0.0.1:3001",
     ]
-    env_origins = [
-        origin.strip()
-        for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
-        if origin.strip()
-    ]
-    candidates = [settings.frontend_origin, *local_defaults, *env_origins]
+    candidates = [settings.frontend_origin, *local_defaults, *_iter_configured_origin_candidates()]
     normalized: list[str] = []
     seen: set[str] = set()
     for origin in candidates:
-        clean = str(origin or "").strip().rstrip("/")
+        clean = _normalize_origin_candidate(origin)
         if not clean or clean in seen:
             continue
         seen.add(clean)
@@ -70,6 +121,10 @@ def _build_allowed_origins() -> list[str]:
 
 allowed_origins = _build_allowed_origins()
 allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
+if allow_origin_regex is None and _is_hosted_runtime():
+    # Hosted preview deployments commonly rotate origins. Allow known hosted
+    # platform subdomains by default unless an explicit regex is configured.
+    allow_origin_regex = r"^https://(?:[A-Za-z0-9-]+\.)*(?:vercel\.app|railway\.app)$"
 
 app.add_middleware(
     CORSMiddleware,
@@ -95,7 +150,21 @@ MAX_TARGET_CLIP_DURATION_SEC = 180
 MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC = 15
 MAX_COMMUNITY_REEL_DURATION_SEC = 8 * 60 * 60
 COMMUNITY_REEL_DURATION_TIMEOUT_SEC = 6.0
+MAX_DURATION_FETCH_REDIRECTS = 4
 PRIVATE_HOST_SUFFIXES = (".localhost", ".local", ".internal")
+COMMUNITY_OWNER_HEADER = "x-studyreels-owner-key"
+COMMUNITY_OWNER_KEY_MIN_LENGTH = 24
+MAX_COMMUNITY_THUMBNAIL_DATA_URL_BODY_CHARS = 2_000_000
+RATE_LIMIT_WINDOW_SEC = 60.0
+CHAT_RATE_LIMIT_PER_WINDOW = 20
+MATERIAL_RATE_LIMIT_PER_WINDOW = 8
+REELS_RATE_LIMIT_PER_WINDOW = 12
+FEEDBACK_RATE_LIMIT_PER_WINDOW = 60
+COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW = 12
+COMMUNITY_DURATION_RATE_LIMIT_PER_WINDOW = 30
+_rate_limit_lock = threading.Lock()
+_rate_limit_hits: dict[str, deque[float]] = {}
+_rate_limit_last_sweep = 0.0
 
 
 def _host_matches(host: str, domain: str) -> bool:
@@ -112,14 +181,7 @@ def _is_public_host(host: str) -> bool:
         ip = ipaddress.ip_address(safe_host)
     except ValueError:
         return True
-    return not (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_reserved
-        or ip.is_multicast
-        or ip.is_unspecified
-    )
+    return bool(getattr(ip, "is_global", False))
 
 
 def _normalize_public_http_url(raw_url: str, field_name: str) -> str:
@@ -131,6 +193,112 @@ def _normalize_public_http_url(raw_url: str, field_name: str) -> str:
     if not _is_public_host(host):
         raise HTTPException(status_code=400, detail=f"{field_name} host is not allowed.")
     return urlunparse(parsed._replace(fragment=""))
+
+
+def _normalize_community_thumbnail_url(raw_url: str) -> str:
+    normalized = str(raw_url or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Thumbnail is required.")
+    if normalized.startswith("/"):
+        parsed = urlparse(normalized)
+        if parsed.scheme or parsed.netloc or not parsed.path.startswith("/"):
+            raise HTTPException(status_code=400, detail="thumbnail_url must be a same-origin path, safe data image, or public http(s) URL.")
+        return urlunparse(("", "", parsed.path, "", parsed.query, ""))
+    if normalized.lower().startswith("data:"):
+        header, separator, body = normalized.partition(",")
+        header_lower = header.lower()
+        media_type = header_lower[5:].split(";", 1)[0]
+        if separator != "," or media_type not in {"image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif"} or ";base64" not in header_lower:
+            raise HTTPException(status_code=400, detail="thumbnail_url must be a safe image data URL.")
+        if not body.strip():
+            raise HTTPException(status_code=400, detail="thumbnail_url image data is empty.")
+        if len(body) > MAX_COMMUNITY_THUMBNAIL_DATA_URL_BODY_CHARS:
+            raise HTTPException(status_code=400, detail="thumbnail_url image data is too large.")
+        return normalized
+    return _normalize_public_http_url(normalized, "thumbnail_url")
+
+
+def _parse_ip_literal(raw_value: str) -> str | None:
+    candidate = str(raw_value or "").strip()
+    if not candidate:
+        return None
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return None
+
+
+def _extract_forwarded_ip(request: Request) -> str | None:
+    for header_name in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+        raw = request.headers.get(header_name, "").strip()
+        if not raw:
+            continue
+        candidates = raw.split(",") if header_name == "x-forwarded-for" else [raw]
+        for candidate in candidates:
+            parsed_ip = _parse_ip_literal(candidate)
+            if parsed_ip:
+                return parsed_ip
+    return None
+
+
+def _client_ip(request: Request) -> str:
+    peer_host = request.client.host if request.client and request.client.host else ""
+    if not peer_host:
+        return _extract_forwarded_ip(request) or "unknown"
+    if not _is_public_host(peer_host):
+        return _extract_forwarded_ip(request) or peer_host
+    return peer_host
+
+
+def _sweep_rate_limit_buckets(now: float, window_sec: float) -> None:
+    global _rate_limit_last_sweep
+    if now - _rate_limit_last_sweep < max(window_sec, 30.0):
+        return
+    cutoff = now - window_sec
+    stale_keys: list[str] = []
+    for current_key, current_bucket in _rate_limit_hits.items():
+        while current_bucket and current_bucket[0] <= cutoff:
+            current_bucket.popleft()
+        if not current_bucket:
+            stale_keys.append(current_key)
+    for stale_key in stale_keys:
+        _rate_limit_hits.pop(stale_key, None)
+    _rate_limit_last_sweep = now
+
+
+def _enforce_rate_limit(request: Request, scope: str, *, limit: int, window_sec: float = RATE_LIMIT_WINDOW_SEC) -> None:
+    if limit <= 0:
+        return
+    now = time.monotonic()
+    key = f"{scope}:{_client_ip(request)}"
+    with _rate_limit_lock:
+        _sweep_rate_limit_buckets(now, window_sec)
+        bucket = _rate_limit_hits.get(key)
+        if bucket is None:
+            bucket = deque()
+            _rate_limit_hits[key] = bucket
+        cutoff = now - window_sec
+        while bucket and bucket[0] <= cutoff:
+            bucket.popleft()
+        if not bucket:
+            _rate_limit_hits.pop(key, None)
+            bucket = deque()
+            _rate_limit_hits[key] = bucket
+        if len(bucket) >= limit:
+            raise HTTPException(status_code=429, detail="Too many requests. Please wait and try again.")
+        bucket.append(now)
+
+
+def _normalize_owner_key(raw_key: str | None) -> str:
+    owner_key = str(raw_key or "").strip()
+    if len(owner_key) < COMMUNITY_OWNER_KEY_MIN_LENGTH:
+        raise HTTPException(status_code=400, detail="Missing or invalid community owner key.")
+    return owner_key
+
+
+def _community_owner_hash_from_request(request: Request) -> str:
+    owner_key = _normalize_owner_key(request.headers.get(COMMUNITY_OWNER_HEADER))
+    return hashlib.sha256(owner_key.encode("utf-8")).hexdigest()
 
 
 def _validate_community_reel_urls(
@@ -221,24 +389,39 @@ def _extract_duration_from_html(html: str) -> float | None:
 
 
 def _fetch_duration_from_source_page(source_url: str) -> float | None:
-    try:
-        response = requests.get(
-            source_url,
-            allow_redirects=False,
-            timeout=COMMUNITY_REEL_DURATION_TIMEOUT_SEC,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        response.raise_for_status()
-    except requests.RequestException:
-        return None
-    html = response.text[:900_000]
-    return _extract_duration_from_html(html)
+    current_url = source_url
+    for _ in range(MAX_DURATION_FETCH_REDIRECTS + 1):
+        try:
+            response = requests.get(
+                current_url,
+                allow_redirects=False,
+                timeout=COMMUNITY_REEL_DURATION_TIMEOUT_SEC,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                    ),
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+        except requests.RequestException:
+            return None
+        if 300 <= response.status_code < 400:
+            location = str(response.headers.get("Location") or "").strip()
+            if not location:
+                return None
+            try:
+                current_url = _normalize_public_http_url(urljoin(current_url, location), "source_url")
+            except HTTPException:
+                return None
+            continue
+        try:
+            response.raise_for_status()
+        except requests.RequestException:
+            return None
+        html = response.text[:900_000]
+        return _extract_duration_from_html(html)
+    return None
 
 
 def _resolve_community_reel_duration_sec(source_url: str) -> float | None:
@@ -246,9 +429,9 @@ def _resolve_community_reel_duration_sec(source_url: str) -> float | None:
     host = (parsed.hostname or "").lower()
 
     if "youtube.com" in host or "youtu.be" in host:
-        video_id = youtube_service._extract_video_id_from_url(source_url)  # noqa: SLF001
+        video_id = youtube_service.extract_video_id_from_url(source_url)
         if video_id:
-            details = youtube_service._video_details([video_id])  # noqa: SLF001
+            details = youtube_service.video_details([video_id])
             duration = _normalize_duration_seconds((details.get(video_id) or {}).get("duration_sec"))
             if duration is not None:
                 return duration
@@ -512,6 +695,11 @@ def on_startup() -> None:
     init_db()
 
 
+@app.get("/")
+def root() -> dict:
+    return {"ok": True, "service": "StudyReels API", "health": "/api/health"}
+
+
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True}
@@ -519,10 +707,12 @@ def health() -> dict:
 
 @app.post("/api/material", response_model=MaterialResponse)
 async def create_material(
+    request: Request,
     file: UploadFile | None = File(default=None),
     text: str | None = Form(default=None),
     subject_tag: str | None = Form(default=None),
 ):
+    _enforce_rate_limit(request, "material", limit=MATERIAL_RATE_LIMIT_PER_WINDOW)
     if not file and not text and not subject_tag:
         raise HTTPException(status_code=400, detail="Provide at least one of: topic, text, or file")
 
@@ -638,7 +828,8 @@ async def create_material(
 
 
 @app.post("/api/reels/generate", response_model=ReelsGenerateResponse)
-def generate_reels(payload: ReelsGenerateRequest):
+def generate_reels(request: Request, payload: ReelsGenerateRequest):
+    _enforce_rate_limit(request, "reels-generate", limit=REELS_RATE_LIMIT_PER_WINDOW)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
     safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
@@ -880,7 +1071,8 @@ def _probe_material_viability(
 
 
 @app.post("/api/reels/can-generate", response_model=ReelsCanGenerateResponse)
-def can_generate_reels(payload: ReelsGenerateRequest):
+def can_generate_reels(request: Request, payload: ReelsGenerateRequest):
+    _enforce_rate_limit(request, "reels-can-generate", limit=REELS_RATE_LIMIT_PER_WINDOW)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
     safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
@@ -948,7 +1140,8 @@ def can_generate_reels(payload: ReelsGenerateRequest):
 
 
 @app.post("/api/reels/can-generate-any", response_model=ReelsCanGenerateAnyResponse)
-def can_generate_reels_any(payload: ReelsCanGenerateAnyRequest):
+def can_generate_reels_any(request: Request, payload: ReelsCanGenerateAnyRequest):
+    _enforce_rate_limit(request, "reels-can-generate-any", limit=REELS_RATE_LIMIT_PER_WINDOW)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
     safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
@@ -1170,16 +1363,6 @@ def feed(
                     target_clip_duration_min_sec=safe_target_clip_min_sec,
                     target_clip_duration_max_sec=safe_target_clip_max_sec,
                 )
-        else:
-            filtered_ranked = _filter_reels_by_min_relevance(ranked, safe_min_relevance)
-            filtered_ranked = _filter_reels_by_video_preferences(
-                filtered_ranked,
-                preferred_video_duration=safe_video_duration_pref,
-                target_clip_duration_sec=safe_target_clip_duration_sec,
-                target_clip_duration_min_sec=safe_target_clip_min_sec,
-                target_clip_duration_max_sec=safe_target_clip_max_sec,
-            )
-
     total = len(filtered_ranked)
     start = (page - 1) * limit
     end = start + limit
@@ -1189,7 +1372,8 @@ def feed(
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(payload: ChatRequest):
+def chat(request: Request, payload: ChatRequest):
+    _enforce_rate_limit(request, "chat", limit=CHAT_RATE_LIMIT_PER_WINDOW)
     history = [{"role": m.role, "content": m.content} for m in payload.history]
     answer = material_intelligence_service.chat_assistant(
         message=payload.message,
@@ -1201,8 +1385,9 @@ def chat(payload: ChatRequest):
 
 
 @app.post("/api/reels/feedback", response_model=FeedbackResponse)
-def feedback(payload: FeedbackRequest):
-    with get_conn() as conn:
+def feedback(request: Request, payload: FeedbackRequest):
+    _enforce_rate_limit(request, "feedback", limit=FEEDBACK_RATE_LIMIT_PER_WINDOW)
+    with get_conn(transactional=True) as conn:
         exists = fetch_all(conn, "SELECT id FROM reels WHERE id = ?", (payload.reel_id,))
         if not exists:
             raise HTTPException(status_code=404, detail="reel_id not found")
@@ -1220,7 +1405,8 @@ def feedback(payload: FeedbackRequest):
 
 
 @app.get("/api/community/reels/duration")
-def get_community_reel_duration(source_url: str):
+def get_community_reel_duration(request: Request, source_url: str):
+    _enforce_rate_limit(request, "community-duration", limit=COMMUNITY_DURATION_RATE_LIMIT_PER_WINDOW)
     normalized_url = source_url.strip()
     if not normalized_url:
         raise HTTPException(status_code=400, detail="source_url is required.")
@@ -1263,7 +1449,9 @@ def list_community_sets(limit: int = 160):
 
 
 @app.post("/api/community/sets", response_model=CommunitySetOut, status_code=201)
-def create_community_set(payload: CommunitySetCreateRequest):
+def create_community_set(request: Request, payload: CommunitySetCreateRequest):
+    _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
+    owner_key_hash = _community_owner_hash_from_request(request)
     title = payload.title.strip()
     description = payload.description.strip()
     thumbnail_url = payload.thumbnail_url.strip()
@@ -1273,6 +1461,7 @@ def create_community_set(payload: CommunitySetCreateRequest):
         raise HTTPException(status_code=400, detail="Description must be at least 18 characters.")
     if not thumbnail_url:
         raise HTTPException(status_code=400, detail="Thumbnail is required.")
+    thumbnail_url = _normalize_community_thumbnail_url(thumbnail_url)
     if not payload.reels:
         raise HTTPException(status_code=400, detail="Add at least one reel URL.")
 
@@ -1312,7 +1501,7 @@ def create_community_set(payload: CommunitySetCreateRequest):
     created_at = now_iso()
     updated_label = "Last Edited: just now"
 
-    with get_conn() as conn:
+    with get_conn(transactional=True) as conn:
         upsert(
             conn,
             "community_sets",
@@ -1328,6 +1517,7 @@ def create_community_set(payload: CommunitySetCreateRequest):
                 "learners": 1,
                 "updated_label": updated_label,
                 "thumbnail_url": thumbnail_url,
+                "owner_key_hash": owner_key_hash,
                 "featured": 0,
                 "created_at": created_at,
                 "updated_at": created_at,
@@ -1365,7 +1555,9 @@ def create_community_set(payload: CommunitySetCreateRequest):
 
 
 @app.put("/api/community/sets/{set_id}", response_model=CommunitySetOut)
-def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
+def update_community_set(request: Request, set_id: str, payload: CommunitySetUpdateRequest):
+    _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
+    owner_key_hash = _community_owner_hash_from_request(request)
     normalized_set_id = set_id.strip()
     if not normalized_set_id:
         raise HTTPException(status_code=400, detail="set_id is required.")
@@ -1381,6 +1573,7 @@ def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
         raise HTTPException(status_code=400, detail="Description must be at least 18 characters.")
     if not thumbnail_url:
         raise HTTPException(status_code=400, detail="Thumbnail is required.")
+    thumbnail_url = _normalize_community_thumbnail_url(thumbnail_url)
     if not payload.reels:
         raise HTTPException(status_code=400, detail="Add at least one reel URL.")
 
@@ -1418,13 +1611,14 @@ def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
     updated_at = now_iso()
     updated_label = "Last Edited: just now"
 
-    with get_conn() as conn:
+    with get_conn(transactional=True) as conn:
         existing_rows = fetch_all(
             conn,
             """
             SELECT
                 id,
                 curator,
+                owner_key_hash,
                 likes,
                 learners,
                 featured,
@@ -1440,6 +1634,9 @@ def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
         existing = existing_rows[0]
         if _to_int(existing.get("featured"), 0) != 0:
             raise HTTPException(status_code=403, detail="Featured sets cannot be edited.")
+        stored_owner_key_hash = str(existing.get("owner_key_hash") or "").strip()
+        if stored_owner_key_hash and stored_owner_key_hash != owner_key_hash:
+            raise HTTPException(status_code=403, detail="You do not have permission to edit this community set.")
 
         existing_curator = str(existing.get("curator") or "").strip()
         curator = (payload.curator or "").strip() or existing_curator or "Community member"
@@ -1460,6 +1657,7 @@ def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
                 "learners": max(0, _to_int(existing.get("learners"), 1)),
                 "updated_label": updated_label,
                 "thumbnail_url": thumbnail_url,
+                "owner_key_hash": stored_owner_key_hash or owner_key_hash,
                 "featured": 0,
                 "created_at": created_at,
                 "updated_at": updated_at,
@@ -1496,19 +1694,20 @@ def update_community_set(set_id: str, payload: CommunitySetUpdateRequest):
     return _serialize_community_set(updated_rows[0])
 
 
-def _delete_community_set_impl(set_id: str) -> Response:
+def _delete_community_set_impl(request: Request, set_id: str) -> Response:
+    owner_key_hash = _community_owner_hash_from_request(request)
     normalized_set_id = set_id.strip()
     if not normalized_set_id:
         raise HTTPException(status_code=400, detail="set_id is required.")
     if not normalized_set_id.startswith("user-set-"):
         raise HTTPException(status_code=403, detail="Only user-created sets can be deleted.")
-
-    with get_conn() as conn:
+    with get_conn(transactional=True) as conn:
         existing_rows = fetch_all(
             conn,
             """
             SELECT
                 id,
+                owner_key_hash,
                 featured
             FROM community_sets
             WHERE id = ?
@@ -1521,6 +1720,9 @@ def _delete_community_set_impl(set_id: str) -> Response:
         existing = existing_rows[0]
         if _to_int(existing.get("featured"), 0) != 0:
             raise HTTPException(status_code=403, detail="Featured sets cannot be deleted.")
+        stored_owner_key_hash = str(existing.get("owner_key_hash") or "").strip()
+        if stored_owner_key_hash and stored_owner_key_hash != owner_key_hash:
+            raise HTTPException(status_code=403, detail="You do not have permission to delete this community set.")
 
         deleted_count = 0
         if conn.__class__.__module__.startswith("psycopg"):
@@ -1543,20 +1745,22 @@ def _delete_community_set_impl(set_id: str) -> Response:
                 (normalized_set_id,),
             )
             if still_exists:
-                raise HTTPException(status_code=404, detail="Community set not found.")
+                raise HTTPException(status_code=500, detail="Community set delete did not persist.")
 
     return Response(status_code=204)
 
 
 @app.delete("/api/community/sets/{set_id}", status_code=204)
-def delete_community_set(set_id: str):
-    return _delete_community_set_impl(set_id)
+def delete_community_set(request: Request, set_id: str):
+    _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
+    return _delete_community_set_impl(request, set_id)
 
 
 @app.post("/api/community/sets/{set_id}/delete", status_code=204)
-def delete_community_set_via_post(set_id: str):
+def delete_community_set_via_post(request: Request, set_id: str):
     # Fallback for deployments/proxies that block DELETE with 405.
-    return _delete_community_set_impl(set_id)
+    _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
+    return _delete_community_set_impl(request, set_id)
 
 
 def _register_non_api_route_aliases() -> None:
