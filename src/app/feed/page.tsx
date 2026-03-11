@@ -468,6 +468,7 @@ function FeedPageInner() {
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [invalidCommunityHandoff, setInvalidCommunityHandoff] = useState(false);
   const [generatingMore, setGeneratingMore] = useState(false);
   const [bootstrappingFirstReels, setBootstrappingFirstReels] = useState(false);
   const [canRequestMore, setCanRequestMore] = useState(true);
@@ -907,6 +908,7 @@ function FeedPageInner() {
       resumeLoadingRef.current = false;
       let communityRows = communityPreviewReel ? [communityPreviewReel] : [];
       let preferredCommunityReelId = communityPreviewReel?.reel_id || "";
+      let handoffMissing = false;
       if (typeof window !== "undefined" && communityHandoffIdParam) {
         const storageKey = `${COMMUNITY_SET_FEED_HANDOFF_PREFIX}${communityHandoffIdParam}`;
         const handoffPayload = parseCommunityFeedHandoff(window.sessionStorage.getItem(storageKey));
@@ -919,10 +921,15 @@ function FeedPageInner() {
               selectedReelId
                 ? buildCommunityFeedReelId(handoffPayload.setId, selectedReelId)
                 : handoffRows[0].reel_id;
+          } else if (!communityPreviewReel) {
+            handoffMissing = true;
           }
+        } else if (!communityPreviewReel) {
+          handoffMissing = true;
         }
         window.sessionStorage.removeItem(storageKey);
       }
+      setInvalidCommunityHandoff(handoffMissing && communityRows.length === 0);
       setReels(communityRows);
       setPage(1);
       setTotal(communityRows.length);
@@ -950,6 +957,7 @@ function FeedPageInner() {
       setLoading(false);
       return;
     }
+    setInvalidCommunityHandoff(false);
     if (hydratedMaterialIdRef.current === materialId) {
       return;
     }
@@ -1908,6 +1916,24 @@ function FeedPageInner() {
     }
     router.push(feedFallbackPath);
   }, [feedFallbackPath, returnTabParam, router]);
+
+  if (!materialId && !communityPreviewReel && invalidCommunityHandoff) {
+    return (
+      <main className="fixed inset-0 px-6 md:inset-4">
+        <div className="flex h-full items-center justify-center">
+          <div className="rounded-3xl border border-white/25 bg-black/60 p-6 text-center text-white backdrop-blur-sm">
+            <p className="text-sm">Community reel preview expired. Reopen this set from the Community tab.</p>
+            <button
+              className="mt-4 rounded-2xl border border-white/25 bg-white px-4 py-2 text-xs font-semibold text-black"
+              onClick={navigateBackToPreviousPage}
+            >
+              Back to Community
+            </button>
+          </div>
+        </div>
+      </main>
+    );
+  }
 
   if (!materialId && !communityPreviewReel && !communityHandoffIdParam) {
     return (

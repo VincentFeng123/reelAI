@@ -236,6 +236,7 @@ _db_init_lock = threading.Lock()
 _db_ready = False
 DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 120000
 _SAFE_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+LEGACY_COMMUNITY_OWNER_HASH = "__legacy_unowned__"
 
 
 def _db_path() -> str:
@@ -434,13 +435,22 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS updated_at TEXT")
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS owner_key_hash TEXT")
                 cur.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR BTRIM(updated_at) = ''")
+                cur.execute(
+                    """
+                    UPDATE community_sets
+                    SET owner_key_hash = %s
+                    WHERE owner_key_hash IS NULL OR BTRIM(owner_key_hash) = ''
+                    """,
+                    (LEGACY_COMMUNITY_OWNER_HASH,),
+                )
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             conn.commit()
         _db_ready = True
         return
 
-    with sqlite3.connect(_db_path()) as conn:
+    conn = sqlite3.connect(_db_path())
+    try:
         conn.executescript(SCHEMA)
         # Lightweight schema migration for existing local databases.
         try:
@@ -459,9 +469,22 @@ def init_db() -> None:
             conn.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR TRIM(updated_at) = ''")
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute(
+                """
+                UPDATE community_sets
+                SET owner_key_hash = ?
+                WHERE owner_key_hash IS NULL OR TRIM(owner_key_hash) = ''
+                """,
+                (LEGACY_COMMUNITY_OWNER_HASH,),
+            )
+        except sqlite3.OperationalError:
+            pass
         _migrate_reels_unique_clip_index_sqlite(conn)
         _migrate_reel_feedback_uniqueness_sqlite(conn)
         conn.commit()
+    finally:
+        conn.close()
     _db_ready = True
 
 
@@ -604,6 +627,17 @@ def fetch_one(conn: Any, query: str, params: Iterable[Any] = ()) -> dict[str, An
 
     row = conn.execute(query, tuple(params)).fetchone()
     return dict(row) if row else None
+
+
+def execute_modify(conn: Any, query: str, params: Iterable[Any] = ()) -> int:
+    """Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of affected rows."""
+    if _is_postgres_conn(conn):
+        with conn.cursor() as cur:
+            cur.execute(_adapt_query_for_postgres(query), tuple(params))
+            return int(cur.rowcount or 0)
+
+    cursor = conn.execute(query, tuple(params))
+    return int(getattr(cursor, "rowcount", 0) or 0)
 
 
 def dumps_json(value: Any) -> str:

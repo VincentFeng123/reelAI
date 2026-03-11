@@ -9,6 +9,7 @@ import {
   deleteCommunitySet,
   fetchCommunityReelDuration,
   fetchCommunitySets,
+  fetchOwnedCommunitySets,
   readOwnedCommunitySetIds,
   saveOwnedCommunitySetIds,
   updateCommunitySet,
@@ -204,19 +205,6 @@ const PLATFORM_ICON: Record<ReelPlatform, string> = {
   tiktok: "fa-brands fa-tiktok",
 };
 
-const DETAIL_LOREM_PARAGRAPHS = [
-  "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer luctus, lorem ut porta vehicula, lectus lectus viverra mi, id faucibus turpis est eget augue.",
-  "Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Velit euismod in pellentesque massa placerat duis ultricies lacus sed turpis tincidunt id aliquet.",
-  "Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Egestas integer eget aliquet nibh praesent tristique magna sit.",
-  "Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Cras semper auctor neque vitae tempus quam pellentesque nec nam aliquam.",
-  "Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. Convallis aenean et tortor at risus viverra adipiscing at in tellus.",
-  "Nunc consequat interdum varius sit amet mattis vulputate enim nulla aliquet porttitor lacus luctus accumsan tortor posuere ac ut consequat semper viverra nam libero justo.",
-  "Purus gravida quis blandit turpis cursus in hac habitasse platea dictumst quisque sagittis purus sit amet volutpat consequat mauris nunc congue nisi vitae suscipit tellus.",
-  "Aliquet sagittis id consectetur purus ut faucibus pulvinar elementum integer enim neque volutpat ac tincidunt vitae semper quis lectus nulla at volutpat diam ut venenatis.",
-  "Pharetra pharetra massa massa ultricies mi quis hendrerit dolor magna eget est lorem ipsum dolor sit amet consectetur adipiscing elit pellentesque habitant morbi tristique.",
-  "Amet dictum sit amet justo donec enim diam vulputate ut pharetra sit amet aliquam id diam maecenas ultricies mi eget mauris pharetra et ultrices neque ornare aenean.",
-];
-
 function daysAgoToIso(daysAgo: number): string {
   return new Date(Date.now() - Math.max(0, daysAgo) * DAY_MS).toISOString();
 }
@@ -327,6 +315,50 @@ function formatCompact(value: number): string {
     return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}K`;
   }
   return String(value);
+}
+
+function formatCommunityPlatformSummary(reels: CommunityReelEmbed[]): string {
+  const counts = reels.reduce<Record<ReelPlatform, number>>(
+    (acc, reel) => {
+      acc[reel.platform] += 1;
+      return acc;
+    },
+    { youtube: 0, instagram: 0, tiktok: 0 },
+  );
+  return (Object.entries(counts) as Array<[ReelPlatform, number]>)
+    .filter(([, count]) => count > 0)
+    .map(([platform, count]) => `${count} ${PLATFORM_LABEL[platform]} ${count === 1 ? "reel" : "reels"}`)
+    .join(", ");
+}
+
+function buildCommunitySetInformationParagraphs(set: CommunitySet): string[] {
+  const availableReelCount = set.reels.length;
+  const listedReelCount = Math.max(set.reelCount, availableReelCount);
+  const platformSummary = formatCommunityPlatformSummary(set.reels);
+  const clippedReelCount = set.reels.filter((reel) => {
+    const start = Number(reel.tStartSec ?? 0);
+    const end = Number(reel.tEndSec);
+    return Number.isFinite(end) && end > start;
+  }).length;
+  const tagSummary = set.tags.length > 0
+    ? `Focus tags: ${set.tags.map((tag) => `#${tag}`).join(", ")}.`
+    : "No topic tags were added to this set yet.";
+  const availabilitySummary = availableReelCount > 0
+    ? `This detail view currently includes ${availableReelCount} playable ${availableReelCount === 1 ? "reel" : "reels"}${platformSummary ? ` across ${platformSummary}` : ""}.`
+    : listedReelCount > 0
+      ? `This collection is listed as a ${listedReelCount}-reel study path, but playable reel embeds have not been attached to the detail view yet.`
+      : "Playable reel embeds have not been attached to the detail view yet.";
+  const clipSummary = availableReelCount === 0
+    ? ""
+    : clippedReelCount > 0
+      ? `${clippedReelCount} ${clippedReelCount === 1 ? "reel uses" : "reels use"} explicit clip ranges for faster review.`
+      : "These reels currently open on the original source without saved clip endpoints.";
+
+  return [
+    `${set.curator} curated this set for ${formatCompact(set.learners)} learners, and it has collected ${formatCompact(set.likes)} likes so far.`,
+    availabilitySummary,
+    `${tagSummary}${clipSummary ? ` ${clipSummary}` : ""}`,
+  ];
 }
 
 function parseTimestampMs(value: unknown): number | null {
@@ -1061,11 +1093,22 @@ export function CommunityReelsPanel({
     setStorageHydrated(true);
     void (async () => {
       try {
-        const remoteSets = await fetchCommunitySets();
+        const [remoteSets, ownedSets] = await Promise.all([
+          fetchCommunitySets(),
+          fetchOwnedCommunitySets().catch(() => [] as CommunitySet[]),
+        ]);
         if (cancelled) {
           return;
         }
         setUserSets(remoteSets.slice(0, MAX_USER_SETS));
+        if (ownedSets.length > 0) {
+          const backendOwnedIds = ownedSets.map((s) => s.id);
+          setOwnedSetIds((prev) => {
+            const merged = Array.from(new Set([...prev, ...backendOwnedIds]));
+            saveOwnedCommunitySetIds(merged);
+            return merged;
+          });
+        }
       } catch {
         // Keep local cache fallback if backend is unavailable.
       }
@@ -1858,20 +1901,12 @@ export function CommunityReelsPanel({
     });
   }, [mode, reelDurationByRow]);
 
-  const hasDetectedDurationForRow = useCallback(
-    (rowId: string) => {
-      const durationSec = reelDurationByRow[rowId]?.durationSec;
-      return Number.isFinite(durationSec) && Number(durationSec) > CLIP_SLIDER_MIN_GAP_SEC;
-    },
-    [reelDurationByRow],
-  );
-
   const validDraftReelCount = useMemo(
     () =>
       parsedDraftReels.filter(
-        (row) => row.value.trim() && row.parsed !== null && !row.hasClipRangeError && hasDetectedDurationForRow(row.id),
+        (row) => row.value.trim() && row.parsed !== null && !row.hasClipRangeError,
       ).length,
-    [hasDetectedDurationForRow, parsedDraftReels],
+    [parsedDraftReels],
   );
   const nonEmptyDraftReelCount = useMemo(
     () => parsedDraftReels.filter((row) => row.value.trim()).length,
@@ -1910,8 +1945,6 @@ export function CommunityReelsPanel({
       items.push("Add at least one reel link");
     } else if (invalidDraftReelCount > 0) {
       items.push("Fix invalid reel links or clip ranges");
-    } else if (validDraftReelCount === 0) {
-      items.push("Wait for reel duration detection");
     }
     return items;
   }, [
@@ -2065,7 +2098,7 @@ export function CommunityReelsPanel({
       return false;
     }
     const firstInvalid = nonEmptyRows.find(
-      (row) => row.parsed === null || row.hasClipRangeError || !hasDetectedDurationForRow(row.id),
+      (row) => row.parsed === null || row.hasClipRangeError,
     );
     if (firstInvalid) {
       if (firstInvalid.parsed === null) {
@@ -2074,13 +2107,6 @@ export function CommunityReelsPanel({
           label: actionLabel,
           title: "Invalid Reel Link",
           message: `One or more reel links are invalid. Supported: ${SUPPORTED_PLATFORMS_LABEL}.`,
-        });
-      } else if (!hasDetectedDurationForRow(firstInvalid.id)) {
-        setPublishResultModal({
-          status: "error",
-          label: actionLabel,
-          title: "Duration Not Ready",
-          message: "Wait until each valid reel's video length is detected before posting.",
         });
       } else {
         setPublishResultModal({
@@ -2166,7 +2192,6 @@ export function CommunityReelsPanel({
     activeEditableSet,
     buildCurrentDraftPayload,
     clearCreateSetDraftProgress,
-    hasDetectedDurationForRow,
     isFormEditMode,
     parsedDraftReels,
     resetCreateSetForm,
@@ -3390,8 +3415,8 @@ export function CommunityReelsPanel({
                       </div>
                     ) : null}
                     <div className="mt-3 space-y-3">
-                      {DETAIL_LOREM_PARAGRAPHS.map((paragraph, index) => (
-                        <p key={`${selectedDirectorySet.id}-detail-lorem-${index}`} className="text-sm leading-relaxed text-white/78">
+                      {buildCommunitySetInformationParagraphs(selectedDirectorySet).map((paragraph, index) => (
+                        <p key={`${selectedDirectorySet.id}-detail-info-${index}`} className="text-sm leading-relaxed text-white/78">
                           {paragraph}
                         </p>
                       ))}
@@ -3833,7 +3858,7 @@ export function CommunityReelsPanel({
                               ) : null}
                               {hasInput && hasValidEmbed && !isDurationLoading && !hasDetectedDuration ? (
                                 <p className="mt-2 text-[10px] text-[#ffb4b4]">
-                                  Could not detect video length for this link yet. Slider appears after detection.
+                                  Could not detect video length for this link yet. You can still post it, but trim sliders stay disabled until detection succeeds.
                                 </p>
                               ) : null}
 

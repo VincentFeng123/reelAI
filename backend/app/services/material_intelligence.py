@@ -4,11 +4,10 @@ import os
 import uuid
 from typing import Any
 
-from openai import OpenAI
-
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, now_iso, upsert
 from .concepts import extract_concepts, extract_learning_objectives
+from .openai_client import build_openai_client
 from .text_utils import normalize_whitespace
 
 
@@ -23,7 +22,11 @@ class MaterialIntelligenceService:
             and bool(settings.openai_api_key)
             and (not serverless_mode or allow_openai_serverless)
         )
-        self.client = OpenAI(api_key=settings.openai_api_key, timeout=8.0) if can_use_openai else None
+        self.client = build_openai_client(
+            api_key=settings.openai_api_key,
+            timeout=8.0,
+            enabled=can_use_openai,
+        )
 
     def extract_concepts_and_objectives(
         self,
@@ -307,5 +310,8 @@ class MaterialIntelligenceService:
         return normalize_whitespace(f"{head}\n\n{middle}\n\n{tail}")[:max_chars]
 
     def _cache_key(self, text: str, subject_tag: str | None, max_concepts: int) -> str:
-        payload = f"{self.model}|{max_concepts}|{subject_tag or ''}|{text[:24000]}"
+        normalized_text = normalize_whitespace(text)
+        normalized_subject = normalize_whitespace(subject_tag or "").strip()
+        text_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+        payload = f"{self.model}|{max_concepts}|{normalized_subject}|{text_hash}"
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()

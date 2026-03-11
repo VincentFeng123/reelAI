@@ -18,7 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 
 from .config import get_settings
-from .db import dumps_json, fetch_all, get_conn, init_db, now_iso, upsert
+from .db import LEGACY_COMMUNITY_OWNER_HASH, dumps_json, execute_modify, fetch_all, get_conn, init_db, now_iso, upsert
 from .models import (
     ChatRequest,
     ChatResponse,
@@ -301,6 +301,23 @@ def _community_owner_hash_from_request(request: Request) -> str:
     return hashlib.sha256(owner_key.encode("utf-8")).hexdigest()
 
 
+def _require_community_set_owner_access(
+    stored_owner_key_hash: object,
+    owner_key_hash: str,
+    *,
+    action: str,
+) -> str:
+    normalized_owner_key_hash = str(stored_owner_key_hash or "").strip()
+    if not normalized_owner_key_hash or normalized_owner_key_hash == LEGACY_COMMUNITY_OWNER_HASH:
+        raise HTTPException(
+            status_code=403,
+            detail=f"This community set predates ownership tracking and cannot be {action} automatically.",
+        )
+    if normalized_owner_key_hash != owner_key_hash:
+        raise HTTPException(status_code=403, detail=f"You do not have permission to {action} this community set.")
+    return normalized_owner_key_hash
+
+
 def _validate_community_reel_urls(
     *,
     platform: Literal["youtube", "instagram", "tiktok"],
@@ -508,7 +525,7 @@ def _resolve_target_clip_duration_bounds(
     target_clip_duration_max_sec: int | float | None,
 ) -> tuple[int, int, int]:
     safe_target = _normalize_target_clip_duration_sec(target_clip_duration_sec)
-    default_min = max(10, int(round(safe_target * 0.35)))
+    default_min = max(MIN_TARGET_CLIP_DURATION_SEC, int(round(safe_target * 0.35)))
     default_max = max(default_min + MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC, safe_target)
 
     safe_min = default_min if target_clip_duration_min_sec is None else _normalize_target_clip_duration_sec(
@@ -1448,6 +1465,43 @@ def list_community_sets(limit: int = 160):
     return {"sets": sets}
 
 
+@app.get("/api/community/sets/mine", response_model=CommunitySetsResponse)
+def list_my_community_sets(request: Request, limit: int = 160):
+    """Return only community sets owned by the caller (matched via owner_key_hash)."""
+    owner_key_hash = _community_owner_hash_from_request(request)
+    if not owner_key_hash:
+        return {"sets": []}
+    safe_limit = max(1, min(limit, 300))
+    with get_conn() as conn:
+        rows = fetch_all(
+            conn,
+            """
+            SELECT
+                id,
+                title,
+                description,
+                tags_json,
+                reels_json,
+                reel_count,
+                curator,
+                likes,
+                learners,
+                updated_label,
+                updated_at,
+                thumbnail_url,
+                featured,
+                created_at
+            FROM community_sets
+            WHERE owner_key_hash = ?
+            ORDER BY COALESCE(NULLIF(updated_at, ''), created_at) DESC
+            LIMIT ?
+            """,
+            (owner_key_hash, safe_limit),
+        )
+    sets = [_serialize_community_set(row) for row in rows]
+    return {"sets": sets}
+
+
 @app.post("/api/community/sets", response_model=CommunitySetOut, status_code=201)
 def create_community_set(request: Request, payload: CommunitySetCreateRequest):
     _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
@@ -1634,9 +1688,11 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
         existing = existing_rows[0]
         if _to_int(existing.get("featured"), 0) != 0:
             raise HTTPException(status_code=403, detail="Featured sets cannot be edited.")
-        stored_owner_key_hash = str(existing.get("owner_key_hash") or "").strip()
-        if stored_owner_key_hash and stored_owner_key_hash != owner_key_hash:
-            raise HTTPException(status_code=403, detail="You do not have permission to edit this community set.")
+        stored_owner_key_hash = _require_community_set_owner_access(
+            existing.get("owner_key_hash"),
+            owner_key_hash,
+            action="edit",
+        )
 
         existing_curator = str(existing.get("curator") or "").strip()
         curator = (payload.curator or "").strip() or existing_curator or "Community member"
@@ -1657,7 +1713,7 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
                 "learners": max(0, _to_int(existing.get("learners"), 1)),
                 "updated_label": updated_label,
                 "thumbnail_url": thumbnail_url,
-                "owner_key_hash": stored_owner_key_hash or owner_key_hash,
+                "owner_key_hash": stored_owner_key_hash,
                 "featured": 0,
                 "created_at": created_at,
                 "updated_at": updated_at,
@@ -1720,18 +1776,13 @@ def _delete_community_set_impl(request: Request, set_id: str) -> Response:
         existing = existing_rows[0]
         if _to_int(existing.get("featured"), 0) != 0:
             raise HTTPException(status_code=403, detail="Featured sets cannot be deleted.")
-        stored_owner_key_hash = str(existing.get("owner_key_hash") or "").strip()
-        if stored_owner_key_hash and stored_owner_key_hash != owner_key_hash:
-            raise HTTPException(status_code=403, detail="You do not have permission to delete this community set.")
+        _require_community_set_owner_access(
+            existing.get("owner_key_hash"),
+            owner_key_hash,
+            action="delete",
+        )
 
-        deleted_count = 0
-        if conn.__class__.__module__.startswith("psycopg"):
-            with conn.cursor() as cur:  # type: ignore[attr-defined]
-                cur.execute("DELETE FROM community_sets WHERE id = %s", (normalized_set_id,))
-                deleted_count = int(cur.rowcount or 0)
-        else:
-            cursor = conn.execute("DELETE FROM community_sets WHERE id = ?", (normalized_set_id,))  # type: ignore[attr-defined]
-            deleted_count = int(getattr(cursor, "rowcount", 0) or 0)
+        deleted_count = execute_modify(conn, "DELETE FROM community_sets WHERE id = ?", (normalized_set_id,))
 
         if deleted_count <= 0:
             still_exists = fetch_all(

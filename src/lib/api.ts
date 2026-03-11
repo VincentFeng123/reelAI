@@ -543,6 +543,16 @@ export async function fetchCommunitySets(): Promise<CommunitySet[]> {
   return rows.map(normalizeCommunitySet).filter(Boolean) as CommunitySet[];
 }
 
+export async function fetchOwnedCommunitySets(): Promise<CommunitySet[]> {
+  const res = await safeFetch(apiUrl("/community/sets/mine"), {
+    cache: "no-store",
+    headers: { ...communityOwnerHeaders() },
+  });
+  const json = await parseJsonResponse<{ sets?: unknown[] }>(res);
+  const rows = Array.isArray(json?.sets) ? json.sets : [];
+  return rows.map(normalizeCommunitySet).filter(Boolean) as CommunitySet[];
+}
+
 export async function createCommunitySet(params: {
   title: string;
   description: string;

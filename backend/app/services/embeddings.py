@@ -6,10 +6,10 @@ import os
 from typing import Iterable
 
 import numpy as np
-from openai import OpenAI
 
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, now_iso, upsert
+from .openai_client import build_openai_client
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,11 @@ class EmbeddingService:
             and bool(settings.openai_api_key)
             and (not serverless_mode or allow_openai_serverless)
         )
-        self.client = OpenAI(api_key=settings.openai_api_key, timeout=8.0) if can_use_openai else None
+        self.client = build_openai_client(
+            api_key=settings.openai_api_key,
+            timeout=8.0,
+            enabled=can_use_openai,
+        )
         self.dim = 1536 if self.client else 256
 
     def embed_texts(self, conn, texts: Iterable[str]) -> np.ndarray:
@@ -100,8 +104,9 @@ class EmbeddingService:
             return None, True
         if vec.size == self.dim:
             return self._normalize(vec), True
-        # Preserve higher-dimensional cached vectors when OpenAI is temporarily unavailable.
-        return None, self.client is not None
+        # Dimension mismatch — always allow replacement so the cache stays usable.
+        # When OpenAI is re-enabled, 256-dim entries will be replaced with 1536-dim ones.
+        return None, True
 
     def _embed_openai(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
         vectors: list[list[float]] = []

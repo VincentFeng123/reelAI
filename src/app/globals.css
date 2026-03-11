@@ -22,9 +22,9 @@ body {
   overflow: hidden;
 }
 
-html,
-body,
-body * {
+button,
+label,
+[role="button"] {
   -webkit-user-select: none;
   -moz-user-select: none;
   user-select: none;

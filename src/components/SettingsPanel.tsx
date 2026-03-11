@@ -977,7 +977,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                     >
                       <span
                         aria-hidden="true"
-                        className="pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 rounded-full border border-black/35 bg-white shadow-[0_0_0_3px_rgba(255,255,255,0.2)]"
+                        className="pointer-events-none absolute left-1/2 top-1/2 h-6 w-6 rounded-full border border-black/35 bg-white shadow-[0_0_0_3px_rgba(255,255,255,0.2)] md:h-4 md:w-4"
                         style={{
                           transform: `translate(calc(-50% + ${relevanceDialKnobX}px), calc(-50% + ${relevanceDialKnobY}px))`,
                         }}
@@ -1117,14 +1117,14 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                     >
                       <span
                         aria-hidden="true"
-                        className="pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 rounded-full border border-black/35 bg-white shadow-[0_0_0_3px_rgba(255,255,255,0.2)]"
+                        className="pointer-events-none absolute left-1/2 top-1/2 h-6 w-6 rounded-full border border-black/35 bg-white shadow-[0_0_0_3px_rgba(255,255,255,0.2)] md:h-4 md:w-4"
                         style={{
                           transform: `translate(calc(-50% + ${clipMinKnobX}px), calc(-50% + ${clipMinKnobY}px))`,
                         }}
                       />
                       <span
                         aria-hidden="true"
-                        className="pointer-events-none absolute left-1/2 top-1/2 h-4 w-4 rounded-full border border-black/35 bg-white shadow-[0_0_0_3px_rgba(255,255,255,0.2)]"
+                        className="pointer-events-none absolute left-1/2 top-1/2 h-6 w-6 rounded-full border border-black/35 bg-white shadow-[0_0_0_3px_rgba(255,255,255,0.2)] md:h-4 md:w-4"
                         style={{
                           transform: `translate(calc(-50% + ${clipMaxKnobX}px), calc(-50% + ${clipMaxKnobY}px))`,
                         }}

@@ -11,11 +11,11 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 import numpy as np
-from openai import OpenAI
 
 from ..config import get_settings
 from ..db import DatabaseIntegrityError, dumps_json, fetch_all, fetch_one, now_iso, upsert
 from .concepts import build_takeaways
+from .openai_client import build_openai_client
 from .segmenter import (
     SegmentMatch,
     TranscriptChunk,
@@ -175,7 +175,11 @@ class ReelService:
             and bool(settings.openai_api_key)
             and (not self.serverless_mode or allow_openai_serverless)
         )
-        self.openai_client = OpenAI(api_key=settings.openai_api_key, timeout=8.0) if can_use_openai else None
+        self.openai_client = build_openai_client(
+            api_key=settings.openai_api_key,
+            timeout=8.0,
+            enabled=can_use_openai,
+        )
 
     def generate_reels(
         self,
@@ -1004,7 +1008,7 @@ class ReelService:
 
     def _clip_length_bounds(self, target_clip_duration_sec: int) -> tuple[int, int]:
         safe_target = self._normalize_target_clip_duration(target_clip_duration_sec)
-        min_len = max(10, int(round(safe_target * 0.35)))
+        min_len = max(self.MIN_TARGET_CLIP_DURATION_SEC, int(round(safe_target * 0.35)))
         max_len = max(min_len + self.MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC, safe_target)
         return min_len, max_len
 

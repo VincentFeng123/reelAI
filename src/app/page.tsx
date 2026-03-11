@@ -632,7 +632,8 @@ function HomePageContent() {
         ? searchPanelScrollable && (topChromeOffset || topChromeGestureActive)
         : topChromeOffset
     );
-  const shouldInsetSettingsForTopChrome = visibleSidebarTab === "settings" && shouldShowTopChromeStrip;
+  // Keep settings content position stable even when the mobile sidebar temporarily hides the top chrome.
+  const shouldInsetSettingsForTopChrome = visibleSidebarTab === "settings";
 
   const openMaterialFeed = useCallback(
     (materialId: string) => {
@@ -1279,7 +1280,7 @@ function HomePageContent() {
               onClearSearchData={clearAllHistory}
               onUnsavedChangesChange={setHasUnsavedSettingsChanges}
               onAvailabilityModalClose={onSettingsAvailabilityModalClose}
-              availabilityModalMode={settingsModalView === "availability" || Boolean(settingsAvailabilityModalSnapshot?.mounted) ? "inline" : "overlay"}
+              availabilityModalMode={settingsModalView === "availability" ? "inline" : "overlay"}
               onAvailabilityModalStateChange={setSettingsAvailabilityModalSnapshot}
             />
           </div>
