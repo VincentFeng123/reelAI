@@ -3,17 +3,30 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
+import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
 import { LoadingFlappyMiniGame } from "@/components/LoadingFlappyMiniGame";
 import { ReelCard } from "@/components/ReelCard";
-import { askStudyChat, fetchFeed, generateReels, queueCommunityHistorySync, readCommunityAuthSession, sendFeedback, uploadMaterial } from "@/lib/api";
+import {
+  COMMUNITY_AUTH_CHANGED_EVENT,
+  askStudyChat,
+  clearCommunityAuthSession,
+  fetchCommunitySettings,
+  fetchFeed,
+  generateReels,
+  isSessionExpiredError,
+  queueCommunityHistorySync,
+  readCommunityAuthSession,
+  sendFeedback,
+  uploadMaterial,
+} from "@/lib/api";
 import { HISTORY_STORAGE_KEY, type StoredHistoryItem, writeScopedHistorySnapshot } from "@/lib/historyStorage";
+import { useLoadingScreenGate } from "@/lib/useLoadingScreenGate";
 import {
   type GenerationMode,
   type PreferredVideoDuration,
   type VideoPoolMode,
-  GENERATION_MODE_STORAGE_KEY,
-  MUTED_STORAGE_KEY,
   readStudyReelsSettings,
+  setActiveStudyReelsSettingsScope,
 } from "@/lib/settings";
 import type { ChatMessage, Reel } from "@/lib/types";
 
@@ -453,6 +466,7 @@ function buildCommunityFeedReelsFromHandoff(payload: CommunityFeedHandoffPayload
 function FeedPageInner() {
   const params = useSearchParams();
   const router = useRouter();
+  const feedRouteKey = params.toString();
   const materialId = params.get("material_id") || "";
   const generationModeParam = params.get("generation_mode");
   const communitySetIdParam = params.get("community_set_id") || "";
@@ -515,6 +529,10 @@ function FeedPageInner() {
   const [generationMode, setGenerationMode] = useState<GenerationMode>("fast");
   const [captionsPreference, setCaptionsPreference] = useState(false);
   const [sessionHydrated, setSessionHydrated] = useState(false);
+  const [initialFeedScreenReady, setInitialFeedScreenReady] = useState(false);
+  const [authAccountId, setAuthAccountId] = useState<string | null>(null);
+  const [authScopeHydrated, setAuthScopeHydrated] = useState(false);
+  const [settingsScopeReady, setSettingsScopeReady] = useState(false);
 
   const feedViewportRef = useRef<HTMLDivElement | null>(null);
   const isFetchingRef = useRef(false);
@@ -543,6 +561,7 @@ function FeedPageInner() {
   const mutedRestoredFromSnapshotRef = useRef(false);
   const hydratedMaterialIdRef = useRef<string | null>(null);
   const materialIdsForFeedRef = useRef<string[]>([]);
+  const settingsLoadSequenceRef = useRef(0);
 
   const normalizeClipKeyTime = useCallback((value: unknown): string => {
     const parsed = Number(value);
@@ -638,20 +657,91 @@ function FeedPageInner() {
 
   const hasMore = reels.length < total;
   const isFastGeneration = generationMode === "fast";
+  const hasExplicitGenerationModeParam = generationModeParam === "fast" || generationModeParam === "slow";
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const syncAuthAccountId = () => {
+      setAuthAccountId(readCommunityAuthSession()?.account?.id?.trim() || null);
+      setAuthScopeHydrated(true);
+    };
+    syncAuthAccountId();
+    window.addEventListener(COMMUNITY_AUTH_CHANGED_EVENT, syncAuthAccountId);
+    return () => {
+      window.removeEventListener(COMMUNITY_AUTH_CHANGED_EVENT, syncAuthAccountId);
+    };
+  }, []);
 
   useEffect(() => {
     if (generationModeParam === "fast" || generationModeParam === "slow") {
       setGenerationMode(generationModeParam);
+    }
+  }, [generationModeParam]);
+
+  useEffect(() => {
+    if (!authScopeHydrated) {
       return;
     }
     if (typeof window === "undefined") {
+      setSettingsScopeReady(true);
       return;
     }
-    const savedMode = window.localStorage.getItem(GENERATION_MODE_STORAGE_KEY);
-    if (savedMode === "fast" || savedMode === "slow") {
-      setGenerationMode(savedMode);
+    let cancelled = false;
+    const loadSequence = settingsLoadSequenceRef.current + 1;
+    settingsLoadSequenceRef.current = loadSequence;
+    setSettingsScopeReady(false);
+
+    const applySettingsSnapshot = (settingsSnapshot: ReturnType<typeof readStudyReelsSettings>) => {
+      if (!hasExplicitGenerationModeParam) {
+        setGenerationMode(settingsSnapshot.generationMode);
+      }
+      if (!mutedRestoredFromSnapshotRef.current) {
+        setMutedPreference(settingsSnapshot.startMuted);
+      }
+    };
+
+    const localSettings = setActiveStudyReelsSettingsScope(authAccountId);
+    applySettingsSnapshot(localSettings);
+
+    if (!authAccountId) {
+      setSettingsScopeReady(true);
+      return;
     }
-  }, [generationModeParam]);
+
+    void (async () => {
+      try {
+        const remoteSettings = await fetchCommunitySettings();
+        if (
+          cancelled
+          || settingsLoadSequenceRef.current !== loadSequence
+          || !remoteSettings
+          || readCommunityAuthSession()?.account?.id?.trim() !== authAccountId
+        ) {
+          return;
+        }
+        const activeSettings = setActiveStudyReelsSettingsScope(authAccountId, { settings: remoteSettings });
+        applySettingsSnapshot(activeSettings);
+      } catch (error) {
+        if (cancelled || settingsLoadSequenceRef.current !== loadSequence) {
+          return;
+        }
+        if (isSessionExpiredError(error)) {
+          clearCommunityAuthSession();
+          setAuthAccountId(null);
+        }
+      } finally {
+        if (!cancelled && settingsLoadSequenceRef.current === loadSequence) {
+          setSettingsScopeReady(true);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authAccountId, authScopeHydrated, hasExplicitGenerationModeParam]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -784,7 +874,7 @@ function FeedPageInner() {
   const loadPage = useCallback(
     async (targetPage: number, options?: { autofill?: boolean }) => {
       const feedMaterialIds = getFeedMaterialIds();
-      if (feedMaterialIds.length === 0 || isFetchingRef.current) {
+      if (!settingsScopeReady || feedMaterialIds.length === 0 || isFetchingRef.current) {
         return;
       }
       isFetchingRef.current = true;
@@ -866,12 +956,12 @@ function FeedPageInner() {
         isFetchingRef.current = false;
       }
     },
-    [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, materialId, recoverMissingMaterial],
+    [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, materialId, recoverMissingMaterial, settingsScopeReady],
   );
 
   const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
     const feedMaterialIds = getFeedMaterialIds();
-    if (feedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
+    if (!settingsScopeReady || feedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
       return [];
     }
     const tuning = getFeedTuningSettings();
@@ -930,7 +1020,7 @@ function FeedPageInner() {
       setGeneratingMore(false);
       isGeneratingRef.current = false;
     }
-  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration]);
+  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration, settingsScopeReady]);
 
   useEffect(() => {
     mutedRestoredFromSnapshotRef.current = false;
@@ -990,6 +1080,9 @@ function FeedPageInner() {
       emptyGenerateStreakRef.current = 0;
       bootstrapAttemptedRef.current = false;
       setLoading(false);
+      return;
+    }
+    if (!settingsScopeReady) {
       return;
     }
     setInvalidCommunityHandoff(false);
@@ -1055,7 +1148,7 @@ function FeedPageInner() {
     if (!restoredSession || restoredSession.reels.length === 0) {
       void loadPage(1, { autofill: true });
     }
-  }, [communityHandoffIdParam, communityPreviewReel, dedupeByIdentity, generationModeParam, materialId, loadPage]);
+  }, [communityHandoffIdParam, communityPreviewReel, dedupeByIdentity, generationModeParam, materialId, loadPage, settingsScopeReady]);
 
   useEffect(() => {
     if (!materialId || sessionHydrated || loading) {
@@ -1083,7 +1176,14 @@ function FeedPageInner() {
 
   const runFastTopUp = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
-    if (feedMaterialIds.length === 0 || generationMode !== "fast" || !canRequestMore || isFastTopUpRef.current || isGeneratingRef.current) {
+    if (
+      !settingsScopeReady
+      || feedMaterialIds.length === 0
+      || generationMode !== "fast"
+      || !canRequestMore
+      || isFastTopUpRef.current
+      || isGeneratingRef.current
+    ) {
       return;
     }
     const tuning = getFeedTuningSettings();
@@ -1120,7 +1220,7 @@ function FeedPageInner() {
     } finally {
       isFastTopUpRef.current = false;
     }
-  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches]);
+  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, settingsScopeReady]);
 
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {
@@ -1334,21 +1434,6 @@ function FeedPageInner() {
       mobileDetailsCloseTimerRef.current = null;
     }, MOBILE_DETAILS_CLOSE_MS);
   }, [mobileDetailsClosing, mobileDetailsOpen]);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-    if (mutedRestoredFromSnapshotRef.current) {
-      return;
-    }
-    const saved = window.localStorage.getItem(MUTED_STORAGE_KEY);
-    if (saved === "0") {
-      setMutedPreference(false);
-    } else if (saved === "1") {
-      setMutedPreference(true);
-    }
-  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined" || !materialId || !sessionHydrated) {
@@ -1677,6 +1762,21 @@ function FeedPageInner() {
     reels.length > 0 &&
     !noMoreReelsAvailable &&
     (hasMore || generatingMore || bootstrappingFirstReels || canRequestMore);
+  const shouldKeepFeedEntryLoading = loading || (reels.length === 0 && bootstrappingFirstReels);
+  const showLoadingScreen = useLoadingScreenGate(initialFeedScreenReady, {
+    minimumVisibleMs: 1000,
+  });
+
+  useEffect(() => {
+    setInitialFeedScreenReady(false);
+  }, [feedRouteKey]);
+
+  useEffect(() => {
+    if (!shouldKeepFeedEntryLoading) {
+      setInitialFeedScreenReady(true);
+    }
+  }, [shouldKeepFeedEntryLoading]);
+
   const activeVideoDescription = useMemo(() => {
     if (!activeReel) {
       return "";
@@ -1988,6 +2088,10 @@ function FeedPageInner() {
     );
   }
 
+  if (showLoadingScreen) {
+    return <FullscreenLoadingScreen />;
+  }
+
   return (
     <main className="fixed inset-0 overflow-visible md:inset-4 md:overflow-hidden">
       <button
@@ -2288,11 +2392,7 @@ function FeedPageInner() {
 export default function FeedPage() {
   return (
     <Suspense
-      fallback={
-        <main className="fixed inset-0 flex items-center justify-center text-sm text-white md:inset-4">
-          Loading feed...
-        </main>
-      }
+      fallback={<FullscreenLoadingScreen />}
     >
       <FeedPageInner />
     </Suspense>

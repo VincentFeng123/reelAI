@@ -288,3 +288,29 @@ class CommunityHistoryReplaceRequest(BaseModel):
 
 class CommunityHistoryResponse(BaseModel):
     items: list[CommunityHistoryItemOut] = Field(default_factory=list)
+
+
+class CommunitySettingsPayload(BaseModel):
+    generation_mode: Literal["slow", "fast"] = "fast"
+    default_input_mode: Literal["topic", "source", "file"] = "source"
+    min_relevance_threshold: float = Field(default=0.3, ge=0.0, le=0.6)
+    start_muted: bool = True
+    video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first"
+    preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
+    target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
+    target_clip_duration_min_sec: int = Field(default=20, ge=15, le=180)
+    target_clip_duration_max_sec: int = Field(default=55, ge=15, le=180)
+
+    @model_validator(mode="after")
+    def validate_clip_duration_bounds(self) -> "CommunitySettingsPayload":
+        if self.target_clip_duration_max_sec <= self.target_clip_duration_min_sec:
+            raise ValueError("target_clip_duration_max_sec must be greater than target_clip_duration_min_sec.")
+        if self.target_clip_duration_max_sec - self.target_clip_duration_min_sec < 15:
+            raise ValueError("target clip duration range must be at least 15 seconds wide.")
+        if not self.target_clip_duration_min_sec <= self.target_clip_duration_sec <= self.target_clip_duration_max_sec:
+            raise ValueError("target_clip_duration_sec must fall within the configured min/max range.")
+        return self
+
+
+class CommunitySettingsResponse(CommunitySettingsPayload):
+    pass

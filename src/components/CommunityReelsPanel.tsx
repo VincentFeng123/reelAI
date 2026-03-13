@@ -20,6 +20,7 @@ import {
   updateCommunitySet,
 } from "@/lib/api";
 import type { CommunityAccount } from "@/lib/types";
+import { ViewportModalPortal } from "@/components/ViewportModalPortal";
 import { loadYouTubeIframeApi } from "@/lib/youtubeIframeApi";
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
@@ -3670,16 +3671,7 @@ export function CommunityReelsPanel({
                             Account Required
                           </span>
                         </div>
-                        <h3 className="mt-3 text-xl font-semibold text-white">Sign in to manage your sets</h3>
-                        <div className="mt-5 flex flex-wrap items-center gap-3">
-                          <button
-                            type="button"
-                            onClick={() => router.push("/account?return_tab=edit")}
-                            className="inline-flex h-11 min-w-[12rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/55 px-4 text-sm font-semibold text-white transition hover:bg-white hover:text-black"
-                          >
-                            Sign In / Login to Access
-                          </button>
-                        </div>
+                        <h3 className="mt-10 text-xl font-semibold text-white">Sign in to manage your sets</h3>
                       </div>
                     </div>
                   </section>
@@ -4292,228 +4284,236 @@ export function CommunityReelsPanel({
     )}
       {detailBannerPortal}
       {draftActionConfirmModal ? (
-        <div
-          className="fixed inset-0 z-[128] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
-          role="presentation"
-          onClick={closeDraftActionConfirmModal}
-        >
+        <ViewportModalPortal>
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Draft action confirmation"
-            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
-            onClick={(event) => event.stopPropagation()}
+            className="fixed inset-0 z-[128] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+            role="presentation"
+            onClick={closeDraftActionConfirmModal}
           >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">{draftActionConfirmModal.label}</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">{draftActionConfirmModal.title}</h3>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Draft action confirmation"
+              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">{draftActionConfirmModal.label}</p>
+                  <h3 className="mt-2 text-lg font-semibold text-white">{draftActionConfirmModal.title}</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeDraftActionConfirmModal}
+                  aria-label="Close"
+                  disabled={isPostingSet}
+                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                    <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                  </svg>
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={closeDraftActionConfirmModal}
-                aria-label="Close"
-                disabled={isPostingSet}
-                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
-              >
-                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
-                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
-                </svg>
-              </button>
-            </div>
-            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-              {draftActionConfirmModal.message}
-            </p>
-            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={closeDraftActionConfirmModal}
-                disabled={isPostingSet}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-55"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={confirmDraftAction}
-                disabled={isPostingSet}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {isPostingSet && draftActionConfirmModal.action === "save-set-changes"
-                  ? "Saving..."
-                  : draftActionConfirmModal.confirmLabel}
-              </button>
+              <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+                {draftActionConfirmModal.message}
+              </p>
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={closeDraftActionConfirmModal}
+                  disabled={isPostingSet}
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-55"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmDraftAction}
+                  disabled={isPostingSet}
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {isPostingSet && draftActionConfirmModal.action === "save-set-changes"
+                    ? "Saving..."
+                    : draftActionConfirmModal.confirmLabel}
+                </button>
+              </div>
             </div>
           </div>
-        </div>
+        </ViewportModalPortal>
       ) : null}
       {unsavedDraftExitModal ? (
-        <div
-          className="fixed inset-0 z-[127] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
-          role="presentation"
-          onClick={closeUnsavedDraftExitModal}
-        >
+        <ViewportModalPortal>
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Unsaved set draft changes"
-            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
-            onClick={(event) => event.stopPropagation()}
+            className="fixed inset-0 z-[127] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+            role="presentation"
+            onClick={closeUnsavedDraftExitModal}
           >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">Save set changes before leaving?</h3>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Unsaved set draft changes"
+              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
+                  <h3 className="mt-2 text-lg font-semibold text-white">Save set changes before leaving?</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeUnsavedDraftExitModal}
+                  aria-label="Close"
+                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                    <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                  </svg>
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={closeUnsavedDraftExitModal}
-                aria-label="Close"
-                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
-              >
-                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
-                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
-                </svg>
-              </button>
-            </div>
-            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-              {isFormEditMode
-                ? "Save to update this set, or discard these edits and continue."
-                : "Save to keep your draft progress, or discard these edits and continue."}
-            </p>
-            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={confirmUnsavedDraftExitDiscard}
-                disabled={isPostingSet}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                Discard
-              </button>
-              <button
-                type="button"
-                onClick={confirmUnsavedDraftExitSave}
-                disabled={isPostingSet}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {isPostingSet ? "Saving..." : "Save"}
-              </button>
+              <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+                {isFormEditMode
+                  ? "Save to update this set, or discard these edits and continue."
+                  : "Save to keep your draft progress, or discard these edits and continue."}
+              </p>
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={confirmUnsavedDraftExitDiscard}
+                  disabled={isPostingSet}
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Discard
+                </button>
+                <button
+                  type="button"
+                  onClick={confirmUnsavedDraftExitSave}
+                  disabled={isPostingSet}
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {isPostingSet ? "Saving..." : "Save"}
+                </button>
+              </div>
             </div>
           </div>
-        </div>
+        </ViewportModalPortal>
       ) : null}
       {deleteSetConfirmModal ? (
-        <div
-          className="fixed inset-0 z-[126] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
-          role="presentation"
-          onClick={closeDeleteSetConfirmModal}
-        >
+        <ViewportModalPortal>
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Delete set confirmation"
-            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
-            onClick={(event) => event.stopPropagation()}
+            className="fixed inset-0 z-[126] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+            role="presentation"
+            onClick={closeDeleteSetConfirmModal}
           >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Delete Set</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">Delete "{deleteSetConfirmModal.title}"?</h3>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Delete set confirmation"
+              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Delete Set</p>
+                  <h3 className="mt-2 text-lg font-semibold text-white">Delete "{deleteSetConfirmModal.title}"?</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeDeleteSetConfirmModal}
+                  aria-label="Close"
+                  disabled={Boolean(deletingSetId)}
+                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                    <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                  </svg>
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={closeDeleteSetConfirmModal}
-                aria-label="Close"
-                disabled={Boolean(deletingSetId)}
-                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-55"
-              >
-                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
-                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
-                </svg>
-              </button>
-            </div>
-            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-              This action cannot be undone.
-            </p>
-            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={closeDeleteSetConfirmModal}
-                disabled={Boolean(deletingSetId)}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-55"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  void onDeleteEditableSet(deleteSetConfirmModal.setId);
-                }}
-                disabled={Boolean(deletingSetId)}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
-              >
-                {deletingSetId === deleteSetConfirmModal.setId ? "Deleting..." : "Delete"}
-              </button>
+              <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+                This action cannot be undone.
+              </p>
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={closeDeleteSetConfirmModal}
+                  disabled={Boolean(deletingSetId)}
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-55"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void onDeleteEditableSet(deleteSetConfirmModal.setId);
+                  }}
+                  disabled={Boolean(deletingSetId)}
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-70"
+                >
+                  {deletingSetId === deleteSetConfirmModal.setId ? "Deleting..." : "Delete"}
+                </button>
+              </div>
             </div>
           </div>
-        </div>
+        </ViewportModalPortal>
       ) : null}
       {publishResultModal ? (
-        <div
-          className="fixed inset-0 z-[125] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px]"
-          role="presentation"
-          onClick={() => setPublishResultModal(null)}
-        >
+        <ViewportModalPortal>
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Publish result"
-            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl md:p-6"
-            onClick={(event) => event.stopPropagation()}
+            className="fixed inset-0 z-[125] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px]"
+            role="presentation"
+            onClick={() => setPublishResultModal(null)}
           >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">{publishResultModal.label ?? "Post Set"}</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">{publishResultModal.title}</h3>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Publish result"
+              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl md:p-6"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">{publishResultModal.label ?? "Post Set"}</p>
+                  <h3 className="mt-2 text-lg font-semibold text-white">{publishResultModal.title}</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPublishResultModal(null)}
+                  aria-label="Close publish result"
+                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                    <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                  </svg>
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => setPublishResultModal(null)}
-                aria-label="Close publish result"
-                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
-              >
-                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
-                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
-                </svg>
-              </button>
-            </div>
-            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-              {publishResultModal.message}
-            </p>
-            {publishResultModal.status === "success" && publishResultModal.thumbnailUrl ? (
-              <div className="mt-4 overflow-hidden rounded-2xl border border-white/15 bg-black/45">
-                <img
-                  src={publishResultModal.thumbnailUrl}
-                  alt={publishResultModal.thumbnailAlt || "Published set thumbnail"}
-                  className="h-52 w-full object-cover"
-                />
+              <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+                {publishResultModal.message}
+              </p>
+              {publishResultModal.status === "success" && publishResultModal.thumbnailUrl ? (
+                <div className="mt-4 overflow-hidden rounded-2xl border border-white/15 bg-black/45">
+                  <img
+                    src={publishResultModal.thumbnailUrl}
+                    alt={publishResultModal.thumbnailAlt || "Published set thumbnail"}
+                    className="h-52 w-full object-cover"
+                  />
+                </div>
+              ) : null}
+              <div className="mt-4 flex items-center justify-end">
+                <button
+                  type="button"
+                  onClick={() => setPublishResultModal(null)}
+                  className={`inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl px-5 py-2.5 text-sm font-semibold transition-colors ${
+                    publishResultModal.status === "success"
+                      ? "bg-white text-black hover:bg-white/90"
+                      : "bg-black/35 text-white hover:bg-white/10"
+                  }`}
+                >
+                  OK
+                </button>
               </div>
-            ) : null}
-            <div className="mt-4 flex items-center justify-end">
-              <button
-                type="button"
-                onClick={() => setPublishResultModal(null)}
-                className={`inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl px-5 py-2.5 text-sm font-semibold transition-colors ${
-                  publishResultModal.status === "success"
-                    ? "bg-white text-black hover:bg-white/90"
-                    : "bg-black/35 text-white hover:bg-white/10"
-                }`}
-              >
-                OK
-              </button>
             </div>
           </div>
-        </div>
+        </ViewportModalPortal>
       ) : null}
     </div>
   );

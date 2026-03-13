@@ -253,6 +253,21 @@ CREATE TABLE IF NOT EXISTS community_material_history (
 CREATE INDEX IF NOT EXISTS idx_community_material_history_account_updated_at
 ON community_material_history(account_id, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS community_account_settings (
+    account_id TEXT PRIMARY KEY,
+    generation_mode TEXT NOT NULL DEFAULT 'fast',
+    default_input_mode TEXT NOT NULL DEFAULT 'source',
+    min_relevance_threshold REAL NOT NULL DEFAULT 0.3,
+    start_muted INTEGER NOT NULL DEFAULT 1,
+    video_pool_mode TEXT NOT NULL DEFAULT 'short-first',
+    preferred_video_duration TEXT NOT NULL DEFAULT 'any',
+    target_clip_duration_sec INTEGER NOT NULL DEFAULT 55,
+    target_clip_duration_min_sec INTEGER NOT NULL DEFAULT 20,
+    target_clip_duration_max_sec INTEGER NOT NULL DEFAULT 55,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(account_id) REFERENCES community_accounts(id)
+);
+
 CREATE TABLE IF NOT EXISTS rate_limit_events (
     id TEXT PRIMARY KEY,
     rate_key TEXT NOT NULL,

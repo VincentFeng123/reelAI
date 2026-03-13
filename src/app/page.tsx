@@ -5,14 +5,17 @@ import { useRouter, useSearchParams } from "next/navigation";
 
 import { type CommunityDraftExitActions, CommunityReelsPanel } from "@/components/CommunityReelsPanel";
 import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
+import { ViewportModalPortal } from "@/components/ViewportModalPortal";
 import {
   COMMUNITY_AUTH_CHANGED_EVENT,
   clearCommunityAuthSession,
   fetchCommunityAccount,
   fetchCommunityHistory,
+  fetchCommunitySettings,
   isSessionExpiredError,
   logoutCommunityAccount,
   queueCommunityHistorySync,
+  queueCommunitySettingsSync,
   readCommunityAuthSession,
 } from "@/lib/api";
 import {
@@ -30,6 +33,7 @@ import {
 } from "@/components/SettingsPanel";
 import { UploadPanel } from "@/components/UploadPanel";
 import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
+import { setActiveStudyReelsSettingsScope, type StudyReelsSettings } from "@/lib/settings";
 import { useLoadingScreenGate } from "@/lib/useLoadingScreenGate";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
@@ -227,6 +231,7 @@ function HomePageContent() {
   const topChromeGestureTimerRef = useRef<number | null>(null);
   const historyMutationVersionRef = useRef(0);
   const historyLoadSequenceRef = useRef(0);
+  const settingsLoadSequenceRef = useRef(0);
 
   const resolveHistoryAccountId = useCallback(() => {
     const activeAccountId = communityAccount?.id?.trim();
@@ -288,6 +293,49 @@ function HomePageContent() {
       cancelled = true;
     };
   }, [resolveHistoryAccountId, setHistorySnapshot]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const scopedAccountId = resolveHistoryAccountId();
+    setActiveStudyReelsSettingsScope(scopedAccountId);
+
+    if (!scopedAccountId) {
+      return;
+    }
+
+    let cancelled = false;
+    const loadSequence = settingsLoadSequenceRef.current + 1;
+    settingsLoadSequenceRef.current = loadSequence;
+
+    void (async () => {
+      try {
+        const remoteSettings = await fetchCommunitySettings();
+        if (
+          cancelled
+          || settingsLoadSequenceRef.current !== loadSequence
+          || resolveHistoryAccountId() !== scopedAccountId
+          || !remoteSettings
+        ) {
+          return;
+        }
+        setActiveStudyReelsSettingsScope(scopedAccountId, { settings: remoteSettings });
+      } catch (error) {
+        if (cancelled || settingsLoadSequenceRef.current !== loadSequence) {
+          return;
+        }
+        if (isSessionExpiredError(error)) {
+          clearCommunityAuthSession();
+          setCommunityAccount(null);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [resolveHistoryAccountId]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -428,6 +476,19 @@ function HomePageContent() {
       }
     });
   }, [resolveHistoryAccountId, setHistorySnapshot]);
+
+  const syncSavedSettings = useCallback((settings: StudyReelsSettings) => {
+    const scopedAccountId = resolveHistoryAccountId();
+    if (!scopedAccountId) {
+      return;
+    }
+    void queueCommunitySettingsSync(settings).catch((error) => {
+      if (isSessionExpiredError(error)) {
+        clearCommunityAuthSession();
+        setCommunityAccount(null);
+      }
+    });
+  }, [resolveHistoryAccountId]);
 
   const upsertHistory = useCallback(
     (entry: {
@@ -1558,6 +1619,7 @@ function HomePageContent() {
             <SettingsPanel
               ref={settingsPanelRef}
               onClearSearchData={clearAllHistory}
+              onSettingsSaved={syncSavedSettings}
               onUnsavedChangesChange={setHasUnsavedSettingsChanges}
               onAvailabilityModalClose={onSettingsAvailabilityModalClose}
               availabilityModalMode={settingsModalView === "availability" ? "inline" : "overlay"}
@@ -1580,162 +1642,166 @@ function HomePageContent() {
         </section>
       </div>
       {showUnsavedCommunityDraftModal ? (
-        <div
-          className="fixed inset-0 z-[121] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
-          role="presentation"
-          onClick={closeUnsavedCommunityDraftModal}
-        >
+        <ViewportModalPortal>
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Unsaved set draft changes"
-            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
-            onClick={(event) => event.stopPropagation()}
+            className="fixed inset-0 z-[121] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+            role="presentation"
+            onClick={closeUnsavedCommunityDraftModal}
           >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">Save set changes before leaving?</h3>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Unsaved set draft changes"
+              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Unsaved changes</p>
+                  <h3 className="mt-2 text-lg font-semibold text-white">Save set changes before leaving?</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={closeUnsavedCommunityDraftModal}
+                  aria-label="Close"
+                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                    <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                  </svg>
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={closeUnsavedCommunityDraftModal}
-                aria-label="Close"
-                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
-              >
-                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
-                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
-                </svg>
-              </button>
-            </div>
-            <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-              Save to keep your draft progress, or discard these edits and continue.
-            </p>
-            <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={discardCommunityDraftAndContinue}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
-              >
-                Discard
-              </button>
-              <button
-                type="button"
-                onClick={saveCommunityDraftAndContinue}
-                className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
-              >
-                Save
-              </button>
+              <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+                Save to keep your draft progress, or discard these edits and continue.
+              </p>
+              <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={discardCommunityDraftAndContinue}
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
+                >
+                  Discard
+                </button>
+                <button
+                  type="button"
+                  onClick={saveCommunityDraftAndContinue}
+                  className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
+                >
+                  Save
+                </button>
+              </div>
             </div>
           </div>
-        </div>
+        </ViewportModalPortal>
       ) : null}
       {settingsModalView ? (
-        <div
-          className="fixed inset-0 z-[120] flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
-          role="presentation"
-          onClick={() => closeSettingsModal("backdrop")}
-        >
+        <ViewportModalPortal>
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label={settingsModalView === "availability" ? "Configuration success rate" : "Unsaved settings changes"}
-            className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
-            onClick={(event) => event.stopPropagation()}
+            className="fixed inset-0 z-[120] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
+            role="presentation"
+            onClick={() => closeSettingsModal("backdrop")}
           >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">
-                  {settingsModalView === "availability" ? "Configuration check" : "Unsaved changes"}
-                </p>
-                <h3 className="mt-2 text-lg font-semibold text-white">
-                  {settingsModalView === "availability"
-                    ? activeSettingsAvailabilityState.status === "checking"
-                      ? "Checking success rate..."
-                      : "Success rate result"
-                    : "Save settings before leaving?"}
-                </h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => closeSettingsModal("close-button")}
-                aria-label="Close"
-                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
-              >
-                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
-                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
-                </svg>
-              </button>
-            </div>
-            {settingsModalView === "availability" ? (
-              <>
-                <div
-                  className={`mt-4 rounded-2xl border px-4 py-3 text-sm ${
-                    activeSettingsAvailabilityState.status === "ok"
-                      ? "border-emerald-300/45 bg-emerald-500/14 text-emerald-100"
-                      : activeSettingsAvailabilityState.status === "partial"
-                      ? "border-sky-300/45 bg-sky-500/14 text-sky-100"
-                      : activeSettingsAvailabilityState.status === "blocked"
-                      ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
-                      : activeSettingsAvailabilityState.status === "none"
-                      ? "border-amber-300/45 bg-amber-500/16 text-amber-100"
-                      : activeSettingsAvailabilityState.status === "error"
-                      ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
-                      : "border-white/24 bg-white/[0.06] text-white/88"
-                  }`}
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={settingsModalView === "availability" ? "Configuration success rate" : "Unsaved settings changes"}
+              className="w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">
+                    {settingsModalView === "availability" ? "Configuration check" : "Unsaved changes"}
+                  </p>
+                  <h3 className="mt-2 text-lg font-semibold text-white">
+                    {settingsModalView === "availability"
+                      ? activeSettingsAvailabilityState.status === "checking"
+                        ? "Checking success rate..."
+                        : "Success rate result"
+                      : "Save settings before leaving?"}
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => closeSettingsModal("close-button")}
+                  aria-label="Close"
+                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
                 >
-                  <p>{activeSettingsAvailabilityState.message}</p>
-                  {activeSettingsAvailabilityState.limitingFactors.length > 0 ? (
-                    <div className="mt-2 border-t border-white/20 pt-2 text-xs">
-                      <p className="font-semibold">
-                        {activeSettingsAvailabilityState.limitingFactors.length > 1 ? "Main limits:" : "Main limit:"}
-                      </p>
-                      <ul className="mt-1.5 space-y-1">
-                        {activeSettingsAvailabilityState.limitingFactors.map((factor) => (
-                          <li key={factor} className="flex items-start gap-1.5">
-                            <span aria-hidden="true" className="leading-[1.2] opacity-80">•</span>
-                            <span>{factor}</span>
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  ) : null}
-                </div>
-                <div className="mt-4 flex items-center justify-end">
-                  <button
-                    type="button"
-                    onClick={() => closeSettingsModal("close-button")}
-                    className="inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
+                  <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                    <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                  </svg>
+                </button>
+              </div>
+              {settingsModalView === "availability" ? (
+                <>
+                  <div
+                    className={`mt-4 rounded-2xl border px-4 py-3 text-sm ${
+                      activeSettingsAvailabilityState.status === "ok"
+                        ? "border-emerald-300/45 bg-emerald-500/14 text-emerald-100"
+                        : activeSettingsAvailabilityState.status === "partial"
+                        ? "border-sky-300/45 bg-sky-500/14 text-sky-100"
+                        : activeSettingsAvailabilityState.status === "blocked"
+                        ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
+                        : activeSettingsAvailabilityState.status === "none"
+                        ? "border-amber-300/45 bg-amber-500/16 text-amber-100"
+                        : activeSettingsAvailabilityState.status === "error"
+                        ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
+                        : "border-white/24 bg-white/[0.06] text-white/88"
+                    }`}
                   >
-                    OK
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
-                  You changed settings. Save to apply them, or discard these edits and continue.
-                </p>
-                <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={discardSettingsAndContinue}
-                    className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
-                  >
-                    Discard
-                  </button>
-                  <button
-                    type="button"
-                    onClick={saveSettingsAndContinue}
-                    className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
-                  >
-                    Save
-                  </button>
-                </div>
-              </>
-            )}
+                    <p>{activeSettingsAvailabilityState.message}</p>
+                    {activeSettingsAvailabilityState.limitingFactors.length > 0 ? (
+                      <div className="mt-2 border-t border-white/20 pt-2 text-xs">
+                        <p className="font-semibold">
+                          {activeSettingsAvailabilityState.limitingFactors.length > 1 ? "Main limits:" : "Main limit:"}
+                        </p>
+                        <ul className="mt-1.5 space-y-1">
+                          {activeSettingsAvailabilityState.limitingFactors.map((factor) => (
+                            <li key={factor} className="flex items-start gap-1.5">
+                              <span aria-hidden="true" className="leading-[1.2] opacity-80">•</span>
+                              <span>{factor}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+                  </div>
+                  <div className="mt-4 flex items-center justify-end">
+                    <button
+                      type="button"
+                      onClick={() => closeSettingsModal("close-button")}
+                      className="inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
+                    >
+                      OK
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="mt-4 rounded-2xl px-4 py-3 text-sm text-white/88">
+                    You changed settings. Save to apply them, or discard these edits and continue.
+                  </p>
+                  <div className="mt-4 flex flex-wrap items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={discardSettingsAndContinue}
+                      className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-black/35 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-white/10"
+                    >
+                      Discard
+                    </button>
+                    <button
+                      type="button"
+                      onClick={saveSettingsAndContinue}
+                      className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
+                    >
+                      Save
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
           </div>
-        </div>
+        </ViewportModalPortal>
       ) : null}
     </main>
   );

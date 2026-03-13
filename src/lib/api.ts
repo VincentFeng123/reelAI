@@ -12,7 +12,13 @@ import type {
   ReelsGenerateResponse,
 } from "@/lib/types";
 import type { StoredHistoryItem } from "@/lib/historyStorage";
-import type { PreferredVideoDuration, VideoPoolMode } from "@/lib/settings";
+import {
+  normalizeStudyReelsSettings,
+  setActiveStudyReelsSettingsScope,
+  type PreferredVideoDuration,
+  type StudyReelsSettings,
+  type VideoPoolMode,
+} from "@/lib/settings";
 
 const RAW_API_BASE = (
   process.env.NEXT_PUBLIC_API_BASE || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "")
@@ -201,6 +207,7 @@ function saveCommunityAuthSessionStorage(session: StoredCommunityAuthSession | n
     if (!session) {
       window.localStorage.removeItem(COMMUNITY_ACCOUNT_STORAGE_KEY);
       window.sessionStorage.removeItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY);
+      setActiveStudyReelsSettingsScope(null);
       return;
     }
     // Account metadata (non-secret) stays in localStorage for cross-tab display.
@@ -208,8 +215,10 @@ function saveCommunityAuthSessionStorage(session: StoredCommunityAuthSession | n
     // attacker would need code running in the same tab to read it.
     window.localStorage.setItem(COMMUNITY_ACCOUNT_STORAGE_KEY, JSON.stringify(session.account));
     window.sessionStorage.setItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY, session.sessionToken);
+    setActiveStudyReelsSettingsScope(session.account.id);
   } catch {
     // Ignore storage failures and keep the in-memory response path usable.
+    setActiveStudyReelsSettingsScope(session?.account.id ?? null);
   } finally {
     window.dispatchEvent(new Event(COMMUNITY_AUTH_CHANGED_EVENT));
   }
@@ -980,6 +989,24 @@ function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | null {
   };
 }
 
+function normalizeCommunitySettings(raw: unknown): StudyReelsSettings {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return normalizeStudyReelsSettings({});
+  }
+  const row = raw as Record<string, unknown>;
+  return normalizeStudyReelsSettings({
+    generationMode: row.generation_mode as string | null | undefined,
+    defaultInputMode: row.default_input_mode as string | null | undefined,
+    minRelevanceThreshold: row.min_relevance_threshold as string | number | null | undefined,
+    startMuted: row.start_muted as string | boolean | null | undefined,
+    videoPoolMode: row.video_pool_mode as string | null | undefined,
+    preferredVideoDuration: row.preferred_video_duration as string | null | undefined,
+    targetClipDurationSec: row.target_clip_duration_sec as string | number | null | undefined,
+    targetClipDurationMinSec: row.target_clip_duration_min_sec as string | number | null | undefined,
+    targetClipDurationMaxSec: row.target_clip_duration_max_sec as string | number | null | undefined,
+  });
+}
+
 export async function fetchCommunityHistory(): Promise<StoredHistoryItem[]> {
   const stored = readCommunityAuthSession();
   if (!stored?.sessionToken) {
@@ -1037,6 +1064,64 @@ export function queueCommunityHistorySync(items: StoredHistoryItem[]): Promise<v
       await replaceCommunityHistory(snapshot);
     });
   return communityHistorySyncChain;
+}
+
+export async function fetchCommunitySettings(): Promise<StudyReelsSettings | null> {
+  const stored = readCommunityAuthSession();
+  if (!stored?.sessionToken) {
+    return null;
+  }
+  const res = await safeFetch(apiUrl("/community/settings"), {
+    cache: "no-store",
+    headers: { ...communitySessionHeaders() },
+  });
+  return normalizeCommunitySettings(await parseJsonResponse<unknown>(res));
+}
+
+export async function replaceCommunitySettings(settings: StudyReelsSettings): Promise<StudyReelsSettings> {
+  const stored = readCommunityAuthSession();
+  if (!stored?.sessionToken) {
+    return settings;
+  }
+  const res = await safeFetch(apiUrl("/community/settings"), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      ...communitySessionHeaders(),
+    },
+    body: JSON.stringify({
+      generation_mode: settings.generationMode,
+      default_input_mode: settings.defaultInputMode,
+      min_relevance_threshold: settings.minRelevanceThreshold,
+      start_muted: settings.startMuted,
+      video_pool_mode: settings.videoPoolMode,
+      preferred_video_duration: settings.preferredVideoDuration,
+      target_clip_duration_sec: settings.targetClipDurationSec,
+      target_clip_duration_min_sec: settings.targetClipDurationMinSec,
+      target_clip_duration_max_sec: settings.targetClipDurationMaxSec,
+    }),
+  });
+  return normalizeCommunitySettings(await parseJsonResponse<unknown>(res));
+}
+
+let communitySettingsSyncVersion = 0;
+let communitySettingsSyncChain: Promise<void> = Promise.resolve();
+
+export function queueCommunitySettingsSync(settings: StudyReelsSettings): Promise<void> {
+  const snapshot = { ...settings };
+  const syncVersion = communitySettingsSyncVersion + 1;
+  communitySettingsSyncVersion = syncVersion;
+  communitySettingsSyncChain = communitySettingsSyncChain
+    .catch(() => {
+      // Keep the queue alive after a prior failed sync.
+    })
+    .then(async () => {
+      if (syncVersion !== communitySettingsSyncVersion) {
+        return;
+      }
+      await replaceCommunitySettings(snapshot);
+    });
+  return communitySettingsSyncChain;
 }
 
 export async function fetchCommunitySets(): Promise<CommunitySet[]> {

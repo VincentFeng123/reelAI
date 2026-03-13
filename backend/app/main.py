@@ -52,6 +52,8 @@ from .models import (
     CommunityHistoryItemOut,
     CommunityHistoryReplaceRequest,
     CommunityHistoryResponse,
+    CommunitySettingsPayload,
+    CommunitySettingsResponse,
     CommunityReelOut,
     CommunitySetCreateRequest,
     CommunitySetOut,
@@ -192,10 +194,20 @@ SERVERLESS_MODE = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAM
 
 VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
+VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
 DEFAULT_TARGET_CLIP_DURATION_SEC = 55
 MIN_TARGET_CLIP_DURATION_SEC = 15
 MAX_TARGET_CLIP_DURATION_SEC = 180
 MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC = 15
+DEFAULT_SETTINGS_MIN_RELEVANCE_THRESHOLD = 0.3
+MIN_SETTINGS_MIN_RELEVANCE_THRESHOLD = 0.0
+MAX_SETTINGS_MIN_RELEVANCE_THRESHOLD = 0.6
+DEFAULT_SETTINGS_DEFAULT_INPUT_MODE = "source"
+DEFAULT_SETTINGS_START_MUTED = True
+DEFAULT_SETTINGS_VIDEO_POOL_MODE = "short-first"
+DEFAULT_SETTINGS_PREFERRED_VIDEO_DURATION = "any"
+DEFAULT_SETTINGS_TARGET_CLIP_DURATION_MIN_SEC = 20
+DEFAULT_SETTINGS_TARGET_CLIP_DURATION_MAX_SEC = 55
 MAX_COMMUNITY_REEL_DURATION_SEC = 8 * 60 * 60
 COMMUNITY_REEL_DURATION_TIMEOUT_SEC = 6.0
 MAX_DURATION_FETCH_REDIRECTS = 4
@@ -225,6 +237,7 @@ COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW = 20
 COMMUNITY_LOGIN_PER_USERNAME_RATE_LIMIT = 8
 COMMUNITY_VERIFY_PER_ACCOUNT_RATE_LIMIT = 5
 COMMUNITY_HISTORY_RATE_LIMIT_PER_WINDOW = 90
+COMMUNITY_SETTINGS_RATE_LIMIT_PER_WINDOW = 90
 MAX_COMMUNITY_HISTORY_ITEMS = 120
 _rate_limit_lock = threading.Lock()
 _rate_limit_hits: dict[str, deque[float]] = {}
@@ -1107,6 +1120,33 @@ def _normalize_preferred_video_duration(value: str | None) -> Literal["any", "sh
     return "any"
 
 
+def _normalize_default_input_mode(value: str | None) -> Literal["topic", "source", "file"]:
+    if value in VALID_SEARCH_INPUT_MODES:
+        return value  # type: ignore[return-value]
+    return DEFAULT_SETTINGS_DEFAULT_INPUT_MODE  # type: ignore[return-value]
+
+
+def _normalize_settings_min_relevance_threshold(value: object) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_SETTINGS_MIN_RELEVANCE_THRESHOLD
+    safe = max(MIN_SETTINGS_MIN_RELEVANCE_THRESHOLD, min(MAX_SETTINGS_MIN_RELEVANCE_THRESHOLD, parsed))
+    return round(safe, 2)
+
+
+def _normalize_settings_start_muted(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    return bool(_to_int(value, 1))
+
+
 def _normalize_target_clip_duration_sec(value: int | float | None) -> int:
     if value is None:
         return DEFAULT_TARGET_CLIP_DURATION_SEC
@@ -1142,6 +1182,35 @@ def _resolve_target_clip_duration_bounds(
             safe_min = max(MIN_TARGET_CLIP_DURATION_SEC, safe_max - MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC)
     safe_target = max(safe_min, min(safe_max, safe_target))
     return safe_target, safe_min, safe_max
+
+
+def _serialize_community_settings(row: dict | None) -> CommunitySettingsResponse:
+    source = row or {}
+    generation_mode_raw = str(source.get("generation_mode") or "").strip().lower()
+    generation_mode = generation_mode_raw if generation_mode_raw in {"slow", "fast"} else "fast"
+    default_input_mode = _normalize_default_input_mode(str(source.get("default_input_mode") or "").strip().lower() or None)
+    min_relevance_threshold = _normalize_settings_min_relevance_threshold(source.get("min_relevance_threshold"))
+    start_muted = _normalize_settings_start_muted(source.get("start_muted", 1 if DEFAULT_SETTINGS_START_MUTED else 0))
+    video_pool_mode = _normalize_video_pool_mode(str(source.get("video_pool_mode") or "").strip().lower() or None)
+    preferred_video_duration = _normalize_preferred_video_duration(
+        str(source.get("preferred_video_duration") or "").strip().lower() or None
+    )
+    target_clip_duration_sec, target_clip_duration_min_sec, target_clip_duration_max_sec = _resolve_target_clip_duration_bounds(
+        source.get("target_clip_duration_sec", DEFAULT_TARGET_CLIP_DURATION_SEC),
+        source.get("target_clip_duration_min_sec", DEFAULT_SETTINGS_TARGET_CLIP_DURATION_MIN_SEC),
+        source.get("target_clip_duration_max_sec", DEFAULT_SETTINGS_TARGET_CLIP_DURATION_MAX_SEC),
+    )
+    return CommunitySettingsResponse(
+        generation_mode=generation_mode,  # type: ignore[arg-type]
+        default_input_mode=default_input_mode,
+        min_relevance_threshold=min_relevance_threshold,
+        start_muted=start_muted,
+        video_pool_mode=video_pool_mode,
+        preferred_video_duration=preferred_video_duration,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
 
 
 def _video_duration_bucket(duration_sec: object) -> Literal["short", "medium", "long"] | None:
@@ -2682,6 +2751,58 @@ def replace_community_history(request: Request, payload: CommunityHistoryReplace
             )
     items = [_serialize_community_history_item(row) for row in normalized_items]
     return {"items": items}
+
+
+@app.get("/api/community/settings", response_model=CommunitySettingsResponse)
+def get_community_settings(request: Request):
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        row = fetch_one(
+            conn,
+            """
+            SELECT
+                generation_mode,
+                default_input_mode,
+                min_relevance_threshold,
+                start_muted,
+                video_pool_mode,
+                preferred_video_duration,
+                target_clip_duration_sec,
+                target_clip_duration_min_sec,
+                target_clip_duration_max_sec
+            FROM community_account_settings
+            WHERE account_id = ?
+            """,
+            (str(account["id"]),),
+        )
+    return _serialize_community_settings(row)
+
+
+@app.put("/api/community/settings", response_model=CommunitySettingsResponse)
+def replace_community_settings(request: Request, payload: CommunitySettingsPayload):
+    _enforce_rate_limit(request, "community-settings", limit=COMMUNITY_SETTINGS_RATE_LIMIT_PER_WINDOW)
+    normalized = _serialize_community_settings(payload.model_dump())
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        upsert(
+            conn,
+            "community_account_settings",
+            {
+                "account_id": str(account["id"]),
+                "generation_mode": normalized.generation_mode,
+                "default_input_mode": normalized.default_input_mode,
+                "min_relevance_threshold": normalized.min_relevance_threshold,
+                "start_muted": 1 if normalized.start_muted else 0,
+                "video_pool_mode": normalized.video_pool_mode,
+                "preferred_video_duration": normalized.preferred_video_duration,
+                "target_clip_duration_sec": normalized.target_clip_duration_sec,
+                "target_clip_duration_min_sec": normalized.target_clip_duration_min_sec,
+                "target_clip_duration_max_sec": normalized.target_clip_duration_max_sec,
+                "updated_at": now_iso(),
+            },
+            pk="account_id",
+        )
+    return normalized
 
 
 @app.post("/api/community/sets", response_model=CommunitySetOut, status_code=201)

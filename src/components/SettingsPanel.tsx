@@ -14,10 +14,13 @@ import {
   TARGET_CLIP_DURATION_MIN,
   readStudyReelsSettings,
   saveStudyReelsSettings,
+  subscribeToStudyReelsSettings,
 } from "@/lib/settings";
+import { ViewportModalPortal } from "@/components/ViewportModalPortal";
 
 type SettingsPanelProps = {
   onClearSearchData: () => void;
+  onSettingsSaved?: (settings: StudyReelsSettings) => void;
   onUnsavedChangesChange?: (hasUnsavedChanges: boolean) => void;
   onAvailabilityModalClose?: (source: "close-button" | "backdrop") => void;
   availabilityModalMode?: "overlay" | "inline";
@@ -226,6 +229,7 @@ function buildHeuristicAvailabilityState(settings: StudyReelsSettings): Settings
 export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>(function SettingsPanel(
   {
     onClearSearchData,
+    onSettingsSaved,
     onUnsavedChangesChange,
     onAvailabilityModalClose,
     availabilityModalMode = "overlay",
@@ -627,8 +631,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     [targetClipDurationMaxSec, updateClipRangeByHandle],
   );
 
-  useEffect(() => {
-    const saved = readStudyReelsSettings();
+  const applySavedSettings = useCallback((saved: StudyReelsSettings) => {
     setMinRelevanceThreshold(saved.minRelevanceThreshold);
     setStartMuted(saved.startMuted);
     setVideoPoolMode(saved.videoPoolMode);
@@ -638,6 +641,13 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     setSavedPreferences(saved);
     setSettingsHydrated(true);
   }, []);
+
+  useEffect(() => {
+    applySavedSettings(readStudyReelsSettings());
+    return subscribeToStudyReelsSettings((next) => {
+      applySavedSettings(next);
+    });
+  }, [applySavedSettings]);
 
   const runAvailabilityCheck = useCallback(async (settings: StudyReelsSettings) => {
     if (!settingsHydrated) {
@@ -807,10 +817,12 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     });
     setSavedPreferences(saved);
     showNotice("Settings saved and applied.");
+    onSettingsSaved?.(saved);
     void runAvailabilityCheck(saved);
   }, [
     defaultInputModeForSave,
     generationModeForChecks,
+    onSettingsSaved,
     minRelevanceThreshold,
     preferredVideoDuration,
     runAvailabilityCheck,
@@ -1317,80 +1329,82 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
         </div>
       </div>
       {isAvailabilityModalMounted && availabilityModalMode === "overlay" ? (
-        <div
-          className={`fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out ${
-            isAvailabilityModalVisible ? "opacity-100" : "pointer-events-none opacity-0"
-          }`}
-          role="presentation"
-          onClick={() => closeAvailabilityModal("backdrop")}
-        >
+        <ViewportModalPortal>
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Configuration success rate"
-            className={`w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out md:p-6 ${
-              isAvailabilityModalVisible ? "opacity-100" : "opacity-0"
+            className={`fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out ${
+              isAvailabilityModalVisible ? "opacity-100" : "pointer-events-none opacity-0"
             }`}
-            onClick={(event) => event.stopPropagation()}
+            role="presentation"
+            onClick={() => closeAvailabilityModal("backdrop")}
           >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Configuration check</p>
-                <h3 className="mt-2 text-lg font-semibold text-white">
-                  {availabilityState.status === "checking" ? "Checking success rate..." : "Success rate result"}
-                </h3>
-              </div>
-              <button
-                type="button"
-                onClick={() => closeAvailabilityModal("close-button")}
-                aria-label="Close"
-                className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
-              >
-                <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
-                  <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
-                </svg>
-              </button>
-            </div>
-
             <div
-              className={`mt-4 rounded-2xl border px-4 py-3 text-sm ${
-                availabilityState.status === "ok"
-                  ? "border-emerald-300/45 bg-emerald-500/14 text-emerald-100"
-                  : availabilityState.status === "partial"
-                  ? "border-sky-300/45 bg-sky-500/14 text-sky-100"
-                  : availabilityState.status === "blocked"
-                  ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
-                  : availabilityState.status === "none"
-                  ? "border-amber-300/45 bg-amber-500/16 text-amber-100"
-                  : availabilityState.status === "error"
-                  ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
-                  : "border-white/24 bg-white/[0.06] text-white/88"
+              role="dialog"
+              aria-modal="true"
+              aria-label="Configuration success rate"
+              className={`w-full max-w-xl rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out md:p-6 ${
+                isAvailabilityModalVisible ? "opacity-100" : "opacity-0"
               }`}
+              onClick={(event) => event.stopPropagation()}
             >
-              <p>{availabilityState.message}</p>
-              {availabilityState.limitingFactors.length > 0 ? (
-                <div className="mt-2 border-t border-white/20 pt-2 text-xs">
-                  <p className="font-semibold">
-                  {availabilityState.limitingFactors.length > 1 ? "Main limits:" : "Main limit:"}
-                  </p>
-                  <ul className="mt-1.5 space-y-1">
-                    {availabilityState.limitingFactors.map((factor) => (
-                      <li key={factor} className="flex items-start gap-1.5">
-                        <span aria-hidden="true" className="leading-[1.2] opacity-80">•</span>
-                        <span className="leading-[1.2]">{factor}</span>
-                      </li>
-                    ))}
-                  </ul>
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">Configuration check</p>
+                  <h3 className="mt-2 text-lg font-semibold text-white">
+                    {availabilityState.status === "checking" ? "Checking success rate..." : "Success rate result"}
+                  </h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => closeAvailabilityModal("close-button")}
+                  aria-label="Close"
+                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                    <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                  </svg>
+                </button>
+              </div>
+
+              <div
+                className={`mt-4 rounded-2xl border px-4 py-3 text-sm ${
+                  availabilityState.status === "ok"
+                    ? "border-emerald-300/45 bg-emerald-500/14 text-emerald-100"
+                    : availabilityState.status === "partial"
+                    ? "border-sky-300/45 bg-sky-500/14 text-sky-100"
+                    : availabilityState.status === "blocked"
+                    ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
+                    : availabilityState.status === "none"
+                    ? "border-amber-300/45 bg-amber-500/16 text-amber-100"
+                    : availabilityState.status === "error"
+                    ? "border-rose-300/45 bg-rose-500/16 text-rose-100"
+                    : "border-white/24 bg-white/[0.06] text-white/88"
+                }`}
+              >
+                <p>{availabilityState.message}</p>
+                {availabilityState.limitingFactors.length > 0 ? (
+                  <div className="mt-2 border-t border-white/20 pt-2 text-xs">
+                    <p className="font-semibold">
+                    {availabilityState.limitingFactors.length > 1 ? "Main limits:" : "Main limit:"}
+                    </p>
+                    <ul className="mt-1.5 space-y-1">
+                      {availabilityState.limitingFactors.map((factor) => (
+                        <li key={factor} className="flex items-start gap-1.5">
+                          <span aria-hidden="true" className="leading-[1.2] opacity-80">•</span>
+                          <span className="leading-[1.2]">{factor}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </div>
+              {showLowRelevanceWarning ? (
+                <div className="mt-3 rounded-2xl border border-amber-300/45 bg-amber-500/16 px-4 py-3 text-sm text-amber-100">
+                  Warning: Videos unrelated to the topic may appear when similarity threshold is too low.
                 </div>
               ) : null}
             </div>
-            {showLowRelevanceWarning ? (
-              <div className="mt-3 rounded-2xl border border-amber-300/45 bg-amber-500/16 px-4 py-3 text-sm text-amber-100">
-                Warning: Videos unrelated to the topic may appear when similarity threshold is too low.
-              </div>
-            ) : null}
           </div>
-        </div>
+        </ViewportModalPortal>
       ) : null}
     </div>
   );
