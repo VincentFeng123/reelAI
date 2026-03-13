@@ -579,9 +579,57 @@ def _community_account_is_verified(row: dict[str, object]) -> bool:
     return _parse_optional_iso_datetime(row.get("verified_at")) is not None
 
 
+def _community_email_verification_required() -> bool:
+    return bool(settings.community_email_verification_required)
+
+
+def _auto_verify_community_account_if_allowed(
+    conn,
+    request: Request,
+    account_row: dict[str, object],
+    *,
+    claim_legacy_sets: bool = False,
+) -> tuple[dict[str, object], int]:
+    normalized_account = dict(account_row)
+    if _community_email_verification_required() or _community_account_is_verified(normalized_account):
+        return normalized_account, 0
+
+    email = str(normalized_account.get("email") or "").strip()
+    if not email:
+        return normalized_account, 0
+
+    account_id = str(normalized_account.get("id") or "").strip()
+    if not account_id:
+        return normalized_account, 0
+
+    verified_at = now_iso()
+    execute_modify(
+        conn,
+        """
+        UPDATE community_accounts
+        SET verified_at = ?, verification_code_hash = NULL, verification_expires_at = NULL, updated_at = ?
+        WHERE id = ?
+        """,
+        (verified_at, verified_at, account_id),
+    )
+    normalized_account["verified_at"] = verified_at
+    normalized_account["verification_code_hash"] = None
+    normalized_account["verification_expires_at"] = None
+
+    claimed_legacy_sets = 0
+    if claim_legacy_sets:
+        claimed_legacy_sets = _claim_legacy_community_sets_for_account(
+            conn,
+            request,
+            account_id=account_id,
+            legacy_claim_owner_key_hash=normalized_account.get("legacy_claim_owner_key_hash"),
+        )
+    return normalized_account, max(0, claimed_legacy_sets)
+
+
 def _community_verification_debug_mode_enabled() -> bool:
     # Plaintext debug codes are allowed only for non-hosted runtimes.
-    return not _is_hosted_runtime()
+    return _community_email_verification_required() and not _is_hosted_runtime()
 
 
 def _community_verification_email_is_configured() -> bool:
@@ -589,6 +637,8 @@ def _community_verification_email_is_configured() -> bool:
 
 
 def _require_hosted_verification_delivery_available() -> None:
+    if not _community_email_verification_required():
+        return
     if _community_verification_debug_mode_enabled():
         return
     if not _community_verification_email_is_configured():
@@ -596,6 +646,8 @@ def _require_hosted_verification_delivery_available() -> None:
 
 
 def _warn_if_hosted_auth_email_is_unconfigured() -> None:
+    if not _community_email_verification_required():
+        return
     if not _is_hosted_runtime():
         return
     if _community_verification_email_is_configured():
@@ -808,6 +860,7 @@ def _require_authenticated_community_account(conn, request: Request) -> dict[str
 
 def _require_verified_community_account(conn, request: Request) -> dict[str, object]:
     account = _require_authenticated_community_account(conn, request)
+    account, _ = _auto_verify_community_account_if_allowed(conn, request, account, claim_legacy_sets=True)
     if not _community_account_is_verified(account):
         raise HTTPException(status_code=403, detail="Verify your account to access your private community sets.")
     return account
@@ -1305,7 +1358,9 @@ def register_community_account(request: Request, payload: CommunityAuthRegisterR
     email, email_normalized = _normalize_community_email(payload.email)
     password = _normalize_community_password(payload.password)
     legacy_claim_owner_key_hash = _community_owner_hash_from_request_optional(request)
-    _require_hosted_verification_delivery_available()
+    verification_required = _community_email_verification_required()
+    if verification_required:
+        _require_hosted_verification_delivery_available()
     with get_conn(transactional=True) as conn:
         existing_identity = fetch_one(
             conn,
@@ -1323,6 +1378,7 @@ def register_community_account(request: Request, payload: CommunityAuthRegisterR
         account_id = str(uuid.uuid4())
         salt_hex = secrets.token_hex(16)
         timestamp = now_iso()
+        verified_at = None if verification_required else timestamp
         try:
             insert(
                 conn,
@@ -1335,7 +1391,7 @@ def register_community_account(request: Request, payload: CommunityAuthRegisterR
                     "email_normalized": email_normalized,
                     "password_hash": _hash_community_password(password, salt_hex),
                     "password_salt": salt_hex,
-                    "verified_at": None,
+                    "verified_at": verified_at,
                     "verification_code_hash": None,
                     "verification_expires_at": None,
                     "legacy_claim_owner_key_hash": legacy_claim_owner_key_hash,
@@ -1346,23 +1402,33 @@ def register_community_account(request: Request, payload: CommunityAuthRegisterR
         except DatabaseIntegrityError as exc:
             raise HTTPException(status_code=409, detail=COMMUNITY_REGISTER_CONFLICT_DETAIL) from exc
         session_token = _create_community_session(conn, account_id)
-        verification_code_debug = _issue_community_verification_code(
-            conn,
-            account_id=account_id,
-            email=email,
-            username=username,
-        )
+        verification_code_debug = None
+        claimed_legacy_sets = 0
+        if verification_required:
+            verification_code_debug = _issue_community_verification_code(
+                conn,
+                account_id=account_id,
+                email=email,
+                username=username,
+            )
+        else:
+            claimed_legacy_sets = _claim_legacy_community_sets_for_account(
+                conn,
+                request,
+                account_id=account_id,
+                legacy_claim_owner_key_hash=legacy_claim_owner_key_hash,
+            )
         account = {
             "id": account_id,
             "username": username,
             "email": email,
-            "verified_at": None,
+            "verified_at": verified_at,
         }
     return CommunityAuthSessionResponse(
         account=_community_account_out(account),
         session_token=session_token,
-        claimed_legacy_sets=0,
-        verification_required=True,
+        claimed_legacy_sets=max(0, claimed_legacy_sets),
+        verification_required=verification_required,
         verification_code_debug=verification_code_debug,
     )
 
@@ -1403,19 +1469,29 @@ def login_community_account(request: Request, payload: CommunityAuthLoginRequest
         if not account or not _verify_community_password(password, str(account.get("password_salt") or ""), str(account.get("password_hash") or "")):
             raise HTTPException(status_code=401, detail="Incorrect username or password.")
         account_id = str(account["id"])
+        verification_required = _community_email_verification_required()
         if not _community_account_is_verified(account):
             email = str(account.get("email") or "").strip()
             if not email:
                 raise HTTPException(status_code=409, detail="This account is missing a verification email.")
-            _require_hosted_verification_delivery_available()
+            if verification_required:
+                _require_hosted_verification_delivery_available()
         session_token = _create_community_session(conn, account_id)
         if not _community_account_is_verified(account):
-            verification_code_debug = _issue_community_verification_code(
-                conn,
-                account_id=account_id,
-                email=str(account.get("email") or "").strip(),
-                username=str(account.get("username") or "").strip(),
-            )
+            if verification_required:
+                verification_code_debug = _issue_community_verification_code(
+                    conn,
+                    account_id=account_id,
+                    email=str(account.get("email") or "").strip(),
+                    username=str(account.get("username") or "").strip(),
+                )
+            else:
+                account, claimed_legacy_sets = _auto_verify_community_account_if_allowed(
+                    conn,
+                    request,
+                    account,
+                    claim_legacy_sets=True,
+                )
         else:
             claimed_legacy_sets = _claim_legacy_community_sets_for_account(
                 conn,
@@ -1428,7 +1504,7 @@ def login_community_account(request: Request, payload: CommunityAuthLoginRequest
             account=_community_account_out(account),
             session_token=session_token,
             claimed_legacy_sets=0,
-            verification_required=True,
+            verification_required=verification_required,
             verification_code_debug=verification_code_debug,
         )
     return CommunityAuthSessionResponse(
@@ -1444,6 +1520,7 @@ def login_community_account(request: Request, payload: CommunityAuthLoginRequest
 def get_community_account_me(request: Request):
     with get_conn(transactional=True) as conn:
         account = _require_authenticated_community_account(conn, request)
+        account, _ = _auto_verify_community_account_if_allowed(conn, request, account, claim_legacy_sets=True)
     return CommunityAuthMeResponse(account=_community_account_out(account))
 
 
@@ -1473,6 +1550,17 @@ def verify_community_account(request: Request, payload: CommunityVerifyAccountRe
         )
         if not full_account:
             raise HTTPException(status_code=404, detail="Community account not found.")
+        full_account, auto_claimed_legacy_sets = _auto_verify_community_account_if_allowed(
+            conn,
+            request,
+            full_account,
+            claim_legacy_sets=True,
+        )
+        if auto_claimed_legacy_sets > 0:
+            return CommunityVerifyAccountResponse(
+                account=_community_account_out(full_account),
+                claimed_legacy_sets=max(0, auto_claimed_legacy_sets),
+            )
         if _community_account_is_verified(full_account):
             claimed_legacy_sets = _claim_legacy_community_sets_for_account(
                 conn,
@@ -1525,7 +1613,6 @@ def verify_community_account(request: Request, payload: CommunityVerifyAccountRe
 @app.post("/api/community/auth/resend-verification", response_model=CommunityResendVerificationResponse)
 def resend_community_verification(request: Request):
     _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
-    _require_hosted_verification_delivery_available()
     with get_conn(transactional=True) as conn:
         account = _require_authenticated_community_account(conn, request)
         account_id = str(account["id"])
@@ -1545,8 +1632,12 @@ def resend_community_verification(request: Request):
         )
         if not full_account:
             raise HTTPException(status_code=404, detail="Community account not found.")
+        full_account, _ = _auto_verify_community_account_if_allowed(conn, request, full_account, claim_legacy_sets=True)
+        if not _community_email_verification_required():
+            return CommunityResendVerificationResponse(account=_community_account_out(full_account), verification_code_debug=None)
         if _community_account_is_verified(full_account):
             return CommunityResendVerificationResponse(account=_community_account_out(full_account), verification_code_debug=None)
+        _require_hosted_verification_delivery_available()
         email = str(full_account.get("email") or "").strip()
         if not email:
             raise HTTPException(status_code=409, detail="This account is missing a verification email.")
@@ -1567,7 +1658,9 @@ def change_community_verification_email(request: Request, payload: CommunityChan
     _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
     email, email_normalized = _normalize_community_email(payload.email)
     current_password = _normalize_community_password(payload.current_password)
-    _require_hosted_verification_delivery_available()
+    verification_required = _community_email_verification_required()
+    if verification_required:
+        _require_hosted_verification_delivery_available()
     with get_conn(transactional=True) as conn:
         account = _require_authenticated_community_account(conn, request)
         account_id = str(account["id"])
@@ -1590,7 +1683,7 @@ def change_community_verification_email(request: Request, payload: CommunityChan
         )
         if not full_account:
             raise HTTPException(status_code=404, detail="Community account not found.")
-        if _community_account_is_verified(full_account):
+        if verification_required and _community_account_is_verified(full_account):
             raise HTTPException(status_code=403, detail="Verified accounts cannot change email from this screen.")
         if not _verify_community_password(
             current_password,
@@ -1624,16 +1717,31 @@ def change_community_verification_email(request: Request, payload: CommunityChan
             if "email_normalized" in lower_error or "unique" in lower_error:
                 raise HTTPException(status_code=409, detail=COMMUNITY_CHANGE_EMAIL_CONFLICT_DETAIL) from exc
             raise
-        verification_code_debug = _issue_community_verification_code(
-            conn,
-            account_id=account_id,
-            email=email,
-            username=str(full_account.get("username") or "").strip(),
-        )
+        verification_code_debug = None
+        if verification_required:
+            verification_code_debug = _issue_community_verification_code(
+                conn,
+                account_id=account_id,
+                email=email,
+                username=str(full_account.get("username") or "").strip(),
+            )
+        else:
+            verified_at = now_iso()
+            execute_modify(
+                conn,
+                """
+                UPDATE community_accounts
+                SET verified_at = ?, verification_code_hash = NULL, verification_expires_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (verified_at, verified_at, account_id),
+            )
+            full_account["verified_at"] = verified_at
 
         full_account["email"] = email
         full_account["email_normalized"] = email_normalized
-        full_account["verified_at"] = None
+        if verification_required:
+            full_account["verified_at"] = None
         return CommunityChangeEmailResponse(
             account=_community_account_out(full_account),
             verification_code_debug=verification_code_debug,

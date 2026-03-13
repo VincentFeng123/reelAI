@@ -26,6 +26,7 @@ class _VerificationTestBase(unittest.TestCase):
         self.previous_env = {key: os.environ.get(key) for key in (
             "DATA_DIR",
             "APP_ENV",
+            "COMMUNITY_EMAIL_VERIFICATION_REQUIRED",
             "DATABASE_URL",
             "SMTP_HOST",
             "SMTP_PORT",
@@ -43,6 +44,7 @@ class _VerificationTestBase(unittest.TestCase):
         main_module._rate_limit_last_sweep = 0.0
         main_module._rate_limit_last_db_cleanup = 0.0
         main_module._local_verification_hmac_key_cache = None
+        os.environ["COMMUNITY_EMAIL_VERIFICATION_REQUIRED"] = "1"
         get_settings.cache_clear()
         main_module.settings = get_settings()
         self._refresh_client()
@@ -398,6 +400,118 @@ class CommunityAuthSecurityTests(_VerificationTestBase):
                 json={"username": "scopeduser", "password": "wrong-password"},
             )
         self.assertEqual(other_ip_response.status_code, 401, other_ip_response.text)
+
+
+class VerificationDisabledModeTests(_VerificationTestBase):
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["APP_ENV"] = "production"
+        os.environ["COMMUNITY_EMAIL_VERIFICATION_REQUIRED"] = "0"
+        os.environ.pop("SMTP_HOST", None)
+        os.environ.pop("SMTP_FROM_EMAIL", None)
+        os.environ.pop("VERIFICATION_HMAC_KEY", None)
+        get_settings.cache_clear()
+        main_module.settings = get_settings()
+        db_module._db_ready = False
+        self._refresh_client()
+
+    def test_hosted_register_auto_verifies_without_email_delivery(self) -> None:
+        response = self.client.post(
+            "/api/community/auth/register",
+            headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
+            json={
+                "username": "autoverify",
+                "email": "autoverify@example.com",
+                "password": "password123",
+            },
+        )
+
+        self.assertEqual(response.status_code, 201, response.text)
+        payload = response.json()
+        self.assertFalse(payload["verification_required"])
+        self.assertIsNone(payload["verification_code_debug"])
+        self.assertTrue(payload["account"]["is_verified"])
+
+        with get_conn(transactional=True) as conn:
+            account = fetch_one(
+                conn,
+                "SELECT verified_at FROM community_accounts WHERE username_normalized = ? LIMIT 1",
+                ("autoverify",),
+            )
+        self.assertIsNotNone(account)
+        self.assertTrue(str(account["verified_at"] or "").strip())
+
+    def test_login_auto_verifies_existing_unverified_account_when_disabled(self) -> None:
+        timestamp = now_iso()
+        salt_hex = "55" * 16
+        with get_conn(transactional=True) as conn:
+            insert(
+                conn,
+                "community_accounts",
+                {
+                    "id": "login-autoverify-account",
+                    "username": "autologin",
+                    "username_normalized": "autologin",
+                    "email": "autologin@example.com",
+                    "email_normalized": "autologin@example.com",
+                    "password_hash": _hash_community_password("password123", salt_hex),
+                    "password_salt": salt_hex,
+                    "verified_at": None,
+                    "verification_code_hash": None,
+                    "verification_expires_at": None,
+                    "legacy_claim_owner_key_hash": None,
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                },
+            )
+
+        response = self.client.post(
+            "/api/community/auth/login",
+            headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
+            json={"username": "autologin", "password": "password123"},
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertFalse(payload["verification_required"])
+        self.assertIsNone(payload["verification_code_debug"])
+        self.assertTrue(payload["account"]["is_verified"])
+
+        with get_conn(transactional=True) as conn:
+            account = fetch_one(
+                conn,
+                "SELECT verified_at FROM community_accounts WHERE username_normalized = ? LIMIT 1",
+                ("autologin",),
+            )
+        self.assertIsNotNone(account)
+        self.assertTrue(str(account["verified_at"] or "").strip())
+
+    def test_change_email_keeps_account_verified_when_verification_is_disabled(self) -> None:
+        register_response = self.client.post(
+            "/api/community/auth/register",
+            headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
+            json={
+                "username": "disableemailchange",
+                "email": "old-disable@example.com",
+                "password": "password123",
+            },
+        )
+        self.assertEqual(register_response.status_code, 201, register_response.text)
+        session_token = str(register_response.json()["session_token"])
+
+        change_email_response = self.client.post(
+            "/api/community/auth/change-email",
+            headers={COMMUNITY_SESSION_HEADER: session_token},
+            json={
+                "email": "new-disable@example.com",
+                "current_password": "password123",
+            },
+        )
+        self.assertEqual(change_email_response.status_code, 200, change_email_response.text)
+        payload = change_email_response.json()
+        self.assertEqual(payload["account"]["email"], "new-disable@example.com")
+        self.assertTrue(payload["account"]["is_verified"])
+        self.assertIsNone(payload["verification_code_debug"])
 
 
 if __name__ == "__main__":

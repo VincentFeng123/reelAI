@@ -15,6 +15,7 @@ os.environ["DATA_DIR"] = _TEST_DATA_DIR.name
 from fastapi.testclient import TestClient
 
 from backend.app.config import get_settings
+import backend.app.main as main_module
 
 get_settings.cache_clear()
 
@@ -28,14 +29,27 @@ def _owner_hash(owner_key: str) -> str:
 
 class CommunitySetOwnershipTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.previous_verification_required = os.environ.get("COMMUNITY_EMAIL_VERIFICATION_REQUIRED")
+        os.environ["COMMUNITY_EMAIL_VERIFICATION_REQUIRED"] = "1"
+        get_settings.cache_clear()
+        main_module.settings = get_settings()
         self.client = TestClient(app)
         self.other_client = TestClient(app)
         self.addCleanup(self.client.close)
         self.addCleanup(self.other_client.close)
+        self.addCleanup(self._restore_environment)
         with get_conn(transactional=True) as conn:
             execute_modify(conn, "DELETE FROM community_sessions")
             execute_modify(conn, "DELETE FROM community_accounts")
             execute_modify(conn, "DELETE FROM community_sets")
+
+    def _restore_environment(self) -> None:
+        if self.previous_verification_required is None:
+            os.environ.pop("COMMUNITY_EMAIL_VERIFICATION_REQUIRED", None)
+        else:
+            os.environ["COMMUNITY_EMAIL_VERIFICATION_REQUIRED"] = self.previous_verification_required
+        get_settings.cache_clear()
+        main_module.settings = get_settings()
 
     def _community_payload(self, *, title: str = "Community Systems Study Set") -> dict:
         return {

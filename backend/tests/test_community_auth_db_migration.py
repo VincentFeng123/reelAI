@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import db as db_module
 from backend.app.config import get_settings
+import backend.app.main as main_module
 from backend.app.main import COMMUNITY_OWNER_HEADER, app
 
 
@@ -29,6 +30,7 @@ class CommunityAuthDbMigrationTests(unittest.TestCase):
 
         get_settings.cache_clear()
         db_module._db_ready = False
+        main_module.settings = get_settings()
         self.addCleanup(self._reset_db_state)
 
         self.db_path = Path(self.temp_dir.name) / "studyreels.db"
@@ -47,10 +49,13 @@ class CommunityAuthDbMigrationTests(unittest.TestCase):
             os.environ.pop("DATABASE_URL", None)
         else:
             os.environ["DATABASE_URL"] = self.previous_database_url
+        get_settings.cache_clear()
+        main_module.settings = get_settings()
 
     def _reset_db_state(self) -> None:
         db_module._db_ready = False
         get_settings.cache_clear()
+        main_module.settings = get_settings()
 
     def _seed_legacy_sqlite_schema(self) -> None:
         conn = sqlite3.connect(self.db_path)

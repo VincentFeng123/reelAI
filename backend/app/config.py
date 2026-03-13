@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = True
     smtp_use_ssl: bool = False
     verification_hmac_key: str = ""
+    community_email_verification_required: bool = False
 
 
 @lru_cache

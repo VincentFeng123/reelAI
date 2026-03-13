@@ -35,6 +35,7 @@ Deploy the repo as a single project from root (`.`).
   - `OPENAI_API_KEY=...`
   - `YOUTUBE_API_KEY=...`
   - `DATABASE_URL=postgresql://...` (recommended for durable hosted data, e.g. Railway)
+  - `COMMUNITY_EMAIL_VERIFICATION_REQUIRED=0` (default disabled; set `1` to require verification again)
   - `VERIFICATION_HMAC_KEY=...` (required for hosted community-account verification)
   - `SMTP_HOST=...`
   - `SMTP_PORT=587`
@@ -44,5 +45,7 @@ Deploy the repo as a single project from root (`.`).
   - Optional: `SMTP_USE_TLS=1`, `SMTP_USE_SSL=0`
 - `DATA_DIR` defaults to `/tmp/studyreels-data` on Vercel and is ephemeral.
 - If you intentionally stay on SQLite in hosted mode, tune lock waits with `SQLITE_BUSY_TIMEOUT_MS` (default `120000`).
+- With `COMMUNITY_EMAIL_VERIFICATION_REQUIRED=0`, accounts activate immediately after signup/login when an email is present.
+- Set `COMMUNITY_EMAIL_VERIFICATION_REQUIRED=1` to restore the verification-email flow.
 - Hosted community-account verification also requires `VERIFICATION_HMAC_KEY`.
-- Hosted community-account registration and email verification will fail with `503` until the SMTP settings above are configured.
+- Hosted community-account registration and email verification will fail with `503` until the SMTP settings above are configured when verification is enabled.

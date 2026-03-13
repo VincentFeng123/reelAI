@@ -276,6 +276,7 @@ From repo root:
    - `OPENAI_API_KEY=...`
    - `YOUTUBE_API_KEY=...`
    - `DATABASE_URL=postgresql://...` (recommended for hosted durable data, e.g. Railway)
+   - `COMMUNITY_EMAIL_VERIFICATION_REQUIRED=0` (default disabled; set `1` to re-enable email verification)
    - `VERIFICATION_HMAC_KEY=...` (required for hosted community-account verification)
    - `SMTP_HOST=...`
    - `SMTP_PORT=587`
@@ -289,9 +290,9 @@ From repo root:
 5. Deploy.
 
 Hosted community-account note:
-- Account registration, email verification, and unverified-account login require SMTP in hosted environments.
-- Hosted verification also requires `VERIFICATION_HMAC_KEY`; if it is missing, verification flows will return `503`.
-- If you deploy on Railway/Vercel without the `SMTP_*` variables above, registration and unverified-account login will return `503`.
+- With `COMMUNITY_EMAIL_VERIFICATION_REQUIRED=0`, accounts activate immediately after signup/login as long as an email is present.
+- Set `COMMUNITY_EMAIL_VERIFICATION_REQUIRED=1` to restore email verification.
+- Hosted verification requires SMTP plus `VERIFICATION_HMAC_KEY`; without them, registration and unverified-account login will return `503` when verification is enabled.
 
 How this works in one project:
 - Next.js serves the frontend from root (`src/...`).
