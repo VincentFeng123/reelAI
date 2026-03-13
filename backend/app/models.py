@@ -260,3 +260,31 @@ class CommunityResendVerificationResponse(BaseModel):
 class CommunityChangeEmailResponse(BaseModel):
     account: CommunityAccountOut
     verification_code_debug: str | None = None
+
+
+class CommunityHistoryItemIn(BaseModel):
+    material_id: str = Field(min_length=1, max_length=240)
+    title: str = Field(min_length=1, max_length=200)
+    updated_at: int = Field(ge=0)
+    starred: bool = False
+    generation_mode: Literal["slow", "fast"] = "fast"
+    source: Literal["search", "community"] = "search"
+    feed_query: str | None = Field(default=None, max_length=4000)
+
+
+class CommunityHistoryItemOut(BaseModel):
+    material_id: str
+    title: str
+    updated_at: int
+    starred: bool = False
+    generation_mode: Literal["slow", "fast"] = "fast"
+    source: Literal["search", "community"] = "search"
+    feed_query: str | None = None
+
+
+class CommunityHistoryReplaceRequest(BaseModel):
+    items: list[CommunityHistoryItemIn] = Field(default_factory=list)
+
+
+class CommunityHistoryResponse(BaseModel):
+    items: list[CommunityHistoryItemOut] = Field(default_factory=list)

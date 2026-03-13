@@ -11,6 +11,7 @@ import type {
   ReelsCanGenerateResponse,
   ReelsGenerateResponse,
 } from "@/lib/types";
+import type { StoredHistoryItem } from "@/lib/historyStorage";
 import type { PreferredVideoDuration, VideoPoolMode } from "@/lib/settings";
 
 const RAW_API_BASE = (
@@ -776,6 +777,19 @@ type CommunitySetApi = {
   featured: boolean;
 };
 
+type CommunityHistoryItemApi = {
+  material_id: string;
+  title: string;
+  updated_at: number;
+  starred?: boolean;
+  generation_mode?: "slow" | "fast";
+  source?: "search" | "community";
+  feed_query?: string | null;
+};
+
+let communityHistorySyncVersion = 0;
+let communityHistorySyncChain: Promise<void> = Promise.resolve();
+
 function parseApiTimestampMs(value: unknown): number | null {
   if (typeof value === "number") {
     return Number.isFinite(value) && value > 0 ? value : null;
@@ -943,6 +957,86 @@ function normalizeCommunitySet(raw: unknown): CommunitySet | null {
     thumbnailUrl: typeof row.thumbnail_url === "string" && row.thumbnail_url.trim() ? row.thumbnail_url.trim() : "/images/community/ai-systems.svg",
     featured: Boolean(row.featured),
   };
+}
+
+function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const row = raw as Partial<CommunityHistoryItemApi>;
+  const materialId = typeof row.material_id === "string" ? row.material_id.trim() : "";
+  const title = typeof row.title === "string" ? row.title.trim() : "";
+  if (!materialId || !title) {
+    return null;
+  }
+  return {
+    materialId,
+    title,
+    updatedAt: Math.max(0, Math.floor(Number(row.updated_at) || 0)),
+    starred: Boolean(row.starred),
+    generationMode: row.generation_mode === "slow" ? "slow" : "fast",
+    source: row.source === "community" ? "community" : "search",
+    feedQuery: typeof row.feed_query === "string" && row.feed_query.trim() ? row.feed_query.trim() : undefined,
+  };
+}
+
+export async function fetchCommunityHistory(): Promise<StoredHistoryItem[]> {
+  const stored = readCommunityAuthSession();
+  if (!stored?.sessionToken) {
+    return [];
+  }
+  const res = await safeFetch(apiUrl("/community/history"), {
+    cache: "no-store",
+    headers: { ...communitySessionHeaders() },
+  });
+  const json = await parseJsonResponse<{ items?: unknown[] }>(res);
+  const rows = Array.isArray(json?.items) ? json.items : [];
+  return rows.map(normalizeStoredHistoryItem).filter(Boolean) as StoredHistoryItem[];
+}
+
+export async function replaceCommunityHistory(items: StoredHistoryItem[]): Promise<StoredHistoryItem[]> {
+  const stored = readCommunityAuthSession();
+  if (!stored?.sessionToken) {
+    return items;
+  }
+  const res = await safeFetch(apiUrl("/community/history"), {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      ...communitySessionHeaders(),
+    },
+    body: JSON.stringify({
+      items: items.map((item) => ({
+        material_id: item.materialId,
+        title: item.title,
+        updated_at: item.updatedAt,
+        starred: item.starred,
+        generation_mode: item.generationMode,
+        source: item.source,
+        feed_query: item.feedQuery ?? null,
+      })),
+    }),
+  });
+  const json = await parseJsonResponse<{ items?: unknown[] }>(res);
+  const rows = Array.isArray(json?.items) ? json.items : [];
+  return rows.map(normalizeStoredHistoryItem).filter(Boolean) as StoredHistoryItem[];
+}
+
+export function queueCommunityHistorySync(items: StoredHistoryItem[]): Promise<void> {
+  const snapshot = items.map((item) => ({ ...item }));
+  const syncVersion = communityHistorySyncVersion + 1;
+  communityHistorySyncVersion = syncVersion;
+  communityHistorySyncChain = communityHistorySyncChain
+    .catch(() => {
+      // Keep the queue alive after a prior failed sync.
+    })
+    .then(async () => {
+      if (syncVersion !== communityHistorySyncVersion) {
+        return;
+      }
+      await replaceCommunityHistory(snapshot);
+    });
+  return communityHistorySyncChain;
 }
 
 export async function fetchCommunitySets(): Promise<CommunitySet[]> {

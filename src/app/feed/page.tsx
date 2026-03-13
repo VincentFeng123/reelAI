@@ -5,8 +5,8 @@ import { useRouter, useSearchParams } from "next/navigation";
 
 import { LoadingFlappyMiniGame } from "@/components/LoadingFlappyMiniGame";
 import { ReelCard } from "@/components/ReelCard";
-import { askStudyChat, fetchFeed, generateReels, readCommunityAuthSession, sendFeedback, uploadMaterial } from "@/lib/api";
-import { HISTORY_STORAGE_KEY, writeScopedHistorySnapshot } from "@/lib/historyStorage";
+import { askStudyChat, fetchFeed, generateReels, queueCommunityHistorySync, readCommunityAuthSession, sendFeedback, uploadMaterial } from "@/lib/api";
+import { HISTORY_STORAGE_KEY, type StoredHistoryItem, writeScopedHistorySnapshot } from "@/lib/historyStorage";
 import {
   type GenerationMode,
   type PreferredVideoDuration,
@@ -102,6 +102,34 @@ type CommunityFeedHandoffPayload = {
     tEndSec?: number;
   }>;
 };
+
+function normalizeStoredHistoryItems(raw: unknown): StoredHistoryItem[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw
+    .map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return null;
+      }
+      const row = item as Record<string, unknown>;
+      const materialId = String(row.materialId || "").trim();
+      const title = String(row.title || "").trim();
+      if (!materialId || !title) {
+        return null;
+      }
+      return {
+        materialId,
+        title,
+        updatedAt: Math.max(0, Math.floor(Number(row.updatedAt) || 0)),
+        starred: Boolean(row.starred),
+        generationMode: row.generationMode === "slow" ? "slow" : "fast",
+        source: row.source === "community" ? "community" : "search",
+        feedQuery: typeof row.feedQuery === "string" && row.feedQuery.trim() ? row.feedQuery.trim() : undefined,
+      } satisfies StoredHistoryItem;
+    })
+    .filter(Boolean) as StoredHistoryItem[];
+}
 
 function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
   if (!raw) {
@@ -660,7 +688,14 @@ function FeedPageInner() {
         };
       });
       if (didChange) {
-        writeScopedHistorySnapshot(readCommunityAuthSession()?.account?.id ?? null, JSON.stringify(updated));
+        const accountId = readCommunityAuthSession()?.account?.id ?? null;
+        const normalizedUpdated = normalizeStoredHistoryItems(updated);
+        writeScopedHistorySnapshot(accountId, JSON.stringify(normalizedUpdated));
+        if (accountId) {
+          void queueCommunityHistorySync(normalizedUpdated).catch(() => {
+            // Keep the local history state even if cross-device sync fails.
+          });
+        }
       }
     } catch {
       // Ignore malformed history payloads and keep feed mode persistence functional.

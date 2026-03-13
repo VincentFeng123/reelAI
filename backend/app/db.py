@@ -237,6 +237,22 @@ CREATE TABLE IF NOT EXISTS community_sets (
 
 CREATE INDEX IF NOT EXISTS idx_community_sets_featured_created_at ON community_sets(featured DESC, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS community_material_history (
+    account_id TEXT NOT NULL,
+    material_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    updated_at BIGINT NOT NULL,
+    starred INTEGER NOT NULL DEFAULT 0,
+    generation_mode TEXT NOT NULL DEFAULT 'fast',
+    source TEXT NOT NULL DEFAULT 'search',
+    feed_query TEXT,
+    PRIMARY KEY(account_id, material_id),
+    FOREIGN KEY(account_id) REFERENCES community_accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_community_material_history_account_updated_at
+ON community_material_history(account_id, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS rate_limit_events (
     id TEXT PRIMARY KEY,
     rate_key TEXT NOT NULL,

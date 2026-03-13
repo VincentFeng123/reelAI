@@ -4,8 +4,22 @@ import { Suspense, type MouseEvent as ReactMouseEvent, type UIEvent, useCallback
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { type CommunityDraftExitActions, CommunityReelsPanel } from "@/components/CommunityReelsPanel";
-import { COMMUNITY_AUTH_CHANGED_EVENT, fetchCommunityAccount, logoutCommunityAccount, readCommunityAuthSession } from "@/lib/api";
-import { LEGACY_TOPIC_HISTORY_STORAGE_KEY, readScopedHistorySnapshot, writeScopedHistorySnapshot } from "@/lib/historyStorage";
+import {
+  COMMUNITY_AUTH_CHANGED_EVENT,
+  clearCommunityAuthSession,
+  fetchCommunityAccount,
+  fetchCommunityHistory,
+  isSessionExpiredError,
+  logoutCommunityAccount,
+  queueCommunityHistorySync,
+  readCommunityAuthSession,
+} from "@/lib/api";
+import {
+  LEGACY_TOPIC_HISTORY_STORAGE_KEY,
+  readScopedHistorySnapshot,
+  type StoredHistoryItem,
+  writeScopedHistorySnapshot,
+} from "@/lib/historyStorage";
 import type { CommunityAccount } from "@/lib/types";
 import {
   type SettingsAvailabilityModalSnapshot,
@@ -29,8 +43,8 @@ const SIDEBAR_INFO_TOOLTIP_DELAY_MS = 1000;
 const SIDEBAR_INFO_TOOLTIP_VISIBLE_MS = 2200;
 const SIDEBAR_INFO_TOOLTIP_FADE_MS = 180;
 const SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS = 24;
-type GenerationMode = "slow" | "fast";
-type HistorySource = "search" | "community";
+type GenerationMode = StoredHistoryItem["generationMode"];
+type HistorySource = StoredHistoryItem["source"];
 type SidebarTab = "search" | "community" | "create" | "edit" | "settings";
 type SidebarSwitchIntent = {
   tab: SidebarTab;
@@ -44,15 +58,7 @@ const DEFAULT_SETTINGS_AVAILABILITY_STATE: SettingsAvailabilityState = {
   limitingFactors: [],
 };
 
-type HistoryItem = {
-  materialId: string;
-  title: string;
-  updatedAt: number;
-  starred: boolean;
-  generationMode: GenerationMode;
-  source: HistorySource;
-  feedQuery?: string;
-};
+type HistoryItem = StoredHistoryItem;
 
 function normalizeSidebarTab(value: string | null): SidebarTab | null {
   if (value === "create" || value === "edit") {
@@ -217,6 +223,8 @@ function HomePageContent() {
   const sidebarInfoTooltipDismissTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipAnimateInTimerRef = useRef<number | null>(null);
   const topChromeGestureTimerRef = useRef<number | null>(null);
+  const historyMutationVersionRef = useRef(0);
+  const historyLoadSequenceRef = useRef(0);
 
   const resolveHistoryAccountId = useCallback(() => {
     const activeAccountId = communityAccount?.id?.trim();
@@ -226,6 +234,13 @@ function HomePageContent() {
     return readCommunityAuthSession()?.account?.id?.trim() || null;
   }, [communityAccount?.id]);
 
+  const setHistorySnapshot = useCallback((next: HistoryItem[], options?: { accountId?: string | null }) => {
+    const scopedAccountId = options?.accountId !== undefined ? options.accountId : resolveHistoryAccountId();
+    historyRef.current = next;
+    setHistory(next);
+    writeScopedHistorySnapshot(scopedAccountId, JSON.stringify(next));
+  }, [resolveHistoryAccountId]);
+
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
@@ -234,10 +249,43 @@ function HomePageContent() {
     const base = parseMaterialHistory(readScopedHistorySnapshot(scopedAccountId));
     const legacy = scopedAccountId ? [] : parseLegacyTopicHistory(window.localStorage.getItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY));
     const merged = mergeHistory(base, legacy);
-    historyRef.current = merged;
-    setHistory(merged);
-    writeScopedHistorySnapshot(scopedAccountId, JSON.stringify(merged));
-  }, [resolveHistoryAccountId, communityAccount?.id]);
+    setHistorySnapshot(merged, { accountId: scopedAccountId });
+
+    if (!scopedAccountId) {
+      return;
+    }
+
+    let cancelled = false;
+    const loadSequence = historyLoadSequenceRef.current + 1;
+    historyLoadSequenceRef.current = loadSequence;
+    const mutationVersionAtLoadStart = historyMutationVersionRef.current;
+
+    void (async () => {
+      try {
+        const remoteHistory = await fetchCommunityHistory();
+        if (
+          cancelled
+          || historyLoadSequenceRef.current !== loadSequence
+          || historyMutationVersionRef.current !== mutationVersionAtLoadStart
+        ) {
+          return;
+        }
+        setHistorySnapshot(remoteHistory, { accountId: scopedAccountId });
+      } catch (error) {
+        if (cancelled || historyLoadSequenceRef.current !== loadSequence) {
+          return;
+        }
+        if (isSessionExpiredError(error)) {
+          clearCommunityAuthSession();
+          setCommunityAccount(null);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [resolveHistoryAccountId, setHistorySnapshot]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -366,10 +414,18 @@ function HomePageContent() {
 
   const persistHistory = useCallback((next: HistoryItem[]) => {
     const scopedAccountId = resolveHistoryAccountId();
-    historyRef.current = next;
-    setHistory(next);
-    writeScopedHistorySnapshot(scopedAccountId, JSON.stringify(next));
-  }, [resolveHistoryAccountId]);
+    historyMutationVersionRef.current += 1;
+    setHistorySnapshot(next, { accountId: scopedAccountId });
+    if (!scopedAccountId) {
+      return;
+    }
+    void queueCommunityHistorySync(next).catch((error) => {
+      if (isSessionExpiredError(error)) {
+        clearCommunityAuthSession();
+        setCommunityAccount(null);
+      }
+    });
+  }, [resolveHistoryAccountId, setHistorySnapshot]);
 
   const upsertHistory = useCallback(
     (entry: {
@@ -399,13 +455,24 @@ function HomePageContent() {
 
   const clearAllHistory = useCallback(() => {
     const scopedAccountId = resolveHistoryAccountId();
+    historyMutationVersionRef.current += 1;
     historyRef.current = [];
     setHistory([]);
     setHistoryQuery("");
     setError(null);
     setActiveHistoryMenuId(null);
     if (typeof window !== "undefined") {
-      writeScopedHistorySnapshot(scopedAccountId, null);
+      if (scopedAccountId) {
+        writeScopedHistorySnapshot(scopedAccountId, JSON.stringify([]));
+        void queueCommunityHistorySync([]).catch((error) => {
+          if (isSessionExpiredError(error)) {
+            clearCommunityAuthSession();
+            setCommunityAccount(null);
+          }
+        });
+      } else {
+        writeScopedHistorySnapshot(scopedAccountId, null);
+      }
       if (!scopedAccountId) {
         window.localStorage.removeItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY);
       }

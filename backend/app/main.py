@@ -49,6 +49,9 @@ from .models import (
     CommunityAccountOut,
     CommunityChangePasswordRequest,
     CommunityResendVerificationResponse,
+    CommunityHistoryItemOut,
+    CommunityHistoryReplaceRequest,
+    CommunityHistoryResponse,
     CommunityReelOut,
     CommunitySetCreateRequest,
     CommunitySetOut,
@@ -221,6 +224,8 @@ COMMUNITY_DURATION_RATE_LIMIT_PER_WINDOW = 30
 COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW = 20
 COMMUNITY_LOGIN_PER_USERNAME_RATE_LIMIT = 8
 COMMUNITY_VERIFY_PER_ACCOUNT_RATE_LIMIT = 5
+COMMUNITY_HISTORY_RATE_LIMIT_PER_WINDOW = 90
+MAX_COMMUNITY_HISTORY_ITEMS = 120
 _rate_limit_lock = threading.Lock()
 _rate_limit_hits: dict[str, deque[float]] = {}
 _rate_limit_last_sweep = 0.0
@@ -1332,6 +1337,58 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
         thumbnail_url=thumbnail_url,
         featured=bool(_to_int(row.get("featured"), 0)),
     )
+
+
+def _serialize_community_history_item(row: dict) -> CommunityHistoryItemOut:
+    generation_mode = str(row.get("generation_mode") or "").strip().lower()
+    if generation_mode not in {"slow", "fast"}:
+        generation_mode = "fast"
+    source = str(row.get("source") or "").strip().lower()
+    if source not in {"search", "community"}:
+        source = "search"
+    feed_query_raw = str(row.get("feed_query") or "").strip()
+    return CommunityHistoryItemOut(
+        material_id=str(row.get("material_id") or "").strip(),
+        title=str(row.get("title") or "").strip() or "New Study Session",
+        updated_at=max(0, _to_int(row.get("updated_at"), 0)),
+        starred=bool(_to_int(row.get("starred"), 0)),
+        generation_mode=generation_mode,  # type: ignore[arg-type]
+        source=source,  # type: ignore[arg-type]
+        feed_query=feed_query_raw or None,
+    )
+
+
+def _normalize_community_history_items(payload_items) -> list[dict[str, object]]:
+    normalized: list[dict[str, object]] = []
+    seen_material_ids: set[str] = set()
+    ordered_items = sorted(payload_items, key=lambda item: max(0, int(item.updated_at)), reverse=True)
+    for item in ordered_items:
+        material_id = str(item.material_id or "").strip()
+        if not material_id or material_id in seen_material_ids:
+            continue
+        seen_material_ids.add(material_id)
+        title = str(item.title or "").strip() or "New Study Session"
+        generation_mode = str(item.generation_mode or "").strip().lower()
+        if generation_mode not in {"slow", "fast"}:
+            generation_mode = "fast"
+        source = str(item.source or "").strip().lower()
+        if source not in {"search", "community"}:
+            source = "search"
+        feed_query_raw = str(item.feed_query or "").strip()
+        normalized.append(
+            {
+                "material_id": material_id,
+                "title": title,
+                "updated_at": max(0, int(item.updated_at)),
+                "starred": 1 if item.starred else 0,
+                "generation_mode": generation_mode,
+                "source": source,
+                "feed_query": feed_query_raw or None,
+            }
+        )
+        if len(normalized) >= MAX_COMMUNITY_HISTORY_ITEMS:
+            break
+    return normalized
 
 
 @app.on_event("startup")
@@ -2571,6 +2628,60 @@ def list_my_community_sets(request: Request, limit: int = 160):
         )
     sets = [_serialize_community_set(row) for row in rows]
     return {"sets": sets}
+
+
+@app.get("/api/community/history", response_model=CommunityHistoryResponse)
+def get_community_history(request: Request, limit: int = MAX_COMMUNITY_HISTORY_ITEMS):
+    safe_limit = max(1, min(limit, MAX_COMMUNITY_HISTORY_ITEMS))
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        rows = fetch_all(
+            conn,
+            """
+            SELECT
+                material_id,
+                title,
+                updated_at,
+                starred,
+                generation_mode,
+                source,
+                feed_query
+            FROM community_material_history
+            WHERE account_id = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (str(account["id"]), safe_limit),
+        )
+    items = [_serialize_community_history_item(row) for row in rows]
+    return {"items": items}
+
+
+@app.put("/api/community/history", response_model=CommunityHistoryResponse)
+def replace_community_history(request: Request, payload: CommunityHistoryReplaceRequest):
+    _enforce_rate_limit(request, "community-history", limit=COMMUNITY_HISTORY_RATE_LIMIT_PER_WINDOW)
+    normalized_items = _normalize_community_history_items(payload.items)
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        account_id = str(account["id"])
+        execute_modify(conn, "DELETE FROM community_material_history WHERE account_id = ?", (account_id,))
+        for item in normalized_items:
+            insert(
+                conn,
+                "community_material_history",
+                {
+                    "account_id": account_id,
+                    "material_id": item["material_id"],
+                    "title": item["title"],
+                    "updated_at": item["updated_at"],
+                    "starred": item["starred"],
+                    "generation_mode": item["generation_mode"],
+                    "source": item["source"],
+                    "feed_query": item["feed_query"],
+                },
+            )
+    items = [_serialize_community_history_item(row) for row in normalized_items]
+    return {"items": items}
 
 
 @app.post("/api/community/sets", response_model=CommunitySetOut, status_code=201)

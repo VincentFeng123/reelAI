@@ -1,5 +1,18 @@
 "use client";
 
+export type StoredHistoryGenerationMode = "slow" | "fast";
+export type StoredHistorySource = "search" | "community";
+
+export type StoredHistoryItem = {
+  materialId: string;
+  title: string;
+  updatedAt: number;
+  starred: boolean;
+  generationMode: StoredHistoryGenerationMode;
+  source: StoredHistorySource;
+  feedQuery?: string;
+};
+
 export const HISTORY_STORAGE_KEY = "studyreels-material-history";
 export const LEGACY_TOPIC_HISTORY_STORAGE_KEY = "studyreels-reel-topic-history";
 
