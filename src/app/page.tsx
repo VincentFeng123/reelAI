@@ -1307,7 +1307,7 @@ function HomePageContent() {
             >
               <div
                 role="menu"
-                className={`overflow-hidden rounded-2xl border border-white/15 bg-[#090909]/96 p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] backdrop-blur-xl transition duration-180 ${
+                className={`overflow-hidden rounded-2xl border border-white/15 bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] transition duration-180 ${
                   accountMenuOpen ? "pointer-events-auto translate-y-0 opacity-100" : "pointer-events-none translate-y-1 opacity-0"
                 }`}
               >
