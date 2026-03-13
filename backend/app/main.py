@@ -862,7 +862,7 @@ def _require_verified_community_account(conn, request: Request) -> dict[str, obj
     account = _require_authenticated_community_account(conn, request)
     account, _ = _auto_verify_community_account_if_allowed(conn, request, account, claim_legacy_sets=True)
     if not _community_account_is_verified(account):
-        raise HTTPException(status_code=403, detail="Verify your account to access your private community sets.")
+        raise HTTPException(status_code=403, detail="Verify your account to access your sets.")
     return account
 
 

@@ -229,7 +229,7 @@ CREATE TABLE IF NOT EXISTS community_sets (
     thumbnail_url TEXT NOT NULL,
     owner_key_hash TEXT,
     owner_account_id TEXT,
-    visibility TEXT NOT NULL DEFAULT 'private',
+    visibility TEXT NOT NULL DEFAULT 'public',
     featured INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -277,7 +277,7 @@ _db_ready = False
 DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 120000
 _SAFE_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LEGACY_COMMUNITY_OWNER_HASH = "__legacy_unowned__"
-DEFAULT_COMMUNITY_VISIBILITY = "private"
+DEFAULT_COMMUNITY_VISIBILITY = "public"
 PUBLIC_COMMUNITY_VISIBILITY = "public"
 
 
@@ -522,6 +522,19 @@ def init_db() -> None:
                     (LEGACY_COMMUNITY_OWNER_HASH, PUBLIC_COMMUNITY_VISIBILITY, DEFAULT_COMMUNITY_VISIBILITY),
                 )
                 cur.execute(
+                    """
+                    UPDATE community_sets
+                    SET visibility = %s
+                    WHERE owner_account_id IS NOT NULL
+                      AND (
+                          visibility IS NULL
+                          OR BTRIM(visibility) = ''
+                          OR visibility = 'private'
+                      )
+                    """,
+                    (PUBLIC_COMMUNITY_VISIBILITY,),
+                )
+                cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_community_sets_owner_account_updated_at ON community_sets(owner_account_id, updated_at DESC)"
                 )
                 cur.execute(
@@ -628,6 +641,22 @@ def init_db() -> None:
                 WHERE visibility IS NULL OR TRIM(visibility) = ''
                 """,
                 (LEGACY_COMMUNITY_OWNER_HASH, PUBLIC_COMMUNITY_VISIBILITY, DEFAULT_COMMUNITY_VISIBILITY),
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                """
+                UPDATE community_sets
+                SET visibility = ?
+                WHERE owner_account_id IS NOT NULL
+                  AND (
+                      visibility IS NULL
+                      OR TRIM(visibility) = ''
+                      OR visibility = 'private'
+                  )
+                """,
+                (PUBLIC_COMMUNITY_VISIBILITY,),
             )
         except sqlite3.OperationalError:
             pass

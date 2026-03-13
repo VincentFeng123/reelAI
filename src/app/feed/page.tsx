@@ -5,7 +5,8 @@ import { useRouter, useSearchParams } from "next/navigation";
 
 import { LoadingFlappyMiniGame } from "@/components/LoadingFlappyMiniGame";
 import { ReelCard } from "@/components/ReelCard";
-import { askStudyChat, fetchFeed, generateReels, sendFeedback, uploadMaterial } from "@/lib/api";
+import { askStudyChat, fetchFeed, generateReels, readCommunityAuthSession, sendFeedback, uploadMaterial } from "@/lib/api";
+import { HISTORY_STORAGE_KEY, writeScopedHistorySnapshot } from "@/lib/historyStorage";
 import {
   type GenerationMode,
   type PreferredVideoDuration,
@@ -33,7 +34,6 @@ const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
-const HISTORY_STORAGE_KEY = "studyreels-material-history";
 const MAX_SAVED_FEED_PROGRESS = 240;
 const MAX_SAVED_FEED_SESSIONS = 24;
 const MAX_REELS_PER_FEED_SESSION = 80;
@@ -660,7 +660,7 @@ function FeedPageInner() {
         };
       });
       if (didChange) {
-        window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(updated));
+        writeScopedHistorySnapshot(readCommunityAuthSession()?.account?.id ?? null, JSON.stringify(updated));
       }
     } catch {
       // Ignore malformed history payloads and keep feed mode persistence functional.

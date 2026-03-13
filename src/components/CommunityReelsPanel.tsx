@@ -1320,9 +1320,22 @@ export function CommunityReelsPanel({
   const normalizedInitialOpenSetId = initialOpenSetId?.trim() || "";
   const shouldSuppressDirectoryDuringRestore =
     mode === "community" && isVisible && Boolean(normalizedInitialOpenSetId) && isInitialDetailRestorePending;
-  const allSets = useMemo(() => [...publicSets, ...DEFAULT_COMMUNITY_SETS], [publicSets]);
   const ownedSetIdSet = useMemo(() => new Set(ownedSetIds), [ownedSetIds]);
   const editableSets = useMemo(() => ownedSets.filter((set) => ownedSetIdSet.has(set.id)), [ownedSetIdSet, ownedSets]);
+  const allSets = useMemo(() => {
+    const merged: CommunitySet[] = [];
+    const seen = new Set<string>();
+    for (const bucket of [editableSets, publicSets, DEFAULT_COMMUNITY_SETS]) {
+      for (const set of bucket) {
+        if (seen.has(set.id)) {
+          continue;
+        }
+        seen.add(set.id);
+        merged.push(set);
+      }
+    }
+    return merged;
+  }, [editableSets, publicSets]);
   const starredSetIdSet = useMemo(() => new Set(starredSetIds), [starredSetIds]);
   const orderedEditableSets = useMemo(() => {
     const starred: CommunitySet[] = [];
@@ -3652,12 +3665,12 @@ export function CommunityReelsPanel({
                       <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
                       <div className="relative z-10 max-w-xl">
                         <div className="flex flex-wrap items-center gap-2">
-                          <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Private Community Sets</p>
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Your Sets</p>
                           <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/65">
                             Account Required
                           </span>
                         </div>
-                        <h3 className="mt-3 text-xl font-semibold text-white">Sign in to see and manage your sets</h3>
+                        <h3 className="mt-3 text-xl font-semibold text-white">Sign in to manage your sets</h3>
                         <div className="mt-5 flex flex-wrap items-center gap-3">
                           <button
                             type="button"
@@ -3676,16 +3689,16 @@ export function CommunityReelsPanel({
                       <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
                       <div className="relative z-10 max-w-xl">
                         <div className="flex flex-wrap items-center gap-2">
-                          <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Private Community Sets</p>
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Your Sets</p>
                           <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/65">
                             Verification Required
                           </span>
                         </div>
-                        <h3 className="mt-3 text-xl font-semibold text-white">Verify your email to unlock Your Sets</h3>
+                        <h3 className="mt-3 text-xl font-semibold text-white">Verify your email to manage Your Sets</h3>
                         <p className="mt-3 text-sm leading-6 text-white/72">
                           {communityAccount?.email
-                            ? `Finish verifying ${communityAccount.email} before creating, editing, or viewing your private sets.`
-                            : "Finish verifying your account before creating, editing, or viewing your private sets."}
+                            ? `Finish verifying ${communityAccount.email} before creating, editing, or viewing your sets.`
+                            : "Finish verifying your account before creating, editing, or viewing your sets."}
                         </p>
                         <div className="mt-5 flex flex-wrap items-center gap-3">
                           <button

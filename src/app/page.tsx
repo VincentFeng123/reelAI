@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 
 import { type CommunityDraftExitActions, CommunityReelsPanel } from "@/components/CommunityReelsPanel";
 import { COMMUNITY_AUTH_CHANGED_EVENT, fetchCommunityAccount, logoutCommunityAccount, readCommunityAuthSession } from "@/lib/api";
+import { LEGACY_TOPIC_HISTORY_STORAGE_KEY, readScopedHistorySnapshot, writeScopedHistorySnapshot } from "@/lib/historyStorage";
 import type { CommunityAccount } from "@/lib/types";
 import {
   type SettingsAvailabilityModalSnapshot,
@@ -15,8 +16,6 @@ import {
 import { UploadPanel } from "@/components/UploadPanel";
 import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
 
-const HISTORY_STORAGE_KEY = "studyreels-material-history";
-const LEGACY_TOPIC_HISTORY_STORAGE_KEY = "studyreels-reel-topic-history";
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
@@ -218,17 +217,27 @@ function HomePageContent() {
   const sidebarInfoTooltipDismissTimerRef = useRef<number | null>(null);
   const sidebarInfoTooltipAnimateInTimerRef = useRef<number | null>(null);
   const topChromeGestureTimerRef = useRef<number | null>(null);
+
+  const resolveHistoryAccountId = useCallback(() => {
+    const activeAccountId = communityAccount?.id?.trim();
+    if (activeAccountId) {
+      return activeAccountId;
+    }
+    return readCommunityAuthSession()?.account?.id?.trim() || null;
+  }, [communityAccount?.id]);
+
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
-    const base = parseMaterialHistory(window.localStorage.getItem(HISTORY_STORAGE_KEY));
-    const legacy = parseLegacyTopicHistory(window.localStorage.getItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY));
+    const scopedAccountId = resolveHistoryAccountId();
+    const base = parseMaterialHistory(readScopedHistorySnapshot(scopedAccountId));
+    const legacy = scopedAccountId ? [] : parseLegacyTopicHistory(window.localStorage.getItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY));
     const merged = mergeHistory(base, legacy);
     historyRef.current = merged;
     setHistory(merged);
-    window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(merged));
-  }, []);
+    writeScopedHistorySnapshot(scopedAccountId, JSON.stringify(merged));
+  }, [resolveHistoryAccountId, communityAccount?.id]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -356,12 +365,11 @@ function HomePageContent() {
   }, [historyQuery, historySorted]);
 
   const persistHistory = useCallback((next: HistoryItem[]) => {
+    const scopedAccountId = resolveHistoryAccountId();
     historyRef.current = next;
     setHistory(next);
-    if (typeof window !== "undefined") {
-      window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(next));
-    }
-  }, []);
+    writeScopedHistorySnapshot(scopedAccountId, JSON.stringify(next));
+  }, [resolveHistoryAccountId]);
 
   const upsertHistory = useCallback(
     (entry: {
@@ -390,20 +398,23 @@ function HomePageContent() {
   );
 
   const clearAllHistory = useCallback(() => {
+    const scopedAccountId = resolveHistoryAccountId();
     historyRef.current = [];
     setHistory([]);
     setHistoryQuery("");
     setError(null);
     setActiveHistoryMenuId(null);
     if (typeof window !== "undefined") {
-      window.localStorage.removeItem(HISTORY_STORAGE_KEY);
-      window.localStorage.removeItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY);
+      writeScopedHistorySnapshot(scopedAccountId, null);
+      if (!scopedAccountId) {
+        window.localStorage.removeItem(LEGACY_TOPIC_HISTORY_STORAGE_KEY);
+      }
       window.localStorage.removeItem(MATERIAL_SEEDS_STORAGE_KEY);
       window.localStorage.removeItem(MATERIAL_GROUPS_STORAGE_KEY);
       window.localStorage.removeItem(FEED_PROGRESS_STORAGE_KEY);
       window.localStorage.removeItem(FEED_SESSION_STORAGE_KEY);
     }
-  }, []);
+  }, [resolveHistoryAccountId]);
 
   const clearMobileSidebarCloseTimer = useCallback(() => {
     if (mobileSidebarCloseTimerRef.current !== null) {

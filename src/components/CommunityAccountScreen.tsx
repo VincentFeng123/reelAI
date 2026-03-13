@@ -352,7 +352,7 @@ export function CommunityAccountScreen({
                         You&apos;re signed in
                       </h1>
                       <p className="mt-4 text-sm leading-6 text-white">
-                        This account can open your private community sets from any device that signs in with the same username and password.
+                        This account can open and manage your sets from any device that signs in with the same username and password.
                       </p>
 
                       <div className="mt-7 rounded-[24px] bg-black/22 px-5 py-5 shadow-[0_16px_40px_rgba(16,16,16,0.16)] backdrop-blur-[16px]">

@@ -264,7 +264,48 @@ class CommunitySetOwnershipTests(unittest.TestCase):
 
         public_response = self.other_client.get("/api/community/sets")
         public_ids = {row["id"] for row in public_response.json()["sets"]}
-        self.assertNotIn("user-set-legacy-owned", public_ids)
+        self.assertIn("user-set-legacy-owned", public_ids)
+
+    def test_created_sets_are_public_in_directory_but_owner_only_in_your_sets(self) -> None:
+        owner_key = "creator-owner-key-abcdefghijklmnopqrstuvwxyz"
+        owner_username = "creatoralpha"
+        owner_password = "studyreels-password"
+        owner_session_token = self._register_and_verify(owner_key=owner_key, username=owner_username, password=owner_password)
+
+        create_response = self.client.post(
+            "/api/community/sets",
+            headers={
+                COMMUNITY_OWNER_HEADER: owner_key,
+                COMMUNITY_SESSION_HEADER: owner_session_token,
+            },
+            json=self._community_payload(title="Creator Public Set"),
+        )
+        self.assertEqual(create_response.status_code, 201, create_response.text)
+        created_set_id = str(create_response.json()["id"])
+
+        other_owner_key = "different-owner-key-for-mine-abcdefghijklmnopqrstuvwxyz"
+        other_username = "creatorbeta"
+        other_password = "studyreels-password"
+        other_session_token = self._register_and_verify(owner_key=other_owner_key, username=other_username, password=other_password)
+
+        owner_mine_response = self.client.get(
+            "/api/community/sets/mine",
+            headers={COMMUNITY_SESSION_HEADER: owner_session_token},
+        )
+        self.assertEqual(owner_mine_response.status_code, 200, owner_mine_response.text)
+        self.assertEqual([row["id"] for row in owner_mine_response.json()["sets"]], [created_set_id])
+
+        other_mine_response = self.other_client.get(
+            "/api/community/sets/mine",
+            headers={COMMUNITY_SESSION_HEADER: other_session_token},
+        )
+        self.assertEqual(other_mine_response.status_code, 200, other_mine_response.text)
+        self.assertEqual(other_mine_response.json()["sets"], [])
+
+        public_response = self.other_client.get("/api/community/sets")
+        self.assertEqual(public_response.status_code, 200, public_response.text)
+        public_ids = {row["id"] for row in public_response.json()["sets"]}
+        self.assertIn(created_set_id, public_ids)
 
     def test_account_owned_user_set_can_be_updated_and_deleted_from_another_device(self) -> None:
         owner_key = "owner-key-for-created-set-abcdefghijklmnopqrstuvwxyz"
