@@ -4,7 +4,9 @@ import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { CommunityAccountScreen } from "@/components/CommunityAccountScreen";
+import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
 import { COMMUNITY_AUTH_CHANGED_EVENT, fetchCommunityAccount, readCommunityAuthSession } from "@/lib/api";
+import { useLoadingScreenGate } from "@/lib/useLoadingScreenGate";
 import type { CommunityAccount } from "@/lib/types";
 
 function normalizeReturnTab(value: string | null): "search" | "community" | "edit" | "settings" | null {
@@ -19,12 +21,19 @@ function AccountPageContent() {
   const searchParams = useSearchParams();
   const returnTab = useMemo(() => normalizeReturnTab(searchParams.get("return_tab")), [searchParams]);
   const [communityAccount, setCommunityAccount] = useState<CommunityAccount | null>(null);
+  const [accountScreenReady, setAccountScreenReady] = useState(false);
+  const showLoadingScreen = useLoadingScreenGate(accountScreenReady, { minimumVisibleMs: 1000 });
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
     let cancelled = false;
+    const finishBootstrap = () => {
+      if (!cancelled) {
+        setAccountScreenReady(true);
+      }
+    };
     const syncAccountFromStorage = () => {
       const stored = readCommunityAuthSession();
       if (!cancelled) {
@@ -37,6 +46,7 @@ function AccountPageContent() {
         if (!cancelled) {
           setCommunityAccount(null);
         }
+        finishBootstrap();
         return;
       }
       try {
@@ -46,6 +56,8 @@ function AccountPageContent() {
         }
       } catch {
         syncAccountFromStorage();
+      } finally {
+        finishBootstrap();
       }
     };
     const onStorage = (event: StorageEvent) => {
@@ -76,6 +88,10 @@ function AccountPageContent() {
     router.push("/?tab=edit");
   }, [router]);
 
+  if (showLoadingScreen) {
+    return <FullscreenLoadingScreen />;
+  }
+
   return (
     <CommunityAccountScreen
       account={communityAccount}
@@ -88,7 +104,7 @@ function AccountPageContent() {
 
 export default function AccountPage() {
   return (
-    <Suspense fallback={<main className="fixed inset-0 bg-black" />}>
+    <Suspense fallback={<FullscreenLoadingScreen />}>
       <AccountPageContent />
     </Suspense>
   );

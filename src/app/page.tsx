@@ -4,6 +4,7 @@ import { Suspense, type MouseEvent as ReactMouseEvent, type UIEvent, useCallback
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { type CommunityDraftExitActions, CommunityReelsPanel } from "@/components/CommunityReelsPanel";
+import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
 import {
   COMMUNITY_AUTH_CHANGED_EVENT,
   clearCommunityAuthSession,
@@ -29,6 +30,7 @@ import {
 } from "@/components/SettingsPanel";
 import { UploadPanel } from "@/components/UploadPanel";
 import { VolumetricLightBackground } from "@/components/VolumetricLightBackground";
+import { useLoadingScreenGate } from "@/lib/useLoadingScreenGate";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
@@ -1060,6 +1062,11 @@ function HomePageContent() {
         ? "edit"
         : "community";
   const activeSettingsAvailabilityState = settingsAvailabilityModalSnapshot?.state ?? DEFAULT_SETTINGS_AVAILABILITY_STATE;
+  const showLoadingScreen = useLoadingScreenGate(sidebarTabHydrated, { minimumVisibleMs: 2000 });
+
+  if (showLoadingScreen) {
+    return <FullscreenLoadingScreen />;
+  }
 
   const sidebarPanelContent = (
     <div className="flex h-full min-h-0 flex-col">
@@ -1236,7 +1243,7 @@ function HomePageContent() {
                     >
                       <div
                         role="menu"
-                        className="overflow-hidden rounded-2xl border border-white/15 bg-[#090909]/96 p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] backdrop-blur-xl"
+                        className="overflow-hidden rounded-2xl border border-white/15 bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)]"
                       >
                         <button
                           type="button"
@@ -1736,7 +1743,7 @@ function HomePageContent() {
 
 export default function HomePage() {
   return (
-    <Suspense fallback={<main className="fixed inset-0 bg-black" />}>
+    <Suspense fallback={<FullscreenLoadingScreen />}>
       <HomePageContent />
     </Suspense>
   );

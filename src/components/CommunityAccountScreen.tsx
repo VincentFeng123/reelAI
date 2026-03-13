@@ -28,7 +28,7 @@ export function CommunityAccountScreen({
   onAccountChange,
   onOpenYourSets,
 }: CommunityAccountScreenProps) {
-  const [authMode, setAuthMode] = useState<"register" | "login">("register");
+  const [authMode, setAuthMode] = useState<"register" | "login">("login");
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
