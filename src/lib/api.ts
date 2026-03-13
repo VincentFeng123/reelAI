@@ -1,6 +1,8 @@
 import type {
   ChatMessage,
   ChatResponse,
+  CommunityAccount,
+  CommunityAuthSession,
   CommunitySet,
   CommunityReelPlatform,
   FeedResponse,
@@ -19,7 +21,12 @@ const BACKEND_DOWN_ERROR = RAW_API_BASE
   : "Cannot reach backend. Check your deployment and API routes.";
 const COMMUNITY_OWNER_KEY_STORAGE_KEY = "studyreels-community-owner-key";
 export const COMMUNITY_OWNED_SET_IDS_STORAGE_KEY = "studyreels-community-owned-set-ids";
+const COMMUNITY_ACCOUNT_STORAGE_KEY = "studyreels-community-account";
+const COMMUNITY_SESSION_TOKEN_STORAGE_KEY = "studyreels-community-session-token";
 const COMMUNITY_OWNER_HEADER = "X-StudyReels-Owner-Key";
+const COMMUNITY_SESSION_HEADER = "X-StudyReels-Session-Token";
+export const COMMUNITY_AUTH_CHANGED_EVENT = "studyreels-community-auth-changed";
+let communityOwnerKeyMemoryFallback: string | null = null;
 
 function apiUrl(path: string): string {
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
@@ -61,29 +68,190 @@ function createCommunityOwnerKey(): string {
       return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
     }
   }
-  return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
+  // crypto is unavailable — generate a best-effort key from multiple entropy
+  // sources. This path only runs in very old or non-browser environments.
+  const segments: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    segments.push(Math.random().toString(36).slice(2, 10));
+  }
+  return segments.join("-");
+}
+
+function normalizeStoredCommunityOwnerKey(raw: string | null): string | null {
+  const ownerKey = (raw || "").trim();
+  return ownerKey.length >= 24 ? ownerKey : null;
+}
+
+function persistCommunityOwnerKey(ownerKey: string): void {
+  communityOwnerKeyMemoryFallback = ownerKey;
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.sessionStorage.setItem(COMMUNITY_OWNER_KEY_STORAGE_KEY, ownerKey);
+    window.localStorage.removeItem(COMMUNITY_OWNER_KEY_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures and keep the in-memory fallback.
+  }
+}
+
+function clearCommunityOwnerKey(): void {
+  communityOwnerKeyMemoryFallback = null;
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.sessionStorage.removeItem(COMMUNITY_OWNER_KEY_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures during logout/session teardown.
+  }
+  try {
+    window.localStorage.removeItem(COMMUNITY_OWNER_KEY_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures during logout/session teardown.
+  }
 }
 
 function getCommunityOwnerKey(): string | null {
   if (typeof window === "undefined") {
-    return null;
+    return communityOwnerKeyMemoryFallback;
   }
   try {
-    const existing = window.localStorage.getItem(COMMUNITY_OWNER_KEY_STORAGE_KEY);
-    if (existing && existing.trim().length >= 24) {
-      return existing.trim();
+    const existingSessionKey = normalizeStoredCommunityOwnerKey(
+      window.sessionStorage.getItem(COMMUNITY_OWNER_KEY_STORAGE_KEY),
+    );
+    if (existingSessionKey) {
+      communityOwnerKeyMemoryFallback = existingSessionKey;
+      return existingSessionKey;
     }
-    const next = createCommunityOwnerKey();
-    window.localStorage.setItem(COMMUNITY_OWNER_KEY_STORAGE_KEY, next);
+    const legacyLocalKey = normalizeStoredCommunityOwnerKey(
+      window.localStorage.getItem(COMMUNITY_OWNER_KEY_STORAGE_KEY),
+    );
+    if (legacyLocalKey) {
+      persistCommunityOwnerKey(legacyLocalKey);
+      return legacyLocalKey;
+    }
+    const next = communityOwnerKeyMemoryFallback || createCommunityOwnerKey();
+    persistCommunityOwnerKey(next);
     return next;
   } catch {
-    return null;
+    if (communityOwnerKeyMemoryFallback) {
+      return communityOwnerKeyMemoryFallback;
+    }
+    const next = createCommunityOwnerKey();
+    communityOwnerKeyMemoryFallback = next;
+    return next;
   }
 }
 
 function communityOwnerHeaders(): HeadersInit {
   const ownerKey = getCommunityOwnerKey();
   return ownerKey ? { [COMMUNITY_OWNER_HEADER]: ownerKey } : {};
+}
+
+function communitySessionHeaders(): HeadersInit {
+  const session = readCommunityAuthSession();
+  return session?.sessionToken ? { [COMMUNITY_SESSION_HEADER]: session.sessionToken } : {};
+}
+
+function communityRequestHeaders(): HeadersInit {
+  return {
+    ...communityOwnerHeaders(),
+    ...communitySessionHeaders(),
+  };
+}
+
+function normalizeCommunityAccount(raw: unknown): CommunityAccount | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const row = raw as Partial<CommunityAccount> & { is_verified?: unknown; isVerified?: unknown; email?: unknown };
+  const id = typeof row.id === "string" ? row.id.trim() : "";
+  const username = typeof row.username === "string" ? row.username.trim() : "";
+  if (!id || !username) {
+    return null;
+  }
+  const email = typeof row.email === "string" && row.email.trim() ? row.email.trim() : null;
+  const isVerifiedRaw = typeof row.isVerified === "boolean" ? row.isVerified : row.is_verified;
+  return {
+    id,
+    username,
+    email,
+    isVerified: typeof isVerifiedRaw === "boolean" ? isVerifiedRaw : true,
+  };
+}
+
+type StoredCommunityAuthSession = {
+  account: CommunityAccount;
+  sessionToken: string;
+};
+
+function saveCommunityAuthSessionStorage(session: StoredCommunityAuthSession | null): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    // Migrate any legacy localStorage token to sessionStorage on first access.
+    const legacyToken = window.localStorage.getItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY);
+    if (legacyToken) {
+      window.localStorage.removeItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY);
+    }
+
+    if (!session) {
+      window.localStorage.removeItem(COMMUNITY_ACCOUNT_STORAGE_KEY);
+      window.sessionStorage.removeItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY);
+      return;
+    }
+    // Account metadata (non-secret) stays in localStorage for cross-tab display.
+    // The session token goes in sessionStorage to limit XSS blast radius — an
+    // attacker would need code running in the same tab to read it.
+    window.localStorage.setItem(COMMUNITY_ACCOUNT_STORAGE_KEY, JSON.stringify(session.account));
+    window.sessionStorage.setItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY, session.sessionToken);
+  } catch {
+    // Ignore storage failures and keep the in-memory response path usable.
+  } finally {
+    window.dispatchEvent(new Event(COMMUNITY_AUTH_CHANGED_EVENT));
+  }
+}
+
+export function clearCommunityAuthSession(): void {
+  clearCommunityOwnerKey();
+  saveCommunityAuthSessionStorage(null);
+}
+
+export function readCommunityAuthSession(): CommunityAuthSession | null {
+  if (typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const account = normalizeCommunityAccount(JSON.parse(window.localStorage.getItem(COMMUNITY_ACCOUNT_STORAGE_KEY) || "null"));
+    // Read token from sessionStorage (preferred) with localStorage migration fallback.
+    let sessionToken = (window.sessionStorage.getItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY) || "").trim();
+    if (sessionToken.length < 24) {
+      // Migrate legacy localStorage token if present.
+      const legacyToken = (window.localStorage.getItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY) || "").trim();
+      if (legacyToken.length >= 24) {
+        sessionToken = legacyToken;
+        window.sessionStorage.setItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY, sessionToken);
+        window.localStorage.removeItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY);
+      }
+    }
+    if (!account || sessionToken.length < 24) {
+      return null;
+    }
+    return {
+      account,
+      sessionToken,
+      claimedLegacySets: 0,
+      // Derive verification state from the persisted account instead of
+      // hardcoding false — prevents a stale "verified" flash after email change
+      // or before the first /auth/me round-trip refreshes the UI.
+      verificationRequired: account.isVerified === false,
+      verificationCodeDebug: null,
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function readOwnedCommunitySetIds(): string[] {
@@ -109,12 +277,255 @@ export function saveOwnedCommunitySetIds(nextIds: string[]): string[] {
   return normalized;
 }
 
+type CommunityAuthResponseApi = {
+  account?: unknown;
+  session_token?: unknown;
+  claimed_legacy_sets?: unknown;
+  verification_required?: unknown;
+  verification_code_debug?: unknown;
+};
+
+function normalizeCommunityAuthSession(raw: unknown): CommunityAuthSession | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const row = raw as CommunityAuthResponseApi;
+  const account = normalizeCommunityAccount(row.account);
+  const sessionToken = typeof row.session_token === "string" ? row.session_token.trim() : "";
+  if (!account || sessionToken.length < 24) {
+    return null;
+  }
+  return {
+    account,
+    sessionToken,
+    claimedLegacySets: Math.max(0, Math.floor(Number(row.claimed_legacy_sets) || 0)),
+    verificationRequired: Boolean(row.verification_required),
+    verificationCodeDebug:
+      typeof row.verification_code_debug === "string" && row.verification_code_debug.trim()
+        ? row.verification_code_debug.trim()
+        : null,
+  };
+}
+
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   try {
     return await response.json() as T;
   } catch {
     throw new Error("Backend returned an invalid JSON response.");
   }
+}
+
+export async function registerCommunityAccount(params: {
+  username: string;
+  email: string;
+  password: string;
+}): Promise<CommunityAuthSession> {
+  const res = await safeFetch(apiUrl("/community/auth/register"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
+    },
+    body: JSON.stringify({
+      username: params.username,
+      email: params.email,
+      password: params.password,
+    }),
+  });
+  const session = normalizeCommunityAuthSession(await parseJsonResponse<unknown>(res));
+  if (!session) {
+    throw new Error("Backend returned an invalid auth response.");
+  }
+  saveCommunityAuthSessionStorage({
+    account: session.account,
+    sessionToken: session.sessionToken,
+  });
+  return session;
+}
+
+export async function loginCommunityAccount(params: {
+  username: string;
+  password: string;
+}): Promise<CommunityAuthSession> {
+  const res = await safeFetch(apiUrl("/community/auth/login"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
+    },
+    body: JSON.stringify({
+      username: params.username,
+      password: params.password,
+    }),
+  });
+  const session = normalizeCommunityAuthSession(await parseJsonResponse<unknown>(res));
+  if (!session) {
+    throw new Error("Backend returned an invalid auth response.");
+  }
+  saveCommunityAuthSessionStorage({
+    account: session.account,
+    sessionToken: session.sessionToken,
+  });
+  return session;
+}
+
+export async function verifyCommunityAccount(params: {
+  code: string;
+}): Promise<{ account: CommunityAccount; claimedLegacySets: number }> {
+  const res = await safeFetch(apiUrl("/community/auth/verify"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityRequestHeaders(),
+    },
+    body: JSON.stringify({
+      code: params.code,
+    }),
+  });
+  const json = await parseJsonResponse<{ account?: unknown; claimed_legacy_sets?: unknown }>(res);
+  const account = normalizeCommunityAccount(json?.account);
+  if (!account) {
+    throw new Error("Backend returned an invalid verification response.");
+  }
+  const stored = readCommunityAuthSession();
+  if (!stored?.sessionToken) {
+    throw new Error("Session expired. Sign in again.");
+  }
+  saveCommunityAuthSessionStorage({
+    account,
+    sessionToken: stored.sessionToken,
+  });
+  return {
+    account,
+    claimedLegacySets: Math.max(0, Math.floor(Number(json?.claimed_legacy_sets) || 0)),
+  };
+}
+
+export async function resendCommunityVerification(): Promise<{ account: CommunityAccount; verificationCodeDebug: string | null }> {
+  const res = await safeFetch(apiUrl("/community/auth/resend-verification"), {
+    method: "POST",
+    headers: {
+      ...communityRequestHeaders(),
+    },
+  });
+  const json = await parseJsonResponse<{ account?: unknown; verification_code_debug?: unknown }>(res);
+  const account = normalizeCommunityAccount(json?.account);
+  if (!account) {
+    throw new Error("Backend returned an invalid verification response.");
+  }
+  const stored = readCommunityAuthSession();
+  if (!stored?.sessionToken) {
+    throw new Error("Session expired. Sign in again.");
+  }
+  saveCommunityAuthSessionStorage({
+    account,
+    sessionToken: stored.sessionToken,
+  });
+  return {
+    account,
+    verificationCodeDebug:
+      typeof json?.verification_code_debug === "string" && json.verification_code_debug.trim()
+        ? json.verification_code_debug.trim()
+        : null,
+  };
+}
+
+export async function changeCommunityVerificationEmail(params: {
+  email: string;
+  currentPassword: string;
+}): Promise<{ account: CommunityAccount; verificationCodeDebug: string | null }> {
+  const res = await safeFetch(apiUrl("/community/auth/change-email"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityRequestHeaders(),
+    },
+    body: JSON.stringify({
+      email: params.email,
+      current_password: params.currentPassword,
+    }),
+  });
+  const json = await parseJsonResponse<{ account?: unknown; verification_code_debug?: unknown }>(res);
+  const account = normalizeCommunityAccount(json?.account);
+  if (!account) {
+    throw new Error("Backend returned an invalid email-change response.");
+  }
+  const stored = readCommunityAuthSession();
+  if (!stored?.sessionToken) {
+    throw new Error("Session expired. Sign in again.");
+  }
+  saveCommunityAuthSessionStorage({
+    account,
+    sessionToken: stored.sessionToken,
+  });
+  return {
+    account,
+    verificationCodeDebug:
+      typeof json?.verification_code_debug === "string" && json.verification_code_debug.trim()
+        ? json.verification_code_debug.trim()
+        : null,
+  };
+}
+
+export async function fetchCommunityAccount(): Promise<CommunityAccount | null> {
+  const stored = readCommunityAuthSession();
+  if (!stored?.sessionToken) {
+    return null;
+  }
+  try {
+    const res = await safeFetch(apiUrl("/community/auth/me"), {
+      cache: "no-store",
+      headers: { ...communitySessionHeaders() },
+    });
+    const json = await parseJsonResponse<{ account?: unknown }>(res);
+    const account = normalizeCommunityAccount(json?.account);
+    if (!account) {
+      clearCommunityAuthSession();
+      return null;
+    }
+    saveCommunityAuthSessionStorage({
+      account,
+      sessionToken: stored.sessionToken,
+    });
+    return account;
+  } catch (error) {
+    if (isSessionExpiredError(error)) {
+      clearCommunityAuthSession();
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function logoutCommunityAccount(): Promise<void> {
+  const stored = readCommunityAuthSession();
+  try {
+    if (stored?.sessionToken) {
+      await safeFetch(apiUrl("/community/auth/logout"), {
+        method: "POST",
+        headers: { ...communitySessionHeaders() },
+      });
+    }
+  } finally {
+    clearCommunityAuthSession();
+  }
+}
+
+export async function changeCommunityPassword(params: {
+  currentPassword: string;
+  newPassword: string;
+}): Promise<void> {
+  await safeFetch(apiUrl("/community/auth/change-password"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communitySessionHeaders(),
+    },
+    body: JSON.stringify({
+      current_password: params.currentPassword,
+      new_password: params.newPassword,
+    }),
+  });
 }
 
 export async function uploadMaterial(params: {
@@ -546,7 +957,7 @@ export async function fetchCommunitySets(): Promise<CommunitySet[]> {
 export async function fetchOwnedCommunitySets(): Promise<CommunitySet[]> {
   const res = await safeFetch(apiUrl("/community/sets/mine"), {
     cache: "no-store",
-    headers: { ...communityOwnerHeaders() },
+    headers: { ...communityRequestHeaders() },
   });
   const json = await parseJsonResponse<{ sets?: unknown[] }>(res);
   const rows = Array.isArray(json?.sets) ? json.sets : [];
@@ -558,6 +969,7 @@ export async function createCommunitySet(params: {
   description: string;
   tags: string[];
   reels: Array<{
+    id?: string;
     platform: CommunityReelPlatform;
     sourceUrl: string;
     embedUrl: string;
@@ -571,7 +983,7 @@ export async function createCommunitySet(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...communityOwnerHeaders(),
+      ...communityRequestHeaders(),
     },
     body: JSON.stringify({
       title: params.title,
@@ -602,6 +1014,7 @@ export async function updateCommunitySet(params: {
   description: string;
   tags: string[];
   reels: Array<{
+    id?: string;
     platform: CommunityReelPlatform;
     sourceUrl: string;
     embedUrl: string;
@@ -620,13 +1033,14 @@ export async function updateCommunitySet(params: {
     method: "PUT",
     headers: {
       "Content-Type": "application/json",
-      ...communityOwnerHeaders(),
+      ...communityRequestHeaders(),
     },
     body: JSON.stringify({
       title: params.title,
       description: params.description,
       tags: params.tags,
       reels: params.reels.map((reel) => ({
+        ...(typeof reel.id === "string" && reel.id.trim() ? { id: reel.id.trim() } : {}),
         platform: reel.platform,
         source_url: reel.sourceUrl,
         embed_url: reel.embedUrl,
@@ -654,7 +1068,7 @@ export async function deleteCommunitySet(params: { setId: string }): Promise<voi
   try {
     await safeFetch(apiUrl(`/community/sets/${encodedSetId}`), {
       method: "DELETE",
-      headers: communityOwnerHeaders(),
+      headers: communityRequestHeaders(),
     });
     return;
   } catch (error) {
@@ -667,7 +1081,7 @@ export async function deleteCommunitySet(params: { setId: string }): Promise<voi
 
   await safeFetch(apiUrl(`/community/sets/${encodedSetId}/delete`), {
     method: "POST",
-    headers: communityOwnerHeaders(),
+    headers: communityRequestHeaders(),
   });
 }
 
@@ -733,16 +1147,37 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
   }
 
   if (!response.ok) {
-    throw new Error(await safeError(response));
+    throw await buildApiError(response);
   }
   return response;
 }
 
-async function safeError(response: Response): Promise<string> {
+class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
+}
+
+async function buildApiError(response: Response): Promise<ApiError> {
+  let message: string;
   try {
     const json = await response.json();
-    return json?.detail || json?.message || `Request failed (${response.status})`;
+    message = json?.detail || json?.message || `Request failed (${response.status})`;
   } catch {
-    return `Request failed (${response.status})`;
+    message = `Request failed (${response.status})`;
   }
+  return new ApiError(message, response.status);
+}
+
+export function isSessionExpiredError(error: unknown): boolean {
+  if (error instanceof ApiError && error.status === 401) {
+    return true;
+  }
+  if (error instanceof Error) {
+    return /session expired|sign in/i.test(error.message);
+  }
+  return false;
 }

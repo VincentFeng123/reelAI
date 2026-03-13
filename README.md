@@ -276,10 +276,22 @@ From repo root:
    - `OPENAI_API_KEY=...`
    - `YOUTUBE_API_KEY=...`
    - `DATABASE_URL=postgresql://...` (recommended for hosted durable data, e.g. Railway)
+   - `VERIFICATION_HMAC_KEY=...` (required for hosted community-account verification)
+   - `SMTP_HOST=...`
+   - `SMTP_PORT=587`
+   - `SMTP_USERNAME=...`
+   - `SMTP_PASSWORD=...`
+   - `SMTP_FROM_EMAIL=...`
+   - Optional: `SMTP_USE_TLS=1`, `SMTP_USE_SSL=0`
    - Optional: S3 variables if using object storage.
 4. Optional frontend variable:
    - `NEXT_PUBLIC_API_BASE` (leave unset for same-origin `/api`; set only if pointing to a different backend URL)
 5. Deploy.
+
+Hosted community-account note:
+- Account registration, email verification, and unverified-account login require SMTP in hosted environments.
+- Hosted verification also requires `VERIFICATION_HMAC_KEY`; if it is missing, verification flows will return `503`.
+- If you deploy on Railway/Vercel without the `SMTP_*` variables above, registration and unverified-account login will return `503`.
 
 How this works in one project:
 - Next.js serves the frontend from root (`src/...`).
@@ -301,7 +313,7 @@ How this works in one project:
 
 Known limitations:
 - Transcript availability is not guaranteed; fallback currently uses video description with low confidence.
-- No user auth/multi-user separation yet.
+- Community-set accounts exist, but broader per-user app auth/progress/dashboard state is still minimal.
 - Ranking is heuristic and not personalized beyond immediate feedback.
 - FAISS index is built at query-time from persisted vectors (no persistent ANN index file yet).
 - If `DATABASE_URL` is unset, Vercel serverless storage is ephemeral and SQLite data under `/tmp` is not durable across cold starts.

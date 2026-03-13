@@ -4,6 +4,8 @@ import { Suspense, type MouseEvent as ReactMouseEvent, type UIEvent, useCallback
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { type CommunityDraftExitActions, CommunityReelsPanel } from "@/components/CommunityReelsPanel";
+import { COMMUNITY_AUTH_CHANGED_EVENT, fetchCommunityAccount, logoutCommunityAccount, readCommunityAuthSession } from "@/lib/api";
+import type { CommunityAccount } from "@/lib/types";
 import {
   type SettingsAvailabilityModalSnapshot,
   type SettingsAvailabilityState,
@@ -189,9 +191,11 @@ function HomePageContent() {
   const [topChromeGestureActive, setTopChromeGestureActive] = useState(false);
   const [searchPanelScrollable, setSearchPanelScrollable] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
   const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
   const [activeCommunitySetId, setActiveCommunitySetId] = useState<string | null>(null);
+  const [communityAccount, setCommunityAccount] = useState<CommunityAccount | null>(null);
   const [hasUnsavedSettingsChanges, setHasUnsavedSettingsChanges] = useState(false);
   const [settingsModalView, setSettingsModalView] = useState<null | "unsaved" | "availability">(null);
   const [settingsAvailabilityModalSnapshot, setSettingsAvailabilityModalSnapshot] = useState<SettingsAvailabilityModalSnapshot | null>(null);
@@ -224,6 +228,61 @@ function HomePageContent() {
     historyRef.current = merged;
     setHistory(merged);
     window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(merged));
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    let cancelled = false;
+    const syncAccountFromStorage = () => {
+      const stored = readCommunityAuthSession();
+      if (!cancelled) {
+        setCommunityAccount(stored?.account ?? null);
+      }
+    };
+    const validateStoredAccount = async () => {
+      const stored = readCommunityAuthSession();
+      if (!stored?.sessionToken) {
+        if (!cancelled) {
+          setCommunityAccount(null);
+        }
+        return;
+      }
+      try {
+        const account = await fetchCommunityAccount();
+        if (!cancelled) {
+          setCommunityAccount(account);
+        }
+      } catch {
+        syncAccountFromStorage();
+      }
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea !== window.localStorage) {
+        return;
+      }
+      if (
+        event.key
+        && event.key !== "studyreels-community-account"
+        && event.key !== "studyreels-community-session-token"
+      ) {
+        return;
+      }
+      syncAccountFromStorage();
+    };
+    const onAuthChanged = () => {
+      syncAccountFromStorage();
+    };
+    syncAccountFromStorage();
+    void validateStoredAccount();
+    window.addEventListener("storage", onStorage);
+    window.addEventListener(COMMUNITY_AUTH_CHANGED_EVENT, onAuthChanged);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener(COMMUNITY_AUTH_CHANGED_EVENT, onAuthChanged);
+    };
   }, []);
 
   useEffect(() => {
@@ -406,12 +465,18 @@ function HomePageContent() {
       if (typeof window === "undefined") {
         return;
       }
+      const target = event.currentTarget;
       if (shouldDisableSidebarTooltips()) {
         clearSidebarInfoTooltipTimers();
+        delete target.dataset.tooltipHoverLocked;
         setSidebarInfoTooltip(null);
         return;
       }
-      const rect = event.currentTarget.getBoundingClientRect();
+      if (target.dataset.tooltipHoverLocked === "true") {
+        return;
+      }
+      target.dataset.tooltipHoverLocked = "true";
+      const rect = target.getBoundingClientRect();
       clearSidebarInfoTooltipTimers();
       setSidebarInfoTooltip(null);
       sidebarInfoTooltipShowTimerRef.current = window.setTimeout(() => {
@@ -438,7 +503,8 @@ function HomePageContent() {
     [clearSidebarInfoTooltipTimers, shouldDisableSidebarTooltips],
   );
 
-  const onSidebarInfoHoverEnd = useCallback(() => {
+  const onSidebarInfoHoverEnd = useCallback((event: ReactMouseEvent<HTMLElement>) => {
+    delete event.currentTarget.dataset.tooltipHoverLocked;
     if (shouldDisableSidebarTooltips()) {
       clearSidebarInfoTooltipTimers();
       setSidebarInfoTooltip(null);
@@ -467,6 +533,7 @@ function HomePageContent() {
       return;
     }
     clearMobileSidebarCloseTimer();
+    setAccountMenuOpen(false);
     setMobileSidebarClosing(true);
     mobileSidebarCloseTimerRef.current = window.setTimeout(() => {
       setMobileSidebarOpen(false);
@@ -477,6 +544,7 @@ function HomePageContent() {
 
   const forceCloseMobileSidebar = useCallback(() => {
     clearMobileSidebarCloseTimer();
+    setAccountMenuOpen(false);
     setMobileSidebarClosing(false);
     setMobileSidebarOpen(false);
   }, [clearMobileSidebarCloseTimer]);
@@ -509,6 +577,7 @@ function HomePageContent() {
     }
     setError(null);
     setActiveHistoryMenuId(null);
+    setAccountMenuOpen(false);
     if (intent.clearHistoryQuery) {
       setHistoryQuery("");
     }
@@ -539,6 +608,14 @@ function HomePageContent() {
   const startNewSearch = useCallback(() => {
     requestSidebarSwitch({ tab: "search", clearHistoryQuery: true });
   }, [requestSidebarSwitch]);
+
+  const openAccountScreen = useCallback(() => {
+    setActiveHistoryMenuId(null);
+    setAccountMenuOpen(false);
+    forceCloseMobileSidebar();
+    const returnTab = activeSidebarTab === "create" ? "edit" : activeSidebarTab;
+    router.push(`/account?return_tab=${returnTab}`);
+  }, [activeSidebarTab, forceCloseMobileSidebar, router]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -715,6 +792,32 @@ function HomePageContent() {
     };
   }, [activeHistoryMenuId]);
 
+  useEffect(() => {
+    if (!accountMenuOpen) {
+      return;
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      if (!(event.target instanceof Element)) {
+        return;
+      }
+      if (event.target.closest("[data-account-actions='true']")) {
+        return;
+      }
+      setAccountMenuOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAccountMenuOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [accountMenuOpen]);
+
   const onUploadMaterialCreated = useCallback(
     async (params: { materialId: string; title: string; topic?: string; generationMode: GenerationMode }) => {
       const nextTitle = params.title?.trim() || params.topic?.trim() || "New Study Session";
@@ -754,6 +857,18 @@ function HomePageContent() {
     },
     [requestSidebarSwitch],
   );
+  const openYourSetsFromAccountMenu = useCallback(() => {
+    setAccountMenuOpen(false);
+    switchSidebarTab("edit");
+  }, [switchSidebarTab]);
+  const onAccountMenuSignOut = useCallback(async () => {
+    setAccountMenuOpen(false);
+    try {
+      await logoutCommunityAccount();
+    } finally {
+      setCommunityAccount(null);
+    }
+  }, []);
   const onCommunityDraftExitActionsChange = useCallback((actions: CommunityDraftExitActions | null) => {
     // Unsaved draft state is owned by the panel's explicit dirty-state callback.
     // Clearing it here would incorrectly mark the form clean during effect cleanups.
@@ -1034,38 +1149,44 @@ function HomePageContent() {
                       <i className="fa-solid fa-ellipsis text-[11px]" aria-hidden="true" />
                     </button>
 
-                    {activeHistoryMenuId === entry.materialId ? (
-                      <div className="absolute right-0 top-full z-30 mt-1 w-36">
-                        <div className="absolute inset-0 rounded-xl bg-black/32 backdrop-blur-md" />
-                        <div className="relative rounded-xl border border-white/20 bg-black/62 p-1 shadow-lg">
-                          <button
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              toggleHistoryStar(entry.materialId);
-                            }}
-                            className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-white/90 transition hover:bg-white/10"
-                          >
-                            <i
-                              className={`fa-${entry.starred ? "solid" : "regular"} fa-star text-[11px] text-white/80`}
-                              aria-hidden="true"
-                            />
-                            {entry.starred ? "Unstar" : "Star"}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              deleteHistoryItem(entry.materialId);
-                            }}
-                            className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-white/90 transition hover:bg-white/10"
-                          >
-                            <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
-                            Delete
-                          </button>
-                        </div>
+                    <div
+                      className={`absolute right-0 top-full z-30 mt-1 w-36 transition-opacity duration-180 ${
+                        activeHistoryMenuId === entry.materialId
+                          ? "pointer-events-auto opacity-100"
+                          : "pointer-events-none opacity-0"
+                      }`}
+                    >
+                      <div
+                        role="menu"
+                        className="overflow-hidden rounded-2xl border border-white/15 bg-[#090909]/96 p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] backdrop-blur-xl"
+                      >
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            toggleHistoryStar(entry.materialId);
+                          }}
+                          className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                        >
+                          <i
+                            className={`fa-${entry.starred ? "solid" : "regular"} fa-star text-[11px] text-white/80`}
+                            aria-hidden="true"
+                          />
+                          {entry.starred ? "Unstar" : "Star"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            deleteHistoryItem(entry.materialId);
+                          }}
+                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                        >
+                          <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
+                          Delete
+                        </button>
                       </div>
-                    ) : null}
+                    </div>
                   </div>
                 </div>
               ))
@@ -1090,6 +1211,80 @@ function HomePageContent() {
               <i
                 className={`fa-solid fa-gear text-[11px] ${
                   visibleSidebarTab === "settings" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+                }`}
+                aria-hidden="true"
+              />
+            </div>
+          </button>
+        </div>
+        <div
+          data-account-actions="true"
+          className="group relative mt-2"
+        >
+          {communityAccount ? (
+            <div
+              className={`absolute inset-x-0 bottom-full z-30 mb-2 ${
+                accountMenuOpen ? "pointer-events-auto" : "pointer-events-none"
+              }`}
+            >
+              <div
+                role="menu"
+                className={`overflow-hidden rounded-2xl border border-white/15 bg-[#090909]/96 p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] backdrop-blur-xl transition duration-180 ${
+                  accountMenuOpen ? "pointer-events-auto translate-y-0 opacity-100" : "pointer-events-none translate-y-1 opacity-0"
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={openAccountScreen}
+                  className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                >
+                  <i className="fa-regular fa-id-badge text-[11px] text-white/75" aria-hidden="true" />
+                  Manage Account
+                </button>
+                <button
+                  type="button"
+                  onClick={openYourSetsFromAccountMenu}
+                  className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                >
+                  <i className="fa-regular fa-folder-open text-[11px] text-white/75" aria-hidden="true" />
+                  Your Sets
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void onAccountMenuSignOut();
+                  }}
+                  className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                >
+                  <i className="fa-solid fa-right-from-bracket text-[11px] text-white/75" aria-hidden="true" />
+                  Log Out
+                </button>
+              </div>
+            </div>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => {
+              if (communityAccount) {
+                setActiveHistoryMenuId(null);
+                setAccountMenuOpen((prev) => !prev);
+                return;
+              }
+              openAccountScreen();
+            }}
+            aria-haspopup={communityAccount ? "menu" : undefined}
+            aria-expanded={communityAccount ? accountMenuOpen : undefined}
+            className="h-10 w-full rounded-xl border border-white/15 bg-transparent px-2.5 text-left text-xs text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
+          >
+            <div className="flex h-full items-center justify-between gap-1.5">
+              <p className="truncate font-semibold leading-none">
+                {communityAccount ? `@${communityAccount.username}` : "Login / Sign Up"}
+              </p>
+              <i
+                className={`text-[11px] ${
+                  communityAccount
+                    ? `fa-solid ${accountMenuOpen ? "fa-chevron-up" : "fa-user"} text-white/74 transition-colors duration-200 group-hover:text-white`
+                    : "fa-solid fa-right-to-bracket text-white/74 transition-colors duration-200 group-hover:text-white"
                 }`}
                 aria-hidden="true"
               />

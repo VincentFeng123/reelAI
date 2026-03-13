@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     s3_endpoint_url: str = ""
     s3_access_key_id: str = ""
     s3_secret_access_key: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from_email: str = ""
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    verification_hmac_key: str = ""
 
 
 @lru_cache

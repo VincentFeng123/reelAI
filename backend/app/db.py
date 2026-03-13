@@ -187,6 +187,34 @@ CREATE TABLE IF NOT EXISTS retrieval_outcomes (
 
 CREATE INDEX IF NOT EXISTS idx_retrieval_outcomes_run ON retrieval_outcomes(run_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS community_accounts (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    username_normalized TEXT NOT NULL UNIQUE,
+    email TEXT,
+    email_normalized TEXT,
+    password_hash TEXT NOT NULL,
+    password_salt TEXT NOT NULL,
+    verified_at TEXT,
+    verification_code_hash TEXT,
+    verification_expires_at TEXT,
+    legacy_claim_owner_key_hash TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS community_sessions (
+    id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY(account_id) REFERENCES community_accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_community_sessions_account_id ON community_sessions(account_id);
+
 CREATE TABLE IF NOT EXISTS community_sets (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -200,12 +228,24 @@ CREATE TABLE IF NOT EXISTS community_sets (
     updated_label TEXT NOT NULL,
     thumbnail_url TEXT NOT NULL,
     owner_key_hash TEXT,
+    owner_account_id TEXT,
+    visibility TEXT NOT NULL DEFAULT 'private',
     featured INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_community_sets_featured_created_at ON community_sets(featured DESC, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS rate_limit_events (
+    id TEXT PRIMARY KEY,
+    rate_key TEXT NOT NULL,
+    hit_at REAL NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_rate_limit_events_key_hit_at ON rate_limit_events(rate_key, hit_at);
+CREATE INDEX IF NOT EXISTS idx_rate_limit_events_hit_at ON rate_limit_events(hit_at);
 
 CREATE TABLE IF NOT EXISTS search_cache (
     cache_key TEXT PRIMARY KEY,
@@ -237,6 +277,8 @@ _db_ready = False
 DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 120000
 _SAFE_SQL_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 LEGACY_COMMUNITY_OWNER_HASH = "__legacy_unowned__"
+DEFAULT_COMMUNITY_VISIBILITY = "private"
+PUBLIC_COMMUNITY_VISIBILITY = "public"
 
 
 def _db_path() -> str:
@@ -432,8 +474,33 @@ def init_db() -> None:
                 for statement in _postgres_schema_statements():
                     cur.execute(statement)
                 # Lightweight schema migration for older community_sets tables.
+                cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS email TEXT")
+                cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS email_normalized TEXT")
+                cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS verified_at TEXT")
+                cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS verification_code_hash TEXT")
+                cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS verification_expires_at TEXT")
+                cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS legacy_claim_owner_key_hash TEXT")
+                cur.execute(
+                    "UPDATE community_accounts SET email = NULL WHERE email IS NOT NULL AND BTRIM(email) = ''"
+                )
+                cur.execute(
+                    "UPDATE community_accounts SET email_normalized = NULL WHERE email_normalized IS NOT NULL AND BTRIM(email_normalized) = ''"
+                )
+                cur.execute(
+                    """
+                    UPDATE community_accounts
+                    SET verified_at = created_at
+                    WHERE (email IS NULL OR BTRIM(email) = '')
+                      AND (verified_at IS NULL OR BTRIM(verified_at) = '')
+                    """
+                )
+                cur.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_community_accounts_email_normalized_unique ON community_accounts(email_normalized)"
+                )
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS updated_at TEXT")
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS owner_key_hash TEXT")
+                cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS owner_account_id TEXT")
+                cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS visibility TEXT")
                 cur.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR BTRIM(updated_at) = ''")
                 cur.execute(
                     """
@@ -442,6 +509,23 @@ def init_db() -> None:
                     WHERE owner_key_hash IS NULL OR BTRIM(owner_key_hash) = ''
                     """,
                     (LEGACY_COMMUNITY_OWNER_HASH,),
+                )
+                cur.execute(
+                    """
+                    UPDATE community_sets
+                    SET visibility = CASE
+                        WHEN featured = 1 OR owner_key_hash = %s THEN %s
+                        ELSE %s
+                    END
+                    WHERE visibility IS NULL OR BTRIM(visibility) = ''
+                    """,
+                    (LEGACY_COMMUNITY_OWNER_HASH, PUBLIC_COMMUNITY_VISIBILITY, DEFAULT_COMMUNITY_VISIBILITY),
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_community_sets_owner_account_updated_at ON community_sets(owner_account_id, updated_at DESC)"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_community_sets_visibility_featured_updated_at ON community_sets(visibility, featured DESC, updated_at DESC)"
                 )
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
@@ -458,11 +542,64 @@ def init_db() -> None:
         except sqlite3.OperationalError:
             pass
         try:
+            conn.execute("ALTER TABLE community_accounts ADD COLUMN email TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_accounts ADD COLUMN email_normalized TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_accounts ADD COLUMN verified_at TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_accounts ADD COLUMN verification_code_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_accounts ADD COLUMN verification_expires_at TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_accounts ADD COLUMN legacy_claim_owner_key_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("UPDATE community_accounts SET email = NULL WHERE email IS NOT NULL AND TRIM(email) = ''")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                "UPDATE community_accounts SET email_normalized = NULL WHERE email_normalized IS NOT NULL AND TRIM(email_normalized) = ''"
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute(
+                """
+                UPDATE community_accounts
+                SET verified_at = created_at
+                WHERE (email IS NULL OR TRIM(email) = '')
+                  AND (verified_at IS NULL OR TRIM(verified_at) = '')
+                """
+            )
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE community_sets ADD COLUMN updated_at TEXT")
         except sqlite3.OperationalError:
             pass
         try:
             conn.execute("ALTER TABLE community_sets ADD COLUMN owner_key_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_sets ADD COLUMN owner_account_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_sets ADD COLUMN visibility TEXT")
         except sqlite3.OperationalError:
             pass
         try:
@@ -480,6 +617,29 @@ def init_db() -> None:
             )
         except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute(
+                """
+                UPDATE community_sets
+                SET visibility = CASE
+                    WHEN featured = 1 OR owner_key_hash = ? THEN ?
+                    ELSE ?
+                END
+                WHERE visibility IS NULL OR TRIM(visibility) = ''
+                """,
+                (LEGACY_COMMUNITY_OWNER_HASH, PUBLIC_COMMUNITY_VISIBILITY, DEFAULT_COMMUNITY_VISIBILITY),
+            )
+        except sqlite3.OperationalError:
+            pass
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_community_accounts_email_normalized_unique ON community_accounts(email_normalized)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_community_sets_owner_account_updated_at ON community_sets(owner_account_id, updated_at DESC)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_community_sets_visibility_featured_updated_at ON community_sets(visibility, featured DESC, updated_at DESC)"
+        )
         _migrate_reels_unique_clip_index_sqlite(conn)
         _migrate_reel_feedback_uniqueness_sqlite(conn)
         conn.commit()
@@ -498,22 +658,77 @@ def ensure_db_initialized() -> None:
         init_db()
 
 
+## ---------------------------------------------------------------------------
+## Lightweight PostgreSQL connection pool (no external dependency required)
+## ---------------------------------------------------------------------------
+_pg_pool_lock = threading.Lock()
+_pg_pool: list[Any] = []
+_PG_POOL_MAX_IDLE = 6
+
+
+def _pg_pool_acquire() -> Any:
+    """Return a reusable PostgreSQL connection, or create a fresh one."""
+    while True:
+        conn: Any = None
+        with _pg_pool_lock:
+            if _pg_pool:
+                conn = _pg_pool.pop()
+        if conn is None:
+            return psycopg.connect(_database_url(), connect_timeout=15, autocommit=True)
+        # Validate before reuse — discard stale/broken connections.
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            # Loop and try next pooled connection or create a new one.
+
+
+def _pg_pool_release(conn: Any) -> None:
+    """Return a connection to the pool (or close it if the pool is full)."""
+    try:
+        # Reset to a clean state: rollback any uncommitted work, set autocommit.
+        if not conn.autocommit:
+            conn.rollback()
+            conn.autocommit = True
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    with _pg_pool_lock:
+        if len(_pg_pool) < _PG_POOL_MAX_IDLE:
+            _pg_pool.append(conn)
+        else:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 @contextmanager
 def get_conn(*, transactional: bool = False):
     ensure_db_initialized()
     if _is_postgres_configured():
         if psycopg is None:
             raise RuntimeError("DATABASE_URL is set to PostgreSQL, but psycopg is not installed.")
-        conn = psycopg.connect(_database_url(), connect_timeout=15)
+        conn = _pg_pool_acquire()
+        conn.autocommit = not transactional
         try:
             yield conn
         except Exception:
-            conn.rollback()
+            if transactional:
+                conn.rollback()
             raise
         else:
-            conn.commit()
+            if transactional:
+                conn.commit()
         finally:
-            conn.close()
+            _pg_pool_release(conn)
         return
 
     busy_timeout_ms = _sqlite_busy_timeout_ms()
@@ -541,6 +756,33 @@ def get_conn(*, transactional: bool = False):
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def insert(conn: Any, table: str, data: dict[str, Any]) -> None:
+    """Plain INSERT — raises DatabaseIntegrityError on unique constraint violation."""
+    if not _SAFE_SQL_IDENTIFIER_RE.fullmatch(table):
+        raise ValueError(f"Unsafe table name: {table!r}")
+    cols = list(data.keys())
+    for col in cols:
+        if not _SAFE_SQL_IDENTIFIER_RE.fullmatch(col):
+            raise ValueError(f"Unsafe column name: {col!r}")
+    placeholders = ", ".join(["?"] * len(cols))
+    sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})"
+    values = [data[c] for c in cols]
+    is_pg = _is_postgres_conn(conn)
+    query = _adapt_query_for_postgres(sql) if is_pg else sql
+    try:
+        if is_pg:
+            with conn.cursor() as cur:
+                cur.execute(query, values)
+        else:
+            conn.execute(query, values)
+    except Exception as exc:
+        if is_pg and _is_unique_violation(exc):
+            raise DatabaseIntegrityError(str(exc)) from exc
+        if isinstance(exc, sqlite3.IntegrityError):
+            raise DatabaseIntegrityError(str(exc)) from exc
+        raise
 
 
 def _is_unique_violation(exc: Exception) -> bool:

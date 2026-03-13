@@ -34,6 +34,15 @@ Deploy the repo as a single project from root (`.`).
   - `OPENAI_ENABLED=0` (set `1` only if you want to enable OpenAI calls)
   - `OPENAI_API_KEY=...`
   - `YOUTUBE_API_KEY=...`
-- `DATABASE_URL=postgresql://...` (recommended for durable hosted data, e.g. Railway)
+  - `DATABASE_URL=postgresql://...` (recommended for durable hosted data, e.g. Railway)
+  - `VERIFICATION_HMAC_KEY=...` (required for hosted community-account verification)
+  - `SMTP_HOST=...`
+  - `SMTP_PORT=587`
+  - `SMTP_USERNAME=...`
+  - `SMTP_PASSWORD=...`
+  - `SMTP_FROM_EMAIL=...`
+  - Optional: `SMTP_USE_TLS=1`, `SMTP_USE_SSL=0`
 - `DATA_DIR` defaults to `/tmp/studyreels-data` on Vercel and is ephemeral.
 - If you intentionally stay on SQLite in hosted mode, tune lock waits with `SQLITE_BUSY_TIMEOUT_MS` (default `120000`).
+- Hosted community-account verification also requires `VERIFICATION_HMAC_KEY`.
+- Hosted community-account registration and email verification will fail with `503` until the SMTP settings above are configured.

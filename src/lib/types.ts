@@ -110,3 +110,18 @@ export type CommunitySet = {
   thumbnailUrl: string;
   featured: boolean;
 };
+
+export type CommunityAccount = {
+  id: string;
+  username: string;
+  email?: string | null;
+  isVerified: boolean;
+};
+
+export type CommunityAuthSession = {
+  account: CommunityAccount;
+  sessionToken: string;
+  claimedLegacySets: number;
+  verificationRequired: boolean;
+  verificationCodeDebug?: string | null;
+};

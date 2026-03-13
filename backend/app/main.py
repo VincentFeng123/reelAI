@@ -3,12 +3,16 @@ import json
 import ipaddress
 import os
 import re
+import secrets
+import smtplib
 import threading
 import time
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from email.utils import parseaddr
 from typing import Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -18,15 +22,40 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute
 
 from .config import get_settings
-from .db import LEGACY_COMMUNITY_OWNER_HASH, dumps_json, execute_modify, fetch_all, get_conn, init_db, now_iso, upsert
+from .db import (
+    DEFAULT_COMMUNITY_VISIBILITY,
+    DatabaseIntegrityError,
+    LEGACY_COMMUNITY_OWNER_HASH,
+    PUBLIC_COMMUNITY_VISIBILITY,
+    dumps_json,
+    execute_modify,
+    fetch_all,
+    fetch_one,
+    get_conn,
+    init_db,
+    insert,
+    now_iso,
+    upsert,
+)
 from .models import (
     ChatRequest,
     ChatResponse,
+    CommunityAuthMeResponse,
+    CommunityAuthLoginRequest,
+    CommunityAuthRegisterRequest,
+    CommunityChangeEmailRequest,
+    CommunityChangeEmailResponse,
+    CommunityAuthSessionResponse,
+    CommunityAccountOut,
+    CommunityChangePasswordRequest,
+    CommunityResendVerificationResponse,
     CommunityReelOut,
     CommunitySetCreateRequest,
     CommunitySetOut,
     CommunitySetUpdateRequest,
     CommunitySetsResponse,
+    CommunityVerifyAccountRequest,
+    CommunityVerifyAccountResponse,
     FeedbackRequest,
     FeedbackResponse,
     FeedResponse,
@@ -122,9 +151,25 @@ def _build_allowed_origins() -> list[str]:
 allowed_origins = _build_allowed_origins()
 allow_origin_regex = os.getenv("CORS_ALLOW_ORIGIN_REGEX", "").strip() or None
 if allow_origin_regex is None and _is_hosted_runtime():
-    # Hosted preview deployments commonly rotate origins. Allow known hosted
-    # platform subdomains by default unless an explicit regex is configured.
-    allow_origin_regex = r"^https://(?:[A-Za-z0-9-]+\.)*(?:vercel\.app|railway\.app)$"
+    # Build a project-scoped CORS regex from configured domains instead of
+    # allowing every *.vercel.app / *.railway.app subdomain, which would let
+    # any attacker with a deployment on those platforms make credentialed
+    # cross-origin requests.
+    _cors_project_slugs: list[str] = []
+    for _cors_env in ("VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_URL", "VERCEL_BRANCH_URL"):
+        _cors_val = os.getenv(_cors_env, "").strip().lower()
+        if _cors_val:
+            # e.g. "my-project.vercel.app" → match "*.my-project.vercel.app"
+            _cors_project_slugs.append(re.escape(_cors_val))
+    for _cors_env in ("RAILWAY_PUBLIC_DOMAIN", "RAILWAY_STATIC_URL"):
+        _cors_val = os.getenv(_cors_env, "").strip().lower()
+        if _cors_val:
+            _cors_project_slugs.append(re.escape(_cors_val))
+    if _cors_project_slugs:
+        _cors_alts = "|".join(_cors_project_slugs)
+        allow_origin_regex = rf"^https://(?:[A-Za-z0-9-]+\.)*(?:{_cors_alts})$"
+    # If no project domains are detected, fall back to explicit origins only
+    # (already collected in allowed_origins from the same env vars).
 
 app.add_middleware(
     CORSMiddleware,
@@ -154,6 +199,17 @@ MAX_DURATION_FETCH_REDIRECTS = 4
 PRIVATE_HOST_SUFFIXES = (".localhost", ".local", ".internal")
 COMMUNITY_OWNER_HEADER = "x-studyreels-owner-key"
 COMMUNITY_OWNER_KEY_MIN_LENGTH = 24
+COMMUNITY_SESSION_HEADER = "x-studyreels-session-token"
+COMMUNITY_SESSION_TOKEN_MIN_LENGTH = 24
+COMMUNITY_ACCOUNT_USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,30}[A-Za-z0-9]$")
+COMMUNITY_ACCOUNT_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+COMMUNITY_ACCOUNT_PASSWORD_ITERATIONS = 240_000
+COMMUNITY_SESSION_TTL_DAYS = 45
+COMMUNITY_MAX_SESSIONS_PER_ACCOUNT = 20
+COMMUNITY_VERIFICATION_CODE_LENGTH = 6
+COMMUNITY_VERIFICATION_TTL_MINUTES = 20
+COMMUNITY_REGISTER_CONFLICT_DETAIL = "An account with that username or email already exists."
+COMMUNITY_CHANGE_EMAIL_CONFLICT_DETAIL = "Could not update the verification email."
 MAX_COMMUNITY_THUMBNAIL_DATA_URL_BODY_CHARS = 2_000_000
 RATE_LIMIT_WINDOW_SEC = 60.0
 CHAT_RATE_LIMIT_PER_WINDOW = 20
@@ -162,9 +218,13 @@ REELS_RATE_LIMIT_PER_WINDOW = 12
 FEEDBACK_RATE_LIMIT_PER_WINDOW = 60
 COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW = 12
 COMMUNITY_DURATION_RATE_LIMIT_PER_WINDOW = 30
+COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW = 20
+COMMUNITY_LOGIN_PER_USERNAME_RATE_LIMIT = 8
+COMMUNITY_VERIFY_PER_ACCOUNT_RATE_LIMIT = 5
 _rate_limit_lock = threading.Lock()
 _rate_limit_hits: dict[str, deque[float]] = {}
 _rate_limit_last_sweep = 0.0
+_rate_limit_last_db_cleanup = 0.0
 
 
 def _host_matches(host: str, domain: str) -> bool:
@@ -229,15 +289,28 @@ def _parse_ip_literal(raw_value: str) -> str | None:
 
 
 def _extract_forwarded_ip(request: Request) -> str | None:
-    for header_name in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+    for header_name in ("cf-connecting-ip", "x-real-ip"):
         raw = request.headers.get(header_name, "").strip()
         if not raw:
             continue
-        candidates = raw.split(",") if header_name == "x-forwarded-for" else [raw]
-        for candidate in candidates:
-            parsed_ip = _parse_ip_literal(candidate)
-            if parsed_ip:
-                return parsed_ip
+        parsed_ip = _parse_ip_literal(raw)
+        if parsed_ip and _is_public_host(parsed_ip):
+            return parsed_ip
+
+    raw_forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+    if not raw_forwarded_for:
+        return None
+    candidates = [candidate.strip() for candidate in raw_forwarded_for.split(",")]
+    # X-Forwarded-For is ordered client first, then each proxy hop that appended
+    # itself later in the chain.
+    for candidate in candidates:
+        parsed_ip = _parse_ip_literal(candidate)
+        if parsed_ip and _is_public_host(parsed_ip):
+            return parsed_ip
+    for candidate in candidates:
+        parsed_ip = _parse_ip_literal(candidate)
+        if parsed_ip:
+            return parsed_ip
     return None
 
 
@@ -266,11 +339,14 @@ def _sweep_rate_limit_buckets(now: float, window_sec: float) -> None:
     _rate_limit_last_sweep = now
 
 
-def _enforce_rate_limit(request: Request, scope: str, *, limit: int, window_sec: float = RATE_LIMIT_WINDOW_SEC) -> None:
+def _check_rate_limit_key(key: str, *, limit: int, window_sec: float) -> None:
+    """Core rate limit check against a pre-built key. Raises HTTPException on breach."""
     if limit <= 0:
         return
+    if _uses_persistent_rate_limits():
+        _check_rate_limit_key_persistent(key, limit=limit, window_sec=window_sec)
+        return
     now = time.monotonic()
-    key = f"{scope}:{_client_ip(request)}"
     with _rate_limit_lock:
         _sweep_rate_limit_buckets(now, window_sec)
         bucket = _rate_limit_hits.get(key)
@@ -289,6 +365,56 @@ def _enforce_rate_limit(request: Request, scope: str, *, limit: int, window_sec:
         bucket.append(now)
 
 
+def _uses_persistent_rate_limits() -> bool:
+    database_url = (settings.database_url or "").strip() or os.getenv("DATABASE_URL", "").strip()
+    return database_url.startswith(("postgres://", "postgresql://"))
+
+
+def _check_rate_limit_key_persistent(key: str, *, limit: int, window_sec: float) -> None:
+    global _rate_limit_last_db_cleanup
+
+    now_wall = time.time()
+    cutoff = now_wall - window_sec
+    should_cleanup = False
+    with _rate_limit_lock:
+        if now_wall - _rate_limit_last_db_cleanup >= max(window_sec, 30.0):
+            _rate_limit_last_db_cleanup = now_wall
+            should_cleanup = True
+
+    with get_conn(transactional=True) as conn:
+        # PostgreSQL advisory locks serialize checks per key across instances.
+        fetch_one(conn, "SELECT pg_advisory_xact_lock(hashtext(?)) AS locked", (key,))
+        if should_cleanup:
+            execute_modify(conn, "DELETE FROM rate_limit_events WHERE hit_at <= ?", (cutoff,))
+        row = fetch_one(
+            conn,
+            """
+            SELECT COUNT(*) AS hit_count
+            FROM rate_limit_events
+            WHERE rate_key = ?
+              AND hit_at > ?
+            """,
+            (key, cutoff),
+        )
+        hit_count = _to_int(row.get("hit_count") if row else 0, 0)
+        if hit_count >= limit:
+            raise HTTPException(status_code=429, detail="Too many requests. Please wait and try again.")
+        insert(
+            conn,
+            "rate_limit_events",
+            {
+                "id": str(uuid.uuid4()),
+                "rate_key": key,
+                "hit_at": now_wall,
+                "created_at": now_iso(),
+            },
+        )
+
+
+def _enforce_rate_limit(request: Request, scope: str, *, limit: int, window_sec: float = RATE_LIMIT_WINDOW_SEC) -> None:
+    _check_rate_limit_key(f"{scope}:{_client_ip(request)}", limit=limit, window_sec=window_sec)
+
+
 def _normalize_owner_key(raw_key: str | None) -> str:
     owner_key = str(raw_key or "").strip()
     if len(owner_key) < COMMUNITY_OWNER_KEY_MIN_LENGTH:
@@ -296,26 +422,412 @@ def _normalize_owner_key(raw_key: str | None) -> str:
     return owner_key
 
 
-def _community_owner_hash_from_request(request: Request) -> str:
-    owner_key = _normalize_owner_key(request.headers.get(COMMUNITY_OWNER_HEADER))
+def _community_owner_hash_from_request_optional(request: Request) -> str | None:
+    raw_owner_key = str(request.headers.get(COMMUNITY_OWNER_HEADER) or "").strip()
+    if not raw_owner_key:
+        return None
+    owner_key = _normalize_owner_key(raw_owner_key)
     return hashlib.sha256(owner_key.encode("utf-8")).hexdigest()
 
 
+def _community_owner_hash_from_request(request: Request) -> str:
+    owner_key_hash = _community_owner_hash_from_request_optional(request)
+    if not owner_key_hash:
+        raise HTTPException(status_code=400, detail="Missing or invalid community owner key.")
+    return owner_key_hash
+
+
+def _normalize_community_session_token(raw_token: str | None) -> str:
+    token = str(raw_token or "").strip()
+    if len(token) < COMMUNITY_SESSION_TOKEN_MIN_LENGTH:
+        raise HTTPException(status_code=401, detail="Sign in to access your community sets.")
+    return token
+
+
+def _community_session_token_from_request(request: Request) -> str:
+    return _normalize_community_session_token(request.headers.get(COMMUNITY_SESSION_HEADER))
+
+
+def _normalize_community_username(raw_username: str) -> tuple[str, str]:
+    username = str(raw_username or "").strip()
+    normalized = username.lower()
+    if not COMMUNITY_ACCOUNT_USERNAME_RE.fullmatch(username):
+        raise HTTPException(
+            status_code=400,
+            detail="Username must be 3-32 characters and use only letters, numbers, dots, underscores, or hyphens.",
+        )
+    return username, normalized
+
+
+def _normalize_community_password(raw_password: str) -> str:
+    password = str(raw_password or "")
+    if len(password) < 8 or len(password) > 128:
+        raise HTTPException(status_code=400, detail="Password must be between 8 and 128 characters.")
+    return password
+
+
+def _normalize_community_email(raw_email: str) -> tuple[str, str]:
+    email = str(raw_email or "").strip()
+    _, parsed_email = parseaddr(email)
+    normalized = parsed_email.strip().lower()
+    if parsed_email != email or not COMMUNITY_ACCOUNT_EMAIL_RE.fullmatch(parsed_email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+    return parsed_email, normalized
+
+
+def _hash_community_password(password: str, salt_hex: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt_hex),
+        COMMUNITY_ACCOUNT_PASSWORD_ITERATIONS,
+    ).hex()
+
+
+def _verify_community_password(password: str, salt_hex: str, expected_hash: str) -> bool:
+    candidate = _hash_community_password(password, salt_hex)
+    return secrets.compare_digest(candidate, str(expected_hash or ""))
+
+
+def _community_session_expires_at_iso() -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=COMMUNITY_SESSION_TTL_DAYS)).isoformat()
+
+
+def _community_verification_expires_at_iso() -> str:
+    return (datetime.now(timezone.utc) + timedelta(minutes=COMMUNITY_VERIFICATION_TTL_MINUTES)).isoformat()
+
+
+def _generate_community_verification_code() -> str:
+    return "".join(str(secrets.randbelow(10)) for _ in range(COMMUNITY_VERIFICATION_CODE_LENGTH))
+
+
+_local_verification_hmac_key_cache: str | None = None
+
+
+def _load_or_create_local_verification_hmac_key() -> str:
+    global _local_verification_hmac_key_cache
+    if _local_verification_hmac_key_cache:
+        return _local_verification_hmac_key_cache
+
+    os.makedirs(settings.data_dir, exist_ok=True)
+    secret_path = os.path.join(settings.data_dir, ".community_verification_hmac_key")
+    try:
+        with open(secret_path, "r", encoding="utf-8") as handle:
+            existing_secret = handle.read().strip()
+    except OSError:
+        existing_secret = ""
+    if existing_secret:
+        _local_verification_hmac_key_cache = existing_secret
+        return existing_secret
+
+    generated_secret = secrets.token_urlsafe(48)
+    try:
+        with open(secret_path, "x", encoding="utf-8") as handle:
+            handle.write(generated_secret)
+        try:
+            os.chmod(secret_path, 0o600)
+        except OSError:
+            pass
+        _local_verification_hmac_key_cache = generated_secret
+        return generated_secret
+    except FileExistsError:
+        try:
+            with open(secret_path, "r", encoding="utf-8") as handle:
+                concurrent_secret = handle.read().strip()
+        except OSError:
+            concurrent_secret = ""
+        _local_verification_hmac_key_cache = concurrent_secret or generated_secret
+        return _local_verification_hmac_key_cache
+    except OSError:
+        _local_verification_hmac_key_cache = generated_secret
+        return generated_secret
+
+
+def _community_verification_hmac_key() -> bytes:
+    configured_secret = settings.verification_hmac_key.strip()
+    if configured_secret:
+        return configured_secret.encode("utf-8")
+    if _is_hosted_runtime():
+        raise HTTPException(status_code=503, detail="Account verification secret is not configured.")
+    return _load_or_create_local_verification_hmac_key().encode("utf-8")
+
+
+def _hash_community_verification_code(code: str) -> str:
+    # Use HMAC with a server-side key so a DB leak doesn't expose the 1M-keyspace
+    # 6-digit codes to trivial rainbow-table recovery.
+    hmac_key = _community_verification_hmac_key()
+    return hashlib.pbkdf2_hmac("sha256", code.encode("utf-8"), hmac_key, 100_000).hex()
+
+
+def _parse_optional_iso_datetime(raw_value: object) -> datetime | None:
+    raw = str(raw_value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace(" ", "T")
+    if normalized.endswith(("z", "Z")):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _community_account_is_verified(row: dict[str, object]) -> bool:
+    return _parse_optional_iso_datetime(row.get("verified_at")) is not None
+
+
+def _community_verification_debug_mode_enabled() -> bool:
+    # Plaintext debug codes are allowed only for non-hosted runtimes.
+    return not _is_hosted_runtime()
+
+
+def _community_verification_email_is_configured() -> bool:
+    return bool(settings.smtp_host.strip() and settings.smtp_from_email.strip())
+
+
+def _require_hosted_verification_delivery_available() -> None:
+    if _community_verification_debug_mode_enabled():
+        return
+    if not _community_verification_email_is_configured():
+        raise HTTPException(status_code=503, detail="Account verification email is not configured.")
+
+
+def _warn_if_hosted_auth_email_is_unconfigured() -> None:
+    if not _is_hosted_runtime():
+        return
+    if _community_verification_email_is_configured():
+        if settings.verification_hmac_key.strip():
+            return
+    if not _community_verification_email_is_configured():
+        print(
+            "Warning: hosted runtime detected but SMTP is not configured. "
+            "Community account registration and unverified login will fail until SMTP_HOST and SMTP_FROM_EMAIL are set."
+        )
+    if not settings.verification_hmac_key.strip():
+        print(
+            "Warning: hosted runtime detected but VERIFICATION_HMAC_KEY is not configured. "
+            "Community account verification will fail until a secret key is set."
+        )
+
+
+def _send_community_verification_email(*, email: str, username: str, code: str) -> None:
+    message = EmailMessage()
+    message["Subject"] = "Verify your StudyReels account"
+    message["From"] = settings.smtp_from_email.strip()
+    message["To"] = email
+    message.set_content(
+        (
+            f"Hi @{username},\n\n"
+            f"Your StudyReels verification code is: {code}\n\n"
+            f"This code expires in {COMMUNITY_VERIFICATION_TTL_MINUTES} minutes.\n"
+            "If you did not create this account, you can ignore this email.\n"
+        )
+    )
+
+    smtp_host = settings.smtp_host.strip()
+    smtp_port = max(1, int(settings.smtp_port))
+    smtp_username = settings.smtp_username.strip()
+    smtp_password = settings.smtp_password
+
+    if settings.smtp_use_ssl:
+        with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=15) as server:
+            if smtp_username:
+                server.login(smtp_username, smtp_password)
+            server.send_message(message)
+        return
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+        if settings.smtp_use_tls:
+            server.starttls()
+        if smtp_username:
+            server.login(smtp_username, smtp_password)
+        server.send_message(message)
+
+
+def _deliver_community_verification_code(*, email: str, username: str, code: str) -> str | None:
+    if _community_verification_email_is_configured():
+        try:
+            _send_community_verification_email(email=email, username=username, code=code)
+            return None
+        except Exception as exc:
+            if _community_verification_debug_mode_enabled():
+                return code
+            raise HTTPException(status_code=502, detail="Could not send verification email. Try again.") from exc
+    if _community_verification_debug_mode_enabled():
+        return code
+    raise HTTPException(status_code=503, detail="Account verification email is not configured.")
+
+
+def _store_community_verification_code(conn, *, account_id: str) -> str:
+    """Generate a verification code, store its hash, and return the plaintext code."""
+    code = _generate_community_verification_code()
+    execute_modify(
+        conn,
+        """
+        UPDATE community_accounts
+        SET verification_code_hash = ?, verification_expires_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (_hash_community_verification_code(code), _community_verification_expires_at_iso(), now_iso(), account_id),
+    )
+    return code
+
+
+def _issue_community_verification_code(conn, *, account_id: str, email: str, username: str) -> str | None:
+    code = _store_community_verification_code(conn, account_id=account_id)
+    return _deliver_community_verification_code(email=email, username=username, code=code)
+
+
+def _community_account_out(row: dict[str, object]) -> CommunityAccountOut:
+    return CommunityAccountOut(
+        id=str(row.get("id") or ""),
+        username=str(row.get("username") or "").strip(),
+        email=str(row.get("email") or "").strip() or None,
+        is_verified=_community_account_is_verified(row),
+    )
+
+
+def _community_set_curator_for_account(account_row: dict[str, object]) -> str:
+    return str(account_row.get("username") or "").strip() or "Community member"
+
+
+def _create_community_session(conn, account_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    timestamp = now_iso()
+    # Clean up expired sessions for this account.
+    execute_modify(
+        conn,
+        "DELETE FROM community_sessions WHERE account_id = ? AND expires_at < ?",
+        (account_id, timestamp),
+    )
+    # Enforce per-account session limit by removing oldest sessions.
+    existing_sessions = fetch_all(
+        conn,
+        "SELECT id FROM community_sessions WHERE account_id = ? ORDER BY last_used_at DESC",
+        (account_id,),
+    )
+    if len(existing_sessions) >= COMMUNITY_MAX_SESSIONS_PER_ACCOUNT:
+        excess_ids = [str(s["id"]) for s in existing_sessions[COMMUNITY_MAX_SESSIONS_PER_ACCOUNT - 1:]]
+        for excess_id in excess_ids:
+            execute_modify(conn, "DELETE FROM community_sessions WHERE id = ?", (excess_id,))
+    insert(
+        conn,
+        "community_sessions",
+        {
+            "id": str(uuid.uuid4()),
+            "account_id": account_id,
+            "token_hash": token_hash,
+            "created_at": timestamp,
+            "last_used_at": timestamp,
+            "expires_at": _community_session_expires_at_iso(),
+        },
+    )
+    return token
+
+
+def _clear_legacy_claim_owner_key_hash(conn, *, account_id: str) -> None:
+    execute_modify(
+        conn,
+        """
+        UPDATE community_accounts
+        SET legacy_claim_owner_key_hash = NULL, updated_at = ?
+        WHERE id = ?
+          AND legacy_claim_owner_key_hash IS NOT NULL
+        """,
+        (now_iso(), account_id),
+    )
+
+
+def _claim_legacy_community_sets_for_account(
+    conn,
+    request: Request,
+    *,
+    account_id: str,
+    legacy_claim_owner_key_hash: object,
+) -> int:
+    stored_owner_key_hash = str(legacy_claim_owner_key_hash or "").strip()
+    if not stored_owner_key_hash or stored_owner_key_hash == LEGACY_COMMUNITY_OWNER_HASH:
+        return 0
+    request_owner_key_hash = _community_owner_hash_from_request_optional(request)
+    if request_owner_key_hash != stored_owner_key_hash:
+        return 0
+    claimed_count = execute_modify(
+        conn,
+        """
+        UPDATE community_sets
+        SET owner_account_id = ?, visibility = ?
+        WHERE owner_account_id IS NULL
+          AND owner_key_hash = ?
+          AND owner_key_hash <> ?
+        """,
+        (account_id, DEFAULT_COMMUNITY_VISIBILITY, stored_owner_key_hash, LEGACY_COMMUNITY_OWNER_HASH),
+    )
+    _clear_legacy_claim_owner_key_hash(conn, account_id=account_id)
+    return claimed_count
+
+
+def _require_authenticated_community_account(conn, request: Request) -> dict[str, object]:
+    session_token = _community_session_token_from_request(request)
+    session_token_hash = hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+    row = fetch_one(
+        conn,
+        """
+        SELECT
+            a.id,
+            a.username,
+            a.email,
+            a.username_normalized,
+            a.verified_at,
+            s.id AS session_id,
+            s.expires_at
+        FROM community_sessions AS s
+        JOIN community_accounts AS a ON a.id = s.account_id
+        WHERE s.token_hash = ?
+        LIMIT 1
+        """,
+        (session_token_hash,),
+    )
+    if not row:
+        raise HTTPException(status_code=401, detail="Session expired. Sign in again.")
+    expires_at = _parse_optional_iso_datetime(row.get("expires_at"))
+    now_dt = datetime.now(timezone.utc)
+    if expires_at is None or expires_at <= now_dt:
+        execute_modify(conn, "DELETE FROM community_sessions WHERE id = ?", (row["session_id"],))
+        raise HTTPException(status_code=401, detail="Session expired. Sign in again.")
+    execute_modify(
+        conn,
+        "UPDATE community_sessions SET last_used_at = ?, expires_at = ? WHERE id = ?",
+        (now_iso(), _community_session_expires_at_iso(), row["session_id"]),
+    )
+    return row
+
+
+def _require_verified_community_account(conn, request: Request) -> dict[str, object]:
+    account = _require_authenticated_community_account(conn, request)
+    if not _community_account_is_verified(account):
+        raise HTTPException(status_code=403, detail="Verify your account to access your private community sets.")
+    return account
+
+
 def _require_community_set_owner_access(
-    stored_owner_key_hash: object,
-    owner_key_hash: str,
+    stored_owner_account_id: object,
+    account_id: str,
     *,
     action: str,
 ) -> str:
-    normalized_owner_key_hash = str(stored_owner_key_hash or "").strip()
-    if not normalized_owner_key_hash or normalized_owner_key_hash == LEGACY_COMMUNITY_OWNER_HASH:
+    normalized_owner_account_id = str(stored_owner_account_id or "").strip()
+    if not normalized_owner_account_id:
         raise HTTPException(
             status_code=403,
-            detail=f"This community set predates ownership tracking and cannot be {action} automatically.",
+            detail=f"This community set is not attached to an account yet and cannot be {action} automatically.",
         )
-    if normalized_owner_key_hash != owner_key_hash:
+    if normalized_owner_account_id != account_id:
         raise HTTPException(status_code=403, detail=f"You do not have permission to {action} this community set.")
-    return normalized_owner_key_hash
+    return normalized_owner_account_id
 
 
 def _validate_community_reel_urls(
@@ -342,7 +854,7 @@ def _validate_community_reel_urls(
     if platform == "instagram":
         if not _host_matches(source_host, "instagram.com"):
             raise HTTPException(status_code=400, detail="source_url host must be an Instagram URL for platform=instagram.")
-        if not _host_matches(embed_host, "instagram.com") or "/embed" not in embed_path:
+        if not _host_matches(embed_host, "instagram.com") or not re.search(r"/embed(?:/|$)", embed_path):
             raise HTTPException(status_code=400, detail="embed_url must be an Instagram embed URL for platform=instagram.")
         return safe_source, safe_embed
 
@@ -351,6 +863,26 @@ def _validate_community_reel_urls(
     if not _host_matches(embed_host, "tiktok.com") or "/embed/" not in embed_path:
         raise HTTPException(status_code=400, detail="embed_url must be a TikTok embed URL for platform=tiktok.")
     return safe_source, safe_embed
+
+
+def _community_duration_source_host_allowed(host: str) -> bool:
+    return bool(
+        _host_matches(host, "youtube.com")
+        or host == "youtu.be"
+        or _host_matches(host, "instagram.com")
+        or _host_matches(host, "tiktok.com")
+    )
+
+
+def _normalize_community_duration_source_url(raw_url: str) -> str:
+    normalized = _normalize_public_http_url(raw_url, "source_url")
+    host = (urlparse(normalized).hostname or "").lower()
+    if not _community_duration_source_host_allowed(host):
+        raise HTTPException(
+            status_code=400,
+            detail="source_url must be a supported YouTube, Instagram, or TikTok URL.",
+        )
+    return normalized
 
 
 def _normalize_duration_seconds(value: object) -> float | None:
@@ -428,7 +960,7 @@ def _fetch_duration_from_source_page(source_url: str) -> float | None:
             if not location:
                 return None
             try:
-                current_url = _normalize_public_http_url(urljoin(current_url, location), "source_url")
+                current_url = _normalize_community_duration_source_url(urljoin(current_url, location))
             except HTTPException:
                 return None
             continue
@@ -442,18 +974,19 @@ def _fetch_duration_from_source_page(source_url: str) -> float | None:
 
 
 def _resolve_community_reel_duration_sec(source_url: str) -> float | None:
-    parsed = urlparse(source_url)
+    normalized_source_url = _normalize_community_duration_source_url(source_url)
+    parsed = urlparse(normalized_source_url)
     host = (parsed.hostname or "").lower()
 
     if "youtube.com" in host or "youtu.be" in host:
-        video_id = youtube_service.extract_video_id_from_url(source_url)
+        video_id = youtube_service.extract_video_id_from_url(normalized_source_url)
         if video_id:
             details = youtube_service.video_details([video_id])
             duration = _normalize_duration_seconds((details.get(video_id) or {}).get("duration_sec"))
             if duration is not None:
                 return duration
 
-    return _fetch_duration_from_source_page(source_url)
+    return _fetch_duration_from_source_page(normalized_source_url)
 
 
 def _normalize_community_tags(raw_tags: list[str]) -> list[str]:
@@ -485,6 +1018,13 @@ def _normalize_clip_seconds(value: object) -> float | None:
     if parsed < 0:
         return None
     return round(parsed, 3)
+
+
+def _normalize_optional_community_reel_id(raw_value: object) -> str | None:
+    reel_id = str(raw_value or "").strip()
+    if not reel_id:
+        return None
+    return reel_id
 
 
 def _normalize_min_relevance(value: float | None) -> float | None:
@@ -628,6 +1168,41 @@ def _normalize_datetime_for_api(value: object) -> str | None:
     return normalized
 
 
+def _compute_updated_label(updated_at_iso: str | None) -> str:
+    if not updated_at_iso:
+        return "Last Edited: unknown"
+    try:
+        normalized = updated_at_iso.replace(" ", "T")
+        if normalized.endswith(("z", "Z")):
+            normalized = normalized[:-1] + "+00:00"
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return "Last Edited: unknown"
+    delta = datetime.now(timezone.utc) - dt
+    seconds = max(0, int(delta.total_seconds()))
+    if seconds < 60:
+        return "Last Edited: just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"Last Edited: {minutes} minute{'s' if minutes != 1 else ''} ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"Last Edited: {hours} hour{'s' if hours != 1 else ''} ago"
+    days = hours // 24
+    if days < 7:
+        return f"Last Edited: {days} day{'s' if days != 1 else ''} ago"
+    if days < 30:
+        weeks = days // 7
+        return f"Last Edited: {weeks} week{'s' if weeks != 1 else ''} ago"
+    if days < 365:
+        months = days // 30
+        return f"Last Edited: {months} month{'s' if months != 1 else ''} ago"
+    years = days // 365
+    return f"Last Edited: {years} year{'s' if years != 1 else ''} ago"
+
+
 def _serialize_community_set(row: dict) -> CommunitySetOut:
     tags_raw = row.get("tags_json")
     reels_raw = row.get("reels_json")
@@ -680,9 +1255,9 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
     reel_count = max(len(reels), _to_int(row.get("reel_count"), len(reels)))
     likes = max(0, _to_int(row.get("likes"), 0))
     learners = max(0, _to_int(row.get("learners"), 1))
-    updated_label = str(row.get("updated_label") or "Last Edited: just now").strip() or "Last Edited: just now"
     created_at = _normalize_datetime_for_api(row.get("created_at"))
     updated_at = _normalize_datetime_for_api(row.get("updated_at")) or created_at
+    updated_label = _compute_updated_label(updated_at)
     curator = str(row.get("curator") or "Community member").strip() or "Community member"
     thumbnail_url = str(row.get("thumbnail_url") or "").strip()
     if not thumbnail_url:
@@ -710,6 +1285,7 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
 def on_startup() -> None:
     os.makedirs(settings.data_dir, exist_ok=True)
     init_db()
+    _warn_if_hosted_auth_email_is_unconfigured()
 
 
 @app.get("/")
@@ -720,6 +1296,395 @@ def root() -> dict:
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True}
+
+
+@app.post("/api/community/auth/register", response_model=CommunityAuthSessionResponse, status_code=201)
+def register_community_account(request: Request, payload: CommunityAuthRegisterRequest):
+    _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
+    username, username_normalized = _normalize_community_username(payload.username)
+    email, email_normalized = _normalize_community_email(payload.email)
+    password = _normalize_community_password(payload.password)
+    legacy_claim_owner_key_hash = _community_owner_hash_from_request_optional(request)
+    _require_hosted_verification_delivery_available()
+    with get_conn(transactional=True) as conn:
+        existing_identity = fetch_one(
+            conn,
+            """
+            SELECT id
+            FROM community_accounts
+            WHERE username_normalized = ?
+               OR email_normalized = ?
+            LIMIT 1
+            """,
+            (username_normalized, email_normalized),
+        )
+        if existing_identity:
+            raise HTTPException(status_code=409, detail=COMMUNITY_REGISTER_CONFLICT_DETAIL)
+        account_id = str(uuid.uuid4())
+        salt_hex = secrets.token_hex(16)
+        timestamp = now_iso()
+        try:
+            insert(
+                conn,
+                "community_accounts",
+                {
+                    "id": account_id,
+                    "username": username,
+                    "username_normalized": username_normalized,
+                    "email": email,
+                    "email_normalized": email_normalized,
+                    "password_hash": _hash_community_password(password, salt_hex),
+                    "password_salt": salt_hex,
+                    "verified_at": None,
+                    "verification_code_hash": None,
+                    "verification_expires_at": None,
+                    "legacy_claim_owner_key_hash": legacy_claim_owner_key_hash,
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                },
+            )
+        except DatabaseIntegrityError as exc:
+            raise HTTPException(status_code=409, detail=COMMUNITY_REGISTER_CONFLICT_DETAIL) from exc
+        session_token = _create_community_session(conn, account_id)
+        verification_code_debug = _issue_community_verification_code(
+            conn,
+            account_id=account_id,
+            email=email,
+            username=username,
+        )
+        account = {
+            "id": account_id,
+            "username": username,
+            "email": email,
+            "verified_at": None,
+        }
+    return CommunityAuthSessionResponse(
+        account=_community_account_out(account),
+        session_token=session_token,
+        claimed_legacy_sets=0,
+        verification_required=True,
+        verification_code_debug=verification_code_debug,
+    )
+
+
+@app.post("/api/community/auth/login", response_model=CommunityAuthSessionResponse)
+def login_community_account(request: Request, payload: CommunityAuthLoginRequest):
+    _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
+    _, username_normalized = _normalize_community_username(payload.username)
+    password = _normalize_community_password(payload.password)
+    _check_rate_limit_key(
+        f"community-login-user:{username_normalized}:{_client_ip(request)}",
+        limit=COMMUNITY_LOGIN_PER_USERNAME_RATE_LIMIT,
+        window_sec=RATE_LIMIT_WINDOW_SEC,
+    )
+    claimed_legacy_sets = 0
+    verification_code_debug = None
+    with get_conn(transactional=True) as conn:
+        account = fetch_one(
+            conn,
+            """
+            SELECT
+                id,
+                username,
+                email,
+                username_normalized,
+                password_hash,
+                password_salt,
+                verified_at,
+                verification_code_hash,
+                verification_expires_at,
+                legacy_claim_owner_key_hash
+            FROM community_accounts
+            WHERE username_normalized = ?
+            LIMIT 1
+            """,
+            (username_normalized,),
+        )
+        if not account or not _verify_community_password(password, str(account.get("password_salt") or ""), str(account.get("password_hash") or "")):
+            raise HTTPException(status_code=401, detail="Incorrect username or password.")
+        account_id = str(account["id"])
+        if not _community_account_is_verified(account):
+            email = str(account.get("email") or "").strip()
+            if not email:
+                raise HTTPException(status_code=409, detail="This account is missing a verification email.")
+            _require_hosted_verification_delivery_available()
+        session_token = _create_community_session(conn, account_id)
+        if not _community_account_is_verified(account):
+            verification_code_debug = _issue_community_verification_code(
+                conn,
+                account_id=account_id,
+                email=str(account.get("email") or "").strip(),
+                username=str(account.get("username") or "").strip(),
+            )
+        else:
+            claimed_legacy_sets = _claim_legacy_community_sets_for_account(
+                conn,
+                request,
+                account_id=account_id,
+                legacy_claim_owner_key_hash=account.get("legacy_claim_owner_key_hash"),
+            )
+    if not _community_account_is_verified(account):
+        return CommunityAuthSessionResponse(
+            account=_community_account_out(account),
+            session_token=session_token,
+            claimed_legacy_sets=0,
+            verification_required=True,
+            verification_code_debug=verification_code_debug,
+        )
+    return CommunityAuthSessionResponse(
+        account=_community_account_out(account),
+        session_token=session_token,
+        claimed_legacy_sets=max(0, claimed_legacy_sets),
+        verification_required=False,
+        verification_code_debug=None,
+    )
+
+
+@app.get("/api/community/auth/me", response_model=CommunityAuthMeResponse)
+def get_community_account_me(request: Request):
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+    return CommunityAuthMeResponse(account=_community_account_out(account))
+
+
+@app.post("/api/community/auth/verify", response_model=CommunityVerifyAccountResponse)
+def verify_community_account(request: Request, payload: CommunityVerifyAccountRequest):
+    _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
+    verification_code = str(payload.code or "").strip()
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        account_id = str(account["id"])
+        full_account = fetch_one(
+            conn,
+            """
+            SELECT
+                id,
+                username,
+                email,
+                verified_at,
+                verification_code_hash,
+                verification_expires_at,
+                legacy_claim_owner_key_hash
+            FROM community_accounts
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (account_id,),
+        )
+        if not full_account:
+            raise HTTPException(status_code=404, detail="Community account not found.")
+        if _community_account_is_verified(full_account):
+            claimed_legacy_sets = _claim_legacy_community_sets_for_account(
+                conn,
+                request,
+                account_id=account_id,
+                legacy_claim_owner_key_hash=full_account.get("legacy_claim_owner_key_hash"),
+            )
+            return CommunityVerifyAccountResponse(
+                account=_community_account_out(full_account),
+                claimed_legacy_sets=max(0, claimed_legacy_sets),
+            )
+        # Per-account brute-force protection: 6-digit codes have only 1M keyspace,
+        # so limit verification attempts to 5 per window per account (on top of IP limit).
+        _check_rate_limit_key(
+            f"community-verify-account:{account_id}",
+            limit=COMMUNITY_VERIFY_PER_ACCOUNT_RATE_LIMIT,
+            window_sec=RATE_LIMIT_WINDOW_SEC,
+        )
+        expected_hash = str(full_account.get("verification_code_hash") or "").strip()
+        expires_at = _parse_optional_iso_datetime(full_account.get("verification_expires_at"))
+        if not expected_hash or expires_at is None or expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=400, detail="Verification code expired. Request a new code.")
+        if not secrets.compare_digest(expected_hash, _hash_community_verification_code(verification_code)):
+            raise HTTPException(status_code=400, detail="Verification code is incorrect.")
+        verified_at = now_iso()
+        execute_modify(
+            conn,
+            """
+            UPDATE community_accounts
+            SET verified_at = ?, verification_code_hash = NULL, verification_expires_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (verified_at, verified_at, account_id),
+        )
+        full_account["verified_at"] = verified_at
+        full_account["verification_code_hash"] = None
+        full_account["verification_expires_at"] = None
+        claimed_legacy_sets = _claim_legacy_community_sets_for_account(
+            conn,
+            request,
+            account_id=account_id,
+            legacy_claim_owner_key_hash=full_account.get("legacy_claim_owner_key_hash"),
+        )
+        return CommunityVerifyAccountResponse(
+            account=_community_account_out(full_account),
+            claimed_legacy_sets=max(0, claimed_legacy_sets),
+        )
+
+
+@app.post("/api/community/auth/resend-verification", response_model=CommunityResendVerificationResponse)
+def resend_community_verification(request: Request):
+    _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
+    _require_hosted_verification_delivery_available()
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        account_id = str(account["id"])
+        full_account = fetch_one(
+            conn,
+            """
+            SELECT
+                id,
+                username,
+                email,
+                verified_at
+            FROM community_accounts
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (account_id,),
+        )
+        if not full_account:
+            raise HTTPException(status_code=404, detail="Community account not found.")
+        if _community_account_is_verified(full_account):
+            return CommunityResendVerificationResponse(account=_community_account_out(full_account), verification_code_debug=None)
+        email = str(full_account.get("email") or "").strip()
+        if not email:
+            raise HTTPException(status_code=409, detail="This account is missing a verification email.")
+        verification_code_debug = _issue_community_verification_code(
+            conn,
+            account_id=account_id,
+            email=email,
+            username=str(full_account.get("username") or "").strip(),
+        )
+        return CommunityResendVerificationResponse(
+            account=_community_account_out(full_account),
+            verification_code_debug=verification_code_debug,
+        )
+
+
+@app.post("/api/community/auth/change-email", response_model=CommunityChangeEmailResponse)
+def change_community_verification_email(request: Request, payload: CommunityChangeEmailRequest):
+    _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
+    email, email_normalized = _normalize_community_email(payload.email)
+    current_password = _normalize_community_password(payload.current_password)
+    _require_hosted_verification_delivery_available()
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        account_id = str(account["id"])
+        full_account = fetch_one(
+            conn,
+            """
+            SELECT
+                id,
+                username,
+                email,
+                email_normalized,
+                password_hash,
+                password_salt,
+                verified_at
+            FROM community_accounts
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (account_id,),
+        )
+        if not full_account:
+            raise HTTPException(status_code=404, detail="Community account not found.")
+        if _community_account_is_verified(full_account):
+            raise HTTPException(status_code=403, detail="Verified accounts cannot change email from this screen.")
+        if not _verify_community_password(
+            current_password,
+            str(full_account.get("password_salt") or ""),
+            str(full_account.get("password_hash") or ""),
+        ):
+            raise HTTPException(status_code=401, detail="Current password is incorrect.")
+
+        previous_email_normalized = str(full_account.get("email_normalized") or "").strip().lower()
+        if email_normalized != previous_email_normalized:
+            existing_email = fetch_one(
+                conn,
+                "SELECT id FROM community_accounts WHERE email_normalized = ? AND id <> ? LIMIT 1",
+                (email_normalized, account_id),
+            )
+            if existing_email:
+                raise HTTPException(status_code=409, detail=COMMUNITY_CHANGE_EMAIL_CONFLICT_DETAIL)
+
+        try:
+            execute_modify(
+                conn,
+                """
+                UPDATE community_accounts
+                SET email = ?, email_normalized = ?, verified_at = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                (email, email_normalized, now_iso(), account_id),
+            )
+        except Exception as exc:
+            lower_error = str(exc).lower()
+            if "email_normalized" in lower_error or "unique" in lower_error:
+                raise HTTPException(status_code=409, detail=COMMUNITY_CHANGE_EMAIL_CONFLICT_DETAIL) from exc
+            raise
+        verification_code_debug = _issue_community_verification_code(
+            conn,
+            account_id=account_id,
+            email=email,
+            username=str(full_account.get("username") or "").strip(),
+        )
+
+        full_account["email"] = email
+        full_account["email_normalized"] = email_normalized
+        full_account["verified_at"] = None
+        return CommunityChangeEmailResponse(
+            account=_community_account_out(full_account),
+            verification_code_debug=verification_code_debug,
+        )
+
+
+@app.post("/api/community/auth/logout", status_code=204)
+def logout_community_account(request: Request):
+    raw_token = str(request.headers.get(COMMUNITY_SESSION_HEADER) or "").strip()
+    if not raw_token:
+        return Response(status_code=204)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    with get_conn(transactional=True) as conn:
+        execute_modify(conn, "DELETE FROM community_sessions WHERE token_hash = ?", (token_hash,))
+    return Response(status_code=204)
+
+
+@app.post("/api/community/auth/change-password", status_code=200)
+def change_community_password(request: Request, payload: CommunityChangePasswordRequest):
+    _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
+    current_password = _normalize_community_password(payload.current_password)
+    new_password = _normalize_community_password(payload.new_password)
+    with get_conn(transactional=True) as conn:
+        account_row = _require_authenticated_community_account(conn, request)
+        account_id = str(account_row["id"])
+        full_account = fetch_one(
+            conn,
+            "SELECT password_hash, password_salt FROM community_accounts WHERE id = ? LIMIT 1",
+            (account_id,),
+        )
+        if not full_account or not _verify_community_password(
+            current_password,
+            str(full_account.get("password_salt") or ""),
+            str(full_account.get("password_hash") or ""),
+        ):
+            raise HTTPException(status_code=401, detail="Current password is incorrect.")
+        new_salt_hex = secrets.token_hex(16)
+        execute_modify(
+            conn,
+            "UPDATE community_accounts SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?",
+            (_hash_community_password(new_password, new_salt_hex), new_salt_hex, now_iso(), account_id),
+        )
+        # Invalidate all other sessions so other devices must re-authenticate.
+        session_token = _community_session_token_from_request(request)
+        current_token_hash = hashlib.sha256(session_token.encode("utf-8")).hexdigest()
+        execute_modify(
+            conn,
+            "DELETE FROM community_sessions WHERE account_id = ? AND token_hash <> ?",
+            (account_id, current_token_hash),
+        )
+    return {"status": "ok"}
 
 
 @app.post("/api/material", response_model=MaterialResponse)
@@ -1427,7 +2392,7 @@ def get_community_reel_duration(request: Request, source_url: str):
     normalized_url = source_url.strip()
     if not normalized_url:
         raise HTTPException(status_code=400, detail="source_url is required.")
-    normalized_url = _normalize_public_http_url(normalized_url, "source_url")
+    normalized_url = _normalize_community_duration_source_url(normalized_url)
 
     duration_sec = _resolve_community_reel_duration_sec(normalized_url)
     return {"duration_sec": duration_sec}
@@ -1456,10 +2421,11 @@ def list_community_sets(limit: int = 160):
                 featured,
                 created_at
             FROM community_sets
+            WHERE visibility = ? OR (featured = 1 AND (visibility IS NULL OR visibility = ? OR visibility = ''))
             ORDER BY featured DESC, COALESCE(NULLIF(updated_at, ''), created_at) DESC
             LIMIT ?
             """,
-            (safe_limit,),
+            (PUBLIC_COMMUNITY_VISIBILITY, PUBLIC_COMMUNITY_VISIBILITY, safe_limit),
         )
     sets = [_serialize_community_set(row) for row in rows]
     return {"sets": sets}
@@ -1467,12 +2433,9 @@ def list_community_sets(limit: int = 160):
 
 @app.get("/api/community/sets/mine", response_model=CommunitySetsResponse)
 def list_my_community_sets(request: Request, limit: int = 160):
-    """Return only community sets owned by the caller (matched via owner_key_hash)."""
-    owner_key_hash = _community_owner_hash_from_request(request)
-    if not owner_key_hash:
-        return {"sets": []}
     safe_limit = max(1, min(limit, 300))
-    with get_conn() as conn:
+    with get_conn(transactional=True) as conn:
+        account = _require_verified_community_account(conn, request)
         rows = fetch_all(
             conn,
             """
@@ -1492,11 +2455,11 @@ def list_my_community_sets(request: Request, limit: int = 160):
                 featured,
                 created_at
             FROM community_sets
-            WHERE owner_key_hash = ?
+            WHERE owner_account_id = ?
             ORDER BY COALESCE(NULLIF(updated_at, ''), created_at) DESC
             LIMIT ?
             """,
-            (owner_key_hash, safe_limit),
+            (str(account["id"]), safe_limit),
         )
     sets = [_serialize_community_set(row) for row in rows]
     return {"sets": sets}
@@ -1505,7 +2468,6 @@ def list_my_community_sets(request: Request, limit: int = 160):
 @app.post("/api/community/sets", response_model=CommunitySetOut, status_code=201)
 def create_community_set(request: Request, payload: CommunitySetCreateRequest):
     _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
-    owner_key_hash = _community_owner_hash_from_request(request)
     title = payload.title.strip()
     description = payload.description.strip()
     thumbnail_url = payload.thumbnail_url.strip()
@@ -1550,12 +2512,14 @@ def create_community_set(request: Request, payload: CommunitySetCreateRequest):
         raise HTTPException(status_code=400, detail="No valid reels found in request.")
 
     tags = _normalize_community_tags(payload.tags)
-    curator = (payload.curator or "").strip() or "Community member"
     set_id = f"user-set-{uuid.uuid4()}"
     created_at = now_iso()
     updated_label = "Last Edited: just now"
 
     with get_conn(transactional=True) as conn:
+        account = _require_verified_community_account(conn, request)
+        curator = _community_set_curator_for_account(account)
+        owner_key_hash = _community_owner_hash_from_request_optional(request)
         upsert(
             conn,
             "community_sets",
@@ -1572,6 +2536,8 @@ def create_community_set(request: Request, payload: CommunitySetCreateRequest):
                 "updated_label": updated_label,
                 "thumbnail_url": thumbnail_url,
                 "owner_key_hash": owner_key_hash,
+                "owner_account_id": str(account["id"]),
+                "visibility": DEFAULT_COMMUNITY_VISIBILITY,
                 "featured": 0,
                 "created_at": created_at,
                 "updated_at": created_at,
@@ -1611,7 +2577,6 @@ def create_community_set(request: Request, payload: CommunitySetCreateRequest):
 @app.put("/api/community/sets/{set_id}", response_model=CommunitySetOut)
 def update_community_set(request: Request, set_id: str, payload: CommunitySetUpdateRequest):
     _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
-    owner_key_hash = _community_owner_hash_from_request(request)
     normalized_set_id = set_id.strip()
     if not normalized_set_id:
         raise HTTPException(status_code=400, detail="set_id is required.")
@@ -1632,6 +2597,7 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
         raise HTTPException(status_code=400, detail="Add at least one reel URL.")
 
     reels_payload: list[dict[str, object]] = []
+    seen_reel_ids: set[str] = set()
     for reel in payload.reels:
         source_url = reel.source_url.strip()
         embed_url = reel.embed_url.strip()
@@ -1648,9 +2614,12 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
             start_for_validation = t_start_sec if t_start_sec is not None else 0.0
             if t_end_sec <= start_for_validation:
                 raise HTTPException(status_code=400, detail="Clip end time must be greater than start time.")
+        existing_reel_id = _normalize_optional_community_reel_id(reel.id)
+        reel_id = existing_reel_id if existing_reel_id and existing_reel_id not in seen_reel_ids else str(uuid.uuid4())
+        seen_reel_ids.add(reel_id)
         reels_payload.append(
             {
-                "id": str(uuid.uuid4()),
+                "id": reel_id,
                 "platform": reel.platform,
                 "source_url": source_url,
                 "embed_url": embed_url,
@@ -1666,6 +2635,7 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
     updated_label = "Last Edited: just now"
 
     with get_conn(transactional=True) as conn:
+        account = _require_verified_community_account(conn, request)
         existing_rows = fetch_all(
             conn,
             """
@@ -1673,6 +2643,8 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
                 id,
                 curator,
                 owner_key_hash,
+                owner_account_id,
+                visibility,
                 likes,
                 learners,
                 featured,
@@ -1688,15 +2660,16 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
         existing = existing_rows[0]
         if _to_int(existing.get("featured"), 0) != 0:
             raise HTTPException(status_code=403, detail="Featured sets cannot be edited.")
-        stored_owner_key_hash = _require_community_set_owner_access(
-            existing.get("owner_key_hash"),
-            owner_key_hash,
+        stored_owner_account_id = _require_community_set_owner_access(
+            existing.get("owner_account_id"),
+            str(account["id"]),
             action="edit",
         )
 
-        existing_curator = str(existing.get("curator") or "").strip()
-        curator = (payload.curator or "").strip() or existing_curator or "Community member"
+        curator = _community_set_curator_for_account(account)
         created_at = str(existing.get("created_at") or "").strip() or updated_at
+        stored_owner_key_hash = str(existing.get("owner_key_hash") or "").strip() or None
+        visibility = str(existing.get("visibility") or "").strip() or DEFAULT_COMMUNITY_VISIBILITY
 
         upsert(
             conn,
@@ -1714,6 +2687,8 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
                 "updated_label": updated_label,
                 "thumbnail_url": thumbnail_url,
                 "owner_key_hash": stored_owner_key_hash,
+                "owner_account_id": stored_owner_account_id,
+                "visibility": visibility,
                 "featured": 0,
                 "created_at": created_at,
                 "updated_at": updated_at,
@@ -1751,19 +2726,19 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
 
 
 def _delete_community_set_impl(request: Request, set_id: str) -> Response:
-    owner_key_hash = _community_owner_hash_from_request(request)
     normalized_set_id = set_id.strip()
     if not normalized_set_id:
         raise HTTPException(status_code=400, detail="set_id is required.")
     if not normalized_set_id.startswith("user-set-"):
         raise HTTPException(status_code=403, detail="Only user-created sets can be deleted.")
     with get_conn(transactional=True) as conn:
+        account = _require_verified_community_account(conn, request)
         existing_rows = fetch_all(
             conn,
             """
             SELECT
                 id,
-                owner_key_hash,
+                owner_account_id,
                 featured
             FROM community_sets
             WHERE id = ?
@@ -1777,8 +2752,8 @@ def _delete_community_set_impl(request: Request, set_id: str) -> Response:
         if _to_int(existing.get("featured"), 0) != 0:
             raise HTTPException(status_code=403, detail="Featured sets cannot be deleted.")
         _require_community_set_owner_access(
-            existing.get("owner_key_hash"),
-            owner_key_hash,
+            existing.get("owner_account_id"),
+            str(account["id"]),
             action="delete",
         )
 

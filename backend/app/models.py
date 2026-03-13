@@ -139,6 +139,7 @@ class ChatResponse(BaseModel):
 
 
 class CommunityReelIn(BaseModel):
+    id: str | None = Field(default=None, min_length=1, max_length=120)
     platform: Literal["youtube", "instagram", "tiktok"]
     source_url: str = Field(min_length=1)
     embed_url: str = Field(min_length=1)
@@ -200,3 +201,62 @@ class CommunitySetOut(BaseModel):
 
 class CommunitySetsResponse(BaseModel):
     sets: list[CommunitySetOut] = Field(default_factory=list)
+
+
+class CommunityAuthRegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    email: str = Field(min_length=3, max_length=254)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class CommunityAuthLoginRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class CommunityAccountOut(BaseModel):
+    id: str
+    username: str
+    email: str | None = None
+    is_verified: bool = True
+
+
+class CommunityAuthSessionResponse(BaseModel):
+    account: CommunityAccountOut
+    session_token: str
+    claimed_legacy_sets: int = 0
+    verification_required: bool = False
+    verification_code_debug: str | None = None
+
+
+class CommunityChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=8, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class CommunityChangeEmailRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    current_password: str = Field(min_length=8, max_length=128)
+
+
+class CommunityVerifyAccountRequest(BaseModel):
+    code: str = Field(min_length=4, max_length=16)
+
+
+class CommunityAuthMeResponse(BaseModel):
+    account: CommunityAccountOut
+
+
+class CommunityVerifyAccountResponse(BaseModel):
+    account: CommunityAccountOut
+    claimed_legacy_sets: int = 0
+
+
+class CommunityResendVerificationResponse(BaseModel):
+    account: CommunityAccountOut
+    verification_code_debug: str | None = None
+
+
+class CommunityChangeEmailResponse(BaseModel):
+    account: CommunityAccountOut
+    verification_code_debug: str | None = None

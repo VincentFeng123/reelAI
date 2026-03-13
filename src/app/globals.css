@@ -122,6 +122,15 @@ textarea:-webkit-autofill:focus {
   transition: background-color 9999s ease-out 0s;
 }
 
+.community-auth-input:-webkit-autofill,
+.community-auth-input:-webkit-autofill:hover,
+.community-auth-input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #fff;
+  caret-color: #fff;
+  -webkit-box-shadow: 0 0 0 1000px #404040 inset;
+  box-shadow: 0 0 0 1000px #404040 inset;
+}
+
 ::selection {
   background: #fff;
   color: #000;

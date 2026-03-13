@@ -5,21 +5,26 @@ import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 
 import {
+  COMMUNITY_AUTH_CHANGED_EVENT,
+  COMMUNITY_OWNED_SET_IDS_STORAGE_KEY,
+  clearCommunityAuthSession,
   createCommunitySet,
   deleteCommunitySet,
+  fetchCommunityAccount,
   fetchCommunityReelDuration,
   fetchCommunitySets,
   fetchOwnedCommunitySets,
-  readOwnedCommunitySetIds,
+  isSessionExpiredError,
+  readCommunityAuthSession,
   saveOwnedCommunitySetIds,
   updateCommunitySet,
 } from "@/lib/api";
+import type { CommunityAccount } from "@/lib/types";
 import { loadYouTubeIframeApi } from "@/lib/youtubeIframeApi";
 
 const COMMUNITY_SETS_STORAGE_KEY = "studyreels-community-sets";
 const COMMUNITY_CREATE_DRAFT_STORAGE_KEY = "studyreels-community-create-draft";
 const COMMUNITY_EDIT_DRAFT_PREFIX = "studyreels-community-edit-draft-";
-const USER_CREATED_SET_ID_PREFIX = "user-set-";
 const MAX_USER_SETS = 120;
 const FALLBACK_THUMBNAIL_URL = "/images/community/ai-systems.svg";
 const SUPPORTED_PLATFORMS_LABEL = "YouTube, Instagram, TikTok";
@@ -70,6 +75,7 @@ type CommunityReelEmbed = {
 
 type DraftReelInput = {
   id: string;
+  communityReelId?: string;
   value: string;
   tStartSec: string;
   tEndSec: string;
@@ -77,6 +83,7 @@ type DraftReelInput = {
 
 type ParsedDraftReel = {
   id: string;
+  communityReelId?: string;
   value: string;
   tStartSec: string;
   tEndSec: string;
@@ -144,6 +151,7 @@ type StoredSetDraft = {
   thumbnailPreview: string;
   thumbnailFileName: string;
   reelInputs: Array<{
+    communityReelId?: string;
     value: string;
     tStartSec: string;
     tEndSec: string;
@@ -183,10 +191,11 @@ export type CommunityDraftExitActions = {
 
 let draftRowCounter = 0;
 
-function createDraftReelRow(value = "", tStartSec = "0", tEndSec = ""): DraftReelInput {
+function createDraftReelRow(value = "", tStartSec = "0", tEndSec = "", communityReelId?: string): DraftReelInput {
   draftRowCounter += 1;
   return {
     id: `draft-reel-${draftRowCounter}`,
+    ...(typeof communityReelId === "string" && communityReelId.trim() ? { communityReelId: communityReelId.trim() } : {}),
     value,
     tStartSec,
     tEndSec,
@@ -872,6 +881,9 @@ function parseStoredSetDraft(raw: string | null): StoredSetDraft | null {
         }
         const reelRow = entry as Record<string, unknown>;
         return {
+          ...(typeof reelRow.communityReelId === "string" && reelRow.communityReelId.trim()
+            ? { communityReelId: reelRow.communityReelId.trim() }
+            : {}),
           value: typeof reelRow.value === "string" ? reelRow.value : "",
           tStartSec: typeof reelRow.tStartSec === "string" ? reelRow.tStartSec : "0",
           tEndSec: typeof reelRow.tEndSec === "string" ? reelRow.tEndSec : "",
@@ -903,6 +915,7 @@ function draftRowsFromReels(reels: CommunityReelEmbed[]): DraftReelInput[] {
       reel.sourceUrl,
       formatClipSecondsInputValue(start),
       hasExplicitEnd ? formatClipSecondsInputValue(endCandidate) : "",
+      reel.id,
     );
   });
 }
@@ -1027,8 +1040,12 @@ export function CommunityReelsPanel({
   const [starredSetsHydrated, setStarredSetsHydrated] = useState(false);
   const [activeSetActionsMenuId, setActiveSetActionsMenuId] = useState<string | null>(null);
   const [deletingSetId, setDeletingSetId] = useState<string | null>(null);
-  const [userSets, setUserSets] = useState<CommunitySet[]>([]);
+  const [publicSets, setPublicSets] = useState<CommunitySet[]>([]);
+  const [ownedSets, setOwnedSets] = useState<CommunitySet[]>([]);
   const [ownedSetIds, setOwnedSetIds] = useState<string[]>([]);
+  const [communityAccount, setCommunityAccount] = useState<CommunityAccount | null>(null);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authHydrated, setAuthHydrated] = useState(false);
   const [storageHydrated, setStorageHydrated] = useState(false);
   const [portalReady, setPortalReady] = useState(false);
   const [relativeTimeNowMs, setRelativeTimeNowMs] = useState(() => Date.now());
@@ -1053,27 +1070,30 @@ export function CommunityReelsPanel({
   const loadedEditSetIdRef = useRef<string | null>(null);
   const lastCommunityResetSignalRef = useRef(communityResetSignal);
   const draftBaselinesByContextRef = useRef<Record<string, string>>({});
+  const ownedSetsAccountIdRef = useRef<string | null>(null);
   const [draftBaselineVersion, setDraftBaselineVersion] = useState(0);
+
+  const clearOwnedCommunityState = useCallback(() => {
+    setOwnedSets([]);
+    setOwnedSetIds([]);
+    saveOwnedCommunitySetIds([]);
+  }, []);
+
+  const refreshOwnedCommunitySets = useCallback(async () => {
+    const remoteOwnedSets = await fetchOwnedCommunitySets();
+    const nextOwnedIds = remoteOwnedSets.map((set) => set.id);
+    setOwnedSets(remoteOwnedSets.slice(0, MAX_USER_SETS));
+    setOwnedSetIds(saveOwnedCommunitySetIds(nextOwnedIds));
+    return remoteOwnedSets;
+  }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") {
       return;
     }
     let cancelled = false;
+    let authSyncSequence = 0;
     setPortalReady(true);
-    const localSets = parseStoredSets(window.localStorage.getItem(COMMUNITY_SETS_STORAGE_KEY));
-    const seededOwnedSetIds = saveOwnedCommunitySetIds([
-      ...readOwnedCommunitySetIds(),
-      ...localSets
-        .filter((set) => {
-          const id = set.id.trim();
-          const curator = set.curator.trim().toLowerCase();
-          return id.startsWith(USER_CREATED_SET_ID_PREFIX) || curator === "you";
-        })
-        .map((set) => set.id),
-    ]);
-    setUserSets(localSets);
-    setOwnedSetIds(seededOwnedSetIds);
     const starredSetIdsRaw = window.localStorage.getItem(COMMUNITY_STARRED_SET_IDS_STORAGE_KEY);
     if (starredSetIdsRaw) {
       try {
@@ -1091,32 +1111,100 @@ export function CommunityReelsPanel({
     }
     setStarredSetsHydrated(true);
     setStorageHydrated(true);
+
+    const syncCommunityAuthState = async (options?: { validateSession?: boolean }) => {
+      const syncSequence = authSyncSequence + 1;
+      authSyncSequence = syncSequence;
+      const storedSession = readCommunityAuthSession();
+      const storedAccount = storedSession?.account ?? null;
+      setCommunityAccount(storedAccount);
+      if (!storedSession?.sessionToken) {
+        ownedSetsAccountIdRef.current = null;
+        clearOwnedCommunityState();
+        if (!cancelled) {
+          setAuthHydrated(true);
+        }
+        return;
+      }
+      if (ownedSetsAccountIdRef.current && ownedSetsAccountIdRef.current !== (storedAccount?.id ?? null)) {
+        clearOwnedCommunityState();
+      }
+      try {
+        const account = options?.validateSession ? await fetchCommunityAccount() : storedAccount;
+        if (cancelled || authSyncSequence !== syncSequence) {
+          return;
+        }
+        if (!account) {
+          setCommunityAccount(null);
+          ownedSetsAccountIdRef.current = null;
+          clearOwnedCommunityState();
+          return;
+        }
+        setCommunityAccount(account);
+        if (account.isVerified) {
+          await refreshOwnedCommunitySets();
+          ownedSetsAccountIdRef.current = account.id;
+        } else {
+          ownedSetsAccountIdRef.current = account.id;
+          clearOwnedCommunityState();
+        }
+      } catch (error) {
+        if (cancelled || authSyncSequence != syncSequence) {
+          return;
+        }
+        if (isSessionExpiredError(error)) {
+          clearCommunityAuthSession();
+          setCommunityAccount(null);
+          ownedSetsAccountIdRef.current = null;
+          clearOwnedCommunityState();
+        }
+      } finally {
+        if (!cancelled && authSyncSequence === syncSequence) {
+          setAuthHydrated(true);
+        }
+      }
+    };
+
     void (async () => {
       try {
-        const [remoteSets, ownedSets] = await Promise.all([
-          fetchCommunitySets(),
-          fetchOwnedCommunitySets().catch(() => [] as CommunitySet[]),
-        ]);
+        const remoteSets = await fetchCommunitySets();
         if (cancelled) {
           return;
         }
-        setUserSets(remoteSets.slice(0, MAX_USER_SETS));
-        if (ownedSets.length > 0) {
-          const backendOwnedIds = ownedSets.map((s) => s.id);
-          setOwnedSetIds((prev) => {
-            const merged = Array.from(new Set([...prev, ...backendOwnedIds]));
-            saveOwnedCommunitySetIds(merged);
-            return merged;
-          });
-        }
+        setPublicSets(remoteSets.slice(0, MAX_USER_SETS));
       } catch {
-        // Keep local cache fallback if backend is unavailable.
+        // Keep the public list empty if the backend is unavailable.
       }
     })();
+    void syncCommunityAuthState({ validateSession: true });
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.storageArea !== window.localStorage) {
+        return;
+      }
+      if (
+        event.key
+        && event.key !== "studyreels-community-account"
+        && event.key !== "studyreels-community-session-token"
+        && event.key !== COMMUNITY_OWNED_SET_IDS_STORAGE_KEY
+      ) {
+        return;
+      }
+      void syncCommunityAuthState();
+    };
+    const onAuthChanged = () => {
+      void syncCommunityAuthState();
+    };
+    window.addEventListener("storage", onStorage);
+    window.addEventListener(COMMUNITY_AUTH_CHANGED_EVENT, onAuthChanged);
+
     return () => {
       cancelled = true;
+      authSyncSequence += 1;
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener(COMMUNITY_AUTH_CHANGED_EVENT, onAuthChanged);
     };
-  }, []);
+  }, [clearOwnedCommunityState, refreshOwnedCommunitySets]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1134,8 +1222,8 @@ export function CommunityReelsPanel({
     if (typeof window === "undefined" || !storageHydrated) {
       return;
     }
-    window.localStorage.setItem(COMMUNITY_SETS_STORAGE_KEY, JSON.stringify(userSets.slice(0, MAX_USER_SETS)));
-  }, [storageHydrated, userSets]);
+    window.localStorage.setItem(COMMUNITY_SETS_STORAGE_KEY, JSON.stringify(publicSets.slice(0, MAX_USER_SETS)));
+  }, [publicSets, storageHydrated]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !storageHydrated) {
@@ -1224,15 +1312,17 @@ export function CommunityReelsPanel({
   const isFormCreateMode = isStandaloneCreateMode || (isYourSetsMode && isCreateSetEditorOpen);
   const shouldShowEditSetGrid = isYourSetsMode && !isEditSetEditorOpen && !isCreateSetEditorOpen;
   const shouldShowEditSetForm = isFormEditMode || isFormCreateMode;
+  const requiresCommunityAuth = isYourSetsMode || isStandaloneCreateMode;
+  const isCommunityAuthReady = !requiresCommunityAuth || authHydrated;
+  const needsCommunityAuth = requiresCommunityAuth && !communityAccount;
+  const needsCommunityVerification = requiresCommunityAuth && communityAccount?.isVerified === false;
+  const canManageYourSets = communityAccount?.isVerified === true;
   const normalizedInitialOpenSetId = initialOpenSetId?.trim() || "";
   const shouldSuppressDirectoryDuringRestore =
     mode === "community" && isVisible && Boolean(normalizedInitialOpenSetId) && isInitialDetailRestorePending;
-  const allSets = useMemo(() => [...userSets, ...DEFAULT_COMMUNITY_SETS], [userSets]);
+  const allSets = useMemo(() => [...publicSets, ...DEFAULT_COMMUNITY_SETS], [publicSets]);
   const ownedSetIdSet = useMemo(() => new Set(ownedSetIds), [ownedSetIds]);
-  const editableSets = useMemo(
-    () => userSets.filter((set) => ownedSetIdSet.has(set.id)),
-    [ownedSetIdSet, userSets],
-  );
+  const editableSets = useMemo(() => ownedSets.filter((set) => ownedSetIdSet.has(set.id)), [ownedSetIdSet, ownedSets]);
   const starredSetIdSet = useMemo(() => new Set(starredSetIds), [starredSetIds]);
   const orderedEditableSets = useMemo(() => {
     const starred: CommunitySet[] = [];
@@ -1538,6 +1628,9 @@ export function CommunityReelsPanel({
   const normalizeStoredDraft = useCallback((draft: StoredSetDraft): StoredSetDraft => {
     const reelInputs = Array.isArray(draft.reelInputs) && draft.reelInputs.length > 0
       ? draft.reelInputs.map((row) => ({
+          ...(typeof row.communityReelId === "string" && row.communityReelId.trim()
+            ? { communityReelId: row.communityReelId.trim() }
+            : {}),
           value: String(row.value ?? ""),
           tStartSec: String(row.tStartSec ?? "0"),
           tEndSec: String(row.tEndSec ?? ""),
@@ -1567,6 +1660,9 @@ export function CommunityReelsPanel({
       thumbnailPreview,
       thumbnailFileName,
       reelInputs: reelInputs.map((row) => ({
+        ...(typeof row.communityReelId === "string" && row.communityReelId.trim()
+          ? { communityReelId: row.communityReelId.trim() }
+          : {}),
         value: row.value,
         tStartSec: row.tStartSec,
         tEndSec: row.tEndSec,
@@ -1592,6 +1688,9 @@ export function CommunityReelsPanel({
         }
       }
       return {
+        ...(typeof row.communityReelId === "string" && row.communityReelId.trim()
+          ? { communityReelId: row.communityReelId.trim() }
+          : {}),
         value: normalizedValue,
         tStartSec: formatClipSecondsInputValue(nextStart),
         tEndSec: nextEnd === null ? "" : formatClipSecondsInputValue(nextEnd),
@@ -1611,7 +1710,12 @@ export function CommunityReelsPanel({
     setThumbnailPreview(normalizedDraft.thumbnailPreview);
     setThumbnailFileName(normalizedDraft.thumbnailFileName);
     const nextRows = normalizedDraft.reelInputs.length > 0
-      ? normalizedDraft.reelInputs.map((row) => createDraftReelRow(row.value, row.tStartSec, row.tEndSec))
+      ? normalizedDraft.reelInputs.map((row) => createDraftReelRow(
+        row.value,
+        row.tStartSec,
+        row.tEndSec,
+        row.communityReelId,
+      ))
       : [createDraftReelRow()];
     setReelInputs(nextRows);
     setReelDurationByRow({});
@@ -1631,6 +1735,9 @@ export function CommunityReelsPanel({
       thumbnailPreview: set.thumbnailUrl || "",
       thumbnailFileName: set.thumbnailUrl ? "Current thumbnail" : "",
       reelInputs: draftRowsFromReels(set.reels).map((row) => ({
+        ...(typeof row.communityReelId === "string" && row.communityReelId.trim()
+          ? { communityReelId: row.communityReelId.trim() }
+          : {}),
         value: row.value,
         tStartSec: row.tStartSec,
         tEndSec: row.tEndSec,
@@ -1641,7 +1748,12 @@ export function CommunityReelsPanel({
     setSetTags(nextDraft.tags);
     setThumbnailPreview(nextDraft.thumbnailPreview);
     setThumbnailFileName(nextDraft.thumbnailFileName);
-    setReelInputs(nextDraft.reelInputs.map((row) => createDraftReelRow(row.value, row.tStartSec, row.tEndSec)));
+    setReelInputs(nextDraft.reelInputs.map((row) => createDraftReelRow(
+      row.value,
+      row.tStartSec,
+      row.tEndSec,
+      row.communityReelId,
+    )));
     setReelDurationByRow({});
     reelDurationCacheRef.current = {};
     setCreateError(null);
@@ -1670,7 +1782,12 @@ export function CommunityReelsPanel({
     setSetTags(nextDraft.tags);
     setThumbnailPreview(nextDraft.thumbnailPreview);
     setThumbnailFileName(nextDraft.thumbnailFileName);
-    setReelInputs(nextDraft.reelInputs.map((row) => createDraftReelRow(row.value, row.tStartSec, row.tEndSec)));
+    setReelInputs(nextDraft.reelInputs.map((row) => createDraftReelRow(
+      row.value,
+      row.tStartSec,
+      row.tEndSec,
+      row.communityReelId,
+    )));
     setReelDurationByRow({});
     reelDurationCacheRef.current = {};
     setCreateError(null);
@@ -1707,6 +1824,14 @@ export function CommunityReelsPanel({
     }
     resetCreateSetForm();
   }, [applyDraftToForm, mode, resetCreateSetForm]);
+
+  useEffect(() => {
+    if (!requiresCommunityAuth || canManageYourSets) {
+      return;
+    }
+    setIsEditSetEditorOpen(false);
+    setIsCreateSetEditorOpen(false);
+  }, [canManageYourSets, requiresCommunityAuth]);
 
   useEffect(() => {
     if (!isYourSetsMode) {
@@ -1762,6 +1887,7 @@ export function CommunityReelsPanel({
         if (!trimmed) {
           return {
             id: row.id,
+            communityReelId: row.communityReelId,
             value: row.value,
             tStartSec: row.tStartSec,
             tEndSec: row.tEndSec,
@@ -1773,6 +1899,7 @@ export function CommunityReelsPanel({
         }
         return {
           id: row.id,
+          communityReelId: row.communityReelId,
           value: row.value,
           tStartSec: row.tStartSec,
           tEndSec: row.tEndSec,
@@ -2122,6 +2249,9 @@ export function CommunityReelsPanel({
     const parsedReels = nonEmptyRows.map((row) => {
       const parsed = row.parsed!;
       return {
+        ...(typeof row.communityReelId === "string" && row.communityReelId.trim()
+          ? { id: row.communityReelId.trim() }
+          : {}),
         platform: parsed.platform,
         sourceUrl: parsed.sourceUrl,
         embedUrl: parsed.embedUrl,
@@ -2142,9 +2272,9 @@ export function CommunityReelsPanel({
           tags,
           reels: parsedReels,
           thumbnailUrl: thumbnailPreview,
-          curator: activeEditableSet?.curator || "You",
+          curator: communityAccount?.username || activeEditableSet?.curator || "Community member",
         });
-        setUserSets((prev) => [updatedSet, ...prev.filter((item) => item.id !== updatedSet.id)].slice(0, MAX_USER_SETS));
+        setOwnedSets((prev) => [updatedSet, ...prev.filter((item) => item.id !== updatedSet.id)].slice(0, MAX_USER_SETS));
         if (typeof window !== "undefined") {
           window.localStorage.removeItem(`${COMMUNITY_EDIT_DRAFT_PREFIX}${updatedSet.id}`);
         }
@@ -2159,16 +2289,16 @@ export function CommunityReelsPanel({
           tags,
           reels: parsedReels,
           thumbnailUrl: thumbnailPreview,
-          curator: "You",
+          curator: communityAccount?.username || "Community member",
         });
         setOwnedSetIds((prev) => (prev.includes(createdSet.id) ? prev : [createdSet.id, ...prev]));
-        setUserSets((prev) => [createdSet, ...prev.filter((item) => item.id !== createdSet.id)].slice(0, MAX_USER_SETS));
+        setOwnedSets((prev) => [createdSet, ...prev.filter((item) => item.id !== createdSet.id)].slice(0, MAX_USER_SETS));
         clearCreateSetDraftProgress();
         resetCreateSetForm();
         setPublishResultModal({
           status: "success",
-          title: "Published Successfully",
-          message: `"${createdSet.title}" is now live with ${createdSet.reels.length} reel${createdSet.reels.length === 1 ? "" : "s"}.`,
+          title: "Saved to Your Sets",
+          message: `"${createdSet.title}" was saved with ${createdSet.reels.length} reel${createdSet.reels.length === 1 ? "" : "s"}.`,
           thumbnailUrl: createdSet.thumbnailUrl || thumbnailPreview || undefined,
           thumbnailAlt: `${createdSet.title} thumbnail`,
         });
@@ -2176,6 +2306,12 @@ export function CommunityReelsPanel({
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : isFormEditMode ? "Could not update community set." : "Could not post community set.";
+      if (isSessionExpiredError(error)) {
+        clearCommunityAuthSession();
+        setCommunityAccount(null);
+        ownedSetsAccountIdRef.current = null;
+        clearOwnedCommunityState();
+      }
       setCreateError(null);
       setPublishResultModal({
         status: "error",
@@ -2192,6 +2328,7 @@ export function CommunityReelsPanel({
     activeEditableSet,
     buildCurrentDraftPayload,
     clearCreateSetDraftProgress,
+    communityAccount,
     isFormEditMode,
     parsedDraftReels,
     resetCreateSetForm,
@@ -2200,7 +2337,8 @@ export function CommunityReelsPanel({
     setDescription,
     setTitle,
     thumbnailPreview,
-    setUserSets,
+    clearOwnedCommunityState,
+    setOwnedSets,
   ]);
 
   const onCreateSet = useCallback((event: FormEvent<HTMLFormElement>) => {
@@ -2396,6 +2534,9 @@ export function CommunityReelsPanel({
   };
 
   const onOpenCreateSetFromGrid = useCallback(() => {
+    if (!canManageYourSets) {
+      return;
+    }
     setIsEditSetEditorOpen(false);
     setIsCreateSetEditorOpen(true);
     setActiveEditSetId(null);
@@ -2412,7 +2553,7 @@ export function CommunityReelsPanel({
     }
     setCreateError(null);
     setCreateSuccess(null);
-  }, [applyDraftToForm, resetCreateSetForm]);
+  }, [applyDraftToForm, canManageYourSets, resetCreateSetForm]);
 
   useEffect(() => {
     onDraftUnsavedChangesChange?.(hasUnsavedDraftChanges);
@@ -2554,7 +2695,7 @@ export function CommunityReelsPanel({
     setDeletingSetId(normalized);
     try {
       await deleteCommunitySet({ setId: normalized });
-      setUserSets((prev) => prev.filter((set) => set.id !== normalized));
+      setOwnedSets((prev) => prev.filter((set) => set.id !== normalized));
       setOwnedSetIds((prev) => prev.filter((id) => id !== normalized));
       setStarredSetIds((prev) => prev.filter((id) => id !== normalized));
       if (typeof window !== "undefined") {
@@ -2569,6 +2710,12 @@ export function CommunityReelsPanel({
       setCreateSuccess(`Deleted "${targetTitle}".`);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Could not delete this set.";
+      if (isSessionExpiredError(error)) {
+        clearCommunityAuthSession();
+        setCommunityAccount(null);
+        ownedSetsAccountIdRef.current = null;
+        clearOwnedCommunityState();
+      }
       setPublishResultModal({
         status: "error",
         label: "Your Sets",
@@ -2579,7 +2726,7 @@ export function CommunityReelsPanel({
       setDeletingSetId(null);
       setActiveSetActionsMenuId(null);
     }
-  }, [activeEditSetId, deletingSetId, editableSets]);
+  }, [activeEditSetId, clearOwnedCommunityState, deletingSetId, editableSets]);
 
   const removeReelInputRow = (rowId: string) => {
     setReelInputs((prev) => {
@@ -3471,15 +3618,17 @@ export function CommunityReelsPanel({
                     <span className="rounded-full border border-[#2b2b2b] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
                   </div>
                 </div>
-                {isYourSetsMode && shouldShowEditSetGrid ? (
-                  <div className="flex items-center justify-center pr-2 sm:pr-2 md:justify-end md:pr-2 lg:pr-2">
-                    <button
-                      type="button"
-                      onClick={onOpenCreateSetFromGrid}
-                      className="inline-flex h-10 min-w-[8.25rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-xs font-semibold uppercase tracking-[0.08em] text-white/80 backdrop-blur-md transition hover:bg-white/10 hover:text-white"
-                    >
-                      Create Set
-                    </button>
+                {((isYourSetsMode && shouldShowEditSetGrid && canManageYourSets) || (requiresCommunityAuth && canManageYourSets)) ? (
+                  <div className="flex flex-wrap items-center justify-center gap-2 pr-2 sm:pr-2 md:justify-end md:pr-2 lg:pr-2">
+                    {isYourSetsMode && shouldShowEditSetGrid && canManageYourSets ? (
+                      <button
+                        type="button"
+                        onClick={onOpenCreateSetFromGrid}
+                        className="inline-flex h-10 min-w-[8.25rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-xs font-semibold uppercase tracking-[0.08em] text-white/80 backdrop-blur-md transition hover:bg-white/10 hover:text-white"
+                      >
+                        Create Set
+                      </button>
+                    ) : null}
                   </div>
                 ) : null}
               </div>
@@ -3487,6 +3636,71 @@ export function CommunityReelsPanel({
 
             <div className="mt-3 min-h-0 flex-1 overflow-hidden md:-mx-4 md:mt-4 lg:-mx-5">
               <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto pb-0">
+                {!isCommunityAuthReady ? (
+                  <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
+                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-5 backdrop-blur-[4px]">
+                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                      <div className="relative z-10">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Account</p>
+                        <p className="mt-3 text-sm text-white/72">Loading your community account…</p>
+                      </div>
+                    </div>
+                  </section>
+                ) : needsCommunityAuth ? (
+                  <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
+                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6">
+                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                      <div className="relative z-10 max-w-xl">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Private Community Sets</p>
+                          <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/65">
+                            Account Required
+                          </span>
+                        </div>
+                        <h3 className="mt-3 text-xl font-semibold text-white">Sign in to see and manage your sets</h3>
+                        <div className="mt-5 flex flex-wrap items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => router.push("/account?return_tab=edit")}
+                            className="inline-flex h-11 min-w-[12rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/55 px-4 text-sm font-semibold text-white transition hover:bg-white hover:text-black"
+                          >
+                            Sign In / Login to Access
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                ) : needsCommunityVerification ? (
+                  <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
+                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6">
+                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                      <div className="relative z-10 max-w-xl">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Private Community Sets</p>
+                          <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/65">
+                            Verification Required
+                          </span>
+                        </div>
+                        <h3 className="mt-3 text-xl font-semibold text-white">Verify your email to unlock Your Sets</h3>
+                        <p className="mt-3 text-sm leading-6 text-white/72">
+                          {communityAccount?.email
+                            ? `Finish verifying ${communityAccount.email} before creating, editing, or viewing your private sets.`
+                            : "Finish verifying your account before creating, editing, or viewing your private sets."}
+                        </p>
+                        <div className="mt-5 flex flex-wrap items-center gap-3">
+                          <button
+                            type="button"
+                            onClick={() => router.push("/account?return_tab=edit")}
+                            className="inline-flex h-11 min-w-[12rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/55 px-4 text-sm font-semibold text-white transition hover:bg-white hover:text-black"
+                          >
+                            Verify Account
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </section>
+                ) : (
+                  <>
                 {shouldShowEditSetGrid ? (
                   <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
                     <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6">
@@ -3534,42 +3748,49 @@ export function CommunityReelsPanel({
                                     >
                                       <i className="fa-solid fa-ellipsis text-xs" aria-hidden="true" />
                                     </button>
-                                    {isActionsMenuOpen ? (
-                                      <div className="absolute right-0 top-full mt-1 w-36">
-                                        <div className="relative rounded-xl border border-[#2b2b2b] bg-black p-1">
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              onOpenEditableSet(set.id);
-                                              setActiveSetActionsMenuId(null);
-                                            }}
-                                            className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-white/90 transition hover:bg-white/10"
-                                          >
-                                            <i className="fa-solid fa-pen-to-square text-[11px] text-white/80" aria-hidden="true" />
-                                            Edit
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={() => onToggleSetStar(set.id)}
-                                            className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-white/90 transition hover:bg-white/10"
-                                          >
-                                            <i className={`fa-${isStarred ? "solid" : "regular"} fa-star text-[11px] text-white/80`} aria-hidden="true" />
-                                            {isStarred ? "Unstar" : "Star"}
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={() => {
-                                              onRequestDeleteEditableSet(set.id);
-                                            }}
-                                            disabled={isDeleting}
-                                            className="mt-0.5 flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs text-white/90 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
-                                          >
-                                            <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
-                                            {isDeleting ? "Deleting..." : "Delete"}
-                                          </button>
-                                        </div>
+                                    <div
+                                      className={`absolute right-0 top-full mt-1 w-36 transition-opacity duration-180 ${
+                                        isActionsMenuOpen
+                                          ? "pointer-events-auto opacity-100"
+                                          : "pointer-events-none opacity-0"
+                                      }`}
+                                    >
+                                      <div
+                                        role="menu"
+                                        className="overflow-hidden rounded-2xl border border-white/15 bg-[#090909]/96 p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] backdrop-blur-xl"
+                                      >
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            onOpenEditableSet(set.id);
+                                            setActiveSetActionsMenuId(null);
+                                          }}
+                                          className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                                        >
+                                          <i className="fa-solid fa-pen-to-square text-[11px] text-white/80" aria-hidden="true" />
+                                          Edit
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => onToggleSetStar(set.id)}
+                                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                                        >
+                                          <i className={`fa-${isStarred ? "solid" : "regular"} fa-star text-[11px] text-white/80`} aria-hidden="true" />
+                                          {isStarred ? "Unstar" : "Star"}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            onRequestDeleteEditableSet(set.id);
+                                          }}
+                                          disabled={isDeleting}
+                                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
+                                        >
+                                          <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
+                                          {isDeleting ? "Deleting..." : "Delete"}
+                                        </button>
                                       </div>
-                                    ) : null}
+                                    </div>
                                   </div>
                                   <button
                                     type="button"
@@ -4049,6 +4270,8 @@ export function CommunityReelsPanel({
                 </div>
               </section>
                 ) : null}
+                  </>
+                )}
             </div>
           </div>
           </div>
