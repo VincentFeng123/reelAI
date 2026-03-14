@@ -8,7 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -45,6 +45,9 @@ class RetrievalStagePlan:
     min_good_results: int
 
 
+RetrievalProfile = Literal["bootstrap", "deep"]
+
+
 class ReelService:
     VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
     VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
@@ -52,6 +55,16 @@ class ReelService:
     MIN_TARGET_CLIP_DURATION_SEC = 15
     MAX_TARGET_CLIP_DURATION_SEC = 180
     MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC = 15
+    DEFAULT_RETRIEVAL_PROFILE: RetrievalProfile = "bootstrap"
+    BOOTSTRAP_CONCEPT_LIMIT = 4
+    BOOTSTRAP_PRIMARY_QUERY_COUNT = 2
+    BOOTSTRAP_RECOVERY_QUERY_COUNT = 1
+    BOOTSTRAP_TRANSCRIPT_CANDIDATES = 3
+    BOOTSTRAP_TRANSCRIPT_CANDIDATES_SERVERLESS = 2
+    BOOTSTRAP_WEAK_POOL_MIN_KEPT = 3
+    BOOTSTRAP_WEAK_POOL_MIN_TOP_SCORE = 0.24
+    BOOTSTRAP_WEAK_POOL_MIN_UNIQUE_CHANNELS = 2
+    BOOTSTRAP_WEAK_POOL_MIN_UNIQUE_STRATEGIES = 2
     GENERIC_CONTEXT_TERMS = {
         "basics",
         "basic",
@@ -195,7 +208,10 @@ class ReelService:
         target_clip_duration_min_sec: int | None = None,
         target_clip_duration_max_sec: int | None = None,
         dry_run: bool = False,
+        retrieval_profile: RetrievalProfile = DEFAULT_RETRIEVAL_PROFILE,
+        generation_id: str | None = None,
     ) -> list[dict[str, Any]]:
+        safe_retrieval_profile = self._normalize_retrieval_profile(retrieval_profile)
         params: tuple[Any, ...] = (material_id,)
         concept_where = "WHERE material_id = ?"
         if concept_id:
@@ -215,29 +231,56 @@ class ReelService:
         concepts = self._order_concepts(conn, material_id, concepts)
         if self.serverless_mode:
             concepts = concepts[:1]
+        elif safe_retrieval_profile == "bootstrap":
+            concepts = concepts[: self.BOOTSTRAP_CONCEPT_LIMIT]
         elif fast_mode:
             concepts = concepts[:4]
 
+        if generation_id:
+            existing_clip_rows = fetch_all(
+                conn,
+                "SELECT video_id, t_start, t_end FROM reels WHERE generation_id = ?",
+                (generation_id,),
+            )
+            existing_video_rows = fetch_all(
+                conn,
+                "SELECT video_id, COUNT(*) AS reel_count FROM reels WHERE generation_id = ? GROUP BY video_id",
+                (generation_id,),
+            )
+        else:
+            existing_clip_rows = fetch_all(
+                conn,
+                """
+                SELECT video_id, t_start, t_end
+                FROM reels
+                WHERE material_id = ?
+                  AND (generation_id IS NULL OR TRIM(generation_id) = '')
+                """,
+                (material_id,),
+            )
+            existing_video_rows = fetch_all(
+                conn,
+                """
+                SELECT video_id, COUNT(*) AS reel_count
+                FROM reels
+                WHERE material_id = ?
+                  AND (generation_id IS NULL OR TRIM(generation_id) = '')
+                GROUP BY video_id
+                """,
+                (material_id,),
+            )
         existing_clip_keys = {
             self._clip_key(
                 str(r.get("video_id") or ""),
                 float(r.get("t_start") or 0),
                 float(r.get("t_end") or 0),
             )
-            for r in fetch_all(
-                conn,
-                "SELECT video_id, t_start, t_end FROM reels WHERE material_id = ?",
-                (material_id,),
-            )
+            for r in existing_clip_rows
             if r.get("video_id")
         }
         existing_video_counts = {
             str(r["video_id"]): int(r["reel_count"] or 0)
-            for r in fetch_all(
-                conn,
-                "SELECT video_id, COUNT(*) AS reel_count FROM reels WHERE material_id = ? GROUP BY video_id",
-                (material_id,),
-            )
+            for r in existing_video_rows
             if r.get("video_id")
         }
         generated_video_counts: dict[str, int] = {}
@@ -301,9 +344,10 @@ class ReelService:
                     context_terms=context_terms,
                     visual_spec=visual_spec,
                     fast_mode=fast_mode,
+                    retrieval_profile=safe_retrieval_profile,
                 )
             else:
-                query_candidates = [
+                legacy_candidates = [
                     QueryCandidate(
                         text=q,
                         strategy="literal",
@@ -318,7 +362,42 @@ class ReelService:
                         context_terms=context_terms,
                     )
                 ]
-            retrieval_stages = self._build_retrieval_stage_plan(query_candidates=query_candidates, fast_mode=fast_mode)
+                if safe_retrieval_profile == "bootstrap":
+                    query_candidates = [
+                        QueryCandidate(
+                            text=candidate.text,
+                            strategy=candidate.strategy,
+                            confidence=candidate.confidence,
+                            source_terms=candidate.source_terms,
+                            weight=candidate.weight,
+                            stage="high_precision",
+                            source_surface="youtube_html",
+                        )
+                        for candidate in legacy_candidates[: self.BOOTSTRAP_PRIMARY_QUERY_COUNT]
+                    ]
+                    query_candidates.append(
+                        QueryCandidate(
+                            text=self._bootstrap_recovery_query(
+                                title=str(concept["title"] or ""),
+                                summary=concept_summary,
+                                keywords=concept_keywords,
+                                subject_tag=subject_tag,
+                            ),
+                            strategy="recovery_adjacent",
+                            confidence=0.64,
+                            source_terms=[concept["title"], *concept_keywords[:2]],
+                            weight=0.68,
+                            stage="recovery",
+                            source_surface="youtube_html",
+                        )
+                    )
+                else:
+                    query_candidates = legacy_candidates
+            retrieval_stages = self._build_retrieval_stage_plan(
+                query_candidates=query_candidates,
+                fast_mode=fast_mode,
+                retrieval_profile=safe_retrieval_profile,
+            )
             retrieval_run = self._init_retrieval_debug_run(
                 material_id=material_id,
                 concept_id=str(concept.get("id") or ""),
@@ -340,6 +419,7 @@ class ReelService:
                     stage_candidates,
                     fast_mode=fast_mode,
                     max_generation_target=max_generation_target,
+                    retrieval_profile=safe_retrieval_profile,
                 ):
                     break
 
@@ -358,6 +438,7 @@ class ReelService:
                         preferred_video_duration=safe_video_duration_pref,
                         video_pool_mode=safe_video_pool_mode,
                         fast_mode=fast_mode,
+                        retrieval_profile=safe_retrieval_profile,
                     )
                     strict_duration = stage.name == "high_precision" and safe_video_duration_pref in {
                         "short",
@@ -391,6 +472,8 @@ class ReelService:
                         max_results_for_query=max_results_for_query,
                         creative_commons_only=creative_commons_only,
                         fast_mode=fast_mode,
+                        retrieval_profile=safe_retrieval_profile,
+                        allow_external_fallbacks=safe_retrieval_profile != "bootstrap",
                     )
 
                     for query_idx, _duration_idx, query_candidate, _duration, videos in search_jobs:
@@ -460,8 +543,97 @@ class ReelService:
                     stage_candidates,
                     fast_mode=fast_mode,
                     max_generation_target=max_generation_target,
+                    retrieval_profile=safe_retrieval_profile,
                 ):
                     break
+
+            if (
+                safe_retrieval_profile == "bootstrap"
+                and self._bootstrap_pool_is_weak(
+                    stage_candidates,
+                    max_generation_target=max_generation_target,
+                )
+            ):
+                fallback_query = self._select_bootstrap_external_fallback_query(retrieval_stages)
+                if fallback_query is not None:
+                    fallback_reports = [
+                        {
+                            "query": fallback_query.text,
+                            "strategy": fallback_query.strategy,
+                            "stage": "recovery",
+                            "source_terms": fallback_query.source_terms,
+                            "weight": float(fallback_query.weight),
+                            "surface": fallback_query.source_surface,
+                            "results": 0,
+                            "kept": 0,
+                        }
+                    ]
+                    fallback_jobs = self._stage_search_jobs_parallel(
+                        stage_name="recovery",
+                        stage_queries=[fallback_query],
+                        stage_duration_plan=self._stage_duration_plan(
+                            stage_name="recovery",
+                            preferred_video_duration=safe_video_duration_pref,
+                            video_pool_mode=safe_video_pool_mode,
+                            fast_mode=fast_mode,
+                            retrieval_profile=safe_retrieval_profile,
+                        ),
+                        max_results_for_query=max_results_for_query,
+                        creative_commons_only=creative_commons_only,
+                        fast_mode=fast_mode,
+                        retrieval_profile=safe_retrieval_profile,
+                        allow_external_fallbacks=True,
+                        variant_limit=1,
+                    )
+                    for query_idx, _duration_idx, query_candidate, _duration, videos in fallback_jobs:
+                        if query_idx >= len(fallback_reports):
+                            continue
+                        query_report = fallback_reports[query_idx]
+                        query_report["results"] += len(videos)
+
+                        for video in videos:
+                            video_id = str(video.get("id") or "").strip()
+                            if not video_id or video_id in seen_video_ids:
+                                continue
+                            seen_video_ids.add(video_id)
+                            existing_for_video = existing_video_counts.get(video_id, 0)
+                            generated_for_video = generated_video_counts.get(video_id, 0)
+                            if existing_for_video + generated_for_video >= max_segments_per_video:
+                                continue
+
+                            video_duration = int(video.get("duration_sec") or 0)
+                            if not dry_run:
+                                self._upsert_video(conn, video)
+
+                            ranking = self._score_video_candidate(
+                                conn,
+                                video=video,
+                                query_candidate=query_candidate,
+                                concept_terms=concept_terms,
+                                context_terms=context_terms,
+                                concept_embedding=concept_embedding,
+                                subject_tag=subject_tag,
+                                visual_spec=visual_spec,
+                                preferred_video_duration=safe_video_duration_pref,
+                                stage_name="recovery",
+                                require_context=bool(context_terms) and vague_topic,
+                                fast_mode=fast_mode,
+                            )
+                            if not bool(ranking.get("passes", False)):
+                                continue
+                            query_report["kept"] += 1
+                            stage_candidates.append(
+                                {
+                                    "video": video,
+                                    "video_id": video_id,
+                                    "video_duration": video_duration,
+                                    "video_relevance": ranking["text_relevance"],
+                                    "ranking": ranking,
+                                    "query_candidate": query_candidate,
+                                    "stage": "recovery",
+                                }
+                            )
+                    all_query_reports.extend(fallback_reports)
 
             if not stage_candidates:
                 local_candidates = self._recover_candidates_from_local_corpus(
@@ -513,14 +685,20 @@ class ReelService:
                     key=lambda row: float((row.get("ranking") or {}).get("final_score") or 0.0),
                     reverse=True,
                 )
-            transcript_budget = min(
-                20,
-                self._transcript_expansion_budget(
-                    fast_mode=fast_mode,
+            if safe_retrieval_profile == "bootstrap":
+                transcript_budget = self._bootstrap_transcript_budget(
                     generated_count=len(generated),
                     max_generation_target=max_generation_target,
-                ),
-            )
+                )
+            else:
+                transcript_budget = min(
+                    20,
+                    self._transcript_expansion_budget(
+                        fast_mode=fast_mode,
+                        generated_count=len(generated),
+                        max_generation_target=max_generation_target,
+                    ),
+                )
             if self.retrieval_tier2_enabled:
                 ranked_candidates = self._diversify_video_candidates(
                     stage_candidates,
@@ -731,6 +909,7 @@ class ReelService:
                             relevance_context=relevance_context,
                             fast_mode=fast_mode,
                             target_clip_duration_sec=safe_target_clip_duration,
+                            generation_id=generation_id,
                         )
                         if not reel:
                             continue
@@ -797,6 +976,11 @@ class ReelService:
             return str(value)
         return "any"
 
+    def _normalize_retrieval_profile(self, value: str | None) -> RetrievalProfile:
+        if value == "deep":
+            return "deep"
+        return self.DEFAULT_RETRIEVAL_PROFILE
+
     def _normalize_target_clip_duration(self, value: int | float | None) -> int:
         if value is None:
             return self.DEFAULT_TARGET_CLIP_DURATION_SEC
@@ -818,6 +1002,85 @@ class ReelService:
         if video_pool_mode == "balanced":
             return ("short", "long", "medium", None)
         return ("short", "long", "medium", None)
+
+    def _bootstrap_transcript_budget(
+        self,
+        *,
+        generated_count: int,
+        max_generation_target: int,
+    ) -> int:
+        remaining = max(1, max_generation_target - max(0, generated_count))
+        cap = (
+            self.BOOTSTRAP_TRANSCRIPT_CANDIDATES_SERVERLESS
+            if self.serverless_mode
+            else self.BOOTSTRAP_TRANSCRIPT_CANDIDATES
+        )
+        return max(1, min(cap, remaining))
+
+    def _bootstrap_pool_is_weak(
+        self,
+        stage_candidates: list[dict[str, Any]],
+        *,
+        max_generation_target: int,
+    ) -> bool:
+        if not stage_candidates:
+            return True
+
+        min_kept = max(2, min(self.BOOTSTRAP_WEAK_POOL_MIN_KEPT, max_generation_target + 1))
+        if len(stage_candidates) < min_kept:
+            return True
+
+        top_score = max(
+            float((candidate.get("ranking") or {}).get("final_score") or 0.0)
+            for candidate in stage_candidates
+        )
+        if top_score < self.BOOTSTRAP_WEAK_POOL_MIN_TOP_SCORE:
+            return True
+
+        unique_channels = {
+            str((candidate.get("video") or {}).get("channel_title") or "").strip().lower()
+            for candidate in stage_candidates
+            if str((candidate.get("video") or {}).get("channel_title") or "").strip()
+        }
+        if len(unique_channels) < min(self.BOOTSTRAP_WEAK_POOL_MIN_UNIQUE_CHANNELS, len(stage_candidates)):
+            return True
+
+        unique_strategies = {
+            str((candidate.get("query_candidate") or QueryCandidate("", "", 0.0)).strategy or "").strip().lower()
+            for candidate in stage_candidates
+            if str((candidate.get("query_candidate") or QueryCandidate("", "", 0.0)).strategy or "").strip()
+        }
+        if len(unique_strategies) < min(self.BOOTSTRAP_WEAK_POOL_MIN_UNIQUE_STRATEGIES, len(stage_candidates)):
+            return True
+
+        return False
+
+    def _bootstrap_recovery_query(
+        self,
+        *,
+        title: str,
+        summary: str,
+        keywords: list[str],
+        subject_tag: str | None,
+    ) -> str:
+        recovery_terms = self._decompose_concept_for_recovery(title, summary, keywords)
+        subject = " ".join(str(subject_tag or "").split()).strip()
+        for recovery_term in recovery_terms:
+            query = " ".join(part for part in [subject, recovery_term] if part).strip()
+            if query:
+                return query
+        fallback = " ".join(part for part in [subject, title] if part).strip()
+        return f"{fallback} example".strip()
+
+    def _select_bootstrap_external_fallback_query(
+        self,
+        retrieval_stages: list[RetrievalStagePlan],
+    ) -> QueryCandidate | None:
+        for stage_name in ("recovery", "high_precision"):
+            stage = next((item for item in retrieval_stages if item.name == stage_name), None)
+            if stage and stage.queries:
+                return stage.queries[0]
+        return None
 
     def _search_passes(self, video_pool_mode: str, preferred_video_duration: str) -> list[dict[str, Any]]:
         if preferred_video_duration in {"short", "medium", "long"}:
@@ -1226,6 +1489,7 @@ class ReelService:
         context_terms: list[str],
         visual_spec: dict[str, list[str]],
         fast_mode: bool,
+        retrieval_profile: RetrievalProfile,
     ) -> list[QueryCandidate]:
         clean_title = " ".join(str(title or "").split()).strip()
         if not clean_title:
@@ -1270,80 +1534,144 @@ class ReelService:
             )
 
         core = " ".join(part for part in [subject, clean_title] if part).strip()
-        add_candidate(core, "literal", 0.96, [clean_title, subject], "high_precision", 1.0)
-        if keyword_terms:
-            add_candidate(f"{core} {' '.join(keyword_terms[:2])}", "literal", 0.9, keyword_terms[:2], "high_precision", 0.95)
-
-        paraphrases = self._expand_controlled_synonyms([clean_title, *keyword_terms[:3]])
-        for phrase in paraphrases[: (3 if fast_mode else 8)]:
-            add_candidate(f"{subject} {phrase}".strip(), "paraphrase", 0.74, [phrase], "broad", 0.84)
-
-        if scene_terms:
+        if retrieval_profile == "bootstrap":
+            literal_query = core or clean_title
             add_candidate(
-                f"{' '.join(scene_terms[:3])} footage",
-                "scene",
-                0.86,
-                scene_terms[:3],
+                literal_query,
+                "literal",
+                0.96,
+                [clean_title, subject],
                 "high_precision",
-                0.95,
+                1.0,
+                source_surface="youtube_html",
             )
+
+            if scene_terms:
+                intent_query = f"{clean_title} {' '.join(scene_terms[:2])} footage"
+                intent_terms = [clean_title, *scene_terms[:2]]
+                intent_strategy = "scene"
+                intent_confidence = 0.86
+            elif action_terms:
+                intent_query = f"{clean_title} {' '.join(action_terms[:2])} demonstration"
+                intent_terms = [clean_title, *action_terms[:2]]
+                intent_strategy = "action"
+                intent_confidence = 0.8
+            elif keyword_terms:
+                intent_query = f"{literal_query} {' '.join(keyword_terms[:2])} explained"
+                intent_terms = [clean_title, *keyword_terms[:2]]
+                intent_strategy = "tutorial_demo"
+                intent_confidence = 0.76
+            else:
+                intent_query = f"{clean_title} explained example"
+                intent_terms = [clean_title]
+                intent_strategy = "tutorial_demo"
+                intent_confidence = 0.72
             add_candidate(
-                f"{' '.join(scene_terms[:3])} b-roll cinematic 4k",
-                "broll",
-                0.88,
-                scene_terms[:3],
+                intent_query,
+                intent_strategy,
+                intent_confidence,
+                intent_terms,
                 "high_precision",
-                0.98,
+                0.92,
+                source_surface="youtube_html",
             )
 
-        if action_terms:
             add_candidate(
-                f"{' '.join(action_terms[:2])} {' '.join(scene_terms[:2])} footage",
-                "action",
-                0.77,
-                [*action_terms[:2], *scene_terms[:2]],
-                "broad",
-                0.82,
+                self._bootstrap_recovery_query(
+                    title=clean_title,
+                    summary=summary,
+                    keywords=keyword_terms,
+                    subject_tag=subject_tag,
+                ),
+                "recovery_adjacent",
+                0.64,
+                [clean_title, *keyword_terms[:2]],
+                "recovery",
+                0.68,
+                source_surface="youtube_html",
             )
-
-        if scene_terms:
-            add_candidate(
-                f"{' '.join(scene_terms[:3])} report interview coverage archive",
-                "news_doc",
-                0.69,
-                scene_terms[:3],
-                "broad",
-                0.74,
-            )
-            add_candidate(
-                f"{clean_title} how it works demonstration example",
-                "tutorial_demo",
-                0.72,
-                [clean_title],
-                "broad",
-                0.76,
-            )
-
-        if self.retrieval_tier2_enabled:
-            for recovery in self._decompose_concept_for_recovery(clean_title, summary, keyword_terms)[: (3 if fast_mode else 7)]:
+        else:
+            add_candidate(core, "literal", 0.96, [clean_title, subject], "high_precision", 1.0)
+            if keyword_terms:
                 add_candidate(
-                    f"{recovery} footage scene",
-                    "recovery_adjacent",
-                    0.62,
-                    [recovery],
-                    "recovery",
-                    0.66,
-                    source_surface="duckduckgo_site",
+                    f"{core} {' '.join(keyword_terms[:2])}",
+                    "literal",
+                    0.9,
+                    keyword_terms[:2],
+                    "high_precision",
+                    0.95,
+                )
+
+            paraphrases = self._expand_controlled_synonyms([clean_title, *keyword_terms[:3]])
+            for phrase in paraphrases[: (3 if fast_mode else 8)]:
+                add_candidate(f"{subject} {phrase}".strip(), "paraphrase", 0.74, [phrase], "broad", 0.84)
+
+            if scene_terms:
+                add_candidate(
+                    f"{' '.join(scene_terms[:3])} footage",
+                    "scene",
+                    0.86,
+                    scene_terms[:3],
+                    "high_precision",
+                    0.95,
                 )
                 add_candidate(
-                    f"\"{recovery}\" site:youtube.com/watch",
-                    "recovery_adjacent",
-                    0.6,
-                    [recovery],
-                    "recovery",
-                    0.62,
-                    source_surface="duckduckgo_quoted",
+                    f"{' '.join(scene_terms[:3])} b-roll cinematic 4k",
+                    "broll",
+                    0.88,
+                    scene_terms[:3],
+                    "high_precision",
+                    0.98,
                 )
+
+            if action_terms:
+                add_candidate(
+                    f"{' '.join(action_terms[:2])} {' '.join(scene_terms[:2])} footage",
+                    "action",
+                    0.77,
+                    [*action_terms[:2], *scene_terms[:2]],
+                    "broad",
+                    0.82,
+                )
+
+            if scene_terms:
+                add_candidate(
+                    f"{' '.join(scene_terms[:3])} report interview coverage archive",
+                    "news_doc",
+                    0.69,
+                    scene_terms[:3],
+                    "broad",
+                    0.74,
+                )
+                add_candidate(
+                    f"{clean_title} how it works demonstration example",
+                    "tutorial_demo",
+                    0.72,
+                    [clean_title],
+                    "broad",
+                    0.76,
+                )
+
+            if self.retrieval_tier2_enabled:
+                for recovery in self._decompose_concept_for_recovery(clean_title, summary, keyword_terms)[: (3 if fast_mode else 7)]:
+                    add_candidate(
+                        f"{recovery} footage scene",
+                        "recovery_adjacent",
+                        0.62,
+                        [recovery],
+                        "recovery",
+                        0.66,
+                        source_surface="duckduckgo_site",
+                    )
+                    add_candidate(
+                        f"\"{recovery}\" site:youtube.com/watch",
+                        "recovery_adjacent",
+                        0.6,
+                        [recovery],
+                        "recovery",
+                        0.62,
+                        source_surface="duckduckgo_quoted",
+                    )
 
         deduped: list[QueryCandidate] = []
         seen: set[str] = set()
@@ -1351,13 +1679,18 @@ class ReelService:
             candidates,
             key=lambda item: (item.stage != "high_precision", -(item.confidence * item.weight), len(item.text)),
         )
+        dedupe_limit = (
+            self.BOOTSTRAP_PRIMARY_QUERY_COUNT + self.BOOTSTRAP_RECOVERY_QUERY_COUNT
+            if retrieval_profile == "bootstrap"
+            else (18 if fast_mode else 42)
+        )
         for item in ordered:
             key = item.text.lower()
             if key in seen:
                 continue
             seen.add(key)
             deduped.append(item)
-            if len(deduped) >= (18 if fast_mode else 42):
+            if len(deduped) >= dedupe_limit:
                 break
         return deduped
 
@@ -1365,13 +1698,21 @@ class ReelService:
         self,
         query_candidates: list[QueryCandidate],
         fast_mode: bool,
+        retrieval_profile: RetrievalProfile,
     ) -> list[RetrievalStagePlan]:
         stage_map: dict[str, list[QueryCandidate]] = {"high_precision": [], "broad": [], "recovery": []}
         for item in query_candidates:
             stage = item.stage if item.stage in stage_map else "broad"
             stage_map[stage].append(item)
 
-        if self.serverless_mode:
+        if retrieval_profile == "bootstrap":
+            high_precision_budget = self.BOOTSTRAP_PRIMARY_QUERY_COUNT
+            high_precision_min = 3
+            broad_budget = 0
+            broad_min = 0
+            recovery_budget = self.BOOTSTRAP_RECOVERY_QUERY_COUNT
+            recovery_min = 1
+        elif self.serverless_mode:
             high_precision_budget = 2
             high_precision_min = 2
             broad_budget = 2
@@ -1414,7 +1755,13 @@ class ReelService:
         *,
         fast_mode: bool,
         max_generation_target: int,
+        retrieval_profile: RetrievalProfile,
     ) -> bool:
+        if retrieval_profile == "bootstrap":
+            return not self._bootstrap_pool_is_weak(
+                stage_candidates,
+                max_generation_target=max_generation_target,
+            )
         if not stage_candidates:
             return False
         if fast_mode:
@@ -1439,6 +1786,9 @@ class ReelService:
         max_results_for_query: int,
         creative_commons_only: bool,
         fast_mode: bool,
+        retrieval_profile: RetrievalProfile,
+        allow_external_fallbacks: bool = True,
+        variant_limit: int | None = None,
     ) -> list[tuple[int, int, QueryCandidate, str | None, list[dict[str, Any]]]]:
         jobs: list[tuple[int, int, QueryCandidate, str | None]] = []
         for query_idx, query_candidate in enumerate(stage_queries):
@@ -1463,6 +1813,9 @@ class ReelService:
                     retrieval_strategy=query_candidate.strategy,
                     retrieval_stage=stage_name,
                     source_surface=query_candidate.source_surface,
+                    retrieval_profile=retrieval_profile,
+                    allow_external_fallbacks=allow_external_fallbacks,
+                    variant_limit=variant_limit,
                 )
                 output.append((query_idx, duration_idx, query_candidate, duration, videos))
             return output
@@ -1480,6 +1833,9 @@ class ReelService:
                     query_candidate.strategy,
                     stage_name,
                     query_candidate.source_surface,
+                    retrieval_profile,
+                    allow_external_fallbacks,
+                    variant_limit,
                 ): (query_idx, duration_idx, query_candidate, duration)
                 for query_idx, duration_idx, query_candidate, duration in jobs
             }
@@ -1531,7 +1887,10 @@ class ReelService:
         preferred_video_duration: str,
         video_pool_mode: str,
         fast_mode: bool,
+        retrieval_profile: RetrievalProfile,
     ) -> tuple[str | None, ...]:
+        if retrieval_profile == "bootstrap":
+            return (None,)
         if stage_name == "high_precision":
             if preferred_video_duration in {"short", "medium", "long"}:
                 return (preferred_video_duration,)
@@ -2835,6 +3194,7 @@ class ReelService:
         target_clip_duration_sec: int = DEFAULT_TARGET_CLIP_DURATION_SEC,
         target_clip_duration_min_sec: int | None = None,
         target_clip_duration_max_sec: int | None = None,
+        generation_id: str | None = None,
     ) -> dict[str, Any] | None:
         reel_id = str(uuid.uuid4())
         clip_min_len, clip_max_len, _ = self._resolve_clip_duration_bounds(
@@ -2892,6 +3252,7 @@ class ReelService:
                 "reels",
                 {
                     "id": reel_id,
+                    "generation_id": generation_id,
                     "material_id": material_id,
                     "concept_id": concept["id"],
                     "video_id": video_id,
@@ -3320,13 +3681,25 @@ class ReelService:
             pk="reel_id",
         )
 
-    def ranked_feed(self, conn, material_id: str, fast_mode: bool = False) -> list[dict[str, Any]]:
+    def ranked_feed(
+        self,
+        conn,
+        material_id: str,
+        fast_mode: bool = False,
+        generation_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         material = fetch_one(conn, "SELECT subject_tag FROM materials WHERE id = ?", (material_id,))
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
 
+        reel_where = "r.material_id = ? AND (r.generation_id IS NULL OR TRIM(r.generation_id) = '')"
+        reel_params: tuple[Any, ...] = (material_id,)
+        if generation_id:
+            reel_where = "r.generation_id = ?"
+            reel_params = (generation_id,)
+
         reel_rows = fetch_all(
             conn,
-            """
+            f"""
             SELECT
                 r.id AS reel_id,
                 r.concept_id,
@@ -3353,7 +3726,7 @@ class ReelService:
             JOIN concepts c ON c.id = r.concept_id
             JOIN videos v ON v.id = r.video_id
             LEFT JOIN reel_feedback f ON f.reel_id = r.id
-            WHERE r.material_id = ?
+            WHERE {reel_where}
               AND (r.t_end - r.t_start) >= 1
             GROUP BY
                 r.id,
@@ -3374,7 +3747,7 @@ class ReelService:
                 r.base_score,
                 r.created_at
             """,
-            (material_id,),
+            reel_params,
         )
 
         video_ids = sorted({str(row["video_id"]) for row in reel_rows if row.get("video_id")})
@@ -3394,17 +3767,17 @@ class ReelService:
 
         concept_feedback = fetch_all(
             conn,
-            """
+            f"""
             SELECT
                 r.concept_id,
                 COALESCE(SUM(f.helpful), 0) AS helpful_votes,
                 COALESCE(SUM(f.confusing), 0) AS confusing_votes
             FROM reels r
             LEFT JOIN reel_feedback f ON f.reel_id = r.id
-            WHERE r.material_id = ?
+            WHERE {reel_where}
             GROUP BY r.concept_id
             """,
-            (material_id,),
+            reel_params,
         )
         concept_signal = {
             row["concept_id"]: (float(row["helpful_votes"]), float(row["confusing_votes"]))

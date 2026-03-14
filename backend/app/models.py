@@ -65,6 +65,10 @@ class ReelOut(BaseModel):
 
 class ReelsGenerateResponse(BaseModel):
     reels: list[ReelOut]
+    generation_id: str | None = None
+    response_profile: str | None = None
+    refinement_job_id: str | None = None
+    refinement_status: str | None = None
 
 
 class ReelsCanGenerateResponse(BaseModel):
@@ -107,6 +111,22 @@ class FeedResponse(BaseModel):
     limit: int
     total: int
     reels: list[ReelOut]
+    generation_id: str | None = None
+    response_profile: str | None = None
+    refinement_job_id: str | None = None
+    refinement_status: str | None = None
+
+
+class RefinementStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    material_id: str
+    request_key: str
+    source_generation_id: str
+    result_generation_id: str | None = None
+    active_generation_id: str | None = None
+    completed_at: str | None = None
+    error: str | None = None
 
 
 class FeedbackRequest(BaseModel):

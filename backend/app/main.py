@@ -9,11 +9,12 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
@@ -65,6 +66,7 @@ from .models import (
     FeedbackResponse,
     FeedResponse,
     MaterialResponse,
+    RefinementStatusResponse,
     ReelsCanGenerateAnyRequest,
     ReelsCanGenerateAnyResponse,
     ReelsCanGenerateResponse,
@@ -191,6 +193,9 @@ material_intelligence_service = MaterialIntelligenceService()
 youtube_service = YouTubeService()
 reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service)
 SERVERLESS_MODE = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
+REFINEMENT_JOB_WORKERS = 2
+_refinement_jobs_lock = threading.Lock()
+_refinement_job_executor = None if SERVERLESS_MODE else ThreadPoolExecutor(max_workers=REFINEMENT_JOB_WORKERS)
 
 VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
@@ -1277,6 +1282,638 @@ def _filter_reels_by_video_preferences(
     return filtered
 
 
+def _build_generation_request_key(
+    *,
+    material_id: str,
+    concept_id: str | None,
+    creative_commons_only: bool,
+    generation_mode: Literal["slow", "fast"],
+    video_pool_mode: Literal["short-first", "balanced", "long-form"],
+    preferred_video_duration: Literal["any", "short", "medium", "long"],
+    target_clip_duration_sec: int,
+    target_clip_duration_min_sec: int | None,
+    target_clip_duration_max_sec: int | None,
+) -> str:
+    payload = {
+        "material_id": material_id,
+        "concept_id": concept_id or "",
+        "creative_commons_only": bool(creative_commons_only),
+        "generation_mode": generation_mode,
+        "video_pool_mode": video_pool_mode,
+        "preferred_video_duration": preferred_video_duration,
+        "target_clip_duration_sec": int(target_clip_duration_sec),
+        "target_clip_duration_min_sec": int(target_clip_duration_min_sec or 0),
+        "target_clip_duration_max_sec": int(target_clip_duration_max_sec or 0),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _build_generation_head_id(material_id: str, request_key: str) -> str:
+    return hashlib.sha256(f"{material_id}:{request_key}".encode("utf-8")).hexdigest()
+
+
+def _serialize_reels_for_request(
+    reels: list[dict[str, Any]],
+    *,
+    min_relevance: float | None,
+    preferred_video_duration: Literal["any", "short", "medium", "long"],
+    target_clip_duration_sec: int,
+    target_clip_duration_min_sec: int | None,
+    target_clip_duration_max_sec: int | None,
+) -> list[dict[str, Any]]:
+    filtered = _filter_reels_by_min_relevance(reels, min_relevance)
+    filtered = _filter_reels_by_video_preferences(
+        filtered,
+        preferred_video_duration=preferred_video_duration,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
+    return filtered
+
+
+def _count_generation_reels(conn, generation_id: str) -> int:
+    row = fetch_one(conn, "SELECT COUNT(*) AS reel_count FROM reels WHERE generation_id = ?", (generation_id,))
+    return max(0, int((row or {}).get("reel_count") or 0))
+
+
+def _fetch_generation_row(conn, generation_id: str | None) -> dict[str, Any] | None:
+    if not generation_id:
+        return None
+    return fetch_one(conn, "SELECT * FROM reel_generations WHERE id = ?", (generation_id,))
+
+
+def _fetch_active_generation_row(conn, *, material_id: str, request_key: str) -> dict[str, Any] | None:
+    head = fetch_one(
+        conn,
+        "SELECT active_generation_id FROM reel_generation_heads WHERE material_id = ? AND request_key = ?",
+        (material_id, request_key),
+    )
+    if not head:
+        return None
+    return _fetch_generation_row(conn, str(head.get("active_generation_id") or ""))
+
+
+def _fetch_refinement_job_for_generation(conn, source_generation_id: str | None) -> dict[str, Any] | None:
+    if not source_generation_id:
+        return None
+    return fetch_one(
+        conn,
+        """
+        SELECT *
+        FROM reel_generation_jobs
+        WHERE source_generation_id = ?
+          AND status IN ('queued', 'running')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (source_generation_id,),
+    )
+
+
+def _create_generation_row(
+    conn,
+    *,
+    material_id: str,
+    concept_id: str | None,
+    request_key: str,
+    generation_mode: Literal["slow", "fast"],
+    retrieval_profile: str,
+    source_generation_id: str | None = None,
+) -> str:
+    generation_id = str(uuid.uuid4())
+    upsert(
+        conn,
+        "reel_generations",
+        {
+            "id": generation_id,
+            "material_id": material_id,
+            "concept_id": concept_id,
+            "request_key": request_key,
+            "generation_mode": generation_mode,
+            "retrieval_profile": retrieval_profile,
+            "status": "pending",
+            "source_generation_id": source_generation_id,
+            "reel_count": 0,
+            "created_at": now_iso(),
+            "completed_at": None,
+            "activated_at": None,
+            "error_text": None,
+        },
+    )
+    return generation_id
+
+
+def _complete_generation(
+    conn,
+    *,
+    generation_id: str,
+    retrieval_profile: str,
+    status: str,
+    error_text: str | None = None,
+    activate: bool = False,
+) -> None:
+    row = _fetch_generation_row(conn, generation_id) or {}
+    completed_at = now_iso()
+    activated_at = completed_at if activate else row.get("activated_at")
+    upsert(
+        conn,
+        "reel_generations",
+        {
+            "id": generation_id,
+            "material_id": str(row.get("material_id") or ""),
+            "concept_id": row.get("concept_id"),
+            "request_key": str(row.get("request_key") or ""),
+            "generation_mode": str(row.get("generation_mode") or "fast"),
+            "retrieval_profile": retrieval_profile,
+            "status": status,
+            "source_generation_id": row.get("source_generation_id"),
+            "reel_count": _count_generation_reels(conn, generation_id),
+            "created_at": str(row.get("created_at") or completed_at),
+            "completed_at": completed_at,
+            "activated_at": activated_at,
+            "error_text": error_text,
+        },
+    )
+
+
+def _activate_generation(conn, *, material_id: str, request_key: str, generation_id: str, retrieval_profile: str) -> None:
+    _complete_generation(
+        conn,
+        generation_id=generation_id,
+        retrieval_profile=retrieval_profile,
+        status="active",
+        activate=True,
+    )
+    upsert(
+        conn,
+        "reel_generation_heads",
+        {
+            "id": _build_generation_head_id(material_id, request_key),
+            "material_id": material_id,
+            "request_key": request_key,
+            "active_generation_id": generation_id,
+            "updated_at": now_iso(),
+        },
+    )
+
+
+def _ranked_request_reels(
+    conn,
+    *,
+    material_id: str,
+    fast_mode: bool,
+    generation_id: str | None,
+    min_relevance: float | None,
+    preferred_video_duration: Literal["any", "short", "medium", "long"],
+    target_clip_duration_sec: int,
+    target_clip_duration_min_sec: int | None,
+    target_clip_duration_max_sec: int | None,
+) -> list[dict[str, Any]]:
+    ranked = reel_service.ranked_feed(
+        conn,
+        material_id,
+        fast_mode=fast_mode,
+        generation_id=generation_id,
+    )
+    return _serialize_reels_for_request(
+        ranked,
+        min_relevance=min_relevance,
+        preferred_video_duration=preferred_video_duration,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
+
+
+def _build_generation_response_payload(
+    *,
+    reels: list[dict[str, Any]],
+    generation_id: str | None,
+    response_profile: str | None,
+    job_row: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "reels": reels,
+        "generation_id": generation_id,
+        "response_profile": response_profile,
+        "refinement_job_id": str((job_row or {}).get("id") or "") or None,
+        "refinement_status": str((job_row or {}).get("status") or "") or None,
+    }
+
+
+def _queue_refinement_job(
+    conn,
+    *,
+    material_id: str,
+    concept_id: str | None,
+    request_key: str,
+    source_generation_id: str,
+    request_params: dict[str, Any],
+) -> dict[str, Any] | None:
+    if SERVERLESS_MODE or _refinement_job_executor is None:
+        return None
+
+    existing = _fetch_refinement_job_for_generation(conn, source_generation_id)
+    if existing:
+        return existing
+
+    job_id = str(uuid.uuid4())
+    created_at = now_iso()
+    job_row = {
+        "id": job_id,
+        "material_id": material_id,
+        "concept_id": concept_id,
+        "request_key": request_key,
+        "source_generation_id": source_generation_id,
+        "result_generation_id": None,
+        "target_profile": "deep",
+        "request_params_json": dumps_json(request_params),
+        "status": "queued",
+        "created_at": created_at,
+        "started_at": None,
+        "completed_at": None,
+        "error_text": None,
+    }
+    upsert(conn, "reel_generation_jobs", job_row)
+
+    with _refinement_jobs_lock:
+        _refinement_job_executor.submit(_run_refinement_job, job_id)
+    return job_row
+
+
+def _run_refinement_job(job_id: str) -> None:
+    with get_conn() as conn:
+        job_row = fetch_one(conn, "SELECT * FROM reel_generation_jobs WHERE id = ?", (job_id,))
+        if not job_row:
+            return
+
+        source_generation_id = str(job_row.get("source_generation_id") or "")
+        source_generation = _fetch_generation_row(conn, source_generation_id)
+        if not source_generation:
+            upsert(
+                conn,
+                "reel_generation_jobs",
+                {
+                    **job_row,
+                    "status": "failed",
+                    "completed_at": now_iso(),
+                    "error_text": "source_generation_missing",
+                },
+            )
+            return
+
+        started_at = now_iso()
+        upsert(
+            conn,
+            "reel_generation_jobs",
+            {
+                **job_row,
+                "status": "running",
+                "started_at": started_at,
+                "error_text": None,
+            },
+        )
+
+        result_generation_id = _create_generation_row(
+            conn,
+            material_id=str(job_row.get("material_id") or ""),
+            concept_id=str(job_row.get("concept_id") or "") or None,
+            request_key=str(job_row.get("request_key") or ""),
+            generation_mode=str(source_generation.get("generation_mode") or "fast"),  # type: ignore[arg-type]
+            retrieval_profile="deep",
+            source_generation_id=source_generation_id,
+        )
+
+        try:
+            try:
+                request_params = json.loads(str(job_row.get("request_params_json") or "{}"))
+            except json.JSONDecodeError:
+                request_params = {}
+            fast_mode = str(source_generation.get("generation_mode") or "fast") == "fast"
+            reel_service.generate_reels(
+                conn,
+                material_id=str(job_row.get("material_id") or ""),
+                concept_id=str(job_row.get("concept_id") or "") or None,
+                num_reels=max(6, int(source_generation.get("reel_count") or 0) or 6),
+                creative_commons_only=bool(request_params.get("creative_commons_only", False)),
+                fast_mode=fast_mode,
+                video_pool_mode=_normalize_video_pool_mode(str(request_params.get("video_pool_mode") or "short-first")),
+                preferred_video_duration=_normalize_preferred_video_duration(
+                    str(request_params.get("preferred_video_duration") or "any")
+                ),
+                target_clip_duration_sec=int(request_params.get("target_clip_duration_sec") or DEFAULT_TARGET_CLIP_DURATION_SEC),
+                target_clip_duration_min_sec=(
+                    int(request_params["target_clip_duration_min_sec"])
+                    if request_params.get("target_clip_duration_min_sec") is not None
+                    else MIN_TARGET_CLIP_DURATION_SEC
+                ),
+                target_clip_duration_max_sec=(
+                    int(request_params["target_clip_duration_max_sec"])
+                    if request_params.get("target_clip_duration_max_sec") is not None
+                    else MAX_TARGET_CLIP_DURATION_SEC
+                ),
+                retrieval_profile="deep",
+                generation_id=result_generation_id,
+            )
+        except Exception as exc:
+            _complete_generation(
+                conn,
+                generation_id=result_generation_id,
+                retrieval_profile="deep",
+                status="failed",
+                error_text=str(exc),
+            )
+            upsert(
+                conn,
+                "reel_generation_jobs",
+                {
+                    **job_row,
+                    "result_generation_id": result_generation_id,
+                    "status": "failed",
+                    "started_at": started_at,
+                    "completed_at": now_iso(),
+                    "error_text": str(exc),
+                },
+            )
+            return
+
+        result_count = _count_generation_reels(conn, result_generation_id)
+        current_active = _fetch_active_generation_row(
+            conn,
+            material_id=str(job_row.get("material_id") or ""),
+            request_key=str(job_row.get("request_key") or ""),
+        )
+        current_active_id = str((current_active or {}).get("id") or "")
+
+        if result_count <= 0:
+            _complete_generation(
+                conn,
+                generation_id=result_generation_id,
+                retrieval_profile="deep",
+                status="failed",
+                error_text="no_reels_generated",
+            )
+            upsert(
+                conn,
+                "reel_generation_jobs",
+                {
+                    **job_row,
+                    "result_generation_id": result_generation_id,
+                    "status": "failed",
+                    "started_at": started_at,
+                    "completed_at": now_iso(),
+                    "error_text": "no_reels_generated",
+                },
+            )
+            return
+
+        if current_active_id != source_generation_id:
+            _complete_generation(
+                conn,
+                generation_id=result_generation_id,
+                retrieval_profile="deep",
+                status="completed",
+            )
+            upsert(
+                conn,
+                "reel_generation_jobs",
+                {
+                    **job_row,
+                    "result_generation_id": result_generation_id,
+                    "status": "superseded",
+                    "started_at": started_at,
+                    "completed_at": now_iso(),
+                    "error_text": None,
+                },
+            )
+            return
+
+        _activate_generation(
+            conn,
+            material_id=str(job_row.get("material_id") or ""),
+            request_key=str(job_row.get("request_key") or ""),
+            generation_id=result_generation_id,
+            retrieval_profile="deep",
+        )
+        upsert(
+            conn,
+            "reel_generation_jobs",
+            {
+                **job_row,
+                "result_generation_id": result_generation_id,
+                "status": "completed",
+                "started_at": started_at,
+                "completed_at": now_iso(),
+                "error_text": None,
+            },
+        )
+
+
+def _ensure_generation_for_request(
+    conn,
+    *,
+    material_id: str,
+    concept_id: str | None,
+    required_count: int,
+    creative_commons_only: bool,
+    generation_mode: Literal["slow", "fast"],
+    min_relevance: float | None,
+    video_pool_mode: Literal["short-first", "balanced", "long-form"],
+    preferred_video_duration: Literal["any", "short", "medium", "long"],
+    target_clip_duration_sec: int,
+    target_clip_duration_min_sec: int | None,
+    target_clip_duration_max_sec: int | None,
+) -> dict[str, Any]:
+    request_key = _build_generation_request_key(
+        material_id=material_id,
+        concept_id=concept_id,
+        creative_commons_only=creative_commons_only,
+        generation_mode=generation_mode,
+        video_pool_mode=video_pool_mode,
+        preferred_video_duration=preferred_video_duration,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
+    fast_mode = generation_mode == "fast"
+    active_generation = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
+    if active_generation:
+        active_reels = _ranked_request_reels(
+            conn,
+            material_id=material_id,
+            fast_mode=fast_mode,
+            generation_id=str(active_generation.get("id") or ""),
+            min_relevance=min_relevance,
+            preferred_video_duration=preferred_video_duration,
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+        )
+        active_job = _fetch_refinement_job_for_generation(conn, str(active_generation.get("id") or ""))
+        if len(active_reels) >= required_count:
+            if str(active_generation.get("retrieval_profile") or "") == "bootstrap" and not active_job:
+                active_job = _queue_refinement_job(
+                    conn,
+                    material_id=material_id,
+                    concept_id=concept_id,
+                    request_key=request_key,
+                    source_generation_id=str(active_generation.get("id") or ""),
+                    request_params={
+                        "creative_commons_only": creative_commons_only,
+                        "video_pool_mode": video_pool_mode,
+                        "preferred_video_duration": preferred_video_duration,
+                        "target_clip_duration_sec": target_clip_duration_sec,
+                        "target_clip_duration_min_sec": target_clip_duration_min_sec,
+                        "target_clip_duration_max_sec": target_clip_duration_max_sec,
+                    },
+                )
+            return {
+                **_build_generation_response_payload(
+                    reels=active_reels,
+                    generation_id=str(active_generation.get("id") or ""),
+                    response_profile=str(active_generation.get("retrieval_profile") or "") or None,
+                    job_row=active_job,
+                ),
+                "request_key": request_key,
+            }
+
+    generation_id = _create_generation_row(
+        conn,
+        material_id=material_id,
+        concept_id=concept_id,
+        request_key=request_key,
+        generation_mode=generation_mode,
+        retrieval_profile="bootstrap",
+        source_generation_id=str((active_generation or {}).get("id") or "") or None,
+    )
+
+    reel_service.generate_reels(
+        conn,
+        material_id=material_id,
+        concept_id=concept_id,
+        num_reels=max(1, required_count),
+        creative_commons_only=creative_commons_only,
+        fast_mode=fast_mode,
+        video_pool_mode=video_pool_mode,
+        preferred_video_duration=preferred_video_duration,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+        retrieval_profile="bootstrap",
+        generation_id=generation_id,
+    )
+    filtered = _ranked_request_reels(
+        conn,
+        material_id=material_id,
+        fast_mode=fast_mode,
+        generation_id=generation_id,
+        min_relevance=min_relevance,
+        preferred_video_duration=preferred_video_duration,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
+
+    response_profile = "bootstrap"
+    if len(filtered) < required_count:
+        shortfall = max(1, required_count - len(filtered))
+        reel_service.generate_reels(
+            conn,
+            material_id=material_id,
+            concept_id=concept_id,
+            num_reels=shortfall,
+            creative_commons_only=creative_commons_only,
+            fast_mode=fast_mode,
+            video_pool_mode=video_pool_mode,
+            preferred_video_duration=preferred_video_duration,
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+            retrieval_profile="deep",
+            generation_id=generation_id,
+        )
+        filtered = _ranked_request_reels(
+            conn,
+            material_id=material_id,
+            fast_mode=fast_mode,
+            generation_id=generation_id,
+            min_relevance=min_relevance,
+            preferred_video_duration=preferred_video_duration,
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+        )
+        response_profile = "bootstrap_then_deep"
+
+    if not filtered:
+        _complete_generation(
+            conn,
+            generation_id=generation_id,
+            retrieval_profile=response_profile,
+            status="failed",
+            error_text="no_reels_generated",
+        )
+        fallback_reels = []
+        if active_generation:
+            fallback_reels = _ranked_request_reels(
+                conn,
+                material_id=material_id,
+                fast_mode=fast_mode,
+                generation_id=str(active_generation.get("id") or ""),
+                min_relevance=min_relevance,
+                preferred_video_duration=preferred_video_duration,
+                target_clip_duration_sec=target_clip_duration_sec,
+                target_clip_duration_min_sec=target_clip_duration_min_sec,
+                target_clip_duration_max_sec=target_clip_duration_max_sec,
+            )
+        active_job = _fetch_refinement_job_for_generation(conn, str((active_generation or {}).get("id") or ""))
+        return {
+            **_build_generation_response_payload(
+                reels=fallback_reels,
+                generation_id=str((active_generation or {}).get("id") or "") or None,
+                response_profile=str((active_generation or {}).get("retrieval_profile") or "") or None,
+                job_row=active_job,
+            ),
+            "request_key": request_key,
+        }
+
+    _activate_generation(
+        conn,
+        material_id=material_id,
+        request_key=request_key,
+        generation_id=generation_id,
+        retrieval_profile=response_profile,
+    )
+    job_row = None
+    if response_profile == "bootstrap":
+        job_row = _queue_refinement_job(
+            conn,
+            material_id=material_id,
+            concept_id=concept_id,
+            request_key=request_key,
+            source_generation_id=generation_id,
+            request_params={
+                "creative_commons_only": creative_commons_only,
+                "video_pool_mode": video_pool_mode,
+                "preferred_video_duration": preferred_video_duration,
+                "target_clip_duration_sec": target_clip_duration_sec,
+                "target_clip_duration_min_sec": target_clip_duration_min_sec,
+                "target_clip_duration_max_sec": target_clip_duration_max_sec,
+            },
+        )
+    return {
+        **_build_generation_response_payload(
+            reels=filtered,
+            generation_id=generation_id,
+            response_profile=response_profile,
+            job_row=job_row,
+        ),
+        "request_key": request_key,
+    }
+
+
 def _normalize_datetime_for_api(value: object) -> str | None:
     if isinstance(value, datetime):
         normalized_dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
@@ -2058,52 +2695,61 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
     if SERVERLESS_MODE:
         # Keep hosted/serverless requests within function time limits.
         requested_num_reels = min(requested_num_reels, 6)
-
-    reels: list[dict] = []
-    filtered: list[dict] = []
     with get_conn() as conn:
         material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
         if not material:
             raise HTTPException(status_code=404, detail="material_id not found")
 
-        attempts = 0
-        max_attempts = 1 if SERVERLESS_MODE else 4
-        effective_fast_mode = True if SERVERLESS_MODE else payload.generation_mode == "fast"
-        while attempts < max_attempts and len(filtered) < requested_num_reels:
-            need = max(1, requested_num_reels - len(filtered))
-            if SERVERLESS_MODE:
-                target_batch = min(8, max(need, 3))
-            else:
-                target_batch = min(30, max(need + 2, requested_num_reels if attempts == 0 else need))
-            try:
-                batch = reel_service.generate_reels(
-                    conn,
-                    material_id=payload.material_id,
-                    concept_id=payload.concept_id,
-                    num_reels=target_batch,
-                    creative_commons_only=payload.creative_commons_only,
-                    fast_mode=effective_fast_mode,
-                    video_pool_mode=safe_video_pool_mode,
-                    preferred_video_duration=safe_video_duration_pref,
-                    target_clip_duration_sec=safe_target_clip_duration_sec,
-                    target_clip_duration_min_sec=safe_target_clip_min_sec,
-                    target_clip_duration_max_sec=safe_target_clip_max_sec,
-                )
-            except YouTubeApiRequestError as e:
-                raise HTTPException(status_code=502, detail=str(e)) from e
-            attempts += 1
-            if not batch:
-                break
-            reels.extend(batch)
-            filtered = _filter_reels_by_min_relevance(reels, min_relevance)
-            filtered = _filter_reels_by_video_preferences(
-                filtered,
+        effective_generation_mode: Literal["slow", "fast"] = "fast" if SERVERLESS_MODE else payload.generation_mode
+        try:
+            generation_result = _ensure_generation_for_request(
+                conn,
+                material_id=payload.material_id,
+                concept_id=payload.concept_id,
+                required_count=requested_num_reels,
+                creative_commons_only=payload.creative_commons_only,
+                generation_mode=effective_generation_mode,
+                min_relevance=min_relevance,
+                video_pool_mode=safe_video_pool_mode,
                 preferred_video_duration=safe_video_duration_pref,
                 target_clip_duration_sec=safe_target_clip_duration_sec,
                 target_clip_duration_min_sec=safe_target_clip_min_sec,
                 target_clip_duration_max_sec=safe_target_clip_max_sec,
             )
-    return {"reels": filtered[:requested_num_reels]}
+        except YouTubeApiRequestError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
+    return {
+        "reels": list(generation_result.get("reels") or [])[:requested_num_reels],
+        "generation_id": generation_result.get("generation_id"),
+        "response_profile": generation_result.get("response_profile"),
+        "refinement_job_id": generation_result.get("refinement_job_id"),
+        "refinement_status": generation_result.get("refinement_status"),
+    }
+
+
+@app.get("/api/reels/refinement-status/{job_id}", response_model=RefinementStatusResponse)
+def refinement_status(request: Request, job_id: str):
+    _enforce_rate_limit(request, "reels-generate", limit=REELS_RATE_LIMIT_PER_WINDOW)
+    with get_conn() as conn:
+        job_row = fetch_one(conn, "SELECT * FROM reel_generation_jobs WHERE id = ? LIMIT 1", (job_id,))
+        if not job_row:
+            raise HTTPException(status_code=404, detail="job_id not found")
+        active_generation = _fetch_active_generation_row(
+            conn,
+            material_id=str(job_row.get("material_id") or ""),
+            request_key=str(job_row.get("request_key") or ""),
+        )
+        return {
+            "job_id": str(job_row.get("id") or ""),
+            "status": str(job_row.get("status") or ""),
+            "material_id": str(job_row.get("material_id") or ""),
+            "request_key": str(job_row.get("request_key") or ""),
+            "source_generation_id": str(job_row.get("source_generation_id") or ""),
+            "result_generation_id": str(job_row.get("result_generation_id") or "") or None,
+            "active_generation_id": str((active_generation or {}).get("id") or "") or None,
+            "completed_at": str(job_row.get("completed_at") or "") or None,
+            "error": str(job_row.get("error_text") or "") or None,
+        }
 
 
 @dataclass
@@ -2216,6 +2862,7 @@ def _probe_material_viability(
         target_clip_duration_min_sec=target_clip_duration_min_sec,
         target_clip_duration_max_sec=target_clip_duration_max_sec,
         dry_run=True,
+        retrieval_profile="bootstrap",
     )
     if batch:
         probe.extend(batch)
@@ -2272,6 +2919,7 @@ def _probe_material_viability(
         target_clip_duration_min_sec=MIN_TARGET_CLIP_DURATION_SEC,
         target_clip_duration_max_sec=MAX_TARGET_CLIP_DURATION_SEC,
         dry_run=True,
+        retrieval_profile="bootstrap",
     )
 
     blocked = bool(relaxed_probe)
@@ -2529,36 +3177,64 @@ def feed(
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
         )
-        ranked = reel_service.ranked_feed(conn, material_id, fast_mode=fast_mode)
-        filtered_ranked = _filter_reels_by_min_relevance(ranked, safe_min_relevance)
-        filtered_ranked = _filter_reels_by_video_preferences(
-            filtered_ranked,
+        request_key = _build_generation_request_key(
+            material_id=material_id,
+            concept_id=None,
+            creative_commons_only=creative_commons_only,
+            generation_mode="fast" if fast_mode else "slow",
+            video_pool_mode=safe_video_pool_mode,
             preferred_video_duration=safe_video_duration_pref,
             target_clip_duration_sec=safe_target_clip_duration_sec,
             target_clip_duration_min_sec=safe_target_clip_min_sec,
             target_clip_duration_max_sec=safe_target_clip_max_sec,
         )
+        active_generation = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
+        active_generation_id = str((active_generation or {}).get("id") or "") or None
+        filtered_ranked = _ranked_request_reels(
+            conn,
+            material_id=material_id,
+            fast_mode=fast_mode,
+            generation_id=active_generation_id,
+            min_relevance=safe_min_relevance,
+            preferred_video_duration=safe_video_duration_pref,
+            target_clip_duration_sec=safe_target_clip_duration_sec,
+            target_clip_duration_min_sec=safe_target_clip_min_sec,
+            target_clip_duration_max_sec=safe_target_clip_max_sec,
+        )
+        response_profile = str((active_generation or {}).get("retrieval_profile") or "") or None
+        refinement_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
+        if active_generation_id and response_profile == "bootstrap" and not refinement_job:
+            refinement_job = _queue_refinement_job(
+                conn,
+                material_id=material_id,
+                concept_id=None,
+                request_key=request_key,
+                source_generation_id=active_generation_id,
+                request_params={
+                    "creative_commons_only": creative_commons_only,
+                    "video_pool_mode": safe_video_pool_mode,
+                    "preferred_video_duration": safe_video_duration_pref,
+                    "target_clip_duration_sec": safe_target_clip_duration_sec,
+                    "target_clip_duration_min_sec": safe_target_clip_min_sec,
+                    "target_clip_duration_max_sec": safe_target_clip_max_sec,
+                },
+            )
         # Auto-expand the feed while users scroll so we can keep serving fresh reels.
         if autofill:
             if SERVERLESS_MODE:
                 target_total = page * limit + prefetch + 2
-                max_attempts = 1
-                max_batch = 6
             else:
                 target_total = page * limit + prefetch + (10 if fast_mode else 6)
-                max_attempts = 5 if fast_mode else 4
-                max_batch = 18 if fast_mode else 14
-            attempts = 0
-            while len(filtered_ranked) < target_total and attempts < max_attempts:
-                need = max(1, target_total - len(filtered_ranked))
+            if len(filtered_ranked) < target_total:
                 try:
-                    generated = reel_service.generate_reels(
+                    generation_result = _ensure_generation_for_request(
                         conn,
                         material_id=material_id,
                         concept_id=None,
-                        num_reels=min(max_batch, max(need + 4, limit + 4)),
+                        required_count=target_total,
                         creative_commons_only=creative_commons_only,
-                        fast_mode=fast_mode,
+                        generation_mode="fast" if fast_mode else "slow",
+                        min_relevance=safe_min_relevance,
                         video_pool_mode=safe_video_pool_mode,
                         preferred_video_duration=safe_video_duration_pref,
                         target_clip_duration_sec=safe_target_clip_duration_sec,
@@ -2566,25 +3242,30 @@ def feed(
                         target_clip_duration_max_sec=safe_target_clip_max_sec,
                     )
                 except YouTubeApiRequestError:
-                    break
-                attempts += 1
-                if not generated:
-                    break
-                ranked = reel_service.ranked_feed(conn, material_id, fast_mode=fast_mode)
-                filtered_ranked = _filter_reels_by_min_relevance(ranked, safe_min_relevance)
-                filtered_ranked = _filter_reels_by_video_preferences(
-                    filtered_ranked,
-                    preferred_video_duration=safe_video_duration_pref,
-                    target_clip_duration_sec=safe_target_clip_duration_sec,
-                    target_clip_duration_min_sec=safe_target_clip_min_sec,
-                    target_clip_duration_max_sec=safe_target_clip_max_sec,
-                )
+                    generation_result = None
+                if generation_result:
+                    filtered_ranked = list(generation_result.get("reels") or [])
+                    active_generation_id = generation_result.get("generation_id")
+                    response_profile = generation_result.get("response_profile")
+                    refinement_job = {
+                        "id": generation_result.get("refinement_job_id"),
+                        "status": generation_result.get("refinement_status"),
+                    } if generation_result.get("refinement_job_id") else None
     total = len(filtered_ranked)
     start = (page - 1) * limit
     end = start + limit
     reels = filtered_ranked[start:end]
 
-    return {"page": page, "limit": limit, "total": total, "reels": reels}
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "reels": reels,
+        "generation_id": active_generation_id,
+        "response_profile": response_profile,
+        "refinement_job_id": str((refinement_job or {}).get("id") or "") or None,
+        "refinement_status": str((refinement_job or {}).get("status") or "") or None,
+    }
 
 
 @app.post("/api/chat", response_model=ChatResponse)

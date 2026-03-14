@@ -86,8 +86,65 @@ CREATE TABLE IF NOT EXISTS transcript_chunks (
 
 CREATE INDEX IF NOT EXISTS idx_transcript_chunks_video_id ON transcript_chunks(video_id);
 
+CREATE TABLE IF NOT EXISTS reel_generations (
+    id TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    concept_id TEXT,
+    request_key TEXT NOT NULL,
+    generation_mode TEXT NOT NULL DEFAULT 'fast',
+    retrieval_profile TEXT NOT NULL DEFAULT 'bootstrap',
+    status TEXT NOT NULL DEFAULT 'pending',
+    source_generation_id TEXT,
+    reel_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    activated_at TEXT,
+    error_text TEXT,
+    FOREIGN KEY(material_id) REFERENCES materials(id),
+    FOREIGN KEY(concept_id) REFERENCES concepts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reel_generations_material_request_created
+ON reel_generations(material_id, request_key, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS reel_generation_heads (
+    id TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    request_key TEXT NOT NULL,
+    active_generation_id TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(material_id) REFERENCES materials(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reel_generation_heads_active
+ON reel_generation_heads(active_generation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_generation_heads_material_request
+ON reel_generation_heads(material_id, request_key);
+
+CREATE TABLE IF NOT EXISTS reel_generation_jobs (
+    id TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    concept_id TEXT,
+    request_key TEXT NOT NULL,
+    source_generation_id TEXT NOT NULL,
+    result_generation_id TEXT,
+    target_profile TEXT NOT NULL DEFAULT 'deep',
+    request_params_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'queued',
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    error_text TEXT,
+    FOREIGN KEY(material_id) REFERENCES materials(id),
+    FOREIGN KEY(concept_id) REFERENCES concepts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reel_generation_jobs_material_request_status
+ON reel_generation_jobs(material_id, request_key, status, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS reels (
     id TEXT PRIMARY KEY,
+    generation_id TEXT,
     material_id TEXT NOT NULL,
     concept_id TEXT NOT NULL,
     video_id TEXT NOT NULL,
@@ -105,6 +162,7 @@ CREATE TABLE IF NOT EXISTS reels (
 
 CREATE INDEX IF NOT EXISTS idx_reels_material_id ON reels(material_id);
 CREATE INDEX IF NOT EXISTS idx_reels_concept_id ON reels(concept_id);
+CREATE INDEX IF NOT EXISTS idx_reels_generation_id ON reels(generation_id);
 
 CREATE TABLE IF NOT EXISTS reel_feedback (
     id TEXT PRIMARY KEY,
@@ -470,12 +528,18 @@ def _migrate_reels_unique_clip_index_sqlite(conn: sqlite3.Connection) -> None:
         WHERE rowid NOT IN (
             SELECT MIN(rowid)
             FROM reels
-            GROUP BY material_id, video_id, t_start, t_end
+            GROUP BY material_id, COALESCE(generation_id, ''), video_id, t_start, t_end
         )
         """
     )
     conn.execute("DROP INDEX IF EXISTS idx_reels_material_video_unique")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique ON reels(material_id, video_id, t_start, t_end)")
+    conn.execute("DROP INDEX IF EXISTS idx_reels_material_video_clip_unique")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique
+        ON reels(material_id, COALESCE(generation_id, ''), video_id, t_start, t_end)
+        """
+    )
 
 
 def _migrate_reels_unique_clip_index_postgres(conn: Any) -> None:
@@ -485,6 +549,7 @@ def _migrate_reels_unique_clip_index_postgres(conn: Any) -> None:
             DELETE FROM reels AS older
             USING reels AS newer
             WHERE older.material_id = newer.material_id
+              AND COALESCE(older.generation_id, '') = COALESCE(newer.generation_id, '')
               AND older.video_id = newer.video_id
               AND older.t_start = newer.t_start
               AND older.t_end = newer.t_end
@@ -492,7 +557,13 @@ def _migrate_reels_unique_clip_index_postgres(conn: Any) -> None:
             """
         )
         cur.execute("DROP INDEX IF EXISTS idx_reels_material_video_unique")
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique ON reels(material_id, video_id, t_start, t_end)")
+        cur.execute("DROP INDEX IF EXISTS idx_reels_material_video_clip_unique")
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique
+            ON reels(material_id, COALESCE(generation_id, ''), video_id, t_start, t_end)
+            """
+        )
 
 
 def init_db() -> None:
@@ -511,6 +582,8 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS verification_code_hash TEXT")
                 cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS verification_expires_at TEXT")
                 cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS legacy_claim_owner_key_hash TEXT")
+                cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS generation_id TEXT")
+                cur.execute("ALTER TABLE reel_generation_jobs ADD COLUMN IF NOT EXISTS request_params_json TEXT NOT NULL DEFAULT '{}'")
                 cur.execute(
                     "UPDATE community_accounts SET email = NULL WHERE email IS NOT NULL AND BTRIM(email) = ''"
                 )
@@ -607,6 +680,14 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE community_accounts ADD COLUMN legacy_claim_owner_key_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE reels ADD COLUMN generation_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE reel_generation_jobs ADD COLUMN request_params_json TEXT NOT NULL DEFAULT '{}'")
         except sqlite3.OperationalError:
             pass
         try:

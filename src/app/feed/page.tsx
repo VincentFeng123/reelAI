@@ -12,6 +12,7 @@ import {
   clearCommunityAuthSession,
   fetchCommunitySettings,
   fetchFeed,
+  fetchRefinementStatus,
   generateReels,
   isSessionExpiredError,
   queueCommunityHistorySync,
@@ -562,6 +563,8 @@ function FeedPageInner() {
   const hydratedMaterialIdRef = useRef<string | null>(null);
   const materialIdsForFeedRef = useRef<string[]>([]);
   const settingsLoadSequenceRef = useRef(0);
+  const pendingRefinementJobsRef = useRef<Map<string, string>>(new Map());
+  const isRefreshingRefinementRef = useRef(false);
 
   const normalizeClipKeyTime = useCallback((value: unknown): string => {
     const parsed = Number(value);
@@ -871,6 +874,23 @@ function FeedPageInner() {
     [params, router],
   );
 
+  const registerRefinementJob = useCallback(
+    (materialIdValue: string, payload?: { refinement_job_id?: string | null; refinement_status?: string | null }) => {
+      const materialIdKey = String(materialIdValue || "").trim();
+      if (!materialIdKey) {
+        return;
+      }
+      const jobId = String(payload?.refinement_job_id || "").trim();
+      const status = String(payload?.refinement_status || "").trim().toLowerCase();
+      if (!jobId || status === "failed" || status === "completed" || status === "superseded") {
+        pendingRefinementJobsRef.current.delete(materialIdKey);
+        return;
+      }
+      pendingRefinementJobsRef.current.set(materialIdKey, jobId);
+    },
+    [],
+  );
+
   const loadPage = useCallback(
     async (targetPage: number, options?: { autofill?: boolean }) => {
       const feedMaterialIds = getFeedMaterialIds();
@@ -907,6 +927,7 @@ function FeedPageInner() {
         );
 
         const successful = rows.filter((row) => row.data);
+        successful.forEach((row) => registerRefinementJob(row.materialId, row.data ?? undefined));
         if (successful.length === 0) {
           if (targetPage === 1) {
             const firstError = rows[0]?.error;
@@ -956,7 +977,7 @@ function FeedPageInner() {
         isFetchingRef.current = false;
       }
     },
-    [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, materialId, recoverMissingMaterial, settingsScopeReady],
+    [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, materialId, recoverMissingMaterial, registerRefinementJob, settingsScopeReady],
   );
 
   const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
@@ -976,7 +997,7 @@ function FeedPageInner() {
       const generatedRows = await Promise.all(
         feedMaterialIds.map(async (id) => {
           try {
-            return await generateReels({
+            const data = await generateReels({
               materialId: id,
               numReels: perTopicBatch,
               generationMode,
@@ -987,13 +1008,19 @@ function FeedPageInner() {
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
             });
+            return { materialId: id, data };
           } catch (e) {
             console.warn(`Background reel generation failed for topic material ${id}:`, e);
             return null;
           }
         }),
       );
-      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row?.reels ?? [])));
+      generatedRows.forEach((row) => {
+        if (row?.data) {
+          registerRefinementJob(row.materialId, row.data);
+        }
+      });
+      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row?.data.reels ?? [])));
       if (generated.length === 0) {
         emptyGenerateStreakRef.current += 1;
         if (emptyGenerateStreakRef.current >= MAX_EMPTY_GENERATION_STREAK) {
@@ -1020,7 +1047,7 @@ function FeedPageInner() {
       setGeneratingMore(false);
       isGeneratingRef.current = false;
     }
-  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration, settingsScopeReady]);
+  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration, registerRefinementJob, settingsScopeReady]);
 
   useEffect(() => {
     mutedRestoredFromSnapshotRef.current = false;
@@ -1079,6 +1106,7 @@ function FeedPageInner() {
       setGeneratingMore(false);
       emptyGenerateStreakRef.current = 0;
       bootstrapAttemptedRef.current = false;
+      pendingRefinementJobsRef.current.clear();
       setLoading(false);
       return;
     }
@@ -1119,6 +1147,7 @@ function FeedPageInner() {
     setBootstrappingFirstReels(false);
     emptyGenerateStreakRef.current = 0;
     bootstrapAttemptedRef.current = false;
+    pendingRefinementJobsRef.current.clear();
     if (restoredSession) {
       const restoredReels = dedupeByIdentity(restoredSession.reels).slice(-MAX_REELS_PER_FEED_SESSION);
       const restoredIndex = restoredReels.length > 0 ? clamp(restoredSession.activeIndex, 0, restoredReels.length - 1) : 0;
@@ -1174,6 +1203,63 @@ function FeedPageInner() {
     [dedupeByIdentity],
   );
 
+  const refreshRefinedFeed = useCallback(async () => {
+    const feedMaterialIds = getFeedMaterialIds();
+    if (!settingsScopeReady || feedMaterialIds.length === 0 || isRefreshingRefinementRef.current) {
+      return;
+    }
+    isRefreshingRefinementRef.current = true;
+    try {
+      const tuning = getFeedTuningSettings();
+      const refreshLimit = Math.max(PAGE_SIZE, reels.length || PAGE_SIZE);
+      const currentReelId = reels[activeIndexRef.current]?.reel_id;
+      const rows = await Promise.all(
+        feedMaterialIds.map(async (id) => {
+          try {
+            const data = await fetchFeed({
+              materialId: id,
+              page: 1,
+              limit: refreshLimit,
+              autofill: false,
+              prefetch: 0,
+              generationMode,
+              minRelevance: tuning.minRelevance,
+              videoPoolMode: tuning.videoPoolMode,
+              preferredVideoDuration: tuning.preferredVideoDuration,
+              targetClipDurationSec: tuning.targetClipDurationSec,
+              targetClipDurationMinSec: tuning.targetClipDurationMinSec,
+              targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+            });
+            return { materialId: id, data };
+          } catch (error) {
+            console.warn(`Refined feed refresh failed for topic material ${id}:`, error);
+            return null;
+          }
+        }),
+      );
+      const successful = rows.filter((row): row is { materialId: string; data: Awaited<ReturnType<typeof fetchFeed>> } => Boolean(row?.data));
+      if (successful.length === 0) {
+        return;
+      }
+      successful.forEach((row) => registerRefinementJob(row.materialId, row.data));
+      const refreshedReels = dedupeByIdentity(interleaveReelBatches(successful.map((row) => row.data.reels)));
+      const refreshedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data.total) || 0), 0);
+      setReels(refreshedReels);
+      setTotal(Math.max(refreshedTotal, refreshedReels.length));
+      setPage(Math.max(1, Math.ceil(refreshedReels.length / PAGE_SIZE)));
+      if (refreshedReels.length === 0) {
+        setActiveIndex(0);
+      } else if (currentReelId) {
+        const nextIndex = refreshedReels.findIndex((reel) => reel.reel_id === currentReelId);
+        setActiveIndex(nextIndex >= 0 ? nextIndex : Math.min(activeIndexRef.current, refreshedReels.length - 1));
+      } else {
+        setActiveIndex(Math.min(activeIndexRef.current, refreshedReels.length - 1));
+      }
+    } finally {
+      isRefreshingRefinementRef.current = false;
+    }
+  }, [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, reels, registerRefinementJob, settingsScopeReady]);
+
   const runFastTopUp = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
     if (
@@ -1193,7 +1279,7 @@ function FeedPageInner() {
       const generatedRows = await Promise.all(
         feedMaterialIds.map(async (id) => {
           try {
-            return await generateReels({
+            const data = await generateReels({
               materialId: id,
               numReels: perTopicBatch,
               generationMode,
@@ -1204,13 +1290,19 @@ function FeedPageInner() {
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
             });
+            return { materialId: id, data };
           } catch (e) {
             console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
             return null;
           }
         }),
       );
-      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row?.reels ?? [])));
+      generatedRows.forEach((row) => {
+        if (row?.data) {
+          registerRefinementJob(row.materialId, row.data);
+        }
+      });
+      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row?.data.reels ?? [])));
       if (generated.length > 0) {
         emptyGenerateStreakRef.current = 0;
         appendGeneratedReels(generated);
@@ -1220,7 +1312,52 @@ function FeedPageInner() {
     } finally {
       isFastTopUpRef.current = false;
     }
-  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, settingsScopeReady]);
+  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, registerRefinementJob, settingsScopeReady]);
+
+  useEffect(() => {
+    if (!settingsScopeReady || getFeedMaterialIds().length === 0) {
+      return;
+    }
+    let cancelled = false;
+    const pollRefinements = async () => {
+      const pendingEntries = Array.from(pendingRefinementJobsRef.current.entries());
+      if (pendingEntries.length === 0 || isRefreshingRefinementRef.current) {
+        return;
+      }
+      let shouldRefresh = false;
+      await Promise.all(
+        pendingEntries.map(async ([materialIdKey, jobId]) => {
+          try {
+            const status = await fetchRefinementStatus(jobId);
+            if (status.status === "failed" || status.status === "superseded" || status.status === "completed") {
+              pendingRefinementJobsRef.current.delete(materialIdKey);
+            }
+            if (
+              status.status === "completed"
+              && status.result_generation_id
+              && status.result_generation_id === status.active_generation_id
+            ) {
+              shouldRefresh = true;
+            }
+          } catch (error) {
+            console.warn(`Refinement status polling failed for material ${materialIdKey}:`, error);
+          }
+        }),
+      );
+      if (!cancelled && shouldRefresh) {
+        await refreshRefinedFeed();
+      }
+    };
+
+    void pollRefinements();
+    const timer = window.setInterval(() => {
+      void pollRefinements();
+    }, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [getFeedMaterialIds, refreshRefinedFeed, settingsScopeReady]);
 
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {

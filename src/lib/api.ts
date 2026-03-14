@@ -7,6 +7,7 @@ import type {
   CommunityReelPlatform,
   FeedResponse,
   MaterialResponse,
+  RefinementStatusResponse,
   ReelsCanGenerateAnyResponse,
   ReelsCanGenerateResponse,
   ReelsGenerateResponse,
@@ -717,6 +718,13 @@ export async function fetchFeed(params: {
   });
 
   return parseJsonResponse<FeedResponse>(res);
+}
+
+export async function fetchRefinementStatus(jobId: string): Promise<RefinementStatusResponse> {
+  const res = await safeFetch(apiUrl(`/reels/refinement-status/${encodeURIComponent(jobId)}`), {
+    cache: "no-store",
+  });
+  return parseJsonResponse<RefinementStatusResponse>(res);
 }
 
 export async function sendFeedback(params: {

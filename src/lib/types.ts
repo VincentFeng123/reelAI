@@ -42,6 +42,10 @@ export type CaptionCue = {
 
 export type ReelsGenerateResponse = {
   reels: Reel[];
+  generation_id?: string | null;
+  response_profile?: string | null;
+  refinement_job_id?: string | null;
+  refinement_status?: string | null;
 };
 
 export type ReelsCanGenerateResponse = {
@@ -72,6 +76,22 @@ export type FeedResponse = {
   limit: number;
   total: number;
   reels: Reel[];
+  generation_id?: string | null;
+  response_profile?: string | null;
+  refinement_job_id?: string | null;
+  refinement_status?: string | null;
+};
+
+export type RefinementStatusResponse = {
+  job_id: string;
+  status: string;
+  material_id: string;
+  request_key: string;
+  source_generation_id: string;
+  result_generation_id?: string | null;
+  active_generation_id?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
 };
 
 export type ChatMessage = {

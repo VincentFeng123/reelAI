@@ -6,7 +6,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
@@ -23,6 +23,9 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 class YouTubeApiRequestError(RuntimeError):
     pass
+
+
+RetrievalProfile = Literal["bootstrap", "deep"]
 
 
 def _cache_key(*parts: str) -> str:
@@ -83,6 +86,9 @@ class YouTubeService:
         retrieval_strategy: str = "",
         retrieval_stage: str = "",
         source_surface: str = "youtube_api",
+        retrieval_profile: RetrievalProfile = "deep",
+        allow_external_fallbacks: bool = True,
+        variant_limit: int | None = None,
     ) -> list[dict[str, Any]]:
         if conn is None:
             with get_conn() as local_conn:
@@ -95,6 +101,9 @@ class YouTubeService:
                     retrieval_strategy=retrieval_strategy,
                     retrieval_stage=retrieval_stage,
                     source_surface=source_surface,
+                    retrieval_profile=retrieval_profile,
+                    allow_external_fallbacks=allow_external_fallbacks,
+                    variant_limit=variant_limit,
                 )
         return self._search_videos_with_conn(
             conn,
@@ -105,6 +114,9 @@ class YouTubeService:
             retrieval_strategy=retrieval_strategy,
             retrieval_stage=retrieval_stage,
             source_surface=source_surface,
+            retrieval_profile=retrieval_profile,
+            allow_external_fallbacks=allow_external_fallbacks,
+            variant_limit=variant_limit,
         )
 
     def _search_videos_with_conn(
@@ -117,6 +129,9 @@ class YouTubeService:
         retrieval_strategy: str,
         retrieval_stage: str,
         source_surface: str,
+        retrieval_profile: RetrievalProfile,
+        allow_external_fallbacks: bool,
+        variant_limit: int | None,
     ) -> list[dict[str, Any]]:
         duration_key = video_duration or "any"
         key = _cache_key(
@@ -127,6 +142,9 @@ class YouTubeService:
             retrieval_strategy or "",
             retrieval_stage or "",
             source_surface or "",
+            retrieval_profile,
+            str(bool(allow_external_fallbacks)),
+            str(variant_limit or 0),
         )
         cached = fetch_one(conn, "SELECT response_json FROM search_cache WHERE cache_key = ?", (key,))
         if cached:
@@ -143,6 +161,46 @@ class YouTubeService:
         deadline = time.monotonic() + self.search_time_budget_sec
         videos: list[dict[str, Any]] = []
         fast_non_api_enabled = not creative_commons_only
+        if retrieval_profile == "bootstrap":
+            if creative_commons_only and self.api_key:
+                videos = self._search_via_data_api(
+                    query=query,
+                    max_results=max_results,
+                    creative_commons_only=True,
+                    video_duration=video_duration,
+                    retrieval_strategy=retrieval_strategy,
+                    retrieval_stage=retrieval_stage,
+                    source_surface="youtube_api",
+                    deadline=deadline,
+                )
+            else:
+                videos = self._search_without_data_api(
+                    query=query,
+                    max_results=max_results,
+                    creative_commons_only=creative_commons_only,
+                    video_duration=video_duration,
+                    retrieval_strategy=retrieval_strategy,
+                    retrieval_stage=retrieval_stage,
+                    source_surface="youtube_html",
+                    deadline=deadline,
+                    include_external_fallbacks=allow_external_fallbacks,
+                    variant_limit=variant_limit or 1,
+                    skip_primary_variants=False,
+                    retrieval_profile=retrieval_profile,
+                )
+            videos = self._merge_unique_videos(videos, [], max_results)
+            upsert(
+                conn,
+                "search_cache",
+                {
+                    "cache_key": key,
+                    "response_json": dumps_json(videos),
+                    "created_at": now_iso(),
+                },
+                pk="cache_key",
+            )
+            return videos
+
         futures: list[tuple[str, Any]] = []
         max_workers = 1 + int(bool(self.api_key)) + int(fast_non_api_enabled)
         max_workers = max(1, min(3, max_workers))
@@ -181,6 +239,7 @@ class YouTubeService:
                             False,
                             self.PRIMARY_VARIANT_LIMIT,
                             False,
+                            retrieval_profile,
                         ),
                     )
                 )
@@ -211,6 +270,7 @@ class YouTubeService:
                 include_external_fallbacks=True,
                 variant_limit=self.SEARCH_VARIANTS_LIMIT,
                 skip_primary_variants=True,
+                retrieval_profile=retrieval_profile,
             )
             videos = self._merge_unique_videos(videos, expanded, max_results)
 
@@ -226,6 +286,7 @@ class YouTubeService:
                 source_surface=source_surface,
                 deadline=deadline,
                 include_external_fallbacks=True,
+                retrieval_profile=retrieval_profile,
             )
         videos = self._merge_unique_videos(videos, [], max_results)
 
@@ -362,6 +423,7 @@ class YouTubeService:
         include_external_fallbacks: bool = True,
         variant_limit: int | None = None,
         skip_primary_variants: bool = False,
+        retrieval_profile: RetrievalProfile = "deep",
     ) -> list[dict[str, Any]]:
         # License cannot be reliably verified without the Data API.
         if creative_commons_only:
@@ -375,6 +437,7 @@ class YouTubeService:
             query=query,
             video_duration=video_duration,
             source_surface=source_surface,
+            retrieval_profile=retrieval_profile,
         )
         if skip_primary_variants and len(query_variants) > self.PRIMARY_VARIANT_LIMIT:
             query_variants = query_variants[self.PRIMARY_VARIANT_LIMIT :]
@@ -592,10 +655,14 @@ class YouTubeService:
         query: str,
         video_duration: str | None,
         source_surface: str,
+        retrieval_profile: RetrievalProfile,
     ) -> list[dict[str, str]]:
         base = " ".join(str(query or "").split()).strip()
         if not base:
             return []
+
+        if retrieval_profile == "bootstrap":
+            return [{"query": base, "surface": source_surface or "youtube_html"}]
 
         variants: list[tuple[str, str]] = [
             (base, source_surface or "youtube_html"),
