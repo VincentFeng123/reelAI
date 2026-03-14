@@ -162,7 +162,6 @@ CREATE TABLE IF NOT EXISTS reels (
 
 CREATE INDEX IF NOT EXISTS idx_reels_material_id ON reels(material_id);
 CREATE INDEX IF NOT EXISTS idx_reels_concept_id ON reels(concept_id);
-CREATE INDEX IF NOT EXISTS idx_reels_generation_id ON reels(generation_id);
 
 CREATE TABLE IF NOT EXISTS reel_feedback (
     id TEXT PRIMARY KEY,
@@ -566,6 +565,15 @@ def _migrate_reels_unique_clip_index_postgres(conn: Any) -> None:
         )
 
 
+def _ensure_reels_generation_index_sqlite(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reels_generation_id ON reels(generation_id)")
+
+
+def _ensure_reels_generation_index_postgres(conn: Any) -> None:
+    with conn.cursor() as cur:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reels_generation_id ON reels(generation_id)")
+
+
 def init_db() -> None:
     global _db_ready
     if _is_postgres_configured():
@@ -584,6 +592,7 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS legacy_claim_owner_key_hash TEXT")
                 cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS generation_id TEXT")
                 cur.execute("ALTER TABLE reel_generation_jobs ADD COLUMN IF NOT EXISTS request_params_json TEXT NOT NULL DEFAULT '{}'")
+                _ensure_reels_generation_index_postgres(conn)
                 cur.execute(
                     "UPDATE community_accounts SET email = NULL WHERE email IS NOT NULL AND BTRIM(email) = ''"
                 )
@@ -686,6 +695,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE reels ADD COLUMN generation_id TEXT")
         except sqlite3.OperationalError:
             pass
+        _ensure_reels_generation_index_sqlite(conn)
         try:
             conn.execute("ALTER TABLE reel_generation_jobs ADD COLUMN request_params_json TEXT NOT NULL DEFAULT '{}'")
         except sqlite3.OperationalError:

@@ -10,7 +10,7 @@ if str(ROOT) not in sys.path:
 
 import backend.app.main as main_module
 from backend.app.main import _resolve_target_clip_duration_bounds
-from backend.app.db import _migrate_reels_unique_clip_index_sqlite
+from backend.app.db import SCHEMA, _ensure_reels_generation_index_sqlite, _migrate_reels_unique_clip_index_sqlite
 from backend.app.services.material_intelligence import MaterialIntelligenceService
 from backend.app.services.reels import QueryCandidate, ReelService
 from backend.app.services.youtube import YouTubeService
@@ -329,6 +329,45 @@ class MediumRegressionTests(unittest.TestCase):
                 "SELECT generation_id, COUNT(*) AS reel_count FROM reels GROUP BY generation_id ORDER BY generation_id"
             ).fetchall()
             self.assertEqual([(row[0], row[1]) for row in rows], [("gen-a", 1), ("gen-b", 1)])
+        finally:
+            conn.close()
+
+    def test_sqlite_schema_upgrade_adds_generation_id_before_generation_index(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE reels (
+                    id TEXT PRIMARY KEY,
+                    material_id TEXT NOT NULL,
+                    concept_id TEXT NOT NULL,
+                    video_id TEXT NOT NULL,
+                    video_url TEXT NOT NULL DEFAULT '',
+                    t_start REAL NOT NULL,
+                    t_end REAL NOT NULL,
+                    transcript_snippet TEXT NOT NULL DEFAULT '',
+                    takeaways_json TEXT NOT NULL DEFAULT '[]',
+                    base_score REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+
+            conn.executescript(SCHEMA)
+            conn.execute("ALTER TABLE reels ADD COLUMN generation_id TEXT")
+            _ensure_reels_generation_index_sqlite(conn)
+            _migrate_reels_unique_clip_index_sqlite(conn)
+
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(reels)").fetchall()
+            }
+            index_names = {
+                row[1]
+                for row in conn.execute("PRAGMA index_list(reels)").fetchall()
+            }
+            self.assertIn("generation_id", columns)
+            self.assertIn("idx_reels_generation_id", index_names)
         finally:
             conn.close()
 
