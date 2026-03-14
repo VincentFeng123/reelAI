@@ -4,7 +4,6 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
-import { LoadingFlappyMiniGame } from "@/components/LoadingFlappyMiniGame";
 import { ReelCard } from "@/components/ReelCard";
 import {
   COMMUNITY_AUTH_CHANGED_EVENT,
@@ -32,6 +31,8 @@ import {
 import type { ChatMessage, Reel } from "@/lib/types";
 
 const PAGE_SIZE = 5;
+const INITIAL_FAST_PREFETCH = 6;
+const INITIAL_SLOW_PREFETCH = 4;
 const REEL_SNAP_DURATION_MS = 300;
 const POST_SNAP_COOLDOWN_MS = 30;
 const WHEEL_GESTURE_RELEASE_MS = 220;
@@ -910,7 +911,7 @@ function FeedPageInner() {
                 page: targetPage,
                 limit: PAGE_SIZE,
                 autofill: options?.autofill ?? true,
-                prefetch: generationMode === "fast" ? 18 : 12,
+                prefetch: generationMode === "fast" ? INITIAL_FAST_PREFETCH : INITIAL_SLOW_PREFETCH,
                 generationMode,
                 minRelevance: tuning.minRelevance,
                 videoPoolMode: tuning.videoPoolMode,
@@ -932,13 +933,15 @@ function FeedPageInner() {
           if (targetPage === 1) {
             const firstError = rows[0]?.error;
             const message = firstError instanceof Error ? firstError.message : "Feed failed to load";
+            const missingMaterialId = String(rows[0]?.materialId || materialId || "").trim();
             if (
               feedMaterialIds.length === 1 &&
               /material_id not found/i.test(message) &&
-              !recoveryAttemptedIdsRef.current.has(materialId)
+              missingMaterialId &&
+              !recoveryAttemptedIdsRef.current.has(missingMaterialId)
             ) {
-              recoveryAttemptedIdsRef.current.add(materialId);
-              const recovered = await recoverMissingMaterial(materialId);
+              recoveryAttemptedIdsRef.current.add(missingMaterialId);
+              const recovered = await recoverMissingMaterial(missingMaterialId);
               if (recovered) {
                 return;
               }
@@ -1008,19 +1011,37 @@ function FeedPageInner() {
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
             });
-            return { materialId: id, data };
+            return { materialId: id, data, error: null };
           } catch (e) {
             console.warn(`Background reel generation failed for topic material ${id}:`, e);
-            return null;
+            return { materialId: id, data: null, error: e };
           }
         }),
       );
+      const firstFailedRow = generatedRows.find((row) => row?.error);
+      const firstFailureMessage =
+        firstFailedRow?.error instanceof Error ? firstFailedRow.error.message : "";
+      const missingMaterialId = String(firstFailedRow?.materialId || materialId || "").trim();
+      if (
+        feedMaterialIds.length === 1 &&
+        /material_id not found/i.test(firstFailureMessage) &&
+        missingMaterialId
+      ) {
+        if (!recoveryAttemptedIdsRef.current.has(missingMaterialId)) {
+          recoveryAttemptedIdsRef.current.add(missingMaterialId);
+          const recovered = await recoverMissingMaterial(missingMaterialId);
+          if (recovered) {
+            return [];
+          }
+        }
+        return [];
+      }
       generatedRows.forEach((row) => {
         if (row?.data) {
           registerRefinementJob(row.materialId, row.data);
         }
       });
-      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row?.data.reels ?? [])));
+      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row.data?.reels ?? [])));
       if (generated.length === 0) {
         emptyGenerateStreakRef.current += 1;
         if (emptyGenerateStreakRef.current >= MAX_EMPTY_GENERATION_STREAK) {
@@ -1047,7 +1068,7 @@ function FeedPageInner() {
       setGeneratingMore(false);
       isGeneratingRef.current = false;
     }
-  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration, registerRefinementJob, settingsScopeReady]);
+  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration, materialId, recoverMissingMaterial, registerRefinementJob, settingsScopeReady]);
 
   useEffect(() => {
     mutedRestoredFromSnapshotRef.current = false;
@@ -2311,7 +2332,6 @@ function FeedPageInner() {
                       Generate Reels
                     </button>
                   ) : null}
-                  {loading || bootstrappingFirstReels || generatingMore ? <LoadingFlappyMiniGame /> : null}
                 </div>
               </div>
             ) : null}

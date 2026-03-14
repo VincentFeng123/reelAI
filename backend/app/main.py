@@ -1717,6 +1717,7 @@ def _ensure_generation_for_request(
     material_id: str,
     concept_id: str | None,
     required_count: int,
+    sync_deep_fallback: Literal["always", "if_empty", "never"] = "always",
     creative_commons_only: bool,
     generation_mode: Literal["slow", "fast"],
     min_relevance: float | None,
@@ -1740,40 +1741,49 @@ def _ensure_generation_for_request(
     fast_mode = generation_mode == "fast"
     active_generation = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
     if active_generation:
+        active_generation_id = str(active_generation.get("id") or "")
+        active_response_profile = str(active_generation.get("retrieval_profile") or "") or None
         active_reels = _ranked_request_reels(
             conn,
             material_id=material_id,
             fast_mode=fast_mode,
-            generation_id=str(active_generation.get("id") or ""),
+            generation_id=active_generation_id,
             min_relevance=min_relevance,
             preferred_video_duration=preferred_video_duration,
             target_clip_duration_sec=target_clip_duration_sec,
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
         )
-        active_job = _fetch_refinement_job_for_generation(conn, str(active_generation.get("id") or ""))
-        if len(active_reels) >= required_count:
-            if str(active_generation.get("retrieval_profile") or "") == "bootstrap" and not active_job:
-                active_job = _queue_refinement_job(
-                    conn,
-                    material_id=material_id,
-                    concept_id=concept_id,
-                    request_key=request_key,
-                    source_generation_id=str(active_generation.get("id") or ""),
-                    request_params={
-                        "creative_commons_only": creative_commons_only,
-                        "video_pool_mode": video_pool_mode,
-                        "preferred_video_duration": preferred_video_duration,
-                        "target_clip_duration_sec": target_clip_duration_sec,
-                        "target_clip_duration_min_sec": target_clip_duration_min_sec,
-                        "target_clip_duration_max_sec": target_clip_duration_max_sec,
-                    },
-                )
+        active_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
+        if active_response_profile == "bootstrap" and not active_job:
+            active_job = _queue_refinement_job(
+                conn,
+                material_id=material_id,
+                concept_id=concept_id,
+                request_key=request_key,
+                source_generation_id=active_generation_id,
+                request_params={
+                    "creative_commons_only": creative_commons_only,
+                    "video_pool_mode": video_pool_mode,
+                    "preferred_video_duration": preferred_video_duration,
+                    "target_clip_duration_sec": target_clip_duration_sec,
+                    "target_clip_duration_min_sec": target_clip_duration_min_sec,
+                    "target_clip_duration_max_sec": target_clip_duration_max_sec,
+                },
+            )
+        if (
+            len(active_reels) >= required_count
+            or (
+                active_reels
+                and sync_deep_fallback != "always"
+                and active_response_profile == "bootstrap"
+            )
+        ):
             return {
                 **_build_generation_response_payload(
                     reels=active_reels,
-                    generation_id=str(active_generation.get("id") or ""),
-                    response_profile=str(active_generation.get("retrieval_profile") or "") or None,
+                    generation_id=active_generation_id,
+                    response_profile=active_response_profile,
                     job_row=active_job,
                 ),
                 "request_key": request_key,
@@ -1817,7 +1827,12 @@ def _ensure_generation_for_request(
     )
 
     response_profile = "bootstrap"
-    if len(filtered) < required_count:
+    should_run_sync_deep = False
+    if not filtered:
+        should_run_sync_deep = sync_deep_fallback in {"always", "if_empty"}
+    elif len(filtered) < required_count:
+        should_run_sync_deep = sync_deep_fallback == "always"
+    if should_run_sync_deep:
         shortfall = max(1, required_count - len(filtered))
         reel_service.generate_reels(
             conn,
@@ -1845,7 +1860,8 @@ def _ensure_generation_for_request(
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
         )
-        response_profile = "bootstrap_then_deep"
+        if filtered:
+            response_profile = "bootstrap_then_deep"
 
     if not filtered:
         _complete_generation(
@@ -2707,6 +2723,7 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 material_id=payload.material_id,
                 concept_id=payload.concept_id,
                 required_count=requested_num_reels,
+                sync_deep_fallback="if_empty",
                 creative_commons_only=payload.creative_commons_only,
                 generation_mode=effective_generation_mode,
                 min_relevance=min_relevance,
@@ -3223,15 +3240,18 @@ def feed(
         if autofill:
             if SERVERLESS_MODE:
                 target_total = page * limit + prefetch + 2
+                sync_target_total = max(page * limit, min(target_total, page * limit + 1))
             else:
                 target_total = page * limit + prefetch + (10 if fast_mode else 6)
-            if len(filtered_ranked) < target_total:
+                sync_target_total = max(page * limit, min(target_total, page * limit + (4 if fast_mode else 3)))
+            if len(filtered_ranked) < sync_target_total:
                 try:
                     generation_result = _ensure_generation_for_request(
                         conn,
                         material_id=material_id,
                         concept_id=None,
-                        required_count=target_total,
+                        required_count=sync_target_total,
+                        sync_deep_fallback="if_empty",
                         creative_commons_only=creative_commons_only,
                         generation_mode="fast" if fast_mode else "slow",
                         min_relevance=safe_min_relevance,

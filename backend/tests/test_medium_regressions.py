@@ -264,6 +264,7 @@ class MediumRegressionTests(unittest.TestCase):
                 material_id="material-1",
                 concept_id=None,
                 required_count=3,
+                sync_deep_fallback="always",
                 creative_commons_only=False,
                 generation_mode="fast",
                 min_relevance=None,
@@ -286,6 +287,80 @@ class MediumRegressionTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual((generation_row["retrieval_profile"], generation_row["status"]), ("bootstrap_then_deep", "active"))
         self.assertEqual(int(generation_row["reel_count"]), 3)
+        conn.close()
+
+    def test_ensure_generation_returns_bootstrap_fast_when_under_target_and_policy_is_if_empty(self) -> None:
+        conn = self._build_generation_test_conn()
+        generate_calls: list[tuple[str, int]] = []
+
+        def fake_generate_reels(*args, **kwargs):
+            generation_id = str(kwargs["generation_id"])
+            material_id = str(kwargs["material_id"])
+            retrieval_profile = str(kwargs["retrieval_profile"])
+            requested = int(kwargs["num_reels"])
+            generate_calls.append((retrieval_profile, requested))
+            insert_count = 1 if retrieval_profile == "bootstrap" else requested
+            existing_count = conn.execute(
+                "SELECT COUNT(*) FROM reels WHERE generation_id = ?",
+                (generation_id,),
+            ).fetchone()[0]
+            for index in range(insert_count):
+                sequence = existing_count + index
+                conn.execute(
+                    """
+                    INSERT INTO reels (
+                        id, generation_id, material_id, concept_id, video_id, video_url,
+                        t_start, t_end, transcript_snippet, takeaways_json, base_score, created_at
+                    ) VALUES (?, ?, ?, ?, ?, '', 0, 55, '', '[]', 0, ?)
+                    """,
+                    (
+                        f"{generation_id}-{retrieval_profile}-{sequence}",
+                        generation_id,
+                        material_id,
+                        "concept-1",
+                        f"video-{retrieval_profile}-{sequence}",
+                        f"2026-03-13T00:00:{sequence:02d}+00:00",
+                    ),
+                )
+            return []
+
+        with mock.patch.object(main_module.reel_service, "generate_reels", side_effect=fake_generate_reels), mock.patch.object(
+            main_module,
+            "_ranked_request_reels",
+            side_effect=lambda test_conn, **kwargs: self._fake_ranked_request_reels(test_conn, kwargs["generation_id"]),
+        ), mock.patch.object(
+            main_module,
+            "_queue_refinement_job",
+            return_value={"id": "job-fast", "status": "queued"},
+        ) as queue_job:
+            result = main_module._ensure_generation_for_request(
+                conn,
+                material_id="material-1",
+                concept_id=None,
+                required_count=3,
+                sync_deep_fallback="if_empty",
+                creative_commons_only=False,
+                generation_mode="fast",
+                min_relevance=None,
+                video_pool_mode="short-first",
+                preferred_video_duration="any",
+                target_clip_duration_sec=55,
+                target_clip_duration_min_sec=20,
+                target_clip_duration_max_sec=55,
+            )
+
+        self.assertEqual(generate_calls, [("bootstrap", 3)])
+        self.assertEqual(result["response_profile"], "bootstrap")
+        self.assertEqual(result["refinement_job_id"], "job-fast")
+        self.assertEqual(result["refinement_status"], "queued")
+        self.assertEqual(len(result["reels"]), 1)
+        queue_job.assert_called_once()
+        generation_row = conn.execute(
+            "SELECT retrieval_profile, status, reel_count FROM reel_generations WHERE id = ?",
+            (result["generation_id"],),
+        ).fetchone()
+        self.assertEqual((generation_row["retrieval_profile"], generation_row["status"]), ("bootstrap", "active"))
+        self.assertEqual(int(generation_row["reel_count"]), 1)
         conn.close()
 
     def test_reel_unique_clip_migration_allows_same_clip_across_generations(self) -> None:

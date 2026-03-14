@@ -21,9 +21,7 @@ import {
   type VideoPoolMode,
 } from "@/lib/settings";
 
-const RAW_API_BASE = (
-  process.env.NEXT_PUBLIC_API_BASE || (process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "")
-).replace(/\/$/, "");
+const RAW_API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
 const BACKEND_DOWN_ERROR = RAW_API_BASE
   ? `Cannot reach backend at ${RAW_API_BASE}. Make sure the backend server is running.`
   : "Cannot reach backend. Check your deployment and API routes.";
