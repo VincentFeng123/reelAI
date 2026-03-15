@@ -5,6 +5,7 @@ import os
 import re
 import secrets
 import smtplib
+import sqlite3
 import threading
 import time
 import uuid
@@ -1396,6 +1397,201 @@ def _serialize_reels_for_request(
     return filtered
 
 
+def _request_root_anchor_terms(subject_tag: str | None) -> tuple[list[str], list[str]]:
+    cleaned = str(subject_tag or "").strip()
+    if not cleaned:
+        return ([], [])
+    aliases = reel_service.topic_expansion_service._deterministic_alias_terms(topic=cleaned, canonical_topic=cleaned)
+    companions = reel_service.topic_expansion_service._deterministic_companion_terms(topic=cleaned, canonical_topic=cleaned)
+    root_terms = [cleaned, *aliases]
+    deduped_root: list[str] = []
+    seen_root: set[str] = set()
+    for term in root_terms:
+        normalized = " ".join(str(term or "").lower().split())
+        if not normalized or normalized in seen_root:
+            continue
+        seen_root.add(normalized)
+        deduped_root.append(str(term).strip())
+    deduped_companions: list[str] = []
+    seen_companions: set[str] = set()
+    for term in companions:
+        normalized = " ".join(str(term or "").lower().split())
+        if not normalized or normalized in seen_companions:
+            continue
+        seen_companions.add(normalized)
+        deduped_companions.append(str(term).strip())
+    return deduped_root, deduped_companions
+
+
+def _request_reel_text(reel: dict[str, Any]) -> str:
+    parts: list[str] = [
+        str(reel.get("video_title") or ""),
+        str(reel.get("video_description") or ""),
+        str(reel.get("transcript_snippet") or ""),
+    ]
+    matched_terms = reel.get("matched_terms") or []
+    if isinstance(matched_terms, list):
+        parts.extend(str(item or "") for item in matched_terms[:8])
+    return " ".join(parts).strip().lower()
+
+
+def _request_text_has_anchor(text: str, terms: list[str]) -> bool:
+    lowered = f" {text.lower()} "
+    text_tokens = set(re.findall(r"[a-z0-9\+#]+", text.lower()))
+    for raw_term in terms:
+        normalized = " ".join(re.findall(r"[a-z0-9\+#]+", str(raw_term or "").lower()))
+        if not normalized:
+            continue
+        if f" {normalized} " in lowered:
+            return True
+        tokens = normalized.split()
+        if len(tokens) > 1 and set(tokens).issubset(text_tokens):
+            return True
+    return False
+
+
+def _request_stage_bonus(reel: dict[str, Any], *, page: int) -> float:
+    source_surface = str(reel.get("source_surface") or "").strip().lower()
+    retrieval_stage = str(reel.get("retrieval_stage") or "").strip().lower()
+    query_strategy = str(reel.get("query_strategy") or "").strip().lower()
+
+    if page <= 1:
+        source_bonus = {
+            "youtube_api": 0.18,
+            "youtube_html": 0.16,
+            "youtube_related": 0.06,
+            "youtube_channel": -0.02,
+            "duckduckgo_site": -0.12,
+            "bing_site": -0.12,
+            "duckduckgo_quoted": -0.1,
+            "bing_quoted": -0.1,
+            "local_cache": -0.16,
+        }.get(source_surface, 0.0)
+        stage_bonus = {"high_precision": 0.09, "broad": 0.02, "recovery": -0.18}.get(retrieval_stage, 0.0)
+        strategy_bonus = {
+            "literal": 0.05,
+            "explained": 0.04,
+            "tutorial": 0.04,
+            "worked_example": 0.05,
+            "recovery_adjacent": -0.18,
+        }.get(query_strategy, 0.0)
+    else:
+        source_bonus = {
+            "youtube_api": 0.08,
+            "youtube_html": 0.08,
+            "youtube_related": 0.04,
+            "youtube_channel": 0.0,
+            "duckduckgo_site": -0.04,
+            "bing_site": -0.04,
+            "duckduckgo_quoted": -0.02,
+            "bing_quoted": -0.02,
+            "local_cache": -0.06,
+        }.get(source_surface, 0.0)
+        stage_bonus = {"high_precision": 0.04, "broad": 0.02, "recovery": -0.04}.get(retrieval_stage, 0.0)
+        strategy_bonus = {"recovery_adjacent": -0.03}.get(query_strategy, 0.0)
+    return source_bonus + stage_bonus + strategy_bonus
+
+
+def _request_page_video_cap(reel: dict[str, Any], *, page: int) -> int:
+    duration_sec = int(reel.get("video_duration_sec") or 0)
+    if page <= 1:
+        return 2
+    if page <= 5:
+        return 4
+    return 6 if duration_sec > 20 * 60 else 4
+
+
+def _request_effective_min_relevance(
+    min_relevance: float | None,
+    *,
+    page: int,
+    subject_tag: str | None,
+    strict_topic_only: bool,
+) -> float | None:
+    if min_relevance is None:
+        return None
+    if page <= 1 or not strict_topic_only or not subject_tag:
+        return float(min_relevance)
+    if page <= 3:
+        return max(0.22, float(min_relevance) - 0.08)
+    if page <= 5:
+        return max(0.18, float(min_relevance) - 0.12)
+    return max(0.15, float(min_relevance) - 0.15)
+
+
+def _shape_reels_for_request_context(
+    reels: list[dict[str, Any]],
+    *,
+    page: int,
+    limit: int,
+    subject_tag: str | None,
+    strict_topic_only: bool,
+) -> list[dict[str, Any]]:
+    if not reels:
+        return []
+
+    root_terms, companion_terms = _request_root_anchor_terms(subject_tag)
+    eligible: list[dict[str, Any]] = []
+    for reel in reels:
+        if reel_service._is_hard_blocked_low_value_video(
+            title=str(reel.get("video_title") or ""),
+            description=str(reel.get("video_description") or ""),
+            channel_title="",
+            subject_tag=subject_tag,
+        ):
+            continue
+
+        if strict_topic_only and subject_tag:
+            text = _request_reel_text(reel)
+            has_root_anchor = _request_text_has_anchor(text, root_terms)
+            if page <= 1:
+                if not has_root_anchor:
+                    continue
+            else:
+                has_companion_anchor = _request_text_has_anchor(text, companion_terms)
+                educational_support = (
+                    float(reel.get("relevance_score") or 0.0) >= (0.22 if page <= 3 else 0.18)
+                    or bool(
+                        re.findall(
+                            r"\b("
+                            r"lecture|tutorial|explained|introduction|science|study|education|biology|"
+                            r"history|behavior|behaviour|societ(?:y|ies)|colony|colonies|world|kingdom|"
+                            r"conversation|conference|episode|documentary|macro"
+                            r")\b",
+                            text,
+                        )
+                    )
+                )
+                if not has_root_anchor and not (has_companion_anchor and educational_support):
+                    continue
+
+        shaped = dict(reel)
+        shaped["_request_rank_score"] = float(reel.get("score") or 0.0) + _request_stage_bonus(reel, page=page)
+        eligible.append(shaped)
+
+    eligible.sort(key=lambda item: (float(item.get("_request_rank_score") or 0.0), str(item.get("created_at") or "")), reverse=True)
+
+    shaped_rows: list[dict[str, Any]] = []
+    per_video_counts: dict[str, int] = {}
+    request_window = max(1, int(page or 1) * max(1, int(limit or 1)))
+    for item in eligible:
+        video_url = str(item.get("video_url") or "")
+        match = re.search(r"/embed/([^?&/]+)", video_url)
+        video_id = match.group(1) if match else ""
+        if video_id:
+            current_count = per_video_counts.get(video_id, 0)
+            if current_count >= _request_page_video_cap(item, page=page):
+                continue
+            per_video_counts[video_id] = current_count + 1
+        clean_item = dict(item)
+        clean_item.pop("_request_rank_score", None)
+        shaped_rows.append(clean_item)
+        if len(shaped_rows) >= max(len(eligible), request_window + 12):
+            break
+
+    return shaped_rows
+
+
 def _count_generation_reels(conn, generation_id: str) -> int:
     row = fetch_one(conn, "SELECT COUNT(*) AS reel_count FROM reels WHERE generation_id = ?", (generation_id,))
     return max(0, int((row or {}).get("reel_count") or 0))
@@ -1608,6 +1804,7 @@ def _extend_active_generation(
     target_clip_duration_sec: int,
     target_clip_duration_min_sec: int | None,
     target_clip_duration_max_sec: int | None,
+    page_hint: int = 1,
     on_reel_created: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     fast_mode = generation_mode == "fast"
@@ -1638,6 +1835,8 @@ def _extend_active_generation(
         generation_id=next_generation_id,
         exclude_generation_ids=prior_generation_ids,
         min_relevance_threshold=float(min_relevance or 0.0),
+        page_hint=page_hint,
+        recovery_stage=_initial_recovery_stage(page_hint=page_hint),
         on_reel_created=on_reel_created,
     )
 
@@ -1659,6 +1858,8 @@ def _extend_active_generation(
             target_clip_duration_sec=target_clip_duration_sec,
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
+            page=page_hint,
+            limit=max(5, min(25, required_count)),
         )
         return {
             **_build_generation_response_payload(
@@ -1687,13 +1888,33 @@ def _extend_active_generation(
         target_clip_duration_sec=target_clip_duration_sec,
         target_clip_duration_min_sec=target_clip_duration_min_sec,
         target_clip_duration_max_sec=target_clip_duration_max_sec,
+        page=page_hint,
+        limit=max(5, min(25, required_count)),
+    )
+    job_row = _queue_refinement_if_needed(
+        conn,
+        material_id=material_id,
+        concept_id=concept_id,
+        request_key=request_key,
+        generation_id=next_generation_id,
+        current_reels=expanded_reels,
+        required_count=required_count,
+        generation_mode=generation_mode,
+        creative_commons_only=creative_commons_only,
+        preferred_video_duration=preferred_video_duration,
+        video_pool_mode=video_pool_mode,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+        min_relevance=min_relevance,
+        page_hint=page_hint,
     )
     return {
         **_build_generation_response_payload(
             reels=expanded_reels,
             generation_id=next_generation_id,
             response_profile="deep",
-            job_row=None,
+            job_row=job_row,
         ),
         "request_key": request_key,
     }
@@ -1710,7 +1931,21 @@ def _ranked_request_reels(
     target_clip_duration_sec: int,
     target_clip_duration_min_sec: int | None,
     target_clip_duration_max_sec: int | None,
+    page: int = 1,
+    limit: int = 5,
 ) -> list[dict[str, Any]]:
+    try:
+        material_row = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
+    except sqlite3.OperationalError:
+        material_row = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
+    subject_tag = str((material_row or {}).get("subject_tag") or "").strip() or None
+    strict_topic_only = str((material_row or {}).get("source_type") or "").strip().lower() == "topic"
+    effective_min_relevance = _request_effective_min_relevance(
+        min_relevance,
+        page=page,
+        subject_tag=subject_tag,
+        strict_topic_only=strict_topic_only,
+    )
     generation_ids = _response_generation_ids(conn, generation_id)
     if generation_ids:
         ranked_batches = [
@@ -1731,14 +1966,49 @@ def _ranked_request_reels(
             fast_mode=fast_mode,
             generation_id=generation_id,
         )
-    return _serialize_reels_for_request(
+    serialized = _serialize_reels_for_request(
         ranked,
-        min_relevance=min_relevance,
+        min_relevance=effective_min_relevance,
         preferred_video_duration=preferred_video_duration,
         target_clip_duration_sec=target_clip_duration_sec,
         target_clip_duration_min_sec=target_clip_duration_min_sec,
         target_clip_duration_max_sec=target_clip_duration_max_sec,
     )
+    if page <= 1:
+        return _shape_reels_for_request_context(
+            serialized,
+            page=page,
+            limit=limit,
+            subject_tag=subject_tag,
+            strict_topic_only=strict_topic_only,
+        )
+
+    cumulative_batches: list[list[dict[str, Any]]] = []
+    for current_page in range(1, max(1, int(page)) + 1):
+        current_min_relevance = _request_effective_min_relevance(
+            min_relevance,
+            page=current_page,
+            subject_tag=subject_tag,
+            strict_topic_only=strict_topic_only,
+        )
+        current_serialized = _serialize_reels_for_request(
+            ranked,
+            min_relevance=current_min_relevance,
+            preferred_video_duration=preferred_video_duration,
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+        )
+        cumulative_batches.append(
+            _shape_reels_for_request_context(
+                current_serialized,
+                page=current_page,
+                limit=limit,
+                subject_tag=subject_tag,
+                strict_topic_only=strict_topic_only,
+            )
+        )
+    return _merge_request_reel_lists(*cumulative_batches)
 
 
 def _build_generation_response_payload(
@@ -1798,6 +2068,14 @@ def _refinement_target_reel_count(
     return max(min_target, safe_required, safe_existing + buffer)
 
 
+def _initial_recovery_stage(*, page_hint: int) -> int:
+    return 1 if max(1, int(page_hint or 1)) > 1 else 0
+
+
+MAX_REFINEMENT_RECOVERY_STAGE = 2
+MAX_REFINEMENT_REFILL_PASSES = 3
+
+
 def _build_refinement_request_params(
     *,
     creative_commons_only: bool,
@@ -1809,6 +2087,10 @@ def _build_refinement_request_params(
     required_count: int,
     generation_mode: Literal["slow", "fast"],
     existing_source_count: int = 0,
+    min_relevance_threshold: float = 0.0,
+    page_hint: int = 1,
+    recovery_stage: int = 0,
+    refill_pass: int = 0,
 ) -> dict[str, Any]:
     return {
         "creative_commons_only": creative_commons_only,
@@ -1822,6 +2104,10 @@ def _build_refinement_request_params(
             generation_mode=generation_mode,
             existing_source_count=existing_source_count,
         ),
+        "min_relevance_threshold": float(min_relevance_threshold or 0.0),
+        "page_hint": max(1, int(page_hint or 1)),
+        "recovery_stage": max(0, int(recovery_stage or 0)),
+        "refill_pass": max(0, int(refill_pass or 0)),
     }
 
 
@@ -1836,11 +2122,73 @@ def _merge_refinement_request_params(existing_job: dict[str, Any], request_param
     for key, value in request_params.items():
         if key == "target_reel_count":
             merged[key] = max(int(existing_params.get(key) or 0), int(value or 0))
+        elif key in {"page_hint", "recovery_stage", "refill_pass"}:
+            merged[key] = max(int(existing_params.get(key) or 0), int(value or 0))
         elif value is not None:
             merged[key] = value
         elif key not in merged:
             merged[key] = value
     return merged
+
+
+def _queue_refinement_if_needed(
+    conn,
+    *,
+    material_id: str,
+    concept_id: str | None,
+    request_key: str,
+    generation_id: str | None,
+    current_reels: list[dict[str, Any]],
+    required_count: int,
+    generation_mode: Literal["slow", "fast"],
+    creative_commons_only: bool,
+    preferred_video_duration: Literal["any", "short", "medium", "long"],
+    video_pool_mode: Literal["short-first", "balanced", "long-form"],
+    target_clip_duration_sec: int,
+    target_clip_duration_min_sec: int | None,
+    target_clip_duration_max_sec: int | None,
+    min_relevance: float | None,
+    page_hint: int = 1,
+    recovery_stage: int | None = None,
+    refill_pass: int = 0,
+) -> dict[str, Any] | None:
+    if not generation_id:
+        return None
+    target_reel_count = _refinement_target_reel_count(
+        required_count=required_count,
+        generation_mode=generation_mode,
+        existing_source_count=len(current_reels),
+    )
+    if len(current_reels) >= target_reel_count:
+        return _fetch_refinement_job_for_generation(conn, generation_id)
+    safe_page_hint = max(1, int(page_hint or 1))
+    safe_recovery_stage = (
+        _initial_recovery_stage(page_hint=safe_page_hint)
+        if recovery_stage is None
+        else max(0, int(recovery_stage or 0))
+    )
+    return _queue_refinement_job(
+        conn,
+        material_id=material_id,
+        concept_id=concept_id,
+        request_key=request_key,
+        source_generation_id=generation_id,
+        request_params=_build_refinement_request_params(
+            creative_commons_only=creative_commons_only,
+            video_pool_mode=video_pool_mode,
+            preferred_video_duration=preferred_video_duration,
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+            required_count=required_count,
+            generation_mode=generation_mode,
+            existing_source_count=len(current_reels),
+            min_relevance_threshold=float(min_relevance or 0.0),
+            page_hint=safe_page_hint,
+            recovery_stage=safe_recovery_stage,
+            refill_pass=refill_pass,
+        ),
+    )
 
 
 def _queue_refinement_job(
@@ -1941,11 +2289,43 @@ def _run_refinement_job(job_id: str) -> None:
                 request_params = {}
             fast_mode = str(source_generation.get("generation_mode") or "fast") == "fast"
             generation_mode: Literal["slow", "fast"] = "fast" if fast_mode else "slow"
+            safe_video_pool_mode = _normalize_video_pool_mode(str(request_params.get("video_pool_mode") or "short-first"))
+            safe_video_duration_pref = _normalize_preferred_video_duration(
+                str(request_params.get("preferred_video_duration") or "any")
+            )
+            safe_target_clip_duration_sec = int(request_params.get("target_clip_duration_sec") or DEFAULT_TARGET_CLIP_DURATION_SEC)
+            safe_target_clip_min_sec = (
+                int(request_params["target_clip_duration_min_sec"])
+                if request_params.get("target_clip_duration_min_sec") is not None
+                else MIN_TARGET_CLIP_DURATION_SEC
+            )
+            safe_target_clip_max_sec = (
+                int(request_params["target_clip_duration_max_sec"])
+                if request_params.get("target_clip_duration_max_sec") is not None
+                else MAX_TARGET_CLIP_DURATION_SEC
+            )
+            safe_min_relevance = float(request_params.get("min_relevance_threshold") or 0.0)
+            safe_page_hint = max(1, int(request_params.get("page_hint") or 1))
+            safe_recovery_stage = max(0, int(request_params.get("recovery_stage") or 0))
+            safe_refill_pass = max(0, int(request_params.get("refill_pass") or 0))
             source_reel_count = int(source_generation.get("reel_count") or 0)
             target_reel_count = _refinement_target_reel_count(
                 required_count=int(request_params.get("target_reel_count") or 0),
                 generation_mode=generation_mode,
                 existing_source_count=source_reel_count,
+            )
+            source_visible_reels = _ranked_request_reels(
+                conn,
+                material_id=str(job_row.get("material_id") or ""),
+                fast_mode=fast_mode,
+                generation_id=source_generation_id,
+                min_relevance=safe_min_relevance,
+                preferred_video_duration=safe_video_duration_pref,
+                target_clip_duration_sec=safe_target_clip_duration_sec,
+                target_clip_duration_min_sec=safe_target_clip_min_sec,
+                target_clip_duration_max_sec=safe_target_clip_max_sec,
+                page=safe_page_hint,
+                limit=max(5, min(25, target_reel_count)),
             )
             reel_service.generate_reels(
                 conn,
@@ -1954,25 +2334,17 @@ def _run_refinement_job(job_id: str) -> None:
                 num_reels=target_reel_count,
                 creative_commons_only=bool(request_params.get("creative_commons_only", False)),
                 fast_mode=fast_mode,
-                video_pool_mode=_normalize_video_pool_mode(str(request_params.get("video_pool_mode") or "short-first")),
-                preferred_video_duration=_normalize_preferred_video_duration(
-                    str(request_params.get("preferred_video_duration") or "any")
-                ),
-                target_clip_duration_sec=int(request_params.get("target_clip_duration_sec") or DEFAULT_TARGET_CLIP_DURATION_SEC),
-                target_clip_duration_min_sec=(
-                    int(request_params["target_clip_duration_min_sec"])
-                    if request_params.get("target_clip_duration_min_sec") is not None
-                    else MIN_TARGET_CLIP_DURATION_SEC
-                ),
-                target_clip_duration_max_sec=(
-                    int(request_params["target_clip_duration_max_sec"])
-                    if request_params.get("target_clip_duration_max_sec") is not None
-                    else MAX_TARGET_CLIP_DURATION_SEC
-                ),
+                video_pool_mode=safe_video_pool_mode,
+                preferred_video_duration=safe_video_duration_pref,
+                target_clip_duration_sec=safe_target_clip_duration_sec,
+                target_clip_duration_min_sec=safe_target_clip_min_sec,
+                target_clip_duration_max_sec=safe_target_clip_max_sec,
                 retrieval_profile="deep",
                 generation_id=result_generation_id,
-                exclude_generation_ids=[source_generation_id],
-                min_relevance_threshold=float(request_params.get("min_relevance_threshold") or 0.0),
+                exclude_generation_ids=_response_generation_ids(conn, source_generation_id) or [source_generation_id],
+                min_relevance_threshold=safe_min_relevance,
+                page_hint=safe_page_hint,
+                recovery_stage=safe_recovery_stage,
             )
         except Exception as exc:
             _complete_generation(
@@ -2024,6 +2396,32 @@ def _run_refinement_job(job_id: str) -> None:
                     "error_text": "no_reels_generated",
                 },
             )
+            if (
+                safe_page_hint > 1
+                and safe_recovery_stage < MAX_REFINEMENT_RECOVERY_STAGE
+                and safe_refill_pass + 1 < MAX_REFINEMENT_REFILL_PASSES
+                and current_active_id == source_generation_id
+            ):
+                _queue_refinement_if_needed(
+                    conn,
+                    material_id=str(job_row.get("material_id") or ""),
+                    concept_id=str(job_row.get("concept_id") or "") or None,
+                    request_key=str(job_row.get("request_key") or ""),
+                    generation_id=source_generation_id,
+                    current_reels=source_visible_reels,
+                    required_count=target_reel_count,
+                    generation_mode=generation_mode,
+                    creative_commons_only=bool(request_params.get("creative_commons_only", False)),
+                    preferred_video_duration=safe_video_duration_pref,
+                    video_pool_mode=safe_video_pool_mode,
+                    target_clip_duration_sec=safe_target_clip_duration_sec,
+                    target_clip_duration_min_sec=safe_target_clip_min_sec,
+                    target_clip_duration_max_sec=safe_target_clip_max_sec,
+                    min_relevance=safe_min_relevance,
+                    page_hint=safe_page_hint,
+                    recovery_stage=safe_recovery_stage + 1,
+                    refill_pass=safe_refill_pass + 1,
+                )
             return
 
         if current_active_id != source_generation_id:
@@ -2066,6 +2464,49 @@ def _run_refinement_job(job_id: str) -> None:
                 "error_text": None,
             },
         )
+        merged_reels = _ranked_request_reels(
+            conn,
+            material_id=str(job_row.get("material_id") or ""),
+            fast_mode=fast_mode,
+            generation_id=result_generation_id,
+            min_relevance=safe_min_relevance,
+            preferred_video_duration=safe_video_duration_pref,
+            target_clip_duration_sec=safe_target_clip_duration_sec,
+            target_clip_duration_min_sec=safe_target_clip_min_sec,
+            target_clip_duration_max_sec=safe_target_clip_max_sec,
+            page=safe_page_hint,
+            limit=max(5, min(25, target_reel_count)),
+        )
+        if safe_refill_pass + 1 < MAX_REFINEMENT_REFILL_PASSES and len(merged_reels) < target_reel_count:
+            next_recovery_stage = safe_recovery_stage
+            if safe_page_hint > 1 and len(merged_reels) <= len(source_visible_reels):
+                next_recovery_stage = min(MAX_REFINEMENT_RECOVERY_STAGE, safe_recovery_stage + 1)
+            should_chain = False
+            if safe_page_hint > 1:
+                should_chain = next_recovery_stage <= MAX_REFINEMENT_RECOVERY_STAGE
+            elif len(merged_reels) > len(source_visible_reels) and safe_refill_pass == 0:
+                should_chain = True
+            if should_chain:
+                _queue_refinement_if_needed(
+                    conn,
+                    material_id=str(job_row.get("material_id") or ""),
+                    concept_id=str(job_row.get("concept_id") or "") or None,
+                    request_key=str(job_row.get("request_key") or ""),
+                    generation_id=result_generation_id,
+                    current_reels=merged_reels,
+                    required_count=target_reel_count,
+                    generation_mode=generation_mode,
+                    creative_commons_only=bool(request_params.get("creative_commons_only", False)),
+                    preferred_video_duration=safe_video_duration_pref,
+                    video_pool_mode=safe_video_pool_mode,
+                    target_clip_duration_sec=safe_target_clip_duration_sec,
+                    target_clip_duration_min_sec=safe_target_clip_min_sec,
+                    target_clip_duration_max_sec=safe_target_clip_max_sec,
+                    min_relevance=safe_min_relevance,
+                    page_hint=safe_page_hint,
+                    recovery_stage=next_recovery_stage,
+                    refill_pass=safe_refill_pass + 1,
+                )
 
 
 def _ensure_generation_for_request(
@@ -2083,6 +2524,7 @@ def _ensure_generation_for_request(
     target_clip_duration_sec: int,
     target_clip_duration_min_sec: int | None,
     target_clip_duration_max_sec: int | None,
+    page_hint: int = 1,
     on_reel_created: Callable[[dict[str, Any]], None] | None = None,
     emit_existing_reels: bool = False,
 ) -> dict[str, Any]:
@@ -2124,25 +2566,24 @@ def _ensure_generation_for_request(
             target_clip_duration_max_sec=target_clip_duration_max_sec,
         )
         active_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
-        if active_response_profile == "bootstrap":
-            active_job = _queue_refinement_job(
-                conn,
-                material_id=material_id,
-                concept_id=concept_id,
-                request_key=request_key,
-                source_generation_id=active_generation_id,
-                request_params=_build_refinement_request_params(
-                    creative_commons_only=creative_commons_only,
-                    video_pool_mode=video_pool_mode,
-                    preferred_video_duration=preferred_video_duration,
-                    target_clip_duration_sec=target_clip_duration_sec,
-                    target_clip_duration_min_sec=target_clip_duration_min_sec,
-                    target_clip_duration_max_sec=target_clip_duration_max_sec,
-                    required_count=required_count,
-                    generation_mode=generation_mode,
-                    existing_source_count=len(active_reels),
-                ),
-            )
+        active_job = _queue_refinement_if_needed(
+            conn,
+            material_id=material_id,
+            concept_id=concept_id,
+            request_key=request_key,
+            generation_id=active_generation_id,
+            current_reels=active_reels,
+            required_count=required_count,
+            generation_mode=generation_mode,
+            creative_commons_only=creative_commons_only,
+            preferred_video_duration=preferred_video_duration,
+            video_pool_mode=video_pool_mode,
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+            min_relevance=min_relevance,
+            page_hint=1,
+        )
         if emit_existing_reels and on_reel_created is not None:
             for reel in active_reels[: max(1, required_count)]:
                 try:
@@ -2170,6 +2611,7 @@ def _ensure_generation_for_request(
                     target_clip_duration_sec=target_clip_duration_sec,
                     target_clip_duration_min_sec=target_clip_duration_min_sec,
                     target_clip_duration_max_sec=target_clip_duration_max_sec,
+                    page_hint=page_hint,
                     on_reel_created=on_reel_created,
                 )
         if (
@@ -2216,6 +2658,8 @@ def _ensure_generation_for_request(
         retrieval_profile="bootstrap",
         generation_id=generation_id,
         min_relevance_threshold=float(min_relevance or 0.0),
+        page_hint=page_hint,
+        recovery_stage=0,
         on_reel_created=on_reel_created,
     )
     filtered = _ranked_request_reels(
@@ -2255,6 +2699,8 @@ def _ensure_generation_for_request(
             retrieval_profile="deep",
             generation_id=generation_id,
             min_relevance_threshold=float(min_relevance or 0.0),
+            page_hint=page_hint,
+            recovery_stage=_initial_recovery_stage(page_hint=page_hint),
             on_reel_created=on_reel_created,
         )
         filtered = _ranked_request_reels(
@@ -2310,26 +2756,24 @@ def _ensure_generation_for_request(
         generation_id=generation_id,
         retrieval_profile=response_profile,
     )
-    job_row = None
-    if response_profile == "bootstrap":
-        job_row = _queue_refinement_job(
-            conn,
-            material_id=material_id,
-            concept_id=concept_id,
-            request_key=request_key,
-            source_generation_id=generation_id,
-            request_params=_build_refinement_request_params(
-                creative_commons_only=creative_commons_only,
-                video_pool_mode=video_pool_mode,
-                preferred_video_duration=preferred_video_duration,
-                target_clip_duration_sec=target_clip_duration_sec,
-                target_clip_duration_min_sec=target_clip_duration_min_sec,
-                target_clip_duration_max_sec=target_clip_duration_max_sec,
-                required_count=required_count,
-                generation_mode=generation_mode,
-                existing_source_count=len(filtered),
-            ),
-        )
+    job_row = _queue_refinement_if_needed(
+        conn,
+        material_id=material_id,
+        concept_id=concept_id,
+        request_key=request_key,
+        generation_id=generation_id,
+        current_reels=filtered,
+        required_count=required_count,
+        generation_mode=generation_mode,
+        creative_commons_only=creative_commons_only,
+        preferred_video_duration=preferred_video_duration,
+        video_pool_mode=video_pool_mode,
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+        min_relevance=min_relevance,
+        page_hint=1,
+    )
     return {
         **_build_generation_response_payload(
             reels=filtered,
@@ -3143,6 +3587,7 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 target_clip_duration_sec=safe_target_clip_duration_sec,
                 target_clip_duration_min_sec=safe_target_clip_min_sec,
                 target_clip_duration_max_sec=safe_target_clip_max_sec,
+                page_hint=1,
             )
         except YouTubeApiRequestError as e:
             raise HTTPException(status_code=502, detail=str(e)) from e
@@ -3209,6 +3654,7 @@ def generate_reels_stream(request: Request, payload: ReelsGenerateRequest):
                         target_clip_duration_sec=safe_target_clip_duration_sec,
                         target_clip_duration_min_sec=safe_target_clip_min_sec,
                         target_clip_duration_max_sec=safe_target_clip_max_sec,
+                        page_hint=1,
                         on_reel_created=emit_reel,
                         emit_existing_reels=True,
                     )
@@ -3728,28 +4174,29 @@ def feed(
             target_clip_duration_sec=safe_target_clip_duration_sec,
             target_clip_duration_min_sec=safe_target_clip_min_sec,
             target_clip_duration_max_sec=safe_target_clip_max_sec,
+            page=page,
+            limit=limit,
         )
         response_profile = str((active_generation or {}).get("retrieval_profile") or "") or None
         refinement_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
-        if active_generation_id and response_profile == "bootstrap" and (not autofill or len(filtered_ranked) >= sync_target_total):
-            refinement_job = _queue_refinement_job(
-                conn,
-                material_id=material_id,
-                concept_id=None,
-                request_key=request_key,
-                source_generation_id=active_generation_id,
-                request_params=_build_refinement_request_params(
-                    creative_commons_only=creative_commons_only,
-                    video_pool_mode=safe_video_pool_mode,
-                    preferred_video_duration=safe_video_duration_pref,
-                    target_clip_duration_sec=safe_target_clip_duration_sec,
-                    target_clip_duration_min_sec=safe_target_clip_min_sec,
-                    target_clip_duration_max_sec=safe_target_clip_max_sec,
-                    required_count=sync_target_total if autofill else page * limit,
-                    generation_mode="fast" if fast_mode else "slow",
-                    existing_source_count=len(filtered_ranked),
-                ),
-            )
+        refinement_job = _queue_refinement_if_needed(
+            conn,
+            material_id=material_id,
+            concept_id=None,
+            request_key=request_key,
+            generation_id=active_generation_id,
+            current_reels=filtered_ranked,
+            required_count=target_total if autofill else page * limit,
+            generation_mode="fast" if fast_mode else "slow",
+            creative_commons_only=creative_commons_only,
+            preferred_video_duration=safe_video_duration_pref,
+            video_pool_mode=safe_video_pool_mode,
+            target_clip_duration_sec=safe_target_clip_duration_sec,
+            target_clip_duration_min_sec=safe_target_clip_min_sec,
+            target_clip_duration_max_sec=safe_target_clip_max_sec,
+            min_relevance=safe_min_relevance,
+            page_hint=page,
+        )
         # Auto-expand the feed while users scroll so we can keep serving fresh reels.
         if autofill:
             if len(filtered_ranked) < sync_target_total:
@@ -3768,6 +4215,7 @@ def feed(
                         target_clip_duration_sec=safe_target_clip_duration_sec,
                         target_clip_duration_min_sec=safe_target_clip_min_sec,
                         target_clip_duration_max_sec=safe_target_clip_max_sec,
+                        page_hint=page,
                     )
                 except YouTubeApiRequestError:
                     generation_result = None

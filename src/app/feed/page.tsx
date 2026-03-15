@@ -543,6 +543,7 @@ function FeedPageInner() {
   const isFetchingRef = useRef(false);
   const isGeneratingRef = useRef(false);
   const activeIndexRef = useRef(0);
+  const reelsRef = useRef<Reel[]>([]);
   const stepLockUntilRef = useRef(0);
   const isTransitioningRef = useRef(false);
   const transitionUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1304,7 +1305,6 @@ function FeedPageInner() {
     isRefreshingRefinementRef.current = true;
     try {
       const tuning = getFeedTuningSettings();
-      const currentReelId = reels[activeIndexRef.current]?.reel_id;
       const rows = await Promise.all(
         feedMaterialIds.map(async (id) => {
           try {
@@ -1365,21 +1365,25 @@ function FeedPageInner() {
       successful.forEach((row) => registerRefinementJob(row.materialId, row.data));
       const refreshedReels = dedupeByIdentity(interleaveReelBatches(successful.map((row) => row.data.reels)));
       const refreshedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data.total) || 0), 0);
-      setReels(refreshedReels);
-      setTotal(Math.max(refreshedTotal, refreshedReels.length));
-      setPage(Math.max(1, Math.ceil(refreshedReels.length / PAGE_SIZE)));
-      if (refreshedReels.length === 0) {
+      const currentReels = reelsRef.current;
+      const currentReelId = currentReels[activeIndexRef.current]?.reel_id;
+      const mergedReels = dedupeByIdentity(refreshedReels, currentReels);
+
+      setReels((prev) => dedupeByIdentity(refreshedReels, prev));
+      setTotal((prevTotal) => Math.max(prevTotal, refreshedTotal, mergedReels.length));
+      setPage((prevPage) => Math.max(prevPage, Math.max(1, Math.ceil(mergedReels.length / PAGE_SIZE))));
+      if (mergedReels.length === 0) {
         setActiveIndex(0);
       } else if (currentReelId) {
-        const nextIndex = refreshedReels.findIndex((reel) => reel.reel_id === currentReelId);
-        setActiveIndex(nextIndex >= 0 ? nextIndex : Math.min(activeIndexRef.current, refreshedReels.length - 1));
+        const nextIndex = mergedReels.findIndex((reel) => reel.reel_id === currentReelId);
+        setActiveIndex(nextIndex >= 0 ? nextIndex : Math.min(activeIndexRef.current, mergedReels.length - 1));
       } else {
-        setActiveIndex(Math.min(activeIndexRef.current, refreshedReels.length - 1));
+        setActiveIndex(Math.min(activeIndexRef.current, mergedReels.length - 1));
       }
     } finally {
       isRefreshingRefinementRef.current = false;
     }
-  }, [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, reels, registerRefinementJob, settingsScopeReady]);
+  }, [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, registerRefinementJob, settingsScopeReady]);
 
   const runFastTopUp = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
@@ -1640,6 +1644,10 @@ function FeedPageInner() {
   useEffect(() => {
     activeIndexRef.current = activeIndex;
   }, [activeIndex]);
+
+  useEffect(() => {
+    reelsRef.current = reels;
+  }, [reels]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !materialId || reels.length === 0) {

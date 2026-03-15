@@ -28,7 +28,9 @@ class MediumRegressionTests(unittest.TestCase):
         conn.executescript(
             """
             CREATE TABLE materials (
-                id TEXT PRIMARY KEY
+                id TEXT PRIMARY KEY,
+                subject_tag TEXT,
+                source_type TEXT
             );
 
             CREATE TABLE reel_generations (
@@ -727,6 +729,22 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertNotIn("ants mythology", related_terms)
         self.assertNotIn("fungi myology", related_terms)
 
+    def test_topic_expansion_service_adds_deterministic_companion_packs_for_niche_disciplines(self) -> None:
+        service = TopicExpansionService()
+
+        self.assertEqual(
+            service._deterministic_companion_terms(topic="myrmecology", canonical_topic="myrmecology"),
+            ["ant", "ants", "formicidae"],
+        )
+        self.assertEqual(
+            service._deterministic_alias_terms(topic="apiology", canonical_topic="apiology"),
+            ["melittology"],
+        )
+        self.assertEqual(
+            service._deterministic_alias_terms(topic="odonatology", canonical_topic="odonatology"),
+            ["odonata"],
+        )
+
     def test_reel_service_builds_topic_concepts_from_expansion_when_missing(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
@@ -1229,6 +1247,243 @@ class MediumRegressionTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_ranked_request_reels_filters_low_value_page_one_niche_reels(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("apiology", "topic", "material-1"),
+        )
+        try:
+            with mock.patch.object(
+                main_module.reel_service,
+                "ranked_feed",
+                side_effect=[
+                    [
+                        {
+                            "reel_id": "bad-meaning",
+                            "video_url": "https://www.youtube.com/embed/video-a?start=0&end=35",
+                            "video_title": "Apiology Meaning",
+                            "video_description": "How to pronounce apiology and word meaning.",
+                            "transcript_snippet": "",
+                            "score": 0.82,
+                            "relevance_score": 0.42,
+                            "matched_terms": ["apiology"],
+                            "video_duration_sec": 120,
+                            "clip_duration_sec": 35.0,
+                            "source_surface": "youtube_html",
+                            "retrieval_stage": "high_precision",
+                            "query_strategy": "literal",
+                            "created_at": "2026-03-15T00:00:00+00:00",
+                        },
+                        {
+                            "reel_id": "good-root",
+                            "video_url": "https://www.youtube.com/embed/video-b?start=0&end=35",
+                            "video_title": "Apiology - The Scientific Study of Honey Bees",
+                            "video_description": "Educational introduction to apiology and bee science.",
+                            "transcript_snippet": "",
+                            "score": 0.76,
+                            "relevance_score": 0.4,
+                            "matched_terms": ["apiology"],
+                            "video_duration_sec": 600,
+                            "clip_duration_sec": 35.0,
+                            "source_surface": "youtube_html",
+                            "retrieval_stage": "high_precision",
+                            "query_strategy": "literal",
+                            "created_at": "2026-03-15T00:00:01+00:00",
+                        },
+                    ]
+                ],
+            ):
+                merged = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=True,
+                    generation_id="gen-1",
+                    min_relevance=None,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=1,
+                    limit=5,
+                )
+
+            self.assertEqual([row["reel_id"] for row in merged], ["good-root"])
+        finally:
+            conn.close()
+
+    def test_ranked_request_reels_relaxes_topic_relevance_for_later_pages(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("myrmecology", "topic", "material-1"),
+        )
+        try:
+            candidate = {
+                "reel_id": "good-companion",
+                "video_url": "https://www.youtube.com/embed/video-ant?start=0&end=35",
+                "video_title": "Ant Colony Behavior Explained",
+                "video_description": "Educational overview of ant colony behavior and social structure.",
+                "transcript_snippet": "",
+                "score": 0.52,
+                "relevance_score": 0.24,
+                "matched_terms": ["ants"],
+                "video_duration_sec": 420,
+                "clip_duration_sec": 35.0,
+                "source_surface": "youtube_related",
+                "retrieval_stage": "recovery",
+                "query_strategy": "recovery_adjacent",
+                "created_at": "2026-03-15T00:00:00+00:00",
+            }
+            with mock.patch.object(main_module.reel_service, "ranked_feed", return_value=[candidate]):
+                page_one = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=1,
+                    limit=5,
+                )
+                page_two = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=2,
+                    limit=5,
+                )
+
+            self.assertEqual(page_one, [])
+            self.assertEqual([row["reel_id"] for row in page_two], ["good-companion"])
+        finally:
+            conn.close()
+
+    def test_ranked_request_reels_accepts_alias_anchor_on_page_one_for_odonatology(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("odonatology", "topic", "material-1"),
+        )
+        try:
+            candidate = {
+                "reel_id": "good-alias",
+                "video_url": "https://www.youtube.com/embed/video-odonata?start=0&end=35",
+                "video_title": "Odonata - Dragonfly and Damselfly",
+                "video_description": "Educational introduction to dragonflies and damselflies.",
+                "transcript_snippet": "",
+                "score": 0.58,
+                "relevance_score": 0.34,
+                "matched_terms": ["odonata"],
+                "video_duration_sec": 420,
+                "clip_duration_sec": 35.0,
+                "source_surface": "youtube_html",
+                "retrieval_stage": "high_precision",
+                "query_strategy": "literal",
+                "created_at": "2026-03-15T00:00:00+00:00",
+            }
+            with mock.patch.object(main_module.reel_service, "ranked_feed", return_value=[candidate]):
+                page_one = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=1,
+                    limit=5,
+                )
+
+            self.assertEqual([row["reel_id"] for row in page_one], ["good-alias"])
+        finally:
+            conn.close()
+
+    def test_ranked_request_reels_accumulates_page_one_before_later_page_relaxation(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("myrmecology", "topic", "material-1"),
+        )
+        try:
+            reels = [
+                {
+                    "reel_id": "good-root",
+                    "video_url": "https://www.youtube.com/embed/video-root?start=0&end=35",
+                    "video_title": "Myrmecology Basics",
+                    "video_description": "Introduction to myrmecology and ant science.",
+                    "transcript_snippet": "",
+                    "score": 0.64,
+                    "relevance_score": 0.34,
+                    "matched_terms": ["myrmecology"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_html",
+                    "retrieval_stage": "high_precision",
+                    "query_strategy": "literal",
+                    "created_at": "2026-03-15T00:00:00+00:00",
+                },
+                {
+                    "reel_id": "good-companion",
+                    "video_url": "https://www.youtube.com/embed/video-ant?start=0&end=35",
+                    "video_title": "Ant Colony Behavior Explained",
+                    "video_description": "Educational overview of ant colony behavior and social structure.",
+                    "transcript_snippet": "",
+                    "score": 0.52,
+                    "relevance_score": 0.24,
+                    "matched_terms": ["ants"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_related",
+                    "retrieval_stage": "recovery",
+                    "query_strategy": "recovery_adjacent",
+                    "created_at": "2026-03-15T00:00:01+00:00",
+                },
+            ]
+            with mock.patch.object(main_module.reel_service, "ranked_feed", return_value=reels):
+                page_one = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=1,
+                    limit=5,
+                )
+                page_two = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=2,
+                    limit=5,
+                )
+
+            self.assertEqual([row["reel_id"] for row in page_one], ["good-root"])
+            self.assertEqual([row["reel_id"] for row in page_two], ["good-root", "good-companion"])
+        finally:
+            conn.close()
+
     def test_response_generation_ids_walks_full_source_chain(self) -> None:
         conn = self._build_generation_test_conn()
         try:
@@ -1420,7 +1675,11 @@ class MediumRegressionTests(unittest.TestCase):
             )
             return []
 
-        with mock.patch.object(main_module.reel_service, "generate_reels", side_effect=fake_generate_reels):
+        with mock.patch.object(main_module, "_ranked_request_reels", return_value=[]), mock.patch.object(
+            main_module.reel_service,
+            "generate_reels",
+            side_effect=fake_generate_reels,
+        ):
             with mock.patch.object(main_module, "get_conn") as patched_get_conn:
                 class _Ctx:
                     def __enter__(self_nonlocal):
@@ -1480,7 +1739,7 @@ class MediumRegressionTests(unittest.TestCase):
             main_module,
             "_ranked_request_reels",
             side_effect=lambda test_conn, **kwargs: self._fake_ranked_request_reels(test_conn, kwargs["generation_id"]),
-        ), mock.patch.object(main_module, "_queue_refinement_job") as queue_job:
+        ), mock.patch.object(main_module, "_queue_refinement_job", return_value={"id": "job-deep", "status": "queued"}) as queue_job:
             result = main_module._ensure_generation_for_request(
                 conn,
                 material_id="material-1",
@@ -1499,10 +1758,10 @@ class MediumRegressionTests(unittest.TestCase):
 
         self.assertEqual(generate_calls, [("bootstrap", 3), ("deep", 2)])
         self.assertEqual(result["response_profile"], "bootstrap_then_deep")
-        self.assertIsNone(result["refinement_job_id"])
-        self.assertIsNone(result["refinement_status"])
+        self.assertEqual(result["refinement_job_id"], "job-deep")
+        self.assertEqual(result["refinement_status"], "queued")
         self.assertEqual(len(result["reels"]), 3)
-        queue_job.assert_not_called()
+        queue_job.assert_called()
         generation_row = conn.execute(
             "SELECT retrieval_profile, status, reel_count FROM reel_generations WHERE id = ?",
             (result["generation_id"],),
@@ -1550,7 +1809,7 @@ class MediumRegressionTests(unittest.TestCase):
             main_module,
             "_ranked_request_reels",
             side_effect=lambda test_conn, **kwargs: self._fake_ranked_request_reels(test_conn, kwargs["generation_id"]),
-        ), mock.patch.object(main_module, "_queue_refinement_job") as queue_job:
+        ), mock.patch.object(main_module, "_queue_refinement_job", return_value={"id": "job-fast-deep", "status": "queued"}) as queue_job:
             result = main_module._ensure_generation_for_request(
                 conn,
                 material_id="material-1",
@@ -1569,10 +1828,10 @@ class MediumRegressionTests(unittest.TestCase):
 
         self.assertEqual(generate_calls, [("bootstrap", 3), ("deep", 2)])
         self.assertEqual(result["response_profile"], "bootstrap_then_deep")
-        self.assertIsNone(result["refinement_job_id"])
-        self.assertIsNone(result["refinement_status"])
+        self.assertEqual(result["refinement_job_id"], "job-fast-deep")
+        self.assertEqual(result["refinement_status"], "queued")
         self.assertEqual(len(result["reels"]), 3)
-        queue_job.assert_not_called()
+        queue_job.assert_called()
         generation_row = conn.execute(
             "SELECT retrieval_profile, status, reel_count FROM reel_generations WHERE id = ?",
             (result["generation_id"],),
@@ -1848,7 +2107,7 @@ class MediumRegressionTests(unittest.TestCase):
             main_module.reel_service,
             "generate_reels",
             side_effect=fake_generate_reels,
-        ), mock.patch.object(main_module, "_queue_refinement_job") as queue_job:
+        ), mock.patch.object(main_module, "_queue_refinement_job", return_value={"id": "job-cumulative", "status": "queued"}) as queue_job:
             result = main_module._ensure_generation_for_request(
                 conn,
                 material_id="material-1",
@@ -1867,7 +2126,7 @@ class MediumRegressionTests(unittest.TestCase):
                 emit_existing_reels=True,
             )
 
-        queue_job.assert_not_called()
+        queue_job.assert_called()
         self.assertEqual(captured["retrieval_profile"], "deep")
         self.assertEqual(captured["num_reels"], 15)
         self.assertEqual(captured["exclude_generation_ids"], ["bootstrap-gen", "deep-gen"])
@@ -1976,7 +2235,7 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual(
             int(request_params["target_reel_count"]),
             main_module._refinement_target_reel_count(
-                required_count=5,
+                required_count=11,
                 generation_mode="fast",
                 existing_source_count=5,
             ),
@@ -2131,12 +2390,33 @@ class MediumRegressionTests(unittest.TestCase):
             fast_mode=False,
             retrieval_profile="deep",
             request_need=8,
+            page_hint=2,
         )
 
         self.assertEqual([plan.name for plan in plans], ["high_precision", "broad", "recovery"])
         self.assertEqual(plans[0].budget, 2)
         self.assertEqual(plans[1].budget, 3)
         self.assertEqual(plans[2].budget, 1)
+
+    def test_reel_service_deep_stage_plan_defers_adjacent_recovery_on_page_one(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+        candidates = [
+            QueryCandidate("query one", "literal", 0.95, stage="high_precision", source_surface="youtube_html"),
+            QueryCandidate("query two", "tutorial", 0.9, stage="high_precision", source_surface="youtube_html"),
+            QueryCandidate("query three", "literal", 0.84, stage="broad", source_surface="youtube_html"),
+            QueryCandidate("query four", "recovery_adjacent", 0.7, stage="recovery", source_surface="youtube_html"),
+        ]
+
+        plans = service._build_retrieval_stage_plan(
+            query_candidates=candidates,
+            fast_mode=False,
+            retrieval_profile="deep",
+            request_need=8,
+            page_hint=1,
+            recovery_stage=0,
+        )
+
+        self.assertEqual([plan.name for plan in plans], ["high_precision", "broad"])
 
     def test_reel_service_bootstrap_primary_query_disambiguates_single_term_topics(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
@@ -3309,6 +3589,26 @@ class MediumRegressionTests(unittest.TestCase):
             root_topic_terms=["melittology", "apiology", "study of bees"],
         )
         self.assertFalse(result["passes"])
+
+    def test_reel_service_hard_blocks_subject_meaning_titles_for_non_language_topics(self) -> None:
+        service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
+
+        self.assertTrue(
+            service._is_hard_blocked_low_value_video(
+                title="Bryology Meaning",
+                description="",
+                channel_title="",
+                subject_tag="bryology",
+            )
+        )
+        self.assertTrue(
+            service._is_hard_blocked_low_value_video(
+                title="What does odonatology mean?",
+                description="",
+                channel_title="",
+                subject_tag="odonatology",
+            )
+        )
 
     def test_quick_candidate_metadata_gate_rejects_lexicon_noise_for_niche_topic(self) -> None:
         service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())

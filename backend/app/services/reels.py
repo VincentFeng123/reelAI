@@ -710,7 +710,7 @@ class ReelService:
     QUERY_RETRIEVAL_WORKERS_SLOW = 6
     TRANSCRIPT_FETCH_WORKERS_FAST = 6
     TRANSCRIPT_FETCH_WORKERS_SLOW = 6
-    RANKED_FEED_CACHE_VERSION = 1
+    RANKED_FEED_CACHE_VERSION = 2
 
     def __init__(self, embedding_service, youtube_service) -> None:
         settings = get_settings()
@@ -918,9 +918,17 @@ class ReelService:
         generation_id: str | None = None,
         exclude_generation_ids: list[str] | None = None,
         min_relevance_threshold: float = 0.0,
+        page_hint: int = 1,
+        recovery_stage: int = 0,
         on_reel_created: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[dict[str, Any]]:
         self._min_relevance_threshold = max(0.0, min(1.0, float(min_relevance_threshold)))
+        safe_page_hint = max(1, int(page_hint or 1))
+        safe_recovery_stage = max(0, int(recovery_stage or 0))
+        allow_adjacent_recovery = self._allow_adjacent_recovery(
+            page_hint=safe_page_hint,
+            recovery_stage=safe_recovery_stage,
+        )
         safe_retrieval_profile = self._normalize_retrieval_profile(retrieval_profile)
         params: tuple[Any, ...] = (material_id,)
         concept_where = "WHERE material_id = ?"
@@ -1052,7 +1060,11 @@ class ReelService:
         }
         generated_video_counts: dict[str, int] = {}
         generated_clip_keys: set[str] = set()
-        default_max_segments_per_video = 1 if fast_mode else 3
+        default_max_segments_per_video = self._request_page_segment_cap(
+            video_duration_sec=0,
+            fast_mode=fast_mode,
+            page_hint=safe_page_hint,
+        )
         excluded_generation_ids = [
             candidate_id
             for candidate_id in (exclude_generation_ids or [])
@@ -1223,6 +1235,8 @@ class ReelService:
                 fast_mode=fast_mode,
                 retrieval_profile=safe_retrieval_profile,
                 request_need=max(1, num_reels),
+                page_hint=safe_page_hint,
+                recovery_stage=safe_recovery_stage,
             )
             retrieval_run = self._init_retrieval_debug_run(
                 material_id=material_id,
@@ -1332,7 +1346,7 @@ class ReelService:
                         creative_commons_only=creative_commons_only,
                         fast_mode=fast_mode,
                         retrieval_profile=safe_retrieval_profile,
-                        allow_external_fallbacks=safe_retrieval_profile != "bootstrap",
+                        allow_external_fallbacks=allow_adjacent_recovery and stage.name == "recovery",
                         variant_limit=2 if safe_retrieval_profile == "bootstrap" else None,
                     )
 
@@ -1359,6 +1373,7 @@ class ReelService:
                                 video_duration_sec=video_duration_val,
                                 fast_mode=fast_mode,
                                 default_cap=default_max_segments_per_video,
+                                page_hint=safe_page_hint,
                             )
                             if existing_for_video + generated_for_video >= video_segment_cap:
                                 query_report["dropped_segment_cap"] += 1
@@ -1544,6 +1559,7 @@ class ReelService:
                                 video_duration_sec=video_duration,
                                 fast_mode=fast_mode,
                                 default_cap=default_max_segments_per_video,
+                                page_hint=safe_page_hint,
                             )
                             if existing_for_video + generated_for_video >= video_segment_cap:
                                 query_report["dropped_segment_cap"] += 1
@@ -1658,7 +1674,7 @@ class ReelService:
                         creative_commons_only=creative_commons_only,
                         fast_mode=fast_mode,
                         retrieval_profile=safe_retrieval_profile,
-                        allow_external_fallbacks=True,
+                        allow_external_fallbacks=allow_adjacent_recovery,
                         variant_limit=1,
                     )
                     for query_idx, _duration_idx, query_candidate, _duration, videos in fallback_jobs:
@@ -1682,6 +1698,7 @@ class ReelService:
                                 video_duration_sec=video_duration,
                                 fast_mode=fast_mode,
                                 default_cap=default_max_segments_per_video,
+                                page_hint=safe_page_hint,
                             )
                             if existing_for_video + generated_for_video >= video_segment_cap:
                                 query_report["dropped_segment_cap"] += 1
@@ -1749,7 +1766,7 @@ class ReelService:
                     )
                     all_query_reports.extend(fallback_reports)
 
-            if not stage_candidates:
+            if not stage_candidates and allow_adjacent_recovery:
                 local_candidates = self._recover_candidates_from_local_corpus(
                     conn,
                     material_id=material_id,
@@ -1766,6 +1783,7 @@ class ReelService:
                     generated_video_counts=generated_video_counts,
                     max_segments_per_video=default_max_segments_per_video,
                     concept_title=str(concept.get("title") or ""),
+                    page_hint=safe_page_hint,
                 )
                 if local_candidates:
                     stage_candidates = local_candidates
@@ -1810,7 +1828,10 @@ class ReelService:
                     query_reports=all_query_reports,
                     candidate_rows=[],
                     selected=None,
-                    failure_reason="no_candidates_after_retrieval",
+                    failure_reason=self._exhaustion_reason_from_metrics(
+                        metrics=retrieval_metrics,
+                        selected=None,
+                    ),
                     dry_run=dry_run,
                     metrics=retrieval_metrics,
                 )
@@ -1889,6 +1910,7 @@ class ReelService:
                     video_duration_sec=video_duration,
                     fast_mode=fast_mode,
                     default_cap=default_max_segments_per_video,
+                    page_hint=safe_page_hint,
                 )
                 if existing_for_video + generated_for_video >= video_segment_cap:
                     continue
@@ -2152,7 +2174,10 @@ class ReelService:
                 query_reports=all_query_reports,
                 candidate_rows=candidate_records,
                 selected=selected_outcome,
-                failure_reason="" if selected_outcome else "no_segment_after_rerank",
+                failure_reason=self._exhaustion_reason_from_metrics(
+                    metrics=retrieval_metrics,
+                    selected=selected_outcome,
+                ),
                 dry_run=dry_run,
                 metrics=retrieval_metrics,
             )
@@ -2378,14 +2403,41 @@ class ReelService:
         video_duration_sec: int | float | None,
         fast_mode: bool,
         default_cap: int,
+        page_hint: int = 1,
     ) -> int:
-        return max(
-            max(1, int(default_cap or 1)),
-            self._max_segments_allowed_for_video(
-                video_duration_sec=video_duration_sec,
-                fast_mode=fast_mode,
-            ),
+        request_cap = self._request_page_segment_cap(
+            video_duration_sec=video_duration_sec,
+            fast_mode=fast_mode,
+            page_hint=page_hint,
         )
+        duration_cap = self._max_segments_allowed_for_video(
+            video_duration_sec=video_duration_sec,
+            fast_mode=fast_mode,
+        )
+        return max(1, min(duration_cap, max(max(1, int(default_cap or 1)), request_cap)))
+
+    def _request_page_segment_cap(
+        self,
+        *,
+        video_duration_sec: int | float | None,
+        fast_mode: bool,
+        page_hint: int,
+    ) -> int:
+        safe_page = max(1, int(page_hint or 1))
+        try:
+            duration_value = int(video_duration_sec or 0)
+        except (TypeError, ValueError):
+            duration_value = 0
+        if safe_page <= 1:
+            return 2 if not fast_mode else 2
+        if safe_page <= 5:
+            return 4
+        if duration_value > 20 * 60:
+            return 6
+        return 4
+
+    def _allow_adjacent_recovery(self, *, page_hint: int, recovery_stage: int) -> bool:
+        return max(1, int(page_hint or 1)) > 1 or int(recovery_stage or 0) > 0
 
     def _generation_result_score(self, reel: dict[str, Any]) -> float:
         relevance = reel.get("relevance_score")
@@ -2651,6 +2703,31 @@ class ReelService:
             "concept_id": concept_id,
             "concept_title": concept_title,
         }
+
+    def _exhaustion_reason_from_metrics(
+        self,
+        *,
+        metrics: dict[str, Any],
+        selected: dict[str, Any] | None = None,
+    ) -> str:
+        if selected:
+            return ""
+        raw_discovered = int(metrics.get("raw_discovered_videos") or 0)
+        filtered_relevant = int(metrics.get("filtered_relevant_videos") or 0)
+        clip_candidates = int(metrics.get("clip_candidate_videos") or 0)
+        dropped_segment_cap = int(metrics.get("dropped_segment_cap") or 0)
+
+        if raw_discovered <= 0:
+            return "search_recall_exhausted"
+        if filtered_relevant <= 0:
+            return "quality_blocked"
+        if dropped_segment_cap > 0 and clip_candidates <= 0:
+            return "quota_or_cap_exhausted"
+        if clip_candidates <= 0:
+            return "clip_yield_exhausted"
+        if dropped_segment_cap > 0:
+            return "quota_or_cap_exhausted"
+        return "clip_yield_exhausted"
 
     def _persist_retrieval_debug_run(
         self,
@@ -3892,6 +3969,8 @@ class ReelService:
         fast_mode: bool,
         retrieval_profile: RetrievalProfile,
         request_need: int,
+        page_hint: int = 1,
+        recovery_stage: int = 0,
     ) -> list[RetrievalStagePlan]:
         stage_map: dict[str, list[QueryCandidate]] = {"high_precision": [], "broad": [], "recovery": []}
         for item in query_candidates:
@@ -3910,7 +3989,7 @@ class ReelService:
             high_precision_min = 2
             broad_budget = min(len(stage_map["broad"]), 1 + max(0, int(request_need) - 1) // 8)
             broad_min = 1
-            recovery_budget = 0
+            recovery_budget = min(len(stage_map["recovery"]), 1) if self._allow_adjacent_recovery(page_hint=page_hint, recovery_stage=recovery_stage) else 0
             recovery_min = 0
         else:
             high_precision_budget = 2
@@ -3918,12 +3997,20 @@ class ReelService:
             if fast_mode:
                 broad_budget = min(len(stage_map["broad"]), 1 + max(0, int(request_need) - 1) // 5)
                 broad_min = 1 if broad_budget > 0 else 0
-                recovery_budget = min(len(stage_map["recovery"]), 1 if int(request_need) >= 6 else 0)
+                recovery_budget = (
+                    min(len(stage_map["recovery"]), 1 if int(request_need) >= 6 else 0)
+                    if self._allow_adjacent_recovery(page_hint=page_hint, recovery_stage=recovery_stage)
+                    else 0
+                )
                 recovery_min = 1 if recovery_budget > 0 else 0
             else:
                 broad_budget = min(len(stage_map["broad"]), 2 + max(0, int(request_need) - 1) // 4)
                 broad_min = min(2, broad_budget)
-                recovery_budget = min(len(stage_map["recovery"]), 1 + max(0, int(request_need) - 6) // 6)
+                recovery_budget = (
+                    min(len(stage_map["recovery"]), 1 + max(0, int(request_need) - 6) // 6)
+                    if self._allow_adjacent_recovery(page_hint=page_hint, recovery_stage=recovery_stage)
+                    else 0
+                )
                 recovery_min = min(1, recovery_budget)
 
         plans = [
@@ -4439,6 +4526,39 @@ class ReelService:
     ) -> dict[str, Any]:
         title = str(video.get("title") or "")
         description = str(video.get("description") or "")
+        if self._is_hard_blocked_low_value_video(
+            title=title,
+            description=description,
+            channel_title=str(video.get("channel_title") or ""),
+            subject_tag=subject_tag,
+        ):
+            return {
+                "passes": False,
+                "final_score": 0.0,
+                "discovery_score": 0.0,
+                "clipability_score": 0.0,
+                "text_relevance": {"passes": False, "score": 0.0, "off_topic_penalty": 1.0},
+                "features": {
+                    "semantic_title": 0.0,
+                    "semantic_description": 0.0,
+                    "strategy_prior": 0.0,
+                    "duration_fit": 0.0,
+                    "freshness_fit": 0.0,
+                    "channel_quality": 0.0,
+                    "engagement_fit": 0.0,
+                    "educational_intent": 0.0,
+                    "visual_intent_match": 0.0,
+                    "query_alignment": 0.0,
+                    "query_alignment_hits": [],
+                    "root_topic_alignment": 0.0,
+                    "root_topic_alignment_hits": [],
+                    "specific_concept_anchor": 0.0,
+                    "specific_concept_anchor_hits": [],
+                    "specific_concept_anchor_required": False,
+                    "lexicon_noise": 1.0,
+                    "source_prior": 0.0,
+                },
+            }
         metadata_text = str((quick_signals or {}).get("metadata_text") or self._video_metadata_text(video))
         text_relevance = self._score_text_relevance(
             conn,
@@ -4629,6 +4749,13 @@ class ReelService:
         metadata_text = self._video_metadata_text(video)
         if not metadata_text.strip():
             return {"passes": False, "metadata_text": metadata_text}
+        if self._is_hard_blocked_low_value_video(
+            title=str(video.get("title") or ""),
+            description=str(video.get("description") or ""),
+            channel_title=str(video.get("channel_title") or ""),
+            subject_tag=subject_tag,
+        ):
+            return {"passes": False, "metadata_text": metadata_text, "lexicon_noise": 1.0}
 
         query_alignment = self._query_alignment_score(
             metadata_text,
@@ -4775,6 +4902,57 @@ class ReelService:
                 score += penalty
         score -= 0.06 * min(2, len(metadata_tokens.intersection(self.STRONG_EDUCATIONAL_CUE_TERMS)))
         return float(max(0.0, min(1.0, score)))
+
+    def _is_hard_blocked_low_value_video(
+        self,
+        *,
+        title: str,
+        description: str,
+        channel_title: str,
+        subject_tag: str | None,
+    ) -> bool:
+        if self._looks_like_language_subject(subject_tag):
+            return False
+
+        lowered = f" {self._clean_query_text(' '.join([title, description, channel_title])).lower()} "
+        normalized_subject = self._clean_query_text(subject_tag or "").lower()
+        metadata_tokens = normalize_terms([title, description, channel_title])
+
+        if " provided to youtube " in lowered:
+            return True
+        if normalized_subject:
+            if re.search(
+                rf"\b{re.escape(normalized_subject)}\b.*\b(meaning|pronunciation|definition|dictionary)\b",
+                lowered,
+            ) or re.search(
+                rf"\b(meaning|pronunciation|definition|dictionary)\b.*\b{re.escape(normalized_subject)}\b",
+                lowered,
+            ):
+                return True
+            if re.search(
+                rf"\bwhat does\b.*\b{re.escape(normalized_subject)}\b.*\bmean\b",
+                lowered,
+            ):
+                return True
+        if any(f" {phrase} " in lowered for phrase in self.LEXICON_CONFLICT_PHRASES):
+            return True
+        if len(metadata_tokens.intersection(self.LEXICON_CONFLICT_TOKENS)) >= 2:
+            return True
+        if len(metadata_tokens.intersection(self.ENTERTAINMENT_CONFLICT_TOKENS)) >= 2:
+            return True
+        if any(
+            token in lowered
+            for token in (
+                " official audio ",
+                " karaoke ",
+                " lyrics ",
+                " lyric video ",
+                " remix ",
+                " music video ",
+            )
+        ):
+            return True
+        return False
 
     def _specific_concept_anchor_terms(self, query_candidate: QueryCandidate) -> list[str]:
         seen: set[str] = set()
@@ -5384,6 +5562,7 @@ class ReelService:
         generated_video_counts: dict[str, int],
         max_segments_per_video: int,
         concept_title: str,
+        page_hint: int = 1,
         root_topic_terms: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         # Fix Q: Search larger corpus; use FAISS pre-filter when embeddings available
@@ -5446,6 +5625,7 @@ class ReelService:
                 video_duration_sec=video_duration,
                 fast_mode=fast_mode,
                 default_cap=max_segments_per_video,
+                page_hint=page_hint,
             )
             existing_for_video = existing_video_counts.get(video_id, 0)
             generated_for_video = generated_video_counts.get(video_id, 0)
@@ -6426,6 +6606,13 @@ class ReelService:
         subject_tag: str | None = None,
         root_topic_terms: list[str] | None = None,
     ) -> bool:
+        if self._is_hard_blocked_low_value_video(
+            title=str(video.get("title") or ""),
+            description=str(video.get("description") or ""),
+            channel_title=str(video.get("channel_title") or ""),
+            subject_tag=subject_tag,
+        ):
+            return False
         video_relevance = dict(ranking.get("text_relevance") or {})
         features = dict(ranking.get("features") or {})
         query_alignment = float(features.get("query_alignment") or 0.0)
@@ -7611,6 +7798,7 @@ class ReelService:
                 c.summary AS concept_summary,
                 c.embedding_json AS concept_embedding_json,
                 v.title AS video_title,
+                COALESCE(v.channel_title, '') AS video_channel_title,
                 COALESCE(v.description, '') AS video_description,
                 COALESCE(v.duration_sec, 0) AS video_duration_sec,
                 r.video_url,
@@ -7639,6 +7827,7 @@ class ReelService:
                 c.summary,
                 c.embedding_json,
                 v.title,
+                v.channel_title,
                 v.description,
                 v.duration_sec,
                 r.video_url,
@@ -7674,6 +7863,36 @@ class ReelService:
         concept_by_id = {row["id"]: row for row in concept_rows}
         total_concepts = len(concept_rows)
         material_context_terms = self._build_material_context_terms(concepts=concept_rows, subject_tag=subject_tag)
+        video_ids = sorted({str(row.get("video_id") or "") for row in reel_rows if str(row.get("video_id") or "").strip()})
+        retrieval_candidate_by_video: dict[str, dict[str, Any]] = {}
+        if video_ids:
+            placeholders = ", ".join(["?"] * len(video_ids))
+            candidate_rows = fetch_all(
+                conn,
+                f"""
+                SELECT
+                    rc.video_id,
+                    rc.strategy,
+                    rc.stage,
+                    rc.source_surface,
+                    rc.discovery_score,
+                    rc.clipability_score,
+                    rc.final_score,
+                    rc.feature_json,
+                    rc.created_at
+                FROM retrieval_candidates rc
+                JOIN retrieval_runs rr ON rr.id = rc.run_id
+                WHERE rr.material_id = ?
+                  AND rc.video_id IN ({placeholders})
+                ORDER BY rc.created_at DESC, rc.position ASC
+                """,
+                tuple([material_id, *video_ids]),
+            )
+            for candidate_row in candidate_rows:
+                video_id = str(candidate_row.get("video_id") or "").strip()
+                if not video_id or video_id in retrieval_candidate_by_video:
+                    continue
+                retrieval_candidate_by_video[video_id] = dict(candidate_row)
 
         scored: list[dict[str, Any]] = []
         for row in reel_rows:
@@ -7698,6 +7917,8 @@ class ReelService:
             concept_summary = str(concept_row.get("concept_summary") or concept_row.get("summary") or "").strip()
             concept_terms = [concept_title, *[str(k) for k in concept_keywords[:8]], concept_summary]
             context_terms = self._context_terms_for_concept(concept_terms, material_context_terms)
+            video_id = str(row.get("video_id") or "").strip()
+            retrieval_candidate = retrieval_candidate_by_video.get(video_id, {})
 
             concept_embedding: np.ndarray | None = None
             if not fast_mode:
@@ -7718,6 +7939,13 @@ class ReelService:
                 concept_embedding=concept_embedding,
                 subject_tag=subject_tag,
             )
+            if self._is_hard_blocked_low_value_video(
+                title=video_title,
+                description=video_description,
+                channel_title=str(row.get("video_channel_title") or ""),
+                subject_tag=subject_tag,
+            ):
+                continue
             relevance["passes"] = self._passes_relevance_gate(
                 relevance=relevance,
                 require_context=bool(context_terms),
@@ -7761,12 +7989,13 @@ class ReelService:
                 - 0.06 * concept_confusing
                 + 0.22 * float(relevance_context.get("score") or 0.0)
                 - 0.12 * float(relevance.get("off_topic_penalty") or 0.0)
+                + 0.04 * float(self.SOURCE_SURFACE_PRIOR.get(str(retrieval_candidate.get("source_surface") or ""), 0.82))
             )
             scored.append(
                 {
                     "reel_id": row["reel_id"],
                     "material_id": material_id,
-                    "video_id": row["video_id"],
+                    "video_id": video_id,
                     "concept_id": row["concept_id"],
                     "concept_title": concept_title,
                     "video_title": video_title,
@@ -7779,11 +8008,14 @@ class ReelService:
                     "takeaways": takeaways,
                     "score": score,
                     "relevance_score": float(relevance_context.get("score") or 0.0),
-                    "discovery_score": float(relevance_context.get("score") or 0.0),
-                    "clipability_score": float(self._score_clipability_from_metadata({"duration_sec": row.get("video_duration_sec")}, strategy="literal")),
-                    "query_strategy": "",
-                    "retrieval_stage": "",
-                    "source_surface": "",
+                    "discovery_score": float(retrieval_candidate.get("discovery_score") or relevance_context.get("score") or 0.0),
+                    "clipability_score": float(
+                        retrieval_candidate.get("clipability_score")
+                        or self._score_clipability_from_metadata({"duration_sec": row.get("video_duration_sec")}, strategy="literal")
+                    ),
+                    "query_strategy": str(retrieval_candidate.get("strategy") or ""),
+                    "retrieval_stage": str(retrieval_candidate.get("stage") or ""),
+                    "source_surface": str(retrieval_candidate.get("source_surface") or ""),
                     "matched_terms": relevance_context.get("matched_terms", []),
                     "relevance_reason": str(relevance_context.get("reason") or ""),
                     "concept_position": concept_order.get(row["concept_id"]),

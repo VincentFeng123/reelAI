@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class TopicExpansionService:
-    CACHE_VERSION = 8
+    CACHE_VERSION = 9
     WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
     WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
     DATAMUSE_API_URL = "https://api.datamuse.com/words"
@@ -188,6 +188,18 @@ class TopicExpansionService:
             "law of sines",
             "law of cosines",
         ),
+    }
+    DETERMINISTIC_ALIAS_TERMS: dict[str, tuple[str, ...]] = {
+        "apiology": ("melittology",),
+        "melittology": ("apiology",),
+        "odonatology": ("odonata",),
+    }
+    DETERMINISTIC_COMPANION_TERMS: dict[str, tuple[str, ...]] = {
+        "apiology": ("bee", "bees", "honey bee", "pollinator"),
+        "melittology": ("bee", "bees", "honey bee", "pollinator"),
+        "myrmecology": ("ant", "ants", "formicidae"),
+        "bryology": ("moss", "mosses", "liverwort", "liverworts", "hornwort", "hornworts"),
+        "odonatology": ("dragonfly", "dragonflies", "damselfly", "damselflies"),
     }
     EDUCATIONAL_CUE_TERMS = {
         "alphabet",
@@ -519,6 +531,11 @@ class TopicExpansionService:
             ],
             max_aliases=max_aliases,
         )
+        aliases = self._merge_term_lists(
+            self._deterministic_alias_terms(topic=clean_topic, canonical_topic=canonical_topic),
+            aliases,
+            limit=max_aliases,
+        )
         static_subtopics = self._static_topic_subtopics(clean_topic)
         generic_subtopics = self._generic_family_subtopics(clean_topic, likely_language=likely_language)
         weighted_candidates.extend((term, 4.4) for term in static_subtopics)
@@ -550,6 +567,11 @@ class TopicExpansionService:
             wikidata_entities=wikidata_entities,
             max_terms=max(2, min(4, max_related_terms)),
         )
+        companion_terms = self._merge_term_lists(
+            self._deterministic_companion_terms(topic=clean_topic, canonical_topic=canonical_topic),
+            companion_terms,
+            limit=max_related_terms,
+        )
         datamuse_terms = [] if opaque_topic else self._fetch_datamuse_related_terms(clean_topic)
         weighted_candidates.extend((term, 1.6) for term in datamuse_terms)
         subtopics = self._collect_subtopics(
@@ -575,6 +597,53 @@ class TopicExpansionService:
             "subtopics": subtopics,
             "related_terms": related_terms,
         }
+
+    def _merge_term_lists(self, *term_lists: list[str] | tuple[str, ...], limit: int) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for values in term_lists:
+            for raw_value in values or []:
+                cleaned = normalize_whitespace(str(raw_value or "")).strip()
+                normalized = self._normalize_key(cleaned)
+                if not cleaned or not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                ordered.append(cleaned)
+                if len(ordered) >= limit:
+                    return ordered[:limit]
+        return ordered[:limit]
+
+    def _deterministic_alias_terms(self, *, topic: str, canonical_topic: str) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw in [topic, canonical_topic]:
+            normalized = self._normalize_key(raw)
+            if not normalized:
+                continue
+            for alias in self.DETERMINISTIC_ALIAS_TERMS.get(normalized, ()):
+                alias_clean = normalize_whitespace(alias).strip()
+                alias_key = self._normalize_key(alias_clean)
+                if not alias_clean or not alias_key or alias_key in seen:
+                    continue
+                seen.add(alias_key)
+                ordered.append(alias_clean)
+        return ordered
+
+    def _deterministic_companion_terms(self, *, topic: str, canonical_topic: str) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for raw in [topic, canonical_topic]:
+            normalized = self._normalize_key(raw)
+            if not normalized:
+                continue
+            for term in self.DETERMINISTIC_COMPANION_TERMS.get(normalized, ()):
+                clean_term = normalize_whitespace(term).strip()
+                normalized_term = self._normalize_key(clean_term)
+                if not clean_term or not normalized_term or normalized_term in seen:
+                    continue
+                seen.add(normalized_term)
+                ordered.append(clean_term)
+        return ordered
 
     def build_topic_search_terms(
         self,
