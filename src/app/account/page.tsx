@@ -16,10 +16,15 @@ function normalizeReturnTab(value: string | null): "search" | "community" | "edi
   return null;
 }
 
+function normalizeAccountView(value: string | null): "default" | "change-password" {
+  return value === "change-password" ? "change-password" : "default";
+}
+
 function AccountPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const returnTab = useMemo(() => normalizeReturnTab(searchParams.get("return_tab")), [searchParams]);
+  const requestedView = useMemo(() => normalizeAccountView(searchParams.get("view")), [searchParams]);
   const [communityAccount, setCommunityAccount] = useState<CommunityAccount | null>(null);
   const [accountScreenReady, setAccountScreenReady] = useState(false);
   const showLoadingScreen = useLoadingScreenGate(accountScreenReady, { minimumVisibleMs: 1000 });
@@ -80,13 +85,25 @@ function AccountPageContent() {
     };
   }, []);
 
-  const backTarget = returnTab ? `/?tab=${returnTab}` : "/";
+  const accountBaseTarget = returnTab ? `/account?return_tab=${returnTab}` : "/account";
+  const backTarget = requestedView === "change-password"
+    ? accountBaseTarget
+    : returnTab
+      ? `/?tab=${returnTab}`
+      : "/";
+  const changePasswordTarget = returnTab
+    ? `/account?view=change-password&return_tab=${returnTab}`
+    : "/account?view=change-password";
+  const accountView = communityAccount ? requestedView : "default";
   const onBack = useCallback(() => {
     router.push(backTarget);
   }, [backTarget, router]);
   const onOpenYourSets = useCallback(() => {
     router.push("/?tab=edit");
   }, [router]);
+  const onOpenChangePassword = useCallback(() => {
+    router.push(changePasswordTarget);
+  }, [changePasswordTarget, router]);
 
   if (showLoadingScreen) {
     return <FullscreenLoadingScreen />;
@@ -95,8 +112,10 @@ function AccountPageContent() {
   return (
     <CommunityAccountScreen
       account={communityAccount}
+      view={accountView}
       onBack={onBack}
       onAccountChange={setCommunityAccount}
+      onOpenChangePassword={onOpenChangePassword}
       onOpenYourSets={onOpenYourSets}
     />
   );

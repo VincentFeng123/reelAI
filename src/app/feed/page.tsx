@@ -12,7 +12,7 @@ import {
   fetchCommunitySettings,
   fetchFeed,
   fetchRefinementStatus,
-  generateReels,
+  generateReelsStream,
   isSessionExpiredError,
   queueCommunityHistorySync,
   readCommunityAuthSession,
@@ -53,6 +53,8 @@ const MAX_SAVED_FEED_PROGRESS = 240;
 const MAX_SAVED_FEED_SESSIONS = 24;
 const MAX_REELS_PER_FEED_SESSION = 80;
 const MAX_EMPTY_GENERATION_STREAK = 10;
+const REFINEMENT_POLL_INTERVAL_MS = 3000;
+const MAX_GENERATION_TARGET_REELS = 60;
 const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
 type FeedbackAction = "helpful" | "confusing" | "save";
 
@@ -407,6 +409,7 @@ function buildCommunityFeedReel(params: {
 
   return {
     reel_id: buildCommunityFeedReelId(safeSetId, normalizedReelId),
+    material_id: safeSetId,
     concept_id: safeSetId,
     concept_title: title,
     video_title: `${title} (${platformLabel})`,
@@ -892,6 +895,59 @@ function FeedPageInner() {
     [],
   );
 
+  const hasPendingRefinementForFeed = useCallback((): boolean => {
+    const feedMaterialIds = getFeedMaterialIds();
+    if (feedMaterialIds.length === 0) {
+      return false;
+    }
+    return feedMaterialIds.some((id) => pendingRefinementJobsRef.current.has(String(id || "").trim()));
+  }, [getFeedMaterialIds]);
+
+  const countReelsForMaterial = useCallback(
+    (materialIdValue: string): number => {
+      const materialIdKey = String(materialIdValue || "").trim();
+      if (!materialIdKey) {
+        return 0;
+      }
+      const singleFeedMaterialId = getFeedMaterialIds().length === 1 ? materialIdKey : "";
+      return reels.reduce((count, reel) => {
+        const reelMaterialId = String(reel.material_id || singleFeedMaterialId).trim();
+        return reelMaterialId === materialIdKey ? count + 1 : count;
+      }, 0);
+    },
+    [getFeedMaterialIds, reels],
+  );
+
+  const feedNeedsBootstrapTopUp = useCallback((): boolean => {
+    const feedMaterialIds = getFeedMaterialIds();
+    if (feedMaterialIds.length === 0) {
+      return false;
+    }
+    const minimumPerTopic = generationMode === "fast" ? 3 : 5;
+    return feedMaterialIds.some((id) => countReelsForMaterial(id) < minimumPerTopic);
+  }, [countReelsForMaterial, generationMode, getFeedMaterialIds]);
+
+  const shouldBlockOnPendingRefinement = useCallback((): boolean => {
+    return hasPendingRefinementForFeed() && !feedNeedsBootstrapTopUp();
+  }, [feedNeedsBootstrapTopUp, hasPendingRefinementForFeed]);
+
+  const appendGeneratedReels = useCallback(
+    (generated: Reel[]) => {
+      if (!generated.length) {
+        return;
+      }
+      setReels((prev) => {
+        const merged = dedupeByIdentity(generated, prev);
+        const added = merged.length - prev.length;
+        if (added > 0) {
+          setTotal((prevTotal) => Math.max(prevTotal, merged.length));
+        }
+        return merged;
+      });
+    },
+    [dedupeByIdentity],
+  );
+
   const loadPage = useCallback(
     async (targetPage: number, options?: { autofill?: boolean }) => {
       const feedMaterialIds = getFeedMaterialIds();
@@ -999,10 +1055,17 @@ function FeedPageInner() {
     try {
       const generatedRows = await Promise.all(
         feedMaterialIds.map(async (id) => {
+          const streamedReels: Reel[] = [];
+          const currentCount = countReelsForMaterial(id);
+          const initialTarget = generationMode === "fast" ? 3 : 5;
+          const targetTotal = Math.max(
+            currentCount > 0 ? perTopicBatch : initialTarget,
+            Math.min(MAX_GENERATION_TARGET_REELS, currentCount > 0 ? currentCount + perTopicBatch : initialTarget),
+          );
           try {
-            const data = await generateReels({
+            const data = await generateReelsStream({
               materialId: id,
-              numReels: perTopicBatch,
+              numReels: targetTotal,
               generationMode,
               minRelevance: tuning.minRelevance,
               videoPoolMode: tuning.videoPoolMode,
@@ -1010,11 +1073,15 @@ function FeedPageInner() {
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+              onReel: (reel) => {
+                streamedReels.push(reel);
+                appendGeneratedReels([reel]);
+              },
             });
-            return { materialId: id, data, error: null };
+            return { materialId: id, data, streamedReels, error: null };
           } catch (e) {
             console.warn(`Background reel generation failed for topic material ${id}:`, e);
-            return { materialId: id, data: null, error: e };
+            return { materialId: id, data: null, streamedReels, error: e };
           }
         }),
       );
@@ -1041,7 +1108,9 @@ function FeedPageInner() {
           registerRefinementJob(row.materialId, row.data);
         }
       });
-      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row.data?.reels ?? [])));
+      const generated = dedupeByIdentity(
+        interleaveReelBatches(generatedRows.map((row) => row.data?.reels ?? row.streamedReels ?? [])),
+      );
       if (generated.length === 0) {
         emptyGenerateStreakRef.current += 1;
         if (emptyGenerateStreakRef.current >= MAX_EMPTY_GENERATION_STREAK) {
@@ -1068,7 +1137,7 @@ function FeedPageInner() {
       setGeneratingMore(false);
       isGeneratingRef.current = false;
     }
-  }, [canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration, materialId, recoverMissingMaterial, registerRefinementJob, settingsScopeReady]);
+  }, [appendGeneratedReels, canRequestMore, countReelsForMaterial, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration, materialId, recoverMissingMaterial, registerRefinementJob, settingsScopeReady]);
 
   useEffect(() => {
     mutedRestoredFromSnapshotRef.current = false;
@@ -1170,16 +1239,36 @@ function FeedPageInner() {
     bootstrapAttemptedRef.current = false;
     pendingRefinementJobsRef.current.clear();
     if (restoredSession) {
-      const restoredReels = dedupeByIdentity(restoredSession.reels).slice(-MAX_REELS_PER_FEED_SESSION);
+      const allowedMaterialIds = new Set(feedMaterialIds.map((id) => String(id || "").trim()).filter(Boolean));
+      const singleFeedMaterialId = feedMaterialIds.length === 1 ? feedMaterialIds[0] : "";
+      const restoredReels = dedupeByIdentity(
+        restoredSession.reels.filter((reel) => {
+          const reelMaterialId = String(reel.material_id || singleFeedMaterialId).trim();
+          return !reelMaterialId || allowedMaterialIds.has(reelMaterialId);
+        }),
+      ).slice(-MAX_REELS_PER_FEED_SESSION);
       const restoredIndex = restoredReels.length > 0 ? clamp(restoredSession.activeIndex, 0, restoredReels.length - 1) : 0;
       const restoredReelId = restoredReels[restoredIndex]?.reel_id;
+      const modeFromQuery =
+        generationModeParam === "fast" || generationModeParam === "slow" ? generationModeParam : null;
+      const restoredGenerationMode = modeFromQuery ?? restoredSession.generationMode;
+      const minimumPerTopic = restoredGenerationMode === "fast" ? 3 : 5;
+      const restoredCounts = new Map<string, number>();
+      for (const reel of restoredReels) {
+        const reelMaterialId = String(reel.material_id || singleFeedMaterialId).trim();
+        if (!reelMaterialId) {
+          continue;
+        }
+        restoredCounts.set(reelMaterialId, (restoredCounts.get(reelMaterialId) ?? 0) + 1);
+      }
+      const restoredSessionUnderfilled = feedMaterialIds.some(
+        (id) => (restoredCounts.get(String(id || "").trim()) ?? 0) < minimumPerTopic,
+      );
       setReels(restoredReels);
       setPage(restoredSession.page);
       setTotal(Math.max(restoredSession.total, restoredReels.length));
-      setCanRequestMore(restoredSession.canRequestMore);
-      const modeFromQuery =
-        generationModeParam === "fast" || generationModeParam === "slow" ? generationModeParam : null;
-      setGenerationMode(modeFromQuery ?? restoredSession.generationMode);
+      setCanRequestMore(restoredSessionUnderfilled || restoredSession.canRequestMore);
+      setGenerationMode(restoredGenerationMode);
       setMutedPreference(restoredSession.mutedPreference);
       setCaptionsPreference(restoredSession.captionsPreference);
       mutedRestoredFromSnapshotRef.current = true;
@@ -1207,23 +1296,6 @@ function FeedPageInner() {
     setSessionHydrated(true);
   }, [loading, materialId, sessionHydrated]);
 
-  const appendGeneratedReels = useCallback(
-    (generated: Reel[]) => {
-      if (!generated.length) {
-        return;
-      }
-      setReels((prev) => {
-        const merged = dedupeByIdentity(generated, prev);
-        const added = merged.length - prev.length;
-        if (added > 0) {
-          setTotal((prevTotal) => Math.max(prevTotal, merged.length));
-        }
-        return merged;
-      });
-    },
-    [dedupeByIdentity],
-  );
-
   const refreshRefinedFeed = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
     if (!settingsScopeReady || feedMaterialIds.length === 0 || isRefreshingRefinementRef.current) {
@@ -1232,26 +1304,54 @@ function FeedPageInner() {
     isRefreshingRefinementRef.current = true;
     try {
       const tuning = getFeedTuningSettings();
-      const refreshLimit = Math.max(PAGE_SIZE, reels.length || PAGE_SIZE);
       const currentReelId = reels[activeIndexRef.current]?.reel_id;
       const rows = await Promise.all(
         feedMaterialIds.map(async (id) => {
           try {
-            const data = await fetchFeed({
+            const pageLimit = 25;
+            const collected: Reel[] = [];
+            let pageToLoad = 1;
+            let totalForMaterial = 0;
+            let latestData: Awaited<ReturnType<typeof fetchFeed>> | null = null;
+
+            while (pageToLoad === 1 || collected.length < totalForMaterial) {
+              const data = await fetchFeed({
+                materialId: id,
+                page: pageToLoad,
+                limit: pageLimit,
+                autofill: false,
+                prefetch: 0,
+                generationMode,
+                minRelevance: tuning.minRelevance,
+                videoPoolMode: tuning.videoPoolMode,
+                preferredVideoDuration: tuning.preferredVideoDuration,
+                targetClipDurationSec: tuning.targetClipDurationSec,
+                targetClipDurationMinSec: tuning.targetClipDurationMinSec,
+                targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+              });
+              latestData = data;
+              totalForMaterial = Math.max(0, Number(data.total) || 0);
+              const merged = dedupeByIdentity(data.reels, collected);
+              collected.splice(0, collected.length, ...merged);
+              if (data.reels.length === 0 || collected.length >= totalForMaterial) {
+                break;
+              }
+              pageToLoad += 1;
+            }
+
+            if (!latestData) {
+              return null;
+            }
+            return {
               materialId: id,
-              page: 1,
-              limit: refreshLimit,
-              autofill: false,
-              prefetch: 0,
-              generationMode,
-              minRelevance: tuning.minRelevance,
-              videoPoolMode: tuning.videoPoolMode,
-              preferredVideoDuration: tuning.preferredVideoDuration,
-              targetClipDurationSec: tuning.targetClipDurationSec,
-              targetClipDurationMinSec: tuning.targetClipDurationMinSec,
-              targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
-            });
-            return { materialId: id, data };
+              data: {
+                ...latestData,
+                page: 1,
+                limit: pageLimit,
+                total: Math.max(totalForMaterial, collected.length),
+                reels: collected,
+              },
+            };
           } catch (error) {
             console.warn(`Refined feed refresh failed for topic material ${id}:`, error);
             return null;
@@ -1290,6 +1390,7 @@ function FeedPageInner() {
       || !canRequestMore
       || isFastTopUpRef.current
       || isGeneratingRef.current
+      || shouldBlockOnPendingRefinement()
     ) {
       return;
     }
@@ -1299,10 +1400,16 @@ function FeedPageInner() {
     try {
       const generatedRows = await Promise.all(
         feedMaterialIds.map(async (id) => {
+          const streamedReels: Reel[] = [];
+          const currentCount = countReelsForMaterial(id);
+          const targetTotal = Math.max(
+            perTopicBatch,
+            Math.min(MAX_GENERATION_TARGET_REELS, currentCount + perTopicBatch),
+          );
           try {
-            const data = await generateReels({
+            const data = await generateReelsStream({
               materialId: id,
-              numReels: perTopicBatch,
+              numReels: targetTotal,
               generationMode,
               minRelevance: tuning.minRelevance,
               videoPoolMode: tuning.videoPoolMode,
@@ -1310,8 +1417,12 @@ function FeedPageInner() {
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+              onReel: (reel) => {
+                streamedReels.push(reel);
+                appendGeneratedReels([reel]);
+              },
             });
-            return { materialId: id, data };
+            return { materialId: id, data, streamedReels };
           } catch (e) {
             console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
             return null;
@@ -1323,17 +1434,18 @@ function FeedPageInner() {
           registerRefinementJob(row.materialId, row.data);
         }
       });
-      const generated = dedupeByIdentity(interleaveReelBatches(generatedRows.map((row) => row?.data.reels ?? [])));
+      const generated = dedupeByIdentity(
+        interleaveReelBatches(generatedRows.map((row) => row?.data.reels ?? row?.streamedReels ?? [])),
+      );
       if (generated.length > 0) {
         emptyGenerateStreakRef.current = 0;
-        appendGeneratedReels(generated);
       }
     } catch (e) {
       console.warn("Fast mode background top-up failed:", e);
     } finally {
       isFastTopUpRef.current = false;
     }
-  }, [appendGeneratedReels, canRequestMore, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, registerRefinementJob, settingsScopeReady]);
+  }, [appendGeneratedReels, canRequestMore, countReelsForMaterial, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, registerRefinementJob, settingsScopeReady, shouldBlockOnPendingRefinement]);
 
   useEffect(() => {
     if (!settingsScopeReady || getFeedMaterialIds().length === 0) {
@@ -1373,7 +1485,7 @@ function FeedPageInner() {
     void pollRefinements();
     const timer = window.setInterval(() => {
       void pollRefinements();
-    }, 5000);
+    }, REFINEMENT_POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -1388,7 +1500,6 @@ function FeedPageInner() {
       setBootstrappingFirstReels(true);
       try {
         const generated = await requestMore({ surfaceError: manual });
-        appendGeneratedReels(generated);
         if (generationMode === "fast" && generated.length > 0) {
           void runFastTopUp();
         }
@@ -1396,16 +1507,23 @@ function FeedPageInner() {
         setBootstrappingFirstReels(false);
       }
     },
-    [appendGeneratedReels, canRequestMore, generationMode, materialId, requestMore, runFastTopUp],
+    [canRequestMore, generationMode, materialId, requestMore, runFastTopUp],
   );
 
   useEffect(() => {
-    if (!materialId || loading || reels.length > 0 || bootstrapAttemptedRef.current) {
+    if (
+      !materialId
+      || loading
+      || bootstrappingFirstReels
+      || bootstrapAttemptedRef.current
+      || shouldBlockOnPendingRefinement()
+      || !feedNeedsBootstrapTopUp()
+    ) {
       return;
     }
     bootstrapAttemptedRef.current = true;
     void bootstrapFirstReels(false);
-  }, [bootstrapFirstReels, loading, materialId, reels.length]);
+  }, [bootstrapFirstReels, bootstrappingFirstReels, feedNeedsBootstrapTopUp, loading, materialId, shouldBlockOnPendingRefinement]);
 
   const maybeLoadMore = useCallback(() => {
     if (isFetchingRef.current) {
@@ -1416,15 +1534,17 @@ function FeedPageInner() {
       return;
     }
     if (canRequestMore && !isGeneratingRef.current) {
+      if (shouldBlockOnPendingRefinement()) {
+        return;
+      }
       void (async () => {
         const generated = await requestMore();
-        appendGeneratedReels(generated);
         if (generationMode === "fast" && generated.length > 0) {
           void runFastTopUp();
         }
       })();
     }
-  }, [appendGeneratedReels, canRequestMore, generationMode, hasMore, loadPage, page, requestMore, runFastTopUp]);
+  }, [canRequestMore, generationMode, hasMore, loadPage, page, requestMore, runFastTopUp, shouldBlockOnPendingRefinement]);
 
   const shouldBlockDownwardAtEnd = useCallback(
     (direction: 1 | -1): boolean => {
@@ -1485,10 +1605,12 @@ function FeedPageInner() {
     }
 
     if (canRequestMore) {
+      if (shouldBlockOnPendingRefinement()) {
+        return;
+      }
       resumeLoadingRef.current = true;
       void (async () => {
         const generated = await requestMore();
-        appendGeneratedReels(generated);
         if (generationMode === "fast" && generated.length > 0) {
           void runFastTopUp();
         }
@@ -1500,7 +1622,7 @@ function FeedPageInner() {
 
     setActiveIndex((prev) => (reels.length > 0 ? Math.min(prev, reels.length - 1) : 0));
     resumeAppliedRef.current = true;
-  }, [appendGeneratedReels, canRequestMore, generationMode, hasMore, loadPage, materialId, page, reels, requestMore, runFastTopUp]);
+  }, [canRequestMore, generationMode, hasMore, loadPage, materialId, page, reels, requestMore, runFastTopUp, shouldBlockOnPendingRefinement]);
 
   useEffect(() => {
     maybeResumeProgress();
@@ -1597,7 +1719,14 @@ function FeedPageInner() {
     if (typeof window === "undefined" || !materialId || !sessionHydrated) {
       return;
     }
-    const dedupedReels = dedupeByIdentity(reels).slice(-MAX_REELS_PER_FEED_SESSION);
+    const allowedMaterialIds = new Set(getFeedMaterialIds().map((id) => String(id || "").trim()).filter(Boolean));
+    const singleFeedMaterialId = allowedMaterialIds.size === 1 ? Array.from(allowedMaterialIds)[0] : "";
+    const dedupedReels = dedupeByIdentity(
+      reels.filter((reel) => {
+        const reelMaterialId = String(reel.material_id || singleFeedMaterialId).trim();
+        return !reelMaterialId || allowedMaterialIds.has(reelMaterialId);
+      }),
+    ).slice(-MAX_REELS_PER_FEED_SESSION);
     const index = dedupedReels.length > 0 ? clamp(activeIndex, 0, dedupedReels.length - 1) : 0;
     const activeReelId = dedupedReels[index]?.reel_id;
     const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));

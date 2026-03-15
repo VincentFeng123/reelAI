@@ -18,7 +18,7 @@ class MaterialResponse(BaseModel):
 class ReelsGenerateRequest(BaseModel):
     material_id: str
     concept_id: str | None = None
-    num_reels: int = Field(default=8, ge=1, le=30)
+    num_reels: int = Field(default=8, ge=1, le=60)
     creative_commons_only: bool = False
     generation_mode: Literal["slow", "fast"] = "fast"
     min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
@@ -37,6 +37,7 @@ class CaptionCue(BaseModel):
 
 class ReelOut(BaseModel):
     reel_id: str
+    material_id: str
     concept_id: str
     concept_title: str
     video_title: str = ""

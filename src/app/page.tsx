@@ -1290,7 +1290,8 @@ function HomePageContent() {
                         event.stopPropagation();
                         setActiveHistoryMenuId((prev) => (prev === entry.materialId ? null : entry.materialId));
                       }}
-                      className="grid h-6 w-6 place-items-center rounded-md text-white/70 opacity-100 transition hover:bg-white/10 hover:text-white lg:opacity-0 lg:group-hover:opacity-100 lg:focus-within:opacity-100"
+                      data-force-visible={activeHistoryMenuId === entry.materialId ? "true" : undefined}
+                      className="reveal-on-desktop-hover grid h-6 w-6 place-items-center rounded-md text-white/70 transition hover:bg-white/10 hover:text-white"
                     >
                       <i className="fa-solid fa-ellipsis text-[11px]" aria-hidden="true" />
                     </button>

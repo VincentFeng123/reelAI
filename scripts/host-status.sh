@@ -11,5 +11,14 @@ show_port() {
   fi
 }
 
-show_port "Backend" 8000
+if lsof -nP -iTCP:8000 -sTCP:LISTEN >/dev/null 2>&1; then
+  if curl --silent --show-error --fail --max-time 2 http://127.0.0.1:8000/api/health >/dev/null 2>&1; then
+    echo "Backend: RUNNING and healthy on localhost:8000"
+  else
+    echo "Backend: LISTENING but unresponsive on localhost:8000"
+  fi
+else
+  echo "Backend: DOWN"
+fi
+
 show_port "Frontend" 3001

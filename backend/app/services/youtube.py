@@ -5,11 +5,12 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     NoTranscriptFound,
@@ -26,6 +27,7 @@ class YouTubeApiRequestError(RuntimeError):
 
 
 RetrievalProfile = Literal["bootstrap", "deep"]
+GraphProfile = Literal["off", "light", "deep"]
 
 
 def _cache_key(*parts: str) -> str:
@@ -47,12 +49,16 @@ def parse_iso8601_duration(value: str) -> int:
 
 
 class YouTubeService:
+    SEARCH_CACHE_VERSION = 4
+    SEARCH_CACHE_TTL_SEC = 24 * 60 * 60  # 24 hours
+    SEARCH_CACHE_EMPTY_TTL_SEC = 2 * 60 * 60  # 2 hours for empty results
     DATA_API_MAX_PAGES = 10
     DATA_API_POOL_MULTIPLIER = 8
     DATA_API_POOL_CAP = 760
     SEARCH_VARIANTS_LIMIT = 16
     PRIMARY_VARIANT_LIMIT = 3
     HTML_MAX_PAGES = 6
+    HTML_MAX_PAGES_DEEP = 10
     HTML_POOL_MULTIPLIER = 8
     HTML_POOL_CAP = 600
     SEARCH_SURFACE_WORKERS = 4
@@ -62,6 +68,71 @@ class YouTubeService:
     REQUEST_TIMEOUT_SEC = 8.0
     SEARCH_TIME_BUDGET_SEC = 12.0
     NETWORK_BACKOFF_SEC = 45.0
+    NETWORK_BACKOFF_FAILURE_THRESHOLD = 3
+    SESSION_POOL_SIZE = 24
+    WATCH_PAGE_CACHE_TTL_SEC = 15 * 60
+    CHANNEL_PAGE_CACHE_TTL_SEC = 15 * 60
+    QUERY_VARIANT_EXACT_MIN_TOKENS = 3
+    QUERY_VARIANT_EXACT_MAX_TOKENS = 9
+    GRAPH_LIGHT_MAX_SEEDS = 2
+    GRAPH_LIGHT_RELATED_PER_SEED = 5
+    GRAPH_LIGHT_CHANNEL_SEEDS = 1
+    GRAPH_LIGHT_CHANNEL_RESULTS = 4
+    GRAPH_LIGHT_STAGE_MAX_SEC = 1.6
+    GRAPH_DEEP_MAX_SEEDS = 5
+    GRAPH_DEEP_RELATED_PER_SEED = 8
+    GRAPH_DEEP_CHANNEL_SEEDS = 2
+    GRAPH_DEEP_CHANNEL_RESULTS = 8
+    GRAPH_DEEP_STAGE_MAX_SEC = 4.5
+    GRAPH_RELATED_SURFACE = "youtube_related"
+    GRAPH_CHANNEL_SURFACE = "youtube_channel"
+    SEARCH_QUERY_NOISE_TOKENS = {
+        "basic",
+        "basics",
+        "course",
+        "guide",
+        "intro",
+        "introduction",
+        "learn",
+        "lesson",
+        "lessons",
+        "overview",
+        "video",
+        "videos",
+        "watch",
+        "youtube",
+    }
+    SEARCH_SOURCE_PRIORITY = {
+        "youtube_api": 1.0,
+        "youtube_html": 0.94,
+        "youtube_related": 0.9,
+        "youtube_channel": 0.86,
+        "duckduckgo_quoted": 0.88,
+        "bing_quoted": 0.85,
+        "duckduckgo_site": 0.82,
+        "bing_site": 0.79,
+    }
+    STRATEGY_SUFFIX_BY_NAME = {
+        "animation": "animation",
+        "demo": "demo",
+        "documentary": "documentary",
+        "explained": "explained",
+        "lecture": "lecture",
+        "tutorial": "tutorial",
+        "worked_example": "worked example",
+    }
+    SEARCH_VARIANT_VISUAL_STRATEGIES = {"action", "broll", "object", "scene"}
+    SEARCH_VARIANT_SUFFIXES = (
+        "worked example",
+        "full lecture",
+        "documentary",
+        "animation",
+        "explained",
+        "tutorial",
+        "lecture",
+        "demo",
+        "shorts",
+    )
 
     def __init__(self) -> None:
         settings = get_settings()
@@ -70,11 +141,61 @@ class YouTubeService:
         self.empty_transcript_ttl_sec = 6 * 60 * 60
         self._network_backoff_until = 0.0
         self._network_backoff_lock = threading.Lock()
+        self._network_backoff_until_by_scope: dict[str, float] = {}
+        self._network_failure_streak_by_scope: dict[str, int] = {}
+        self._page_cache_lock = threading.Lock()
+        self._page_cache: dict[str, tuple[float, str]] = {}
         self.serverless_mode = bool(
             os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
         )
         self.search_time_budget_sec = 3.5 if self.serverless_mode else self.SEARCH_TIME_BUDGET_SEC
         self.request_timeout_sec = 2.5 if self.serverless_mode else self.REQUEST_TIMEOUT_SEC
+        self._session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=self.SESSION_POOL_SIZE,
+            pool_maxsize=self.SESSION_POOL_SIZE,
+            max_retries=0,
+        )
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        self._session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+        )
+
+    def _session_get(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
+        return self._session.get(
+            url,
+            timeout=self._request_timeout(deadline),
+            **kwargs,
+        )
+
+    def _session_post(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
+        return self._session.post(
+            url,
+            timeout=self._request_timeout(deadline),
+            **kwargs,
+        )
+
+    def _cache_get_text(self, cache_key: str, *, ttl_sec: int) -> str | None:
+        with self._page_cache_lock:
+            cached = self._page_cache.get(cache_key)
+            if cached is None:
+                return None
+            created_at, payload = cached
+            if (time.monotonic() - created_at) >= ttl_sec:
+                self._page_cache.pop(cache_key, None)
+                return None
+            return payload
+
+    def _cache_set_text(self, cache_key: str, payload: str) -> None:
+        with self._page_cache_lock:
+            self._page_cache[cache_key] = (time.monotonic(), payload)
 
     def search_videos(
         self,
@@ -89,6 +210,8 @@ class YouTubeService:
         retrieval_profile: RetrievalProfile = "deep",
         allow_external_fallbacks: bool = True,
         variant_limit: int | None = None,
+        graph_profile: GraphProfile = "off",
+        root_terms: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if conn is None:
             with get_conn() as local_conn:
@@ -104,6 +227,8 @@ class YouTubeService:
                     retrieval_profile=retrieval_profile,
                     allow_external_fallbacks=allow_external_fallbacks,
                     variant_limit=variant_limit,
+                    graph_profile=graph_profile,
+                    root_terms=root_terms,
                 )
         return self._search_videos_with_conn(
             conn,
@@ -117,6 +242,8 @@ class YouTubeService:
             retrieval_profile=retrieval_profile,
             allow_external_fallbacks=allow_external_fallbacks,
             variant_limit=variant_limit,
+            graph_profile=graph_profile,
+            root_terms=root_terms,
         )
 
     def _search_videos_with_conn(
@@ -132,9 +259,13 @@ class YouTubeService:
         retrieval_profile: RetrievalProfile,
         allow_external_fallbacks: bool,
         variant_limit: int | None,
+        graph_profile: GraphProfile = "off",
+        root_terms: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         duration_key = video_duration or "any"
+        normalized_root_terms = self._normalized_root_terms(query=query, root_terms=root_terms)
         key = _cache_key(
+            str(self.SEARCH_CACHE_VERSION),
             query,
             str(max_results),
             str(creative_commons_only),
@@ -145,18 +276,27 @@ class YouTubeService:
             retrieval_profile,
             str(bool(allow_external_fallbacks)),
             str(variant_limit or 0),
+            graph_profile,
+            "||".join(normalized_root_terms),
         )
-        cached = fetch_one(conn, "SELECT response_json FROM search_cache WHERE cache_key = ?", (key,))
+        cached = fetch_one(conn, "SELECT response_json, created_at FROM search_cache WHERE cache_key = ?", (key,))
         if cached:
             try:
                 payload = json.loads(cached["response_json"])
             except (TypeError, json.JSONDecodeError):
                 payload = []
             if isinstance(payload, list):
-                return self._merge_unique_videos(payload, [], max_results)
-
-        if self._network_backoff_active():
-            return []
+                cache_fresh = self._search_cache_is_fresh(
+                    created_at=cached.get("created_at"),
+                    is_empty=len(payload) == 0,
+                )
+                if cache_fresh:
+                    return self._finalize_search_rows(
+                        payload,
+                        query=query,
+                        max_results=max_results,
+                        video_duration=video_duration,
+                    )
 
         deadline = time.monotonic() + self.search_time_budget_sec
         videos: list[dict[str, Any]] = []
@@ -187,8 +327,15 @@ class YouTubeService:
                     variant_limit=variant_limit or 1,
                     skip_primary_variants=False,
                     retrieval_profile=retrieval_profile,
+                    graph_profile=graph_profile,
+                    root_terms=normalized_root_terms,
                 )
-            videos = self._merge_unique_videos(videos, [], max_results)
+            videos = self._finalize_search_rows(
+                videos,
+                query=query,
+                max_results=max_results,
+                video_duration=video_duration,
+            )
             upsert(
                 conn,
                 "search_cache",
@@ -219,6 +366,7 @@ class YouTubeService:
                             retrieval_stage,
                             source_surface,
                             deadline,
+                            normalized_root_terms,
                         ),
                     )
                 )
@@ -240,22 +388,28 @@ class YouTubeService:
                             self.PRIMARY_VARIANT_LIMIT,
                             False,
                             retrieval_profile,
+                            "off",
+                            normalized_root_terms,
                         ),
                     )
                 )
 
+            surface_results: dict[str, list[dict[str, Any]]] = {}
             future_to_surface = {future: surface for surface, future in futures}
             for future in as_completed(future_to_surface):
+                surface = future_to_surface[future]
                 try:
                     rows = future.result()
                 except YouTubeApiRequestError:
                     rows = []
                 except Exception:
                     rows = []
-                if rows:
-                    videos = self._merge_unique_videos(videos, rows, max_results)
-                if len(videos) >= max_results:
-                    break
+                surface_results[surface] = rows
+
+        for surface, _future in futures:
+            rows = surface_results.get(surface) or []
+            if rows:
+                videos = self._merge_unique_videos(videos, rows, None)
 
         if not creative_commons_only and len(videos) < max_results:
             expanded = self._search_without_data_api(
@@ -267,12 +421,51 @@ class YouTubeService:
                 retrieval_stage=retrieval_stage,
                 source_surface=source_surface,
                 deadline=deadline,
-                include_external_fallbacks=True,
+                include_external_fallbacks=False,
                 variant_limit=self.SEARCH_VARIANTS_LIMIT,
                 skip_primary_variants=True,
                 retrieval_profile=retrieval_profile,
+                graph_profile="off",
+                root_terms=normalized_root_terms,
             )
-            videos = self._merge_unique_videos(videos, expanded, max_results)
+            videos = self._merge_unique_videos(videos, expanded, None)
+
+        if (
+            not creative_commons_only
+            and graph_profile != "off"
+            and self._should_expand_graph(
+                rows=videos,
+                query=query,
+                max_results=max_results,
+                video_duration=video_duration,
+            )
+        ):
+            graph_rows = self._expand_videos_via_youtube_graph(
+                seed_rows=videos,
+                query=query,
+                max_results=max_results,
+                video_duration=video_duration,
+                retrieval_strategy=retrieval_strategy,
+                retrieval_stage=retrieval_stage,
+                deadline=deadline,
+                graph_profile=graph_profile,
+                root_terms=normalized_root_terms,
+            )
+            videos = self._merge_unique_videos(videos, graph_rows, None)
+
+        if not creative_commons_only and allow_external_fallbacks and len(videos) < max_results:
+            external = self._search_external_fallbacks(
+                query=query,
+                max_results=max_results,
+                video_duration=video_duration,
+                retrieval_strategy=retrieval_strategy,
+                retrieval_stage=retrieval_stage,
+                source_surface=source_surface,
+                retrieval_profile=retrieval_profile,
+                deadline=deadline,
+                variant_limit=variant_limit,
+            )
+            videos = self._merge_unique_videos(videos, external, None)
 
         if not videos and self.api_key and not creative_commons_only:
             # Secondary recovery in case primary pass got blocked by transient API errors.
@@ -287,8 +480,15 @@ class YouTubeService:
                 deadline=deadline,
                 include_external_fallbacks=True,
                 retrieval_profile=retrieval_profile,
+                graph_profile=graph_profile,
+                root_terms=normalized_root_terms,
             )
-        videos = self._merge_unique_videos(videos, [], max_results)
+        videos = self._finalize_search_rows(
+            videos,
+            query=query,
+            max_results=max_results,
+            video_duration=video_duration,
+        )
 
         upsert(
             conn,
@@ -312,6 +512,7 @@ class YouTubeService:
         retrieval_stage: str,
         source_surface: str,
         deadline: float | None = None,
+        root_terms: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         target_pool = max(max_results, min(self.DATA_API_POOL_CAP, max_results * self.DATA_API_POOL_MULTIPLIER))
         per_page = 50
@@ -320,7 +521,7 @@ class YouTubeService:
         next_page_token: str | None = None
 
         for page_idx in range(self.DATA_API_MAX_PAGES):
-            if self._deadline_exceeded(deadline):
+            if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_api"):
                 break
             params = {
                 "key": self.api_key,
@@ -340,15 +541,16 @@ class YouTubeService:
                 params["pageToken"] = next_page_token
 
             try:
-                resp = requests.get(
+                resp = self._session_get(
                     "https://www.googleapis.com/youtube/v3/search",
                     params=params,
-                    timeout=self._request_timeout(deadline),
+                    deadline=deadline,
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                self._note_request_success("youtube_api")
             except requests.RequestException as exc:
-                self._note_request_failure(exc)
+                self._note_request_failure(exc, scope="youtube_api")
                 if page_idx == 0:
                     status = getattr(getattr(exc, "response", None), "status_code", None)
                     if status == 403:
@@ -396,6 +598,7 @@ class YouTubeService:
                 {
                     "id": video_id,
                     "title": item.get("snippet", {}).get("title", "Untitled"),
+                    "channel_id": item.get("snippet", {}).get("channelId", ""),
                     "channel_title": item.get("snippet", {}).get("channelTitle", ""),
                     "description": item.get("snippet", {}).get("description", ""),
                     "duration_sec": detail.get("duration_sec", 0),
@@ -406,9 +609,18 @@ class YouTubeService:
                     "query_strategy": retrieval_strategy or "",
                     "query_stage": retrieval_stage or "",
                     "search_query": query,
+                    "discovery_path": "search:youtube_api",
+                    "seed_video_id": "",
+                    "seed_channel_id": item.get("snippet", {}).get("channelId", ""),
+                    "crawl_depth": 0,
                 }
             )
-        return self._merge_unique_videos(videos, [], max_results)
+        return self._finalize_search_rows(
+            videos,
+            query=query,
+            max_results=max_results,
+            video_duration=video_duration,
+        )
 
     def _search_without_data_api(
         self,
@@ -424,11 +636,13 @@ class YouTubeService:
         variant_limit: int | None = None,
         skip_primary_variants: bool = False,
         retrieval_profile: RetrievalProfile = "deep",
+        graph_profile: GraphProfile = "off",
+        root_terms: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         # License cannot be reliably verified without the Data API.
         if creative_commons_only:
             return []
-        if self._deadline_exceeded(deadline) or self._network_backoff_active():
+        if self._deadline_exceeded(deadline):
             return []
 
         target_pool = max(max_results, min(self.HTML_POOL_CAP, max_results * self.HTML_POOL_MULTIPLIER))
@@ -438,6 +652,7 @@ class YouTubeService:
             video_duration=video_duration,
             source_surface=source_surface,
             retrieval_profile=retrieval_profile,
+            retrieval_strategy=retrieval_strategy,
         )
         if skip_primary_variants and len(query_variants) > self.PRIMARY_VARIANT_LIMIT:
             query_variants = query_variants[self.PRIMARY_VARIANT_LIMIT :]
@@ -446,15 +661,15 @@ class YouTubeService:
         if not query_variants:
             return []
 
-        html_futures: list[Any] = []
+        html_futures: dict[Any, int] = {}
         max_html_workers = max(1, min(self.SEARCH_SURFACE_WORKERS, len(query_variants)))
         with ThreadPoolExecutor(max_workers=max_html_workers) as executor:
-            for variant in query_variants:
+            for variant_idx, variant in enumerate(query_variants):
                 search_query = str(variant.get("query") or "").strip()
                 variant_surface = str(variant.get("surface") or source_surface or "youtube_html")
                 if not search_query:
                     continue
-                html_futures.append(
+                html_futures[
                     executor.submit(
                         self._search_variant_via_html,
                         search_query,
@@ -464,10 +679,12 @@ class YouTubeService:
                         retrieval_strategy,
                         retrieval_stage,
                         deadline,
+                        retrieval_profile,
                     )
-                )
+                ] = variant_idx
+            ordered_variant_rows: list[list[dict[str, Any]]] = [[] for _ in query_variants]
             for future in as_completed(html_futures):
-                if self._deadline_exceeded(deadline) or self._network_backoff_active():
+                if self._deadline_exceeded(deadline):
                     break
                 try:
                     rows = future.result()
@@ -475,63 +692,74 @@ class YouTubeService:
                     rows = []
                 if not rows:
                     continue
-                results = self._merge_unique_videos(results, rows, target_pool)
-                if len(results) >= target_pool:
-                    break
+                ordered_variant_rows[html_futures[future]] = rows
+        for rows in ordered_variant_rows:
+            if rows:
+                results = self._merge_unique_videos(results, rows, None)
+        results = self._finalize_search_rows(
+            results,
+            query=query,
+            max_results=target_pool,
+            video_duration=video_duration,
+        )
 
-        if include_external_fallbacks and len(results) < target_pool:
-            per_variant_budget = max(4, min(20, target_pool // max(1, len(query_variants))))
-            max_external_workers = max(1, min(self.SEARCH_SURFACE_WORKERS, len(query_variants) * 2))
-            with ThreadPoolExecutor(max_workers=max_external_workers) as executor:
-                future_map: dict[Any, tuple[str, str]] = {}
-                for variant in query_variants:
-                    search_query = str(variant.get("query") or "").strip()
-                    if not search_query:
-                        continue
-                    future_map[
-                        executor.submit(
-                            self._search_via_duckduckgo,
-                            search_query,
-                            per_variant_budget,
-                            deadline,
-                        )
-                    ] = ("duckduckgo", search_query)
-                    future_map[
-                        executor.submit(
-                            self._search_via_bing,
-                            search_query,
-                            per_variant_budget,
-                            deadline,
-                        )
-                    ] = ("bing", search_query)
+        normalized_root_terms = self._normalized_root_terms(query=query, root_terms=root_terms)
+        if (
+            graph_profile != "off"
+            and self._should_expand_graph(
+                rows=results,
+                query=query,
+                max_results=max_results,
+                video_duration=video_duration,
+            )
+        ):
+            graph_rows = self._expand_videos_via_youtube_graph(
+                seed_rows=results,
+                query=query,
+                max_results=target_pool,
+                video_duration=video_duration,
+                retrieval_strategy=retrieval_strategy,
+                retrieval_stage=retrieval_stage,
+                deadline=deadline,
+                graph_profile=graph_profile,
+                root_terms=normalized_root_terms,
+            )
+            if graph_rows:
+                results = self._merge_unique_videos(results, graph_rows, None)
+                results = self._finalize_search_rows(
+                    results,
+                    query=query,
+                    max_results=target_pool,
+                    video_duration=video_duration,
+                )
 
-                for future in as_completed(future_map):
-                    if self._deadline_exceeded(deadline) or self._network_backoff_active():
-                        break
-                    engine, search_query = future_map[future]
-                    try:
-                        ids = future.result()
-                    except Exception:
-                        ids = []
-                    if not ids:
-                        continue
-                    if engine == "duckduckgo":
-                        surface = "duckduckgo_quoted" if '"' in search_query else "duckduckgo_site"
-                    else:
-                        surface = "bing_quoted" if '"' in search_query else "bing_site"
-                    fallback_rows = [self._fallback_video_row(video_id) for video_id in ids]
-                    self._annotate_search_rows(
-                        fallback_rows,
-                        search_source=surface,
-                        retrieval_strategy=retrieval_strategy,
-                        retrieval_stage=retrieval_stage,
-                        search_query=search_query,
-                    )
-                    results = self._merge_unique_videos(results, fallback_rows, target_pool)
-                    if len(results) >= target_pool:
-                        break
+        if include_external_fallbacks and len(results) < max_results:
+            external_rows = self._search_external_fallbacks(
+                query=query,
+                max_results=target_pool,
+                video_duration=video_duration,
+                retrieval_strategy=retrieval_strategy,
+                retrieval_stage=retrieval_stage,
+                source_surface=source_surface,
+                retrieval_profile=retrieval_profile,
+                deadline=deadline,
+                variant_limit=variant_limit,
+            )
+            if external_rows:
+                results = self._merge_unique_videos(results, external_rows, None)
+                results = self._finalize_search_rows(
+                    results,
+                    query=query,
+                    max_results=target_pool,
+                    video_duration=video_duration,
+                )
 
-        return results[:max_results]
+        return self._finalize_search_rows(
+            results,
+            query=query,
+            max_results=max_results,
+            video_duration=video_duration,
+        )
 
     def _search_variant_via_html(
         self,
@@ -542,8 +770,9 @@ class YouTubeService:
         retrieval_strategy: str,
         retrieval_stage: str,
         deadline: float | None,
+        retrieval_profile: RetrievalProfile = "deep",
     ) -> list[dict[str, Any]]:
-        if self._deadline_exceeded(deadline) or self._network_backoff_active():
+        if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_html"):
             return []
         html = self._fetch_search_html(search_query, deadline=deadline)
         if not html:
@@ -569,9 +798,14 @@ class YouTubeService:
             retrieval_stage=retrieval_stage,
             search_query=search_query,
         )
-        rows = self._merge_unique_videos(rows, parsed, target_pool)
+        rows = self._merge_unique_videos(rows, parsed, None)
         if len(rows) >= target_pool:
-            return rows
+            return self._finalize_search_rows(
+                rows,
+                query=search_query,
+                max_results=target_pool,
+                video_duration=video_duration,
+            )
 
         ids: list[str] = []
         seen_ids: set[str] = set()
@@ -591,12 +825,22 @@ class YouTubeService:
                 retrieval_stage=retrieval_stage,
                 search_query=search_query,
             )
-            rows = self._merge_unique_videos(rows, fallback_rows, target_pool)
+            rows = self._merge_unique_videos(rows, fallback_rows, None)
             if len(rows) >= target_pool:
-                return rows
+                return self._finalize_search_rows(
+                    rows,
+                    query=search_query,
+                    max_results=target_pool,
+                    video_duration=video_duration,
+                )
 
         if not initial_data:
-            return rows
+            return self._finalize_search_rows(
+                rows,
+                query=search_query,
+                max_results=target_pool,
+                video_duration=video_duration,
+            )
 
         api_key, client_version = self._extract_innertube_config(html)
         continuation_token = self._extract_search_continuation_token(initial_data)
@@ -604,9 +848,9 @@ class YouTubeService:
         while (
             continuation_token
             and len(rows) < target_pool
-            and len(seen_tokens) < max(1, self.HTML_MAX_PAGES - 1)
+            and len(seen_tokens) < max(1, (self.HTML_MAX_PAGES_DEEP if retrieval_profile == "deep" else self.HTML_MAX_PAGES) - 1)
             and not self._deadline_exceeded(deadline)
-            and not self._network_backoff_active()
+            and not self._network_backoff_active("youtube_html")
         ):
             if continuation_token in seen_tokens:
                 break
@@ -631,9 +875,14 @@ class YouTubeService:
                 retrieval_stage=retrieval_stage,
                 search_query=search_query,
             )
-            rows = self._merge_unique_videos(rows, continuation_rows, target_pool)
+            rows = self._merge_unique_videos(rows, continuation_rows, None)
             continuation_token = self._extract_search_continuation_token(continuation_data)
-        return rows
+        return self._finalize_search_rows(
+            rows,
+            query=search_query,
+            max_results=target_pool,
+            video_duration=video_duration,
+        )
 
     def _annotate_search_rows(
         self,
@@ -649,6 +898,539 @@ class YouTubeService:
             row["query_strategy"] = retrieval_strategy or ""
             row["query_stage"] = retrieval_stage or ""
             row["search_query"] = search_query
+            if not str(row.get("discovery_path") or "").strip():
+                row["discovery_path"] = f"search:{search_source}"
+            row["seed_video_id"] = str(row.get("seed_video_id") or "")
+            row["seed_channel_id"] = str(row.get("seed_channel_id") or row.get("channel_id") or "")
+            row["crawl_depth"] = max(0, int(row.get("crawl_depth") or 0))
+
+    def _normalized_root_terms(self, *, query: str, root_terms: list[str] | None) -> list[str]:
+        values: list[str] = []
+        seen: set[str] = set()
+        for raw in [query, self._strip_search_variant_suffix(query), *(root_terms or [])]:
+            clean = self._clean_query_text(str(raw or ""))
+            if not clean:
+                continue
+            key = clean.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            values.append(clean)
+        return values[:8]
+
+    def _graph_profile_settings(self, graph_profile: GraphProfile) -> dict[str, Any]:
+        if graph_profile == "light":
+            return {
+                "seed_limit": self.GRAPH_LIGHT_MAX_SEEDS,
+                "related_per_seed": self.GRAPH_LIGHT_RELATED_PER_SEED,
+                "channel_seed_limit": self.GRAPH_LIGHT_CHANNEL_SEEDS,
+                "channel_results": self.GRAPH_LIGHT_CHANNEL_RESULTS,
+                "phase_max_sec": self.GRAPH_LIGHT_STAGE_MAX_SEC,
+                "seed_min_score": 0.46,
+            }
+        if graph_profile == "deep":
+            return {
+                "seed_limit": self.GRAPH_DEEP_MAX_SEEDS,
+                "related_per_seed": self.GRAPH_DEEP_RELATED_PER_SEED,
+                "channel_seed_limit": self.GRAPH_DEEP_CHANNEL_SEEDS,
+                "channel_results": self.GRAPH_DEEP_CHANNEL_RESULTS,
+                "phase_max_sec": self.GRAPH_DEEP_STAGE_MAX_SEC,
+                "seed_min_score": 0.4,
+            }
+        return {}
+
+    def _phase_deadline(
+        self,
+        deadline: float | None,
+        *,
+        share: float,
+        max_sec: float,
+    ) -> float | None:
+        if max_sec <= 0:
+            return deadline
+        now = time.monotonic()
+        if deadline is None:
+            return now + max_sec
+        remaining = deadline - now
+        if remaining <= 0:
+            return deadline
+        budget = min(max_sec, max(0.25, remaining * share))
+        return min(deadline, now + budget)
+
+    def _strong_direct_inventory_count(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        query: str,
+        video_duration: str | None,
+    ) -> int:
+        count = 0
+        for row in rows:
+            if str(row.get("search_source") or "") not in {"youtube_api", "youtube_html"}:
+                continue
+            if self._search_result_score(row, query=query, video_duration=video_duration) >= 0.62:
+                count += 1
+        return count
+
+    def _should_expand_graph(
+        self,
+        *,
+        rows: list[dict[str, Any]],
+        query: str,
+        max_results: int,
+        video_duration: str | None,
+    ) -> bool:
+        if not rows:
+            return False
+        direct_rows = [row for row in rows if str(row.get("search_source") or "") in {"youtube_api", "youtube_html"}]
+        if len(direct_rows) < max_results:
+            return True
+        strong_direct = self._strong_direct_inventory_count(
+            direct_rows,
+            query=query,
+            video_duration=video_duration,
+        )
+        return strong_direct < min(max_results, 4)
+
+    def _search_external_fallbacks(
+        self,
+        *,
+        query: str,
+        max_results: int,
+        video_duration: str | None,
+        retrieval_strategy: str,
+        retrieval_stage: str,
+        source_surface: str,
+        retrieval_profile: RetrievalProfile,
+        deadline: float | None,
+        variant_limit: int | None,
+    ) -> list[dict[str, Any]]:
+        query_variants = self._build_search_query_variants(
+            query=query,
+            video_duration=video_duration,
+            source_surface=source_surface,
+            retrieval_profile=retrieval_profile,
+            retrieval_strategy=retrieval_strategy,
+        )
+        if variant_limit and variant_limit > 0:
+            query_variants = query_variants[:variant_limit]
+        if not query_variants:
+            return []
+        external_variants = self._build_external_query_variants(
+            query_variants=query_variants,
+            retrieval_strategy=retrieval_strategy,
+            retrieval_profile=retrieval_profile,
+        )
+        if not external_variants:
+            return []
+        results: list[dict[str, Any]] = []
+        per_variant_budget = max(3, min(8, max_results + 2))
+        max_external_workers = max(1, min(self.SEARCH_SURFACE_WORKERS, len(external_variants) * 2))
+        with ThreadPoolExecutor(max_workers=max_external_workers) as executor:
+            future_map: dict[Any, tuple[int, str, str]] = {}
+            for variant_idx, variant in enumerate(external_variants):
+                search_query = str(variant.get("query") or "").strip()
+                if not search_query:
+                    continue
+                future_map[
+                    executor.submit(
+                        self._search_via_duckduckgo,
+                        search_query,
+                        per_variant_budget,
+                        deadline,
+                    )
+                ] = (variant_idx, "duckduckgo", search_query)
+                future_map[
+                    executor.submit(
+                        self._search_via_bing,
+                        search_query,
+                        per_variant_budget,
+                        deadline,
+                    )
+                ] = (variant_idx, "bing", search_query)
+            ordered_external_rows: list[list[dict[str, Any]]] = [[] for _ in range(len(external_variants) * 2)]
+            for future in as_completed(future_map):
+                if self._deadline_exceeded(deadline):
+                    break
+                variant_idx, engine, search_query = future_map[future]
+                try:
+                    ids = future.result()
+                except Exception:
+                    ids = []
+                if not ids:
+                    continue
+                if engine == "duckduckgo":
+                    surface = "duckduckgo_quoted" if '"' in search_query else "duckduckgo_site"
+                    order_idx = variant_idx * 2
+                else:
+                    surface = "bing_quoted" if '"' in search_query else "bing_site"
+                    order_idx = variant_idx * 2 + 1
+                fallback_rows = self._build_fallback_rows(ids, deadline=deadline)
+                self._annotate_search_rows(
+                    fallback_rows,
+                    search_source=surface,
+                    retrieval_strategy=retrieval_strategy,
+                    retrieval_stage=retrieval_stage,
+                    search_query=search_query,
+                )
+                ordered_external_rows[order_idx] = fallback_rows
+        for rows in ordered_external_rows:
+            if rows:
+                results = self._merge_unique_videos(results, rows, None)
+        return self._finalize_search_rows(
+            results,
+            query=query,
+            max_results=max_results,
+            video_duration=video_duration,
+        )
+
+    def _graph_seed_score(
+        self,
+        row: dict[str, Any],
+        *,
+        query: str,
+        root_terms: list[str],
+        video_duration: str | None,
+    ) -> float:
+        metadata = " ".join(
+            part
+            for part in [
+                str(row.get("title") or ""),
+                str(row.get("description") or ""),
+                str(row.get("channel_title") or ""),
+            ]
+            if part
+        ).strip()
+        root_tokens: list[str] = []
+        for term in root_terms:
+            for token in self._search_query_tokens(term):
+                if token not in root_tokens:
+                    root_tokens.append(token)
+        title_overlap = self._query_token_overlap(str(row.get("title") or ""), root_tokens)
+        metadata_overlap = self._query_token_overlap(metadata, root_tokens)
+        phrase_hit = 1.0 if any(self._contains_query_phrase(metadata, term) for term in root_terms) else 0.0
+        duration_score = self._duration_match_score(int(row.get("duration_sec") or 0), video_duration)
+        source_score = self._search_source_priority(str(row.get("search_source") or ""))
+        quality_score = self._video_row_quality(row)
+        return float(
+            0.34 * phrase_hit
+            + 0.24 * title_overlap
+            + 0.14 * metadata_overlap
+            + 0.12 * duration_score
+            + 0.08 * source_score
+            + 0.08 * quality_score
+        )
+
+    def _graph_candidate_anchor_metrics(
+        self,
+        row: dict[str, Any],
+        *,
+        query: str,
+        root_terms: list[str],
+        seed_row: dict[str, Any],
+    ) -> dict[str, float]:
+        metadata = " ".join(
+            part
+            for part in [
+                str(row.get("title") or ""),
+                str(row.get("description") or ""),
+                str(row.get("channel_title") or ""),
+            ]
+            if part
+        ).strip()
+        title = str(row.get("title") or "")
+        root_tokens: list[str] = []
+        for term in root_terms:
+            for token in self._search_query_tokens(term):
+                if token not in root_tokens:
+                    root_tokens.append(token)
+        seed_tokens = self._search_query_tokens(str(seed_row.get("title") or ""))
+        title_overlap = self._query_token_overlap(title, root_tokens)
+        metadata_overlap = self._query_token_overlap(metadata, root_tokens)
+        phrase_hit = 1.0 if any(self._contains_query_phrase(metadata, term) for term in root_terms) else 0.0
+        seed_overlap = self._query_token_overlap(metadata, seed_tokens)
+        same_channel = 1.0 if (
+            str(row.get("channel_id") or "").strip()
+            and str(row.get("channel_id") or "").strip() == str(seed_row.get("channel_id") or "").strip()
+        ) else 0.0
+        return {
+            "title_overlap": float(title_overlap),
+            "metadata_overlap": float(metadata_overlap),
+            "phrase_hit": float(phrase_hit),
+            "seed_overlap": float(seed_overlap),
+            "same_channel": float(same_channel),
+        }
+
+    def _graph_candidate_is_anchored(
+        self,
+        row: dict[str, Any],
+        *,
+        query: str,
+        root_terms: list[str],
+        seed_row: dict[str, Any],
+        require_same_channel: bool,
+    ) -> bool:
+        metrics = self._graph_candidate_anchor_metrics(
+            row,
+            query=query,
+            root_terms=root_terms,
+            seed_row=seed_row,
+        )
+        if require_same_channel and metrics["same_channel"] <= 0.0:
+            return False
+        if metrics["phrase_hit"] >= 1.0:
+            return True
+        if metrics["title_overlap"] >= 0.5:
+            return True
+        if metrics["metadata_overlap"] >= 0.68:
+            return True
+        if metrics["same_channel"] > 0.0 and (
+            metrics["metadata_overlap"] >= 0.45 or metrics["title_overlap"] >= 0.42
+        ):
+            return True
+        return metrics["seed_overlap"] >= 0.55 and metrics["metadata_overlap"] >= 0.4
+
+    def _expand_videos_via_youtube_graph(
+        self,
+        *,
+        seed_rows: list[dict[str, Any]],
+        query: str,
+        max_results: int,
+        video_duration: str | None,
+        retrieval_strategy: str,
+        retrieval_stage: str,
+        deadline: float | None,
+        graph_profile: GraphProfile,
+        root_terms: list[str],
+    ) -> list[dict[str, Any]]:
+        settings = self._graph_profile_settings(graph_profile)
+        if not settings or not seed_rows or self._deadline_exceeded(deadline):
+            return []
+        phase_deadline = self._phase_deadline(
+            deadline,
+            share=0.45,
+            max_sec=float(settings.get("phase_max_sec") or 0.0),
+        )
+        if self._deadline_exceeded(phase_deadline):
+            return []
+
+        scored_seeds: list[tuple[float, dict[str, Any]]] = []
+        for row in self._finalize_search_rows(
+            seed_rows,
+            query=query,
+            max_results=max(len(seed_rows), int(settings.get("seed_limit") or 1) * 2),
+            video_duration=video_duration,
+        ):
+            score = self._graph_seed_score(
+                row,
+                query=query,
+                root_terms=root_terms,
+                video_duration=video_duration,
+            )
+            if score >= float(settings.get("seed_min_score") or 0.0):
+                scored_seeds.append((score, row))
+        if not scored_seeds:
+            fallback_seed = seed_rows[0]
+            scored_seeds.append(
+                (
+                    self._graph_seed_score(
+                        fallback_seed,
+                        query=query,
+                        root_terms=root_terms,
+                        video_duration=video_duration,
+                    ),
+                    fallback_seed,
+                )
+            )
+        scored_seeds.sort(key=lambda item: item[0], reverse=True)
+
+        selected_seeds: list[tuple[float, dict[str, Any]]] = []
+        seen_seed_ids: set[str] = set()
+        for score, seed_row in scored_seeds:
+            video_id = str(seed_row.get("id") or "").strip()
+            if not video_id or video_id in seen_seed_ids:
+                continue
+            seen_seed_ids.add(video_id)
+            selected_seeds.append((score, seed_row))
+            if len(selected_seeds) >= int(settings.get("seed_limit") or 1):
+                break
+
+        results: list[dict[str, Any]] = []
+        related_deadline = self._phase_deadline(
+            phase_deadline,
+            share=0.7,
+            max_sec=max(0.6, float(settings.get("phase_max_sec") or 0.0) * 0.7),
+        )
+        best_channel_seed: dict[str, tuple[float, dict[str, Any]]] = {}
+        for score, seed_row in selected_seeds:
+            if self._deadline_exceeded(related_deadline):
+                break
+            seed_video_id = str(seed_row.get("id") or "").strip()
+            if not seed_video_id:
+                continue
+            watch_html = self._fetch_watch_html(seed_video_id, deadline=related_deadline)
+            if not watch_html:
+                continue
+            related_rows = self._extract_related_videos_from_watch_html(
+                watch_html,
+                max_results=int(settings.get("related_per_seed") or 0),
+                video_duration=video_duration,
+            )
+            for row in related_rows:
+                candidate_id = str(row.get("id") or "").strip()
+                if not candidate_id or candidate_id == seed_video_id:
+                    continue
+                if not self._graph_candidate_is_anchored(
+                    row,
+                    query=query,
+                    root_terms=root_terms,
+                    seed_row=seed_row,
+                    require_same_channel=False,
+                ):
+                    continue
+                row["search_source"] = self.GRAPH_RELATED_SURFACE
+                row["query_strategy"] = retrieval_strategy or ""
+                row["query_stage"] = retrieval_stage or ""
+                row["search_query"] = query
+                row["discovery_path"] = f"related:{seed_video_id}"
+                row["seed_video_id"] = seed_video_id
+                row["seed_channel_id"] = str(seed_row.get("channel_id") or "")
+                row["crawl_depth"] = 1
+                results = self._merge_unique_videos(results, [row], None)
+            channel_id = str(seed_row.get("channel_id") or "").strip()
+            if channel_id:
+                best_existing = best_channel_seed.get(channel_id)
+                if best_existing is None or score > best_existing[0]:
+                    best_channel_seed[channel_id] = (score, seed_row)
+
+        strong_inventory = self._strong_direct_inventory_count(
+            self._merge_unique_videos(seed_rows, results, None),
+            query=query,
+            video_duration=video_duration,
+        )
+        if strong_inventory >= min(max_results, 4):
+            return results
+
+        channel_deadline = self._phase_deadline(
+            phase_deadline,
+            share=0.3,
+            max_sec=max(0.45, float(settings.get("phase_max_sec") or 0.0) * 0.35),
+        )
+        channel_candidates = sorted(best_channel_seed.values(), key=lambda item: item[0], reverse=True)
+        for score, seed_row in channel_candidates[: int(settings.get("channel_seed_limit") or 0)]:
+            if self._deadline_exceeded(channel_deadline):
+                break
+            if score < max(0.45, float(settings.get("seed_min_score") or 0.0)):
+                continue
+            channel_id = str(seed_row.get("channel_id") or "").strip()
+            if not channel_id:
+                continue
+            channel_html = self._fetch_channel_videos_html(channel_id, deadline=channel_deadline)
+            if not channel_html:
+                continue
+            channel_rows = self._extract_channel_videos_from_channel_html(
+                channel_html,
+                max_results=int(settings.get("channel_results") or 0),
+                video_duration=video_duration,
+            )
+            seed_video_id = str(seed_row.get("id") or "").strip()
+            for row in channel_rows:
+                candidate_id = str(row.get("id") or "").strip()
+                if not candidate_id or candidate_id == seed_video_id:
+                    continue
+                if not self._graph_candidate_is_anchored(
+                    row,
+                    query=query,
+                    root_terms=root_terms,
+                    seed_row=seed_row,
+                    require_same_channel=True,
+                ):
+                    continue
+                row["search_source"] = self.GRAPH_CHANNEL_SURFACE
+                row["query_strategy"] = retrieval_strategy or ""
+                row["query_stage"] = retrieval_stage or ""
+                row["search_query"] = query
+                row["discovery_path"] = f"channel:{channel_id}"
+                row["seed_video_id"] = seed_video_id
+                row["seed_channel_id"] = channel_id
+                row["crawl_depth"] = 2
+                results = self._merge_unique_videos(results, [row], None)
+        return results
+
+    def _fetch_watch_html(self, video_id: str, *, deadline: float | None) -> str:
+        cache_key = f"watch:{video_id}"
+        cached = self._cache_get_text(cache_key, ttl_sec=self.WATCH_PAGE_CACHE_TTL_SEC)
+        if cached is not None:
+            return cached
+        if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_html"):
+            return ""
+        try:
+            resp = self._session_get(
+                "https://www.youtube.com/watch",
+                params={"v": video_id},
+                deadline=deadline,
+            )
+            resp.raise_for_status()
+            payload = resp.text
+            self._note_request_success("youtube_html")
+        except requests.RequestException as exc:
+            self._note_request_failure(exc, scope="youtube_html")
+            return ""
+        self._cache_set_text(cache_key, payload)
+        return payload
+
+    def _fetch_channel_videos_html(self, channel_id: str, *, deadline: float | None) -> str:
+        cache_key = f"channel_videos:{channel_id}"
+        cached = self._cache_get_text(cache_key, ttl_sec=self.CHANNEL_PAGE_CACHE_TTL_SEC)
+        if cached is not None:
+            return cached
+        if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_html"):
+            return ""
+        try:
+            resp = self._session_get(
+                f"https://www.youtube.com/channel/{channel_id}/videos",
+                deadline=deadline,
+            )
+            resp.raise_for_status()
+            payload = resp.text
+            self._note_request_success("youtube_html")
+        except requests.RequestException as exc:
+            self._note_request_failure(exc, scope="youtube_html")
+            return ""
+        self._cache_set_text(cache_key, payload)
+        return payload
+
+    def _extract_related_videos_from_watch_html(
+        self,
+        html: str,
+        *,
+        max_results: int,
+        video_duration: str | None,
+    ) -> list[dict[str, Any]]:
+        data = self._extract_yt_initial_data(html)
+        if not data:
+            return []
+        return self._extract_videos_from_search_data(
+            data=data,
+            max_results=max_results,
+            video_duration=video_duration,
+        )
+
+    def _extract_channel_videos_from_channel_html(
+        self,
+        html: str,
+        *,
+        max_results: int,
+        video_duration: str | None,
+    ) -> list[dict[str, Any]]:
+        data = self._extract_yt_initial_data(html)
+        if not data:
+            return []
+        return self._extract_videos_from_search_data(
+            data=data,
+            max_results=max_results,
+            video_duration=video_duration,
+        )
 
     def _build_search_query_variants(
         self,
@@ -656,112 +1438,220 @@ class YouTubeService:
         video_duration: str | None,
         source_surface: str,
         retrieval_profile: RetrievalProfile,
+        retrieval_strategy: str = "",
     ) -> list[dict[str, str]]:
         base = " ".join(str(query or "").split()).strip()
         if not base:
             return []
-
-        if retrieval_profile == "bootstrap":
+        strategy_key = self._clean_query_text(retrieval_strategy).lower()
+        if strategy_key in self.SEARCH_VARIANT_VISUAL_STRATEGIES:
             return [{"query": base, "surface": source_surface or "youtube_html"}]
 
-        variants: list[tuple[str, str]] = [
-            (base, source_surface or "youtube_html"),
-            (f"{base} youtube", source_surface or "youtube_html"),
-            (f"\"{base}\" site:youtube.com/watch", "duckduckgo_quoted"),
-            (f"{base} b-roll footage scene site:youtube.com/watch", "duckduckgo_site"),
-        ]
-        if video_duration == "short":
-            variants.extend(
-                [
-                    (f"{base} shorts", source_surface or "youtube_html"),
-                    (f"{base} quick explainer", source_surface or "youtube_html"),
-                    (f"{base} in 60 seconds", source_surface or "youtube_html"),
-                    (f"{base} short tutorial", source_surface or "youtube_html"),
-                    (f"{base} bite sized", source_surface or "youtube_html"),
-                    (f"{base} quick tips", source_surface or "youtube_html"),
-                ]
-            )
-        elif video_duration == "medium":
-            variants.extend(
-                [
-                    (f"{base} tutorial", source_surface or "youtube_html"),
-                    (f"{base} lesson", source_surface or "youtube_html"),
-                    (f"{base} explained", source_surface or "youtube_html"),
-                    (f"{base} walkthrough", source_surface or "youtube_html"),
-                    (f"{base} examples", source_surface or "youtube_html"),
-                ]
-            )
-        elif video_duration == "long":
-            variants.extend(
-                [
-                    (f"{base} full lecture", source_surface or "youtube_html"),
-                    (f"{base} deep dive", source_surface or "youtube_html"),
-                    (f"{base} full course", source_surface or "youtube_html"),
-                    (f"{base} complete tutorial", source_surface or "youtube_html"),
-                    (f"{base} full class", source_surface or "youtube_html"),
-                    (f"{base} masterclass", source_surface or "youtube_html"),
-                ]
-            )
-        else:
-            variants.extend(
-                [
-                    (f"{base} tutorial", source_surface or "youtube_html"),
-                    (f"{base} lecture", source_surface or "youtube_html"),
-                    (f"{base} full course", source_surface or "youtube_html"),
-                    (f"{base} deep dive", source_surface or "youtube_html"),
-                    (f"{base} worked examples", source_surface or "youtube_html"),
-                    (f"{base} shorts", source_surface or "youtube_html"),
-                    (f"{base} crash course", source_surface or "youtube_html"),
-                    (f"{base} full class", source_surface or "youtube_html"),
-                    (f"{base} complete guide", source_surface or "youtube_html"),
-                    (f"{base} walkthrough", source_surface or "youtube_html"),
-                    (f"{base} quick explainer", source_surface or "youtube_html"),
-                    (f"{base} 60 seconds", source_surface or "youtube_html"),
-                    (f"{base} fundamentals", source_surface or "youtube_html"),
-                ]
-            )
-
-        deduped: list[dict[str, str]] = []
+        limit = 2 if retrieval_profile == "bootstrap" else 5
+        variants: list[dict[str, str]] = []
         seen: set[str] = set()
-        for variant, variant_surface in variants:
-            normalized = " ".join(variant.split()).strip()
-            if not normalized:
-                continue
-            key = normalized.lower()
+
+        def add_variant(raw_query: str | None) -> None:
+            clean_query = self._clean_query_text(str(raw_query or ""))
+            if not clean_query:
+                return
+            key = clean_query.lower()
             if key in seen:
-                continue
+                return
             seen.add(key)
-            deduped.append({"query": normalized, "surface": variant_surface})
-            if len(deduped) >= self.SEARCH_VARIANTS_LIMIT:
-                break
-        return deduped
+            variants.append({"query": clean_query, "surface": source_surface or "youtube_html"})
+
+        add_variant(base)
+        core_query = self._strip_search_variant_suffix(base)
+        if core_query != base:
+            add_variant(core_query)
+        elif self._should_add_pedagogical_variant(base):
+            for suffix in self._search_variant_suffix_candidates(
+                retrieval_strategy=strategy_key,
+                video_duration=video_duration,
+            ):
+                add_variant(f"{base} {suffix}")
+                if len(variants) >= limit:
+                    return variants[:limit]
+
+        if retrieval_profile == "deep":
+            add_variant(
+                self._build_exact_query_variant(
+                    base,
+                    retrieval_strategy=retrieval_strategy,
+                    retrieval_profile=retrieval_profile,
+                )
+            )
+            if core_query != base:
+                add_variant(
+                    self._build_exact_query_variant(
+                        core_query,
+                        retrieval_strategy="",
+                        retrieval_profile=retrieval_profile,
+                    )
+                )
+                if self._should_add_pedagogical_variant(core_query):
+                    for suffix in self._search_variant_suffix_candidates(
+                        retrieval_strategy=strategy_key,
+                        video_duration=video_duration,
+                    ):
+                        add_variant(f"{core_query} {suffix}")
+                        if len(variants) >= limit:
+                            break
+        return variants[:limit]
+
+    def _build_external_query_variants(
+        self,
+        *,
+        query_variants: list[dict[str, str]],
+        retrieval_strategy: str,
+        retrieval_profile: RetrievalProfile,
+    ) -> list[dict[str, str]]:
+        variants: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for variant in query_variants:
+            search_query = self._clean_query_text(str(variant.get("query") or ""))
+            surface = str(variant.get("surface") or "youtube_html")
+            if not search_query:
+                continue
+            if search_query.lower() not in seen:
+                seen.add(search_query.lower())
+                variants.append({"query": search_query, "surface": surface})
+            exact_variant = self._build_exact_query_variant(
+                search_query,
+                retrieval_strategy=retrieval_strategy,
+                retrieval_profile=retrieval_profile,
+            )
+            if exact_variant and exact_variant.lower() not in seen:
+                seen.add(exact_variant.lower())
+                variants.append({"query": exact_variant, "surface": surface})
+        # Fix L: Add educational platform search variants in deep mode
+        if retrieval_profile == "deep" and query_variants:
+            first_query = self._clean_query_text(str(query_variants[0].get("query") or ""))
+            if first_query:
+                edu_query = f"site:youtube.com {first_query} educational"
+                if edu_query.lower() not in seen:
+                    seen.add(edu_query.lower())
+                    variants.append({"query": edu_query, "surface": "duckduckgo_site"})
+        return variants
+
+    def _clean_query_text(self, value: str) -> str:
+        return " ".join(str(value or "").split()).strip()
+
+    def _normalize_query_key(self, value: str) -> str:
+        cleaned = self._clean_query_text(value).lower()
+        tokens = re.findall(r"[a-z0-9\+#]+", cleaned)
+        return " ".join(tokens)
+
+    def _search_query_tokens(self, query: str) -> list[str]:
+        tokens = []
+        seen: set[str] = set()
+        for token in re.findall(r"[A-Za-z0-9\+#]+", self._clean_query_text(query).lower()):
+            if len(token) < 3 or token in self.SEARCH_QUERY_NOISE_TOKENS or token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+        return tokens
+
+    def _strip_search_variant_suffix(self, query: str) -> str:
+        base = self._clean_query_text(query)
+        lowered = base.lower()
+        for suffix in sorted(self.SEARCH_VARIANT_SUFFIXES, key=len, reverse=True):
+            if lowered.endswith(f" {suffix}"):
+                candidate = self._clean_query_text(base[: -len(suffix)])
+                if len(self._search_query_tokens(candidate)) >= 1:
+                    return candidate
+        return base
+
+    def _query_has_educational_suffix(self, query: str) -> bool:
+        lowered = self._clean_query_text(query).lower()
+        return any(lowered.endswith(f" {suffix}") or lowered == suffix for suffix in self.SEARCH_VARIANT_SUFFIXES)
+
+    def _should_add_pedagogical_variant(self, query: str) -> bool:
+        if self._query_has_educational_suffix(query):
+            return False
+        tokens = self._search_query_tokens(query)
+        return 1 <= len(tokens) <= 6
+
+    def _search_variant_suffix_candidates(
+        self,
+        *,
+        retrieval_strategy: str,
+        video_duration: str | None,
+    ) -> tuple[str, ...]:
+        strategy_key = self._clean_query_text(retrieval_strategy).lower()
+        if video_duration == "long":
+            return ("lecture", "explained")
+        if video_duration == "short":
+            return ("explained", "shorts")
+        if strategy_key == "worked_example":
+            return ("worked example", "tutorial")
+        if strategy_key == "lecture":
+            return ("lecture", "explained")
+        if strategy_key == "documentary":
+            return ("documentary", "explained")
+        if strategy_key == "animation":
+            return ("animation", "explained")
+        if strategy_key in {"tutorial", "demo"}:
+            return ("tutorial", "explained")
+        return ("explained", "lecture")
+
+    def _build_exact_query_variant(
+        self,
+        query: str,
+        *,
+        retrieval_strategy: str,
+        retrieval_profile: RetrievalProfile,
+    ) -> str | None:
+        if retrieval_profile != "deep":
+            return None
+        base = self._clean_query_text(query)
+        if not base or '"' in base:
+            return None
+        tokens = self._search_query_tokens(base)
+        if len(tokens) < self.QUERY_VARIANT_EXACT_MIN_TOKENS or len(tokens) > self.QUERY_VARIANT_EXACT_MAX_TOKENS:
+            return None
+
+        suffix = self.STRATEGY_SUFFIX_BY_NAME.get(self._clean_query_text(retrieval_strategy).lower())
+        core = base
+        if suffix:
+            suffix_words = suffix.split()
+            query_words = base.split()
+            if len(query_words) > len(suffix_words) and [word.lower() for word in query_words[-len(suffix_words) :]] == [
+                word.lower() for word in suffix_words
+            ]:
+                candidate_core = " ".join(query_words[: -len(suffix_words)]).strip()
+                if len(self._search_query_tokens(candidate_core)) >= 2:
+                    core = candidate_core
+
+        if len(self._search_query_tokens(core)) < 2:
+            return None
+        exact_core = f"\"{core}\""
+        if suffix and core != base:
+            return self._clean_query_text(f"{exact_core} {suffix}")
+        return exact_core
 
     def _fetch_search_html(self, search_query: str, deadline: float | None = None) -> str:
-        if self._deadline_exceeded(deadline):
+        if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_html"):
             return ""
         try:
-            resp = requests.get(
+            resp = self._session_get(
                 "https://www.youtube.com/results",
                 params={"search_query": search_query},
-                timeout=self._request_timeout(deadline),
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                    ),
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
+                deadline=deadline,
             )
             resp.raise_for_status()
+            self._note_request_success("youtube_html")
             return resp.text
         except requests.RequestException as exc:
-            self._note_request_failure(exc)
+            self._note_request_failure(exc, scope="youtube_html")
             return ""
 
     def _fallback_video_row(self, video_id: str) -> dict[str, Any]:
         return {
             "id": video_id,
             "title": f"YouTube Video {video_id}",
+            "channel_id": "",
             "channel_title": "",
             "description": "",
             "duration_sec": 0,
@@ -772,42 +1662,284 @@ class YouTubeService:
             "query_strategy": "",
             "query_stage": "",
             "search_query": "",
+            "discovery_path": "search:youtube_html",
+            "seed_video_id": "",
+            "seed_channel_id": "",
+            "crawl_depth": 0,
         }
+
+    def _build_fallback_rows(self, video_ids: list[str], deadline: float | None = None) -> list[dict[str, Any]]:
+        details = self._video_details(video_ids, deadline=deadline) if self.api_key else {}
+        rows: list[dict[str, Any]] = []
+        for video_id in video_ids:
+            row = self._fallback_video_row(video_id)
+            detail = details.get(video_id, {})
+            if detail:
+                row["duration_sec"] = int(detail.get("duration_sec") or 0)
+                row["view_count"] = int(detail.get("view_count") or 0)
+                row["is_creative_commons"] = detail.get("license") == "creativeCommon"
+            rows.append(row)
+        return rows
 
     def _merge_unique_videos(
         self,
         primary: list[dict[str, Any]],
         secondary: list[dict[str, Any]],
-        limit: int,
+        limit: int | None,
     ) -> list[dict[str, Any]]:
-        merged: list[dict[str, Any]] = []
-        seen_ids: set[str] = set()
+        ordered_ids: list[str] = []
+        merged_by_id: dict[str, dict[str, Any]] = {}
 
         for source in (primary, secondary):
             for row in source:
                 video_id = str(row.get("id") or "").strip()
-                if not video_id or video_id in seen_ids:
+                if not video_id:
                     continue
-                seen_ids.add(video_id)
-                merged.append(
-                    {
-                        "id": video_id,
-                        "title": str(row.get("title") or "Untitled"),
-                        "channel_title": str(row.get("channel_title") or ""),
-                        "description": str(row.get("description") or ""),
-                        "duration_sec": int(row.get("duration_sec") or 0),
-                        "view_count": int(row.get("view_count") or 0),
-                        "published_at": str(row.get("published_at") or ""),
-                        "is_creative_commons": bool(row.get("is_creative_commons")),
-                        "search_source": str(row.get("search_source") or "youtube_html"),
-                        "query_strategy": str(row.get("query_strategy") or ""),
-                        "query_stage": str(row.get("query_stage") or ""),
-                        "search_query": str(row.get("search_query") or ""),
-                    }
-                )
-                if len(merged) >= limit:
-                    return merged
+                normalized = self._normalize_video_row(row)
+                existing = merged_by_id.get(video_id)
+                if existing is None:
+                    ordered_ids.append(video_id)
+                    merged_by_id[video_id] = normalized
+                    continue
+                merged_by_id[video_id] = self._merge_video_rows(existing, normalized)
+
+        merged = [merged_by_id[video_id] for video_id in ordered_ids]
+        if limit is not None:
+            return merged[:limit]
         return merged
+
+    def _normalize_video_row(self, row: dict[str, Any]) -> dict[str, Any]:
+        video_id = str(row.get("id") or "").strip()
+        return {
+            "id": video_id,
+            "title": str(row.get("title") or "Untitled"),
+            "channel_id": str(row.get("channel_id") or ""),
+            "channel_title": str(row.get("channel_title") or ""),
+            "description": str(row.get("description") or ""),
+            "duration_sec": int(row.get("duration_sec") or 0),
+            "view_count": int(row.get("view_count") or 0),
+            "published_at": str(row.get("published_at") or ""),
+            "is_creative_commons": bool(row.get("is_creative_commons")),
+            "search_source": str(row.get("search_source") or "youtube_html"),
+            "query_strategy": str(row.get("query_strategy") or ""),
+            "query_stage": str(row.get("query_stage") or ""),
+            "search_query": str(row.get("search_query") or ""),
+            "discovery_path": str(row.get("discovery_path") or ""),
+            "seed_video_id": str(row.get("seed_video_id") or ""),
+            "seed_channel_id": str(row.get("seed_channel_id") or row.get("channel_id") or ""),
+            "crawl_depth": max(0, int(row.get("crawl_depth") or 0)),
+        }
+
+    def _merge_video_rows(self, existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
+        winner = candidate if self._video_row_rank(candidate) > self._video_row_rank(existing) else existing
+        loser = existing if winner is candidate else candidate
+        video_id = str(winner.get("id") or loser.get("id") or "").strip()
+        merged = dict(winner)
+        merged["title"] = self._prefer_text_field(
+            existing.get("title"),
+            candidate.get("title"),
+            video_id=video_id,
+            placeholder_sensitive=True,
+        )
+        merged["channel_id"] = self._prefer_text_field(existing.get("channel_id"), candidate.get("channel_id"))
+        merged["channel_title"] = self._prefer_text_field(existing.get("channel_title"), candidate.get("channel_title"))
+        merged["description"] = self._prefer_text_field(existing.get("description"), candidate.get("description"))
+        merged["duration_sec"] = self._prefer_numeric_field(existing.get("duration_sec"), candidate.get("duration_sec"))
+        merged["view_count"] = max(int(existing.get("view_count") or 0), int(candidate.get("view_count") or 0))
+        merged["published_at"] = self._prefer_published_at(existing.get("published_at"), candidate.get("published_at"))
+        merged["is_creative_commons"] = bool(existing.get("is_creative_commons")) or bool(candidate.get("is_creative_commons"))
+        merged["search_source"] = str(winner.get("search_source") or loser.get("search_source") or "youtube_html")
+        merged["query_strategy"] = str(winner.get("query_strategy") or loser.get("query_strategy") or "")
+        merged["query_stage"] = str(winner.get("query_stage") or loser.get("query_stage") or "")
+        merged["search_query"] = str(winner.get("search_query") or loser.get("search_query") or "")
+        merged["discovery_path"] = str(winner.get("discovery_path") or loser.get("discovery_path") or "")
+        merged["seed_video_id"] = str(winner.get("seed_video_id") or loser.get("seed_video_id") or "")
+        merged["seed_channel_id"] = str(
+            winner.get("seed_channel_id")
+            or loser.get("seed_channel_id")
+            or winner.get("channel_id")
+            or loser.get("channel_id")
+            or ""
+        )
+        merged["crawl_depth"] = min(
+            4,
+            max(int(existing.get("crawl_depth") or 0), int(candidate.get("crawl_depth") or 0)),
+        )
+        return merged
+
+    def _prefer_text_field(
+        self,
+        left: Any,
+        right: Any,
+        *,
+        video_id: str = "",
+        placeholder_sensitive: bool = False,
+    ) -> str:
+        left_text = str(left or "").strip()
+        right_text = str(right or "").strip()
+        left_score = self._text_field_score(left_text, video_id=video_id, placeholder_sensitive=placeholder_sensitive)
+        right_score = self._text_field_score(right_text, video_id=video_id, placeholder_sensitive=placeholder_sensitive)
+        if right_score > left_score:
+            return right_text
+        return left_text or right_text
+
+    def _text_field_score(self, value: str, *, video_id: str, placeholder_sensitive: bool) -> float:
+        text = str(value or "").strip()
+        if not text:
+            return 0.0
+        score = min(1.0, 0.2 + 0.04 * len(text.split()) + 0.003 * min(len(text), 120))
+        if placeholder_sensitive and self._is_placeholder_title(text, video_id):
+            score -= 0.7
+        return score
+
+    def _is_placeholder_title(self, title: str, video_id: str) -> bool:
+        normalized = self._normalize_query_key(title)
+        if not normalized:
+            return True
+        placeholder = self._normalize_query_key(f"YouTube Video {video_id}")
+        return normalized == placeholder or normalized.startswith("youtube video ")
+
+    def _prefer_numeric_field(self, left: Any, right: Any) -> int:
+        left_value = int(left or 0)
+        right_value = int(right or 0)
+        if right_value > 0 and left_value <= 0:
+            return right_value
+        if left_value > 0:
+            return left_value
+        return right_value
+
+    def _prefer_published_at(self, left: Any, right: Any) -> str:
+        left_text = str(left or "").strip()
+        right_text = str(right or "").strip()
+        left_dt = self._parse_cache_time(left_text)
+        right_dt = self._parse_cache_time(right_text)
+        if right_dt and not left_dt:
+            return right_text
+        if left_dt and not right_dt:
+            return left_text
+        if right_dt and left_dt and right_dt > left_dt:
+            return right_text
+        return left_text or right_text
+
+    def _video_row_rank(self, row: dict[str, Any]) -> tuple[float, float]:
+        return (
+            self._search_source_priority(str(row.get("search_source") or "")),
+            self._video_row_quality(row),
+        )
+
+    def _search_source_priority(self, source: str) -> float:
+        return float(self.SEARCH_SOURCE_PRIORITY.get(str(source or ""), 0.76))
+
+    def _video_row_quality(self, row: dict[str, Any]) -> float:
+        video_id = str(row.get("id") or "").strip()
+        title = str(row.get("title") or "").strip()
+        description = str(row.get("description") or "").strip()
+        quality = 0.0
+        if title and not self._is_placeholder_title(title, video_id):
+            quality += 0.42
+        if str(row.get("channel_title") or "").strip():
+            quality += 0.18
+        if description:
+            quality += min(0.2, 0.02 * len(description.split()))
+        if int(row.get("duration_sec") or 0) > 0:
+            quality += 0.12
+        if int(row.get("view_count") or 0) > 0:
+            quality += 0.08
+        if str(row.get("published_at") or "").strip():
+            quality += 0.05
+        quality += 0.12 * self._search_source_priority(str(row.get("search_source") or ""))
+        return quality
+
+    def _query_token_overlap(self, text: str, query_tokens: list[str]) -> float:
+        if not query_tokens:
+            return 0.0
+        text_tokens = set(re.findall(r"[a-z0-9\+#]+", self._normalize_query_key(text)))
+        if not text_tokens:
+            return 0.0
+        hits = sum(1 for token in query_tokens if token in text_tokens)
+        return min(1.0, hits / max(1, len(query_tokens)))
+
+    def _contains_query_phrase(self, text: str, query: str) -> bool:
+        text_key = self._normalize_query_key(text)
+        query_key = self._normalize_query_key(query)
+        return bool(text_key and query_key and query_key in text_key)
+
+    def _view_count_rank(self, view_count: Any) -> float:
+        try:
+            views = int(view_count or 0)
+        except (TypeError, ValueError):
+            views = 0
+        if views <= 0:
+            return 0.0
+        if views >= 1_000_000:
+            return 1.0
+        if views >= 100_000:
+            return 0.8
+        if views >= 10_000:
+            return 0.6
+        if views >= 1_000:
+            return 0.4
+        return 0.2
+
+    def _duration_match_score(self, duration_sec: int, video_duration: str | None) -> float:
+        if video_duration not in {"short", "medium", "long"}:
+            return 0.75 if duration_sec > 0 else 0.45
+        if duration_sec <= 0:
+            return 0.4
+        if video_duration == "short":
+            return 1.0 if duration_sec < 4 * 60 else 0.0
+        if video_duration == "medium":
+            return 1.0 if 4 * 60 <= duration_sec <= 20 * 60 else 0.0
+        return 1.0 if duration_sec > 20 * 60 else 0.0
+
+    def _search_result_score(self, row: dict[str, Any], *, query: str, video_duration: str | None) -> float:
+        title = str(row.get("title") or "")
+        metadata = " ".join(
+            part for part in [title, str(row.get("description") or ""), str(row.get("channel_title") or "")] if part
+        ).strip()
+        query_tokens = self._search_query_tokens(query)
+        title_overlap = self._query_token_overlap(title, query_tokens)
+        metadata_overlap = self._query_token_overlap(metadata, query_tokens)
+        title_phrase_hit = 1.0 if self._contains_query_phrase(title, query) else 0.0
+        metadata_phrase_hit = 1.0 if self._contains_query_phrase(metadata, query) else 0.0
+        duration_score = self._duration_match_score(int(row.get("duration_sec") or 0), video_duration)
+        source_score = self._search_source_priority(str(row.get("search_source") or ""))
+        metadata_quality = self._video_row_quality(row)
+        view_score = self._view_count_rank(row.get("view_count"))
+        placeholder_penalty = 0.28 if self._is_placeholder_title(title, str(row.get("id") or "")) else 0.0
+        return (
+            0.3 * title_overlap
+            + 0.24 * metadata_overlap
+            + 0.16 * title_phrase_hit
+            + 0.1 * metadata_phrase_hit
+            + 0.08 * duration_score
+            + 0.12 * source_score
+            + 0.12 * metadata_quality
+            + 0.05 * view_score
+            - placeholder_penalty
+        )
+
+    def _finalize_search_rows(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        query: str,
+        max_results: int,
+        video_duration: str | None,
+    ) -> list[dict[str, Any]]:
+        merged = self._merge_unique_videos(rows, [], None)
+        indexed = list(enumerate(merged))
+        indexed.sort(
+            key=lambda item: (
+                self._search_result_score(item[1], query=query, video_duration=video_duration),
+                self._search_source_priority(str(item[1].get("search_source") or "")),
+                self._video_row_quality(item[1]),
+                self._view_count_rank(item[1].get("view_count")),
+                -item[0],
+            ),
+            reverse=True,
+        )
+        return [row for _idx, row in indexed[:max_results]]
 
     def _extract_videos_from_search_html(
         self,
@@ -836,42 +1968,16 @@ class YouTubeService:
         rows: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         for renderer in self._iter_video_renderers(data):
-            video_id = renderer.get("videoId")
-            if not isinstance(video_id, str) or video_id in seen_ids:
-                continue
-
-            duration_text = (
-                (renderer.get("lengthText") or {}).get("simpleText")
-                or self._first_run_text((renderer.get("lengthText") or {}).get("runs"))
-                or ""
+            parsed = self._video_row_from_renderer(
+                renderer,
+                video_duration=video_duration,
             )
-            duration_sec = self._parse_duration_text(duration_text)
-            if not self._duration_matches(duration_sec, video_duration):
+            if not parsed:
                 continue
-
-            title = self._first_run_text((renderer.get("title") or {}).get("runs")) or "Untitled"
-            channel = self._first_run_text((renderer.get("ownerText") or {}).get("runs"))
-            detailed = renderer.get("detailedMetadataSnippets")
-            snippet_runs: Any = None
-            if isinstance(detailed, list) and detailed:
-                first = detailed[0]
-                if isinstance(first, dict):
-                    snippet_runs = (first.get("snippetText") or {}).get("runs")
-            snippet = self._runs_text(snippet_runs)
-            if not snippet:
-                snippet = self._runs_text((renderer.get("descriptionSnippet") or {}).get("runs"))
-
-            rows.append(
-                {
-                    "id": video_id,
-                    "title": title,
-                    "channel_title": channel,
-                    "description": snippet,
-                    "duration_sec": duration_sec,
-                    "view_count": 0,
-                    "is_creative_commons": False,
-                }
-            )
+            video_id = str(parsed.get("id") or "").strip()
+            if not video_id or video_id in seen_ids:
+                continue
+            rows.append(parsed)
             seen_ids.add(video_id)
             if len(rows) >= max_results:
                 break
@@ -924,11 +2030,16 @@ class YouTubeService:
         innertube_client_version: str | None,
         deadline: float | None = None,
     ) -> dict[str, Any] | None:
-        if not innertube_api_key or not continuation_token or self._deadline_exceeded(deadline):
+        if (
+            not innertube_api_key
+            or not continuation_token
+            or self._deadline_exceeded(deadline)
+            or self._network_backoff_active("youtube_html")
+        ):
             return None
         client_version = innertube_client_version or "2.20240214.00.00"
         try:
-            resp = requests.post(
+            resp = self._session_post(
                 f"https://www.youtube.com/youtubei/v1/search?key={innertube_api_key}",
                 json={
                     "context": {
@@ -941,13 +2052,8 @@ class YouTubeService:
                     },
                     "continuation": continuation_token,
                 },
-                timeout=self._request_timeout(deadline),
+                deadline=deadline,
                 headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                    ),
-                    "Accept-Language": "en-US,en;q=0.9",
                     "Content-Type": "application/json",
                     "Origin": "https://www.youtube.com",
                     "x-youtube-client-name": "1",
@@ -956,8 +2062,9 @@ class YouTubeService:
             )
             resp.raise_for_status()
             data = resp.json()
+            self._note_request_success("youtube_html")
         except requests.RequestException as exc:
-            self._note_request_failure(exc)
+            self._note_request_failure(exc, scope="youtube_html")
             return None
         except ValueError:
             return None
@@ -1012,9 +2119,10 @@ class YouTubeService:
 
     def _iter_video_renderers(self, node: Any):
         if isinstance(node, dict):
-            video_renderer = node.get("videoRenderer")
-            if isinstance(video_renderer, dict):
-                yield video_renderer
+            for renderer_key in ("videoRenderer", "compactVideoRenderer", "gridVideoRenderer"):
+                video_renderer = node.get(renderer_key)
+                if isinstance(video_renderer, dict):
+                    yield video_renderer
             for child in node.values():
                 yield from self._iter_video_renderers(child)
         elif isinstance(node, list):
@@ -1042,6 +2150,102 @@ class YouTubeService:
                     parts.append(text.strip())
         return " ".join(parts).strip()
 
+    def _text_value(self, node: Any) -> str:
+        if isinstance(node, dict):
+            simple = node.get("simpleText")
+            if isinstance(simple, str) and simple.strip():
+                return simple.strip()
+            runs = node.get("runs")
+            return self._runs_text(runs)
+        if isinstance(node, list):
+            return self._runs_text(node)
+        return str(node or "").strip()
+
+    def _thumbnail_overlay_duration_text(self, renderer: dict[str, Any]) -> str:
+        overlays = renderer.get("thumbnailOverlays")
+        if not isinstance(overlays, list):
+            return ""
+        for item in overlays:
+            if not isinstance(item, dict):
+                continue
+            status = item.get("thumbnailOverlayTimeStatusRenderer")
+            if isinstance(status, dict):
+                text = self._text_value(status.get("text"))
+                if text:
+                    return text
+        return ""
+
+    def _extract_channel_id_from_renderer(self, renderer: dict[str, Any]) -> str:
+        for key in ("ownerText", "shortBylineText", "longBylineText"):
+            node = renderer.get(key)
+            runs = (node or {}).get("runs") if isinstance(node, dict) else None
+            if not isinstance(runs, list):
+                continue
+            for item in runs:
+                if not isinstance(item, dict):
+                    continue
+                endpoint = (item.get("navigationEndpoint") or {}).get("browseEndpoint") or {}
+                browse_id = str(endpoint.get("browseId") or "").strip()
+                if browse_id.startswith("UC"):
+                    return browse_id
+        navigation = (renderer.get("navigationEndpoint") or {}).get("browseEndpoint") or {}
+        browse_id = str(navigation.get("browseId") or "").strip()
+        if browse_id.startswith("UC"):
+            return browse_id
+        return ""
+
+    def _renderer_description_text(self, renderer: dict[str, Any]) -> str:
+        detailed = renderer.get("detailedMetadataSnippets")
+        if isinstance(detailed, list) and detailed:
+            first = detailed[0]
+            if isinstance(first, dict):
+                snippet = self._text_value((first.get("snippetText") or {}).get("runs"))
+                if snippet:
+                    return snippet
+        for key in ("descriptionSnippet", "shortDescriptionSnippet"):
+            snippet = self._text_value(renderer.get(key))
+            if snippet:
+                return snippet
+        return ""
+
+    def _video_row_from_renderer(
+        self,
+        renderer: dict[str, Any],
+        *,
+        video_duration: str | None,
+    ) -> dict[str, Any] | None:
+        video_id = renderer.get("videoId")
+        if not isinstance(video_id, str) or not video_id.strip():
+            return None
+
+        duration_text = self._text_value(renderer.get("lengthText")) or self._thumbnail_overlay_duration_text(renderer)
+        duration_sec = self._parse_duration_text(duration_text)
+        if not self._duration_matches(duration_sec, video_duration):
+            return None
+
+        title = self._text_value(renderer.get("title")) or "Untitled"
+        channel = (
+            self._text_value(renderer.get("ownerText"))
+            or self._text_value(renderer.get("shortBylineText"))
+            or self._text_value(renderer.get("longBylineText"))
+        )
+        view_text = self._text_value(renderer.get("viewCountText")) or self._text_value(renderer.get("shortViewCountText"))
+        published_text = self._text_value(renderer.get("publishedTimeText"))
+        return {
+            "id": video_id,
+            "title": title,
+            "channel_id": self._extract_channel_id_from_renderer(renderer),
+            "channel_title": channel,
+            "description": self._renderer_description_text(renderer),
+            "duration_sec": duration_sec,
+            "view_count": self._parse_view_count_text(view_text),
+            "published_at": self._parse_published_time_text(published_text),
+            "is_creative_commons": False,
+            "seed_video_id": "",
+            "seed_channel_id": "",
+            "crawl_depth": 0,
+        }
+
     def _parse_duration_text(self, value: str) -> int:
         if not value:
             return 0
@@ -1054,6 +2258,55 @@ class YouTubeService:
         if len(parts) == 3:
             return parts[0] * 3600 + parts[1] * 60 + parts[2]
         return 0
+
+    def _parse_view_count_text(self, value: str) -> int:
+        clean = " ".join(str(value or "").lower().replace(",", "").split()).strip()
+        if not clean:
+            return 0
+        match = re.search(r"([\d.]+)\s*([kmb]?)\s+views?\b", clean)
+        if not match:
+            return 0
+        try:
+            amount = float(match.group(1))
+        except (TypeError, ValueError):
+            return 0
+        suffix = match.group(2)
+        multiplier = 1.0
+        if suffix == "k":
+            multiplier = 1_000.0
+        elif suffix == "m":
+            multiplier = 1_000_000.0
+        elif suffix == "b":
+            multiplier = 1_000_000_000.0
+        return max(0, int(amount * multiplier))
+
+    def _parse_published_time_text(self, value: str) -> str:
+        clean = " ".join(str(value or "").lower().split()).strip()
+        if not clean:
+            return ""
+        clean = clean.replace("streamed ", "").replace("premiered ", "")
+        match = re.search(r"(\d+)\s+(second|minute|hour|day|week|month|year)s?\s+ago\b", clean)
+        if not match:
+            return ""
+        amount = int(match.group(1))
+        unit = match.group(2)
+        if amount <= 0:
+            return ""
+        if unit == "second":
+            delta = timedelta(seconds=amount)
+        elif unit == "minute":
+            delta = timedelta(minutes=amount)
+        elif unit == "hour":
+            delta = timedelta(hours=amount)
+        elif unit == "day":
+            delta = timedelta(days=amount)
+        elif unit == "week":
+            delta = timedelta(weeks=amount)
+        elif unit == "month":
+            delta = timedelta(days=30 * amount)
+        else:
+            delta = timedelta(days=365 * amount)
+        return (datetime.now(timezone.utc) - delta).isoformat()
 
     def _duration_matches(self, duration_sec: int, video_duration: str | None) -> bool:
         if video_duration not in {"short", "medium", "long"}:
@@ -1072,24 +2325,18 @@ class YouTubeService:
         seen: set[str] = set()
 
         for offset in self.DUCKDUCKGO_PAGE_OFFSETS:
-            if self._deadline_exceeded(deadline) or self._network_backoff_active():
+            if self._deadline_exceeded(deadline) or self._network_backoff_active("duckduckgo"):
                 break
             try:
-                resp = requests.get(
+                resp = self._session_get(
                     "https://duckduckgo.com/html/",
                     params={"q": f"site:youtube.com/watch {query}", "s": offset},
-                    timeout=self._request_timeout(deadline),
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                        ),
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
+                    deadline=deadline,
                 )
                 resp.raise_for_status()
+                self._note_request_success("duckduckgo")
             except requests.RequestException as exc:
-                self._note_request_failure(exc)
+                self._note_request_failure(exc, scope="duckduckgo")
                 continue
 
             html = resp.text
@@ -1115,28 +2362,22 @@ class YouTubeService:
         ids: list[str] = []
         seen: set[str] = set()
         for first in self.BING_FIRST_OFFSETS:
-            if self._deadline_exceeded(deadline) or self._network_backoff_active():
+            if self._deadline_exceeded(deadline) or self._network_backoff_active("bing"):
                 break
             try:
-                resp = requests.get(
+                resp = self._session_get(
                     "https://www.bing.com/search",
                     params={
                         "q": f"site:youtube.com/watch {query}",
                         "count": 50,
                         "first": first,
                     },
-                    timeout=self._request_timeout(deadline),
-                    headers={
-                        "User-Agent": (
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                        ),
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
+                    deadline=deadline,
                 )
                 resp.raise_for_status()
+                self._note_request_success("bing")
             except requests.RequestException as exc:
-                self._note_request_failure(exc)
+                self._note_request_failure(exc, scope="bing")
                 continue
 
             html = resp.text
@@ -1195,10 +2436,10 @@ class YouTubeService:
             futures = [
                 executor.submit(self._video_details_batch, batch, deadline)
                 for batch in batches
-                if batch and not self._deadline_exceeded(deadline) and not self._network_backoff_active()
+                if batch and not self._deadline_exceeded(deadline)
             ]
             for future in as_completed(futures):
-                if self._deadline_exceeded(deadline) or self._network_backoff_active():
+                if self._deadline_exceeded(deadline):
                     break
                 try:
                     payload = future.result()
@@ -1212,7 +2453,7 @@ class YouTubeService:
         return self._video_details(video_ids, deadline=deadline)
 
     def _video_details_batch(self, batch: list[str], deadline: float | None) -> dict[str, dict[str, Any]]:
-        if not batch or self._deadline_exceeded(deadline) or self._network_backoff_active():
+        if not batch or self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_api"):
             return {}
         params = {
             "key": self.api_key,
@@ -1221,15 +2462,16 @@ class YouTubeService:
             "maxResults": len(batch),
         }
         try:
-            resp = requests.get(
+            resp = self._session_get(
                 "https://www.googleapis.com/youtube/v3/videos",
                 params=params,
-                timeout=self._request_timeout(deadline),
+                deadline=deadline,
             )
             resp.raise_for_status()
             data = resp.json()
+            self._note_request_success("youtube_api")
         except requests.RequestException as exc:
-            self._note_request_failure(exc)
+            self._note_request_failure(exc, scope="youtube_api")
             return {}
         payload: dict[str, dict[str, Any]] = {}
         for item in data.get("items", []):
@@ -1260,19 +2502,47 @@ class YouTubeService:
             return 0.2
         return max(0.2, min(self.request_timeout_sec, remaining))
 
-    def _network_backoff_active(self) -> bool:
-        with self._network_backoff_lock:
-            return time.monotonic() < self._network_backoff_until
+    def _search_cache_is_fresh(self, created_at: str | None, is_empty: bool) -> bool:
+        if not created_at:
+            return True  # Legacy rows without timestamp — accept them
+        try:
+            ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            age_sec = (datetime.now(timezone.utc) - ts).total_seconds()
+        except (TypeError, ValueError):
+            return True
+        ttl = self.SEARCH_CACHE_EMPTY_TTL_SEC if is_empty else self.SEARCH_CACHE_TTL_SEC
+        return age_sec < ttl
 
-    def _note_request_failure(self, exc: requests.RequestException) -> None:
+    def _network_backoff_active(self, scope: str | None = None) -> bool:
+        with self._network_backoff_lock:
+            now = time.monotonic()
+            if scope:
+                return now < float(self._network_backoff_until_by_scope.get(scope, 0.0) or 0.0)
+            return any(now < until for until in self._network_backoff_until_by_scope.values())
+
+    def _note_request_success(self, scope: str) -> None:
+        clean_scope = str(scope or "").strip()
+        if not clean_scope:
+            return
+        with self._network_backoff_lock:
+            self._network_failure_streak_by_scope[clean_scope] = 0
+            self._network_backoff_until_by_scope.pop(clean_scope, None)
+
+    def _note_request_failure(self, exc: requests.RequestException, *, scope: str) -> None:
         # Treat transport-level failures (DNS/connect/timeouts) as transient outages.
         if getattr(exc, "response", None) is not None:
             return
+        clean_scope = str(scope or "").strip()
+        if not clean_scope:
+            return
         with self._network_backoff_lock:
-            self._network_backoff_until = max(
-                self._network_backoff_until,
-                time.monotonic() + self.NETWORK_BACKOFF_SEC,
-            )
+            streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0) + 1
+            self._network_failure_streak_by_scope[clean_scope] = streak
+            if streak >= self.NETWORK_BACKOFF_FAILURE_THRESHOLD:
+                self._network_backoff_until_by_scope[clean_scope] = max(
+                    float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
+                    time.monotonic() + self.NETWORK_BACKOFF_SEC,
+                )
 
     def get_transcript(self, conn, video_id: str) -> list[dict[str, Any]]:
         if conn is None:

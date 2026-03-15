@@ -9,9 +9,81 @@ from ..db import dumps_json, fetch_one, now_iso, upsert
 from .concepts import extract_concepts, extract_learning_objectives
 from .openai_client import build_openai_client
 from .text_utils import normalize_whitespace
+from .topic_expansion import TopicExpansionService
 
 
 class MaterialIntelligenceService:
+    TOPIC_SUBTOPICS: dict[str, tuple[str, ...]] = {
+        "calculus": (
+            "limits",
+            "continuity",
+            "derivatives",
+            "chain rule",
+            "product rule",
+            "implicit differentiation",
+            "integrals",
+            "u substitution",
+            "optimization",
+            "fundamental theorem of calculus",
+        ),
+        "algebra": (
+            "linear equations",
+            "quadratic equations",
+            "factoring",
+            "systems of equations",
+            "polynomials",
+        ),
+        "biology": (
+            "cell signaling",
+            "photosynthesis",
+            "cell cycle",
+            "genetics",
+            "evolution",
+        ),
+        "chemistry": (
+            "stoichiometry",
+            "chemical bonding",
+            "equilibrium",
+            "acids and bases",
+            "thermodynamics",
+        ),
+        "physics": (
+            "kinematics",
+            "forces",
+            "energy",
+            "momentum",
+            "electricity",
+        ),
+        "computer science": (
+            "data structures",
+            "algorithms",
+            "recursion",
+            "time complexity",
+            "dynamic programming",
+        ),
+        "linear algebra": (
+            "vectors",
+            "matrices",
+            "linear transformations",
+            "eigenvalues",
+            "eigenvectors",
+        ),
+        "probability": (
+            "conditional probability",
+            "random variables",
+            "expected value",
+            "distributions",
+            "bayes theorem",
+        ),
+        "statistics": (
+            "descriptive statistics",
+            "probability distributions",
+            "hypothesis testing",
+            "confidence intervals",
+            "regression",
+        ),
+    }
+
     def __init__(self) -> None:
         settings = get_settings()
         self.model = settings.openai_chat_model
@@ -27,6 +99,7 @@ class MaterialIntelligenceService:
             timeout=8.0,
             enabled=can_use_openai,
         )
+        self.topic_expansion_service = TopicExpansionService()
 
     def extract_concepts_and_objectives(
         self,
@@ -35,8 +108,42 @@ class MaterialIntelligenceService:
         subject_tag: str | None = None,
         max_concepts: int = 12,
     ) -> tuple[list[dict[str, Any]], list[str]]:
-        base_concepts = extract_concepts(text, max_concepts=max_concepts)
-        base_objectives = extract_learning_objectives(text, limit=6)
+        prefer_topic_seed = self._is_topic_only_material(text=text, subject_tag=subject_tag)
+        opaque_topic_seed = False
+        clean_subject = normalize_whitespace(subject_tag or "").strip()
+        if prefer_topic_seed and clean_subject:
+            expansion = self.topic_expansion_service.expand_topic(
+                conn,
+                topic=clean_subject,
+                max_subtopics=max(8, max_concepts + 2),
+                max_aliases=6,
+                max_related_terms=6,
+            )
+            opaque_topic_seed = self.topic_expansion_service._is_opaque_single_token_topic(
+                clean_subject,
+                canonical_topic=str(expansion.get("canonical_topic") or clean_subject),
+                likely_language=self.topic_expansion_service._looks_like_language_topic(
+                    str(expansion.get("canonical_topic") or clean_subject)
+                ),
+            )
+        topic_seed_concepts, topic_seed_objectives = self._topic_seed_material(
+            conn=conn,
+            text=text,
+            subject_tag=subject_tag,
+            max_concepts=max_concepts,
+        )
+        heuristic_concepts = extract_concepts(text, max_concepts=max_concepts)
+        if prefer_topic_seed and topic_seed_concepts:
+            heuristic_concepts = self._filter_topic_only_heuristic_concepts(
+                heuristic_concepts,
+                subject_tag=subject_tag,
+            )
+        heuristic_objectives = extract_learning_objectives(text, limit=6)
+        base_concepts = self._merge_concepts(topic_seed_concepts, heuristic_concepts, max_concepts=max_concepts)
+        base_objectives = self._merge_objectives(topic_seed_objectives, heuristic_objectives, limit=6)
+
+        if prefer_topic_seed and opaque_topic_seed:
+            return base_concepts, base_objectives
 
         if not self.client:
             return base_concepts, base_objectives
@@ -46,12 +153,217 @@ class MaterialIntelligenceService:
         llm_objectives = self._sanitize_objectives(payload.get("objectives"), limit=6)
         priority_focus = self._sanitize_priority_focus(payload, text)
 
-        if priority_focus:
+        if priority_focus and not prefer_topic_seed:
             llm_concepts = [priority_focus, *llm_concepts]
 
-        merged_concepts = self._merge_concepts(llm_concepts, base_concepts, max_concepts=max_concepts)
-        merged_objectives = self._merge_objectives(llm_objectives, base_objectives, limit=6)
+        if prefer_topic_seed:
+            merged_concepts = self._merge_concepts(base_concepts, llm_concepts, max_concepts=max_concepts)
+            merged_objectives = self._merge_objectives(base_objectives, llm_objectives, limit=6)
+        else:
+            merged_concepts = self._merge_concepts(llm_concepts, base_concepts, max_concepts=max_concepts)
+            merged_objectives = self._merge_objectives(llm_objectives, base_objectives, limit=6)
         return merged_concepts, merged_objectives
+
+    def _topic_seed_material(
+        self,
+        *,
+        conn,
+        text: str,
+        subject_tag: str | None,
+        max_concepts: int,
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        clean_subject = normalize_whitespace(subject_tag or "").strip()
+        if not clean_subject:
+            return [], []
+
+        normalized_subject = clean_subject.lower()
+        if not self._is_topic_only_material(text=text, subject_tag=subject_tag):
+            return [], []
+
+        expansion = self.topic_expansion_service.expand_topic(
+            conn,
+            topic=clean_subject,
+            max_subtopics=max(8, max_concepts + 2),
+            max_aliases=6,
+            max_related_terms=6,
+        )
+        search_terms = self.topic_expansion_service.build_topic_search_terms(
+            topic=clean_subject,
+            expansion=expansion,
+            limit=8,
+        )
+        canonical_topic = str(expansion.get("canonical_topic") or "").strip().lower()
+        opaque_topic = self.topic_expansion_service._is_opaque_single_token_topic(
+            clean_subject,
+            canonical_topic=str(expansion.get("canonical_topic") or clean_subject),
+            likely_language=self.topic_expansion_service._looks_like_language_topic(
+                str(expansion.get("canonical_topic") or clean_subject)
+            ),
+        )
+        search_subtopics = [
+            term
+            for term in search_terms
+            if term.strip().lower() not in {normalized_subject, canonical_topic}
+            and len(normalize_whitespace(term).split()) <= 2
+            and (
+                not opaque_topic
+                or self.topic_expansion_service._is_topic_anchor_candidate(
+                    topic=clean_subject,
+                    canonical_topic=str(expansion.get("canonical_topic") or clean_subject),
+                    candidate=term,
+                )
+            )
+        ]
+        expansion_subtopics = [str(item).strip() for item in (expansion.get("subtopics") or []) if str(item).strip()]
+        prefer_search_subtopics = bool(search_subtopics) and (
+            not expansion_subtopics
+            or not any(len(normalize_whitespace(term).split()) <= 2 for term in expansion_subtopics[:4])
+        )
+        subtopics = self._dedupe_topic_terms(
+            [
+                *self._topic_subtopics(clean_subject),
+                *(search_subtopics if prefer_search_subtopics else expansion_subtopics),
+            ]
+        )
+        root_keywords = self._dedupe_topic_terms(
+            [
+                normalized_subject,
+                *[term.lower() for term in search_terms],
+                *[str(item).strip().lower() for item in subtopics],
+            ]
+        )
+        title_subject = self._title_case_topic(clean_subject)
+        concepts: list[dict[str, Any]] = [
+            {
+                "id": str(uuid.uuid4()),
+                "title": title_subject,
+                "keywords": root_keywords[:8] or [normalized_subject],
+                "summary": self._topic_root_summary(
+                    subject=title_subject,
+                    canonical_topic=str(expansion.get("canonical_topic") or "").strip(),
+                ),
+            }
+        ]
+
+        if subtopics:
+            for term in subtopics[: max(0, max_concepts - 1)]:
+                related_keywords = self._dedupe_topic_terms(
+                    [
+                        term.lower(),
+                        normalized_subject,
+                        *root_keywords[:4],
+                        f"{term.lower()} explained",
+                    ]
+                )
+                concepts.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "title": self._title_case_topic(term),
+                        "keywords": related_keywords[:8],
+                        "summary": f"Key subtopic within {title_subject}: {term}.",
+                    }
+                )
+        else:
+            generic_titles = (
+                f"{title_subject} Foundations",
+                f"{title_subject} Worked Examples",
+                f"{title_subject} Problem Solving",
+            )
+            for term in generic_titles[: max(0, max_concepts - 1)]:
+                concepts.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "title": term,
+                        "keywords": [normalized_subject, term.lower(), f"{normalized_subject} tutorial"][:8],
+                        "summary": f"Foundational study path for {title_subject}.",
+                    }
+                )
+
+        objectives = [
+            f"Understand the core definitions and intuition behind {title_subject}.",
+            f"Solve representative problems in {title_subject}.",
+        ]
+        objectives.extend(
+            f"Explain how {term} fits into {title_subject}."
+            for term in subtopics[:4]
+        )
+        return concepts[:max_concepts], objectives[:6]
+
+    def _topic_subtopics(self, subject_tag: str) -> list[str]:
+        normalized_subject = normalize_whitespace(subject_tag).strip().lower()
+        if not normalized_subject:
+            return []
+        for topic, subtopics in self.TOPIC_SUBTOPICS.items():
+            normalized_topic = topic.lower()
+            if normalized_subject == normalized_topic or normalized_topic in normalized_subject or normalized_subject in normalized_topic:
+                return [str(item).strip() for item in subtopics if str(item).strip()]
+        return []
+
+    def _title_case_topic(self, value: str) -> str:
+        parts = [segment for segment in normalize_whitespace(value).split(" ") if segment]
+        return " ".join(part[:1].upper() + part[1:] for part in parts)
+
+    def _topic_root_summary(self, *, subject: str, canonical_topic: str) -> str:
+        clean_canonical = normalize_whitespace(canonical_topic or "").strip()
+        if clean_canonical and clean_canonical.lower() != subject.lower():
+            return f"Core ideas, terminology, and intuition for {subject} ({clean_canonical})."
+        return f"Core ideas, terminology, and intuition for {subject}."
+
+    def _dedupe_topic_terms(self, values: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for raw in values:
+            cleaned = normalize_whitespace(raw or "").strip()
+            key = cleaned.lower()
+            if not cleaned or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(cleaned)
+        return deduped
+
+    def _is_topic_only_material(self, *, text: str, subject_tag: str | None) -> bool:
+        clean_subject = normalize_whitespace(subject_tag or "").strip().lower()
+        if not clean_subject:
+            return False
+        normalized_text = normalize_whitespace(text).strip().lower()
+        return normalized_text in {
+            clean_subject,
+            f"topic: {clean_subject}",
+            f"topic {clean_subject}",
+        }
+
+    def _filter_topic_only_heuristic_concepts(
+        self,
+        concepts: list[dict[str, Any]],
+        *,
+        subject_tag: str | None,
+    ) -> list[dict[str, Any]]:
+        clean_subject = normalize_whitespace(subject_tag or "").strip().lower()
+        if not clean_subject:
+            return concepts
+
+        filtered: list[dict[str, Any]] = []
+        blocked_titles = {
+            "topic",
+            clean_subject,
+            f"topic {clean_subject}",
+            f"topic: {clean_subject}",
+        }
+        blocked_prefixes = (
+            "topic ",
+            "topic:",
+        )
+        for concept in concepts:
+            title = normalize_whitespace(str(concept.get("title") or "")).strip()
+            title_key = title.lower()
+            if not title:
+                continue
+            if title_key in blocked_titles:
+                continue
+            if any(title_key.startswith(prefix) for prefix in blocked_prefixes):
+                continue
+            filtered.append(concept)
+        return filtered
 
     def chat_assistant(
         self,

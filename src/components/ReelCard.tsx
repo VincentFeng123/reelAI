@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { Reel } from "@/lib/types";
 import { loadYouTubeIframeApi } from "@/lib/youtubeIframeApi";
@@ -121,6 +121,8 @@ export function ReelCard({
   const autoplayRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoplayRetryCountRef = useRef(0);
   const didUserInteractRef = useRef(false);
+  const manualPauseRequestedRef = useRef(false);
+  const isMutedRef = useRef(mutedPreference);
 
   const [isReady, setIsReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -171,6 +173,8 @@ export function ReelCard({
       ? detectedClipEnd
       : Math.max(clipStart + 1, Math.min(configuredClipEnd, detectedClipEnd));
   const clipDuration = Math.max(1, clipEnd - clipStart);
+  const progressPercent = clipDuration > 0 ? clamp((currentSec / clipDuration) * 100, 0, 100) : 0;
+  const reelProgressStyle = { width: `${progressPercent}%` } as CSSProperties;
   const showCaptions = captionsEnabled;
   const captionCues = useMemo(
     () =>
@@ -179,6 +183,10 @@ export function ReelCard({
         .sort((a, b) => a.start - b.start),
     [reel.captions],
   );
+
+  useEffect(() => {
+    isMutedRef.current = isMuted;
+  }, [isMuted]);
 
   useEffect(() => {
     setDetectedDurationSec(null);
@@ -388,6 +396,7 @@ export function ReelCard({
     setIsResumeMaskVisible(false);
     setLoadError(null);
     didUserInteractRef.current = false;
+    manualPauseRequestedRef.current = false;
 
     destroyPlayerSafely();
 
@@ -503,6 +512,7 @@ export function ReelCard({
               if (state === playerState.PLAYING) {
                 clearAutoplayRetryTimer();
                 autoplayRetryCountRef.current = 0;
+                manualPauseRequestedRef.current = false;
                 setIsPlaying(true);
                 startProgressTimer();
               } else if (state === playerState.PAUSED) {
@@ -510,22 +520,28 @@ export function ReelCard({
                 setIsResumeMaskVisible(false);
                 stopProgressTimer();
                 syncProgress();
-                if (isActive && !didUserInteractRef.current && autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES) {
+                if (isActive && !manualPauseRequestedRef.current && autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES) {
                   clearAutoplayRetryTimer();
                   autoplayRetryTimerRef.current = setTimeout(() => {
                     autoplayRetryTimerRef.current = null;
-                    if (cancelled || !isActive || didUserInteractRef.current) {
+                    if (cancelled || !isActive || manualPauseRequestedRef.current) {
                       return;
                     }
                     autoplayRetryCountRef.current += 1;
-                    event.target.mute();
-                    setIsMuted(true);
+                    if (isMutedRef.current) {
+                      event.target.mute();
+                      setIsMuted(true);
+                    } else {
+                      event.target.unMute();
+                      setIsMuted(false);
+                    }
                     event.target.seekTo(clipStart, true);
                     event.target.playVideo();
                   }, AUTOPLAY_RETRY_DELAY_MS);
                 }
               } else if (state === playerState.ENDED) {
                 clearAutoplayRetryTimer();
+                manualPauseRequestedRef.current = false;
                 event.target.seekTo(clipStart, true);
                 event.target.playVideo();
                 setIsPlaying(true);
@@ -535,11 +551,17 @@ export function ReelCard({
                 startProgressTimer();
               } else if ((state === playerState.UNSTARTED || state === playerState.CUED) && isActive) {
                 // Retry autoplay for devices that initially report cued/unstarted.
+                manualPauseRequestedRef.current = false;
                 if (autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES) {
                   autoplayRetryCountRef.current += 1;
                 }
-                event.target.mute();
-                setIsMuted(true);
+                if (isMutedRef.current) {
+                  event.target.mute();
+                  setIsMuted(true);
+                } else {
+                  event.target.unMute();
+                  setIsMuted(false);
+                }
                 event.target.playVideo();
               }
             },
@@ -626,6 +648,7 @@ export function ReelCard({
       setIsMuted(false);
     }
     if (isPlaying) {
+      manualPauseRequestedRef.current = true;
       player.pauseVideo();
       setIsPlaying(false);
       setIsResumeMaskVisible(false);
@@ -633,6 +656,7 @@ export function ReelCard({
       syncProgress();
       return;
     }
+    manualPauseRequestedRef.current = false;
     showResumeMask(RESUME_MASK_MS);
     scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
     setIsSurfaceVisible(true);
@@ -661,6 +685,7 @@ export function ReelCard({
       return;
     }
     didUserInteractRef.current = true;
+    manualPauseRequestedRef.current = false;
     clearAutoplayRetryTimer();
     const nextMuted = !isMuted;
     if (nextMuted) {
@@ -684,6 +709,7 @@ export function ReelCard({
       }
       const rel = clamp(Number(event.target.value), 0, clipDuration);
       setCurrentSec(rel);
+      manualPauseRequestedRef.current = false;
       player.seekTo(clipStart + rel, true);
       if (!isPlaying && isActive) {
         showResumeMask(RESUME_MASK_MS);
@@ -928,17 +954,25 @@ export function ReelCard({
           </div>
 
           {isYouTubeVideo ? (
-            <input
-              data-reel-control="true"
-              type="range"
-              min={0}
-              max={clipDuration}
-              step={0.1}
-              value={currentSec}
-              onChange={onSeek}
-              className="reel-range h-1.5 w-full cursor-pointer disabled:opacity-40"
-              disabled={!controlsEnabled}
-            />
+            <div className="relative w-full">
+              <div
+                aria-hidden="true"
+                className="pointer-events-none absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full bg-white/32"
+              >
+                <div className="h-full rounded-full bg-white" style={reelProgressStyle} />
+              </div>
+              <input
+                data-reel-control="true"
+                type="range"
+                min={0}
+                max={clipDuration}
+                step={0.1}
+                value={currentSec}
+                onChange={onSeek}
+                className="reel-range relative z-10 h-1.5 w-full cursor-pointer disabled:opacity-40"
+                disabled={!controlsEnabled}
+              />
+            </div>
           ) : (
             <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/60">Platform-managed playback</p>
           )}

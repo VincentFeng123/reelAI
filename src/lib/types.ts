@@ -12,6 +12,7 @@ export type MaterialResponse = {
 
 export type Reel = {
   reel_id: string;
+  material_id: string;
   concept_id: string;
   concept_title: string;
   video_title?: string;
@@ -47,6 +48,21 @@ export type ReelsGenerateResponse = {
   refinement_job_id?: string | null;
   refinement_status?: string | null;
 };
+
+export type ReelsGenerateStreamEvent =
+  | {
+      type: "reel";
+      reel: Reel;
+    }
+  | {
+      type: "done";
+      response: ReelsGenerateResponse;
+    }
+  | {
+      type: "error";
+      detail: string;
+      status_code?: number;
+    };
 
 export type ReelsCanGenerateResponse = {
   can_generate: boolean;

@@ -7,10 +7,12 @@ import type {
   CommunityReelPlatform,
   FeedResponse,
   MaterialResponse,
+  Reel,
   RefinementStatusResponse,
   ReelsCanGenerateAnyResponse,
   ReelsCanGenerateResponse,
   ReelsGenerateResponse,
+  ReelsGenerateStreamEvent,
 } from "@/lib/types";
 import type { StoredHistoryItem } from "@/lib/historyStorage";
 import {
@@ -22,8 +24,11 @@ import {
 } from "@/lib/settings";
 
 const RAW_API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
-const BACKEND_DOWN_ERROR = RAW_API_BASE
-  ? `Cannot reach backend at ${RAW_API_BASE}. Make sure the backend server is running.`
+const DEV_DIRECT_API_BASE =
+  !RAW_API_BASE && process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "";
+const RESOLVED_API_BASE = (RAW_API_BASE || DEV_DIRECT_API_BASE).replace(/\/$/, "");
+const BACKEND_DOWN_ERROR = RESOLVED_API_BASE
+  ? `Cannot reach backend at ${RESOLVED_API_BASE}. Make sure the backend server is running.`
   : "Cannot reach backend. Check your deployment and API routes.";
 const COMMUNITY_OWNER_KEY_STORAGE_KEY = "studyreels-community-owner-key";
 export const COMMUNITY_OWNED_SET_IDS_STORAGE_KEY = "studyreels-community-owned-set-ids";
@@ -36,10 +41,10 @@ let communityOwnerKeyMemoryFallback: string | null = null;
 
 function apiUrl(path: string): string {
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
-  if (!RAW_API_BASE) {
+  if (!RESOLVED_API_BASE) {
     return `/api${cleanPath}`;
   }
-  const cleanBase = RAW_API_BASE.replace(/\/$/, "");
+  const cleanBase = RESOLVED_API_BASE.replace(/\/$/, "");
   if (cleanBase.endsWith("/api")) {
     return `${cleanBase}${cleanPath}`;
   }
@@ -560,7 +565,7 @@ export async function uploadMaterial(params: {
   return parseJsonResponse<MaterialResponse>(res);
 }
 
-export async function generateReels(params: {
+type GenerateReelsParams = {
   materialId: string;
   numReels?: number;
   conceptId?: string;
@@ -571,32 +576,120 @@ export async function generateReels(params: {
   targetClipDurationSec?: number;
   targetClipDurationMinSec?: number;
   targetClipDurationMaxSec?: number;
-}): Promise<ReelsGenerateResponse> {
+};
+
+function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<string, unknown> {
+  return {
+    material_id: params.materialId,
+    concept_id: params.conceptId,
+    num_reels: params.numReels ?? 7,
+    creative_commons_only: false,
+    generation_mode: params.generationMode ?? "fast",
+    min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
+    video_pool_mode: params.videoPoolMode ?? "short-first",
+    preferred_video_duration: params.preferredVideoDuration ?? "any",
+    target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : undefined,
+    target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
+      ? Math.round(params.targetClipDurationMinSec as number)
+      : undefined,
+    target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
+      ? Math.round(params.targetClipDurationMaxSec as number)
+      : undefined,
+  };
+}
+
+export async function generateReels(params: GenerateReelsParams): Promise<ReelsGenerateResponse> {
   const res = await safeFetch(apiUrl("/reels/generate"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      material_id: params.materialId,
-      concept_id: params.conceptId,
-      num_reels: params.numReels ?? 7,
-      creative_commons_only: false,
-      generation_mode: params.generationMode ?? "fast",
-      min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
-      video_pool_mode: params.videoPoolMode ?? "short-first",
-      preferred_video_duration: params.preferredVideoDuration ?? "any",
-      target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : undefined,
-      target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
-        ? Math.round(params.targetClipDurationMinSec as number)
-        : undefined,
-      target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
-        ? Math.round(params.targetClipDurationMaxSec as number)
-        : undefined,
-    }),
+    body: JSON.stringify(buildGenerateReelsRequestBody(params)),
   });
 
   return parseJsonResponse<ReelsGenerateResponse>(res);
+}
+
+export async function generateReelsStream(
+  params: GenerateReelsParams & {
+    signal?: AbortSignal;
+    onReel?: (reel: Reel) => void;
+  },
+): Promise<ReelsGenerateResponse> {
+  const res = await safeFetch(apiUrl("/reels/generate-stream"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/x-ndjson",
+    },
+    body: JSON.stringify(buildGenerateReelsRequestBody(params)),
+    signal: params.signal,
+    timeoutMs: 120_000,
+  });
+
+  const contentType = (res.headers.get("content-type") || "").toLowerCase();
+  if (!res.body || contentType.includes("application/json")) {
+    return parseJsonResponse<ReelsGenerateResponse>(res);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let finalResponse: ReelsGenerateResponse | null = null;
+
+  const processLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    let event: ReelsGenerateStreamEvent;
+    try {
+      event = JSON.parse(trimmed) as ReelsGenerateStreamEvent;
+    } catch {
+      return;
+    }
+
+    if (event.type === "reel") {
+      params.onReel?.(event.reel);
+      return;
+    }
+    if (event.type === "done") {
+      finalResponse = event.response;
+      return;
+    }
+    if (event.type === "error") {
+      throw new Error(event.detail || "Generation stream failed.");
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex = buffer.indexOf("\n");
+      while (newlineIndex >= 0) {
+        const line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        processLine(line);
+        newlineIndex = buffer.indexOf("\n");
+      }
+    }
+    buffer += decoder.decode();
+    if (buffer.trim()) {
+      processLine(buffer);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!finalResponse) {
+    throw new Error("Generation stream ended before completion.");
+  }
+  return finalResponse;
 }
 
 export async function checkReelsCanGenerate(params: {

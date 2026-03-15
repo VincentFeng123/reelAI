@@ -15,8 +15,10 @@ import type { CommunityAccount } from "@/lib/types";
 
 type CommunityAccountScreenProps = {
   account: CommunityAccount | null;
+  view: "default" | "change-password";
   onBack: () => void;
   onAccountChange: (account: CommunityAccount | null) => void;
+  onOpenChangePassword: () => void;
   onOpenYourSets: () => void;
 };
 
@@ -24,11 +26,14 @@ const AUTH_MODE_FADE_MS = 160;
 
 export function CommunityAccountScreen({
   account,
+  view,
   onBack,
   onAccountChange,
+  onOpenChangePassword,
   onOpenYourSets,
 }: CommunityAccountScreenProps) {
   const [authMode, setAuthMode] = useState<"register" | "login">("login");
+  const [displayView, setDisplayView] = useState<"default" | "change-password">(view);
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -43,7 +48,6 @@ export function CommunityAccountScreen({
   const [authContentVisible, setAuthContentVisible] = useState(true);
   const [authModeTransitioning, setAuthModeTransitioning] = useState(false);
   const authModeTransitionTimerRef = useRef<number | null>(null);
-  const [showChangePassword, setShowChangePassword] = useState(false);
   const [showChangeEmail, setShowChangeEmail] = useState(false);
   const [changeEmailValue, setChangeEmailValue] = useState("");
   const [changeEmailPassword, setChangeEmailPassword] = useState("");
@@ -52,6 +56,7 @@ export function CommunityAccountScreen({
   const [changePasswordBusy, setChangePasswordBusy] = useState(false);
   const [changePasswordError, setChangePasswordError] = useState<string | null>(null);
   const [changePasswordSuccess, setChangePasswordSuccess] = useState<string | null>(null);
+  const authSubmitInFlightRef = useRef(false);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -70,7 +75,6 @@ export function CommunityAccountScreen({
     setError(null);
     setSuccess(null);
     setVerificationCode("");
-    setShowChangePassword(false);
     setShowChangeEmail(false);
     setChangeEmailValue(account?.email ?? "");
     setChangeEmailPassword("");
@@ -88,7 +92,8 @@ export function CommunityAccountScreen({
       setUsername("");
       setVerificationCodeDebug(null);
     }
-  }, [account]);
+    authSubmitInFlightRef.current = false;
+  }, [account, view]);
 
   useEffect(() => {
     return () => {
@@ -98,9 +103,30 @@ export function CommunityAccountScreen({
     };
   }, []);
 
+  useEffect(() => {
+    if (view === displayView) {
+      return;
+    }
+    if (authModeTransitionTimerRef.current !== null) {
+      window.clearTimeout(authModeTransitionTimerRef.current);
+    }
+    setAuthModeTransitioning(true);
+    setAuthContentVisible(false);
+    authModeTransitionTimerRef.current = window.setTimeout(() => {
+      setDisplayView(view);
+      window.requestAnimationFrame(() => {
+        setAuthContentVisible(true);
+        authModeTransitionTimerRef.current = window.setTimeout(() => {
+          setAuthModeTransitioning(false);
+          authModeTransitionTimerRef.current = null;
+        }, AUTH_MODE_FADE_MS);
+      });
+    }, AUTH_MODE_FADE_MS);
+  }, [displayView, view]);
+
   const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (busy) {
+    if (busy || authSubmitInFlightRef.current) {
       return;
     }
     const trimmedUsername = username.trim();
@@ -110,6 +136,7 @@ export function CommunityAccountScreen({
       setSuccess(null);
       return;
     }
+    authSubmitInFlightRef.current = true;
     setBusy(true);
     setError(null);
     setSuccess(null);
@@ -138,6 +165,7 @@ export function CommunityAccountScreen({
       setError(submitError instanceof Error ? submitError.message : "Could not complete that request.");
       setSuccess(null);
     } finally {
+      authSubmitInFlightRef.current = false;
       setBusy(false);
     }
   };
@@ -298,6 +326,7 @@ export function CommunityAccountScreen({
     setVerificationCodeDebug(null);
     setShowChangeEmail(false);
     setChangeEmailPassword("");
+    authSubmitInFlightRef.current = false;
     setAuthModeTransitioning(true);
     setAuthContentVisible(false);
     authModeTransitionTimerRef.current = window.setTimeout(() => {
@@ -312,6 +341,8 @@ export function CommunityAccountScreen({
     }, AUTH_MODE_FADE_MS);
   }, [authMode, authModeTransitioning]);
 
+  const backLabel = displayView === "change-password" ? "Back to Account Manager" : "Back to ReelAI";
+
   return (
     <main className="fixed inset-0 h-[100dvh] w-screen overflow-hidden bg-black text-black">
       <div className="absolute inset-0">
@@ -324,28 +355,86 @@ export function CommunityAccountScreen({
         <div className="absolute inset-0 bg-black/46" />
       </div>
 
+      <div className="fixed left-0 top-0 z-20 px-4 pb-2 pt-[calc(env(safe-area-inset-top)+1rem)] sm:px-6 lg:hidden">
+        <button
+          type="button"
+          onClick={onBack}
+          className="inline-flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition hover:text-white"
+        >
+          <i className="fa-solid fa-arrow-left text-[10px]" aria-hidden="true" />
+          {backLabel}
+        </button>
+      </div>
+
       <div className="relative z-10 h-full w-full lg:flex lg:items-center lg:justify-center lg:px-10 lg:py-8">
         <div className="h-full w-full lg:h-auto lg:max-w-[1080px] xl:max-w-[1120px]">
           <div className="h-full overflow-hidden bg-black/22 backdrop-blur-[22px] lg:h-auto lg:rounded-[32px] lg:border lg:border-[#8c8c95]/45 lg:shadow-[0_32px_140px_rgba(10,5,20,0.42)]">
             <div className="grid h-full w-full lg:h-[min(82dvh,680px)] lg:grid-cols-[minmax(0,0.94fr)_minmax(320px,0.96fr)]">
-            <section className="order-2 flex min-h-full bg-transparent px-6 py-8 sm:px-10 lg:order-1 lg:px-12 lg:py-10 xl:px-14 xl:py-12">
+            <section className="order-2 flex min-h-full bg-transparent px-6 pb-8 pt-24 sm:px-10 sm:pt-28 lg:order-1 lg:px-12 lg:py-10 xl:px-14 xl:py-12">
               <div className="mx-auto flex h-full w-full max-w-[360px] flex-col">
                 <div className="shrink-0">
                   <button
                     type="button"
                     onClick={onBack}
-                    className="inline-flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition hover:text-white"
+                    className="hidden items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition hover:text-white lg:inline-flex"
                   >
                     <i className="fa-solid fa-arrow-left text-[10px]" aria-hidden="true" />
-                    Back to ReelAI
+                    {backLabel}
                   </button>
                 </div>
 
                 {account ? (
-                  account.isVerified ? (
+                  displayView === "change-password" ? (
                     <div
                       className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
-                        authContentVisible ? "opacity-100" : "opacity-0"
+                        authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
+                      }`}
+                    >
+                      <h1 className="text-[2.3rem] font-semibold leading-[1.05] tracking-[-0.04em] text-white sm:text-[2.7rem]">
+                        Change Password
+                      </h1>
+                      <p className="mt-4 text-sm leading-6 text-white">
+                        Enter your old password and choose a new one for this account.
+                      </p>
+
+                      <div className="mt-7 rounded-[24px] bg-black/22 px-5 py-5 shadow-[0_16px_40px_rgba(16,16,16,0.16)] backdrop-blur-[16px]">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white">Active Session</p>
+                        <p className="mt-3 text-2xl font-semibold tracking-[-0.03em] text-white">@{account.username}</p>
+                        {account.email ? <p className="mt-2 text-sm text-white">{account.email}</p> : null}
+                      </div>
+
+                      <form onSubmit={onChangePassword} className="mt-6 flex flex-col gap-3">
+                        <input
+                          type="password"
+                          value={currentPassword}
+                          onChange={(event) => setCurrentPassword(event.target.value)}
+                          autoComplete="current-password"
+                          placeholder="Old password"
+                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                        />
+                        <input
+                          type="password"
+                          value={newPassword}
+                          onChange={(event) => setNewPassword(event.target.value)}
+                          autoComplete="new-password"
+                          placeholder="New password"
+                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                        />
+                        {changePasswordError ? <p className="text-sm text-[#ffb4b4]">{changePasswordError}</p> : null}
+                        {changePasswordSuccess ? <p className="text-sm text-[#9ef8cb]">{changePasswordSuccess}</p> : null}
+                        <button
+                          type="submit"
+                          disabled={changePasswordBusy}
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                        >
+                          {changePasswordBusy ? "Changing..." : "Change Password"}
+                        </button>
+                      </form>
+                    </div>
+                  ) : account.isVerified ? (
+                    <div
+                      className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
+                        authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
                       }`}
                     >
                       <h1 className="text-[2.3rem] font-semibold leading-[1.05] tracking-[-0.04em] text-white sm:text-[2.7rem]">
@@ -374,46 +463,11 @@ export function CommunityAccountScreen({
                         </button>
                         <button
                           type="button"
-                          onClick={() => {
-                            setShowChangePassword((prev) => !prev);
-                            setChangePasswordError(null);
-                            setChangePasswordSuccess(null);
-                            setCurrentPassword("");
-                            setNewPassword("");
-                          }}
+                          onClick={onOpenChangePassword}
                           className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a]"
                         >
-                          {showChangePassword ? "Cancel" : "Change Password"}
+                          Change Password
                         </button>
-                        {showChangePassword ? (
-                          <form onSubmit={onChangePassword} className="mt-1 flex flex-col gap-3">
-                            <input
-                              type="password"
-                              value={currentPassword}
-                              onChange={(event) => setCurrentPassword(event.target.value)}
-                              autoComplete="current-password"
-                              placeholder="Current password"
-                              className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
-                            />
-                            <input
-                              type="password"
-                              value={newPassword}
-                              onChange={(event) => setNewPassword(event.target.value)}
-                              autoComplete="new-password"
-                              placeholder="New password (min 8 characters)"
-                              className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
-                            />
-                            {changePasswordError ? <p className="text-sm text-[#ffb4b4]">{changePasswordError}</p> : null}
-                            {changePasswordSuccess ? <p className="text-sm text-[#9ef8cb]">{changePasswordSuccess}</p> : null}
-                            <button
-                              type="submit"
-                              disabled={changePasswordBusy}
-                              className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
-                            >
-                              {changePasswordBusy ? "Changing..." : "Update Password"}
-                            </button>
-                          </form>
-                        ) : null}
                         <button
                           type="button"
                           onClick={onSignOut}
@@ -427,7 +481,7 @@ export function CommunityAccountScreen({
                   ) : (
                     <div
                       className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
-                        authContentVisible ? "opacity-100" : "opacity-0"
+                        authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
                       }`}
                     >
                       <h1 className="text-[2.3rem] font-semibold leading-[1.05] tracking-[-0.04em] text-white sm:text-[2.7rem]">

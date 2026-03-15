@@ -1,6 +1,11 @@
+import json
+import logging
+import os
 import uuid
 
 from .text_utils import headings_from_text, keyword_candidates, split_sentences
+
+logger = logging.getLogger(__name__)
 
 
 def extract_learning_objectives(text: str, limit: int = 5) -> list[str]:
@@ -14,7 +19,75 @@ def extract_learning_objectives(text: str, limit: int = 5) -> list[str]:
     return objectives
 
 
+def _extract_concepts_via_llm(text: str, max_concepts: int = 12) -> list[dict] | None:
+    """Fix G: Use LLM to extract higher-quality concepts when OpenAI is available."""
+    from ..config import get_settings
+    settings = get_settings()
+    serverless_mode = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
+    allow_openai_serverless = os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1"
+    if not (settings.openai_enabled and settings.openai_api_key and (not serverless_mode or allow_openai_serverless)):
+        return None
+
+    from .openai_client import build_openai_client
+    client = build_openai_client(api_key=settings.openai_api_key, timeout=15.0, enabled=True)
+    if client is None:
+        return None
+
+    truncated = text[:6000]
+    prompt = f"""Extract the {max_concepts} most important study concepts from this text.
+For each concept, provide:
+- title: A concise concept name (2-5 words)
+- keywords: 3-5 related search terms that would find good YouTube educational videos
+- summary: A one-sentence description of what this concept covers
+
+Return a JSON array of objects with keys: title, keywords (array of strings), summary.
+Only return the JSON array, no other text.
+
+Text:
+{truncated}"""
+
+    try:
+        response = client.chat.completions.create(
+            model=settings.openai_chat_model or "gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        content = (response.choices[0].message.content or "").strip()
+        # Strip markdown code fences if present
+        if content.startswith("```"):
+            content = content.split("\n", 1)[-1]
+            if content.endswith("```"):
+                content = content[:-3]
+        parsed = json.loads(content)
+        if not isinstance(parsed, list):
+            return None
+        concepts: list[dict] = []
+        for item in parsed[:max_concepts]:
+            if not isinstance(item, dict) or not item.get("title"):
+                continue
+            keywords = item.get("keywords", [])
+            if not isinstance(keywords, list):
+                keywords = []
+            concepts.append({
+                "id": str(uuid.uuid4()),
+                "title": str(item["title"]),
+                "keywords": [str(k) for k in keywords[:5]],
+                "summary": str(item.get("summary", ""))[:240],
+            })
+        return concepts if concepts else None
+    except Exception as exc:
+        logger.warning("LLM concept extraction failed; falling back to keyword extraction: %s", exc)
+        return None
+
+
 def extract_concepts(text: str, max_concepts: int = 12) -> list[dict]:
+    # Fix G: Try LLM-powered extraction first for better accuracy
+    llm_concepts = _extract_concepts_via_llm(text, max_concepts=max_concepts)
+    if llm_concepts:
+        return llm_concepts[:max_concepts]
+
+    # Fallback to keyword-based extraction
     headings = headings_from_text(text, max_headings=max_concepts)
     keywords = keyword_candidates(text, limit=40)
     sentences = split_sentences(text)

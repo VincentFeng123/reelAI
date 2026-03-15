@@ -347,6 +347,20 @@ CREATE TABLE IF NOT EXISTS transcript_cache (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ranked_feed_cache (
+    cache_key TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    generation_id TEXT NOT NULL DEFAULT '',
+    fast_mode INTEGER NOT NULL DEFAULT 0,
+    source_fingerprint TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ranked_feed_cache_material_generation
+ON ranked_feed_cache(material_id, generation_id, fast_mode);
+
 CREATE TABLE IF NOT EXISTS embedding_cache (
     text_hash TEXT PRIMARY KEY,
     embedding_json TEXT NOT NULL,

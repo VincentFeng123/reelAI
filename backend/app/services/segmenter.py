@@ -178,10 +178,63 @@ def lexical_overlap_score(text: str, concept_terms: list[str]) -> float:
     return min(1.0, len(overlap) / max(1, len(term_tokens)))
 
 
+def _basic_stem_variants(token: str) -> list[str]:
+    """Generate stem variants for better lexical recall without a heavy stemmer."""
+    variants: list[str] = []
+    if len(token) <= 4:
+        return variants
+    # Strip common suffixes in order, generating multiple variants
+    # Plural forms
+    if token.endswith("ies") and len(token) > 5:
+        variants.append(token[:-3] + "y")  # studies → study
+    if token.endswith("es") and len(token) > 4:
+        variants.append(token[:-2])  # processes → process
+    if token.endswith("s") and not token.endswith("ss") and len(token) > 4:
+        variants.append(token[:-1])  # functions → function
+    # Verb forms
+    if token.endswith("ing") and len(token) > 5:
+        variants.append(token[:-3])  # learning → learn
+        if len(token) > 6 and token[-4] == token[-5]:  # running → run
+            variants.append(token[:-4])
+    if token.endswith("ed") and len(token) > 4:
+        variants.append(token[:-2])  # explained → explain
+        variants.append(token[:-1])  # used → us (filtered by length)
+    if token.endswith("er") and len(token) > 4:
+        variants.append(token[:-2])  # teacher → teach
+    # Nominal forms
+    if token.endswith("ation") and len(token) > 7:
+        base = token[:-5]
+        variants.append(base + "ate")  # calculation → calculate
+        variants.append(base)  # calculation → calcul
+    elif token.endswith("tion") and len(token) > 7:
+        variants.append(token[:-4])  # reduction → reduc
+    if token.endswith("ment") and len(token) > 6:
+        variants.append(token[:-4])  # development → develop
+    if token.endswith("ness") and len(token) > 6:
+        variants.append(token[:-4])  # awareness → aware
+    if token.endswith("ive") and len(token) > 5:
+        variants.append(token[:-3])  # derivative → derivat
+        variants.append(token[:-3] + "e")  # derivative → derivate
+    if token.endswith("ity") and len(token) > 5:
+        variants.append(token[:-3])  # complexity → complex
+    if token.endswith("ly") and len(token) > 5:
+        variants.append(token[:-2])  # quickly → quick
+    return [v for v in variants if len(v) >= 3]
+
+
 def normalize_terms(terms: list[str]) -> set[str]:
     tokens: set[str] = set()
     for term in terms:
         for token in re.findall(r"[A-Za-z][A-Za-z0-9\-']*", term.lower()):
             if len(token) >= 3:
                 tokens.add(token)
+                # First-pass variants
+                variants = _basic_stem_variants(token)
+                for variant in variants:
+                    if len(variant) >= 3:
+                        tokens.add(variant)
+                        # Second-pass: stem the variants too (e.g. calculations→calculation→calculate)
+                        for v2 in _basic_stem_variants(variant):
+                            if len(v2) >= 3:
+                                tokens.add(v2)
     return tokens

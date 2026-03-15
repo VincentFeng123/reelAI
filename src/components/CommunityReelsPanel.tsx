@@ -341,10 +341,11 @@ function formatCommunityPlatformSummary(reels: CommunityReelEmbed[]): string {
     .join(", ");
 }
 
-function buildCommunitySetInformationParagraphs(set: CommunitySet): string[] {
+function buildCommunitySetInformationParagraphs(set: CommunitySet, curatorLabel?: string): string[] {
   const availableReelCount = set.reels.length;
   const listedReelCount = Math.max(set.reelCount, availableReelCount);
   const platformSummary = formatCommunityPlatformSummary(set.reels);
+  const resolvedCuratorLabel = typeof curatorLabel === "string" && curatorLabel.trim() ? curatorLabel.trim() : set.curator;
   const clippedReelCount = set.reels.filter((reel) => {
     const start = Number(reel.tStartSec ?? 0);
     const end = Number(reel.tEndSec);
@@ -365,7 +366,7 @@ function buildCommunitySetInformationParagraphs(set: CommunitySet): string[] {
       : "These reels currently open on the original source without saved clip endpoints.";
 
   return [
-    `${set.curator} curated this set for ${formatCompact(set.learners)} learners, and it has collected ${formatCompact(set.likes)} likes so far.`,
+    `${resolvedCuratorLabel} curated this set for ${formatCompact(set.learners)} learners, and it has collected ${formatCompact(set.likes)} likes so far.`,
     availabilitySummary,
     `${tagSummary}${clipSummary ? ` ${clipSummary}` : ""}`,
   ];
@@ -1592,6 +1593,20 @@ export function CommunityReelsPanel({
   const detailCarouselCount = detailCarouselReels.length;
   const maxDetailCarouselIndex = Math.max(0, detailCarouselCount - 1);
   const activeDetailCarouselReel = detailCarouselReels[detailCarouselIndex] ?? null;
+  const selectedDirectorySetCuratorLabel = useMemo(() => {
+    if (!selectedDirectorySet) {
+      return "Community member";
+    }
+    const rawCurator = selectedDirectorySet.curator.trim();
+    if (!rawCurator) {
+      return "Community member";
+    }
+    if (rawCurator.toLowerCase() === "you") {
+      const username = communityAccount?.username?.trim();
+      return username || rawCurator;
+    }
+    return rawCurator;
+  }, [communityAccount?.username, selectedDirectorySet]);
 
   const goToPreviousDetailCarousel = useCallback(() => {
     setDetailCarouselIndex((prev) => {
@@ -3234,7 +3249,7 @@ export function CommunityReelsPanel({
                   <span className="rounded-full bg-black/28 px-2.5 py-1">{getSetReelCount(selectedDirectorySet)} reels</span>
                   <span className="rounded-full bg-black/28 px-2.5 py-1">{formatCompact(selectedDirectorySet.learners)} learners</span>
                   <span className="rounded-full bg-black/28 px-2.5 py-1">{formatCompact(selectedDirectorySet.likes)} likes</span>
-                  <span className="rounded-full bg-black/28 px-2.5 py-1">Curated by {selectedDirectorySet.curator}</span>
+                  <span className="rounded-full bg-black/28 px-2.5 py-1">Curated by {selectedDirectorySetCuratorLabel}</span>
                 </div>
               </div>
 
@@ -3576,7 +3591,7 @@ export function CommunityReelsPanel({
                       </div>
                     ) : null}
                     <div className="mt-3 space-y-3">
-                      {buildCommunitySetInformationParagraphs(selectedDirectorySet).map((paragraph, index) => (
+                      {buildCommunitySetInformationParagraphs(selectedDirectorySet, selectedDirectorySetCuratorLabel).map((paragraph, index) => (
                         <p key={`${selectedDirectorySet.id}-detail-info-${index}`} className="text-sm leading-relaxed text-white/78">
                           {paragraph}
                         </p>
@@ -3735,11 +3750,8 @@ export function CommunityReelsPanel({
                                 >
                                   <div
                                     data-your-set-actions="true"
-                                    className={`absolute right-2 top-2 z-20 transition-opacity ${
-                                      isActionsMenuOpen
-                                        ? "opacity-100 pointer-events-auto"
-                                        : "opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto"
-                                    }`}
+                                    data-force-visible={isActionsMenuOpen ? "true" : undefined}
+                                    className="reveal-on-desktop-hover absolute right-2 top-2 z-20 transition-opacity"
                                   >
                                     <button
                                       type="button"
