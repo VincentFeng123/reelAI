@@ -80,6 +80,14 @@ class TopicExpansionService:
             "acids and bases",
             "thermodynamics",
         ),
+        "calculus": (
+            "limits",
+            "derivatives",
+            "integrals",
+            "chain rule",
+            "fundamental theorem of calculus",
+            "optimization",
+        ),
         "economics": (
             "supply and demand",
             "opportunity cost",
@@ -146,6 +154,14 @@ class TopicExpansionService:
             "electricity",
             "waves",
         ),
+        "photosynthesis": (
+            "light dependent reactions",
+            "calvin cycle",
+            "chloroplast",
+            "carbon fixation",
+            "atp and nadph",
+            "stomata",
+        ),
         "physiology": (
             "homeostasis",
             "nervous system",
@@ -187,6 +203,110 @@ class TopicExpansionService:
             "graphs of trig functions",
             "law of sines",
             "law of cosines",
+        ),
+        "python programming": (
+            "variables",
+            "loops",
+            "functions",
+            "lists and dictionaries",
+            "classes and objects",
+            "file handling",
+        ),
+        "world war ii": (
+            "causes of world war ii",
+            "european theater",
+            "pacific theater",
+            "d day",
+            "axis and allies",
+            "holocaust",
+        ),
+        "algebra": (
+            "linear equations",
+            "quadratic equations",
+            "polynomials",
+            "factoring",
+            "inequalities",
+            "systems of equations",
+        ),
+        "art history": (
+            "renaissance art",
+            "baroque art",
+            "impressionism",
+            "modern art",
+            "ancient art",
+            "art movements",
+        ),
+        "biology": (
+            "cell biology",
+            "genetics",
+            "evolution",
+            "ecology",
+            "molecular biology",
+            "human biology",
+        ),
+        "computer science": (
+            "algorithms",
+            "data structures",
+            "operating systems",
+            "computer networks",
+            "databases",
+            "software engineering",
+        ),
+        "engineering": (
+            "statics",
+            "dynamics",
+            "thermodynamics",
+            "fluid mechanics",
+            "materials science",
+            "circuit analysis",
+        ),
+        "environmental science": (
+            "climate change",
+            "ecosystems",
+            "biodiversity",
+            "pollution",
+            "renewable energy",
+            "conservation",
+        ),
+        "music theory": (
+            "scales and modes",
+            "chord progressions",
+            "rhythm and meter",
+            "harmony",
+            "counterpoint",
+            "music notation",
+        ),
+        "nursing": (
+            "pharmacology",
+            "patient assessment",
+            "pathophysiology",
+            "medical surgical nursing",
+            "fundamentals of nursing",
+            "clinical skills",
+        ),
+        "organic chemistry": (
+            "functional groups",
+            "reaction mechanisms",
+            "stereochemistry",
+            "substitution reactions",
+            "elimination reactions",
+            "spectroscopy",
+        ),
+        "philosophy": (
+            "epistemology",
+            "ethics",
+            "logic",
+            "metaphysics",
+            "political philosophy",
+            "philosophy of mind",
+        ),
+        "political science": (
+            "political theory",
+            "comparative politics",
+            "international relations",
+            "public policy",
+            "constitutional law",
+            "political institutions",
         ),
     }
     DETERMINISTIC_ALIAS_TERMS: dict[str, tuple[str, ...]] = {
@@ -517,6 +637,9 @@ class TopicExpansionService:
             likely_language=likely_language,
         )
 
+        if opaque_topic:
+            self.request_timeout_sec = self.request_timeout_sec * 1.5
+
         aliases = self._collect_aliases(
             topic=clean_topic,
             canonical_topic=canonical_topic,
@@ -572,7 +695,14 @@ class TopicExpansionService:
             companion_terms,
             limit=max_related_terms,
         )
-        datamuse_terms = [] if opaque_topic else self._fetch_datamuse_related_terms(clean_topic)
+        raw_datamuse_terms = self._fetch_datamuse_related_terms(clean_topic)
+        if opaque_topic:
+            datamuse_terms = [
+                term for term in raw_datamuse_terms
+                if self._is_topic_anchor_candidate(topic=clean_topic, canonical_topic=canonical_topic, candidate=term)
+            ]
+        else:
+            datamuse_terms = raw_datamuse_terms
         weighted_candidates.extend((term, 1.6) for term in datamuse_terms)
         subtopics = self._collect_subtopics(
             topic=clean_topic,

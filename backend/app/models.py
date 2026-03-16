@@ -255,6 +255,10 @@ class CommunityChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=8, max_length=128)
 
 
+class CommunityDeleteAccountRequest(BaseModel):
+    current_password: str = Field(min_length=8, max_length=128)
+
+
 class CommunityChangeEmailRequest(BaseModel):
     email: str = Field(min_length=3, max_length=254)
     current_password: str = Field(min_length=8, max_length=128)
@@ -291,6 +295,8 @@ class CommunityHistoryItemIn(BaseModel):
     generation_mode: Literal["slow", "fast"] = "fast"
     source: Literal["search", "community"] = "search"
     feed_query: str | None = Field(default=None, max_length=4000)
+    active_index: int | None = Field(default=None, ge=0)
+    active_reel_id: str | None = Field(default=None, max_length=400)
 
 
 class CommunityHistoryItemOut(BaseModel):
@@ -301,6 +307,8 @@ class CommunityHistoryItemOut(BaseModel):
     generation_mode: Literal["slow", "fast"] = "fast"
     source: Literal["search", "community"] = "search"
     feed_query: str | None = None
+    active_index: int | None = None
+    active_reel_id: str | None = None
 
 
 class CommunityHistoryReplaceRequest(BaseModel):

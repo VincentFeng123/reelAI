@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import sys
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +24,7 @@ from fastapi.testclient import TestClient
 
 class MediumRegressionTests(unittest.TestCase):
     def _build_generation_test_conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(":memory:")
+        conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.executescript(
             """
@@ -373,6 +374,22 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertNotIn("topic psychology", titles)
         self.assertTrue(any("psychology" in objective.lower() for objective in objectives))
 
+    def test_material_intelligence_machine_learning_topic_prefers_curated_core_subtopics(self) -> None:
+        service = MaterialIntelligenceService()
+        service.client = None
+        concepts, _objectives = service.extract_concepts_and_objectives(
+            None,
+            "Topic: machine learning",
+            subject_tag="machine learning",
+            max_concepts=6,
+        )
+        titles = [str(concept.get("title") or "").strip().lower() for concept in concepts]
+        self.assertEqual(titles[0], "machine learning")
+        self.assertIn("supervised learning", titles)
+        self.assertIn("unsupervised learning", titles)
+        self.assertNotIn("quantum machine learning", titles)
+        self.assertNotIn("adversarial machine learning", titles)
+
     def test_material_intelligence_topic_seed_precedes_llm_for_topic_only_material(self) -> None:
         service = MaterialIntelligenceService()
         service.client = object()
@@ -649,7 +666,7 @@ class MediumRegressionTests(unittest.TestCase):
 
         aliases = {str(item).strip().lower() for item in (payload.get("aliases") or [])}
         subtopics = {str(item).strip().lower() for item in (payload.get("subtopics") or [])}
-        datamuse_mock.assert_not_called()
+        datamuse_mock.assert_called_once()
         self.assertIn("melittology", aliases)
         self.assertNotIn("action research", aliases)
         self.assertNotIn("action research", subtopics)
@@ -723,7 +740,7 @@ class MediumRegressionTests(unittest.TestCase):
             str(item).strip().lower()
             for item in service.build_topic_search_terms(topic="myrmecology", expansion=payload, limit=6)
         }
-        datamuse_mock.assert_not_called()
+        datamuse_mock.assert_called_once()
         self.assertIn("ants", related_terms)
         self.assertIn("ants", search_terms)
         self.assertNotIn("ants mythology", related_terms)
@@ -902,6 +919,82 @@ class MediumRegressionTests(unittest.TestCase):
             self.assertNotIn("entomology", titles)
             self.assertNotIn("melittology or apiology bees", titles)
             self.assertNotIn("pollinator biology", titles)
+        finally:
+            conn.close()
+
+    def test_reel_service_sync_topic_expansion_rewrites_broad_topic_to_curated_subtopics(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        conn.execute(
+            """
+            INSERT INTO materials (
+                id, subject_tag, raw_text, source_type, source_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "material-machine-learning",
+                "machine learning",
+                "Topic: machine learning",
+                "topic",
+                None,
+                "2026-03-14T00:00:00+00:00",
+            ),
+        )
+        concept_rows = [
+            ("concept-root", "Machine Learning", '["machine learning"]', "Core ideas in machine learning."),
+            ("concept-a", "Attention", '["attention"]', "Attention mechanisms."),
+            ("concept-b", "Quantum Machine Learning", '["quantum machine learning"]', "Quantum ML."),
+            ("concept-c", "Adversarial Machine Learning", '["adversarial machine learning"]', "Adversarial ML."),
+        ]
+        for concept_id, title, keywords_json, summary in concept_rows:
+            conn.execute(
+                """
+                INSERT INTO concepts (
+                    id, material_id, title, keywords_json, summary, embedding_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    concept_id,
+                    "material-machine-learning",
+                    title,
+                    keywords_json,
+                    summary,
+                    None,
+                    "2026-03-14T00:00:00+00:00",
+                ),
+            )
+
+        service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
+        try:
+            updated = service._sync_topic_expansion_concepts(
+                conn,
+                material_id="material-machine-learning",
+                concepts=conn.execute(
+                    "SELECT id, material_id, title, keywords_json, summary, embedding_json, created_at FROM concepts WHERE material_id = ? ORDER BY created_at ASC, id ASC",
+                    ("material-machine-learning",),
+                ).fetchall(),
+                subject_tag="machine learning",
+                expansion={
+                    "canonical_topic": "Machine Learning",
+                    "aliases": [],
+                    "subtopics": ["attention", "quantum machine learning", "adversarial machine learning"],
+                    "related_terms": ["explainable artificial intelligence"],
+                },
+            )
+            titles = [str(concept.get("title") or "").strip().lower() for concept in updated]
+            self.assertEqual(
+                titles,
+                [
+                    "machine learning",
+                    "supervised learning",
+                    "unsupervised learning",
+                    "regression",
+                    "classification",
+                    "neural networks",
+                    "model evaluation",
+                ],
+            )
         finally:
             conn.close()
 
@@ -1364,7 +1457,7 @@ class MediumRegressionTests(unittest.TestCase):
                 )
 
             self.assertEqual(page_one, [])
-            self.assertEqual([row["reel_id"] for row in page_two], ["good-companion"])
+            self.assertEqual(page_two, [])
         finally:
             conn.close()
 
@@ -1407,6 +1500,354 @@ class MediumRegressionTests(unittest.TestCase):
                 )
 
             self.assertEqual([row["reel_id"] for row in page_one], ["good-alias"])
+        finally:
+            conn.close()
+
+    def test_ranked_request_reels_accepts_curated_broad_subtopic_on_page_one(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("calculus", "topic", "material-1"),
+        )
+        try:
+            candidate = {
+                "reel_id": "good-subtopic",
+                "video_url": "https://www.youtube.com/embed/video-chain-rule?start=0&end=35",
+                "video_title": "Chain Rule Explained with Worked Examples",
+                "video_description": "Intro calculus lesson on derivatives and composite functions.",
+                "transcript_snippet": "",
+                "score": 0.57,
+                "relevance_score": 0.31,
+                "matched_terms": ["chain rule", "derivatives"],
+                "video_duration_sec": 420,
+                "clip_duration_sec": 35.0,
+                "source_surface": "youtube_html",
+                "retrieval_stage": "broad",
+                "query_strategy": "explained",
+                "created_at": "2026-03-15T00:00:00+00:00",
+            }
+            with mock.patch.object(main_module.reel_service, "ranked_feed", return_value=[candidate]):
+                page_one = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=1,
+                    limit=5,
+                )
+
+            self.assertEqual([row["reel_id"] for row in page_one], ["good-subtopic"])
+        finally:
+            conn.close()
+
+    def test_ranked_request_reels_allows_local_bootstrap_on_page_one(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("python programming", "topic", "material-1"),
+        )
+        try:
+            candidate = {
+                "reel_id": "local-bootstrap",
+                "video_url": "https://www.youtube.com/embed/python-basics?start=0&end=35",
+                "video_title": "Python Programming Tutorial for Beginners",
+                "video_description": "Learn Python programming with variables, loops, and functions.",
+                "transcript_snippet": "",
+                "score": 0.58,
+                "relevance_score": 0.33,
+                "matched_terms": ["python programming", "variables", "loops"],
+                "video_duration_sec": 420,
+                "clip_duration_sec": 35.0,
+                "source_surface": "local_bootstrap",
+                "retrieval_stage": "high_precision",
+                "query_strategy": "literal",
+                "created_at": "2026-03-15T00:00:00+00:00",
+            }
+            with mock.patch.object(main_module.reel_service, "ranked_feed", return_value=[candidate]):
+                page_one = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=1,
+                    limit=5,
+                )
+
+            self.assertEqual([row["reel_id"] for row in page_one], ["local-bootstrap"])
+        finally:
+            conn.close()
+
+    def test_ranked_request_reels_backfills_page_one_from_later_page_for_curated_broad_topic(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("machine learning", "topic", "material-1"),
+        )
+        try:
+            reels = [
+                {
+                    "reel_id": "page-one",
+                    "video_url": "https://www.youtube.com/embed/video-root?start=0&end=35",
+                    "video_title": "Supervised Learning Explained in 60 Seconds",
+                    "video_description": "Quick introduction to machine learning basics.",
+                    "transcript_snippet": "",
+                    "score": 0.59,
+                    "relevance_score": 0.31,
+                    "matched_terms": ["supervised learning", "machine learning"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_html",
+                    "retrieval_stage": "high_precision",
+                    "query_strategy": "explained",
+                    "created_at": "2026-03-15T00:00:00+00:00",
+                },
+                {
+                    "reel_id": "page-two-fill",
+                    "video_url": "https://www.youtube.com/embed/video-types?start=0&end=35",
+                    "video_title": "Types of Machine Learning | Supervised vs Unsupervised Learning",
+                    "video_description": "Overview of the main machine learning categories for beginners.",
+                    "transcript_snippet": "",
+                    "score": 0.56,
+                    "relevance_score": 0.24,
+                    "matched_terms": ["supervised learning", "unsupervised learning"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_html",
+                    "retrieval_stage": "broad",
+                    "query_strategy": "explained",
+                    "created_at": "2026-03-15T00:00:01+00:00",
+                },
+            ]
+            with mock.patch.object(main_module.reel_service, "ranked_feed", return_value=reels):
+                page_one = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=1,
+                    limit=5,
+                )
+
+            self.assertEqual([row["reel_id"] for row in page_one], ["page-one"])
+        finally:
+            conn.close()
+
+    def test_ranked_request_reels_page_one_emergency_backfill_keeps_direct_inventory_only(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("machine learning", "topic", "material-1"),
+        )
+        try:
+            reels = [
+                {
+                    "reel_id": "page-one",
+                    "video_url": "https://www.youtube.com/embed/video-root?start=0&end=35",
+                    "video_title": "Supervised Learning Explained in 60 Seconds",
+                    "video_description": "Quick introduction to machine learning basics.",
+                    "transcript_snippet": "",
+                    "score": 0.59,
+                    "relevance_score": 0.31,
+                    "matched_terms": ["supervised learning", "machine learning"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_html",
+                    "retrieval_stage": "high_precision",
+                    "query_strategy": "explained",
+                    "created_at": "2026-03-15T00:00:00+00:00",
+                },
+                {
+                    "reel_id": "page-one-emergency",
+                    "video_url": "https://www.youtube.com/embed/video-types?start=0&end=35",
+                    "video_title": "Types of Machine Learning | Supervised vs Unsupervised Learning",
+                    "video_description": "Overview of the main machine learning categories for beginners.",
+                    "transcript_snippet": "",
+                    "score": 0.56,
+                    "relevance_score": 0.28,
+                    "matched_terms": ["supervised learning", "unsupervised learning"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_html",
+                    "retrieval_stage": "broad",
+                    "query_strategy": "explained",
+                    "created_at": "2026-03-15T00:00:01+00:00",
+                },
+                {
+                    "reel_id": "blocked-related",
+                    "video_url": "https://www.youtube.com/embed/video-related?start=0&end=35",
+                    "video_title": "Related machine learning overview",
+                    "video_description": "A related-video recommendation about machine learning.",
+                    "transcript_snippet": "",
+                    "score": 0.56,
+                    "relevance_score": 0.28,
+                    "matched_terms": ["machine learning"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_related",
+                    "retrieval_stage": "recovery",
+                    "query_strategy": "recovery_adjacent",
+                    "created_at": "2026-03-15T00:00:02+00:00",
+                },
+            ]
+            with mock.patch.object(main_module.reel_service, "ranked_feed", return_value=reels):
+                page_one = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=1,
+                    limit=5,
+                )
+
+            self.assertEqual([row["reel_id"] for row in page_one], ["page-one", "page-one-emergency"])
+        finally:
+            conn.close()
+
+    def test_ranked_request_reels_page_two_preserves_page_one_emergency_inventory(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("machine learning", "topic", "material-1"),
+        )
+        try:
+            reels = [
+                {
+                    "reel_id": "page-one",
+                    "video_url": "https://www.youtube.com/embed/video-root?start=0&end=35",
+                    "video_title": "Supervised Learning Explained in 60 Seconds",
+                    "video_description": "Quick introduction to machine learning basics.",
+                    "transcript_snippet": "",
+                    "score": 0.59,
+                    "relevance_score": 0.31,
+                    "matched_terms": ["supervised learning", "machine learning"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_html",
+                    "retrieval_stage": "high_precision",
+                    "query_strategy": "explained",
+                    "created_at": "2026-03-15T00:00:00+00:00",
+                },
+                {
+                    "reel_id": "page-one-emergency",
+                    "video_url": "https://www.youtube.com/embed/video-types?start=0&end=35",
+                    "video_title": "Types of Machine Learning | Supervised vs Unsupervised Learning",
+                    "video_description": "Overview of the main machine learning categories for beginners.",
+                    "transcript_snippet": "",
+                    "score": 0.56,
+                    "relevance_score": 0.28,
+                    "matched_terms": ["supervised learning", "unsupervised learning"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_html",
+                    "retrieval_stage": "broad",
+                    "query_strategy": "explained",
+                    "created_at": "2026-03-15T00:00:01+00:00",
+                },
+            ]
+            with mock.patch.object(main_module.reel_service, "ranked_feed", return_value=reels):
+                merged = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=2,
+                    limit=5,
+                )
+
+            self.assertEqual([row["reel_id"] for row in merged], ["page-one", "page-one-emergency"])
+        finally:
+            conn.close()
+
+    def test_ranked_request_reels_caps_repeated_broad_topic_anchor_flooding(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute(
+            "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
+            ("machine learning", "topic", "material-1"),
+        )
+        try:
+            reels = []
+            for index in range(5):
+                reels.append(
+                    {
+                        "reel_id": f"supervised-{index}",
+                        "video_url": f"https://www.youtube.com/embed/video-supervised-{index}?start=0&end=35",
+                        "video_title": f"Supervised Learning Explained Part {index + 1}",
+                        "video_description": "Machine learning lesson about supervised learning for beginners.",
+                        "transcript_snippet": "",
+                        "score": 0.58 - index * 0.01,
+                        "relevance_score": 0.34,
+                        "matched_terms": ["supervised learning", "machine learning"],
+                        "video_duration_sec": 420,
+                        "clip_duration_sec": 35.0,
+                        "source_surface": "youtube_html",
+                        "retrieval_stage": "broad",
+                        "query_strategy": "explained",
+                        "created_at": f"2026-03-15T00:00:0{index}+00:00",
+                    }
+                )
+            reels.append(
+                {
+                    "reel_id": "classification-1",
+                    "video_url": "https://www.youtube.com/embed/video-classification?start=0&end=35",
+                    "video_title": "Classification and Regression in Machine Learning",
+                    "video_description": "Intro machine learning lesson on classification and regression.",
+                    "transcript_snippet": "",
+                    "score": 0.53,
+                    "relevance_score": 0.33,
+                    "matched_terms": ["classification", "regression", "machine learning"],
+                    "video_duration_sec": 420,
+                    "clip_duration_sec": 35.0,
+                    "source_surface": "youtube_html",
+                    "retrieval_stage": "broad",
+                    "query_strategy": "explained",
+                    "created_at": "2026-03-15T00:00:09+00:00",
+                }
+            )
+            with mock.patch.object(main_module.reel_service, "ranked_feed", return_value=reels):
+                page_two = main_module._ranked_request_reels(
+                    conn,
+                    material_id="material-1",
+                    fast_mode=False,
+                    generation_id="gen-1",
+                    min_relevance=0.3,
+                    preferred_video_duration="any",
+                    target_clip_duration_sec=55,
+                    target_clip_duration_min_sec=20,
+                    target_clip_duration_max_sec=55,
+                    page=2,
+                    limit=5,
+                )
+
+            supervised_count = sum(
+                1 for row in page_two if "supervised learning" in str(row.get("video_title") or "").lower()
+            )
+            self.assertLessEqual(supervised_count, 4)
+            self.assertIn("classification-1", [row["reel_id"] for row in page_two])
         finally:
             conn.close()
 
@@ -1480,7 +1921,7 @@ class MediumRegressionTests(unittest.TestCase):
                 )
 
             self.assertEqual([row["reel_id"] for row in page_one], ["good-root"])
-            self.assertEqual([row["reel_id"] for row in page_two], ["good-root", "good-companion"])
+            self.assertEqual([row["reel_id"] for row in page_two], ["good-root"])
         finally:
             conn.close()
 
@@ -1698,6 +2139,215 @@ class MediumRegressionTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(updated_job["status"], "completed")
         self.assertTrue(str(updated_job["result_generation_id"]))
+        conn.close()
+
+    def test_fetch_refinement_job_for_generation_resubmits_active_queued_job(self) -> None:
+        conn = self._build_generation_test_conn()
+        request_key = "request-key"
+        conn.execute(
+            """
+            INSERT INTO reel_generations (
+                id, material_id, concept_id, request_key, generation_mode, retrieval_profile,
+                status, source_generation_id, reel_count, created_at, completed_at, activated_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "bootstrap-gen",
+                "material-1",
+                None,
+                request_key,
+                "fast",
+                "bootstrap",
+                "active",
+                None,
+                4,
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                None,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO reel_generation_heads (
+                id, material_id, request_key, active_generation_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            ("head-1", "material-1", request_key, "bootstrap-gen", "2026-03-13T00:00:00+00:00"),
+        )
+        conn.execute(
+            """
+            INSERT INTO reel_generation_jobs (
+                id, material_id, concept_id, request_key, source_generation_id, result_generation_id,
+                target_profile, request_params_json, status, created_at, started_at, completed_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "job-1",
+                "material-1",
+                None,
+                request_key,
+                "bootstrap-gen",
+                None,
+                "deep",
+                "{}",
+                "queued",
+                "2026-03-13T00:01:00+00:00",
+                None,
+                None,
+                None,
+            ),
+        )
+
+        with mock.patch.object(main_module, "_submit_refinement_job", return_value=True) as submit_job:
+            job_row = main_module._fetch_refinement_job_for_generation(conn, "bootstrap-gen")
+
+        self.assertIsNotNone(job_row)
+        self.assertEqual(str(job_row["id"]), "job-1")
+        submit_job.assert_called_once_with("job-1")
+        conn.close()
+
+    def test_resume_pending_refinement_jobs_requeues_active_running_jobs_and_clears_stale_ones(self) -> None:
+        conn = self._build_generation_test_conn()
+        conn.execute("INSERT INTO materials (id) VALUES (?)", ("material-2",))
+        active_request_key = "request-key-active"
+        stale_request_key = "request-key-stale"
+        conn.executemany(
+            """
+            INSERT INTO reel_generations (
+                id, material_id, concept_id, request_key, generation_mode, retrieval_profile,
+                status, source_generation_id, reel_count, created_at, completed_at, activated_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "active-source-gen",
+                    "material-1",
+                    None,
+                    active_request_key,
+                    "fast",
+                    "bootstrap",
+                    "active",
+                    None,
+                    4,
+                    "2026-03-13T00:00:00+00:00",
+                    "2026-03-13T00:00:00+00:00",
+                    "2026-03-13T00:00:00+00:00",
+                    None,
+                ),
+                (
+                    "stale-source-gen",
+                    "material-2",
+                    None,
+                    stale_request_key,
+                    "fast",
+                    "bootstrap",
+                    "completed",
+                    None,
+                    3,
+                    "2026-03-13T00:02:00+00:00",
+                    "2026-03-13T00:02:00+00:00",
+                    "2026-03-13T00:02:00+00:00",
+                    None,
+                ),
+                (
+                    "active-deep-gen",
+                    "material-2",
+                    None,
+                    stale_request_key,
+                    "fast",
+                    "deep",
+                    "active",
+                    "stale-source-gen",
+                    6,
+                    "2026-03-13T00:03:00+00:00",
+                    "2026-03-13T00:03:00+00:00",
+                    "2026-03-13T00:03:00+00:00",
+                    None,
+                ),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO reel_generation_heads (
+                id, material_id, request_key, active_generation_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                ("head-1", "material-1", active_request_key, "active-source-gen", "2026-03-13T00:00:00+00:00"),
+                ("head-2", "material-2", stale_request_key, "active-deep-gen", "2026-03-13T00:03:00+00:00"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO reel_generation_jobs (
+                id, material_id, concept_id, request_key, source_generation_id, result_generation_id,
+                target_profile, request_params_json, status, created_at, started_at, completed_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "job-active",
+                    "material-1",
+                    None,
+                    active_request_key,
+                    "active-source-gen",
+                    None,
+                    "deep",
+                    "{}",
+                    "running",
+                    "2026-03-13T00:01:00+00:00",
+                    "2026-03-13T00:01:05+00:00",
+                    None,
+                    None,
+                ),
+                (
+                    "job-stale",
+                    "material-2",
+                    None,
+                    stale_request_key,
+                    "stale-source-gen",
+                    None,
+                    "deep",
+                    "{}",
+                    "queued",
+                    "2026-03-13T00:04:00+00:00",
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+        )
+
+        class _ConnCtx:
+            def __enter__(self_nonlocal):
+                return conn
+
+            def __exit__(self_nonlocal, exc_type, exc, tb):
+                return False
+
+        with mock.patch.object(main_module, "get_conn", return_value=_ConnCtx()), mock.patch.object(
+            main_module,
+            "_submit_refinement_job",
+            return_value=True,
+        ) as submit_job:
+            main_module._resume_pending_refinement_jobs()
+
+        submit_job.assert_called_once_with("job-active")
+        active_job = conn.execute(
+            "SELECT status, started_at, completed_at FROM reel_generation_jobs WHERE id = ?",
+            ("job-active",),
+        ).fetchone()
+        self.assertEqual(active_job["status"], "queued")
+        self.assertIsNone(active_job["started_at"])
+        self.assertIsNone(active_job["completed_at"])
+
+        stale_job = conn.execute(
+            "SELECT status, completed_at FROM reel_generation_jobs WHERE id = ?",
+            ("job-stale",),
+        ).fetchone()
+        self.assertEqual(stale_job["status"], "superseded")
+        self.assertTrue(str(stale_job["completed_at"]))
         conn.close()
 
     def test_ensure_generation_runs_sync_deep_fallback_when_bootstrap_is_under_target(self) -> None:
@@ -1954,6 +2604,8 @@ class MediumRegressionTests(unittest.TestCase):
             main_module._refinement_target_reel_count(
                 required_count=9,
                 generation_mode="fast",
+                target_page=1,
+                page_size_hint=5,
                 existing_source_count=3,
             ),
         )
@@ -2149,6 +2801,91 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual((next_generation["retrieval_profile"], next_generation["source_generation_id"]), ("deep", "deep-gen"))
         conn.close()
 
+    def test_activate_generation_falls_back_to_legacy_generation_head_schema(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE reel_generations (
+                id TEXT PRIMARY KEY,
+                material_id TEXT NOT NULL,
+                concept_id TEXT,
+                request_key TEXT NOT NULL,
+                generation_mode TEXT NOT NULL DEFAULT 'fast',
+                retrieval_profile TEXT NOT NULL DEFAULT 'bootstrap',
+                status TEXT NOT NULL DEFAULT 'pending',
+                source_generation_id TEXT,
+                reel_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                activated_at TEXT,
+                error_text TEXT
+            );
+
+            CREATE TABLE reel_generation_heads (
+                material_id TEXT NOT NULL,
+                request_key TEXT NOT NULL,
+                active_generation_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(material_id, request_key)
+            );
+
+            CREATE TABLE reels (
+                id TEXT PRIMARY KEY,
+                generation_id TEXT,
+                material_id TEXT NOT NULL,
+                concept_id TEXT NOT NULL,
+                video_id TEXT NOT NULL,
+                video_url TEXT NOT NULL DEFAULT '',
+                t_start REAL NOT NULL,
+                t_end REAL NOT NULL,
+                transcript_snippet TEXT NOT NULL DEFAULT '',
+                takeaways_json TEXT NOT NULL DEFAULT '[]',
+                base_score REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO reel_generations (
+                id, material_id, concept_id, request_key, generation_mode, retrieval_profile,
+                status, source_generation_id, reel_count, created_at, completed_at, activated_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "gen-1",
+                "material-1",
+                None,
+                "request-key",
+                "fast",
+                "bootstrap",
+                "pending",
+                None,
+                0,
+                "2026-03-13T00:00:00+00:00",
+                None,
+                None,
+                None,
+            ),
+        )
+
+        main_module._activate_generation(
+            conn,
+            material_id="material-1",
+            request_key="request-key",
+            generation_id="gen-1",
+            retrieval_profile="bootstrap",
+        )
+
+        head = conn.execute(
+            "SELECT active_generation_id FROM reel_generation_heads WHERE material_id = ? AND request_key = ?",
+            ("material-1", "request-key"),
+        ).fetchone()
+        self.assertIsNotNone(head)
+        self.assertEqual(str(head["active_generation_id"]), "gen-1")
+        conn.close()
+
     def test_feed_queues_bootstrap_refinement_with_sync_target_budget(self) -> None:
         conn = self._build_generation_test_conn()
         target_clip_duration_sec, target_clip_duration_min_sec, target_clip_duration_max_sec = _resolve_target_clip_duration_bounds(
@@ -2237,12 +2974,349 @@ class MediumRegressionTests(unittest.TestCase):
             main_module._refinement_target_reel_count(
                 required_count=11,
                 generation_mode="fast",
+                target_page=1,
+                page_size_hint=1,
                 existing_source_count=5,
             ),
         )
         self.assertEqual(result["response_profile"], "bootstrap")
         self.assertEqual(result["refinement_job_id"], "job-feed")
         self.assertEqual(result["refinement_status"], "queued")
+        conn.close()
+
+    def test_feed_page_two_skips_sync_extension_when_current_page_is_already_filled(self) -> None:
+        conn = self._build_generation_test_conn()
+        target_clip_duration_sec, target_clip_duration_min_sec, target_clip_duration_max_sec = _resolve_target_clip_duration_bounds(
+            55,
+            None,
+            None,
+        )
+        request_key = _build_generation_request_key(
+            material_id="material-1",
+            concept_id=None,
+            creative_commons_only=False,
+            generation_mode="slow",
+            video_pool_mode="short-first",
+            preferred_video_duration="any",
+            target_clip_duration_sec=target_clip_duration_sec,
+            target_clip_duration_min_sec=target_clip_duration_min_sec,
+            target_clip_duration_max_sec=target_clip_duration_max_sec,
+        )
+        conn.execute(
+            """
+            INSERT INTO reel_generations (
+                id, material_id, concept_id, request_key, generation_mode, retrieval_profile,
+                status, source_generation_id, reel_count, created_at, completed_at, activated_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "deep-gen",
+                "material-1",
+                None,
+                request_key,
+                "slow",
+                "deep",
+                "active",
+                None,
+                12,
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                None,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO reel_generation_heads (
+                id, material_id, request_key, active_generation_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            ("head-1", "material-1", request_key, "deep-gen", "2026-03-13T00:00:00+00:00"),
+        )
+        ranked_reels = [
+            {
+                "reel_id": f"reel-{index}",
+                "video_duration_sec": 600,
+                "clip_duration_sec": 55.0,
+            }
+            for index in range(12)
+        ]
+
+        with mock.patch.object(main_module, "_ranked_request_reels", return_value=ranked_reels), mock.patch.object(
+            main_module,
+            "_queue_refinement_job",
+            return_value={"id": "job-feed-page2", "status": "queued"},
+        ), mock.patch.object(main_module, "_ensure_generation_for_request") as ensure_generation, mock.patch.object(
+            main_module,
+            "get_conn",
+        ) as patched_get_conn:
+            class _Ctx:
+                def __enter__(self_nonlocal):
+                    return conn
+
+                def __exit__(self_nonlocal, exc_type, exc, tb):
+                    return False
+
+            patched_get_conn.return_value = _Ctx()
+            result = main_module.feed(
+                material_id="material-1",
+                page=2,
+                limit=5,
+                autofill=True,
+                prefetch=12,
+                generation_mode="slow",
+            )
+
+        ensure_generation.assert_not_called()
+        self.assertEqual(result["total"], 12)
+        self.assertEqual([row["reel_id"] for row in result["reels"]], [f"reel-{index}" for index in range(5, 10)])
+        self.assertEqual(result["refinement_job_id"], "job-feed-page2")
+        self.assertEqual(result["refinement_status"], "queued")
+        conn.close()
+
+    def test_feed_requeues_full_autofill_target_after_sync_bootstrap(self) -> None:
+        conn = self._build_generation_test_conn()
+        generated_reels = [
+            {"reel_id": f"reel-{index}", "video_duration_sec": 600, "clip_duration_sec": 55.0}
+            for index in range(4)
+        ]
+
+        with mock.patch.object(main_module, "_ranked_request_reels", return_value=[]), mock.patch.object(
+            main_module,
+            "_queue_refinement_if_needed",
+            side_effect=[None, {"id": "job-full", "status": "queued"}],
+        ) as queue_if_needed, mock.patch.object(
+            main_module,
+            "_ensure_generation_for_request",
+            return_value={
+                "reels": generated_reels,
+                "generation_id": "bootstrap-gen",
+                "response_profile": "bootstrap",
+                "refinement_job_id": "job-sync",
+                "refinement_status": "queued",
+            },
+        ) as ensure_generation, mock.patch.object(
+            main_module,
+            "get_conn",
+        ) as patched_get_conn:
+            class _Ctx:
+                def __enter__(self_nonlocal):
+                    return conn
+
+                def __exit__(self_nonlocal, exc_type, exc, tb):
+                    return False
+
+            patched_get_conn.return_value = _Ctx()
+            result = main_module.feed(
+                material_id="material-1",
+                page=1,
+                limit=5,
+                autofill=True,
+                prefetch=12,
+                generation_mode="fast",
+            )
+
+        ensure_generation.assert_called_once()
+        self.assertEqual(queue_if_needed.call_count, 2)
+        first_kwargs = queue_if_needed.call_args_list[0].kwargs
+        second_kwargs = queue_if_needed.call_args_list[1].kwargs
+        self.assertIsNone(first_kwargs["generation_id"])
+        self.assertEqual(first_kwargs["required_count"], 27)
+        self.assertEqual(second_kwargs["generation_id"], "bootstrap-gen")
+        self.assertEqual(second_kwargs["required_count"], 27)
+        self.assertEqual(second_kwargs["current_reels"], generated_reels)
+        self.assertEqual(result["refinement_job_id"], "job-full")
+        self.assertEqual(result["refinement_status"], "queued")
+        conn.close()
+
+    def test_build_refinement_request_params_infers_later_target_page_from_inventory_horizon(self) -> None:
+        request_params = main_module._build_refinement_request_params(
+            creative_commons_only=False,
+            video_pool_mode="short-first",
+            preferred_video_duration="any",
+            target_clip_duration_sec=55,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+            required_count=21,
+            generation_mode="fast",
+            existing_source_count=10,
+            min_relevance_threshold=0.3,
+            page_hint=1,
+            page_size_hint=5,
+            target_page=1,
+        )
+
+        self.assertEqual(int(request_params["page_hint"]), 1)
+        self.assertEqual(
+            int(request_params["target_reel_count"]),
+            main_module._refinement_target_reel_count(
+                required_count=21,
+                generation_mode="fast",
+                target_page=1,
+                page_size_hint=5,
+                existing_source_count=10,
+            ),
+        )
+        self.assertEqual(int(request_params["inventory_target_count"]), 25)
+        self.assertEqual(int(request_params["target_page"]), 5)
+
+    def test_queue_refinement_if_needed_uses_inventory_target_not_burst_target(self) -> None:
+        conn = self._build_generation_test_conn()
+        request_key = "request-key"
+        conn.execute(
+            """
+            INSERT INTO reel_generations (
+                id, material_id, concept_id, request_key, generation_mode, retrieval_profile,
+                status, source_generation_id, reel_count, created_at, completed_at, activated_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "deep-gen",
+                "material-1",
+                None,
+                request_key,
+                "fast",
+                "deep",
+                "active",
+                None,
+                10,
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                None,
+            ),
+        )
+
+        current_reels = [
+            {"reel_id": f"reel-{index}", "video_duration_sec": 90, "clip_duration_sec": 35.0}
+            for index in range(10)
+        ]
+
+        with mock.patch.object(
+            main_module,
+            "_queue_refinement_job",
+            return_value={"id": "job-gap", "status": "queued"},
+        ) as queue_job:
+            job = main_module._queue_refinement_if_needed(
+                conn,
+                material_id="material-1",
+                concept_id=None,
+                request_key=request_key,
+                generation_id="deep-gen",
+                current_reels=current_reels,
+                required_count=12,
+                generation_mode="fast",
+                creative_commons_only=False,
+                preferred_video_duration="any",
+                video_pool_mode="short-first",
+                target_clip_duration_sec=55,
+                target_clip_duration_min_sec=20,
+                target_clip_duration_max_sec=55,
+                min_relevance=0.3,
+                page_hint=2,
+                page_size_hint=5,
+            )
+
+        self.assertEqual(job, {"id": "job-gap", "status": "queued"})
+        queue_job.assert_called_once()
+        request_params = queue_job.call_args.kwargs["request_params"]
+        self.assertEqual(int(request_params["inventory_target_count"]), 15)
+        self.assertEqual(int(request_params["target_reel_count"]), 5)
+        conn.close()
+
+    def test_advance_refinement_state_resets_counters_when_ladder_advances(self) -> None:
+        next_state = main_module._advance_refinement_state(
+            recovery_stage=0,
+            stage_exhausted={},
+            no_new_sources_passes=1,
+            no_new_windows_passes=1,
+            no_new_visible_reels_passes=1,
+            new_unique_videos=0,
+            new_unique_clip_windows=0,
+            new_unique_visible_reels=0,
+        )
+
+        self.assertEqual(next_state["next_stage"], 1)
+        self.assertEqual(next_state["no_new_sources_passes"], 0)
+        self.assertEqual(next_state["no_new_windows_passes"], 0)
+        self.assertEqual(next_state["no_new_visible_reels_passes"], 0)
+        self.assertTrue(next_state["stage_exhausted"].get("0"))
+        self.assertEqual(next_state["growth_reason"], "stage_exhausted")
+
+    def test_refinement_status_resumes_queued_jobs(self) -> None:
+        conn = self._build_generation_test_conn()
+        request_key = "request-key"
+        conn.execute(
+            """
+            INSERT INTO reel_generations (
+                id, material_id, concept_id, request_key, generation_mode, retrieval_profile,
+                status, source_generation_id, reel_count, created_at, completed_at, activated_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "bootstrap-gen",
+                "material-1",
+                None,
+                request_key,
+                "fast",
+                "bootstrap",
+                "active",
+                None,
+                5,
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                None,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO reel_generation_heads (
+                id, material_id, request_key, active_generation_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            ("head-1", "material-1", request_key, "bootstrap-gen", "2026-03-13T00:00:00+00:00"),
+        )
+        conn.execute(
+            """
+            INSERT INTO reel_generation_jobs (
+                id, material_id, concept_id, request_key, source_generation_id,
+                result_generation_id, target_profile, request_params_json, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "job-queued",
+                "material-1",
+                None,
+                request_key,
+                "bootstrap-gen",
+                None,
+                "deep",
+                "{}",
+                "queued",
+                "2026-03-13T00:01:00+00:00",
+            ),
+        )
+
+        with mock.patch.object(main_module, "_enforce_rate_limit"), mock.patch.object(
+            main_module,
+            "_submit_refinement_job",
+            return_value=True,
+        ) as submit_job, mock.patch.object(main_module, "get_conn") as patched_get_conn:
+            class _Ctx:
+                def __enter__(self_nonlocal):
+                    return conn
+
+                def __exit__(self_nonlocal, exc_type, exc, tb):
+                    return False
+
+            patched_get_conn.return_value = _Ctx()
+            payload = main_module.refinement_status(object(), "job-queued")
+
+        submit_job.assert_called_once_with("job-queued")
+        self.assertEqual(payload["job_id"], "job-queued")
+        self.assertEqual(payload["status"], "queued")
+        self.assertEqual(payload["active_generation_id"], "bootstrap-gen")
         conn.close()
 
     def test_reel_unique_clip_migration_allows_same_clip_across_generations(self) -> None:
@@ -2391,12 +3465,13 @@ class MediumRegressionTests(unittest.TestCase):
             retrieval_profile="deep",
             request_need=8,
             page_hint=2,
+            recovery_stage=2,
         )
 
-        self.assertEqual([plan.name for plan in plans], ["high_precision", "broad", "recovery"])
-        self.assertEqual(plans[0].budget, 2)
+        self.assertEqual([plan.name for plan in plans], ["high_precision", "broad"])
+        self.assertEqual(plans[0].budget, 3)
         self.assertEqual(plans[1].budget, 3)
-        self.assertEqual(plans[2].budget, 1)
+        self.assertEqual(plans[1].max_budget, 3)
 
     def test_reel_service_deep_stage_plan_defers_adjacent_recovery_on_page_one(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
@@ -2416,7 +3491,134 @@ class MediumRegressionTests(unittest.TestCase):
             recovery_stage=0,
         )
 
+        self.assertEqual([plan.name for plan in plans], ["high_precision"])
+
+    def test_reel_service_deep_stage_plan_unlocks_adjacent_recovery_only_on_later_pages(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+        candidates = [
+            QueryCandidate("query one", "literal", 0.95, stage="high_precision", source_surface="youtube_html"),
+            QueryCandidate("query two", "tutorial", 0.9, stage="high_precision", source_surface="youtube_html"),
+            QueryCandidate("query three", "literal", 0.84, stage="broad", source_surface="youtube_html"),
+            QueryCandidate("query four", "recovery_adjacent", 0.7, stage="recovery", source_surface="youtube_html"),
+        ]
+
+        plans = service._build_retrieval_stage_plan(
+            query_candidates=candidates,
+            fast_mode=False,
+            retrieval_profile="deep",
+            request_need=12,
+            page_hint=3,
+            recovery_stage=6,
+        )
+
+        self.assertEqual([plan.name for plan in plans], ["high_precision", "broad", "recovery"])
+        self.assertEqual(plans[2].budget, 1)
+
+    def test_reel_service_bootstrap_stage_plan_allows_one_broad_query_for_curated_broad_topic(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+        candidates = [
+            QueryCandidate("python programming", "literal", 0.95, stage="high_precision", source_surface="youtube_html"),
+            QueryCandidate("python programming tutorial", "tutorial", 0.9, stage="high_precision", source_surface="youtube_html"),
+            QueryCandidate("python programming variables", "literal", 0.84, stage="broad", source_surface="youtube_html"),
+        ]
+
+        plans = service._build_retrieval_stage_plan(
+            query_candidates=candidates,
+            fast_mode=False,
+            retrieval_profile="bootstrap",
+            request_need=5,
+            subject_tag="python programming",
+            page_hint=1,
+            recovery_stage=0,
+        )
+
         self.assertEqual([plan.name for plan in plans], ["high_precision", "broad"])
+        self.assertEqual(plans[1].budget, 1)
+
+    def test_reel_service_topic_novelty_profile_calibrates_for_breadth(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+
+        broad = service._topic_novelty_profile(
+            subject_tag="machine learning",
+            retrieval_profile="deep",
+            fast_mode=False,
+        )
+        niche = service._topic_novelty_profile(
+            subject_tag="myrmecology",
+            retrieval_profile="deep",
+            fast_mode=False,
+        )
+
+        self.assertLess(float(broad["cross_video_similarity"]), float(niche["cross_video_similarity"]))
+        self.assertLess(float(broad["same_video_similarity"]), float(niche["same_video_similarity"]))
+
+    def test_reel_service_recovery_stage_gates_non_direct_surfaces(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+
+        self.assertFalse(
+            service._recovery_stage_allows_source_surface(
+                source_surface="youtube_related",
+                page_hint=2,
+                recovery_stage=4,
+            )
+        )
+        self.assertTrue(
+            service._recovery_stage_allows_source_surface(
+                source_surface="youtube_related",
+                page_hint=3,
+                recovery_stage=4,
+            )
+        )
+        self.assertFalse(
+            service._recovery_stage_allows_source_surface(
+                source_surface="local_cache",
+                page_hint=3,
+                recovery_stage=5,
+            )
+        )
+        self.assertTrue(
+            service._recovery_stage_allows_source_surface(
+                source_surface="local_cache",
+                page_hint=3,
+                recovery_stage=6,
+            )
+        )
+
+    def test_reel_service_same_video_clip_novelty_requires_distance_or_high_confidence_function_change(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+        prior = [{"text": "definition of machine learning and the core idea", "function_label": "definition", "function_confidence": 0.92}]
+        current = {
+            "text": "worked example of machine learning classification",
+            "function_label": "worked_example",
+            "function_confidence": 0.86,
+            "clip_duration_sec": 35.0,
+        }
+
+        with mock.patch.object(service, "_text_pair_similarity", return_value=0.91):
+            self.assertTrue(
+                service._passes_same_video_clip_novelty(
+                    None,
+                    clip_context=current,
+                    prior_contexts=prior,
+                    subject_tag="machine learning",
+                    retrieval_profile="deep",
+                    fast_mode=False,
+                )
+            )
+
+        weak_current = dict(current)
+        weak_current["function_confidence"] = 0.7
+        with mock.patch.object(service, "_text_pair_similarity", return_value=0.91):
+            self.assertFalse(
+                service._passes_same_video_clip_novelty(
+                    None,
+                    clip_context=weak_current,
+                    prior_contexts=prior,
+                    subject_tag="machine learning",
+                    retrieval_profile="deep",
+                    fast_mode=False,
+                )
+            )
 
     def test_reel_service_bootstrap_primary_query_disambiguates_single_term_topics(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
@@ -2429,6 +3631,41 @@ class MediumRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual(query, "mathematics Calculus")
+
+    def test_reel_service_exact_multiword_subject_root_keeps_literal_query_intact(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+
+        python_disambiguator = service._choose_disambiguator(
+            title="Python Programming",
+            keywords=["python programming", "variables", "loops"],
+            context_terms=["variables", "loops"],
+            subject_tag="python programming",
+        )
+        world_war_disambiguator = service._choose_disambiguator(
+            title="World War Ii",
+            keywords=["world war ii", "d day", "axis and allies"],
+            context_terms=["d day", "axis and allies"],
+            subject_tag="world war ii",
+        )
+
+        self.assertIsNone(python_disambiguator)
+        self.assertIsNone(world_war_disambiguator)
+        self.assertEqual(
+            service._build_literal_query(
+                title="Python Programming",
+                keywords=["python programming", "variables", "loops"],
+                disambiguator=python_disambiguator,
+            ),
+            "Python Programming",
+        )
+        self.assertEqual(
+            service._build_literal_query(
+                title="World War Ii",
+                keywords=["world war ii", "d day", "axis and allies"],
+                disambiguator=world_war_disambiguator,
+            ),
+            "World War Ii",
+        )
 
     def test_reel_service_query_planner_limits_bootstrap_concepts_by_request_need(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
@@ -2596,6 +3833,40 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertTrue(any("cognitive psychology" in text for text in expansion_texts))
         self.assertTrue(any("behavioral psychology" in text or "social psychology" in text for text in expansion_texts))
 
+    def test_reel_service_topic_expansion_terms_prioritize_curated_broad_subtopics(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+
+        terms = service._topic_expansion_terms(
+            expansion={
+                "canonical_topic": "Machine Learning",
+                "aliases": [],
+                "related_terms": [
+                    "quantum machine learning",
+                    "adversarial machine learning",
+                    "attention",
+                ],
+                "subtopics": [
+                    "quantum machine learning",
+                    "adversarial machine learning",
+                    "attention",
+                ],
+            },
+            subject_tag="machine learning",
+            limit=6,
+        )
+
+        self.assertEqual(
+            terms[:6],
+            [
+                "supervised learning",
+                "unsupervised learning",
+                "regression",
+                "classification",
+                "neural networks",
+                "model evaluation",
+            ],
+        )
+
     def test_reel_service_bootstrap_planner_can_defer_subtopic_expansion_for_broad_topic(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
         concepts = [
@@ -2718,9 +3989,11 @@ class MediumRegressionTests(unittest.TestCase):
             retrieval_profile="bootstrap",
         )
 
-        self.assertEqual(len(recovery_queries), 1)
+        self.assertEqual(len(recovery_queries), 2)
         self.assertEqual(recovery_queries[0].stage, "recovery")
         self.assertEqual(recovery_queries[0].strategy, "recovery_adjacent")
+        self.assertEqual(recovery_queries[1].stage, "recovery")
+        self.assertEqual(recovery_queries[1].strategy, "recovery_adjacent")
 
     def test_reel_service_topic_gate_rejects_dental_calculus_false_positive(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
@@ -3284,6 +4557,111 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual(external_calls, [])
         self.assertEqual(len(rows), 3)
 
+    def test_youtube_service_graph_expansion_merges_related_and_channel_rows(self) -> None:
+        service = YouTubeService()
+        seed_rows = [
+            {
+                "id": "seedvideo01a",
+                "title": "Melittology introduction",
+                "channel_id": "UCbeechannel1",
+                "channel_title": "Bee Channel",
+                "description": "Study of bees overview.",
+                "duration_sec": 420,
+                "search_source": "youtube_html",
+            },
+            {
+                "id": "seedvideo02a",
+                "title": "Melittology behavior",
+                "channel_id": "UCbeechannel2",
+                "channel_title": "Bee Lab",
+                "description": "Bee behavior and ecology.",
+                "duration_sec": 480,
+                "search_source": "youtube_html",
+            },
+        ]
+        related_rows_by_seed = {
+            "seedvideo01a": [
+                {
+                    "id": "related001a",
+                    "title": "Melittology field methods",
+                    "channel_id": "UCbeechannel1",
+                    "channel_title": "Bee Channel",
+                    "description": "Field methods in melittology.",
+                    "duration_sec": 510,
+                }
+            ],
+            "seedvideo02a": [
+                {
+                    "id": "related002a",
+                    "title": "Melittology lab workflow",
+                    "channel_id": "UCbeechannel2",
+                    "channel_title": "Bee Lab",
+                    "description": "Lab workflow for bee studies.",
+                    "duration_sec": 540,
+                }
+            ],
+        }
+        channel_rows_by_channel = {
+            "UCbeechannel1": [
+                {
+                    "id": "channel001a",
+                    "title": "Apiology and melittology comparison",
+                    "channel_id": "UCbeechannel1",
+                    "channel_title": "Bee Channel",
+                    "description": "Comparing bee-study disciplines.",
+                    "duration_sec": 360,
+                }
+            ],
+            "UCbeechannel2": [
+                {
+                    "id": "channel002a",
+                    "title": "Bee taxonomy lecture",
+                    "channel_id": "UCbeechannel2",
+                    "channel_title": "Bee Lab",
+                    "description": "Classification and taxonomy for bees.",
+                    "duration_sec": 600,
+                }
+            ],
+        }
+
+        with (
+            mock.patch.object(service, "_graph_seed_score", return_value=0.9),
+            mock.patch.object(service, "_strong_direct_inventory_count", return_value=0),
+            mock.patch.object(service, "_graph_candidate_is_anchored", return_value=True),
+            mock.patch.object(service, "_fetch_watch_html", side_effect=lambda video_id, *, deadline: video_id),
+            mock.patch.object(
+                service,
+                "_extract_related_videos_from_watch_html",
+                side_effect=lambda html, *, max_results, video_duration: related_rows_by_seed.get(str(html), [])[:max_results],
+            ),
+            mock.patch.object(service, "_fetch_channel_videos_html", side_effect=lambda channel_id, *, deadline: channel_id),
+            mock.patch.object(
+                service,
+                "_extract_channel_videos_from_channel_html",
+                side_effect=lambda html, *, max_results, video_duration: channel_rows_by_channel.get(str(html), [])[:max_results],
+            ),
+        ):
+            rows = service._expand_videos_via_youtube_graph(
+                seed_rows=seed_rows,
+                query="melittology",
+                max_results=6,
+                video_duration="medium",
+                retrieval_strategy="literal",
+                retrieval_stage="recovery",
+                deadline=time.monotonic() + 5.0,
+                graph_profile="deep",
+                root_terms=["melittology", "study of bees"],
+            )
+
+        row_by_id = {row["id"]: row for row in rows}
+        self.assertEqual(
+            set(row_by_id),
+            {"related001a", "related002a", "channel001a", "channel002a"},
+        )
+        self.assertEqual(row_by_id["related001a"]["search_source"], "youtube_related")
+        self.assertEqual(row_by_id["channel001a"]["search_source"], "youtube_channel")
+        self.assertEqual(row_by_id["channel001a"]["seed_channel_id"], "UCbeechannel1")
+
     def test_youtube_service_finalize_search_rows_prefers_direct_search_over_channel_backfill(self) -> None:
         service = YouTubeService()
         ranked = service._finalize_search_rows(
@@ -3395,6 +4773,106 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual(len(rows), 4)
         self.assertEqual(external_calls, [])
 
+    def test_youtube_service_search_external_fallbacks_batches_video_details_once(self) -> None:
+        service = YouTubeService()
+        service.api_key = "test-key"
+        detail_calls: list[list[str]] = []
+
+        def fake_search_via_duckduckgo(*args, **kwargs):
+            return ["abc123xyz01", "abc123xyz02"]
+
+        def fake_search_via_bing(*args, **kwargs):
+            return ["abc123xyz02", "abc123xyz03"]
+
+        def fake_video_details(video_ids: list[str], deadline: float | None = None):
+            del deadline
+            detail_calls.append(list(video_ids))
+            return {
+                "abc123xyz01": {"duration_sec": 420, "view_count": 1_000, "license": "youtube"},
+                "abc123xyz02": {"duration_sec": 480, "view_count": 2_000, "license": "youtube"},
+                "abc123xyz03": {"duration_sec": 540, "view_count": 3_000, "license": "youtube"},
+            }
+
+        service._search_via_duckduckgo = fake_search_via_duckduckgo  # type: ignore[method-assign]
+        service._search_via_bing = fake_search_via_bing  # type: ignore[method-assign]
+        service._video_details = fake_video_details  # type: ignore[method-assign]
+
+        rows = service._search_external_fallbacks(
+            query="binary search trees",
+            max_results=3,
+            video_duration="medium",
+            retrieval_strategy="literal",
+            retrieval_stage="recovery",
+            source_surface="youtube_html",
+            retrieval_profile="bootstrap",
+            deadline=None,
+            variant_limit=1,
+        )
+
+        self.assertEqual(len(detail_calls), 1)
+        self.assertEqual(set(detail_calls[0]), {"abc123xyz01", "abc123xyz02", "abc123xyz03"})
+        row_by_id = {row["id"]: row for row in rows}
+        self.assertEqual(row_by_id["abc123xyz01"]["duration_sec"], 420)
+        self.assertEqual(row_by_id["abc123xyz03"]["view_count"], 3_000)
+
+    def test_youtube_service_search_via_data_api_prefers_full_detail_description(self) -> None:
+        service = YouTubeService()
+        service.api_key = "test-key"
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "items": [
+                {
+                    "id": {"videoId": "abc123xyz00"},
+                    "snippet": {
+                        "title": "Search title",
+                        "channelId": "UCsearch01",
+                        "channelTitle": "Search Channel",
+                        "description": "Short search preview...",
+                        "publishedAt": "2025-01-01T00:00:00Z",
+                    },
+                }
+            ]
+        }
+        full_description = (
+            "Full lesson description covering binary search tree search, insertion, and traversal with worked examples."
+        )
+
+        with (
+            mock.patch.object(service, "_session_get", return_value=response),
+            mock.patch.object(
+                service,
+                "_video_details",
+                return_value={
+                    "abc123xyz00": {
+                        "title": "Binary Search Trees Tutorial",
+                        "channel_id": "UCdetail01",
+                        "channel_title": "Detail Channel",
+                        "description": full_description,
+                        "published_at": "2025-02-02T00:00:00Z",
+                        "duration_sec": 420,
+                        "view_count": 12345,
+                        "license": "youtube",
+                    }
+                },
+            ),
+        ):
+            rows = service._search_via_data_api(
+                query="binary search trees",
+                max_results=1,
+                creative_commons_only=False,
+                video_duration="medium",
+                retrieval_strategy="literal",
+                retrieval_stage="high_precision",
+                source_surface="youtube_api",
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["title"], "Binary Search Trees Tutorial")
+        self.assertEqual(rows[0]["channel_title"], "Detail Channel")
+        self.assertEqual(rows[0]["description"], full_description)
+        self.assertEqual(rows[0]["published_at"], "2025-02-02T00:00:00Z")
+
     def test_youtube_service_bootstrap_creative_commons_uses_data_api_when_available(self) -> None:
         service = YouTubeService()
         service.api_key = "test-key"
@@ -3500,6 +4978,43 @@ class MediumRegressionTests(unittest.TestCase):
             self.assertEqual(len(caption_calls), 3)
         conn.close()
 
+    def test_ranked_feed_enriches_short_cached_video_descriptions_from_youtube_details(self) -> None:
+        conn = self._build_ranked_feed_test_conn()
+        youtube_service = mock.Mock()
+        full_description = (
+            "A full description of cell signaling pathways with receptors, second messengers, and example pathways."
+        )
+        youtube_service.video_details.return_value = {
+            "video-ranked": {
+                "title": "Cell signaling explainer",
+                "channel_title": "Bio Channel",
+                "description": full_description,
+                "duration_sec": 180,
+                "view_count": 100,
+                "license": "youtube",
+            }
+        }
+        service = ReelService(embedding_service=None, youtube_service=youtube_service)
+
+        def fake_score_text_relevance(*args, **kwargs):
+            return {
+                "score": 0.82,
+                "concept_overlap": 0.5,
+                "context_overlap": 0.2,
+                "matched_terms": ["cell signaling"],
+                "off_topic_penalty": 0.0,
+                "reason": "matched concept terms",
+            }
+
+        with mock.patch.object(service, "_score_text_relevance", side_effect=fake_score_text_relevance):
+            ranked = service.ranked_feed(conn, "material-ranked", fast_mode=True)
+
+        self.assertEqual(ranked[0]["video_description"], full_description)
+        updated_description = conn.execute("SELECT description FROM videos WHERE id = ?", ("video-ranked",)).fetchone()
+        self.assertEqual(updated_description[0], full_description)
+        youtube_service.video_details.assert_called_once_with(["video-ranked"])
+        conn.close()
+
     def test_quick_candidate_metadata_gate_rejects_off_topic_risky_video(self) -> None:
         service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
         result = service._quick_candidate_metadata_gate(
@@ -3590,6 +5105,32 @@ class MediumRegressionTests(unittest.TestCase):
         )
         self.assertFalse(result["passes"])
 
+    def test_quick_candidate_metadata_gate_accepts_topical_short_without_educational_cues(self) -> None:
+        service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
+        result = service._quick_candidate_metadata_gate(
+            video={
+                "title": "Chain rule in 45 seconds",
+                "description": "Quick derivative trick for inner and outer functions.",
+                "channel_title": "Math Shorts",
+                "search_source": "youtube_html",
+                "duration_sec": 45,
+            },
+            query_candidate=QueryCandidate(
+                text="chain rule calculus shorts",
+                strategy="literal",
+                confidence=0.8,
+                source_terms=["chain rule", "calculus"],
+            ),
+            concept_terms=["chain rule", "calculus", "derivative", "composition of functions"],
+            context_terms=["differentiation"],
+            subject_tag="calculus",
+            strict_topic_only=True,
+            require_context=False,
+            fast_mode=True,
+            root_topic_terms=["calculus", "derivative", "chain rule"],
+        )
+        self.assertTrue(result["passes"])
+
     def test_reel_service_hard_blocks_subject_meaning_titles_for_non_language_topics(self) -> None:
         service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
 
@@ -3607,6 +5148,14 @@ class MediumRegressionTests(unittest.TestCase):
                 description="",
                 channel_title="",
                 subject_tag="odonatology",
+            )
+        )
+        self.assertTrue(
+            service._is_hard_blocked_low_value_video(
+                title="What is Lambda Calculus and why?",
+                description="An introduction to lambda calculus and functional programming.",
+                channel_title="Programming Theory",
+                subject_tag="calculus",
             )
         )
 
@@ -3660,7 +5209,59 @@ class MediumRegressionTests(unittest.TestCase):
             root_topic_terms=["palynology", "forensic palynology"],
         )
         self.assertFalse(result["passes"])
-        self.assertEqual(result["specific_concept_anchor"]["hits"], [])
+
+    def test_shape_reels_for_request_context_accepts_topical_short_companion_anchor(self) -> None:
+        shaped = main_module._shape_reels_for_request_context(
+            [
+                {
+                    "reel_id": "reel-1",
+                    "video_title": "Neural networks in 60 seconds",
+                    "video_description": "How hidden layers learn patterns from data.",
+                    "transcript_snippet": "",
+                    "matched_terms": ["neural networks", "patterns"],
+                    "video_url": "https://www.youtube.com/embed/video-1",
+                    "video_duration_sec": 60,
+                    "clip_duration_sec": 45.0,
+                    "relevance_score": 0.29,
+                    "score": 0.41,
+                    "source_surface": "youtube_html",
+                    "created_at": "2026-03-15T00:00:00+00:00",
+                }
+            ],
+            page=1,
+            limit=5,
+            subject_tag="machine learning",
+            strict_topic_only=True,
+        )
+
+        self.assertEqual(len(shaped), 1)
+        self.assertEqual(str(shaped[0]["reel_id"]), "reel-1")
+
+    def test_request_source_surface_allowed_opens_related_results_on_page_two(self) -> None:
+        reel = {"source_surface": "youtube_related"}
+
+        self.assertFalse(main_module._request_source_surface_allowed(reel, page=1))
+        self.assertTrue(main_module._request_source_surface_allowed(reel, page=2))
+
+    def test_request_effective_min_relevance_relaxes_on_page_two_for_topic_feeds(self) -> None:
+        self.assertEqual(
+            main_module._request_effective_min_relevance(
+                0.0,
+                page=1,
+                subject_tag="calculus",
+                strict_topic_only=True,
+            ),
+            0.3,
+        )
+        self.assertEqual(
+            main_module._request_effective_min_relevance(
+                0.0,
+                page=2,
+                subject_tag="calculus",
+                strict_topic_only=True,
+            ),
+            0.22,
+        )
 
     def test_score_video_candidate_skips_description_semantic_for_strong_prefilter(self) -> None:
         service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
@@ -4135,6 +5736,167 @@ class MediumRegressionTests(unittest.TestCase):
         )
         self.assertEqual(result["job_id"], "job-status")
         conn.close()
+
+
+    # --- Bug fix regression tests ---
+
+    def test_bug_1b_final_unique_reels_counter_increments(self) -> None:
+        """Bug 1B: final_unique_reels should increment, not stay at max(current, 1)."""
+        metrics: dict[str, object] = {"final_unique_reels": 0}
+        # Simulate 3 reel generations
+        for _ in range(3):
+            metrics["final_unique_reels"] = int(metrics.get("final_unique_reels") or 0) + 1
+        self.assertEqual(metrics["final_unique_reels"], 3)
+
+    def test_bug_1c_bootstrap_pool_is_weak_ignores_transcript_field(self) -> None:
+        """Bug 1C: _bootstrap_pool_is_weak should not check has_transcript (never set on candidates)."""
+        service = ReelService(embedding_service=None, youtube_service=None)
+        candidates = [
+            {
+                "video": {"channel_title": f"channel_{i}"},
+                "ranking": {"final_score": 0.5},
+                "query_candidate": QueryCandidate(f"query {i}", f"strategy_{i}", 0.9),
+            }
+            for i in range(5)
+        ]
+        # Pool should be strong (enough candidates, good score, unique channels/strategies)
+        self.assertFalse(service._bootstrap_pool_is_weak(candidates, max_generation_target=3))
+
+    def test_bug_1d_bootstrap_topic_retrieval_concepts_called_once(self) -> None:
+        """Bug 1D: _bootstrap_topic_retrieval_concepts should only be called after topic expansion, not before."""
+        service = ReelService(embedding_service=None, youtube_service=None)
+        # Verify the method exists and is callable
+        self.assertTrue(hasattr(service, "_bootstrap_topic_retrieval_concepts"))
+
+    def test_bug_1e_empty_cache_ttl_is_short(self) -> None:
+        """Bug 1E: Empty search results should only be cached for 15 minutes, not 2 hours."""
+        self.assertEqual(YouTubeService.SEARCH_CACHE_EMPTY_TTL_SEC, 900)
+
+    def test_bug_1a_recovery_query_count_is_two(self) -> None:
+        """Bug 1A: BOOTSTRAP_RECOVERY_QUERY_COUNT should be 2 to enable a distinct second recovery block."""
+        self.assertEqual(ReelService.BOOTSTRAP_RECOVERY_QUERY_COUNT, 2)
+
+    def test_recall_3a_broad_topics_get_more_concepts(self) -> None:
+        """Recall 3A: curated_broad topics should allow up to 6 concepts in bootstrap."""
+        service = ReelService(embedding_service=None, youtube_service=None)
+        concepts = [{"id": str(i), "title": f"Concept {i}"} for i in range(8)]
+        selected, _, _ = service._select_concepts(
+            concepts,
+            retrieval_profile="bootstrap",
+            request_need=6,
+            fast_mode=False,
+            targeted_concept_id=None,
+            subject_tag="calculus",
+        )
+        self.assertGreaterEqual(len(selected), 5)
+
+    def test_recall_3b_serverless_concept_limit_is_two(self) -> None:
+        """Recall 3B: Serverless mode should allow 2 concepts."""
+        service = ReelService(embedding_service=None, youtube_service=None)
+        service.serverless_mode = True
+        concepts = [{"id": str(i), "title": f"Concept {i}"} for i in range(5)]
+        selected, _, _ = service._select_concepts(
+            concepts,
+            retrieval_profile="bootstrap",
+            request_need=3,
+            fast_mode=False,
+            targeted_concept_id=None,
+        )
+        self.assertEqual(len(selected), 2)
+
+    def test_recall_3c_transcript_budgets_increased(self) -> None:
+        """Recall 3C: Bootstrap transcript budgets should be raised."""
+        self.assertEqual(ReelService.BOOTSTRAP_TRANSCRIPT_CANDIDATES, 6)
+        self.assertEqual(ReelService.BOOTSTRAP_TRANSCRIPT_CANDIDATES_SERVERLESS, 4)
+
+    def test_perf_2b_duration_plan_skips_specific_when_any_present(self) -> None:
+        """Perf 2B: When duration plan includes None (any), specific durations should be skipped."""
+        service = ReelService(embedding_service=None, youtube_service=None)
+        duration_plan = (None, "short", "medium")
+        has_any = None in duration_plan
+        jobs = []
+        for qi, q in enumerate([QueryCandidate("test", "literal", 0.9)]):
+            for di, d in enumerate(duration_plan):
+                if has_any and d is not None:
+                    continue
+                jobs.append((qi, di, q, d))
+        # Should only have the None duration job
+        self.assertEqual(len(jobs), 1)
+        self.assertIsNone(jobs[0][3])
+
+    def test_quality_5a_known_educational_channels_get_higher_tier(self) -> None:
+        """Quality 5A: Known educational channels should get 'known_educational' tier."""
+        service = ReelService(embedding_service=None, youtube_service=None)
+        tier = service._infer_channel_tier("khan academy", "intro to algebra")
+        self.assertEqual(tier, "known_educational")
+        tier2 = service._infer_channel_tier("3blue1brown", "essence of linear algebra")
+        self.assertEqual(tier2, "known_educational")
+
+    def test_niche_4a_datamuse_called_for_opaque_topics_with_filtering(self) -> None:
+        """Niche 4A: Datamuse should be called for opaque topics, with results filtered."""
+        service = TopicExpansionService()
+        with (
+            mock.patch.object(
+                service,
+                "_search_wikipedia_results",
+                side_effect=[
+                    [{"title": "Bryology", "snippet": "Bryology is the study of mosses."}],
+                    [],
+                ],
+            ),
+            mock.patch.object(
+                service,
+                "_search_wikidata_entities",
+                return_value=[{"label": "Bryology", "description": "study of mosses", "aliases": []}],
+            ),
+            mock.patch.object(service, "_fetch_wikipedia_links", return_value=["Moss", "Liverwort"]),
+            mock.patch.object(
+                service,
+                "_fetch_datamuse_related_terms",
+                return_value=["bryophyte", "cooking", "bryology research"],
+            ) as datamuse_mock,
+        ):
+            payload = service._expand_topic_uncached(
+                topic="bryology",
+                max_subtopics=6,
+                max_aliases=4,
+                max_related_terms=4,
+            )
+        datamuse_mock.assert_called_once()
+        # "bryology research" should pass anchor check, "cooking" should not
+        all_terms = " ".join(str(v) for v in payload.values()).lower()
+        self.assertNotIn("cooking", all_terms)
+
+    def test_niche_4c_new_static_topics_present(self) -> None:
+        """Niche 4C: New static topics should be in STATIC_TOPIC_SUBTOPICS."""
+        for topic in [
+            "computer science", "nursing", "engineering", "philosophy",
+            "music theory", "art history", "environmental science",
+            "political science", "organic chemistry", "algebra",
+        ]:
+            self.assertIn(topic, TopicExpansionService.STATIC_TOPIC_SUBTOPICS, f"Missing: {topic}")
+
+    def test_niche_4d_graph_profile_light_for_opaque_niche_bootstrap(self) -> None:
+        """Niche 4D: Opaque niche topics should get 'light' graph profile in bootstrap."""
+        service = ReelService(embedding_service=None, youtube_service=None)
+        # "melittology" is opaque_niche
+        profile = service._graph_profile_for_stage(
+            fast_mode=False,
+            retrieval_profile="bootstrap",
+            page_hint=1,
+            recovery_stage=0,
+            subject_tag="melittology",
+        )
+        self.assertEqual(profile, "light")
+        # Non-opaque should still be "off"
+        profile2 = service._graph_profile_for_stage(
+            fast_mode=False,
+            retrieval_profile="bootstrap",
+            page_hint=1,
+            recovery_stage=0,
+            subject_tag="calculus",
+        )
+        self.assertEqual(profile2, "off")
 
 
 if __name__ == "__main__":

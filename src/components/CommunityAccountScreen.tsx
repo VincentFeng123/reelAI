@@ -5,6 +5,7 @@ import { type FormEvent, useCallback, useEffect, useRef, useState } from "react"
 import {
   changeCommunityVerificationEmail,
   changeCommunityPassword,
+  deleteCommunityAccount,
   loginCommunityAccount,
   logoutCommunityAccount,
   registerCommunityAccount,
@@ -15,11 +16,11 @@ import type { CommunityAccount } from "@/lib/types";
 
 type CommunityAccountScreenProps = {
   account: CommunityAccount | null;
-  view: "default" | "change-password";
+  view: "default" | "change-password" | "delete-account";
   onBack: () => void;
   onAccountChange: (account: CommunityAccount | null) => void;
   onOpenChangePassword: () => void;
-  onOpenYourSets: () => void;
+  onOpenDeleteAccount: () => void;
 };
 
 const AUTH_MODE_FADE_MS = 160;
@@ -30,10 +31,10 @@ export function CommunityAccountScreen({
   onBack,
   onAccountChange,
   onOpenChangePassword,
-  onOpenYourSets,
+  onOpenDeleteAccount,
 }: CommunityAccountScreenProps) {
   const [authMode, setAuthMode] = useState<"register" | "login">("login");
-  const [displayView, setDisplayView] = useState<"default" | "change-password">(view);
+  const [displayView, setDisplayView] = useState<"default" | "change-password" | "delete-account">(view);
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -56,11 +57,14 @@ export function CommunityAccountScreen({
   const [changePasswordBusy, setChangePasswordBusy] = useState(false);
   const [changePasswordError, setChangePasswordError] = useState<string | null>(null);
   const [changePasswordSuccess, setChangePasswordSuccess] = useState<string | null>(null);
+  const [deleteAccountPassword, setDeleteAccountPassword] = useState("");
+  const [deleteAccountBusy, setDeleteAccountBusy] = useState(false);
+  const [deleteAccountError, setDeleteAccountError] = useState<string | null>(null);
   const authSubmitInFlightRef = useRef(false);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy && !verificationBusy && !resendBusy && !changeEmailBusy) {
+      if (event.key === "Escape" && !busy && !verificationBusy && !resendBusy && !changeEmailBusy && !deleteAccountBusy) {
         onBack();
       }
     };
@@ -68,7 +72,7 @@ export function CommunityAccountScreen({
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [busy, changeEmailBusy, onBack, resendBusy, verificationBusy]);
+  }, [busy, changeEmailBusy, deleteAccountBusy, onBack, resendBusy, verificationBusy]);
 
   useEffect(() => {
     setPassword("");
@@ -82,6 +86,8 @@ export function CommunityAccountScreen({
     setNewPassword("");
     setChangePasswordError(null);
     setChangePasswordSuccess(null);
+    setDeleteAccountPassword("");
+    setDeleteAccountError(null);
     if (account) {
       setEmail(account.email ?? "");
       if (account.isVerified) {
@@ -171,7 +177,7 @@ export function CommunityAccountScreen({
   };
 
   const onSignOut = async () => {
-    if (busy || verificationBusy || resendBusy || changeEmailBusy || changePasswordBusy) {
+    if (busy || verificationBusy || resendBusy || changeEmailBusy || changePasswordBusy || deleteAccountBusy) {
       return;
     }
     setBusy(true);
@@ -180,6 +186,8 @@ export function CommunityAccountScreen({
     setVerificationCodeDebug(null);
     setShowChangeEmail(false);
     setChangeEmailPassword("");
+    setDeleteAccountPassword("");
+    setDeleteAccountError(null);
     try {
       await logoutCommunityAccount();
       onAccountChange(null);
@@ -216,6 +224,29 @@ export function CommunityAccountScreen({
       setChangePasswordSuccess(null);
     } finally {
       setChangePasswordBusy(false);
+    }
+  };
+
+  const onDeleteAccount = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (deleteAccountBusy) {
+      return;
+    }
+    if (!deleteAccountPassword) {
+      setDeleteAccountError("Enter your current password to delete this account.");
+      return;
+    }
+    setDeleteAccountBusy(true);
+    setDeleteAccountError(null);
+    setError(null);
+    setSuccess(null);
+    try {
+      await deleteCommunityAccount({ currentPassword: deleteAccountPassword });
+      onAccountChange(null);
+    } catch (submitError) {
+      setDeleteAccountError(submitError instanceof Error ? submitError.message : "Could not delete this account.");
+    } finally {
+      setDeleteAccountBusy(false);
     }
   };
 
@@ -341,7 +372,7 @@ export function CommunityAccountScreen({
     }, AUTH_MODE_FADE_MS);
   }, [authMode, authModeTransitioning]);
 
-  const backLabel = displayView === "change-password" ? "Back to Account Manager" : "Back to ReelAI";
+  const backLabel = displayView === "default" ? "Back to ReelAI" : "Back to Account Manager";
 
   return (
     <main className="fixed inset-0 h-[100dvh] w-screen overflow-hidden bg-black text-black">
@@ -431,6 +462,47 @@ export function CommunityAccountScreen({
                         </button>
                       </form>
                     </div>
+                  ) : displayView === "delete-account" ? (
+                    <div
+                      className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
+                        authContentVisible ? "opacity-100" : "pointer-events-none opacity-0"
+                      }`}
+                    >
+                      <h1 className="text-[2.3rem] font-semibold leading-[1.05] tracking-[-0.04em] text-white sm:text-[2.7rem]">
+                        Delete Account
+                      </h1>
+                      <p className="mt-4 text-sm leading-6 text-white">
+                        Permanently delete this account, its signed-in sessions, saved history, settings, and your sets.
+                      </p>
+
+                      <div className="mt-7 rounded-[24px] bg-black/22 px-5 py-5 shadow-[0_16px_40px_rgba(16,16,16,0.16)] backdrop-blur-[16px]">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white">Active Session</p>
+                        <p className="mt-3 text-2xl font-semibold tracking-[-0.03em] text-white">@{account.username}</p>
+                        {account.email ? <p className="mt-2 text-sm text-white">{account.email}</p> : null}
+                      </div>
+
+                      <form onSubmit={onDeleteAccount} className="mt-6 flex flex-col gap-3">
+                        <p className="text-sm leading-6 text-[#ffb4b4]">
+                          This action cannot be undone.
+                        </p>
+                        <input
+                          type="password"
+                          value={deleteAccountPassword}
+                          onChange={(event) => setDeleteAccountPassword(event.target.value)}
+                          autoComplete="current-password"
+                          placeholder="Current password"
+                          className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                        />
+                        {deleteAccountError ? <p className="text-sm text-[#ffb4b4]">{deleteAccountError}</p> : null}
+                        <button
+                          type="submit"
+                          disabled={deleteAccountBusy}
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#8f232a] px-5 text-sm font-semibold text-white transition hover:bg-[#a12831] disabled:cursor-not-allowed disabled:bg-[#8f232a]/45 disabled:text-white/35"
+                        >
+                          {deleteAccountBusy ? "Deleting..." : "Delete Account"}
+                        </button>
+                      </form>
+                    </div>
                   ) : account.isVerified ? (
                     <div
                       className={`flex flex-1 flex-col justify-center pb-6 transition-opacity duration-150 lg:pb-0 ${
@@ -456,25 +528,27 @@ export function CommunityAccountScreen({
                       <div className="mt-7 flex flex-col gap-3">
                         <button
                           type="button"
-                          onClick={onOpenYourSets}
-                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a]"
-                        >
-                          Open Your Sets
-                        </button>
-                        <button
-                          type="button"
                           onClick={onOpenChangePassword}
-                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a]"
+                          disabled={busy || deleteAccountBusy}
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                         >
                           Change Password
                         </button>
                         <button
                           type="button"
                           onClick={onSignOut}
-                          disabled={busy || changePasswordBusy}
+                          disabled={busy || deleteAccountBusy}
                           className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
                         >
                           {busy ? "Signing out..." : "Sign Out"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={onOpenDeleteAccount}
+                          disabled={busy || deleteAccountBusy}
+                          className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#622329] px-5 text-sm font-semibold text-white transition hover:bg-[#7a2b33] disabled:cursor-not-allowed disabled:bg-[#622329]/45 disabled:text-white/35"
+                        >
+                          Delete Account
                         </button>
                       </div>
                     </div>

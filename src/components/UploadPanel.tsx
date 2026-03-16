@@ -4,6 +4,8 @@ import { type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useRef
 import { useRouter } from "next/navigation";
 
 import { uploadMaterial } from "@/lib/api";
+import { safeStorageSetItem } from "@/lib/browserStorage";
+import { buildSearchFeedQuery } from "@/lib/feedQuery";
 import { type GenerationMode, type SearchInputMode, readStudyReelsSettings, subscribeToStudyReelsSettings } from "@/lib/settings";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
@@ -115,6 +117,7 @@ type UploadPanelProps = {
     title: string;
     topic?: string;
     generationMode: GenerationMode;
+    feedQuery: string;
   }) => void | Promise<void>;
   onScrollOffsetChange?: (isOffset: boolean) => void;
   onScrollGesture?: () => void;
@@ -179,6 +182,8 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
     setLoading(true);
 
     try {
+      const activeSettings = readStudyReelsSettings();
+      const generationModeForSearch = activeSettings.generationMode;
       const topicList = inputMode === "topic" ? topics.map((t) => t.trim()).filter(Boolean) : [];
       const topicValue = topicList.join(", ");
       const textValue = inputMode === "source" ? text.trim() : "";
@@ -239,7 +244,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         const ordered = Object.entries(seeds)
           .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
           .slice(0, MAX_MATERIAL_SEEDS);
-        window.localStorage.setItem(MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
+        safeStorageSetItem(window.localStorage, MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
 
         const groups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
         if (inputMode === "topic" && topicList.length > 1) {
@@ -254,28 +259,36 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         const orderedGroups = Object.entries(groups)
           .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
           .slice(0, MAX_MATERIAL_GROUPS);
-        window.localStorage.setItem(MATERIAL_GROUPS_STORAGE_KEY, JSON.stringify(Object.fromEntries(orderedGroups)));
+        safeStorageSetItem(window.localStorage, MATERIAL_GROUPS_STORAGE_KEY, JSON.stringify(Object.fromEntries(orderedGroups)));
       }
       if (onMaterialCreated) {
+        const feedQuery = buildSearchFeedQuery({
+          materialId: primaryMaterialId,
+          generationMode: generationModeForSearch,
+          returnTab: "search",
+          settings: activeSettings,
+        });
         await onMaterialCreated({
           materialId: primaryMaterialId,
           title,
           topic: topicValue || undefined,
-          generationMode,
+          generationMode: generationModeForSearch,
+          feedQuery,
         });
       }
-      const nextParams = new URLSearchParams({
-        material_id: primaryMaterialId,
-        generation_mode: generationMode,
-        return_tab: "search",
+      const nextQuery = buildSearchFeedQuery({
+        materialId: primaryMaterialId,
+        generationMode: generationModeForSearch,
+        returnTab: "search",
+        settings: activeSettings,
       });
-      router.push(`/feed?${nextParams.toString()}`);
+      router.push(`/feed?${nextQuery}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something failed");
     } finally {
       setLoading(false);
     }
-  }, [file, generationMode, inputMode, onMaterialCreated, router, text, topics]);
+  }, [file, inputMode, onMaterialCreated, router, text, topics]);
 
   const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();

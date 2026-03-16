@@ -175,6 +175,7 @@ export function ReelCard({
   const clipDuration = Math.max(1, clipEnd - clipStart);
   const progressPercent = clipDuration > 0 ? clamp((currentSec / clipDuration) * 100, 0, 100) : 0;
   const reelProgressStyle = { width: `${progressPercent}%` } as CSSProperties;
+  const reelProgressDotStyle = { left: `${progressPercent}%` } as CSSProperties;
   const showCaptions = captionsEnabled;
   const captionCues = useMemo(
     () =>
@@ -954,13 +955,18 @@ export function ReelCard({
           </div>
 
           {isYouTubeVideo ? (
-            <div className="relative w-full">
+            <div className="group/progress relative w-full py-2">
               <div
                 aria-hidden="true"
-                className="pointer-events-none absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full bg-white/32"
+                className="pointer-events-none absolute inset-x-0 top-1/2 h-1.5 -translate-y-1/2 overflow-hidden rounded-full bg-[rgba(255,255,255,0.38)]"
               >
                 <div className="h-full rounded-full bg-white" style={reelProgressStyle} />
               </div>
+              <div
+                aria-hidden="true"
+                style={reelProgressDotStyle}
+                className="pointer-events-none absolute top-1/2 z-[1] h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow-[0_0_0_1px_rgba(0,0,0,0.28)] transition-transform duration-150 group-hover/progress:scale-150 group-focus-within/progress:scale-150"
+              />
               <input
                 data-reel-control="true"
                 type="range"
@@ -969,7 +975,7 @@ export function ReelCard({
                 step={0.1}
                 value={currentSec}
                 onChange={onSeek}
-                className="reel-range relative z-10 h-1.5 w-full cursor-pointer disabled:opacity-40"
+                className="reel-range relative z-10 h-5 w-full cursor-pointer disabled:opacity-40"
                 disabled={!controlsEnabled}
               />
             </div>

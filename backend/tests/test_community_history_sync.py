@@ -89,6 +89,9 @@ class CommunityHistorySyncTests(unittest.TestCase):
                         "starred": True,
                         "generation_mode": "fast",
                         "source": "search",
+                        "feed_query": "material_id=material-apush&generation_mode=fast&return_tab=search",
+                        "active_index": 4,
+                        "active_reel_id": "reel-apush-4",
                     },
                     {
                         "material_id": "material-spanish",
@@ -119,6 +122,9 @@ class CommunityHistorySyncTests(unittest.TestCase):
             [row["material_id"] for row in other_history_response.json()["items"]],
             ["material-apush", "material-spanish"],
         )
+        self.assertEqual(other_history_response.json()["items"][0]["feed_query"], "material_id=material-apush&generation_mode=fast&return_tab=search")
+        self.assertEqual(other_history_response.json()["items"][0]["active_index"], 4)
+        self.assertEqual(other_history_response.json()["items"][0]["active_reel_id"], "reel-apush-4")
 
         overwrite_response = self.other_client.put(
             "/api/community/history",

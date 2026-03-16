@@ -13,17 +13,25 @@ import {
   fetchFeed,
   fetchRefinementStatus,
   generateReelsStream,
+  isRequestInterruptedError,
   isSessionExpiredError,
   queueCommunityHistorySync,
   readCommunityAuthSession,
   sendFeedback,
   uploadMaterial,
 } from "@/lib/api";
-import { HISTORY_STORAGE_KEY, type StoredHistoryItem, writeScopedHistorySnapshot } from "@/lib/historyStorage";
+import { applySearchFeedSettingsToParams, mergeSearchFeedQuerySettings, readSearchFeedQuerySettings } from "@/lib/feedQuery";
+import {
+  HISTORY_STORAGE_KEY,
+  normalizeStoredHistoryItems as normalizeHistoryStorageItems,
+  type StoredHistoryItem,
+  writeScopedHistorySnapshot,
+} from "@/lib/historyStorage";
 import { useLoadingScreenGate } from "@/lib/useLoadingScreenGate";
 import {
   type GenerationMode,
   type PreferredVideoDuration,
+  type StudyReelsSettings,
   type VideoPoolMode,
   readStudyReelsSettings,
   setActiveStudyReelsSettingsScope,
@@ -51,11 +59,14 @@ const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const MAX_SAVED_FEED_PROGRESS = 240;
 const MAX_SAVED_FEED_SESSIONS = 24;
+const MAX_HISTORY_ITEMS = 120;
 const MAX_REELS_PER_FEED_SESSION = 80;
+const COMPACT_REELS_PER_FEED_SESSION = 48;
+const MINIMAL_REELS_PER_FEED_SESSION = 20;
 const MAX_EMPTY_GENERATION_STREAK = 10;
 const REFINEMENT_POLL_INTERVAL_MS = 3000;
-const MAX_GENERATION_TARGET_REELS = 60;
 const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
+const DESCRIPTION_PREVIEW_CHAR_LIMIT = 180;
 type FeedbackAction = "helpful" | "confusing" | "save";
 
 type FeedTuningSettings = {
@@ -120,32 +131,65 @@ type CommunityFeedHandoffPayload = {
   }>;
 };
 
-function normalizeStoredHistoryItems(raw: unknown): StoredHistoryItem[] {
-  if (!Array.isArray(raw)) {
-    return [];
+type FeedSearchScope = {
+  key: string;
+  seq: number;
+  controller: AbortController;
+};
+
+type ExpandableTextProps = {
+  text: string;
+  expanded: boolean;
+  onToggle: () => void;
+  className?: string;
+  previewChars?: number;
+  forceExpandable?: boolean;
+  loading?: boolean;
+};
+
+function buildExpandablePreview(text: string, previewChars: number): { preview: string; truncated: boolean } {
+  const normalized = text.trim();
+  if (normalized.length <= previewChars) {
+    return { preview: normalized, truncated: false };
   }
-  return raw
-    .map((item) => {
-      if (!item || typeof item !== "object" || Array.isArray(item)) {
-        return null;
-      }
-      const row = item as Record<string, unknown>;
-      const materialId = String(row.materialId || "").trim();
-      const title = String(row.title || "").trim();
-      if (!materialId || !title) {
-        return null;
-      }
-      return {
-        materialId,
-        title,
-        updatedAt: Math.max(0, Math.floor(Number(row.updatedAt) || 0)),
-        starred: Boolean(row.starred),
-        generationMode: row.generationMode === "slow" ? "slow" : "fast",
-        source: row.source === "community" ? "community" : "search",
-        feedQuery: typeof row.feedQuery === "string" && row.feedQuery.trim() ? row.feedQuery.trim() : undefined,
-      } satisfies StoredHistoryItem;
-    })
-    .filter(Boolean) as StoredHistoryItem[];
+  const sliced = normalized.slice(0, previewChars);
+  const lastBoundary = Math.max(sliced.lastIndexOf(" "), sliced.lastIndexOf("\n"));
+  const preview = (lastBoundary >= Math.floor(previewChars * 0.6) ? sliced.slice(0, lastBoundary) : sliced).trimEnd();
+  return { preview, truncated: true };
+}
+
+function ExpandableText({
+  text,
+  expanded,
+  onToggle,
+  className,
+  previewChars = DESCRIPTION_PREVIEW_CHAR_LIMIT,
+  forceExpandable = false,
+  loading = false,
+}: ExpandableTextProps) {
+  const { preview, truncated } = useMemo(() => buildExpandablePreview(text, previewChars), [previewChars, text]);
+  const canExpand = truncated || forceExpandable;
+  const displayedText = truncated && !expanded ? `${preview}...` : text;
+
+  return (
+    <p className={className}>
+      {displayedText}
+      {canExpand ? (
+        <>
+          {" "}
+          <button
+            type="button"
+            onClick={onToggle}
+            disabled={loading}
+            aria-busy={loading}
+            className="inline font-semibold text-white underline decoration-white/40 underline-offset-2 transition hover:text-white/82 hover:decoration-white/70 disabled:cursor-wait disabled:text-white/60 disabled:decoration-white/25"
+          >
+            {loading ? "Loading full text..." : expanded ? "View less" : "View more"}
+          </button>
+        </>
+      ) : null}
+    </p>
+  );
 }
 
 function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
@@ -334,6 +378,166 @@ function parseCommunityFeedHandoff(raw: string | null): CommunityFeedHandoffPayl
   }
 }
 
+function safeLocalStorageSetItem(key: string, value: string): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  try {
+    window.localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function trimStoredText(value: string | undefined, maxChars: number): string | undefined {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return undefined;
+  }
+  return normalized.length <= maxChars ? normalized : `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+}
+
+function compactStoredText(value: string | undefined, maxChars: number): { text?: string; truncated: boolean } {
+  const text = trimStoredText(value, maxChars);
+  return {
+    text,
+    truncated: Boolean(text) && text !== String(value || "").trim(),
+  };
+}
+
+function looksLikeCompactedStoredText(value: string | undefined, maxChars: number): boolean {
+  const normalized = String(value || "").trim();
+  if (!normalized || !normalized.endsWith("…")) {
+    return false;
+  }
+  return normalized.length >= Math.floor(maxChars * 0.95) && normalized.length <= maxChars;
+}
+
+function hasCompactedDescriptionText(reel: Reel): boolean {
+  const description = reel.video_description?.trim();
+  if (description) {
+    return Boolean(reel.video_description_truncated) || looksLikeCompactedStoredText(description, 220) || looksLikeCompactedStoredText(description, 360);
+  }
+  const snippet = reel.transcript_snippet?.trim();
+  if (snippet) {
+    return Boolean(reel.transcript_snippet_truncated) || looksLikeCompactedStoredText(snippet, 220) || looksLikeCompactedStoredText(snippet, 360);
+  }
+  return false;
+}
+
+function selectStoredSessionWindow(reels: Reel[], activeIndex: number, maxReels: number): { reels: Reel[]; activeIndex: number } {
+  if (reels.length <= maxReels) {
+    return { reels, activeIndex: clamp(activeIndex, 0, Math.max(0, reels.length - 1)) };
+  }
+  const clampedActiveIndex = clamp(activeIndex, 0, reels.length - 1);
+  const leadingCount = Math.floor(maxReels / 2);
+  const start = clamp(clampedActiveIndex - leadingCount, 0, reels.length - maxReels);
+  const nextReels = reels.slice(start, start + maxReels);
+  return {
+    reels: nextReels,
+    activeIndex: clamp(clampedActiveIndex - start, 0, Math.max(0, nextReels.length - 1)),
+  };
+}
+
+function compactStoredReel(reel: Reel, mode: "compact" | "minimal"): Reel {
+  const isMinimal = mode === "minimal";
+  const takeawayLimit = isMinimal ? 2 : 3;
+  const takeawayCharLimit = isMinimal ? 120 : 180;
+  const matchedTermLimit = isMinimal ? 4 : 6;
+  const videoDescription = compactStoredText(reel.video_description, isMinimal ? 220 : 360);
+  const aiSummary = compactStoredText(reel.ai_summary, isMinimal ? 220 : 360);
+  const transcriptSnippet = compactStoredText(reel.transcript_snippet, isMinimal ? 220 : 360);
+  return {
+    ...reel,
+    video_title: trimStoredText(reel.video_title, isMinimal ? 140 : 200),
+    video_description: videoDescription.text,
+    video_description_truncated: videoDescription.truncated || undefined,
+    ai_summary: aiSummary.text,
+    ai_summary_truncated: aiSummary.truncated || undefined,
+    transcript_snippet: transcriptSnippet.text || "",
+    transcript_snippet_truncated: transcriptSnippet.truncated || undefined,
+    takeaways: (reel.takeaways ?? []).map((item) => trimStoredText(item, takeawayCharLimit) || "").filter(Boolean).slice(0, takeawayLimit),
+    matched_terms: (reel.matched_terms ?? []).map((term) => trimStoredText(term, 48) || "").filter(Boolean).slice(0, matchedTermLimit),
+    captions: undefined,
+  };
+}
+
+function compactFeedSessionSnapshot(snapshot: FeedSessionSnapshot, mode: "compact" | "minimal"): FeedSessionSnapshot {
+  const { reels, activeIndex } = selectStoredSessionWindow(
+    snapshot.reels,
+    snapshot.activeIndex,
+    mode === "minimal" ? MINIMAL_REELS_PER_FEED_SESSION : COMPACT_REELS_PER_FEED_SESSION,
+  );
+  const compactedReels = reels.map((reel) => compactStoredReel(reel, mode));
+  const nextActiveIndex = compactedReels.length > 0 ? clamp(activeIndex, 0, compactedReels.length - 1) : 0;
+  return {
+    ...snapshot,
+    reels: compactedReels,
+    activeIndex: nextActiveIndex,
+    activeReelId: compactedReels[nextActiveIndex]?.reel_id,
+  };
+}
+
+function persistFeedProgressSnapshot(materialId: string, entry: FeedProgressEntry): void {
+  if (typeof window === "undefined" || !materialId) {
+    return;
+  }
+  try {
+    const allProgress = parseFeedProgress(window.localStorage.getItem(FEED_PROGRESS_STORAGE_KEY));
+    allProgress[materialId] = entry;
+    const ordered = Object.entries(allProgress)
+      .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+      .slice(0, MAX_SAVED_FEED_PROGRESS);
+    const attempts = [
+      ordered,
+      ordered.slice(0, Math.min(96, ordered.length)),
+      ordered.slice(0, Math.min(24, ordered.length)),
+      ordered.slice(0, 1),
+    ];
+    for (const candidate of attempts) {
+      if (safeLocalStorageSetItem(FEED_PROGRESS_STORAGE_KEY, JSON.stringify(Object.fromEntries(candidate)))) {
+        return;
+      }
+    }
+  } catch {
+    // Keep feed interaction usable even if browser storage is unavailable.
+  }
+}
+
+function persistFeedSessionSnapshot(materialId: string, snapshot: FeedSessionSnapshot): void {
+  if (typeof window === "undefined" || !materialId) {
+    return;
+  }
+  try {
+    const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));
+    allSessions[materialId] = snapshot;
+    const ordered = Object.entries(allSessions)
+      .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+      .slice(0, MAX_SAVED_FEED_SESSIONS);
+    // Retry with fewer and smaller snapshots so feed resume stays best-effort instead of crashing the page.
+    const attempts: Array<Array<[string, FeedSessionSnapshot]>> = [
+      ordered,
+      ordered.slice(0, Math.min(12, ordered.length)),
+      ordered
+        .slice(0, Math.min(8, ordered.length))
+        .map(([id, value]) => [id, id === materialId ? value : compactFeedSessionSnapshot(value, "compact")]),
+      ordered
+        .slice(0, Math.min(4, ordered.length))
+        .map(([id, value]) => [id, compactFeedSessionSnapshot(value, id === materialId ? "compact" : "minimal")]),
+      [[materialId, compactFeedSessionSnapshot(snapshot, "compact")]],
+      [[materialId, compactFeedSessionSnapshot(snapshot, "minimal")]],
+    ];
+    for (const candidate of attempts) {
+      if (safeLocalStorageSetItem(FEED_SESSION_STORAGE_KEY, JSON.stringify(Object.fromEntries(candidate)))) {
+        return;
+      }
+    }
+  } catch {
+    // Keep feed interaction usable even if browser storage is unavailable.
+  }
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -485,6 +689,10 @@ function FeedPageInner() {
   const communityHandoffIdParam = params.get("community_handoff_id") || "";
   const returnTabParam = params.get("return_tab") || "";
   const returnCommunitySetIdParam = params.get("return_community_set_id") || "";
+  const searchFeedSettingsOverride = useMemo(
+    () => readSearchFeedQuerySettings((key) => params.get(key)),
+    [params],
+  );
 
   const communityPreviewReel = useMemo(
     () =>
@@ -570,6 +778,54 @@ function FeedPageInner() {
   const settingsLoadSequenceRef = useRef(0);
   const pendingRefinementJobsRef = useRef<Map<string, string>>(new Map());
   const isRefreshingRefinementRef = useRef(false);
+  const pendingHistorySyncRef = useRef<StoredHistoryItem[] | null>(null);
+  const historySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const activeSearchScopeRef = useRef<FeedSearchScope>({
+    key: "",
+    seq: 0,
+    controller: new AbortController(),
+  });
+
+  const abortActiveSearchScope = useCallback(() => {
+    const scope = activeSearchScopeRef.current;
+    if (!scope.controller.signal.aborted) {
+      scope.controller.abort();
+    }
+  }, []);
+
+  const resetActiveSearchRequestState = useCallback(() => {
+    isFetchingRef.current = false;
+    isGeneratingRef.current = false;
+    isFastTopUpRef.current = false;
+    isRefreshingRefinementRef.current = false;
+    isRecoveringMissingMaterialRef.current = false;
+    resumeLoadingRef.current = false;
+    pendingRefinementJobsRef.current.clear();
+    setGeneratingMore(false);
+    setBootstrappingFirstReels(false);
+  }, []);
+
+  const isSearchScopeActive = useCallback((scope: Pick<FeedSearchScope, "key" | "seq">): boolean => {
+    const current = activeSearchScopeRef.current;
+    return current.key === scope.key && current.seq === scope.seq && !current.controller.signal.aborted;
+  }, []);
+
+  useEffect(() => {
+    abortActiveSearchScope();
+    const previous = activeSearchScopeRef.current;
+    activeSearchScopeRef.current = {
+      key: feedRouteKey,
+      seq: previous.seq + 1,
+      controller: new AbortController(),
+    };
+    resetActiveSearchRequestState();
+    return () => {
+      const current = activeSearchScopeRef.current;
+      if (current.key === feedRouteKey) {
+        current.controller.abort();
+      }
+    };
+  }, [abortActiveSearchScope, feedRouteKey, resetActiveSearchRequestState]);
 
   const normalizeClipKeyTime = useCallback((value: unknown): string => {
     const parsed = Number(value);
@@ -651,8 +907,13 @@ function FeedPageInner() {
     return materialId ? [materialId] : [];
   }, [materialId]);
 
+  const mergeFeedSettingsSnapshot = useCallback(
+    (settings: StudyReelsSettings): StudyReelsSettings => mergeSearchFeedQuerySettings(settings, searchFeedSettingsOverride),
+    [searchFeedSettingsOverride],
+  );
+
   const getFeedTuningSettings = useCallback((): FeedTuningSettings => {
-    const settings = readStudyReelsSettings();
+    const settings = mergeFeedSettingsSnapshot(readStudyReelsSettings());
     return {
       minRelevance: settings.minRelevanceThreshold,
       videoPoolMode: settings.videoPoolMode,
@@ -661,7 +922,7 @@ function FeedPageInner() {
       targetClipDurationMinSec: settings.targetClipDurationMinSec,
       targetClipDurationMaxSec: settings.targetClipDurationMaxSec,
     };
-  }, []);
+  }, [mergeFeedSettingsSnapshot]);
 
   const hasMore = reels.length < total;
   const isFastGeneration = generationMode === "fast";
@@ -702,11 +963,12 @@ function FeedPageInner() {
     setSettingsScopeReady(false);
 
     const applySettingsSnapshot = (settingsSnapshot: ReturnType<typeof readStudyReelsSettings>) => {
+      const mergedSettings = mergeFeedSettingsSnapshot(settingsSnapshot);
       if (!hasExplicitGenerationModeParam) {
-        setGenerationMode(settingsSnapshot.generationMode);
+        setGenerationMode(mergedSettings.generationMode);
       }
       if (!mutedRestoredFromSnapshotRef.current) {
-        setMutedPreference(settingsSnapshot.startMuted);
+        setMutedPreference(mergedSettings.startMuted);
       }
     };
 
@@ -749,56 +1011,128 @@ function FeedPageInner() {
     return () => {
       cancelled = true;
     };
-  }, [authAccountId, authScopeHydrated, hasExplicitGenerationModeParam]);
+  }, [authAccountId, authScopeHydrated, hasExplicitGenerationModeParam, mergeFeedSettingsSnapshot]);
 
-  useEffect(() => {
-    if (typeof window === "undefined") {
+  const clearHistorySyncTimer = useCallback(() => {
+    if (historySyncTimerRef.current) {
+      clearTimeout(historySyncTimerRef.current);
+      historySyncTimerRef.current = null;
+    }
+  }, []);
+
+  const flushPendingHistorySync = useCallback(() => {
+    clearHistorySyncTimer();
+    const pending = pendingHistorySyncRef.current;
+    pendingHistorySyncRef.current = null;
+    if (!pending || pending.length === 0) {
       return;
     }
+    void queueCommunityHistorySync(pending).catch(() => {
+      // Keep the local history state even if cross-device sync fails.
+    });
+  }, [clearHistorySyncTimer]);
+
+  const scheduleRemoteHistorySync = useCallback((items: StoredHistoryItem[]) => {
+    const accountId = authAccountId || readCommunityAuthSession()?.account?.id?.trim() || null;
+    if (!accountId) {
+      return;
+    }
+    pendingHistorySyncRef.current = items.map((item) => ({ ...item }));
+    clearHistorySyncTimer();
+    historySyncTimerRef.current = setTimeout(() => {
+      const snapshot = pendingHistorySyncRef.current;
+      pendingHistorySyncRef.current = null;
+      historySyncTimerRef.current = null;
+      if (!snapshot || snapshot.length === 0) {
+        return;
+      }
+      void queueCommunityHistorySync(snapshot).catch(() => {
+        // Keep the local history state even if cross-device sync fails.
+      });
+    }, 900);
+  }, [authAccountId, clearHistorySyncTimer]);
+
+  const buildPersistedSearchFeedQuery = useCallback(() => {
     if (!materialId) {
+      return "";
+    }
+    const nextParams = new URLSearchParams(params.toString());
+    nextParams.set("material_id", materialId);
+    nextParams.set("generation_mode", generationMode);
+    applySearchFeedSettingsToParams(nextParams, mergeFeedSettingsSnapshot(readStudyReelsSettings()));
+    return nextParams.toString();
+  }, [generationMode, materialId, mergeFeedSettingsSnapshot, params]);
+
+  const persistCurrentSearchHistoryEntry = useCallback((options?: {
+    syncRemote?: boolean;
+    touchUpdatedAt?: boolean;
+    reels?: Reel[];
+    activeIndex?: number;
+  }) => {
+    if (typeof window === "undefined" || !materialId) {
       return;
     }
     try {
       const rawHistory = window.localStorage.getItem(HISTORY_STORAGE_KEY);
-      if (!rawHistory) {
+      const historyItems = rawHistory ? normalizeHistoryStorageItems(JSON.parse(rawHistory)) : [];
+      const existing = historyItems.find((item) => item.materialId === materialId);
+      const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
+      const groups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
+      const currentReels = options?.reels ?? reelsRef.current;
+      const activeIndexValue = options?.activeIndex ?? activeIndexRef.current;
+      const currentIndex = currentReels.length > 0 ? clamp(activeIndexValue, 0, currentReels.length - 1) : undefined;
+      const currentReelId = currentIndex !== undefined ? currentReels[currentIndex]?.reel_id : undefined;
+      const nextEntry: StoredHistoryItem = {
+        materialId,
+        title: existing?.title || groups[materialId]?.title?.trim() || seeds[materialId]?.title?.trim() || "New Study Session",
+        updatedAt: options?.touchUpdatedAt === false ? existing?.updatedAt ?? Date.now() : Date.now(),
+        starred: existing?.starred ?? false,
+        generationMode,
+        source: existing?.source ?? "search",
+        feedQuery: buildPersistedSearchFeedQuery() || existing?.feedQuery,
+        activeIndex: currentIndex ?? existing?.activeIndex,
+        activeReelId: currentReelId || existing?.activeReelId,
+      };
+      const didChange =
+        !existing
+        || existing.title !== nextEntry.title
+        || existing.updatedAt !== nextEntry.updatedAt
+        || existing.starred !== nextEntry.starred
+        || existing.generationMode !== nextEntry.generationMode
+        || existing.source !== nextEntry.source
+        || existing.feedQuery !== nextEntry.feedQuery
+        || existing.activeIndex !== nextEntry.activeIndex
+        || existing.activeReelId !== nextEntry.activeReelId;
+      if (!didChange) {
         return;
       }
-      const parsed = JSON.parse(rawHistory);
-      if (!Array.isArray(parsed)) {
-        return;
-      }
-      let didChange = false;
-      const updated = parsed.map((item) => {
-        if (!item || typeof item !== "object") {
-          return item;
-        }
-        const row = item as Record<string, unknown>;
-        if (String(row.materialId || "") !== materialId) {
-          return item;
-        }
-        if (row.generationMode === generationMode) {
-          return item;
-        }
-        didChange = true;
-        return {
-          ...row,
-          generationMode,
-        };
-      });
-      if (didChange) {
-        const accountId = readCommunityAuthSession()?.account?.id ?? null;
-        const normalizedUpdated = normalizeStoredHistoryItems(updated);
-        writeScopedHistorySnapshot(accountId, JSON.stringify(normalizedUpdated));
-        if (accountId) {
-          void queueCommunityHistorySync(normalizedUpdated).catch(() => {
-            // Keep the local history state even if cross-device sync fails.
-          });
-        }
+      const nextHistory = existing
+        ? historyItems.map((item) => (item.materialId === materialId ? nextEntry : item))
+        : [nextEntry, ...historyItems].slice(0, MAX_HISTORY_ITEMS);
+      const accountId = authAccountId || readCommunityAuthSession()?.account?.id?.trim() || null;
+      writeScopedHistorySnapshot(accountId, JSON.stringify(nextHistory));
+      if (options?.syncRemote !== false) {
+        scheduleRemoteHistorySync(nextHistory);
       }
     } catch {
       // Ignore malformed history payloads and keep feed mode persistence functional.
     }
-  }, [generationMode, materialId]);
+  }, [authAccountId, buildPersistedSearchFeedQuery, generationMode, materialId, scheduleRemoteHistorySync]);
+
+  useEffect(() => {
+    persistCurrentSearchHistoryEntry();
+  }, [feedRouteKey, generationMode, materialId, persistCurrentSearchHistoryEntry]);
+
+  useEffect(() => {
+    if (!materialId || reels.length === 0) {
+      return;
+    }
+    persistCurrentSearchHistoryEntry({ syncRemote: false, touchUpdatedAt: false, reels, activeIndex });
+  }, [activeIndex, materialId, persistCurrentSearchHistoryEntry, reels, reels.length]);
+
+  useEffect(() => () => {
+    flushPendingHistorySync();
+  }, [flushPendingHistorySync]);
 
   const setGenerationModeWithUrlSync = useCallback(
     (nextMode: GenerationMode) => {
@@ -812,9 +1146,10 @@ function FeedPageInner() {
       const nextParams = new URLSearchParams(params.toString());
       nextParams.set("material_id", materialId);
       nextParams.set("generation_mode", nextMode);
+      applySearchFeedSettingsToParams(nextParams, mergeFeedSettingsSnapshot(readStudyReelsSettings()));
       router.replace(`/feed?${nextParams.toString()}`, { scroll: false });
     },
-    [generationMode, materialId, params, router],
+    [generationMode, materialId, mergeFeedSettingsSnapshot, params, router],
   );
 
   const recoverMissingMaterial = useCallback(
@@ -822,6 +1157,7 @@ function FeedPageInner() {
       if (typeof window === "undefined" || isRecoveringMissingMaterialRef.current) {
         return false;
       }
+      const searchScope = activeSearchScopeRef.current;
 
       const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
       const seed = seeds[missingMaterialId];
@@ -837,7 +1173,11 @@ function FeedPageInner() {
         const rebuilt = await uploadMaterial({
           subjectTag: topic || undefined,
           text: text || undefined,
+          signal: searchScope.controller.signal,
         });
+        if (!isSearchScopeActive(searchScope)) {
+          return false;
+        }
         const rebuiltId = rebuilt.material_id;
         seeds[rebuiltId] = {
           ...seed,
@@ -846,7 +1186,7 @@ function FeedPageInner() {
           updatedAt: Date.now(),
         };
         delete seeds[missingMaterialId];
-        window.localStorage.setItem(MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(seeds));
+        safeLocalStorageSetItem(MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(seeds));
         const groups = parseMaterialGroups(window.localStorage.getItem(MATERIAL_GROUPS_STORAGE_KEY));
         const nextGroups: Record<string, MaterialGroup> = {};
         for (const [groupId, group] of Object.entries(groups)) {
@@ -863,20 +1203,25 @@ function FeedPageInner() {
             updatedAt: Date.now(),
           };
         }
-        window.localStorage.setItem(MATERIAL_GROUPS_STORAGE_KEY, JSON.stringify(nextGroups));
+        safeLocalStorageSetItem(MATERIAL_GROUPS_STORAGE_KEY, JSON.stringify(nextGroups));
 
         const nextParams = new URLSearchParams(params.toString());
         nextParams.set("material_id", rebuiltId);
         router.replace(`/feed?${nextParams.toString()}`);
         return true;
       } catch (e) {
+        if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
+          return false;
+        }
         setError(e instanceof Error ? e.message : "Could not rebuild material.");
         return false;
       } finally {
-        isRecoveringMissingMaterialRef.current = false;
+        if (isSearchScopeActive(searchScope)) {
+          isRecoveringMissingMaterialRef.current = false;
+        }
       }
     },
-    [params, router],
+    [isSearchScopeActive, params, router],
   );
 
   const registerRefinementJob = useCallback(
@@ -955,6 +1300,7 @@ function FeedPageInner() {
       if (!settingsScopeReady || feedMaterialIds.length === 0 || isFetchingRef.current) {
         return;
       }
+      const searchScope = activeSearchScopeRef.current;
       isFetchingRef.current = true;
       setError(null);
 
@@ -976,6 +1322,7 @@ function FeedPageInner() {
                 targetClipDurationSec: tuning.targetClipDurationSec,
                 targetClipDurationMinSec: tuning.targetClipDurationMinSec,
                 targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+                signal: searchScope.controller.signal,
               });
               return { materialId: id, data, error: null };
             } catch (error) {
@@ -983,12 +1330,18 @@ function FeedPageInner() {
             }
           }),
         );
+        if (!isSearchScopeActive(searchScope)) {
+          return;
+        }
 
         const successful = rows.filter((row) => row.data);
         successful.forEach((row) => registerRefinementJob(row.materialId, row.data ?? undefined));
         if (successful.length === 0) {
           if (targetPage === 1) {
             const firstError = rows[0]?.error;
+            if (isRequestInterruptedError(firstError)) {
+              return;
+            }
             const message = firstError instanceof Error ? firstError.message : "Feed failed to load";
             const missingMaterialId = String(rows[0]?.materialId || materialId || "").trim();
             if (
@@ -1029,15 +1382,20 @@ function FeedPageInner() {
           console.warn("Some topic feeds failed to load:", failedIds);
         }
       } catch (e) {
+        if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
+          return;
+        }
         if (targetPage === 1) {
           setError(e instanceof Error ? e.message : "Feed failed to load");
         }
       } finally {
-        setLoading(false);
-        isFetchingRef.current = false;
+        if (isSearchScopeActive(searchScope)) {
+          setLoading(false);
+          isFetchingRef.current = false;
+        }
       }
     },
-    [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, materialId, recoverMissingMaterial, registerRefinementJob, settingsScopeReady],
+    [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isSearchScopeActive, materialId, recoverMissingMaterial, registerRefinementJob, settingsScopeReady],
   );
 
   const requestMore = useCallback(async (options?: { surfaceError?: boolean }): Promise<Reel[]> => {
@@ -1045,6 +1403,7 @@ function FeedPageInner() {
     if (!settingsScopeReady || feedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
       return [];
     }
+    const searchScope = activeSearchScopeRef.current;
     const tuning = getFeedTuningSettings();
     const batchSize = isFastGeneration ? 10 : 14;
     const perTopicBatch = Math.max(1, Math.ceil(batchSize / feedMaterialIds.length));
@@ -1059,10 +1418,8 @@ function FeedPageInner() {
           const streamedReels: Reel[] = [];
           const currentCount = countReelsForMaterial(id);
           const initialTarget = generationMode === "fast" ? 3 : 5;
-          const targetTotal = Math.max(
-            currentCount > 0 ? perTopicBatch : initialTarget,
-            Math.min(MAX_GENERATION_TARGET_REELS, currentCount > 0 ? currentCount + perTopicBatch : initialTarget),
-          );
+          // Keep extending the requested total upward so broad topics do not stall at a client-side cap.
+          const targetTotal = currentCount > 0 ? currentCount + perTopicBatch : initialTarget;
           try {
             const data = await generateReelsStream({
               materialId: id,
@@ -1074,21 +1431,33 @@ function FeedPageInner() {
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+              signal: searchScope.controller.signal,
               onReel: (reel) => {
+                if (!isSearchScopeActive(searchScope)) {
+                  return;
+                }
                 streamedReels.push(reel);
                 appendGeneratedReels([reel]);
               },
             });
             return { materialId: id, data, streamedReels, error: null };
           } catch (e) {
-            console.warn(`Background reel generation failed for topic material ${id}:`, e);
+            if (!isRequestInterruptedError(e)) {
+              console.warn(`Background reel generation failed for topic material ${id}:`, e);
+            }
             return { materialId: id, data: null, streamedReels, error: e };
           }
         }),
       );
+      if (!isSearchScopeActive(searchScope)) {
+        return [];
+      }
       const firstFailedRow = generatedRows.find((row) => row?.error);
       const firstFailureMessage =
         firstFailedRow?.error instanceof Error ? firstFailedRow.error.message : "";
+      if (isRequestInterruptedError(firstFailedRow?.error)) {
+        return [];
+      }
       const missingMaterialId = String(firstFailedRow?.materialId || materialId || "").trim();
       if (
         feedMaterialIds.length === 1 &&
@@ -1125,6 +1494,9 @@ function FeedPageInner() {
       emptyGenerateStreakRef.current = 0;
       return generated;
     } catch (e) {
+      if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
+        return [];
+      }
       console.warn("Background reel generation failed:", e);
       emptyGenerateStreakRef.current += 1;
       if (emptyGenerateStreakRef.current >= MAX_EMPTY_GENERATION_STREAK) {
@@ -1135,10 +1507,12 @@ function FeedPageInner() {
       }
       return [];
     } finally {
-      setGeneratingMore(false);
-      isGeneratingRef.current = false;
+      if (isSearchScopeActive(searchScope)) {
+        setGeneratingMore(false);
+        isGeneratingRef.current = false;
+      }
     }
-  }, [appendGeneratedReels, canRequestMore, countReelsForMaterial, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration, materialId, recoverMissingMaterial, registerRefinementJob, settingsScopeReady]);
+  }, [appendGeneratedReels, canRequestMore, countReelsForMaterial, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isFastGeneration, isSearchScopeActive, materialId, recoverMissingMaterial, registerRefinementJob, settingsScopeReady]);
 
   useEffect(() => {
     mutedRestoredFromSnapshotRef.current = false;
@@ -1219,6 +1593,24 @@ function FeedPageInner() {
       feedMaterialIds = Array.from(new Set([materialId, ...groupedMaterialIds].map((id) => id.trim()).filter(Boolean)));
       const allProgress = parseFeedProgress(window.localStorage.getItem(FEED_PROGRESS_STORAGE_KEY));
       resumeTarget = allProgress[materialId] ?? null;
+      try {
+        const rawHistory = window.localStorage.getItem(HISTORY_STORAGE_KEY);
+        if (rawHistory) {
+          const historyEntry = normalizeHistoryStorageItems(JSON.parse(rawHistory)).find((item) => item.materialId === materialId);
+          if (historyEntry && (historyEntry.activeReelId || historyEntry.activeIndex !== undefined)) {
+            const historyResume: FeedProgressEntry = {
+              index: Math.max(0, Math.floor(historyEntry.activeIndex || 0)),
+              reelId: historyEntry.activeReelId,
+              updatedAt: historyEntry.updatedAt || 0,
+            };
+            if (!resumeTarget || historyResume.updatedAt >= (resumeTarget.updatedAt || 0)) {
+              resumeTarget = historyResume;
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed history payloads and keep feed resume best-effort.
+      }
       const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));
       restoredSession = allSessions[materialId] ?? null;
     }
@@ -1302,6 +1694,7 @@ function FeedPageInner() {
     if (!settingsScopeReady || feedMaterialIds.length === 0 || isRefreshingRefinementRef.current) {
       return;
     }
+    const searchScope = activeSearchScopeRef.current;
     isRefreshingRefinementRef.current = true;
     try {
       const tuning = getFeedTuningSettings();
@@ -1315,6 +1708,9 @@ function FeedPageInner() {
             let latestData: Awaited<ReturnType<typeof fetchFeed>> | null = null;
 
             while (pageToLoad === 1 || collected.length < totalForMaterial) {
+              if (!isSearchScopeActive(searchScope)) {
+                return null;
+              }
               const data = await fetchFeed({
                 materialId: id,
                 page: pageToLoad,
@@ -1328,7 +1724,11 @@ function FeedPageInner() {
                 targetClipDurationSec: tuning.targetClipDurationSec,
                 targetClipDurationMinSec: tuning.targetClipDurationMinSec,
                 targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+                signal: searchScope.controller.signal,
               });
+              if (!isSearchScopeActive(searchScope)) {
+                return null;
+              }
               latestData = data;
               totalForMaterial = Math.max(0, Number(data.total) || 0);
               const merged = dedupeByIdentity(data.reels, collected);
@@ -1353,11 +1753,16 @@ function FeedPageInner() {
               },
             };
           } catch (error) {
-            console.warn(`Refined feed refresh failed for topic material ${id}:`, error);
+            if (!isRequestInterruptedError(error)) {
+              console.warn(`Refined feed refresh failed for topic material ${id}:`, error);
+            }
             return null;
           }
         }),
       );
+      if (!isSearchScopeActive(searchScope)) {
+        return;
+      }
       const successful = rows.filter((row): row is { materialId: string; data: Awaited<ReturnType<typeof fetchFeed>> } => Boolean(row?.data));
       if (successful.length === 0) {
         return;
@@ -1381,9 +1786,11 @@ function FeedPageInner() {
         setActiveIndex(Math.min(activeIndexRef.current, mergedReels.length - 1));
       }
     } finally {
-      isRefreshingRefinementRef.current = false;
+      if (isSearchScopeActive(searchScope)) {
+        isRefreshingRefinementRef.current = false;
+      }
     }
-  }, [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, registerRefinementJob, settingsScopeReady]);
+  }, [dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isSearchScopeActive, registerRefinementJob, settingsScopeReady]);
 
   const runFastTopUp = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
@@ -1398,6 +1805,7 @@ function FeedPageInner() {
     ) {
       return;
     }
+    const searchScope = activeSearchScopeRef.current;
     const tuning = getFeedTuningSettings();
     const perTopicBatch = Math.max(1, Math.ceil(12 / feedMaterialIds.length));
     isFastTopUpRef.current = true;
@@ -1406,10 +1814,7 @@ function FeedPageInner() {
         feedMaterialIds.map(async (id) => {
           const streamedReels: Reel[] = [];
           const currentCount = countReelsForMaterial(id);
-          const targetTotal = Math.max(
-            perTopicBatch,
-            Math.min(MAX_GENERATION_TARGET_REELS, currentCount + perTopicBatch),
-          );
+          const targetTotal = currentCount + perTopicBatch;
           try {
             const data = await generateReelsStream({
               materialId: id,
@@ -1421,18 +1826,27 @@ function FeedPageInner() {
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+              signal: searchScope.controller.signal,
               onReel: (reel) => {
+                if (!isSearchScopeActive(searchScope)) {
+                  return;
+                }
                 streamedReels.push(reel);
                 appendGeneratedReels([reel]);
               },
             });
             return { materialId: id, data, streamedReels };
           } catch (e) {
-            console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
+            if (!isRequestInterruptedError(e)) {
+              console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
+            }
             return null;
           }
         }),
       );
+      if (!isSearchScopeActive(searchScope)) {
+        return;
+      }
       generatedRows.forEach((row) => {
         if (row?.data) {
           registerRefinementJob(row.materialId, row.data);
@@ -1445,11 +1859,16 @@ function FeedPageInner() {
         emptyGenerateStreakRef.current = 0;
       }
     } catch (e) {
+      if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
+        return;
+      }
       console.warn("Fast mode background top-up failed:", e);
     } finally {
-      isFastTopUpRef.current = false;
+      if (isSearchScopeActive(searchScope)) {
+        isFastTopUpRef.current = false;
+      }
     }
-  }, [appendGeneratedReels, canRequestMore, countReelsForMaterial, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, registerRefinementJob, settingsScopeReady, shouldBlockOnPendingRefinement]);
+  }, [appendGeneratedReels, canRequestMore, countReelsForMaterial, dedupeByIdentity, generationMode, getFeedMaterialIds, getFeedTuningSettings, interleaveReelBatches, isSearchScopeActive, registerRefinementJob, settingsScopeReady, shouldBlockOnPendingRefinement]);
 
   useEffect(() => {
     if (!settingsScopeReady || getFeedMaterialIds().length === 0) {
@@ -1457,6 +1876,7 @@ function FeedPageInner() {
     }
     let cancelled = false;
     const pollRefinements = async () => {
+      const searchScope = activeSearchScopeRef.current;
       const pendingEntries = Array.from(pendingRefinementJobsRef.current.entries());
       if (pendingEntries.length === 0 || isRefreshingRefinementRef.current) {
         return;
@@ -1465,7 +1885,10 @@ function FeedPageInner() {
       await Promise.all(
         pendingEntries.map(async ([materialIdKey, jobId]) => {
           try {
-            const status = await fetchRefinementStatus(jobId);
+            const status = await fetchRefinementStatus(jobId, { signal: searchScope.controller.signal });
+            if (!isSearchScopeActive(searchScope)) {
+              return;
+            }
             if (status.status === "failed" || status.status === "superseded" || status.status === "completed") {
               pendingRefinementJobsRef.current.delete(materialIdKey);
             }
@@ -1477,11 +1900,14 @@ function FeedPageInner() {
               shouldRefresh = true;
             }
           } catch (error) {
+            if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(error)) {
+              return;
+            }
             console.warn(`Refinement status polling failed for material ${materialIdKey}:`, error);
           }
         }),
       );
-      if (!cancelled && shouldRefresh) {
+      if (!cancelled && shouldRefresh && isSearchScopeActive(searchScope)) {
         await refreshRefinedFeed();
       }
     };
@@ -1494,24 +1920,27 @@ function FeedPageInner() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [getFeedMaterialIds, refreshRefinedFeed, settingsScopeReady]);
+  }, [getFeedMaterialIds, isSearchScopeActive, refreshRefinedFeed, settingsScopeReady]);
 
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {
       if (!materialId || isGeneratingRef.current || !canRequestMore) {
         return;
       }
+      const searchScope = activeSearchScopeRef.current;
       setBootstrappingFirstReels(true);
       try {
         const generated = await requestMore({ surfaceError: manual });
-        if (generationMode === "fast" && generated.length > 0) {
+        if (isSearchScopeActive(searchScope) && generationMode === "fast" && generated.length > 0) {
           void runFastTopUp();
         }
       } finally {
-        setBootstrappingFirstReels(false);
+        if (isSearchScopeActive(searchScope)) {
+          setBootstrappingFirstReels(false);
+        }
       }
     },
-    [canRequestMore, generationMode, materialId, requestMore, runFastTopUp],
+    [canRequestMore, generationMode, isSearchScopeActive, materialId, requestMore, runFastTopUp],
   );
 
   useEffect(() => {
@@ -1658,16 +2087,11 @@ function FeedPageInner() {
     if (!activeReel?.reel_id) {
       return;
     }
-    const allProgress = parseFeedProgress(window.localStorage.getItem(FEED_PROGRESS_STORAGE_KEY));
-    allProgress[materialId] = {
+    persistFeedProgressSnapshot(materialId, {
       index,
       reelId: activeReel.reel_id,
       updatedAt: Date.now(),
-    };
-    const ordered = Object.entries(allProgress)
-      .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
-      .slice(0, MAX_SAVED_FEED_PROGRESS);
-    window.localStorage.setItem(FEED_PROGRESS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
+    });
   }, [activeIndex, materialId, reels]);
 
   useEffect(() => {
@@ -1737,8 +2161,7 @@ function FeedPageInner() {
     ).slice(-MAX_REELS_PER_FEED_SESSION);
     const index = dedupedReels.length > 0 ? clamp(activeIndex, 0, dedupedReels.length - 1) : 0;
     const activeReelId = dedupedReels[index]?.reel_id;
-    const allSessions = parseFeedSessions(window.localStorage.getItem(FEED_SESSION_STORAGE_KEY));
-    allSessions[materialId] = {
+    persistFeedSessionSnapshot(materialId, {
       reels: dedupedReels,
       page: Math.max(1, Math.floor(page || 1)),
       total: Math.max(total, dedupedReels.length),
@@ -1749,11 +2172,7 @@ function FeedPageInner() {
       activeIndex: index,
       activeReelId,
       updatedAt: Date.now(),
-    };
-    const ordered = Object.entries(allSessions)
-      .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
-      .slice(0, MAX_SAVED_FEED_SESSIONS);
-    window.localStorage.setItem(FEED_SESSION_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
+    });
   }, [
     activeIndex,
     canRequestMore,
@@ -2043,6 +2462,8 @@ function FeedPageInner() {
   );
 
   const activeReel = reels[activeIndex] ?? null;
+  const [descriptionExpanded, setDescriptionExpanded] = useState(false);
+  const [descriptionHydrating, setDescriptionHydrating] = useState(false);
   const atLastLoadedReel = reels.length > 0 && activeIndex >= reels.length - 1;
   const noMoreReelsAvailable =
     atLastLoadedReel &&
@@ -2072,43 +2493,37 @@ function FeedPageInner() {
     }
   }, [shouldKeepFeedEntryLoading]);
 
+  useEffect(() => {
+    setDescriptionExpanded(false);
+    setDescriptionHydrating(false);
+  }, [activeReel?.reel_id]);
+
   const activeVideoDescription = useMemo(() => {
     if (!activeReel) {
-      return "";
+      return { text: "", compacted: false };
     }
     const description = activeReel.video_description?.trim();
     if (description) {
-      return description;
+      return { text: description, compacted: hasCompactedDescriptionText(activeReel) };
     }
     const snippet = activeReel.transcript_snippet?.trim();
     if (snippet) {
-      return snippet;
+      return { text: snippet, compacted: hasCompactedDescriptionText(activeReel) };
     }
-    return "No video description available for this reel.";
+    return { text: "No video description available for this reel.", compacted: false };
   }, [activeReel]);
 
-  const activeAiSummary = useMemo(() => {
-    if (!activeReel) {
-      return "";
+  const toggleDescriptionExpanded = useCallback(async () => {
+    if (!descriptionExpanded && activeVideoDescription.compacted) {
+      setDescriptionHydrating(true);
+      try {
+        await refreshRefinedFeed();
+      } finally {
+        setDescriptionHydrating(false);
+      }
     }
-    const aiSummary = activeReel.ai_summary?.trim();
-    if (aiSummary) {
-      return aiSummary;
-    }
-    const takeawaySummary = activeReel.takeaways
-      .map((point) => point.trim())
-      .filter(Boolean)
-      .slice(0, 3)
-      .join(" ");
-    if (takeawaySummary) {
-      return takeawaySummary;
-    }
-    const snippet = activeReel.transcript_snippet?.trim();
-    if (snippet) {
-      return snippet;
-    }
-    return "No AI summary available for this reel.";
-  }, [activeReel]);
+    setDescriptionExpanded((prev) => !prev);
+  }, [activeVideoDescription.compacted, descriptionExpanded, refreshRefinedFeed]);
 
   const activeRelevanceReason = useMemo(() => {
     if (!activeReel) {
@@ -2323,6 +2738,7 @@ function FeedPageInner() {
   }, [communityHandoffIdParam, communityPreviewReel, communitySetIdParam, returnCommunitySetIdParam, returnTabParam]);
 
   const navigateBackToPreviousPage = useCallback(() => {
+    abortActiveSearchScope();
     if (returnTabParam === "search" || returnTabParam === "community") {
       router.push(feedFallbackPath);
       return;
@@ -2345,7 +2761,7 @@ function FeedPageInner() {
       }
     }
     router.push(feedFallbackPath);
-  }, [feedFallbackPath, returnTabParam, router]);
+  }, [abortActiveSearchScope, feedFallbackPath, returnTabParam, router]);
 
   if (!materialId && !communityPreviewReel && invalidCommunityHandoff) {
     return (
@@ -2512,12 +2928,17 @@ function FeedPageInner() {
 
                 <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Video Description</p>
-                  <p className="whitespace-pre-line break-words [overflow-wrap:anywhere]">{activeVideoDescription}</p>
-                </div>
-
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
-                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">AI Summary</p>
-                  <p className="break-words [overflow-wrap:anywhere]">{activeAiSummary}</p>
+                  <ExpandableText
+                    text={activeVideoDescription.text}
+                    expanded={descriptionExpanded}
+                    onToggle={() => {
+                      void toggleDescriptionExpanded();
+                    }}
+                    className="whitespace-pre-line break-words [overflow-wrap:anywhere]"
+                    previewChars={DESCRIPTION_PREVIEW_CHAR_LIMIT}
+                    forceExpandable={activeVideoDescription.compacted}
+                    loading={descriptionHydrating}
+                  />
                 </div>
 
                 <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
@@ -2577,12 +2998,17 @@ function FeedPageInner() {
 
                 <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Video Description</p>
-                  <p className="whitespace-pre-line break-words [overflow-wrap:anywhere]">{activeVideoDescription}</p>
-                </div>
-
-                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
-                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">AI Summary</p>
-                  <p className="break-words [overflow-wrap:anywhere]">{activeAiSummary}</p>
+                  <ExpandableText
+                    text={activeVideoDescription.text}
+                    expanded={descriptionExpanded}
+                    onToggle={() => {
+                      void toggleDescriptionExpanded();
+                    }}
+                    className="whitespace-pre-line break-words [overflow-wrap:anywhere]"
+                    previewChars={DESCRIPTION_PREVIEW_CHAR_LIMIT}
+                    forceExpandable={activeVideoDescription.compacted}
+                    loading={descriptionHydrating}
+                  />
                 </div>
 
                 <div className="mt-3 mb-0 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">

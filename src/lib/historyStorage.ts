@@ -11,6 +11,8 @@ export type StoredHistoryItem = {
   generationMode: StoredHistoryGenerationMode;
   source: StoredHistorySource;
   feedQuery?: string;
+  activeIndex?: number;
+  activeReelId?: string;
 };
 
 export const HISTORY_STORAGE_KEY = "studyreels-material-history";
@@ -41,6 +43,39 @@ function seedGuestHistoryScopeFromActiveHistory(): string | null {
   } catch {
     return null;
   }
+}
+
+export function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const row = raw as Record<string, unknown>;
+  const materialId = String(row.materialId || "").trim();
+  const title = String(row.title || "").trim();
+  if (!materialId || !title) {
+    return null;
+  }
+  const activeIndexRaw = Number(row.activeIndex);
+  const activeIndex = Number.isFinite(activeIndexRaw) && activeIndexRaw >= 0 ? Math.floor(activeIndexRaw) : undefined;
+  const activeReelId = typeof row.activeReelId === "string" && row.activeReelId.trim() ? row.activeReelId.trim() : undefined;
+  return {
+    materialId,
+    title: title || "New Study Session",
+    updatedAt: Math.max(0, Math.floor(Number(row.updatedAt) || 0)),
+    starred: Boolean(row.starred),
+    generationMode: row.generationMode === "slow" ? "slow" : "fast",
+    source: row.source === "community" ? "community" : "search",
+    feedQuery: typeof row.feedQuery === "string" && row.feedQuery.trim() ? row.feedQuery.trim() : undefined,
+    activeIndex,
+    activeReelId,
+  };
+}
+
+export function normalizeStoredHistoryItems(raw: unknown): StoredHistoryItem[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  return raw.map(normalizeStoredHistoryItem).filter(Boolean) as StoredHistoryItem[];
 }
 
 export function readScopedHistorySnapshot(accountId: string | null | undefined): string | null {

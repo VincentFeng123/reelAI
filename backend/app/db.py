@@ -303,6 +303,8 @@ CREATE TABLE IF NOT EXISTS community_material_history (
     generation_mode TEXT NOT NULL DEFAULT 'fast',
     source TEXT NOT NULL DEFAULT 'search',
     feed_query TEXT,
+    active_index INTEGER,
+    active_reel_id TEXT,
     PRIMARY KEY(account_id, material_id),
     FOREIGN KEY(account_id) REFERENCES community_accounts(id)
 );
@@ -628,6 +630,8 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS owner_key_hash TEXT")
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS owner_account_id TEXT")
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS visibility TEXT")
+                cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS active_index INTEGER")
+                cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS active_reel_id TEXT")
                 cur.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR BTRIM(updated_at) = ''")
                 cur.execute(
                     """
@@ -749,6 +753,14 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE community_sets ADD COLUMN visibility TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_material_history ADD COLUMN active_index INTEGER")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_material_history ADD COLUMN active_reel_id TEXT")
         except sqlite3.OperationalError:
             pass
         try:

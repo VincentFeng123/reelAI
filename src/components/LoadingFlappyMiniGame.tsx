@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { safeStorageSetItem } from "@/lib/browserStorage";
+
 const WIDTH = 320;
 const HEIGHT = 156;
 const FLOOR_HEIGHT = 10;
@@ -71,7 +73,7 @@ export function LoadingFlappyMiniGame() {
     if (typeof window === "undefined") {
       return;
     }
-    window.localStorage.setItem(BEST_SCORE_KEY, String(nextBest));
+    safeStorageSetItem(window.localStorage, BEST_SCORE_KEY, String(nextBest));
   }, []);
 
   const resetRound = useCallback((state: GameState, keepStarted = false) => {

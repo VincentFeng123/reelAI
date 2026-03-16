@@ -51,7 +51,7 @@ def parse_iso8601_duration(value: str) -> int:
 class YouTubeService:
     SEARCH_CACHE_VERSION = 4
     SEARCH_CACHE_TTL_SEC = 24 * 60 * 60  # 24 hours
-    SEARCH_CACHE_EMPTY_TTL_SEC = 2 * 60 * 60  # 2 hours for empty results
+    SEARCH_CACHE_EMPTY_TTL_SEC = 15 * 60  # 15 minutes for empty results
     DATA_API_MAX_PAGES = 10
     DATA_API_POOL_MULTIPLIER = 8
     DATA_API_POOL_CAP = 760
@@ -86,6 +86,7 @@ class YouTubeService:
     GRAPH_DEEP_STAGE_MAX_SEC = 4.5
     GRAPH_RELATED_SURFACE = "youtube_related"
     GRAPH_CHANNEL_SURFACE = "youtube_channel"
+    GRAPH_FETCH_WORKERS = 4
     SEARCH_QUERY_NOISE_TOKENS = {
         "basic",
         "basics",
@@ -594,16 +595,17 @@ class YouTubeService:
             is_cc = detail.get("license") == "creativeCommon"
             if creative_commons_only and not is_cc:
                 continue
+            snippet = item.get("snippet", {})
             videos.append(
                 {
                     "id": video_id,
-                    "title": item.get("snippet", {}).get("title", "Untitled"),
-                    "channel_id": item.get("snippet", {}).get("channelId", ""),
-                    "channel_title": item.get("snippet", {}).get("channelTitle", ""),
-                    "description": item.get("snippet", {}).get("description", ""),
+                    "title": detail.get("title") or snippet.get("title", "Untitled"),
+                    "channel_id": detail.get("channel_id") or snippet.get("channelId", ""),
+                    "channel_title": detail.get("channel_title") or snippet.get("channelTitle", ""),
+                    "description": detail.get("description") or snippet.get("description", ""),
                     "duration_sec": detail.get("duration_sec", 0),
                     "view_count": detail.get("view_count", 0),
-                    "published_at": item.get("snippet", {}).get("publishedAt", ""),
+                    "published_at": detail.get("published_at") or snippet.get("publishedAt", ""),
                     "is_creative_commons": bool(is_cc),
                     "search_source": "youtube_api",
                     "query_strategy": retrieval_strategy or "",
@@ -1048,7 +1050,7 @@ class YouTubeService:
                         deadline,
                     )
                 ] = (variant_idx, "bing", search_query)
-            ordered_external_rows: list[list[dict[str, Any]]] = [[] for _ in range(len(external_variants) * 2)]
+            ordered_external_ids: list[list[str]] = [[] for _ in range(len(external_variants) * 2)]
             for future in as_completed(future_map):
                 if self._deadline_exceeded(deadline):
                     break
@@ -1060,20 +1062,41 @@ class YouTubeService:
                 if not ids:
                     continue
                 if engine == "duckduckgo":
-                    surface = "duckduckgo_quoted" if '"' in search_query else "duckduckgo_site"
                     order_idx = variant_idx * 2
                 else:
-                    surface = "bing_quoted" if '"' in search_query else "bing_site"
                     order_idx = variant_idx * 2 + 1
-                fallback_rows = self._build_fallback_rows(ids, deadline=deadline)
-                self._annotate_search_rows(
-                    fallback_rows,
-                    search_source=surface,
-                    retrieval_strategy=retrieval_strategy,
-                    retrieval_stage=retrieval_stage,
-                    search_query=search_query,
-                )
-                ordered_external_rows[order_idx] = fallback_rows
+                ordered_external_ids[order_idx] = ids
+        all_video_ids = list(
+            dict.fromkeys(
+                video_id
+                for ids in ordered_external_ids
+                for video_id in ids
+                if str(video_id or "").strip()
+            )
+        )
+        details_by_id = self._video_details(all_video_ids, deadline=deadline) if all_video_ids and self.api_key else {}
+        ordered_external_rows: list[list[dict[str, Any]]] = [[] for _ in range(len(external_variants) * 2)]
+        for order_idx, ids in enumerate(ordered_external_ids):
+            if not ids:
+                continue
+            search_query = str(external_variants[order_idx // 2].get("query") or query)
+            if order_idx % 2 == 0:
+                surface = "duckduckgo_quoted" if '"' in search_query else "duckduckgo_site"
+            else:
+                surface = "bing_quoted" if '"' in search_query else "bing_site"
+            fallback_rows = self._build_fallback_rows(
+                ids,
+                deadline=deadline,
+                details_by_id=details_by_id,
+            )
+            self._annotate_search_rows(
+                fallback_rows,
+                search_source=surface,
+                retrieval_strategy=retrieval_strategy,
+                retrieval_stage=retrieval_stage,
+                search_query=search_query,
+            )
+            ordered_external_rows[order_idx] = fallback_rows
         for rows in ordered_external_rows:
             if rows:
                 results = self._merge_unique_videos(results, rows, None)
@@ -1263,45 +1286,42 @@ class YouTubeService:
         )
         best_channel_seed: dict[str, tuple[float, dict[str, Any]]] = {}
         for score, seed_row in selected_seeds:
-            if self._deadline_exceeded(related_deadline):
-                break
-            seed_video_id = str(seed_row.get("id") or "").strip()
-            if not seed_video_id:
-                continue
-            watch_html = self._fetch_watch_html(seed_video_id, deadline=related_deadline)
-            if not watch_html:
-                continue
-            related_rows = self._extract_related_videos_from_watch_html(
-                watch_html,
-                max_results=int(settings.get("related_per_seed") or 0),
-                video_duration=video_duration,
-            )
-            for row in related_rows:
-                candidate_id = str(row.get("id") or "").strip()
-                if not candidate_id or candidate_id == seed_video_id:
-                    continue
-                if not self._graph_candidate_is_anchored(
-                    row,
-                    query=query,
-                    root_terms=root_terms,
-                    seed_row=seed_row,
-                    require_same_channel=False,
-                ):
-                    continue
-                row["search_source"] = self.GRAPH_RELATED_SURFACE
-                row["query_strategy"] = retrieval_strategy or ""
-                row["query_stage"] = retrieval_stage or ""
-                row["search_query"] = query
-                row["discovery_path"] = f"related:{seed_video_id}"
-                row["seed_video_id"] = seed_video_id
-                row["seed_channel_id"] = str(seed_row.get("channel_id") or "")
-                row["crawl_depth"] = 1
-                results = self._merge_unique_videos(results, [row], None)
             channel_id = str(seed_row.get("channel_id") or "").strip()
             if channel_id:
                 best_existing = best_channel_seed.get(channel_id)
                 if best_existing is None or score > best_existing[0]:
                     best_channel_seed[channel_id] = (score, seed_row)
+        related_seed_rows = [
+            seed_row
+            for _score, seed_row in selected_seeds
+            if str(seed_row.get("id") or "").strip()
+        ]
+        if related_seed_rows and not self._deadline_exceeded(related_deadline):
+            max_workers = max(1, min(self.GRAPH_FETCH_WORKERS, len(related_seed_rows)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        self._graph_related_rows_for_seed,
+                        seed_row=seed_row,
+                        query=query,
+                        root_terms=root_terms,
+                        video_duration=video_duration,
+                        retrieval_strategy=retrieval_strategy,
+                        retrieval_stage=retrieval_stage,
+                        deadline=related_deadline,
+                        related_per_seed=int(settings.get("related_per_seed") or 0),
+                    ): seed_row
+                    for seed_row in related_seed_rows
+                }
+                for future in as_completed(future_map):
+                    if self._deadline_exceeded(related_deadline):
+                        break
+                    try:
+                        related_rows = future.result()
+                    except Exception:
+                        related_rows = []
+                    if related_rows:
+                        results = self._merge_unique_videos(results, related_rows, None)
 
         strong_inventory = self._strong_direct_inventory_count(
             self._merge_unique_videos(seed_rows, results, None),
@@ -1317,45 +1337,139 @@ class YouTubeService:
             max_sec=max(0.45, float(settings.get("phase_max_sec") or 0.0) * 0.35),
         )
         channel_candidates = sorted(best_channel_seed.values(), key=lambda item: item[0], reverse=True)
-        for score, seed_row in channel_candidates[: int(settings.get("channel_seed_limit") or 0)]:
-            if self._deadline_exceeded(channel_deadline):
-                break
-            if score < max(0.45, float(settings.get("seed_min_score") or 0.0)):
-                continue
-            channel_id = str(seed_row.get("channel_id") or "").strip()
-            if not channel_id:
-                continue
-            channel_html = self._fetch_channel_videos_html(channel_id, deadline=channel_deadline)
-            if not channel_html:
-                continue
-            channel_rows = self._extract_channel_videos_from_channel_html(
-                channel_html,
-                max_results=int(settings.get("channel_results") or 0),
-                video_duration=video_duration,
-            )
-            seed_video_id = str(seed_row.get("id") or "").strip()
-            for row in channel_rows:
-                candidate_id = str(row.get("id") or "").strip()
-                if not candidate_id or candidate_id == seed_video_id:
-                    continue
-                if not self._graph_candidate_is_anchored(
-                    row,
-                    query=query,
-                    root_terms=root_terms,
-                    seed_row=seed_row,
-                    require_same_channel=True,
-                ):
-                    continue
-                row["search_source"] = self.GRAPH_CHANNEL_SURFACE
-                row["query_strategy"] = retrieval_strategy or ""
-                row["query_stage"] = retrieval_stage or ""
-                row["search_query"] = query
-                row["discovery_path"] = f"channel:{channel_id}"
-                row["seed_video_id"] = seed_video_id
-                row["seed_channel_id"] = channel_id
-                row["crawl_depth"] = 2
-                results = self._merge_unique_videos(results, [row], None)
+        selected_channel_seeds = [
+            seed_row
+            for score, seed_row in channel_candidates[: int(settings.get("channel_seed_limit") or 0)]
+            if score >= max(0.45, float(settings.get("seed_min_score") or 0.0))
+            and str(seed_row.get("channel_id") or "").strip()
+        ]
+        if selected_channel_seeds and not self._deadline_exceeded(channel_deadline):
+            max_workers = max(1, min(self.GRAPH_FETCH_WORKERS, len(selected_channel_seeds)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        self._graph_channel_rows_for_seed,
+                        seed_row=seed_row,
+                        query=query,
+                        root_terms=root_terms,
+                        video_duration=video_duration,
+                        retrieval_strategy=retrieval_strategy,
+                        retrieval_stage=retrieval_stage,
+                        deadline=channel_deadline,
+                        channel_results=int(settings.get("channel_results") or 0),
+                    ): seed_row
+                    for seed_row in selected_channel_seeds
+                }
+                for future in as_completed(future_map):
+                    if self._deadline_exceeded(channel_deadline):
+                        break
+                    try:
+                        channel_rows = future.result()
+                    except Exception:
+                        channel_rows = []
+                    if channel_rows:
+                        results = self._merge_unique_videos(results, channel_rows, None)
         return results
+
+    def _graph_related_rows_for_seed(
+        self,
+        *,
+        seed_row: dict[str, Any],
+        query: str,
+        root_terms: list[str],
+        video_duration: str | None,
+        retrieval_strategy: str,
+        retrieval_stage: str,
+        deadline: float | None,
+        related_per_seed: int,
+    ) -> list[dict[str, Any]]:
+        if related_per_seed <= 0 or self._deadline_exceeded(deadline):
+            return []
+        seed_video_id = str(seed_row.get("id") or "").strip()
+        if not seed_video_id:
+            return []
+        watch_html = self._fetch_watch_html(seed_video_id, deadline=deadline)
+        if not watch_html:
+            return []
+        related_rows = self._extract_related_videos_from_watch_html(
+            watch_html,
+            max_results=related_per_seed,
+            video_duration=video_duration,
+        )
+        anchored_rows: list[dict[str, Any]] = []
+        seed_channel_id = str(seed_row.get("channel_id") or "")
+        for row in related_rows:
+            candidate_id = str(row.get("id") or "").strip()
+            if not candidate_id or candidate_id == seed_video_id:
+                continue
+            if not self._graph_candidate_is_anchored(
+                row,
+                query=query,
+                root_terms=root_terms,
+                seed_row=seed_row,
+                require_same_channel=False,
+            ):
+                continue
+            row["search_source"] = self.GRAPH_RELATED_SURFACE
+            row["query_strategy"] = retrieval_strategy or ""
+            row["query_stage"] = retrieval_stage or ""
+            row["search_query"] = query
+            row["discovery_path"] = f"related:{seed_video_id}"
+            row["seed_video_id"] = seed_video_id
+            row["seed_channel_id"] = seed_channel_id
+            row["crawl_depth"] = 1
+            anchored_rows.append(row)
+        return anchored_rows
+
+    def _graph_channel_rows_for_seed(
+        self,
+        *,
+        seed_row: dict[str, Any],
+        query: str,
+        root_terms: list[str],
+        video_duration: str | None,
+        retrieval_strategy: str,
+        retrieval_stage: str,
+        deadline: float | None,
+        channel_results: int,
+    ) -> list[dict[str, Any]]:
+        if channel_results <= 0 or self._deadline_exceeded(deadline):
+            return []
+        channel_id = str(seed_row.get("channel_id") or "").strip()
+        seed_video_id = str(seed_row.get("id") or "").strip()
+        if not channel_id or not seed_video_id:
+            return []
+        channel_html = self._fetch_channel_videos_html(channel_id, deadline=deadline)
+        if not channel_html:
+            return []
+        channel_rows = self._extract_channel_videos_from_channel_html(
+            channel_html,
+            max_results=channel_results,
+            video_duration=video_duration,
+        )
+        anchored_rows: list[dict[str, Any]] = []
+        for row in channel_rows:
+            candidate_id = str(row.get("id") or "").strip()
+            if not candidate_id or candidate_id == seed_video_id:
+                continue
+            if not self._graph_candidate_is_anchored(
+                row,
+                query=query,
+                root_terms=root_terms,
+                seed_row=seed_row,
+                require_same_channel=True,
+            ):
+                continue
+            row["search_source"] = self.GRAPH_CHANNEL_SURFACE
+            row["query_strategy"] = retrieval_strategy or ""
+            row["query_stage"] = retrieval_stage or ""
+            row["search_query"] = query
+            row["discovery_path"] = f"channel:{channel_id}"
+            row["seed_video_id"] = seed_video_id
+            row["seed_channel_id"] = channel_id
+            row["crawl_depth"] = 2
+            anchored_rows.append(row)
+        return anchored_rows
 
     def _fetch_watch_html(self, video_id: str, *, deadline: float | None) -> str:
         cache_key = f"watch:{video_id}"
@@ -1668,15 +1782,25 @@ class YouTubeService:
             "crawl_depth": 0,
         }
 
-    def _build_fallback_rows(self, video_ids: list[str], deadline: float | None = None) -> list[dict[str, Any]]:
-        details = self._video_details(video_ids, deadline=deadline) if self.api_key else {}
+    def _build_fallback_rows(
+        self,
+        video_ids: list[str],
+        deadline: float | None = None,
+        details_by_id: dict[str, dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
+        details = details_by_id if details_by_id is not None else (self._video_details(video_ids, deadline=deadline) if self.api_key else {})
         rows: list[dict[str, Any]] = []
         for video_id in video_ids:
             row = self._fallback_video_row(video_id)
             detail = details.get(video_id, {})
             if detail:
+                row["title"] = str(detail.get("title") or row["title"])
+                row["channel_id"] = str(detail.get("channel_id") or row["channel_id"])
+                row["channel_title"] = str(detail.get("channel_title") or row["channel_title"])
+                row["description"] = str(detail.get("description") or row["description"])
                 row["duration_sec"] = int(detail.get("duration_sec") or 0)
                 row["view_count"] = int(detail.get("view_count") or 0)
+                row["published_at"] = str(detail.get("published_at") or row["published_at"])
                 row["is_creative_commons"] = detail.get("license") == "creativeCommon"
             rows.append(row)
         return rows
@@ -2457,7 +2581,7 @@ class YouTubeService:
             return {}
         params = {
             "key": self.api_key,
-            "part": "contentDetails,status,statistics",
+            "part": "snippet,contentDetails,status,statistics",
             "id": ",".join(batch),
             "maxResults": len(batch),
         }
@@ -2485,6 +2609,11 @@ class YouTubeService:
             except (TypeError, ValueError):
                 view_count = 0
             payload[vid] = {
+                "title": str(item.get("snippet", {}).get("title") or "Untitled"),
+                "channel_id": str(item.get("snippet", {}).get("channelId") or ""),
+                "channel_title": str(item.get("snippet", {}).get("channelTitle") or ""),
+                "description": str(item.get("snippet", {}).get("description") or ""),
+                "published_at": str(item.get("snippet", {}).get("publishedAt") or ""),
                 "duration_sec": duration,
                 "view_count": max(0, view_count),
                 "license": item.get("status", {}).get("license", "youtube"),

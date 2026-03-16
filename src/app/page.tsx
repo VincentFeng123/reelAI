@@ -18,8 +18,10 @@ import {
   queueCommunitySettingsSync,
   readCommunityAuthSession,
 } from "@/lib/api";
+import { safeStorageRemoveItem, safeStorageSetItem } from "@/lib/browserStorage";
 import {
   LEGACY_TOPIC_HISTORY_STORAGE_KEY,
+  normalizeStoredHistoryItems,
   readScopedHistorySnapshot,
   type StoredHistoryItem,
   writeScopedHistorySnapshot,
@@ -97,22 +99,7 @@ function parseMaterialHistory(raw: string | null): HistoryItem[] {
     return [];
   }
   try {
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) {
-      return [];
-    }
-    return parsed
-      .filter((item) => item && typeof item.materialId === "string" && typeof item.title === "string")
-      .map((item): HistoryItem => ({
-        materialId: String(item.materialId),
-        title: String(item.title).trim() || "New Study Session",
-        updatedAt: Number(item.updatedAt) || 0,
-        starred: Boolean(item.starred),
-        generationMode: item.generationMode === "slow" ? "slow" : "fast",
-        source: item.source === "community" ? "community" : "search",
-        feedQuery: typeof item.feedQuery === "string" && item.feedQuery.trim() ? item.feedQuery.trim() : undefined,
-      }))
-      .slice(0, MAX_HISTORY_ITEMS);
+    return normalizeStoredHistoryItems(JSON.parse(raw)).slice(0, MAX_HISTORY_ITEMS);
   } catch {
     return [];
   }
@@ -166,6 +153,8 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
         generationMode: item.generationMode || existing.generationMode || "fast",
         source: item.source || existing.source || "search",
         feedQuery: item.feedQuery ?? existing.feedQuery,
+        activeIndex: item.activeIndex ?? existing.activeIndex,
+        activeReelId: item.activeReelId ?? existing.activeReelId,
       });
       continue;
     }
@@ -175,6 +164,8 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
       generationMode: existing.generationMode || item.generationMode || "fast",
       source: existing.source || item.source || "search",
       feedQuery: existing.feedQuery ?? item.feedQuery,
+      activeIndex: existing.activeIndex ?? item.activeIndex,
+      activeReelId: existing.activeReelId ?? item.activeReelId,
     });
   }
   return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_HISTORY_ITEMS);
@@ -430,7 +421,7 @@ function HomePageContent() {
     if (typeof window === "undefined" || !sidebarTabHydrated) {
       return;
     }
-    window.sessionStorage.setItem(ACTIVE_SIDEBAR_TAB_SESSION_KEY, activeSidebarTab);
+    safeStorageSetItem(window.sessionStorage, ACTIVE_SIDEBAR_TAB_SESSION_KEY, activeSidebarTab);
   }, [activeSidebarTab, sidebarTabHydrated]);
 
   useEffect(() => {
@@ -438,10 +429,10 @@ function HomePageContent() {
       return;
     }
     if (activeCommunitySetId) {
-      window.sessionStorage.setItem(ACTIVE_COMMUNITY_SET_ID_SESSION_KEY, activeCommunitySetId);
+      safeStorageSetItem(window.sessionStorage, ACTIVE_COMMUNITY_SET_ID_SESSION_KEY, activeCommunitySetId);
       return;
     }
-    window.sessionStorage.removeItem(ACTIVE_COMMUNITY_SET_ID_SESSION_KEY);
+    safeStorageRemoveItem(window.sessionStorage, ACTIVE_COMMUNITY_SET_ID_SESSION_KEY);
   }, [activeCommunitySetId, sidebarTabHydrated]);
 
   const historySorted = useMemo(
@@ -499,6 +490,8 @@ function HomePageContent() {
       generationMode?: GenerationMode;
       source?: HistorySource;
       feedQuery?: string;
+      activeIndex?: number;
+      activeReelId?: string;
     }) => {
       const existing = historyRef.current.find((item) => item.materialId === entry.materialId);
       const merged: HistoryItem = {
@@ -509,6 +502,8 @@ function HomePageContent() {
         generationMode: entry.generationMode ?? existing?.generationMode ?? "fast",
         source: entry.source ?? existing?.source ?? "search",
         feedQuery: entry.feedQuery ?? existing?.feedQuery,
+        activeIndex: entry.activeIndex ?? existing?.activeIndex,
+        activeReelId: entry.activeReelId ?? existing?.activeReelId,
       };
       const next = [merged, ...historyRef.current.filter((item) => item.materialId !== merged.materialId)].slice(0, MAX_HISTORY_ITEMS);
       persistHistory(next);
@@ -861,12 +856,12 @@ function HomePageContent() {
       }
       setActiveHistoryMenuId(null);
       forceCloseMobileSidebar();
+      const savedFeedQuery = (existing?.feedQuery || "").trim();
+      if (savedFeedQuery) {
+        router.push(`/feed?${savedFeedQuery}`);
+        return;
+      }
       if (existing?.source === "community") {
-        const savedFeedQuery = (existing.feedQuery || "").trim();
-        if (savedFeedQuery) {
-          router.push(`/feed?${savedFeedQuery}`);
-          return;
-        }
         const fallbackSetId = parseCommunitySetIdFromHistoryMaterialId(materialId);
         if (fallbackSetId) {
           const fallbackParams = new URLSearchParams({
@@ -960,7 +955,7 @@ function HomePageContent() {
   }, [accountMenuOpen]);
 
   const onUploadMaterialCreated = useCallback(
-    async (params: { materialId: string; title: string; topic?: string; generationMode: GenerationMode }) => {
+    async (params: { materialId: string; title: string; topic?: string; generationMode: GenerationMode; feedQuery: string }) => {
       const nextTitle = params.title?.trim() || params.topic?.trim() || "New Study Session";
       upsertHistory({
         materialId: params.materialId,
@@ -968,6 +963,7 @@ function HomePageContent() {
         updatedAt: Date.now(),
         generationMode: params.generationMode,
         source: "search",
+        feedQuery: params.feedQuery.trim() || undefined,
       });
     },
     [upsertHistory],
@@ -987,6 +983,7 @@ function HomePageContent() {
         generationMode: "fast",
         source: "community",
         feedQuery: payload.feedQuery.trim() || undefined,
+        activeReelId: payload.selectedReelId.trim() || undefined,
       });
     },
     [upsertHistory],

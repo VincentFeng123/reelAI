@@ -16,8 +16,11 @@ function normalizeReturnTab(value: string | null): "search" | "community" | "edi
   return null;
 }
 
-function normalizeAccountView(value: string | null): "default" | "change-password" {
-  return value === "change-password" ? "change-password" : "default";
+function normalizeAccountView(value: string | null): "default" | "change-password" | "delete-account" {
+  if (value === "change-password" || value === "delete-account") {
+    return value;
+  }
+  return "default";
 }
 
 function AccountPageContent() {
@@ -86,7 +89,7 @@ function AccountPageContent() {
   }, []);
 
   const accountBaseTarget = returnTab ? `/account?return_tab=${returnTab}` : "/account";
-  const backTarget = requestedView === "change-password"
+  const backTarget = requestedView === "change-password" || requestedView === "delete-account"
     ? accountBaseTarget
     : returnTab
       ? `/?tab=${returnTab}`
@@ -94,16 +97,19 @@ function AccountPageContent() {
   const changePasswordTarget = returnTab
     ? `/account?view=change-password&return_tab=${returnTab}`
     : "/account?view=change-password";
+  const deleteAccountTarget = returnTab
+    ? `/account?view=delete-account&return_tab=${returnTab}`
+    : "/account?view=delete-account";
   const accountView = communityAccount ? requestedView : "default";
   const onBack = useCallback(() => {
     router.push(backTarget);
   }, [backTarget, router]);
-  const onOpenYourSets = useCallback(() => {
-    router.push("/?tab=edit");
-  }, [router]);
   const onOpenChangePassword = useCallback(() => {
     router.push(changePasswordTarget);
   }, [changePasswordTarget, router]);
+  const onOpenDeleteAccount = useCallback(() => {
+    router.push(deleteAccountTarget);
+  }, [deleteAccountTarget, router]);
 
   if (showLoadingScreen) {
     return <FullscreenLoadingScreen />;
@@ -116,7 +122,7 @@ function AccountPageContent() {
       onBack={onBack}
       onAccountChange={setCommunityAccount}
       onOpenChangePassword={onOpenChangePassword}
-      onOpenYourSets={onOpenYourSets}
+      onOpenDeleteAccount={onOpenDeleteAccount}
     />
   );
 }

@@ -17,11 +17,14 @@ export type Reel = {
   concept_title: string;
   video_title?: string;
   video_description?: string;
+  video_description_truncated?: boolean;
   ai_summary?: string;
+  ai_summary_truncated?: boolean;
   video_url: string;
   t_start: number;
   t_end: number;
   transcript_snippet: string;
+  transcript_snippet_truncated?: boolean;
   takeaways: string[];
   captions?: CaptionCue[];
   score: number;

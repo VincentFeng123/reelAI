@@ -291,6 +291,17 @@ export function saveOwnedCommunitySetIds(nextIds: string[]): string[] {
   return normalized;
 }
 
+function clearOwnedCommunitySetIds(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.removeItem(COMMUNITY_OWNED_SET_IDS_STORAGE_KEY);
+  } catch {
+    // Ignore storage failures during account teardown.
+  }
+}
+
 type CommunityAuthResponseApi = {
   account?: unknown;
   session_token?: unknown;
@@ -525,6 +536,31 @@ export async function logoutCommunityAccount(): Promise<void> {
   }
 }
 
+export async function deleteCommunityAccount(params: {
+  currentPassword: string;
+}): Promise<void> {
+  try {
+    await safeFetch(apiUrl("/community/auth/delete-account"), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...communitySessionHeaders(),
+      },
+      body: JSON.stringify({
+        current_password: params.currentPassword,
+      }),
+    });
+  } catch (error) {
+    if (error instanceof Error && /session expired|sign in/i.test(error.message)) {
+      clearOwnedCommunitySetIds();
+      clearCommunityAuthSession();
+    }
+    throw error;
+  }
+  clearOwnedCommunitySetIds();
+  clearCommunityAuthSession();
+}
+
 export async function changeCommunityPassword(params: {
   currentPassword: string;
   newPassword: string;
@@ -546,6 +582,7 @@ export async function uploadMaterial(params: {
   text?: string;
   file?: File;
   subjectTag?: string;
+  signal?: AbortSignal;
 }): Promise<MaterialResponse> {
   const form = new FormData();
   if (params.text) {
@@ -561,6 +598,7 @@ export async function uploadMaterial(params: {
   const res = await safeFetch(apiUrl("/material"), {
     method: "POST",
     body: form,
+    signal: params.signal,
   });
   return parseJsonResponse<MaterialResponse>(res);
 }
@@ -779,6 +817,7 @@ export async function fetchFeed(params: {
   targetClipDurationSec?: number;
   targetClipDurationMinSec?: number;
   targetClipDurationMaxSec?: number;
+  signal?: AbortSignal;
 }): Promise<FeedResponse> {
   const query = new URLSearchParams({
     material_id: params.materialId,
@@ -806,14 +845,16 @@ export async function fetchFeed(params: {
 
   const res = await safeFetch(`${apiUrl("/feed")}?${query}`, {
     cache: "no-store",
+    signal: params.signal,
   });
 
   return parseJsonResponse<FeedResponse>(res);
 }
 
-export async function fetchRefinementStatus(jobId: string): Promise<RefinementStatusResponse> {
+export async function fetchRefinementStatus(jobId: string, options?: { signal?: AbortSignal }): Promise<RefinementStatusResponse> {
   const res = await safeFetch(apiUrl(`/reels/refinement-status/${encodeURIComponent(jobId)}`), {
     cache: "no-store",
+    signal: options?.signal,
   });
   return parseJsonResponse<RefinementStatusResponse>(res);
 }
@@ -893,6 +934,8 @@ type CommunityHistoryItemApi = {
   generation_mode?: "slow" | "fast";
   source?: "search" | "community";
   feed_query?: string | null;
+  active_index?: number | null;
+  active_reel_id?: string | null;
 };
 
 let communityHistorySyncVersion = 0;
@@ -1077,6 +1120,7 @@ function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | null {
   if (!materialId || !title) {
     return null;
   }
+  const activeIndex = Number(row.active_index);
   return {
     materialId,
     title,
@@ -1085,6 +1129,8 @@ function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | null {
     generationMode: row.generation_mode === "slow" ? "slow" : "fast",
     source: row.source === "community" ? "community" : "search",
     feedQuery: typeof row.feed_query === "string" && row.feed_query.trim() ? row.feed_query.trim() : undefined,
+    activeIndex: Number.isFinite(activeIndex) && activeIndex >= 0 ? Math.floor(activeIndex) : undefined,
+    activeReelId: typeof row.active_reel_id === "string" && row.active_reel_id.trim() ? row.active_reel_id.trim() : undefined,
   };
 }
 
@@ -1140,6 +1186,10 @@ export async function replaceCommunityHistory(items: StoredHistoryItem[]): Promi
         generation_mode: item.generationMode,
         source: item.source,
         feed_query: item.feedQuery ?? null,
+        active_index: typeof item.activeIndex === "number" && Number.isFinite(item.activeIndex)
+          ? Math.max(0, Math.floor(item.activeIndex))
+          : null,
+        active_reel_id: item.activeReelId ?? null,
       })),
     }),
   });
@@ -1428,6 +1478,10 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
     throw await buildApiError(response);
   }
   return response;
+}
+
+export function isRequestInterruptedError(error: unknown): boolean {
+  return error instanceof Error && error.message === "Request was interrupted.";
 }
 
 class ApiError extends Error {

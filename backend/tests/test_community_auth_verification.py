@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from backend.app import db as db_module
 from backend.app.config import get_settings
-from backend.app.db import fetch_one, get_conn, insert, now_iso
+from backend.app.db import dumps_json, fetch_one, get_conn, insert, now_iso
 import backend.app.main as main_module
 from backend.app.main import COMMUNITY_OWNER_HEADER, COMMUNITY_SESSION_HEADER, _hash_community_password, app
 
@@ -400,6 +400,152 @@ class CommunityAuthSecurityTests(_VerificationTestBase):
                 json={"username": "scopeduser", "password": "wrong-password"},
             )
         self.assertEqual(other_ip_response.status_code, 401, other_ip_response.text)
+
+
+class CommunityDeleteAccountTests(_VerificationTestBase):
+    def _register_and_verify(self, *, owner_key: str, username: str, password: str) -> tuple[str, str]:
+        register_response = self.client.post(
+            "/api/community/auth/register",
+            headers={COMMUNITY_OWNER_HEADER: owner_key},
+            json={
+                "username": username,
+                "email": f"{username}@example.com",
+                "password": password,
+            },
+        )
+        self.assertEqual(register_response.status_code, 201, register_response.text)
+        register_payload = register_response.json()
+        session_token = str(register_payload["session_token"])
+        verification_code = str(register_payload["verification_code_debug"])
+        account_id = str(register_payload["account"]["id"])
+
+        verify_response = self.client.post(
+            "/api/community/auth/verify",
+            headers={
+                COMMUNITY_OWNER_HEADER: owner_key,
+                COMMUNITY_SESSION_HEADER: session_token,
+            },
+            json={"code": verification_code},
+        )
+        self.assertEqual(verify_response.status_code, 200, verify_response.text)
+        self.assertTrue(verify_response.json()["account"]["is_verified"])
+        return account_id, session_token
+
+    def test_delete_account_removes_account_sessions_and_owned_data(self) -> None:
+        owner_key = "delete-owner-key-abcdefghijklmnopqrstuvwxyz"
+        username = "deleteowner"
+        password = "correct-password"
+        account_id, session_token = self._register_and_verify(owner_key=owner_key, username=username, password=password)
+        timestamp = now_iso()
+
+        with get_conn(transactional=True) as conn:
+            insert(
+                conn,
+                "community_sets",
+                {
+                    "id": "user-set-delete-me",
+                    "title": "Delete Me",
+                    "description": "This description is long enough to satisfy the backend validation.",
+                    "tags_json": dumps_json(["cleanup"]),
+                    "reels_json": dumps_json(
+                        [
+                            {
+                                "id": "delete-reel",
+                                "platform": "youtube",
+                                "source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                                "embed_url": "https://www.youtube.com/embed/dQw4w9WgXcQ",
+                                "t_start_sec": 0,
+                                "t_end_sec": 30,
+                            }
+                        ]
+                    ),
+                    "reel_count": 1,
+                    "curator": "Delete Owner",
+                    "likes": 0,
+                    "learners": 1,
+                    "updated_label": "Last Edited: just now",
+                    "thumbnail_url": "https://example.com/thumb.png",
+                    "owner_key_hash": hashlib.sha256(owner_key.encode("utf-8")).hexdigest(),
+                    "owner_account_id": account_id,
+                    "visibility": "private",
+                    "featured": 0,
+                    "created_at": timestamp,
+                    "updated_at": timestamp,
+                },
+            )
+            insert(
+                conn,
+                "community_material_history",
+                {
+                    "account_id": account_id,
+                    "material_id": "material-delete-test",
+                    "title": "Delete History",
+                    "updated_at": 1234567890,
+                    "starred": 1,
+                    "generation_mode": "fast",
+                    "source": "search",
+                    "feed_query": "delete test",
+                },
+            )
+            insert(
+                conn,
+                "community_account_settings",
+                {
+                    "account_id": account_id,
+                    "generation_mode": "fast",
+                    "default_input_mode": "source",
+                    "min_relevance_threshold": 0.3,
+                    "start_muted": 1,
+                    "video_pool_mode": "short-first",
+                    "preferred_video_duration": "any",
+                    "target_clip_duration_sec": 55,
+                    "target_clip_duration_min_sec": 20,
+                    "target_clip_duration_max_sec": 55,
+                    "updated_at": timestamp,
+                },
+            )
+
+        delete_response = self.client.post(
+            "/api/community/auth/delete-account",
+            headers={COMMUNITY_SESSION_HEADER: session_token},
+            json={"current_password": password},
+        )
+        self.assertEqual(delete_response.status_code, 204, delete_response.text)
+
+        with get_conn(transactional=True) as conn:
+            self.assertIsNone(fetch_one(conn, "SELECT id FROM community_accounts WHERE id = ? LIMIT 1", (account_id,)))
+            self.assertIsNone(fetch_one(conn, "SELECT id FROM community_sessions WHERE account_id = ? LIMIT 1", (account_id,)))
+            self.assertIsNone(fetch_one(conn, "SELECT id FROM community_sets WHERE owner_account_id = ? LIMIT 1", (account_id,)))
+            self.assertIsNone(fetch_one(conn, "SELECT material_id FROM community_material_history WHERE account_id = ? LIMIT 1", (account_id,)))
+            self.assertIsNone(fetch_one(conn, "SELECT account_id FROM community_account_settings WHERE account_id = ? LIMIT 1", (account_id,)))
+
+        login_response = self.client.post(
+            "/api/community/auth/login",
+            json={"username": username, "password": password},
+        )
+        self.assertEqual(login_response.status_code, 401, login_response.text)
+        self.assertIn("incorrect username or password", login_response.json()["detail"].lower())
+
+    def test_delete_account_rejects_incorrect_password_without_deleting(self) -> None:
+        owner_key = "delete-wrong-password-owner-key-abcdefghijklmnopqrstuvwxyz"
+        password = "correct-password"
+        account_id, session_token = self._register_and_verify(
+            owner_key=owner_key,
+            username="deletewrongpassword",
+            password=password,
+        )
+
+        delete_response = self.client.post(
+            "/api/community/auth/delete-account",
+            headers={COMMUNITY_SESSION_HEADER: session_token},
+            json={"current_password": "wrong-password"},
+        )
+        self.assertEqual(delete_response.status_code, 401, delete_response.text)
+        self.assertIn("current password is incorrect", delete_response.json()["detail"].lower())
+
+        with get_conn(transactional=True) as conn:
+            self.assertIsNotNone(fetch_one(conn, "SELECT id FROM community_accounts WHERE id = ? LIMIT 1", (account_id,)))
+            self.assertIsNotNone(fetch_one(conn, "SELECT id FROM community_sessions WHERE account_id = ? LIMIT 1", (account_id,)))
 
 
 class VerificationDisabledModeTests(_VerificationTestBase):

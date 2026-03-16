@@ -61,12 +61,28 @@ class MaterialIntelligenceService:
             "time complexity",
             "dynamic programming",
         ),
+        "machine learning": (
+            "supervised learning",
+            "unsupervised learning",
+            "regression",
+            "classification",
+            "neural networks",
+            "model evaluation",
+        ),
         "linear algebra": (
             "vectors",
             "matrices",
             "linear transformations",
             "eigenvalues",
             "eigenvectors",
+        ),
+        "photosynthesis": (
+            "light dependent reactions",
+            "calvin cycle",
+            "chloroplast",
+            "carbon fixation",
+            "atp and nadph",
+            "stomata",
         ),
         "probability": (
             "conditional probability",
@@ -75,12 +91,28 @@ class MaterialIntelligenceService:
             "distributions",
             "bayes theorem",
         ),
+        "python programming": (
+            "variables",
+            "loops",
+            "functions",
+            "lists and dictionaries",
+            "classes and objects",
+            "file handling",
+        ),
         "statistics": (
             "descriptive statistics",
             "probability distributions",
             "hypothesis testing",
             "confidence intervals",
             "regression",
+        ),
+        "world war ii": (
+            "causes of world war ii",
+            "european theater",
+            "pacific theater",
+            "d day",
+            "axis and allies",
+            "holocaust",
         ),
     }
 

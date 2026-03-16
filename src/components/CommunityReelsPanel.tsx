@@ -19,6 +19,7 @@ import {
   saveOwnedCommunitySetIds,
   updateCommunitySet,
 } from "@/lib/api";
+import { safeStorageRemoveItem, safeStorageSetItem } from "@/lib/browserStorage";
 import type { CommunityAccount } from "@/lib/types";
 import { ViewportModalPortal } from "@/components/ViewportModalPortal";
 import { loadYouTubeIframeApi } from "@/lib/youtubeIframeApi";
@@ -1096,6 +1097,7 @@ export function CommunityReelsPanel({
     let cancelled = false;
     let authSyncSequence = 0;
     setPortalReady(true);
+    safeStorageRemoveItem(window.localStorage, COMMUNITY_SETS_STORAGE_KEY);
     const starredSetIdsRaw = window.localStorage.getItem(COMMUNITY_STARRED_SET_IDS_STORAGE_KEY);
     if (starredSetIdsRaw) {
       try {
@@ -1224,13 +1226,6 @@ export function CommunityReelsPanel({
     if (typeof window === "undefined" || !storageHydrated) {
       return;
     }
-    window.localStorage.setItem(COMMUNITY_SETS_STORAGE_KEY, JSON.stringify(publicSets.slice(0, MAX_USER_SETS)));
-  }, [publicSets, storageHydrated]);
-
-  useEffect(() => {
-    if (typeof window === "undefined" || !storageHydrated) {
-      return;
-    }
     saveOwnedCommunitySetIds(ownedSetIds);
   }, [ownedSetIds, storageHydrated]);
 
@@ -1238,7 +1233,7 @@ export function CommunityReelsPanel({
     if (typeof window === "undefined" || !starredSetsHydrated) {
       return;
     }
-    window.localStorage.setItem(COMMUNITY_STARRED_SET_IDS_STORAGE_KEY, JSON.stringify(starredSetIds));
+    safeStorageSetItem(window.localStorage, COMMUNITY_STARRED_SET_IDS_STORAGE_KEY, JSON.stringify(starredSetIds));
   }, [starredSetIds, starredSetsHydrated]);
 
   useEffect(() => {
@@ -2390,27 +2385,22 @@ export function CommunityReelsPanel({
     if (typeof window === "undefined") {
       return { ok: false, error: "Draft storage is unavailable in this environment." };
     }
-    try {
-      window.localStorage.setItem(storageKey, JSON.stringify(draftPayload));
+    if (safeStorageSetItem(window.localStorage, storageKey, JSON.stringify(draftPayload))) {
       return { ok: true };
-    } catch {
-      // If storage quota is tight (large thumbnail previews), retry with a compact draft.
-      const compactDraft: StoredSetDraft = {
-        ...draftPayload,
-        thumbnailPreview: "",
-        thumbnailFileName: draftPayload.thumbnailFileName || "",
-      };
-      try {
-        window.localStorage.setItem(storageKey, JSON.stringify(compactDraft));
-        return {
-          ok: true,
-          warning: "Draft saved without thumbnail preview due browser storage limits.",
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : "Could not save draft progress.";
-        return { ok: false, error: message };
-      }
     }
+    // If storage quota is tight (large thumbnail previews), retry with a compact draft.
+    const compactDraft: StoredSetDraft = {
+      ...draftPayload,
+      thumbnailPreview: "",
+      thumbnailFileName: draftPayload.thumbnailFileName || "",
+    };
+    if (safeStorageSetItem(window.localStorage, storageKey, JSON.stringify(compactDraft))) {
+      return {
+        ok: true,
+        warning: "Draft saved without thumbnail preview due to browser storage limits.",
+      };
+    }
+    return { ok: false, error: "Could not save draft progress." };
   }, []);
 
   const saveCurrentDraftProgress = useCallback((options?: { showSuccessMessage?: boolean }): boolean => {
