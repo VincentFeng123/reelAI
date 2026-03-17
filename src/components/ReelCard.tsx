@@ -10,8 +10,10 @@ type Props = {
   isActive: boolean;
   mutedPreference: boolean;
   onMutedPreferenceChange: (nextMuted: boolean) => void;
-  captionsEnabled: boolean;
-  onCaptionsEnabledChange: (nextEnabled: boolean) => void;
+  autoplayEnabled: boolean;
+  onAutoplayEnabledChange: (nextEnabled: boolean) => void;
+  playbackRate: number;
+  onPlaybackRateChange: (nextRate: number) => void;
   onOpenContent?: () => void;
 };
 
@@ -22,7 +24,10 @@ type YouTubePlayer = {
   seekTo: (seconds: number, allowSeekAhead: boolean) => void;
   getCurrentTime: () => number;
   getDuration?: () => number;
+  getAvailablePlaybackRates?: () => number[];
+  getPlayerState?: () => number;
   mute: () => void;
+  setPlaybackRate?: (rate: number) => void;
   unMute: () => void;
 };
 
@@ -32,6 +37,7 @@ const PLAYER_REVEAL_DELAY_MS = 0;
 const RESUME_MASK_MS = 480;
 const AUTOPLAY_RETRY_DELAY_MS = 320;
 const AUTOPLAY_MAX_RETRIES = 5;
+const PLAYBACK_SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 
 function detectTouchLikeDevice(): boolean {
   if (typeof window === "undefined") {
@@ -104,22 +110,31 @@ function formatClock(seconds: number): string {
   return `${m}:${String(rem).padStart(2, "0")}`;
 }
 
+function formatPlaybackRate(rate: number): string {
+  return `${Number.isInteger(rate) ? rate.toFixed(0) : rate.toFixed(2).replace(/0$/, "")}x`;
+}
+
 export function ReelCard({
   reel,
   isActive,
   mutedPreference,
   onMutedPreferenceChange,
-  captionsEnabled,
-  onCaptionsEnabledChange,
+  autoplayEnabled,
+  onAutoplayEnabledChange,
+  playbackRate,
+  onPlaybackRateChange,
   onOpenContent,
 }: Props) {
   const hostContainerRef = useRef<HTMLDivElement | null>(null);
+  const playbackMenuRef = useRef<HTMLDivElement | null>(null);
   const playerRef = useRef<YouTubePlayer | null>(null);
   const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const resumeMaskTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoplayRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoplayRetryCountRef = useRef(0);
+  const autoplayEnabledRef = useRef(autoplayEnabled);
+  const playbackRateRef = useRef(playbackRate);
   const didUserInteractRef = useRef(false);
   const manualPauseRequestedRef = useRef(false);
   const isMutedRef = useRef(mutedPreference);
@@ -134,6 +149,7 @@ export function ReelCard({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isTouchLikeDevice, setIsTouchLikeDevice] = useState(false);
   const [isMobilePhoneDevice, setIsMobilePhoneDevice] = useState(false);
+  const [isPlaybackMenuOpen, setIsPlaybackMenuOpen] = useState(false);
 
   const videoId = useMemo(() => extractVideoId(reel.video_url), [reel.video_url]);
   const videoProvider = useMemo(() => detectVideoProvider(reel.video_url), [reel.video_url]);
@@ -176,18 +192,19 @@ export function ReelCard({
   const progressPercent = clipDuration > 0 ? clamp((currentSec / clipDuration) * 100, 0, 100) : 0;
   const reelProgressStyle = { width: `${progressPercent}%` } as CSSProperties;
   const reelProgressDotStyle = { left: `${progressPercent}%` } as CSSProperties;
-  const showCaptions = captionsEnabled;
-  const captionCues = useMemo(
-    () =>
-      (reel.captions ?? [])
-        .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && Boolean(cue.text?.trim()))
-        .sort((a, b) => a.start - b.start),
-    [reel.captions],
-  );
+  const playbackRateIndex = Math.max(0, PLAYBACK_SPEED_OPTIONS.findIndex((rate) => rate === playbackRate));
 
   useEffect(() => {
     isMutedRef.current = isMuted;
   }, [isMuted]);
+
+  useEffect(() => {
+    autoplayEnabledRef.current = autoplayEnabled;
+  }, [autoplayEnabled]);
+
+  useEffect(() => {
+    playbackRateRef.current = playbackRate;
+  }, [playbackRate]);
 
   useEffect(() => {
     setDetectedDurationSec(null);
@@ -298,6 +315,22 @@ export function ReelCard({
     setCurrentSec(rel);
   }, [clipDuration, clipEnd, clipStart, syncDetectedDurationFromPlayer]);
 
+  const applyPlaybackRateToPlayer = useCallback((player: YouTubePlayer | null, nextRate: number) => {
+    if (!player?.setPlaybackRate) {
+      return;
+    }
+    const availableRates = player.getAvailablePlaybackRates?.();
+    const resolvedRate =
+      Array.isArray(availableRates) && availableRates.length > 0 && !availableRates.includes(nextRate)
+        ? (availableRates.includes(1) ? 1 : availableRates[0] ?? nextRate)
+        : nextRate;
+    try {
+      player.setPlaybackRate(resolvedRate);
+    } catch {
+      // Ignore unsupported playback rate updates from the iframe API.
+    }
+  }, []);
+
   const startProgressTimer = useCallback(() => {
     stopProgressTimer();
     progressTimerRef.current = setInterval(() => {
@@ -384,6 +417,36 @@ export function ReelCard({
   }, [clearAutoplayRetryTimer, clearRevealTimer, clearResumeMaskTimer, destroyPlayerSafely, stopProgressTimer]);
 
   useEffect(() => {
+    if (!isPlaybackMenuOpen) {
+      return;
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (!target || playbackMenuRef.current?.contains(target)) {
+        return;
+      }
+      setIsPlaybackMenuOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setIsPlaybackMenuOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [isPlaybackMenuOpen]);
+
+  useEffect(() => {
+    if (!isActive) {
+      setIsPlaybackMenuOpen(false);
+    }
+  }, [isActive]);
+
+  useEffect(() => {
     stopProgressTimer();
     clearRevealTimer();
     clearResumeMaskTimer();
@@ -441,7 +504,7 @@ export function ReelCard({
           height: "100%",
           videoId,
           playerVars: {
-            autoplay: 1,
+            autoplay: autoplayEnabledRef.current ? 1 : 0,
             controls: 0,
             disablekb: 1,
             fs: 0,
@@ -459,9 +522,10 @@ export function ReelCard({
               if (cancelled) {
                 return;
               }
+              applyPlaybackRateToPlayer(event.target as YouTubePlayer, playbackRateRef.current);
               syncDetectedDurationFromPlayer(event.target as YouTubePlayer);
               const tryAutoplay = () => {
-                if (cancelled || !isActive || didUserInteractRef.current) {
+                if (cancelled || !isActive || !autoplayEnabledRef.current || didUserInteractRef.current) {
                   return;
                 }
                 event.target.mute();
@@ -471,7 +535,7 @@ export function ReelCard({
               };
               const queueAutoplayRetry = () => {
                 clearAutoplayRetryTimer();
-                if (cancelled || !isActive || didUserInteractRef.current) {
+                if (cancelled || !isActive || !autoplayEnabledRef.current || didUserInteractRef.current) {
                   return;
                 }
                 if (autoplayRetryCountRef.current >= AUTOPLAY_MAX_RETRIES) {
@@ -492,16 +556,27 @@ export function ReelCard({
                   queueAutoplayRetry();
                 }, AUTOPLAY_RETRY_DELAY_MS);
               };
-              // Mobile browsers commonly block autoplay with sound; always start muted and retry.
               autoplayRetryCountRef.current = 0;
-              tryAutoplay();
-              setIsMuted(true);
+              if (autoplayEnabledRef.current) {
+                // Mobile browsers commonly block autoplay with sound; always start muted and retry.
+                tryAutoplay();
+                setIsMuted(true);
+                queueAutoplayRetry();
+              } else {
+                clearAutoplayRetryTimer();
+                if (mutedPreference) {
+                  event.target.mute();
+                  setIsMuted(true);
+                } else {
+                  event.target.unMute();
+                  setIsMuted(false);
+                }
+              }
               setIsReady(true);
               setIsPlaying(false);
               setCurrentSec(0);
               setIsSurfaceVisible(true);
               scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
-              queueAutoplayRetry();
             },
             onStateChange: (event: any) => {
               if (cancelled) {
@@ -510,6 +585,7 @@ export function ReelCard({
               syncDetectedDurationFromPlayer(event.target as YouTubePlayer);
               const state = event.data;
               const playerState = yt.PlayerState;
+              const shouldResumePlayback = autoplayEnabledRef.current || didUserInteractRef.current;
               if (state === playerState.PLAYING) {
                 clearAutoplayRetryTimer();
                 autoplayRetryCountRef.current = 0;
@@ -521,11 +597,16 @@ export function ReelCard({
                 setIsResumeMaskVisible(false);
                 stopProgressTimer();
                 syncProgress();
-                if (isActive && !manualPauseRequestedRef.current && autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES) {
+                if (
+                  isActive
+                  && shouldResumePlayback
+                  && !manualPauseRequestedRef.current
+                  && autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES
+                ) {
                   clearAutoplayRetryTimer();
                   autoplayRetryTimerRef.current = setTimeout(() => {
                     autoplayRetryTimerRef.current = null;
-                    if (cancelled || !isActive || manualPauseRequestedRef.current) {
+                    if (cancelled || !isActive || manualPauseRequestedRef.current || !(autoplayEnabledRef.current || didUserInteractRef.current)) {
                       return;
                     }
                     autoplayRetryCountRef.current += 1;
@@ -542,6 +623,13 @@ export function ReelCard({
                 }
               } else if (state === playerState.ENDED) {
                 clearAutoplayRetryTimer();
+                if (!shouldResumePlayback) {
+                  setIsPlaying(false);
+                  setCurrentSec(0);
+                  stopProgressTimer();
+                  event.target.seekTo(clipStart, true);
+                  return;
+                }
                 manualPauseRequestedRef.current = false;
                 event.target.seekTo(clipStart, true);
                 event.target.playVideo();
@@ -550,7 +638,7 @@ export function ReelCard({
                 setCurrentSec(0);
                 scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
                 startProgressTimer();
-              } else if ((state === playerState.UNSTARTED || state === playerState.CUED) && isActive) {
+              } else if ((state === playerState.UNSTARTED || state === playerState.CUED) && isActive && shouldResumePlayback) {
                 // Retry autoplay for devices that initially report cued/unstarted.
                 manualPauseRequestedRef.current = false;
                 if (autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES) {
@@ -699,6 +787,75 @@ export function ReelCard({
     onMutedPreferenceChange(nextMuted);
   }, [clearAutoplayRetryTimer, isMuted, isReady, isYouTubeVideo, onMutedPreferenceChange]);
 
+  useEffect(() => {
+    if (!isYouTubeVideo) {
+      return;
+    }
+    const player = playerRef.current;
+    if (!player || !isReady) {
+      return;
+    }
+    applyPlaybackRateToPlayer(player, playbackRate);
+  }, [applyPlaybackRateToPlayer, isReady, isYouTubeVideo, playbackRate]);
+
+  const toggleAutoplayPreference = useCallback(() => {
+    const nextEnabled = !autoplayEnabled;
+    autoplayEnabledRef.current = nextEnabled;
+    onAutoplayEnabledChange(nextEnabled);
+    if (!nextEnabled) {
+      clearAutoplayRetryTimer();
+      return;
+    }
+    if (!isYouTubeVideo) {
+      return;
+    }
+    const player = playerRef.current;
+    if (!player || !isReady || isPlaying || manualPauseRequestedRef.current) {
+      return;
+    }
+    if (isMutedRef.current) {
+      player.mute();
+      setIsMuted(true);
+    } else {
+      player.unMute();
+      setIsMuted(false);
+    }
+    didUserInteractRef.current = true;
+    manualPauseRequestedRef.current = false;
+    showResumeMask(RESUME_MASK_MS);
+    scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
+    setIsSurfaceVisible(true);
+    player.seekTo(clipStart + clamp(currentSec, 0, clipDuration), true);
+    player.playVideo();
+    setIsPlaying(true);
+    startProgressTimer();
+  }, [
+    autoplayEnabled,
+    clearAutoplayRetryTimer,
+    clipDuration,
+    clipStart,
+    currentSec,
+    isPlaying,
+    isReady,
+    isYouTubeVideo,
+    onAutoplayEnabledChange,
+    scheduleSurfaceReveal,
+    showResumeMask,
+    startProgressTimer,
+  ]);
+
+  const handlePlaybackRateChange = useCallback((nextRate: number) => {
+    playbackRateRef.current = nextRate;
+    applyPlaybackRateToPlayer(playerRef.current, nextRate);
+    onPlaybackRateChange(nextRate);
+  }, [applyPlaybackRateToPlayer, onPlaybackRateChange]);
+
+  const handlePlaybackRateSliderChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    const nextIndex = clamp(Math.round(Number(event.target.value)), 0, PLAYBACK_SPEED_OPTIONS.length - 1);
+    const nextRate = PLAYBACK_SPEED_OPTIONS[nextIndex] ?? 1;
+    handlePlaybackRateChange(nextRate);
+  }, [handlePlaybackRateChange]);
+
   const onSeek = useCallback(
     (event: React.ChangeEvent<HTMLInputElement>) => {
       if (!isYouTubeVideo) {
@@ -728,10 +885,6 @@ export function ReelCard({
     event.stopPropagation();
   }, []);
 
-  const toggleCaptions = useCallback(() => {
-    onCaptionsEnabledChange(!captionsEnabled);
-  }, [captionsEnabled, onCaptionsEnabledChange]);
-
   useEffect(() => {
     if (!isActive) {
       return;
@@ -742,8 +895,7 @@ export function ReelCard({
       }
       const isSpace = event.code === "Space" || event.key === " ";
       const isMute = event.code === "KeyM" || event.key.toLowerCase() === "m";
-      const isCaptions = event.code === "KeyC" || event.key.toLowerCase() === "c";
-      if (!isSpace && !isMute && !isCaptions) {
+      if (!isSpace && !isMute) {
         return;
       }
       const target = event.target as HTMLElement | null;
@@ -768,47 +920,24 @@ export function ReelCard({
         toggleMute();
         return;
       }
-      toggleCaptions();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [isActive, toggleCaptions, toggleMute, togglePlayPause]);
+  }, [isActive, toggleMute, togglePlayPause]);
 
   const hidePlayerSurface = isActive && isYouTubeVideo && (!isReady || !isPlaying || !isSurfaceVisible || Boolean(loadError));
   const showTransitionMask = isActive && isYouTubeVideo && isResumeMaskVisible;
   const canToggleFromSurface = isYouTubeVideo && isActive && isReady && !loadError;
   const surfaceAriaLabel = isPlaying ? "Pause clip" : "Play clip";
   const controlsEnabled = isReady && isActive && isYouTubeVideo;
-  const activeCaptionText = useMemo(() => {
-    if (!showCaptions) {
-      return "";
-    }
-    if (captionCues.length === 0) {
-      return isMobilePhoneDevice ? "" : "No caption available.";
-    }
-
-    const now = clamp(currentSec, 0, clipDuration);
-    const active = captionCues.find((cue) => now >= cue.start - 0.05 && now <= cue.end + 0.04);
-    if (active) {
-      return active.text;
-    }
-    for (let i = captionCues.length - 1; i >= 0; i -= 1) {
-      const cue = captionCues[i];
-      if (now > cue.end && now - cue.end <= 0.28) {
-        return cue.text;
-      }
-    }
-    return "";
-  }, [captionCues, clipDuration, currentSec, isMobilePhoneDevice, showCaptions]);
-  const captionClass = isMobilePhoneDevice
-    ? "max-w-[92%] px-1 text-center text-[12px] font-medium leading-relaxed text-white/96 [text-shadow:0_1px_3px_rgba(0,0,0,0.9)]"
-    : "max-w-[92%] rounded-xl border border-white/16 bg-black/72 px-3 py-2 text-center text-[12px] font-medium leading-relaxed text-white/96 backdrop-blur-sm";
   const controlButtonClass = (active: boolean) =>
-    `grid h-9 w-9 place-items-center text-base transition ${
-      active ? "text-white" : "text-white/88 hover:text-white"
-    } disabled:text-white/35`;
+    `grid h-9 w-9 place-items-center rounded-full text-base transition-colors duration-200 disabled:pointer-events-none disabled:text-white/35 ${
+      active
+        ? "bg-white/12 text-white"
+        : "bg-transparent text-white/88 hover:bg-white/10 hover:text-white"
+    }`;
   const controlsChromeClass = isMobilePhoneDevice
     ? "rounded-2xl border border-white/20 bg-black/70 px-3 py-2 shadow-[0_10px_26px_rgba(0,0,0,0.38)] backdrop-blur-md"
     : "px-0 py-0";
@@ -881,14 +1010,6 @@ export function ReelCard({
         className="absolute inset-x-0 bottom-0 z-20 p-3"
       >
         <div className={controlsChromeClass}>
-          {isYouTubeVideo && showCaptions && activeCaptionText ? (
-            <div className="mb-2 flex justify-center px-1">
-              <p className={captionClass}>
-                {activeCaptionText}
-              </p>
-            </div>
-          ) : null}
-
           <div className="mb-2 flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <div className="inline-flex h-9 items-center rounded-full border border-white/30 bg-black/82 px-3 text-[10px] font-semibold uppercase tracking-[0.08em] text-white/92">
@@ -907,7 +1028,7 @@ export function ReelCard({
             </div>
             <div className="flex items-center gap-2">
               {isYouTubeVideo ? (
-                <>
+                <div ref={playbackMenuRef} className="relative flex items-center gap-2">
                   <button
                     type="button"
                     data-reel-control="true"
@@ -932,15 +1053,81 @@ export function ReelCard({
                   <button
                     type="button"
                     data-reel-control="true"
-                    onClick={toggleCaptions}
-                    className={controlButtonClass(showCaptions)}
-                    disabled={!controlsEnabled}
-                    aria-label={showCaptions ? "Hide captions" : "Show captions"}
-                    title={showCaptions ? "Hide captions" : "Show captions"}
+                    onClick={() => setIsPlaybackMenuOpen((prev) => !prev)}
+                    className={controlButtonClass(isPlaybackMenuOpen)}
+                    aria-label="Playback settings"
+                    aria-expanded={isPlaybackMenuOpen}
+                    aria-haspopup="menu"
+                    title="Playback settings"
                   >
-                    <i className="fa-regular fa-closed-captioning" aria-hidden="true" />
+                    <i className="fa-solid fa-ellipsis" aria-hidden="true" />
                   </button>
-                </>
+                  <div
+                    className={`absolute bottom-full right-0 z-30 mb-2 w-56 transition-opacity duration-180 ${
+                      isPlaybackMenuOpen
+                        ? "pointer-events-auto opacity-100"
+                        : "pointer-events-none opacity-0"
+                    }`}
+                  >
+                    <div
+                      role="menu"
+                      className="overflow-hidden rounded-2xl border border-white/15 bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)]"
+                    >
+                      <button
+                        type="button"
+                        data-reel-control="true"
+                        onClick={toggleAutoplayPreference}
+                        aria-pressed={autoplayEnabled}
+                        className="flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                      >
+                        <span className="flex items-center gap-2.5">
+                          <i className="fa-solid fa-play text-[11px] text-white/80" aria-hidden="true" />
+                          Autoplay
+                        </span>
+                        <span
+                          aria-hidden="true"
+                          className={`relative inline-flex h-6 w-10 shrink-0 rounded-full border transition-colors duration-200 ${
+                            autoplayEnabled ? "border-white bg-white" : "border-white/32 bg-black/50"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-0.5 h-[18px] w-[18px] rounded-full transition-transform duration-200 ${
+                              autoplayEnabled ? "translate-x-[20px] bg-black" : "translate-x-[2px] bg-white"
+                            }`}
+                          />
+                        </span>
+                      </button>
+                      <div className="mt-1 rounded-xl px-3 py-2">
+                        <div className="mb-2 flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2.5 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/58">
+                            <i className="fa-solid fa-gauge-high text-[11px] text-white/72" aria-hidden="true" />
+                            Speed
+                          </div>
+                          <span className="rounded-full bg-white px-2 py-0.5 text-[10px] font-semibold tracking-[0.04em] text-black">
+                            {formatPlaybackRate(playbackRate)}
+                          </span>
+                        </div>
+                        <div className="relative px-1 py-1">
+                          <input
+                            type="range"
+                            min={0}
+                            max={PLAYBACK_SPEED_OPTIONS.length - 1}
+                            step={1}
+                            value={playbackRateIndex}
+                            onChange={handlePlaybackRateSliderChange}
+                            className="playback-speed-range relative z-10 block h-4 w-full cursor-pointer"
+                            aria-label="Playback speed"
+                            aria-valuetext={formatPlaybackRate(playbackRate)}
+                          />
+                        </div>
+                        <div className="mt-0.5 flex items-center justify-between px-1 text-[9px] font-semibold text-white/58">
+                          <span>{PLAYBACK_SPEED_OPTIONS[0]}</span>
+                          <span>{PLAYBACK_SPEED_OPTIONS[PLAYBACK_SPEED_OPTIONS.length - 1]}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
               ) : (
                 <a
                   href={reel.video_url}

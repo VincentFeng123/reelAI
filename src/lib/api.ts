@@ -607,6 +607,7 @@ type GenerateReelsParams = {
   materialId: string;
   numReels?: number;
   conceptId?: string;
+  excludeVideoIds?: string[];
   generationMode?: "slow" | "fast";
   minRelevance?: number;
   videoPoolMode?: VideoPoolMode;
@@ -616,11 +617,19 @@ type GenerateReelsParams = {
   targetClipDurationMaxSec?: number;
 };
 
+function normalizeVideoIdList(values: string[] | undefined): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return Array.from(new Set(values.map((value) => String(value || "").trim()).filter(Boolean)));
+}
+
 function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<string, unknown> {
   return {
     material_id: params.materialId,
     concept_id: params.conceptId,
     num_reels: params.numReels ?? 7,
+    exclude_video_ids: normalizeVideoIdList(params.excludeVideoIds),
     creative_commons_only: false,
     generation_mode: params.generationMode ?? "fast",
     min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
@@ -808,6 +817,7 @@ export async function fetchFeed(params: {
   materialId: string;
   page: number;
   limit: number;
+  excludeVideoIds?: string[];
   prefetch?: number;
   autofill?: boolean;
   generationMode?: "slow" | "fast";
@@ -842,10 +852,15 @@ export async function fetchFeed(params: {
   if (Number.isFinite(params.minRelevance)) {
     query.set("min_relevance", String(params.minRelevance));
   }
+  const excludeVideoIds = normalizeVideoIdList(params.excludeVideoIds);
+  if (excludeVideoIds.length > 0) {
+    query.set("exclude_video_ids", excludeVideoIds.join(","));
+  }
 
   const res = await safeFetch(`${apiUrl("/feed")}?${query}`, {
     cache: "no-store",
     signal: params.signal,
+    timeoutMs: 45_000,
   });
 
   return parseJsonResponse<FeedResponse>(res);
@@ -1441,7 +1456,13 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
   const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.max(1_000, timeoutRaw) : null;
   const upstreamSignal = init?.signal;
   const controller = new AbortController();
-  const timeoutId = timeoutMs ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  let didTimeout = false;
+  const timeoutId = timeoutMs
+    ? setTimeout(() => {
+      didTimeout = true;
+      controller.abort();
+    }, timeoutMs)
+    : null;
   const onUpstreamAbort = () => controller.abort();
 
   if (upstreamSignal) {
@@ -1462,9 +1483,12 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
     response = await fetch(url, requestInit);
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
+      if (didTimeout) {
+        throw new TransportError("Request timed out before the backend responded.");
+      }
       throw new Error("Request was interrupted.");
     }
-    throw new Error(BACKEND_DOWN_ERROR);
+    throw new TransportError(BACKEND_DOWN_ERROR);
   } finally {
     if (timeoutId) {
       clearTimeout(timeoutId);
@@ -1482,6 +1506,17 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
 
 export function isRequestInterruptedError(error: unknown): boolean {
   return error instanceof Error && error.message === "Request was interrupted.";
+}
+
+class TransportError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TransportError";
+  }
+}
+
+export function isTransportError(error: unknown): boolean {
+  return error instanceof TransportError;
 }
 
 class ApiError extends Error {

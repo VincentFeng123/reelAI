@@ -946,6 +946,7 @@ class ReelService:
         concept_id: str | None,
         num_reels: int,
         creative_commons_only: bool,
+        exclude_video_ids: list[str] | None = None,
         fast_mode: bool = False,
         video_pool_mode: str = "short-first",
         preferred_video_duration: str = "any",
@@ -1226,6 +1227,10 @@ class ReelService:
                     logger.warning("Batch concept embedding failed: %s", exc)
 
         material_seen_video_ids: set[str] = set()
+        for excluded_video_id in exclude_video_ids or []:
+            clean_video_id = str(excluded_video_id or "").strip()
+            if clean_video_id:
+                material_seen_video_ids.add(clean_video_id)
 
         for concept_plan in query_plan.selected_concepts:
             raise_if_cancelled()
@@ -3024,6 +3029,23 @@ class ReelService:
                 "created_at": now_iso(),
             },
         )
+        selected_video_id = str((selected or {}).get("video_id") or "").strip()
+        log_payload = {
+            "run_id": run_id,
+            "material_id": str(run.get("material_id") or ""),
+            "concept_id": str(run.get("concept_id") or ""),
+            "concept_title": str(run.get("concept_title") or ""),
+            "selected_video_id": selected_video_id or None,
+            "failure_reason": failure_reason.strip() or None,
+            "query_count": len(query_reports),
+            "candidate_count": len(candidate_rows),
+            "dry_run": bool(dry_run),
+            "metrics": metrics or {},
+        }
+        if failure_reason.strip():
+            logger.warning("Retrieval run summary: %s", json.dumps(log_payload, sort_keys=True))
+        else:
+            logger.info("Retrieval run summary: %s", json.dumps(log_payload, sort_keys=True))
 
         for idx, row in enumerate(query_reports[:240]):
             upsert(

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import ipaddress
+import logging
 import math
 import os
 import re
@@ -87,6 +88,7 @@ from .services.text_utils import chunk_text, normalize_whitespace
 from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8601_duration
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 app = FastAPI(title="StudyReels API", version="0.1.0")
 
 
@@ -2293,6 +2295,7 @@ def _extend_active_generation(
     target_clip_duration_sec: int,
     target_clip_duration_min_sec: int | None,
     target_clip_duration_max_sec: int | None,
+    exclude_video_ids: list[str] | None = None,
     page_hint: int = 1,
     on_reel_created: Callable[[dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -2317,6 +2320,7 @@ def _extend_active_generation(
         concept_id=concept_id,
         num_reels=max(1, int(required_count)),
         creative_commons_only=creative_commons_only,
+        exclude_video_ids=exclude_video_ids,
         fast_mode=fast_mode,
         video_pool_mode=video_pool_mode,
         preferred_video_duration=preferred_video_duration,
@@ -2351,18 +2355,26 @@ def _extend_active_generation(
             target_clip_duration_sec=target_clip_duration_sec,
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
+            exclude_video_ids=exclude_video_ids,
             page=page_hint,
             limit=max(5, min(25, required_count)),
         )
-        return {
-            **_build_generation_response_payload(
-                reels=fallback_reels,
-                generation_id=active_generation_id,
-                response_profile=active_response_profile,
-                job_row=None,
-            ),
-            "request_key": request_key,
-        }
+        response_payload = _build_generation_response_payload(
+            reels=fallback_reels,
+            generation_id=active_generation_id,
+            response_profile=active_response_profile,
+            job_row=None,
+        )
+        _log_generation_response_summary(
+            event="extend_active_generation_empty",
+            material_id=material_id,
+            request_key=request_key,
+            generation_mode=generation_mode,
+            required_count=required_count,
+            response_payload=response_payload,
+            page_hint=page_hint,
+        )
+        return {**response_payload, "request_key": request_key}
 
     _activate_generation(
         conn,
@@ -2381,6 +2393,7 @@ def _extend_active_generation(
         target_clip_duration_sec=target_clip_duration_sec,
         target_clip_duration_min_sec=target_clip_duration_min_sec,
         target_clip_duration_max_sec=target_clip_duration_max_sec,
+        exclude_video_ids=exclude_video_ids,
         page=page_hint,
         limit=max(5, min(25, required_count)),
     )
@@ -2403,15 +2416,22 @@ def _extend_active_generation(
         page_hint=page_hint,
         page_size_hint=max(5, min(25, required_count)),
     )
-    return {
-        **_build_generation_response_payload(
-            reels=expanded_reels,
-            generation_id=next_generation_id,
-            response_profile="deep",
-            job_row=job_row,
-        ),
-        "request_key": request_key,
-    }
+    response_payload = _build_generation_response_payload(
+        reels=expanded_reels,
+        generation_id=next_generation_id,
+        response_profile="deep",
+        job_row=job_row,
+    )
+    _log_generation_response_summary(
+        event="extend_active_generation_complete",
+        material_id=material_id,
+        request_key=request_key,
+        generation_mode=generation_mode,
+        required_count=required_count,
+        response_payload=response_payload,
+        page_hint=page_hint,
+    )
+    return {**response_payload, "request_key": request_key}
 
 
 def _ranked_request_reels(
@@ -2425,6 +2445,7 @@ def _ranked_request_reels(
     target_clip_duration_sec: int,
     target_clip_duration_min_sec: int | None,
     target_clip_duration_max_sec: int | None,
+    exclude_video_ids: list[str] | None = None,
     page: int = 1,
     limit: int = 5,
 ) -> list[dict[str, Any]]:
@@ -2460,6 +2481,16 @@ def _ranked_request_reels(
             fast_mode=fast_mode,
             generation_id=generation_id,
         )
+    excluded_video_id_set = {
+        str(video_id or "").strip()
+        for video_id in (exclude_video_ids or [])
+        if str(video_id or "").strip()
+    }
+    if excluded_video_id_set:
+        ranked = [
+            reel for reel in ranked
+            if str(reel.get("video_id") or "").strip() not in excluded_video_id_set
+        ]
     if page <= 1:
         return _shape_request_page_reels(
             ranked,
@@ -2513,6 +2544,73 @@ def _build_generation_response_payload(
         "refinement_job_id": str((job_row or {}).get("id") or "") or None,
         "refinement_status": str((job_row or {}).get("status") or "") or None,
     }
+
+
+def _normalize_excluded_video_ids(values: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values or []:
+        clean = str(raw_value or "").strip()
+        if not clean or clean in seen:
+            continue
+        seen.add(clean)
+        normalized.append(clean)
+    return normalized
+
+
+def _parse_excluded_video_ids_param(raw_value: str | None) -> list[str]:
+    if not raw_value:
+        return []
+    return _normalize_excluded_video_ids(raw_value.split(","))
+
+
+def _short_debug_token(value: str | None, *, limit: int = 12) -> str | None:
+    clean = str(value or "").strip()
+    if not clean:
+        return None
+    if len(clean) <= limit:
+        return clean
+    return f"{clean[:limit]}..."
+
+
+def _generation_source_video_count(reels: list[dict[str, Any]]) -> int:
+    source_ids: set[str] = set()
+    for reel in reels:
+        source_id = str(reel.get("video_id") or reel.get("video_url") or "").strip()
+        if source_id:
+            source_ids.add(source_id)
+    return len(source_ids)
+
+
+def _log_generation_response_summary(
+    *,
+    event: str,
+    material_id: str,
+    request_key: str | None,
+    generation_mode: str,
+    required_count: int,
+    response_payload: dict[str, Any],
+    page_hint: int = 1,
+) -> None:
+    reels = list(response_payload.get("reels") or [])
+    payload = {
+        "event": event,
+        "material_id": material_id,
+        "request_key": _short_debug_token(request_key),
+        "generation_id": _short_debug_token(str(response_payload.get("generation_id") or "") or None),
+        "generation_mode": generation_mode,
+        "response_profile": str(response_payload.get("response_profile") or "") or None,
+        "required_count": int(max(1, required_count)),
+        "returned_count": len(reels),
+        "unique_source_videos": _generation_source_video_count(reels),
+        "page_hint": int(max(1, page_hint)),
+        "refinement_status": str(response_payload.get("refinement_status") or "") or None,
+    }
+    if len(reels) == 0:
+        logger.warning("Generation response summary: %s", json.dumps(payload, sort_keys=True))
+        return
+    if len(reels) < max(1, int(required_count or 1)) or settings.retrieval_debug_logging:
+        logger.info("Generation response summary: %s", json.dumps(payload, sort_keys=True))
 
 
 def _initial_response_reel_target(
@@ -3287,6 +3385,7 @@ def _ensure_generation_for_request(
     target_clip_duration_sec: int,
     target_clip_duration_min_sec: int | None,
     target_clip_duration_max_sec: int | None,
+    exclude_video_ids: list[str] | None = None,
     page_hint: int = 1,
     page_size_hint: int = 5,
     on_reel_created: Callable[[dict[str, Any]], None] | None = None,
@@ -3307,6 +3406,7 @@ def _ensure_generation_for_request(
         target_clip_duration_max_sec=target_clip_duration_max_sec,
     )
     fast_mode = generation_mode == "fast"
+    normalized_excluded_video_ids = _normalize_excluded_video_ids(exclude_video_ids)
     bootstrap_target = _initial_response_reel_target(
         required_count=required_count,
         generation_mode=generation_mode,
@@ -3331,6 +3431,7 @@ def _ensure_generation_for_request(
             target_clip_duration_sec=target_clip_duration_sec,
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
+            exclude_video_ids=normalized_excluded_video_ids,
             page=page_hint,
             limit=max(page_size_hint, min(25, required_count)),
         )
@@ -3383,6 +3484,7 @@ def _ensure_generation_for_request(
                     target_clip_duration_sec=target_clip_duration_sec,
                     target_clip_duration_min_sec=target_clip_duration_min_sec,
                     target_clip_duration_max_sec=target_clip_duration_max_sec,
+                    exclude_video_ids=normalized_excluded_video_ids,
                     page_hint=page_hint,
                     on_reel_created=on_reel_created,
                     should_cancel=should_cancel,
@@ -3396,15 +3498,22 @@ def _ensure_generation_for_request(
                 and len(active_reels) >= minimum_initial_response_reels
             )
         ):
-            return {
-                **_build_generation_response_payload(
-                    reels=active_reels,
-                    generation_id=active_generation_id,
-                    response_profile=active_response_profile,
-                    job_row=active_job,
-                ),
-                "request_key": request_key,
-            }
+            response_payload = _build_generation_response_payload(
+                reels=active_reels,
+                generation_id=active_generation_id,
+                response_profile=active_response_profile,
+                job_row=active_job,
+            )
+            _log_generation_response_summary(
+                event="reuse_active_generation",
+                material_id=material_id,
+                request_key=request_key,
+                generation_mode=generation_mode,
+                required_count=required_count,
+                response_payload=response_payload,
+                page_hint=page_hint,
+            )
+            return {**response_payload, "request_key": request_key}
 
     generation_id = _create_generation_row(
         conn,
@@ -3422,6 +3531,7 @@ def _ensure_generation_for_request(
         concept_id=concept_id,
         num_reels=bootstrap_target,
         creative_commons_only=creative_commons_only,
+        exclude_video_ids=normalized_excluded_video_ids,
         fast_mode=fast_mode,
         video_pool_mode=video_pool_mode,
         preferred_video_duration=preferred_video_duration,
@@ -3446,6 +3556,7 @@ def _ensure_generation_for_request(
         target_clip_duration_sec=target_clip_duration_sec,
         target_clip_duration_min_sec=target_clip_duration_min_sec,
         target_clip_duration_max_sec=target_clip_duration_max_sec,
+        exclude_video_ids=normalized_excluded_video_ids,
         page=page_hint,
         limit=max(page_size_hint, min(25, required_count)),
     )
@@ -3466,6 +3577,7 @@ def _ensure_generation_for_request(
             concept_id=concept_id,
             num_reels=shortfall,
             creative_commons_only=creative_commons_only,
+            exclude_video_ids=normalized_excluded_video_ids,
             fast_mode=fast_mode,
             video_pool_mode=video_pool_mode,
             preferred_video_duration=preferred_video_duration,
@@ -3490,6 +3602,7 @@ def _ensure_generation_for_request(
             target_clip_duration_sec=target_clip_duration_sec,
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
+            exclude_video_ids=normalized_excluded_video_ids,
         )
         if filtered:
             response_profile = "bootstrap_then_deep"
@@ -3514,17 +3627,25 @@ def _ensure_generation_for_request(
                 target_clip_duration_sec=target_clip_duration_sec,
                 target_clip_duration_min_sec=target_clip_duration_min_sec,
                 target_clip_duration_max_sec=target_clip_duration_max_sec,
+                exclude_video_ids=normalized_excluded_video_ids,
             )
         active_job = _fetch_refinement_job_for_generation(conn, str((active_generation or {}).get("id") or ""))
-        return {
-            **_build_generation_response_payload(
-                reels=fallback_reels,
-                generation_id=str((active_generation or {}).get("id") or "") or None,
-                response_profile=str((active_generation or {}).get("retrieval_profile") or "") or None,
-                job_row=active_job,
-            ),
-            "request_key": request_key,
-        }
+        response_payload = _build_generation_response_payload(
+            reels=fallback_reels,
+            generation_id=str((active_generation or {}).get("id") or "") or None,
+            response_profile=str((active_generation or {}).get("retrieval_profile") or "") or None,
+            job_row=active_job,
+        )
+        _log_generation_response_summary(
+            event="new_generation_empty",
+            material_id=material_id,
+            request_key=request_key,
+            generation_mode=generation_mode,
+            required_count=required_count,
+            response_payload=response_payload,
+            page_hint=page_hint,
+        )
+        return {**response_payload, "request_key": request_key}
 
     _activate_generation(
         conn,
@@ -3552,15 +3673,22 @@ def _ensure_generation_for_request(
         page_hint=1,
         page_size_hint=max(1, int(page_size_hint or 1)),
     )
-    return {
-        **_build_generation_response_payload(
-            reels=filtered,
-            generation_id=generation_id,
-            response_profile=response_profile,
-            job_row=job_row,
-        ),
-        "request_key": request_key,
-    }
+    response_payload = _build_generation_response_payload(
+        reels=filtered,
+        generation_id=generation_id,
+        response_profile=response_profile,
+        job_row=job_row,
+    )
+    _log_generation_response_summary(
+        event="new_generation_complete",
+        material_id=material_id,
+        request_key=request_key,
+        generation_mode=generation_mode,
+        required_count=required_count,
+        response_payload=response_payload,
+        page_hint=page_hint,
+    )
+    return {**response_payload, "request_key": request_key}
 
 
 def _normalize_datetime_for_api(value: object) -> str | None:
@@ -4400,9 +4528,22 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 target_clip_duration_sec=safe_target_clip_duration_sec,
                 target_clip_duration_min_sec=safe_target_clip_min_sec,
                 target_clip_duration_max_sec=safe_target_clip_max_sec,
+                exclude_video_ids=payload.exclude_video_ids,
                 page_hint=1,
             )
         except YouTubeApiRequestError as e:
+            logger.warning(
+                "Reels generate request failed: %s",
+                json.dumps(
+                    {
+                        "material_id": payload.material_id,
+                        "generation_mode": effective_generation_mode,
+                        "requested_num_reels": requested_num_reels,
+                        "error": str(e),
+                    },
+                    sort_keys=True,
+                ),
+            )
             raise HTTPException(status_code=502, detail=str(e)) from e
     return {
         "reels": list(generation_result.get("reels") or [])[:requested_num_reels],
@@ -4468,6 +4609,7 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
                         target_clip_duration_sec=safe_target_clip_duration_sec,
                         target_clip_duration_min_sec=safe_target_clip_min_sec,
                         target_clip_duration_max_sec=safe_target_clip_max_sec,
+                        exclude_video_ids=payload.exclude_video_ids,
                         page_hint=1,
                         on_reel_created=emit_reel,
                         emit_existing_reels=True,
@@ -4488,10 +4630,28 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
             except GenerationCancelledError:
                 pass
             except YouTubeApiRequestError as exc:
+                logger.warning(
+                    "Reels generate-stream request failed: %s",
+                    json.dumps(
+                        {
+                            "material_id": payload.material_id,
+                            "generation_mode": effective_generation_mode,
+                            "requested_num_reels": requested_num_reels,
+                            "error": str(exc),
+                        },
+                        sort_keys=True,
+                    ),
+                )
                 emit_event({"type": "error", "detail": str(exc)})
             except HTTPException as exc:
                 emit_event({"type": "error", "detail": str(exc.detail), "status_code": exc.status_code})
             except Exception as exc:
+                logger.exception(
+                    "Reels generate-stream unexpected failure material_id=%s mode=%s requested=%s",
+                    payload.material_id,
+                    effective_generation_mode,
+                    requested_num_reels,
+                )
                 emit_event({"type": "error", "detail": str(exc)})
             finally:
                 event_queue.put(None)
@@ -4951,6 +5111,7 @@ def feed(
     target_clip_duration_sec: int = DEFAULT_TARGET_CLIP_DURATION_SEC,
     target_clip_duration_min_sec: int | None = None,
     target_clip_duration_max_sec: int | None = None,
+    exclude_video_ids: str = "",
 ):
     if page < 1:
         page = 1
@@ -4974,6 +5135,7 @@ def feed(
             fast_mode = True
             prefetch = min(prefetch, 6)
         safe_min_relevance = _normalize_min_relevance(min_relevance)
+        normalized_excluded_video_ids = _parse_excluded_video_ids_param(exclude_video_ids)
         safe_video_pool_mode = _normalize_video_pool_mode(video_pool_mode)
         safe_video_duration_pref = _normalize_preferred_video_duration(preferred_video_duration)
         safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
@@ -5010,11 +5172,28 @@ def feed(
             target_clip_duration_sec=safe_target_clip_duration_sec,
             target_clip_duration_min_sec=safe_target_clip_min_sec,
             target_clip_duration_max_sec=safe_target_clip_max_sec,
+            exclude_video_ids=normalized_excluded_video_ids,
             page=page,
             limit=limit,
         )
         response_profile = str((active_generation or {}).get("retrieval_profile") or "") or None
         refinement_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
+        has_visible_reels_for_page = len(filtered_ranked) > (page - 1) * limit
+        if has_visible_reels_for_page:
+            total = len(filtered_ranked)
+            start = (page - 1) * limit
+            end = start + limit
+            reels = filtered_ranked[start:end]
+            return {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "reels": reels,
+                "generation_id": active_generation_id,
+                "response_profile": response_profile,
+                "refinement_job_id": str((refinement_job or {}).get("id") or "") or None,
+                "refinement_status": str((refinement_job or {}).get("status") or "") or None,
+            }
         refinement_job = _queue_refinement_if_needed(
             conn,
             material_id=material_id,
@@ -5034,62 +5213,6 @@ def feed(
             page_hint=page,
             page_size_hint=limit,
         )
-        # Auto-expand the feed while users scroll so we can keep serving fresh reels.
-        if autofill:
-            active_refinement_pending = str((refinement_job or {}).get("status") or "").strip().lower() in {"queued", "running"}
-            should_sync_expand = False
-            if page <= 1:
-                should_sync_expand = len(filtered_ranked) < sync_target_total
-            else:
-                should_sync_expand = len(filtered_ranked) < page * limit and not active_refinement_pending
-            if should_sync_expand:
-                try:
-                    generation_result = _ensure_generation_for_request(
-                        conn,
-                        material_id=material_id,
-                        concept_id=None,
-                        required_count=sync_target_total,
-                        sync_deep_fallback="if_empty",
-                        creative_commons_only=creative_commons_only,
-                        generation_mode="fast" if fast_mode else "slow",
-                        min_relevance=safe_min_relevance,
-                        video_pool_mode=safe_video_pool_mode,
-                        preferred_video_duration=safe_video_duration_pref,
-                        target_clip_duration_sec=safe_target_clip_duration_sec,
-                        target_clip_duration_min_sec=safe_target_clip_min_sec,
-                        target_clip_duration_max_sec=safe_target_clip_max_sec,
-                        page_hint=page,
-                        page_size_hint=limit,
-                    )
-                except YouTubeApiRequestError:
-                    generation_result = None
-                if generation_result:
-                    filtered_ranked = list(generation_result.get("reels") or [])
-                    active_generation_id = generation_result.get("generation_id")
-                    response_profile = generation_result.get("response_profile")
-                    sync_refinement_job = {
-                        "id": generation_result.get("refinement_job_id"),
-                        "status": generation_result.get("refinement_status"),
-                    } if generation_result.get("refinement_job_id") else None
-                    refinement_job = _queue_refinement_if_needed(
-                        conn,
-                        material_id=material_id,
-                        concept_id=None,
-                        request_key=request_key,
-                        generation_id=active_generation_id,
-                        current_reels=filtered_ranked,
-                        required_count=target_total if autofill else page * limit,
-                        generation_mode="fast" if fast_mode else "slow",
-                        creative_commons_only=creative_commons_only,
-                        preferred_video_duration=safe_video_duration_pref,
-                        video_pool_mode=safe_video_pool_mode,
-                        target_clip_duration_sec=safe_target_clip_duration_sec,
-                        target_clip_duration_min_sec=safe_target_clip_min_sec,
-                        target_clip_duration_max_sec=safe_target_clip_max_sec,
-                        min_relevance=safe_min_relevance,
-                        page_hint=page,
-                        page_size_hint=limit,
-                    ) or sync_refinement_job
     total = len(filtered_ranked)
     start = (page - 1) * limit
     end = start + limit

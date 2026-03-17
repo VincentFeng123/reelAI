@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import os
 import re
 import threading
@@ -20,6 +21,8 @@ from youtube_transcript_api._errors import (
 
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
+
+logger = logging.getLogger(__name__)
 
 
 class YouTubeApiRequestError(RuntimeError):
@@ -149,6 +152,7 @@ class YouTubeService:
         self.serverless_mode = bool(
             os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
         )
+        self.retrieval_debug_logging = bool(settings.retrieval_debug_logging)
         self.search_time_budget_sec = 3.5 if self.serverless_mode else self.SEARCH_TIME_BUDGET_SEC
         self.request_timeout_sec = 2.5 if self.serverless_mode else self.REQUEST_TIMEOUT_SEC
         self._session = requests.Session()
@@ -197,6 +201,57 @@ class YouTubeService:
     def _cache_set_text(self, cache_key: str, payload: str) -> None:
         with self._page_cache_lock:
             self._page_cache[cache_key] = (time.monotonic(), payload)
+
+    def _query_preview(self, query: str, *, limit: int = 96) -> str:
+        clean = self._clean_query_text(query)
+        if len(clean) <= limit:
+            return clean
+        return f"{clean[: max(0, limit - 3)].rstrip()}..."
+
+    def _row_source_counts(self, rows: list[dict[str, Any]]) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for row in rows:
+            source = str(row.get("search_source") or "").strip() or "unknown"
+            counts[source] = counts.get(source, 0) + 1
+        return counts
+
+    def _log_search_summary(
+        self,
+        *,
+        query: str,
+        max_results: int,
+        retrieval_profile: RetrievalProfile,
+        retrieval_stage: str,
+        source_surface: str,
+        creative_commons_only: bool,
+        video_duration: str | None,
+        rows: list[dict[str, Any]],
+        cache_hit: bool,
+        allow_external_fallbacks: bool,
+        graph_profile: GraphProfile,
+    ) -> None:
+        should_log = self.retrieval_debug_logging or not rows
+        if not should_log:
+            return
+        payload = {
+            "query": self._query_preview(query),
+            "max_results": int(max_results),
+            "result_count": len(rows),
+            "source_counts": self._row_source_counts(rows),
+            "retrieval_profile": retrieval_profile,
+            "retrieval_stage": retrieval_stage or "",
+            "source_surface": source_surface or "",
+            "creative_commons_only": bool(creative_commons_only),
+            "video_duration": video_duration or "any",
+            "cache_hit": bool(cache_hit),
+            "allow_external_fallbacks": bool(allow_external_fallbacks),
+            "graph_profile": graph_profile,
+            "api_key_enabled": bool(self.api_key),
+        }
+        if rows:
+            logger.info("YouTube search summary: %s", json.dumps(payload, sort_keys=True))
+        else:
+            logger.warning("YouTube search returned no rows: %s", json.dumps(payload, sort_keys=True))
 
     def search_videos(
         self,
@@ -292,12 +347,26 @@ class YouTubeService:
                     is_empty=len(payload) == 0,
                 )
                 if cache_fresh:
-                    return self._finalize_search_rows(
+                    finalized_rows = self._finalize_search_rows(
                         payload,
                         query=query,
                         max_results=max_results,
                         video_duration=video_duration,
                     )
+                    self._log_search_summary(
+                        query=query,
+                        max_results=max_results,
+                        retrieval_profile=retrieval_profile,
+                        retrieval_stage=retrieval_stage,
+                        source_surface=source_surface,
+                        creative_commons_only=creative_commons_only,
+                        video_duration=video_duration,
+                        rows=finalized_rows,
+                        cache_hit=True,
+                        allow_external_fallbacks=allow_external_fallbacks,
+                        graph_profile=graph_profile,
+                    )
+                    return finalized_rows
 
         deadline = time.monotonic() + self.search_time_budget_sec
         videos: list[dict[str, Any]] = []
@@ -346,6 +415,19 @@ class YouTubeService:
                     "created_at": now_iso(),
                 },
                 pk="cache_key",
+            )
+            self._log_search_summary(
+                query=query,
+                max_results=max_results,
+                retrieval_profile=retrieval_profile,
+                retrieval_stage=retrieval_stage,
+                source_surface=source_surface,
+                creative_commons_only=creative_commons_only,
+                video_duration=video_duration,
+                rows=videos,
+                cache_hit=False,
+                allow_external_fallbacks=allow_external_fallbacks,
+                graph_profile=graph_profile,
             )
             return videos
 
@@ -500,6 +582,19 @@ class YouTubeService:
                 "created_at": now_iso(),
             },
             pk="cache_key",
+        )
+        self._log_search_summary(
+            query=query,
+            max_results=max_results,
+            retrieval_profile=retrieval_profile,
+            retrieval_stage=retrieval_stage,
+            source_surface=source_surface,
+            creative_commons_only=creative_commons_only,
+            video_duration=video_duration,
+            rows=videos,
+            cache_hit=False,
+            allow_external_fallbacks=allow_external_fallbacks,
+            graph_profile=graph_profile,
         )
         return videos
 
@@ -2653,25 +2748,72 @@ class YouTubeService:
         clean_scope = str(scope or "").strip()
         if not clean_scope:
             return
+        prior_streak = 0
+        had_backoff = False
         with self._network_backoff_lock:
+            prior_streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0)
+            had_backoff = float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0) > time.monotonic()
             self._network_failure_streak_by_scope[clean_scope] = 0
             self._network_backoff_until_by_scope.pop(clean_scope, None)
+        if self.retrieval_debug_logging and (prior_streak > 0 or had_backoff):
+            logger.info(
+                "YouTube request recovered: %s",
+                json.dumps(
+                    {
+                        "scope": clean_scope,
+                        "prior_streak": prior_streak,
+                        "had_backoff": had_backoff,
+                    },
+                    sort_keys=True,
+                ),
+            )
 
     def _note_request_failure(self, exc: requests.RequestException, *, scope: str) -> None:
-        # Treat transport-level failures (DNS/connect/timeouts) as transient outages.
-        if getattr(exc, "response", None) is not None:
-            return
         clean_scope = str(scope or "").strip()
         if not clean_scope:
             return
+        response = getattr(exc, "response", None)
+        request = getattr(exc, "request", None)
+        request_url = str(getattr(response, "url", None) or getattr(request, "url", None) or "").strip()
+        parsed_url = urlparse(request_url)
+        url_target = (
+            f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
+            if parsed_url.scheme and parsed_url.netloc
+            else request_url
+        )
+        status_code = int(response.status_code) if getattr(response, "status_code", None) else None
+        is_transport_failure = response is None
+        streak = 0
+        backoff_remaining_sec = 0.0
         with self._network_backoff_lock:
-            streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0) + 1
-            self._network_failure_streak_by_scope[clean_scope] = streak
-            if streak >= self.NETWORK_BACKOFF_FAILURE_THRESHOLD:
-                self._network_backoff_until_by_scope[clean_scope] = max(
-                    float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
-                    time.monotonic() + self.NETWORK_BACKOFF_SEC,
-                )
+            if is_transport_failure:
+                streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0) + 1
+                self._network_failure_streak_by_scope[clean_scope] = streak
+                if streak >= self.NETWORK_BACKOFF_FAILURE_THRESHOLD:
+                    self._network_backoff_until_by_scope[clean_scope] = max(
+                        float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
+                        time.monotonic() + self.NETWORK_BACKOFF_SEC,
+                    )
+            else:
+                streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0)
+            backoff_until = float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0)
+            backoff_remaining_sec = max(0.0, backoff_until - time.monotonic())
+        logger.warning(
+            "YouTube request failure: %s",
+            json.dumps(
+                {
+                    "scope": clean_scope,
+                    "kind": "transport" if is_transport_failure else "http",
+                    "status_code": status_code,
+                    "url": url_target,
+                    "failure_streak": streak,
+                    "backoff_remaining_sec": round(backoff_remaining_sec, 2),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                sort_keys=True,
+            ),
+        )
 
     def get_transcript(self, conn, video_id: str) -> list[dict[str, Any]]:
         if conn is None:

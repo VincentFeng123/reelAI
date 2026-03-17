@@ -59,6 +59,22 @@ type SidebarSwitchIntent = {
   clearHistoryQuery?: boolean;
   resetCommunityView?: boolean;
 };
+type HistoryInfoField = {
+  label: string;
+  value: string;
+};
+type HistoryInfoSection = {
+  title: string;
+  fields: HistoryInfoField[];
+};
+type HistoryInfoPopoverState = {
+  materialId: string;
+  placement: "above" | "below";
+  insetRight: number;
+  insetTop?: number;
+  insetBottom?: number;
+  maxHeight: number;
+};
 
 const DEFAULT_SETTINGS_AVAILABILITY_STATE: SettingsAvailabilityState = {
   status: "checking",
@@ -171,6 +187,180 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
   return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_HISTORY_ITEMS);
 }
 
+function pushHistoryInfoField(fields: HistoryInfoField[], label: string, value: string | null | undefined): void {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!normalized) {
+    return;
+  }
+  fields.push({ label, value: normalized });
+}
+
+function formatHistoryInfoToken(value: string | null | undefined): string | null {
+  const normalized = String(value || "").trim();
+  if (!normalized) {
+    return null;
+  }
+  return normalized
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((part) => {
+      const lower = part.toLowerCase();
+      return `${lower.charAt(0).toUpperCase()}${lower.slice(1)}`;
+    })
+    .join(" ");
+}
+
+function formatHistoryInfoBoolean(value: boolean): string {
+  return value ? "Yes" : "No";
+}
+
+function formatHistoryInfoBooleanQuery(value: string | null): string | null {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (normalized === "1" || normalized === "true") {
+    return "Yes";
+  }
+  if (normalized === "0" || normalized === "false") {
+    return "No";
+  }
+  return null;
+}
+
+function formatHistoryInfoDate(timestamp: number): string {
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return "Unknown";
+  }
+  try {
+    return new Date(timestamp).toLocaleString(undefined, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+  } catch {
+    return new Date(timestamp).toLocaleString();
+  }
+}
+
+function formatHistoryInfoSeconds(value: string | null | undefined): string | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return `${Math.round(parsed)} sec`;
+}
+
+function formatHistoryInfoClipRange(minValue: string | null, maxValue: string | null): string | null {
+  const minLabel = formatHistoryInfoSeconds(minValue);
+  const maxLabel = formatHistoryInfoSeconds(maxValue);
+  if (!minLabel && !maxLabel) {
+    return null;
+  }
+  if (minLabel && maxLabel) {
+    return minLabel === maxLabel ? minLabel : `${minLabel} to ${maxLabel}`;
+  }
+  return minLabel || maxLabel;
+}
+
+function formatHistoryInfoStrictness(value: string | null | undefined): string | null {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return null;
+  }
+  return `${parsed.toFixed(2)} minimum relevance`;
+}
+
+function formatHistoryInfoReturnTab(value: string | null | undefined): string | null {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+  if (normalized === "create" || normalized === "edit") {
+    return "Your Sets";
+  }
+  return formatHistoryInfoToken(normalized);
+}
+
+function parseHistoryInfoQuery(feedQuery: string | undefined): URLSearchParams | null {
+  const normalized = typeof feedQuery === "string" ? feedQuery.trim() : "";
+  if (!normalized) {
+    return null;
+  }
+  return new URLSearchParams(normalized);
+}
+
+function buildHistoryInfoSections(item: HistoryItem): HistoryInfoSection[] {
+  const params = parseHistoryInfoQuery(item.feedQuery);
+  const summaryFields: HistoryInfoField[] = [];
+  const searchFields: HistoryInfoField[] = [];
+  const playbackFields: HistoryInfoField[] = [];
+
+  pushHistoryInfoField(summaryFields, "Source", item.source === "community" ? "Community" : "Search");
+  pushHistoryInfoField(summaryFields, "Generation mode", item.generationMode === "slow" ? "Slow" : "Fast");
+  pushHistoryInfoField(summaryFields, "Starred", formatHistoryInfoBoolean(item.starred));
+  pushHistoryInfoField(summaryFields, "Last updated", formatHistoryInfoDate(item.updatedAt));
+  pushHistoryInfoField(summaryFields, "Material ID", item.materialId);
+
+  const communitySetId = params?.get("community_set_id") || parseCommunitySetIdFromHistoryMaterialId(item.materialId);
+  pushHistoryInfoField(summaryFields, "Community set ID", communitySetId);
+  pushHistoryInfoField(summaryFields, "Return tab", formatHistoryInfoReturnTab(params?.get("return_tab")));
+  pushHistoryInfoField(summaryFields, "Return set ID", params?.get("return_community_set_id"));
+
+  pushHistoryInfoField(searchFields, "Strictness", formatHistoryInfoStrictness(params?.get("min_relevance")));
+  pushHistoryInfoField(searchFields, "Target clip length", formatHistoryInfoSeconds(params?.get("target_clip_duration_sec")));
+  pushHistoryInfoField(
+    searchFields,
+    "Clip length range",
+    formatHistoryInfoClipRange(params?.get("target_clip_duration_min_sec") || null, params?.get("target_clip_duration_max_sec") || null),
+  );
+  pushHistoryInfoField(searchFields, "Video pool", formatHistoryInfoToken(params?.get("video_pool_mode")));
+  pushHistoryInfoField(searchFields, "Preferred duration", formatHistoryInfoToken(params?.get("preferred_video_duration")));
+  pushHistoryInfoField(searchFields, "Start muted", formatHistoryInfoBooleanQuery(params?.get("start_muted") || null));
+  pushHistoryInfoField(searchFields, "Creative Commons only", formatHistoryInfoBooleanQuery(params?.get("creative_commons_only") || null));
+
+  if (typeof item.activeIndex === "number" && Number.isFinite(item.activeIndex) && item.activeIndex >= 0) {
+    pushHistoryInfoField(playbackFields, "Resume reel", `#${item.activeIndex + 1}`);
+  }
+  pushHistoryInfoField(playbackFields, "Active reel ID", item.activeReelId);
+  pushHistoryInfoField(playbackFields, "Community reel ID", params?.get("community_reel_id"));
+  pushHistoryInfoField(playbackFields, "Platform", formatHistoryInfoToken(params?.get("community_reel_platform")));
+  pushHistoryInfoField(playbackFields, "Clip start", formatHistoryInfoSeconds(params?.get("community_t_start_sec")));
+  pushHistoryInfoField(playbackFields, "Clip end", formatHistoryInfoSeconds(params?.get("community_t_end_sec")));
+
+  return [
+    { title: "Session details", fields: summaryFields },
+    { title: "Search settings", fields: searchFields },
+    { title: "Playback", fields: playbackFields },
+  ].filter((section) => section.fields.length > 0);
+}
+
+function buildHistoryInfoPopoverState(materialId: string, rect: DOMRect): HistoryInfoPopoverState {
+  const viewportPadding = 16;
+  const popoverGap = 10;
+  const desiredHeight = 360;
+  const spaceBelow = window.innerHeight - rect.bottom - viewportPadding - popoverGap;
+  const spaceAbove = rect.top - viewportPadding - popoverGap;
+  const shouldPlaceAbove = spaceBelow < desiredHeight && spaceAbove > spaceBelow;
+
+  if (shouldPlaceAbove) {
+    return {
+      materialId,
+      placement: "above",
+      insetRight: Math.max(viewportPadding, window.innerWidth - rect.right),
+      insetBottom: Math.max(viewportPadding, window.innerHeight - rect.top + popoverGap),
+      maxHeight: Math.max(220, spaceAbove),
+    };
+  }
+
+  return {
+    materialId,
+    placement: "below",
+    insetRight: Math.max(viewportPadding, window.innerWidth - rect.right),
+    insetTop: Math.max(viewportPadding, rect.bottom + popoverGap),
+    maxHeight: Math.max(220, spaceBelow),
+  };
+}
+
 function HomePageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -193,6 +383,7 @@ function HomePageContent() {
   const [topChromeGestureActive, setTopChromeGestureActive] = useState(false);
   const [searchPanelScrollable, setSearchPanelScrollable] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
+  const [selectedHistoryInfoPopover, setSelectedHistoryInfoPopover] = useState<HistoryInfoPopoverState | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
   const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
@@ -452,6 +643,35 @@ function HomePageContent() {
     }
     return historySorted.filter((item) => item.title.toLowerCase().includes(query));
   }, [historyQuery, historySorted]);
+  const selectedHistoryInfoItem = useMemo(
+    () => (selectedHistoryInfoPopover ? history.find((item) => item.materialId === selectedHistoryInfoPopover.materialId) ?? null : null),
+    [history, selectedHistoryInfoPopover],
+  );
+  const selectedHistoryInfoSections = useMemo(
+    () => (selectedHistoryInfoItem ? buildHistoryInfoSections(selectedHistoryInfoItem) : []),
+    [selectedHistoryInfoItem],
+  );
+  const selectedHistoryInfoQuery = useMemo(
+    () => (selectedHistoryInfoItem?.feedQuery?.trim() ? selectedHistoryInfoItem.feedQuery.trim() : null),
+    [selectedHistoryInfoItem],
+  );
+  const selectedHistoryInfoPopoverStyle = useMemo(() => {
+    if (!selectedHistoryInfoPopover) {
+      return undefined;
+    }
+    if (selectedHistoryInfoPopover.placement === "above") {
+      return {
+        right: `${selectedHistoryInfoPopover.insetRight}px`,
+        bottom: `${selectedHistoryInfoPopover.insetBottom ?? 16}px`,
+        maxHeight: `${selectedHistoryInfoPopover.maxHeight}px`,
+      };
+    }
+    return {
+      right: `${selectedHistoryInfoPopover.insetRight}px`,
+      top: `${selectedHistoryInfoPopover.insetTop ?? 16}px`,
+      maxHeight: `${selectedHistoryInfoPopover.maxHeight}px`,
+    };
+  }, [selectedHistoryInfoPopover]);
 
   const persistHistory = useCallback((next: HistoryItem[]) => {
     const scopedAccountId = resolveHistoryAccountId();
@@ -519,6 +739,7 @@ function HomePageContent() {
     setHistoryQuery("");
     setError(null);
     setActiveHistoryMenuId(null);
+    setSelectedHistoryInfoPopover(null);
     if (typeof window !== "undefined") {
       if (scopedAccountId) {
         writeScopedHistorySnapshot(scopedAccountId, JSON.stringify([]));
@@ -713,6 +934,7 @@ function HomePageContent() {
     }
     setError(null);
     setActiveHistoryMenuId(null);
+    setSelectedHistoryInfoPopover(null);
     setAccountMenuOpen(false);
     if (intent.clearHistoryQuery) {
       setHistoryQuery("");
@@ -747,6 +969,7 @@ function HomePageContent() {
 
   const openAccountScreen = useCallback(() => {
     setActiveHistoryMenuId(null);
+    setSelectedHistoryInfoPopover(null);
     setAccountMenuOpen(false);
     forceCloseMobileSidebar();
     const returnTab = activeSidebarTab === "create" ? "edit" : activeSidebarTab;
@@ -855,6 +1078,7 @@ function HomePageContent() {
         upsertHistory({ ...existing, updatedAt: Date.now() });
       }
       setActiveHistoryMenuId(null);
+      setSelectedHistoryInfoPopover(null);
       forceCloseMobileSidebar();
       const savedFeedQuery = (existing?.feedQuery || "").trim();
       if (savedFeedQuery) {
@@ -905,9 +1129,19 @@ function HomePageContent() {
       const next = historyRef.current.filter((item) => item.materialId !== materialId);
       persistHistory(next);
       setActiveHistoryMenuId((prev) => (prev === materialId ? null : prev));
+      setSelectedHistoryInfoPopover((prev) => (prev?.materialId === materialId ? null : prev));
     },
     [persistHistory],
   );
+
+  useEffect(() => {
+    if (!selectedHistoryInfoPopover) {
+      return;
+    }
+    if (!selectedHistoryInfoItem) {
+      setSelectedHistoryInfoPopover(null);
+    }
+  }, [selectedHistoryInfoItem, selectedHistoryInfoPopover]);
 
   useEffect(() => {
     if (!activeHistoryMenuId) {
@@ -927,6 +1161,28 @@ function HomePageContent() {
       window.removeEventListener("pointerdown", onPointerDown);
     };
   }, [activeHistoryMenuId]);
+
+  useEffect(() => {
+    if (!selectedHistoryInfoPopover) {
+      return;
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setSelectedHistoryInfoPopover(null);
+      }
+    };
+    const closePopover = () => {
+      setSelectedHistoryInfoPopover(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("resize", closePopover);
+    window.addEventListener("scroll", closePopover, true);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("resize", closePopover);
+      window.removeEventListener("scroll", closePopover, true);
+    };
+  }, [selectedHistoryInfoPopover]);
 
   useEffect(() => {
     if (!accountMenuOpen) {
@@ -1294,7 +1550,7 @@ function HomePageContent() {
                     </button>
 
                     <div
-                      className={`absolute right-0 top-full z-30 mt-1 w-36 transition-opacity duration-180 ${
+                      className={`absolute right-0 top-full z-30 mt-1 w-44 transition-opacity duration-180 ${
                         activeHistoryMenuId === entry.materialId
                           ? "pointer-events-auto opacity-100"
                           : "pointer-events-none opacity-0"
@@ -1308,9 +1564,21 @@ function HomePageContent() {
                           type="button"
                           onClick={(event) => {
                             event.stopPropagation();
-                            toggleHistoryStar(entry.materialId);
+                            setSelectedHistoryInfoPopover(buildHistoryInfoPopoverState(entry.materialId, event.currentTarget.getBoundingClientRect()));
+                            setActiveHistoryMenuId(null);
                           }}
                           className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                        >
+                          <i className="fa-regular fa-circle-info text-[11px] text-white/80" aria-hidden="true" />
+                          More information
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            toggleHistoryStar(entry.materialId);
+                          }}
+                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
                         >
                           <i
                             className={`fa-${entry.starred ? "solid" : "regular"} fa-star text-[11px] text-white/80`}
@@ -1686,6 +1954,80 @@ function HomePageContent() {
                   className="inline-flex min-w-[9rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
                 >
                   Save
+                </button>
+              </div>
+            </div>
+          </div>
+        </ViewportModalPortal>
+      ) : null}
+      {selectedHistoryInfoItem ? (
+        <ViewportModalPortal>
+          <div
+            className="fixed inset-0 z-[122]"
+            role="presentation"
+            onClick={() => setSelectedHistoryInfoPopover(null)}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={`${selectedHistoryInfoItem.title} history information`}
+              className="absolute flex w-[min(30rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
+              style={selectedHistoryInfoPopoverStyle}
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-white/65">More information</p>
+                  <h3 className="mt-2 text-lg font-semibold text-white">{selectedHistoryInfoItem.title}</h3>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedHistoryInfoPopover(null)}
+                  aria-label="Close"
+                  className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
+                >
+                  <svg viewBox="0 0 20 20" aria-hidden="true" className="h-4 w-4 fill-none stroke-current stroke-2">
+                    <path d="M5 5L15 15M15 5L5 15" strokeLinecap="round" />
+                  </svg>
+                </button>
+              </div>
+              <div className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
+                {selectedHistoryInfoSections.map((section) => (
+                  <section key={section.title}>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/58">{section.title}</p>
+                    <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                      {section.fields.map((field) => (
+                        <div
+                          key={`${section.title}-${field.label}`}
+                          className="rounded-2xl border border-white/12 bg-white/[0.04] px-3 py-3"
+                        >
+                          <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/52">{field.label}</p>
+                          <p className="mt-1 break-words text-sm text-white/92">{field.value}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </section>
+                ))}
+                {selectedHistoryInfoQuery ? (
+                  <section>
+                    <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/58">Saved feed query</p>
+                    <div className="mt-2 rounded-2xl border border-white/12 bg-white/[0.04] px-3 py-3">
+                      <p className="break-all font-mono text-[11px] leading-5 text-white/72">{selectedHistoryInfoQuery}</p>
+                    </div>
+                  </section>
+                ) : (
+                  <div className="rounded-2xl border border-white/12 bg-white/[0.04] px-4 py-3 text-sm text-white/72">
+                    Detailed feed settings were not saved for this history item.
+                  </div>
+                )}
+              </div>
+              <div className="mt-4 flex items-center justify-end">
+                <button
+                  type="button"
+                  onClick={() => setSelectedHistoryInfoPopover(null)}
+                  className="inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
+                >
+                  Close
                 </button>
               </div>
             </div>

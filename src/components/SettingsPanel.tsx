@@ -102,6 +102,9 @@ function SettingsInfoTooltip({ text }: { text: string }) {
       <span
         tabIndex={0}
         aria-label={text}
+        onMouseLeave={(event) => {
+          event.currentTarget.blur();
+        }}
         className="inline-flex h-4 w-4 items-center justify-center rounded-full text-white/55 transition-colors hover:text-white focus-visible:text-white focus-visible:outline-none"
       >
         <i className="fa-solid fa-circle-info text-[11px]" aria-hidden="true" />
