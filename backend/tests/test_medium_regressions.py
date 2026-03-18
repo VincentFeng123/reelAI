@@ -2163,7 +2163,10 @@ class MediumRegressionTests(unittest.TestCase):
             main_module.reel_service,
             "generate_reels",
             side_effect=fake_generate_reels,
-        ):
+        ), mock.patch.object(
+            main_module,
+            "_queue_refinement_if_needed",
+        ) as queue_refinement:
             with mock.patch.object(main_module, "get_conn") as patched_get_conn:
                 class _Ctx:
                     def __enter__(self_nonlocal):
@@ -2176,6 +2179,7 @@ class MediumRegressionTests(unittest.TestCase):
                 main_module._run_refinement_job("job-1")
 
         self.assertEqual(captured_excluded_generation_ids, [source_generation_id])
+        queue_refinement.assert_not_called()
         updated_job = conn.execute(
             "SELECT status, result_generation_id FROM reel_generation_jobs WHERE id = ?",
             ("job-1",),
@@ -2248,6 +2252,93 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertIsNotNone(job_row)
         self.assertEqual(str(job_row["id"]), "job-1")
         submit_job.assert_called_once_with("job-1")
+        conn.close()
+
+    def test_refinement_job_without_results_does_not_chain_follow_on_work(self) -> None:
+        conn = self._build_generation_test_conn()
+        request_key = "request-key"
+        source_generation_id = "bootstrap-gen"
+        conn.execute(
+            """
+            INSERT INTO reel_generations (
+                id, material_id, concept_id, request_key, generation_mode, retrieval_profile,
+                status, source_generation_id, reel_count, created_at, completed_at, activated_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                source_generation_id,
+                "material-1",
+                None,
+                request_key,
+                "fast",
+                "bootstrap",
+                "active",
+                None,
+                4,
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                "2026-03-13T00:00:00+00:00",
+                None,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO reel_generation_heads (
+                id, material_id, request_key, active_generation_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            ("head-1", "material-1", request_key, source_generation_id, "2026-03-13T00:00:00+00:00"),
+        )
+        conn.execute(
+            """
+            INSERT INTO reel_generation_jobs (
+                id, material_id, concept_id, request_key, source_generation_id, result_generation_id,
+                target_profile, request_params_json, status, created_at, started_at, completed_at, error_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "job-1",
+                "material-1",
+                None,
+                request_key,
+                source_generation_id,
+                None,
+                "deep",
+                "{}",
+                "queued",
+                "2026-03-13T00:01:00+00:00",
+                None,
+                None,
+                None,
+            ),
+        )
+
+        with mock.patch.object(main_module, "_ranked_request_reels", return_value=[]), mock.patch.object(
+            main_module.reel_service,
+            "generate_reels",
+            return_value=[],
+        ), mock.patch.object(
+            main_module,
+            "_queue_refinement_if_needed",
+        ) as queue_refinement:
+            with mock.patch.object(main_module, "get_conn") as patched_get_conn:
+                class _Ctx:
+                    def __enter__(self_nonlocal):
+                        return conn
+
+                    def __exit__(self_nonlocal, exc_type, exc, tb):
+                        return False
+
+                patched_get_conn.return_value = _Ctx()
+                main_module._run_refinement_job("job-1")
+
+        queue_refinement.assert_not_called()
+        updated_job = conn.execute(
+            "SELECT status, error_text FROM reel_generation_jobs WHERE id = ?",
+            ("job-1",),
+        ).fetchone()
+        self.assertEqual(updated_job["status"], "failed")
+        self.assertEqual(updated_job["error_text"], "no_reels_generated")
         conn.close()
 
     def test_resume_pending_refinement_jobs_requeues_active_running_jobs_and_clears_stale_ones(self) -> None:

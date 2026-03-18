@@ -3648,38 +3648,6 @@ def _run_refinement_job(job_id: str) -> None:
                     "error_text": "all_stages_exhausted" if next_state["all_stages_exhausted"] else "no_reels_generated",
                 },
             )
-            if (
-                current_active_id == source_generation_id
-                and len(source_visible_reels) < inventory_target_count
-                and not next_state["all_stages_exhausted"]
-            ):
-                _queue_refinement_if_needed(
-                    conn,
-                    material_id=str(job_row.get("material_id") or ""),
-                    concept_id=str(job_row.get("concept_id") or "") or None,
-                    request_key=str(job_row.get("request_key") or ""),
-                    generation_id=source_generation_id,
-                    current_reels=source_visible_reels,
-                    required_count=safe_required_reel_count,
-                    generation_mode=generation_mode,
-                    creative_commons_only=bool(request_params.get("creative_commons_only", False)),
-                    preferred_video_duration=safe_video_duration_pref,
-                    video_pool_mode=safe_video_pool_mode,
-                    target_clip_duration_sec=safe_target_clip_duration_sec,
-                    target_clip_duration_min_sec=safe_target_clip_min_sec,
-                    target_clip_duration_max_sec=safe_target_clip_max_sec,
-                    min_relevance=safe_min_relevance,
-                    page_hint=safe_page_hint,
-                    target_page=safe_target_page,
-                    page_size_hint=safe_page_size_hint,
-                    recovery_stage=next_state["next_stage"],
-                    refill_pass=safe_refill_pass + 1,
-                    no_new_sources_passes=next_state["no_new_sources_passes"],
-                    no_new_windows_passes=next_state["no_new_windows_passes"],
-                    no_new_visible_reels_passes=next_state["no_new_visible_reels_passes"],
-                    stage_exhausted=next_state["stage_exhausted"],
-                    growth_reason=next_state["growth_reason"],
-                )
             return
 
         if current_active_id != source_generation_id:
@@ -3757,34 +3725,10 @@ def _run_refinement_job(job_id: str) -> None:
             new_unique_clip_windows=result_count,
             new_unique_visible_reels=len(new_visible_reels),
         )
-        if len(merged_reels) < inventory_target_count and not next_state["all_stages_exhausted"]:
-            _queue_refinement_if_needed(
-                conn,
-                material_id=str(job_row.get("material_id") or ""),
-                concept_id=str(job_row.get("concept_id") or "") or None,
-                request_key=str(job_row.get("request_key") or ""),
-                generation_id=result_generation_id,
-                current_reels=merged_reels,
-                required_count=safe_required_reel_count,
-                generation_mode=generation_mode,
-                creative_commons_only=bool(request_params.get("creative_commons_only", False)),
-                preferred_video_duration=safe_video_duration_pref,
-                video_pool_mode=safe_video_pool_mode,
-                target_clip_duration_sec=safe_target_clip_duration_sec,
-                target_clip_duration_min_sec=safe_target_clip_min_sec,
-                target_clip_duration_max_sec=safe_target_clip_max_sec,
-                min_relevance=safe_min_relevance,
-                page_hint=safe_page_hint,
-                target_page=safe_target_page,
-                page_size_hint=safe_page_size_hint,
-                recovery_stage=next_state["next_stage"],
-                refill_pass=safe_refill_pass + 1,
-                no_new_sources_passes=next_state["no_new_sources_passes"],
-                no_new_windows_passes=next_state["no_new_windows_passes"],
-                no_new_visible_reels_passes=next_state["no_new_visible_reels_passes"],
-                stage_exhausted=next_state["stage_exhausted"],
-                growth_reason=next_state["growth_reason"],
-            )
+        # Keep refinement client-driven. A single queued job may finish after the
+        # user leaves the page, but it should not recursively schedule more work
+        # on its own. If the client is still active and needs more inventory, the
+        # next /api/feed or /api/reels/generate request will enqueue another pass.
 
 
 def _ensure_generation_for_request(
