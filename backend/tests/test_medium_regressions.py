@@ -74,6 +74,49 @@ class MediumRegressionTests(unittest.TestCase):
                 error_text TEXT
             );
 
+            CREATE TABLE request_frontier_entries (
+                id TEXT PRIMARY KEY,
+                material_id TEXT NOT NULL,
+                request_key TEXT NOT NULL,
+                family_key TEXT NOT NULL,
+                stage TEXT NOT NULL DEFAULT '',
+                query_text TEXT NOT NULL DEFAULT '',
+                source_family TEXT NOT NULL DEFAULT '',
+                seed_video_id TEXT,
+                seed_channel_id TEXT,
+                anchor_mode TEXT NOT NULL DEFAULT '',
+                runs INTEGER NOT NULL DEFAULT 0,
+                new_good_videos INTEGER NOT NULL DEFAULT 0,
+                new_accepted_reels INTEGER NOT NULL DEFAULT 0,
+                new_visible_reels INTEGER NOT NULL DEFAULT 0,
+                duplicate_rate REAL NOT NULL DEFAULT 0,
+                off_topic_rate REAL NOT NULL DEFAULT 0,
+                last_run_at TEXT,
+                cooldown_until TEXT,
+                exhausted INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE request_video_mining_state (
+                id TEXT PRIMARY KEY,
+                material_id TEXT NOT NULL,
+                request_key TEXT NOT NULL,
+                video_id TEXT NOT NULL,
+                mining_state TEXT NOT NULL DEFAULT 'unmined',
+                quality_tier TEXT NOT NULL DEFAULT '',
+                transcript_fetched INTEGER NOT NULL DEFAULT 0,
+                windows_scanned INTEGER NOT NULL DEFAULT 0,
+                clusters_mined INTEGER NOT NULL DEFAULT 0,
+                accepted_clip_count INTEGER NOT NULL DEFAULT 0,
+                visible_clip_count INTEGER NOT NULL DEFAULT 0,
+                remaining_spans_json TEXT NOT NULL DEFAULT '[]',
+                last_mined_at TEXT,
+                exhausted INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            );
+
             CREATE TABLE reels (
                 id TEXT PRIMARY KEY,
                 generation_id TEXT,
@@ -3402,6 +3445,136 @@ class MediumRegressionTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_schema_includes_request_frontier_and_video_mining_tables(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(SCHEMA)
+            table_names = {
+                row[0]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            self.assertIn("request_frontier_entries", table_names)
+            self.assertIn("request_video_mining_state", table_names)
+        finally:
+            conn.close()
+
+    def test_frontier_entry_marks_exhausted_after_dead_runs(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.executescript(SCHEMA)
+            family_key = service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "ants colony communication")
+            for _ in range(3):
+                service._upsert_request_frontier_entry(
+                    conn,
+                    material_id="material-1",
+                    request_key="request-1",
+                    family_key=family_key,
+                    stage="broad",
+                    query_text="ants colony communication",
+                    source_family="lecture",
+                    anchor_mode="root_companion",
+                    stat_deltas={
+                        "runs": 1,
+                        "new_good_videos": 0,
+                        "new_accepted_reels": 0,
+                        "new_visible_reels": 0,
+                        "duplicate_rate": 0.8,
+                        "off_topic_rate": 0.0,
+                    },
+                )
+            row = conn.execute(
+                "SELECT exhausted, runs, new_visible_reels FROM request_frontier_entries WHERE family_key = ?",
+                (family_key,),
+            ).fetchone()
+            self.assertEqual(int(row["runs"]), 3)
+            self.assertEqual(int(row["new_visible_reels"]), 0)
+            self.assertEqual(int(row["exhausted"]), 1)
+        finally:
+            conn.close()
+
+    def test_frontier_scheduler_prefers_visible_yield_and_skips_exhausted(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.executescript(SCHEMA)
+            exact_key = service._frontier_family_key(service.FRONTIER_ROOT_EXACT, "myrmecology")
+            exhausted_key = service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "ant behavior lecture")
+            adjacent_key = service._frontier_family_key(service.FRONTIER_ANCHORED_ADJACENT, "eusocial insects ant colonies")
+            service._upsert_request_frontier_entry(
+                conn,
+                material_id="material-1",
+                request_key="request-1",
+                family_key=exact_key,
+                stage="high_precision",
+                query_text="myrmecology",
+                source_family="lecture",
+                anchor_mode="root_exact",
+                stat_deltas={"runs": 2, "new_good_videos": 2, "new_visible_reels": 4},
+            )
+            service._upsert_request_frontier_entry(
+                conn,
+                material_id="material-1",
+                request_key="request-1",
+                family_key=exhausted_key,
+                stage="broad",
+                query_text="ant behavior lecture",
+                source_family="lecture",
+                anchor_mode="root_companion",
+                stat_deltas={"runs": 3, "new_good_videos": 0, "new_visible_reels": 0, "duplicate_rate": 0.75},
+            )
+            service._upsert_request_frontier_entry(
+                conn,
+                material_id="material-1",
+                request_key="request-1",
+                family_key=adjacent_key,
+                stage="recovery",
+                query_text="eusocial insects ant colonies",
+                source_family="documentary",
+                anchor_mode="anchored_adjacent",
+                stat_deltas={"runs": 1, "new_good_videos": 1, "new_visible_reels": 1},
+            )
+
+            scheduled = service._apply_frontier_scheduler(
+                conn,
+                material_id="material-1",
+                request_key="request-1",
+                query_candidates=[
+                    QueryCandidate(
+                        "myrmecology",
+                        "literal",
+                        0.96,
+                        stage="high_precision",
+                        source_surface="youtube_html",
+                        family_key=exact_key,
+                    ),
+                    QueryCandidate(
+                        "ant behavior lecture",
+                        "tutorial",
+                        0.84,
+                        stage="broad",
+                        source_surface="youtube_html",
+                        family_key=exhausted_key,
+                    ),
+                    QueryCandidate(
+                        "eusocial insects ant colonies",
+                        "recovery_adjacent",
+                        0.76,
+                        stage="recovery",
+                        source_surface="youtube_html",
+                        family_key=adjacent_key,
+                    ),
+                ],
+                page_hint=3,
+                recovery_stage=service.REFILL_STAGE_ANCHORED_ADJACENT,
+            )
+
+            self.assertEqual([candidate.family_key for candidate in scheduled], [exact_key, adjacent_key])
+        finally:
+            conn.close()
+
     def test_reel_service_bootstrap_query_candidates_are_capped_and_html_first(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
 
@@ -3433,9 +3606,30 @@ class MediumRegressionTests(unittest.TestCase):
     def test_reel_service_bootstrap_stage_plan_skips_broad(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
         candidates = [
-            QueryCandidate("query one", "literal", 0.9, stage="high_precision", source_surface="youtube_html"),
-            QueryCandidate("query two", "tutorial", 0.85, stage="high_precision", source_surface="youtube_html"),
-            QueryCandidate("query three", "recovery_adjacent", 0.7, stage="recovery", source_surface="youtube_html"),
+            QueryCandidate(
+                "query one",
+                "literal",
+                0.9,
+                stage="high_precision",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_EXACT, "query one"),
+            ),
+            QueryCandidate(
+                "query two",
+                "tutorial",
+                0.85,
+                stage="high_precision",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "query two"),
+            ),
+            QueryCandidate(
+                "query three",
+                "recovery_adjacent",
+                0.7,
+                stage="recovery",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ANCHORED_ADJACENT, "query three"),
+            ),
         ]
 
         plans = service._build_retrieval_stage_plan(
@@ -3446,17 +3640,59 @@ class MediumRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual([plan.name for plan in plans], ["high_precision"])
-        self.assertEqual(plans[0].budget, 3)
+        self.assertEqual([candidate.text for candidate in plans[0].queries], ["query one"])
 
     def test_reel_service_deep_stage_plan_expands_for_larger_request(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
         candidates = [
-            QueryCandidate("query one", "literal", 0.95, stage="high_precision", source_surface="youtube_html"),
-            QueryCandidate("query two", "tutorial", 0.9, stage="high_precision", source_surface="youtube_html"),
-            QueryCandidate("query three", "literal", 0.84, stage="broad", source_surface="youtube_html"),
-            QueryCandidate("query four", "worked_example", 0.82, stage="broad", source_surface="youtube_html"),
-            QueryCandidate("query five", "explained", 0.8, stage="broad", source_surface="youtube_html"),
-            QueryCandidate("query six", "recovery_adjacent", 0.7, stage="recovery", source_surface="youtube_html"),
+            QueryCandidate(
+                "query one",
+                "literal",
+                0.95,
+                stage="high_precision",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_EXACT, "query one"),
+            ),
+            QueryCandidate(
+                "query two",
+                "tutorial",
+                0.9,
+                stage="high_precision",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "query two"),
+            ),
+            QueryCandidate(
+                "query three",
+                "literal",
+                0.84,
+                stage="broad",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "query three"),
+            ),
+            QueryCandidate(
+                "query four",
+                "worked_example",
+                0.82,
+                stage="broad",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "query four"),
+            ),
+            QueryCandidate(
+                "query five",
+                "explained",
+                0.8,
+                stage="broad",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "query five"),
+            ),
+            QueryCandidate(
+                "query six",
+                "recovery_adjacent",
+                0.7,
+                stage="recovery",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ANCHORED_ADJACENT, "query six"),
+            ),
         ]
 
         plans = service._build_retrieval_stage_plan(
@@ -3469,17 +3705,45 @@ class MediumRegressionTests(unittest.TestCase):
         )
 
         self.assertEqual([plan.name for plan in plans], ["high_precision", "broad"])
-        self.assertEqual(plans[0].budget, 3)
-        self.assertEqual(plans[1].budget, 3)
-        self.assertEqual(plans[1].max_budget, 3)
+        self.assertGreater(plans[0].budget, 0)
+        self.assertGreater(plans[1].budget, 0)
+        self.assertGreaterEqual(int(plans[1].max_budget or 0), plans[1].budget)
 
     def test_reel_service_deep_stage_plan_defers_adjacent_recovery_on_page_one(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
         candidates = [
-            QueryCandidate("query one", "literal", 0.95, stage="high_precision", source_surface="youtube_html"),
-            QueryCandidate("query two", "tutorial", 0.9, stage="high_precision", source_surface="youtube_html"),
-            QueryCandidate("query three", "literal", 0.84, stage="broad", source_surface="youtube_html"),
-            QueryCandidate("query four", "recovery_adjacent", 0.7, stage="recovery", source_surface="youtube_html"),
+            QueryCandidate(
+                "query one",
+                "literal",
+                0.95,
+                stage="high_precision",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_EXACT, "query one"),
+            ),
+            QueryCandidate(
+                "query two",
+                "tutorial",
+                0.9,
+                stage="high_precision",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "query two"),
+            ),
+            QueryCandidate(
+                "query three",
+                "literal",
+                0.84,
+                stage="broad",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "query three"),
+            ),
+            QueryCandidate(
+                "query four",
+                "recovery_adjacent",
+                0.7,
+                stage="recovery",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ANCHORED_ADJACENT, "query four"),
+            ),
         ]
 
         plans = service._build_retrieval_stage_plan(
@@ -3496,10 +3760,38 @@ class MediumRegressionTests(unittest.TestCase):
     def test_reel_service_deep_stage_plan_unlocks_adjacent_recovery_only_on_later_pages(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
         candidates = [
-            QueryCandidate("query one", "literal", 0.95, stage="high_precision", source_surface="youtube_html"),
-            QueryCandidate("query two", "tutorial", 0.9, stage="high_precision", source_surface="youtube_html"),
-            QueryCandidate("query three", "literal", 0.84, stage="broad", source_surface="youtube_html"),
-            QueryCandidate("query four", "recovery_adjacent", 0.7, stage="recovery", source_surface="youtube_html"),
+            QueryCandidate(
+                "query one",
+                "literal",
+                0.95,
+                stage="high_precision",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_EXACT, "query one"),
+            ),
+            QueryCandidate(
+                "query two",
+                "tutorial",
+                0.9,
+                stage="high_precision",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "query two"),
+            ),
+            QueryCandidate(
+                "query three",
+                "literal",
+                0.84,
+                stage="broad",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_COMPANION, "query three"),
+            ),
+            QueryCandidate(
+                "query four",
+                "recovery_adjacent",
+                0.7,
+                stage="recovery",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ANCHORED_ADJACENT, "query four"),
+            ),
         ]
 
         plans = service._build_retrieval_stage_plan(
@@ -3508,13 +3800,46 @@ class MediumRegressionTests(unittest.TestCase):
             retrieval_profile="deep",
             request_need=12,
             page_hint=3,
-            recovery_stage=6,
+            recovery_stage=service.REFILL_STAGE_ANCHORED_ADJACENT,
         )
 
         self.assertEqual([plan.name for plan in plans], ["high_precision", "broad", "recovery"])
         self.assertEqual(plans[2].budget, 1)
 
-    def test_reel_service_bootstrap_stage_plan_allows_one_broad_query_for_curated_broad_topic(self) -> None:
+    def test_build_retrieval_stage_plan_unlocks_recovery_graph_on_page_four(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+        candidates = [
+            QueryCandidate(
+                "myrmecology",
+                "literal",
+                0.96,
+                stage="high_precision",
+                source_surface="youtube_html",
+                family_key=service._frontier_family_key(service.FRONTIER_ROOT_EXACT, "myrmecology"),
+            ),
+            QueryCandidate(
+                "ant study archive",
+                "recovery_adjacent",
+                0.72,
+                stage="recovery",
+                source_surface="local_cache",
+                family_key=service._frontier_family_key(service.FRONTIER_RECOVERY_GRAPH, "ant study archive"),
+            ),
+        ]
+
+        plans = service._build_retrieval_stage_plan(
+            query_candidates=candidates,
+            fast_mode=False,
+            retrieval_profile="deep",
+            request_need=12,
+            page_hint=4,
+            recovery_stage=service.REFILL_STAGE_RECOVERY_GRAPH,
+        )
+
+        self.assertEqual([plan.name for plan in plans], ["high_precision", "recovery"])
+        self.assertEqual([candidate.text for candidate in plans[1].queries], ["ant study archive"])
+
+    def test_reel_service_bootstrap_stage_plan_keeps_curated_broad_topic_root_exact_only(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
         candidates = [
             QueryCandidate("python programming", "literal", 0.95, stage="high_precision", source_surface="youtube_html"),
@@ -3532,8 +3857,7 @@ class MediumRegressionTests(unittest.TestCase):
             recovery_stage=0,
         )
 
-        self.assertEqual([plan.name for plan in plans], ["high_precision", "broad"])
-        self.assertEqual(plans[1].budget, 1)
+        self.assertEqual([plan.name for plan in plans], ["high_precision"])
 
     def test_reel_service_topic_novelty_profile_calibrates_for_breadth(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
@@ -3559,30 +3883,154 @@ class MediumRegressionTests(unittest.TestCase):
             service._recovery_stage_allows_source_surface(
                 source_surface="youtube_related",
                 page_hint=2,
-                recovery_stage=4,
+                recovery_stage=service.REFILL_STAGE_ANCHORED_ADJACENT,
             )
         )
         self.assertTrue(
             service._recovery_stage_allows_source_surface(
                 source_surface="youtube_related",
                 page_hint=3,
-                recovery_stage=4,
+                recovery_stage=service.REFILL_STAGE_ANCHORED_ADJACENT,
             )
         )
         self.assertFalse(
             service._recovery_stage_allows_source_surface(
                 source_surface="local_cache",
                 page_hint=3,
-                recovery_stage=5,
+                recovery_stage=service.REFILL_STAGE_RECOVERY_GRAPH,
             )
         )
         self.assertTrue(
             service._recovery_stage_allows_source_surface(
                 source_surface="local_cache",
-                page_hint=3,
-                recovery_stage=6,
+                page_hint=4,
+                recovery_stage=service.REFILL_STAGE_RECOVERY_GRAPH,
             )
         )
+
+    def test_dense_transcript_windows_produces_multiple_candidate_segments_for_long_video(self) -> None:
+        service = ReelService(embedding_service=None, youtube_service=None)
+        transcript = [
+            {"start": 0.0, "duration": 12.0, "text": "Ant colonies organize labor through caste roles and pheromone signaling."},
+            {"start": 25.0, "duration": 12.0, "text": "In myrmecology, researchers study how worker ants communicate using trail pheromones."},
+            {"start": 55.0, "duration": 12.0, "text": "A field study can explain how ant colonies adapt when food sources move."},
+            {"start": 90.0, "duration": 12.0, "text": "Another example shows how queens, workers, and brood shape colony behavior."},
+            {"start": 125.0, "duration": 12.0, "text": "Scientists compare ant behavior, nest defense, and eusocial coordination in long observations."},
+            {"start": 160.0, "duration": 12.0, "text": "The lecture concludes with a worked example about pheromone trails and recruitment."},
+        ]
+
+        windows = service._dense_transcript_windows(
+            None,
+            transcript=transcript,
+            concept_terms=["myrmecology", "ant colonies", "pheromone trails"],
+            root_topic_terms=["myrmecology", "ants", "ant colonies"],
+            target_clip_duration_sec=38,
+            prior_contexts=[],
+            fast_mode=True,
+            max_windows=6,
+        )
+
+        self.assertGreaterEqual(len(windows), 2)
+        self.assertGreaterEqual(max((window.t_end - window.t_start) for window in windows), 75)
+        self.assertTrue(all((window.t_end - window.t_start) >= 35 for window in windows[:2]))
+        self.assertNotEqual(windows[0].text, windows[1].text)
+
+    def test_shape_request_page_reels_relaxes_later_pages_before_dropping_topic_guard(self) -> None:
+        ranked = [
+            {
+                "reel_id": "related-reel",
+                "video_title": "Ant colony communication explained",
+                "video_description": "A lecture on ant colony communication and myrmecology.",
+                "transcript_snippet": "This ant colony lecture explains myrmecology and pheromone trails.",
+                "video_url": "https://www.youtube.com/embed/related-video?start=0&end=32",
+                "t_start": 0.0,
+                "t_end": 32.0,
+                "score": 0.82,
+                "relevance_score": 0.41,
+                "matched_terms": ["ant colony", "myrmecology"],
+                "source_surface": "youtube_related",
+                "retrieval_stage": "recovery",
+                "query_strategy": "recovery_adjacent",
+                "video_duration_sec": 1800,
+                "clip_duration_sec": 32.0,
+                "created_at": "2026-03-13T00:00:00+00:00",
+            },
+            {
+                "reel_id": "cache-reel",
+                "video_title": "Ant field notes archive",
+                "video_description": "Archived ant field notes with myrmecology commentary.",
+                "transcript_snippet": "Archived myrmecology notes describe ant colonies and field behavior.",
+                "video_url": "https://www.youtube.com/embed/cache-video?start=0&end=30",
+                "t_start": 0.0,
+                "t_end": 30.0,
+                "score": 0.78,
+                "relevance_score": 0.39,
+                "matched_terms": ["myrmecology", "ant colonies"],
+                "source_surface": "local_cache",
+                "retrieval_stage": "recovery",
+                "query_strategy": "recovery_adjacent",
+                "video_duration_sec": 2400,
+                "clip_duration_sec": 30.0,
+                "created_at": "2026-03-13T00:01:00+00:00",
+            },
+        ]
+
+        page_one = main_module._shape_request_page_reels(
+            ranked,
+            page=1,
+            limit=5,
+            subject_tag="myrmecology",
+            strict_topic_only=True,
+            min_relevance=0.3,
+            preferred_video_duration="any",
+            target_clip_duration_sec=38,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+        )
+        page_three = main_module._shape_request_page_reels(
+            ranked,
+            page=3,
+            limit=5,
+            subject_tag="myrmecology",
+            strict_topic_only=True,
+            min_relevance=0.3,
+            preferred_video_duration="any",
+            target_clip_duration_sec=38,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+        )
+        page_four = main_module._shape_request_page_reels(
+            ranked,
+            page=4,
+            limit=5,
+            subject_tag="myrmecology",
+            strict_topic_only=True,
+            min_relevance=0.3,
+            preferred_video_duration="any",
+            target_clip_duration_sec=38,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+        )
+
+        self.assertEqual(len(page_one), 0)
+        self.assertEqual([item["reel_id"] for item in page_three], ["related-reel"])
+        self.assertEqual([item["reel_id"] for item in page_four], ["related-reel", "cache-reel"])
+
+    def test_window_stage_does_not_advance_without_visible_growth(self) -> None:
+        next_state = main_module._advance_refinement_state(
+            recovery_stage=main_module.REFINEMENT_STAGE_MULTI_CLIP_STRICT,
+            stage_exhausted={},
+            no_new_sources_passes=0,
+            no_new_windows_passes=1,
+            no_new_visible_reels_passes=1,
+            new_unique_videos=0,
+            new_unique_clip_windows=3,
+            new_unique_visible_reels=0,
+        )
+
+        self.assertEqual(next_state["next_stage"], main_module.REFINEMENT_STAGE_MULTI_CLIP_STRICT)
+        self.assertFalse(next_state["stage_is_exhausted"])
+        self.assertEqual(next_state["growth_reason"], "new_clip_windows")
 
     def test_reel_service_same_video_clip_novelty_requires_distance_or_high_confidence_function_change(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)

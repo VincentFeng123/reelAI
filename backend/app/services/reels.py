@@ -6,6 +6,7 @@ import re
 import sqlite3
 import threading
 import uuid
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal
@@ -43,6 +44,11 @@ class QueryCandidate:
     weight: float = 1.0
     stage: str = "broad"
     source_surface: str = "youtube_api"
+    family_key: str = ""
+    source_family: str = ""
+    anchor_mode: str = ""
+    seed_video_id: str = ""
+    seed_channel_id: str = ""
 
 
 @dataclass
@@ -75,6 +81,11 @@ class PlannedQuery:
     normalization_key: str = ""
     cluster_key: str = ""
     rationale: str = ""
+    family_key: str = ""
+    source_family: str = ""
+    anchor_mode: str = ""
+    seed_video_id: str = ""
+    seed_channel_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -123,6 +134,15 @@ RetrievalProfile = Literal["bootstrap", "deep"]
 
 
 class ReelService:
+    FRONTIER_ROOT_EXACT = "root_exact"
+    FRONTIER_ROOT_COMPANION = "root_companion"
+    FRONTIER_ANCHORED_ADJACENT = "anchored_adjacent"
+    FRONTIER_RECOVERY_GRAPH = "recovery_graph"
+    MINING_STATE_UNMINED = "unmined"
+    MINING_STATE_PARTIALLY_MINED = "partially_mined"
+    MINING_STATE_HIGH_YIELD = "high_yield"
+    MINING_STATE_LOW_YIELD = "low_yield"
+    MINING_STATE_EXHAUSTED = "exhausted"
     VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
     VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
     DEFAULT_TARGET_CLIP_DURATION_SEC = 55
@@ -743,13 +763,12 @@ class ReelService:
     TRANSCRIPT_FETCH_WORKERS_SLOW = 6
     RANKED_FEED_CACHE_VERSION = 3
     REFILL_STAGE_EXACT_ROOT = 0
-    REFILL_STAGE_EXACT_CONTINUATION = 1
-    REFILL_STAGE_CURATED_SUBTOPICS = 2
-    REFILL_STAGE_LONG_FORM = 3
-    REFILL_STAGE_RELATED = 4
-    REFILL_STAGE_CHANNEL = 5
-    REFILL_STAGE_ADJACENT = 6
-    MAX_REFILL_STAGE = REFILL_STAGE_ADJACENT
+    REFILL_STAGE_ROOT_COMPANION = 1
+    REFILL_STAGE_MULTI_CLIP_STRICT = 2
+    REFILL_STAGE_ANCHORED_ADJACENT = 3
+    REFILL_STAGE_MULTI_CLIP_EXPANDED = 4
+    REFILL_STAGE_RECOVERY_GRAPH = 5
+    MAX_REFILL_STAGE = REFILL_STAGE_RECOVERY_GRAPH
 
     def __init__(self, embedding_service, youtube_service) -> None:
         settings = get_settings()
@@ -983,6 +1002,14 @@ class ReelService:
             recovery_stage=safe_recovery_stage,
         )
         safe_retrieval_profile = self._normalize_retrieval_profile(retrieval_profile)
+        request_key = ""
+        if generation_id:
+            generation_row = fetch_one(
+                conn,
+                "SELECT request_key FROM reel_generations WHERE id = ?",
+                (generation_id,),
+            )
+            request_key = str((generation_row or {}).get("request_key") or "").strip()
         params: tuple[Any, ...] = (material_id,)
         concept_where = "WHERE material_id = ?"
         if concept_id:
@@ -1270,6 +1297,17 @@ class ReelService:
             planned_queries = [concept_plan.literal_query, concept_plan.intent_query, *concept_plan.expansion_queries]
             if safe_retrieval_profile == "deep":
                 planned_queries.extend(concept_plan.recovery_queries)
+                if safe_recovery_stage >= self.REFILL_STAGE_RECOVERY_GRAPH and request_key:
+                    planned_queries.extend(
+                        self._plan_source_graph_queries(
+                            conn,
+                            material_id=material_id,
+                            request_key=request_key,
+                            current_generation_id=generation_id,
+                            concept_title=str(concept.get("title") or ""),
+                            subject_tag=subject_tag,
+                        )
+                    )
             if self.retrieval_engine_v2_enabled:
                 query_candidates = [
                     QueryCandidate(
@@ -1280,6 +1318,11 @@ class ReelService:
                         weight=query.weight,
                         stage=query.stage,
                         source_surface=query.source_surface,
+                        family_key=query.family_key,
+                        source_family=query.source_family,
+                        anchor_mode=query.anchor_mode,
+                        seed_video_id=query.seed_video_id,
+                        seed_channel_id=query.seed_channel_id,
                     )
                     for query in planned_queries
                 ]
@@ -1292,6 +1335,12 @@ class ReelService:
                         source_terms=[concept["title"]],
                         stage="high_precision" if index < self.BOOTSTRAP_PRIMARY_QUERY_COUNT else "broad",
                         source_surface="youtube_html",
+                        family_key=self._frontier_family_key(
+                            self.FRONTIER_ROOT_EXACT if index == 0 else self.FRONTIER_ROOT_COMPANION,
+                            query,
+                        ),
+                        source_family="other",
+                        anchor_mode="root_exact" if index == 0 else "root_companion",
                     )
                     for index, query in enumerate(
                         self._build_query_variants(
@@ -1302,6 +1351,14 @@ class ReelService:
                         )
                     )
                 ]
+            query_candidates = self._apply_frontier_scheduler(
+                conn,
+                material_id=material_id,
+                request_key=request_key or None,
+                query_candidates=query_candidates,
+                page_hint=safe_page_hint,
+                recovery_stage=safe_recovery_stage,
+            )
             retrieval_stages = self._build_retrieval_stage_plan(
                 query_candidates=query_candidates,
                 fast_mode=fast_mode,
@@ -1320,6 +1377,7 @@ class ReelService:
             seen_video_ids: set[str] = set(material_seen_video_ids)
             stage_candidates: list[dict[str, Any]] = []
             all_query_reports: list[dict[str, Any]] = []
+            accepted_reels_by_family: dict[str, int] = defaultdict(int)
             retrieval_metrics = {
                 "raw_discovered_videos": 0,
                 "filtered_relevant_videos": 0,
@@ -1357,10 +1415,45 @@ class ReelService:
                         recovery_stage=safe_recovery_stage,
                     ),
                 )
+            mined_stage_candidates: list[dict[str, Any]] = []
+            if safe_retrieval_profile == "deep" and request_key and safe_recovery_stage >= self.REFILL_STAGE_MULTI_CLIP_STRICT:
+                mined_stage_candidates = self._mine_existing_request_chain_videos(
+                    conn,
+                    material_id=material_id,
+                    request_key=request_key,
+                    generation_id=generation_id,
+                    concept=concept,
+                    concept_terms=concept_terms,
+                    context_terms=context_terms,
+                    concept_embedding=concept_embedding,
+                    subject_tag=subject_tag,
+                    root_topic_terms=root_topic_terms,
+                    visual_spec=visual_spec,
+                    preferred_video_duration=safe_video_duration_pref,
+                    fast_mode=fast_mode,
+                    strict_topic_only=strict_topic_only,
+                    existing_video_counts=existing_video_counts,
+                    generated_video_counts=generated_video_counts,
+                    accepted_clip_contexts_by_video=accepted_clip_contexts_by_video,
+                    target_clip_duration_sec=safe_target_clip_duration,
+                    page_hint=safe_page_hint,
+                    recovery_stage=safe_recovery_stage,
+                    default_max_segments_per_video=default_max_segments_per_video,
+                )
+                if mined_stage_candidates:
+                    stage_candidates.extend(mined_stage_candidates)
+                    retrieval_metrics["clip_candidate_videos"] = max(
+                        int(retrieval_metrics.get("clip_candidate_videos") or 0),
+                        len(mined_stage_candidates),
+                    )
+                    for mined_candidate in mined_stage_candidates:
+                        clean_video_id = str(mined_candidate.get("video_id") or "").strip()
+                        if clean_video_id:
+                            seen_video_ids.add(clean_video_id)
             transcript_prefetch_task: TranscriptPrefetchTask | None = None
             primary_stages = [stage for stage in retrieval_stages if stage.name == "high_precision"]
             expansion_stages = [stage for stage in retrieval_stages if stage.name != "high_precision"]
-            pass_groups = [primary_stages, expansion_stages]
+            pass_groups = [] if mined_stage_candidates else [primary_stages, expansion_stages]
 
             for pass_index, stage_group in enumerate(pass_groups):
                 raise_if_cancelled()
@@ -1415,6 +1508,11 @@ class ReelService:
                             "source_terms": query_candidate.source_terms,
                             "weight": float(query_candidate.weight),
                             "surface": query_candidate.source_surface,
+                            "family_key": query_candidate.family_key,
+                            "source_family": query_candidate.source_family,
+                            "anchor_mode": query_candidate.anchor_mode,
+                            "seed_video_id": query_candidate.seed_video_id,
+                            "seed_channel_id": query_candidate.seed_channel_id,
                             "results": 0,
                             "kept": 0,
                             "dropped_duplicate": 0,
@@ -1607,6 +1705,11 @@ class ReelService:
                             weight=recovery_query.weight,
                             stage="recovery",
                             source_surface=recovery_query.source_surface,
+                            family_key=recovery_query.family_key,
+                            source_family=recovery_query.source_family,
+                            anchor_mode=recovery_query.anchor_mode,
+                            seed_video_id=recovery_query.seed_video_id,
+                            seed_channel_id=recovery_query.seed_channel_id,
                         )
                         recovery_reports = [
                             {
@@ -1616,6 +1719,11 @@ class ReelService:
                                 "source_terms": recovery_candidate.source_terms,
                                 "weight": float(recovery_candidate.weight),
                                 "surface": recovery_candidate.source_surface,
+                                "family_key": recovery_candidate.family_key,
+                                "source_family": recovery_candidate.source_family,
+                                "anchor_mode": recovery_candidate.anchor_mode,
+                                "seed_video_id": recovery_candidate.seed_video_id,
+                                "seed_channel_id": recovery_candidate.seed_channel_id,
                                 "results": 0,
                                 "kept": 0,
                                 "dropped_duplicate": 0,
@@ -1760,6 +1868,11 @@ class ReelService:
                         weight=second_recovery_query.weight,
                         stage="recovery",
                         source_surface=second_recovery_query.source_surface,
+                        family_key=second_recovery_query.family_key,
+                        source_family=second_recovery_query.source_family,
+                        anchor_mode=second_recovery_query.anchor_mode,
+                        seed_video_id=second_recovery_query.seed_video_id,
+                        seed_channel_id=second_recovery_query.seed_channel_id,
                     )
                     fallback_reports = [
                         {
@@ -1769,6 +1882,11 @@ class ReelService:
                             "source_terms": fallback_candidate.source_terms,
                             "weight": float(fallback_candidate.weight),
                             "surface": fallback_candidate.source_surface,
+                            "family_key": fallback_candidate.family_key,
+                            "source_family": fallback_candidate.source_family,
+                            "anchor_mode": fallback_candidate.anchor_mode,
+                            "seed_video_id": fallback_candidate.seed_video_id,
+                            "seed_channel_id": fallback_candidate.seed_channel_id,
                             "results": 0,
                             "kept": 0,
                             "dropped_duplicate": 0,
@@ -1929,6 +2047,14 @@ class ReelService:
                             "source_terms": concept_terms[:4],
                             "weight": 0.76 if bootstrap_local_recovery else 0.5,
                             "surface": "local_bootstrap" if bootstrap_local_recovery else "local_cache",
+                            "family_key": self._frontier_family_key(
+                                self.FRONTIER_ROOT_EXACT if bootstrap_local_recovery else self.FRONTIER_RECOVERY_GRAPH,
+                                f"local_cache:{concept.get('title')}",
+                            ),
+                            "source_family": "other",
+                            "anchor_mode": "root_exact" if bootstrap_local_recovery else "recovery_graph",
+                            "seed_video_id": "",
+                            "seed_channel_id": "",
                             "results": len(local_candidates),
                             "kept": len(local_candidates),
                             "dropped_duplicate": 0,
@@ -1967,6 +2093,14 @@ class ReelService:
                     dry_run=dry_run,
                     metrics=retrieval_metrics,
                 )
+                if request_key:
+                    self._persist_request_frontier_reports(
+                        conn,
+                        material_id=material_id,
+                        request_key=request_key,
+                        query_reports=all_query_reports,
+                        accepted_reels_by_family=accepted_reels_by_family,
+                    )
                 continue
 
             if self.retrieval_tier2_enabled:
@@ -2058,14 +2192,19 @@ class ReelService:
                     clip_min_len=clip_min_len,
                     clip_max_len=clip_max_len,
                 )
+                mined_transcript = candidate.get("mined_transcript")
                 transcript = (
-                    []
-                    if use_full_short_clip
-                    else self._transcript_for_candidate(
-                        prefetch_task=transcript_prefetch_task,
-                        transcript_cache=transcript_cache,
-                        video_id=video_id,
-                        fast_mode=fast_mode,
+                    list(mined_transcript)
+                    if isinstance(mined_transcript, list)
+                    else (
+                        []
+                        if use_full_short_clip
+                        else self._transcript_for_candidate(
+                            prefetch_task=transcript_prefetch_task,
+                            transcript_cache=transcript_cache,
+                            video_id=video_id,
+                            fast_mode=fast_mode,
+                        )
                     )
                 )
                 transcript_ranking: dict[str, Any] | None = None
@@ -2092,7 +2231,10 @@ class ReelService:
                     )
 
                 segments: list[SegmentMatch] = []
-                if transcript:
+                mined_segments = candidate.get("mined_segments")
+                if isinstance(mined_segments, list) and mined_segments:
+                    segments = list(mined_segments)
+                elif transcript:
                     if fast_mode:
                         segments = self._fast_segments_from_transcript(
                             transcript=transcript,
@@ -2288,6 +2430,31 @@ class ReelService:
                     generated_clip_keys.add(clip_key)
                     generated_video_counts[video_id] = generated_video_counts.get(video_id, 0) + 1
                     accepted_clip_contexts_by_video.setdefault(video_id, []).append(clip_context)
+                    mining_request_key = str(candidate.get("mining_request_key") or "").strip()
+                    mining_video_id = str(candidate.get("mining_video_id") or "").strip()
+                    if mining_request_key and mining_video_id:
+                        updated_video_count = existing_for_video + generated_video_counts.get(video_id, 0)
+                        mining_cap = max(1, int(candidate.get("mining_segment_cap") or video_segment_cap))
+                        mining_exhausted = updated_video_count >= mining_cap
+                        next_mining_state = (
+                            self.MINING_STATE_EXHAUSTED
+                            if mining_exhausted
+                            else self.MINING_STATE_HIGH_YIELD
+                            if updated_video_count >= 3
+                            else self.MINING_STATE_PARTIALLY_MINED
+                        )
+                        self._upsert_request_video_mining_state(
+                            conn,
+                            material_id=material_id,
+                            request_key=mining_request_key,
+                            video_id=mining_video_id,
+                            mining_state=next_mining_state,
+                            accepted_clip_delta=1,
+                            exhausted=mining_exhausted,
+                        )
+                    family_key = str(query_candidate.family_key or "").strip()
+                    if family_key:
+                        accepted_reels_by_family[family_key] += 1
                     selected_outcome = {
                         "video_id": video_id,
                         "reasons": [
@@ -2320,6 +2487,14 @@ class ReelService:
                             dry_run=dry_run,
                             metrics=retrieval_metrics,
                         )
+                        if request_key:
+                            self._persist_request_frontier_reports(
+                                conn,
+                                material_id=material_id,
+                                request_key=request_key,
+                                query_reports=all_query_reports,
+                                accepted_reels_by_family=accepted_reels_by_family,
+                            )
                         self._shutdown_transcript_prefetch_task(
                             transcript_prefetch_task,
                             wait=False,
@@ -2347,6 +2522,14 @@ class ReelService:
                 dry_run=dry_run,
                 metrics=retrieval_metrics,
             )
+            if request_key:
+                self._persist_request_frontier_reports(
+                    conn,
+                    material_id=material_id,
+                    request_key=request_key,
+                    query_reports=all_query_reports,
+                    accepted_reels_by_family=accepted_reels_by_family,
+                )
             self._shutdown_transcript_prefetch_task(
                 transcript_prefetch_task,
                 wait=False,
@@ -2619,13 +2802,13 @@ class ReelService:
         }
 
     def _recovery_stage_allows_related(self, *, page_hint: int, recovery_stage: int) -> bool:
-        return max(1, int(page_hint or 1)) > 2 and int(recovery_stage or 0) >= self.REFILL_STAGE_RELATED
+        return max(1, int(page_hint or 1)) >= 3 and int(recovery_stage or 0) >= self.REFILL_STAGE_ANCHORED_ADJACENT
 
     def _recovery_stage_allows_channel(self, *, page_hint: int, recovery_stage: int) -> bool:
-        return max(1, int(page_hint or 1)) > 2 and int(recovery_stage or 0) >= self.REFILL_STAGE_CHANNEL
+        return max(1, int(page_hint or 1)) >= 3 and int(recovery_stage or 0) >= self.REFILL_STAGE_ANCHORED_ADJACENT
 
     def _recovery_stage_allows_adjacent(self, *, page_hint: int, recovery_stage: int) -> bool:
-        return max(1, int(page_hint or 1)) > 2 and int(recovery_stage or 0) >= self.REFILL_STAGE_ADJACENT
+        return max(1, int(page_hint or 1)) >= 4 and int(recovery_stage or 0) >= self.REFILL_STAGE_RECOVERY_GRAPH
 
     def _recovery_stage_allows_source_surface(
         self,
@@ -2677,11 +2860,11 @@ class ReelService:
         except (TypeError, ValueError):
             duration_value = 0
         if safe_page <= 2:
-            return 4
-        if safe_page <= 5:
-            return 8
+            return 2 if safe_page == 1 else 3
+        if safe_page == 3:
+            return 5
         if duration_value > 20 * 60:
-            return 12
+            return 10
         return 8
 
     def _allow_adjacent_recovery(self, *, page_hint: int, recovery_stage: int) -> bool:
@@ -2736,7 +2919,7 @@ class ReelService:
             if fast_mode:
                 return max(5, min(7, 4 + remaining))
             return max(8, min(14, 6 + remaining * 2))
-        if int(recovery_stage or 0) <= self.REFILL_STAGE_EXACT_CONTINUATION:
+        if int(recovery_stage or 0) <= self.REFILL_STAGE_ROOT_COMPANION:
             return max(6, min(18 if not fast_mode else 10, 4 + remaining * (2 if not fast_mode else 1)))
         if self.serverless_mode:
             return max(6, min(10, 4 + remaining))
@@ -2757,11 +2940,11 @@ class ReelService:
             return max(1, min(3, remaining))
         if fast_mode:
             base_budget = max(2, min(4, remaining))
-            if int(recovery_stage or 0) >= self.REFILL_STAGE_LONG_FORM:
+            if int(recovery_stage or 0) >= self.REFILL_STAGE_MULTI_CLIP_STRICT:
                 return max(base_budget, min(8, remaining * 2))
             return base_budget
         base_budget = max(6, min(16, remaining * 3))
-        if int(recovery_stage or 0) >= self.REFILL_STAGE_LONG_FORM:
+        if int(recovery_stage or 0) >= self.REFILL_STAGE_MULTI_CLIP_STRICT:
             return max(base_budget, min(24, remaining * 4))
         return base_budget
 
@@ -3159,6 +3342,331 @@ class ReelService:
         }
         return mapping.get(self._clean_query_text(suffix).lower(), "explained")
 
+    def _source_family_from_strategy(self, strategy: str, query_text: str = "") -> str:
+        normalized_strategy = self._clean_query_text(strategy).lower().replace(" ", "_")
+        normalized_query = self._clean_query_text(query_text).lower()
+        if normalized_strategy in {"lecture", "conference_talk"} or "lecture" in normalized_query:
+            return "lecture"
+        if normalized_strategy == "documentary" or "documentary" in normalized_query:
+            return "documentary"
+        if normalized_strategy in {"tutorial", "worked_example", "demo"}:
+            return "tutorial"
+        if normalized_strategy in {"explained", "animation", "broadened_parent"}:
+            return "explainer"
+        if "conference" in normalized_query or "symposium" in normalized_query:
+            return "conference"
+        if "podcast" in normalized_query or "episode" in normalized_query:
+            return "podcast"
+        if "course" in normalized_query or "lesson" in normalized_query:
+            return "course"
+        if "interview" in normalized_query:
+            return "interview"
+        if "field" in normalized_query or "footage" in normalized_query:
+            return "field_footage"
+        return "other"
+
+    def _frontier_family_for_query(self, *, stage: str, strategy: str, source_surface: str) -> str:
+        normalized_stage = str(stage or "").strip().lower()
+        normalized_strategy = self._clean_query_text(strategy).lower().replace(" ", "_")
+        normalized_surface = str(source_surface or "").strip().lower()
+        if normalized_stage == "high_precision" and normalized_strategy == "literal":
+            return self.FRONTIER_ROOT_EXACT
+        if normalized_stage == "recovery" and normalized_surface in {
+            "youtube_related",
+            "youtube_channel",
+            "local_cache",
+            "duckduckgo_site",
+            "duckduckgo_quoted",
+            "bing_site",
+            "bing_quoted",
+        }:
+            return self.FRONTIER_RECOVERY_GRAPH
+        if normalized_stage == "recovery":
+            return self.FRONTIER_ANCHORED_ADJACENT
+        return self.FRONTIER_ROOT_COMPANION
+
+    def _frontier_anchor_mode(self, family: str) -> str:
+        if family == self.FRONTIER_ROOT_EXACT:
+            return "root_exact"
+        if family == self.FRONTIER_ROOT_COMPANION:
+            return "root_companion"
+        if family == self.FRONTIER_ANCHORED_ADJACENT:
+            return "anchored_adjacent"
+        return "recovery_graph"
+
+    def _frontier_family_key(self, family: str, query_text: str) -> str:
+        normalized_query = self._normalize_query_key(query_text)
+        return f"{family}:{normalized_query}" if normalized_query else family
+
+    def _allowed_frontier_families(self, *, page_hint: int, recovery_stage: int) -> set[str]:
+        allowed = {self.FRONTIER_ROOT_EXACT}
+        if max(1, int(page_hint or 1)) <= 2 or int(recovery_stage or 0) >= self.REFILL_STAGE_ROOT_COMPANION:
+            allowed.add(self.FRONTIER_ROOT_COMPANION)
+        if max(1, int(page_hint or 1)) >= 3 and int(recovery_stage or 0) >= self.REFILL_STAGE_ANCHORED_ADJACENT:
+            allowed.add(self.FRONTIER_ANCHORED_ADJACENT)
+        if max(1, int(page_hint or 1)) >= 4 and int(recovery_stage or 0) >= self.REFILL_STAGE_RECOVERY_GRAPH:
+            allowed.add(self.FRONTIER_RECOVERY_GRAPH)
+        return allowed
+
+    def _request_frontier_entry_id(self, *, material_id: str, request_key: str, family_key: str) -> str:
+        payload = f"{material_id}|{request_key}|{family_key}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _load_request_frontier_entries(
+        self,
+        conn,
+        *,
+        material_id: str,
+        request_key: str,
+    ) -> dict[str, dict[str, Any]]:
+        if not material_id or not request_key:
+            return {}
+        rows = fetch_all(
+            conn,
+            """
+            SELECT *
+            FROM request_frontier_entries
+            WHERE material_id = ?
+              AND request_key = ?
+            """,
+            (material_id, request_key),
+        )
+        entries: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            family_key = str(row.get("family_key") or "").strip()
+            if family_key:
+                entries[family_key] = dict(row)
+        return entries
+
+    def _upsert_request_frontier_entry(
+        self,
+        conn,
+        *,
+        material_id: str,
+        request_key: str,
+        family_key: str,
+        stage: str,
+        query_text: str,
+        source_family: str,
+        anchor_mode: str,
+        seed_video_id: str = "",
+        seed_channel_id: str = "",
+        stat_deltas: dict[str, float | int] | None = None,
+        exhausted: bool | None = None,
+    ) -> dict[str, Any]:
+        existing = fetch_one(
+            conn,
+            """
+            SELECT *
+            FROM request_frontier_entries
+            WHERE material_id = ?
+              AND request_key = ?
+              AND family_key = ?
+            """,
+            (material_id, request_key, family_key),
+        )
+        now = now_iso()
+        row = {
+            "id": str((existing or {}).get("id") or self._request_frontier_entry_id(
+                material_id=material_id,
+                request_key=request_key,
+                family_key=family_key,
+            )),
+            "material_id": material_id,
+            "request_key": request_key,
+            "family_key": family_key,
+            "stage": stage,
+            "query_text": query_text,
+            "source_family": source_family,
+            "seed_video_id": seed_video_id,
+            "seed_channel_id": seed_channel_id,
+            "anchor_mode": anchor_mode,
+            "runs": int((existing or {}).get("runs") or 0),
+            "new_good_videos": int((existing or {}).get("new_good_videos") or 0),
+            "new_accepted_reels": int((existing or {}).get("new_accepted_reels") or 0),
+            "new_visible_reels": int((existing or {}).get("new_visible_reels") or 0),
+            "duplicate_rate": float((existing or {}).get("duplicate_rate") or 0.0),
+            "off_topic_rate": float((existing or {}).get("off_topic_rate") or 0.0),
+            "last_run_at": (existing or {}).get("last_run_at"),
+            "cooldown_until": (existing or {}).get("cooldown_until"),
+            "exhausted": 1 if bool((existing or {}).get("exhausted")) else 0,
+            "created_at": str((existing or {}).get("created_at") or now),
+            "updated_at": now,
+        }
+        deltas = stat_deltas or {}
+        if deltas:
+            row["runs"] = int(row["runs"]) + int(deltas.get("runs") or 0)
+            row["new_good_videos"] = int(row["new_good_videos"]) + int(deltas.get("new_good_videos") or 0)
+            row["new_accepted_reels"] = int(row["new_accepted_reels"]) + int(deltas.get("new_accepted_reels") or 0)
+            row["new_visible_reels"] = int(row["new_visible_reels"]) + int(deltas.get("new_visible_reels") or 0)
+            if "duplicate_rate" in deltas:
+                row["duplicate_rate"] = float(deltas.get("duplicate_rate") or 0.0)
+            if "off_topic_rate" in deltas:
+                row["off_topic_rate"] = float(deltas.get("off_topic_rate") or 0.0)
+            if int(deltas.get("runs") or 0) > 0:
+                row["last_run_at"] = now
+        if exhausted is not None:
+            row["exhausted"] = 1 if exhausted else 0
+        if (
+            int(row["runs"]) >= 3
+            and int(row["new_visible_reels"]) <= 0
+            and (
+                float(row["duplicate_rate"]) >= 0.7
+                or float(row["off_topic_rate"]) >= 0.4
+            )
+        ):
+            row["exhausted"] = 1
+        upsert(conn, "request_frontier_entries", row)
+        return row
+
+    def _apply_frontier_scheduler(
+        self,
+        conn,
+        *,
+        material_id: str,
+        request_key: str | None,
+        query_candidates: list[QueryCandidate],
+        page_hint: int,
+        recovery_stage: int,
+    ) -> list[QueryCandidate]:
+        if not request_key:
+            return query_candidates
+        frontier_entries = self._load_request_frontier_entries(
+            conn,
+            material_id=material_id,
+            request_key=request_key,
+        )
+        allowed_families = self._allowed_frontier_families(
+            page_hint=page_hint,
+            recovery_stage=recovery_stage,
+        )
+        family_priority = {
+            self.FRONTIER_ROOT_EXACT: 0,
+            self.FRONTIER_ROOT_COMPANION: 1,
+            self.FRONTIER_ANCHORED_ADJACENT: 2,
+            self.FRONTIER_RECOVERY_GRAPH: 3,
+        }
+
+        scheduled: list[QueryCandidate] = []
+        for candidate in query_candidates:
+            family_key = candidate.family_key or self._frontier_family_key(
+                self._frontier_family_for_query(
+                    stage=candidate.stage,
+                    strategy=candidate.strategy,
+                    source_surface=candidate.source_surface,
+                ),
+                candidate.text,
+            )
+            family = family_key.split(":", 1)[0]
+            if family not in allowed_families:
+                continue
+            entry = frontier_entries.get(family_key) or {}
+            if bool(int(entry.get("exhausted") or 0)):
+                continue
+            scheduled.append(
+                QueryCandidate(
+                    text=candidate.text,
+                    strategy=candidate.strategy,
+                    confidence=candidate.confidence,
+                    source_terms=list(candidate.source_terms),
+                    weight=candidate.weight,
+                    stage=candidate.stage,
+                    source_surface=candidate.source_surface,
+                    family_key=family_key,
+                    source_family=candidate.source_family or self._source_family_from_strategy(candidate.strategy, candidate.text),
+                    anchor_mode=candidate.anchor_mode or self._frontier_anchor_mode(family),
+                    seed_video_id=candidate.seed_video_id,
+                    seed_channel_id=candidate.seed_channel_id,
+                )
+            )
+
+        def sort_key(candidate: QueryCandidate) -> tuple[Any, ...]:
+            family_key = candidate.family_key
+            family = family_key.split(":", 1)[0] if family_key else self.FRONTIER_ROOT_COMPANION
+            entry = frontier_entries.get(family_key) or {}
+            runs = int(entry.get("runs") or 0)
+            visible_yield = float(entry.get("new_visible_reels") or 0.0) / max(1, runs)
+            good_video_yield = float(entry.get("new_good_videos") or 0.0) / max(1, runs)
+            duplicate_rate = float(entry.get("duplicate_rate") or 0.0)
+            off_topic_rate = float(entry.get("off_topic_rate") or 0.0)
+            return (
+                family_priority.get(family, 9),
+                0 if runs <= 0 else 1,
+                -visible_yield,
+                -good_video_yield,
+                duplicate_rate,
+                off_topic_rate,
+                -float(candidate.confidence * candidate.weight),
+            )
+
+        scheduled.sort(key=sort_key)
+        return scheduled
+
+    def _persist_request_frontier_reports(
+        self,
+        conn,
+        *,
+        material_id: str,
+        request_key: str,
+        query_reports: list[dict[str, Any]],
+        accepted_reels_by_family: dict[str, int] | None = None,
+        visible_reels_by_family: dict[str, int] | None = None,
+    ) -> None:
+        if not material_id or not request_key:
+            return
+        accepted_counts = accepted_reels_by_family or {}
+        visible_counts = visible_reels_by_family or {}
+        aggregated: dict[str, dict[str, Any]] = {}
+        for report in query_reports:
+            family_key = str(report.get("family_key") or "").strip()
+            if not family_key:
+                continue
+            stats = aggregated.setdefault(
+                family_key,
+                {
+                    "stage": str(report.get("stage") or ""),
+                    "query": str(report.get("query") or ""),
+                    "source_family": str(report.get("source_family") or ""),
+                    "anchor_mode": str(report.get("anchor_mode") or ""),
+                    "seed_video_id": str(report.get("seed_video_id") or ""),
+                    "seed_channel_id": str(report.get("seed_channel_id") or ""),
+                    "runs": 0,
+                    "results": 0,
+                    "kept": 0,
+                    "dropped_duplicate": 0,
+                    "dropped_off_topic": 0,
+                },
+            )
+            stats["runs"] += 1
+            stats["results"] += int(report.get("results") or 0)
+            stats["kept"] += int(report.get("kept") or 0)
+            stats["dropped_duplicate"] += int(report.get("dropped_duplicate") or 0)
+            stats["dropped_off_topic"] += int(report.get("dropped_metadata_gate") or 0) + int(report.get("dropped_ranking") or 0)
+        for family_key, stats in aggregated.items():
+            total_results = max(0, int(stats["results"]))
+            duplicate_rate = float(stats["dropped_duplicate"]) / max(1, total_results)
+            off_topic_rate = float(stats["dropped_off_topic"]) / max(1, total_results)
+            self._upsert_request_frontier_entry(
+                conn,
+                material_id=material_id,
+                request_key=request_key,
+                family_key=family_key,
+                stage=str(stats["stage"] or ""),
+                query_text=str(stats["query"] or ""),
+                source_family=str(stats["source_family"] or ""),
+                anchor_mode=str(stats["anchor_mode"] or ""),
+                seed_video_id=str(stats["seed_video_id"] or ""),
+                seed_channel_id=str(stats["seed_channel_id"] or ""),
+                stat_deltas={
+                    "runs": int(stats["runs"]),
+                    "new_good_videos": int(stats["kept"]),
+                    "new_accepted_reels": int(accepted_counts.get(family_key) or 0),
+                    "new_visible_reels": int(visible_counts.get(family_key) or 0),
+                    "duplicate_rate": duplicate_rate,
+                    "off_topic_rate": off_topic_rate,
+                },
+            )
+
     def _build_planned_query(
         self,
         *,
@@ -3172,6 +3680,11 @@ class ReelService:
         source_surface: str = "youtube_html",
         disambiguator: str | None = None,
         rationale: str = "",
+        family: str | None = None,
+        source_family: str | None = None,
+        anchor_mode: str | None = None,
+        seed_video_id: str = "",
+        seed_channel_id: str = "",
     ) -> PlannedQuery:
         cleaned = self._clean_query_text(text)
         normalization_key = self._normalize_query_key(cleaned)
@@ -3181,6 +3694,11 @@ class ReelService:
             cluster_key = f"recovery:{concept_key}:{normalization_key}"
         elif stage == "broad":
             cluster_key = f"broad:{strategy}:{concept_key}:{normalization_key}"
+        resolved_family = family or self._frontier_family_for_query(
+            stage=stage,
+            strategy=strategy,
+            source_surface=source_surface,
+        )
         return PlannedQuery(
             text=cleaned,
             strategy=self._clean_query_text(strategy).lower().replace(" ", "_"),
@@ -3193,6 +3711,11 @@ class ReelService:
             normalization_key=normalization_key,
             cluster_key=cluster_key,
             rationale=self._clean_query_text(rationale),
+            family_key=self._frontier_family_key(resolved_family, cleaned),
+            source_family=source_family or self._source_family_from_strategy(strategy, cleaned),
+            anchor_mode=anchor_mode or self._frontier_anchor_mode(resolved_family),
+            seed_video_id=str(seed_video_id or "").strip(),
+            seed_channel_id=str(seed_channel_id or "").strip(),
         )
 
     def _select_concepts(
@@ -4079,6 +4602,74 @@ class ReelService:
                 break
         return self._dedupe_queries(queries, limit=limit)
 
+    def _plan_source_graph_queries(
+        self,
+        conn,
+        *,
+        material_id: str,
+        request_key: str,
+        current_generation_id: str | None,
+        concept_title: str,
+        subject_tag: str | None,
+        limit: int = 2,
+    ) -> list[PlannedQuery]:
+        clean_request_key = str(request_key or "").strip()
+        if not clean_request_key:
+            return []
+        rows = fetch_all(
+            conn,
+            """
+            SELECT
+                v.channel_title,
+                v.title
+            FROM reels r
+            JOIN reel_generations g ON g.id = r.generation_id
+            JOIN videos v ON v.id = r.video_id
+            WHERE g.material_id = ?
+              AND g.request_key = ?
+              AND (? = '' OR g.id <> ?)
+            ORDER BY r.created_at DESC
+            LIMIT 24
+            """,
+            (material_id, clean_request_key, str(current_generation_id or ""), str(current_generation_id or "")),
+        )
+        if not rows:
+            return []
+        queries: list[PlannedQuery] = []
+        seen_channels: set[str] = set()
+        base_topic = self._clean_query_text(subject_tag or concept_title)
+        for row in rows:
+            channel_title = self._clean_query_text(str(row.get("channel_title") or ""))
+            if not channel_title:
+                continue
+            normalized_channel = self._normalize_query_key(channel_title)
+            if not normalized_channel or normalized_channel in seen_channels:
+                continue
+            seen_channels.add(normalized_channel)
+            query_text = self._clean_query_text(" ".join(part for part in [channel_title, base_topic] if part))
+            if not query_text:
+                continue
+            queries.append(
+                self._build_planned_query(
+                    text=query_text,
+                    strategy="channel_graph",
+                    stage="recovery",
+                    confidence=0.68,
+                    source_terms=[channel_title, base_topic],
+                    concept_title=concept_title,
+                    weight=0.72,
+                    source_surface="youtube_channel",
+                    rationale="recovery expands from channels that already produced accepted request-chain clips",
+                    family=self.FRONTIER_RECOVERY_GRAPH,
+                    source_family=self._source_family_from_strategy("channel_graph", query_text),
+                    anchor_mode="recovery_graph",
+                    seed_channel_id=channel_title,
+                )
+            )
+            if len(queries) >= limit:
+                break
+        return self._dedupe_queries(queries, limit=limit)
+
     def _plan_query_set_for_concepts(
         self,
         *,
@@ -4274,6 +4865,11 @@ class ReelService:
                 weight=query.weight,
                 stage=query.stage,
                 source_surface=query.source_surface,
+                family_key=query.family_key,
+                source_family=query.source_family,
+                anchor_mode=query.anchor_mode,
+                seed_video_id=query.seed_video_id,
+                seed_channel_id=query.seed_channel_id,
             )
             for query in queries
         ]
@@ -4309,44 +4905,52 @@ class ReelService:
         recovery_stage: int = 0,
     ) -> list[RetrievalStagePlan]:
         stage_map: dict[str, list[QueryCandidate]] = {"high_precision": [], "broad": [], "recovery": []}
+        allowed_families = self._allowed_frontier_families(
+            page_hint=page_hint,
+            recovery_stage=recovery_stage,
+        )
         for item in query_candidates:
+            family = item.family_key.split(":", 1)[0] if item.family_key else self._frontier_family_for_query(
+                stage=item.stage,
+                strategy=item.strategy,
+                source_surface=item.source_surface,
+            )
+            if retrieval_profile == "bootstrap" and family != self.FRONTIER_ROOT_EXACT:
+                continue
+            if retrieval_profile != "bootstrap" and family not in allowed_families:
+                continue
             stage = item.stage if item.stage in stage_map else "broad"
             stage_map[stage].append(item)
 
         if retrieval_profile == "bootstrap":
-            high_precision_budget = self.BOOTSTRAP_PRIMARY_QUERY_COUNT
-            high_precision_min = 2
-            breadth_class = self._topic_breadth_class(subject_tag)
-            if breadth_class == "curated_broad":
-                broad_budget = min(len(stage_map["broad"]), 1)
-                broad_max = broad_budget
-                broad_min = 0
-            else:
-                broad_budget = 0
-                broad_max = 0
-                broad_min = 0
+            high_precision_budget = max(1, min(len(stage_map["high_precision"]), 2 if fast_mode else 3))
+            high_precision_min = min(2, high_precision_budget)
+            broad_budget = 0
+            broad_max = 0
+            broad_min = 0
             recovery_budget = 0
             recovery_min = 0
         elif self.serverless_mode:
             high_precision_budget = 1 if int(recovery_stage or 0) <= self.REFILL_STAGE_EXACT_ROOT else 2
             high_precision_min = 2
-            if int(recovery_stage or 0) < self.REFILL_STAGE_CURATED_SUBTOPICS:
+            if int(recovery_stage or 0) < self.REFILL_STAGE_ROOT_COMPANION:
                 broad_budget = 0
                 broad_max = 0
+            elif int(recovery_stage or 0) < self.REFILL_STAGE_ANCHORED_ADJACENT:
+                broad_budget = min(len(stage_map["broad"]), 1)
+                broad_max = broad_budget
             else:
-                breadth_class = self._topic_breadth_class(subject_tag)
-                base_budget = 2 if breadth_class == "curated_broad" else 1
-                broad_budget = min(len(stage_map["broad"]), base_budget)
-                broad_max = min(len(stage_map["broad"]), base_budget + 1)
+                broad_budget = min(len(stage_map["broad"]), 2)
+                broad_max = min(len(stage_map["broad"]), 3)
             broad_min = 1 if broad_budget > 0 else 0
             recovery_budget = (
-                min(len(stage_map["recovery"]), 1)
-                if self._allow_adjacent_recovery(page_hint=page_hint, recovery_stage=recovery_stage)
+                min(len(stage_map["recovery"]), 1 if int(recovery_stage or 0) >= self.REFILL_STAGE_RECOVERY_GRAPH else 0)
+                if self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage)
                 else 0
             )
             recovery_min = 0
         else:
-            if int(recovery_stage or 0) <= self.REFILL_STAGE_EXACT_ROOT:
+            if int(recovery_stage or 0) <= self.REFILL_STAGE_ROOT_COMPANION:
                 high_precision_budget = 1 if fast_mode else 2
                 high_precision_min = 1 if fast_mode else 2
             else:
@@ -4368,25 +4972,31 @@ class ReelService:
             else:
                 base_broad_budget = slow_base_broad_budget
                 max_broad_budget = slow_max_broad_budget
-            if int(recovery_stage or 0) < self.REFILL_STAGE_CURATED_SUBTOPICS:
+            if int(recovery_stage or 0) < self.REFILL_STAGE_ROOT_COMPANION:
                 broad_budget = 0
                 broad_max = 0
+            elif int(recovery_stage or 0) < self.REFILL_STAGE_ANCHORED_ADJACENT:
+                broad_budget = min(len(stage_map["broad"]), max(1, base_broad_budget // 2))
+                broad_max = min(len(stage_map["broad"]), max(1, max_broad_budget // 2))
             else:
                 broad_budget = min(len(stage_map["broad"]), base_broad_budget)
                 broad_max = min(len(stage_map["broad"]), max_broad_budget)
             if fast_mode:
                 broad_min = 1 if broad_budget > 0 else 0
                 recovery_budget = (
-                    min(len(stage_map["recovery"]), 1 if int(request_need) >= 6 else 0)
-                    if self._allow_adjacent_recovery(page_hint=page_hint, recovery_stage=recovery_stage)
+                    min(len(stage_map["recovery"]), 1 if int(recovery_stage or 0) >= self.REFILL_STAGE_ANCHORED_ADJACENT else 0)
+                    if self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage)
                     else 0
                 )
                 recovery_min = 1 if recovery_budget > 0 else 0
             else:
                 broad_min = min(2, broad_budget)
                 recovery_budget = (
-                    min(len(stage_map["recovery"]), 1 + max(0, int(request_need) - 6) // 6)
-                    if self._allow_adjacent_recovery(page_hint=page_hint, recovery_stage=recovery_stage)
+                    min(
+                        len(stage_map["recovery"]),
+                        1 if int(recovery_stage or 0) < self.REFILL_STAGE_RECOVERY_GRAPH else 2 + max(0, int(request_need) - 6) // 6,
+                    )
+                    if self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage)
                     else 0
                 )
                 recovery_min = min(1, recovery_budget)
@@ -4459,7 +5069,7 @@ class ReelService:
             return "off"
         if not self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage):
             return "off"
-        if int(recovery_stage or 0) < self.REFILL_STAGE_CHANNEL:
+        if int(recovery_stage or 0) < self.REFILL_STAGE_RECOVERY_GRAPH:
             return "light"
         if self.serverless_mode:
             return "light"
@@ -4875,6 +5485,452 @@ class ReelService:
                 transcript = []
         transcript_cache[clean_video_id] = transcript
         return transcript
+
+    def _request_video_mining_state_id(self, *, material_id: str, request_key: str, video_id: str) -> str:
+        payload = f"{material_id}|{request_key}|{video_id}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _fetch_request_video_mining_state(
+        self,
+        conn,
+        *,
+        material_id: str,
+        request_key: str,
+        video_id: str,
+    ) -> dict[str, Any] | None:
+        if not material_id or not request_key or not video_id:
+            return None
+        return fetch_one(
+            conn,
+            """
+            SELECT *
+            FROM request_video_mining_state
+            WHERE material_id = ?
+              AND request_key = ?
+              AND video_id = ?
+            """,
+            (material_id, request_key, video_id),
+        )
+
+    def _upsert_request_video_mining_state(
+        self,
+        conn,
+        *,
+        material_id: str,
+        request_key: str,
+        video_id: str,
+        mining_state: str | None = None,
+        quality_tier: str | None = None,
+        transcript_fetched: bool | None = None,
+        windows_scanned_delta: int = 0,
+        clusters_mined_delta: int = 0,
+        accepted_clip_delta: int = 0,
+        visible_clip_delta: int = 0,
+        remaining_spans: list[dict[str, Any]] | None = None,
+        exhausted: bool | None = None,
+    ) -> dict[str, Any]:
+        existing = self._fetch_request_video_mining_state(
+            conn,
+            material_id=material_id,
+            request_key=request_key,
+            video_id=video_id,
+        )
+        now = now_iso()
+        row = {
+            "id": str((existing or {}).get("id") or self._request_video_mining_state_id(
+                material_id=material_id,
+                request_key=request_key,
+                video_id=video_id,
+            )),
+            "material_id": material_id,
+            "request_key": request_key,
+            "video_id": video_id,
+            "mining_state": str((existing or {}).get("mining_state") or self.MINING_STATE_UNMINED),
+            "quality_tier": str((existing or {}).get("quality_tier") or ""),
+            "transcript_fetched": 1 if bool((existing or {}).get("transcript_fetched")) else 0,
+            "windows_scanned": int((existing or {}).get("windows_scanned") or 0),
+            "clusters_mined": int((existing or {}).get("clusters_mined") or 0),
+            "accepted_clip_count": int((existing or {}).get("accepted_clip_count") or 0),
+            "visible_clip_count": int((existing or {}).get("visible_clip_count") or 0),
+            "remaining_spans_json": str((existing or {}).get("remaining_spans_json") or "[]"),
+            "last_mined_at": str((existing or {}).get("last_mined_at") or "") or None,
+            "exhausted": 1 if bool((existing or {}).get("exhausted")) else 0,
+            "created_at": str((existing or {}).get("created_at") or now),
+            "updated_at": now,
+        }
+        if mining_state is not None:
+            row["mining_state"] = str(mining_state or self.MINING_STATE_UNMINED)
+        if quality_tier is not None:
+            row["quality_tier"] = str(quality_tier or "")
+        if transcript_fetched is not None:
+            row["transcript_fetched"] = 1 if transcript_fetched else 0
+        row["windows_scanned"] = int(row["windows_scanned"]) + max(0, int(windows_scanned_delta or 0))
+        row["clusters_mined"] = int(row["clusters_mined"]) + max(0, int(clusters_mined_delta or 0))
+        row["accepted_clip_count"] = int(row["accepted_clip_count"]) + max(0, int(accepted_clip_delta or 0))
+        row["visible_clip_count"] = int(row["visible_clip_count"]) + max(0, int(visible_clip_delta or 0))
+        if remaining_spans is not None:
+            row["remaining_spans_json"] = dumps_json(remaining_spans[:24])
+        if exhausted is not None:
+            row["exhausted"] = 1 if exhausted else 0
+        if row["mining_state"] == self.MINING_STATE_EXHAUSTED:
+            row["exhausted"] = 1
+        row["last_mined_at"] = now
+        upsert(conn, "request_video_mining_state", row)
+        return row
+
+    def _dense_transcript_windows(
+        self,
+        conn,
+        *,
+        transcript: list[dict[str, Any]],
+        concept_terms: list[str],
+        root_topic_terms: list[str],
+        target_clip_duration_sec: int,
+        prior_contexts: list[dict[str, Any]],
+        fast_mode: bool,
+        max_windows: int,
+    ) -> list[SegmentMatch]:
+        entries = [entry for entry in transcript if str(entry.get("text") or "").strip()]
+        if not entries:
+            return []
+        safe_target = max(20, int(target_clip_duration_sec or DEFAULT_TARGET_CLIP_DURATION_SEC))
+        window_len = max(75, 2 * safe_target)
+        stride = max(20, safe_target // 2)
+        first_start = max(0, int(float(entries[0].get("start") or 0.0)))
+        last_entry = entries[-1]
+        total_end = int(float(last_entry.get("start") or 0.0) + float(last_entry.get("duration") or 0.0))
+        if total_end <= first_start:
+            return []
+
+        anchor_terms = root_topic_terms or concept_terms[:4]
+        cue_pattern = re.compile(
+            r"\b(explains?|because|therefore|for example|for instance|means|refers to|"
+            r"defined as|in practice|lets|let's|suppose|imagine|proof|derive|application)\b"
+        )
+        candidates: list[SegmentMatch] = []
+        for window_start in range(first_start, max(first_start + 1, total_end), stride):
+            window_end = min(total_end, window_start + window_len)
+            if window_end - window_start < 35:
+                continue
+            window_entries = [
+                entry
+                for entry in entries
+                if float(entry.get("start") or 0.0) < window_end
+                and (float(entry.get("start") or 0.0) + float(entry.get("duration") or 0.0)) > window_start
+            ]
+            if not window_entries:
+                continue
+            text = " ".join(str(entry.get("text") or "").strip() for entry in window_entries).strip()
+            if len(text) < 120:
+                continue
+            concept_support = lexical_overlap_score(text, concept_terms)
+            root_support = lexical_overlap_score(text, anchor_terms)
+            if root_support <= 0.0 and concept_support < 0.08:
+                continue
+            clip_duration = float(max(0, window_end - window_start))
+            clip_context = self._build_clip_context(text=text, clip_duration_sec=clip_duration)
+            clipability = self._clip_self_containment_score(text=text, clip_duration_sec=clip_duration)
+            cue_hits = len(cue_pattern.findall(text.lower()))
+            teaching_density = min(1.0, 0.18 + 0.12 * cue_hits + 0.01 * len(normalize_terms([text])))
+            novelty_penalty = 0.0
+            for prior in prior_contexts[:8]:
+                prior_text = str(prior.get("text") or "").strip()
+                if not prior_text:
+                    continue
+                lexical = lexical_overlap_score(text, [prior_text])
+                similarity = lexical
+                if lexical >= 0.32:
+                    similarity = max(
+                        similarity,
+                        self._text_pair_similarity(
+                            conn,
+                            left_text=text,
+                            right_text=prior_text,
+                            fast_mode=fast_mode,
+                        ),
+                    )
+                novelty_penalty = max(novelty_penalty, similarity)
+            duration_fit = max(0.0, 1.0 - abs(clip_duration - safe_target) / max(30.0, float(safe_target * 2)))
+            score = (
+                0.28 * root_support
+                + 0.26 * concept_support
+                + 0.16 * teaching_density
+                + 0.16 * clipability
+                + 0.08 * duration_fit
+                + 0.06 * float(clip_context.get("function_confidence") or 0.0)
+                - 0.14 * novelty_penalty
+            )
+            candidates.append(
+                SegmentMatch(
+                    chunk_index=len(candidates),
+                    t_start=float(window_start),
+                    t_end=float(window_end),
+                    text=text[:1200],
+                    score=float(score),
+                )
+            )
+
+        candidates.sort(key=lambda item: item.score, reverse=True)
+        selected: list[SegmentMatch] = []
+        for candidate in candidates:
+            duplicate = False
+            for prior in selected:
+                lexical = lexical_overlap_score(candidate.text, [prior.text])
+                if lexical >= 0.7:
+                    duplicate = True
+                    break
+                if lexical >= 0.35:
+                    similarity = self._text_pair_similarity(
+                        conn,
+                        left_text=candidate.text,
+                        right_text=prior.text,
+                        fast_mode=fast_mode,
+                    )
+                    if similarity >= 0.82:
+                        duplicate = True
+                        break
+            if duplicate:
+                continue
+            selected.append(candidate)
+            if len(selected) >= max(1, int(max_windows or 1)):
+                break
+        return selected
+
+    def _mine_existing_request_chain_videos(
+        self,
+        conn,
+        *,
+        material_id: str,
+        request_key: str,
+        generation_id: str | None,
+        concept: dict[str, Any],
+        concept_terms: list[str],
+        context_terms: list[str],
+        concept_embedding: np.ndarray | None,
+        subject_tag: str | None,
+        root_topic_terms: list[str],
+        visual_spec: dict[str, list[str]],
+        preferred_video_duration: str,
+        fast_mode: bool,
+        strict_topic_only: bool,
+        existing_video_counts: dict[str, int],
+        generated_video_counts: dict[str, int],
+        accepted_clip_contexts_by_video: dict[str, list[dict[str, Any]]],
+        target_clip_duration_sec: int,
+        page_hint: int,
+        recovery_stage: int,
+        default_max_segments_per_video: int,
+    ) -> list[dict[str, Any]]:
+        if not material_id or not request_key or recovery_stage < self.REFILL_STAGE_MULTI_CLIP_STRICT:
+            return []
+
+        max_videos = 3 if recovery_stage < self.REFILL_STAGE_MULTI_CLIP_EXPANDED else 5
+        candidate_rows = fetch_all(
+            conn,
+            """
+            SELECT
+                v.*,
+                COUNT(r.id) AS request_reel_count,
+                MAX(r.created_at) AS last_reel_created_at
+            FROM reels r
+            JOIN reel_generations g ON g.id = r.generation_id
+            JOIN videos v ON v.id = r.video_id
+            WHERE g.material_id = ?
+              AND g.request_key = ?
+              AND COALESCE(v.duration_sec, 0) >= 480
+            GROUP BY v.id
+            ORDER BY COUNT(r.id) DESC, MAX(r.created_at) DESC
+            LIMIT ?
+            """,
+            (material_id, request_key, max_videos * 3),
+        )
+        if not candidate_rows:
+            return []
+
+        state_priority = {
+            self.MINING_STATE_HIGH_YIELD: 0,
+            self.MINING_STATE_PARTIALLY_MINED: 1,
+            self.MINING_STATE_UNMINED: 2,
+            self.MINING_STATE_LOW_YIELD: 3,
+            self.MINING_STATE_EXHAUSTED: 4,
+        }
+        ranked_rows: list[tuple[tuple[Any, ...], dict[str, Any], dict[str, Any] | None]] = []
+        for row in candidate_rows:
+            video_id = str(row.get("id") or "").strip()
+            if not video_id:
+                continue
+            state_row = self._fetch_request_video_mining_state(
+                conn,
+                material_id=material_id,
+                request_key=request_key,
+                video_id=video_id,
+            )
+            mining_state = str((state_row or {}).get("mining_state") or self.MINING_STATE_UNMINED)
+            if mining_state == self.MINING_STATE_EXHAUSTED or bool(int((state_row or {}).get("exhausted") or 0)):
+                continue
+            if mining_state == self.MINING_STATE_LOW_YIELD and recovery_stage < self.REFILL_STAGE_MULTI_CLIP_EXPANDED:
+                continue
+            ranked_rows.append(
+                (
+                    (
+                        state_priority.get(mining_state, 9),
+                        -int(row.get("request_reel_count") or 0),
+                        str(row.get("last_reel_created_at") or ""),
+                    ),
+                    dict(row),
+                    state_row,
+                )
+            )
+        ranked_rows.sort(key=lambda item: item[0])
+
+        mined_candidates: list[dict[str, Any]] = []
+        for _priority, row, state_row in ranked_rows[:max_videos]:
+            video = dict(row)
+            video_id = str(video.get("id") or "").strip()
+            video_duration = int(video.get("duration_sec") or 0)
+            video_segment_cap = self._video_segment_cap(
+                video_duration_sec=video_duration,
+                fast_mode=fast_mode,
+                default_cap=default_max_segments_per_video,
+                page_hint=page_hint,
+            )
+            existing_for_video = existing_video_counts.get(video_id, 0)
+            generated_for_video = generated_video_counts.get(video_id, 0)
+            accepted_count = existing_for_video + generated_for_video
+            if accepted_count >= video_segment_cap:
+                self._upsert_request_video_mining_state(
+                    conn,
+                    material_id=material_id,
+                    request_key=request_key,
+                    video_id=video_id,
+                    mining_state=self.MINING_STATE_EXHAUSTED,
+                    exhausted=True,
+                )
+                continue
+
+            try:
+                transcript = list(self.youtube_service.get_transcript(None, video_id) or [])
+            except Exception:
+                transcript = []
+            if not transcript:
+                prior_low_yield = str((state_row or {}).get("mining_state") or "") == self.MINING_STATE_LOW_YIELD
+                self._upsert_request_video_mining_state(
+                    conn,
+                    material_id=material_id,
+                    request_key=request_key,
+                    video_id=video_id,
+                    mining_state=self.MINING_STATE_EXHAUSTED if prior_low_yield else self.MINING_STATE_LOW_YIELD,
+                    transcript_fetched=False,
+                    exhausted=prior_low_yield,
+                )
+                continue
+
+            remaining_capacity = max(1, video_segment_cap - accepted_count)
+            dense_segments = self._dense_transcript_windows(
+                conn,
+                transcript=transcript,
+                concept_terms=concept_terms,
+                root_topic_terms=root_topic_terms,
+                target_clip_duration_sec=target_clip_duration_sec,
+                prior_contexts=accepted_clip_contexts_by_video.get(video_id, []),
+                fast_mode=fast_mode,
+                max_windows=min(18, max(4, remaining_capacity * 3)),
+            )
+            if not dense_segments:
+                prior_low_yield = str((state_row or {}).get("mining_state") or "") == self.MINING_STATE_LOW_YIELD
+                self._upsert_request_video_mining_state(
+                    conn,
+                    material_id=material_id,
+                    request_key=request_key,
+                    video_id=video_id,
+                    mining_state=self.MINING_STATE_EXHAUSTED if prior_low_yield else self.MINING_STATE_LOW_YIELD,
+                    transcript_fetched=True,
+                    windows_scanned_delta=1,
+                    exhausted=prior_low_yield,
+                )
+                continue
+
+            stage_name = "broad" if recovery_stage < self.REFILL_STAGE_MULTI_CLIP_EXPANDED else "recovery"
+            query_candidate = QueryCandidate(
+                text=str(video.get("title") or concept.get("title") or video_id),
+                strategy="video_mining",
+                confidence=0.84,
+                source_terms=concept_terms[:6],
+                weight=0.94,
+                stage=stage_name,
+                source_surface=str(video.get("search_source") or "youtube_html"),
+            )
+            ranking = self._score_video_candidate(
+                conn,
+                video=video,
+                query_candidate=query_candidate,
+                concept_terms=concept_terms,
+                context_terms=context_terms,
+                concept_embedding=concept_embedding,
+                subject_tag=subject_tag,
+                visual_spec=visual_spec,
+                preferred_video_duration=preferred_video_duration,
+                stage_name=stage_name,
+                require_context=False,
+                fast_mode=fast_mode,
+                root_topic_terms=root_topic_terms,
+                strict_topic_only=strict_topic_only,
+            )
+            if not bool(ranking.get("passes", False)):
+                self._upsert_request_video_mining_state(
+                    conn,
+                    material_id=material_id,
+                    request_key=request_key,
+                    video_id=video_id,
+                    mining_state=self.MINING_STATE_LOW_YIELD,
+                    transcript_fetched=True,
+                    windows_scanned_delta=len(dense_segments),
+                )
+                continue
+
+            quality_score = float(ranking.get("final_score") or 0.0)
+            quality_tier = "high" if quality_score >= 0.7 else "medium" if quality_score >= 0.55 else "low"
+            next_state = (
+                self.MINING_STATE_HIGH_YIELD
+                if len(dense_segments) >= max(3, remaining_capacity)
+                else self.MINING_STATE_PARTIALLY_MINED
+            )
+            remaining_spans = [
+                {
+                    "t_start": float(segment.t_start),
+                    "t_end": float(segment.t_end),
+                }
+                for segment in dense_segments[:12]
+            ]
+            self._upsert_request_video_mining_state(
+                conn,
+                material_id=material_id,
+                request_key=request_key,
+                video_id=video_id,
+                mining_state=next_state,
+                quality_tier=quality_tier,
+                transcript_fetched=True,
+                windows_scanned_delta=len(dense_segments),
+                clusters_mined_delta=len(dense_segments),
+                remaining_spans=remaining_spans,
+            )
+            mined_candidates.append(
+                {
+                    "video": video,
+                    "video_id": video_id,
+                    "video_duration": video_duration,
+                    "video_relevance": ranking["text_relevance"],
+                    "ranking": ranking,
+                    "query_candidate": query_candidate,
+                    "stage": stage_name,
+                    "mined_transcript": transcript,
+                    "mined_segments": dense_segments,
+                    "mining_video_id": video_id,
+                    "mining_request_key": request_key,
+                    "mining_segment_cap": video_segment_cap,
+                }
+            )
+        return mined_candidates
 
     def _stage_duration_plan(
         self,
@@ -7999,17 +9055,26 @@ class ReelService:
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
         )
+        normalized_clip_window: tuple[int, int] | None
         if clip_window is None:
-            clip_window = self._normalize_clip_window(
+            normalized_clip_window = self._normalize_clip_window(
                 segment.t_start,
                 segment.t_end,
                 int(video.get("duration_sec") or 0),
                 min_len=clip_min_len,
                 max_len=clip_max_len,
             )
-        if not clip_window:
+        else:
+            normalized_clip_window = self._normalize_clip_window(
+                clip_window[0],
+                clip_window[1],
+                int(video.get("duration_sec") or 0),
+                min_len=clip_min_len,
+                max_len=clip_max_len,
+            )
+        if not normalized_clip_window:
             return None
-        start_sec, end_sec = clip_window
+        start_sec, end_sec = normalized_clip_window
         video_id = video["id"]
         url = (
             f"https://www.youtube.com/embed/{video_id}?start={start_sec}&end={end_sec}"

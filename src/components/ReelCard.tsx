@@ -14,6 +14,7 @@ type Props = {
   onAutoplayEnabledChange: (nextEnabled: boolean) => void;
   playbackRate: number;
   onPlaybackRateChange: (nextRate: number) => void;
+  onRequestNextReel?: () => void;
   onOpenContent?: () => void;
 };
 
@@ -123,6 +124,7 @@ export function ReelCard({
   onAutoplayEnabledChange,
   playbackRate,
   onPlaybackRateChange,
+  onRequestNextReel,
   onOpenContent,
 }: Props) {
   const hostContainerRef = useRef<HTMLDivElement | null>(null);
@@ -504,7 +506,7 @@ export function ReelCard({
           height: "100%",
           videoId,
           playerVars: {
-            autoplay: autoplayEnabledRef.current ? 1 : 0,
+            autoplay: 1,
             controls: 0,
             disablekb: 1,
             fs: 0,
@@ -525,7 +527,7 @@ export function ReelCard({
               applyPlaybackRateToPlayer(event.target as YouTubePlayer, playbackRateRef.current);
               syncDetectedDurationFromPlayer(event.target as YouTubePlayer);
               const tryAutoplay = () => {
-                if (cancelled || !isActive || !autoplayEnabledRef.current || didUserInteractRef.current) {
+                if (cancelled || !isActive || didUserInteractRef.current) {
                   return;
                 }
                 event.target.mute();
@@ -535,7 +537,7 @@ export function ReelCard({
               };
               const queueAutoplayRetry = () => {
                 clearAutoplayRetryTimer();
-                if (cancelled || !isActive || !autoplayEnabledRef.current || didUserInteractRef.current) {
+                if (cancelled || !isActive || didUserInteractRef.current) {
                   return;
                 }
                 if (autoplayRetryCountRef.current >= AUTOPLAY_MAX_RETRIES) {
@@ -557,21 +559,10 @@ export function ReelCard({
                 }, AUTOPLAY_RETRY_DELAY_MS);
               };
               autoplayRetryCountRef.current = 0;
-              if (autoplayEnabledRef.current) {
-                // Mobile browsers commonly block autoplay with sound; always start muted and retry.
-                tryAutoplay();
-                setIsMuted(true);
-                queueAutoplayRetry();
-              } else {
-                clearAutoplayRetryTimer();
-                if (mutedPreference) {
-                  event.target.mute();
-                  setIsMuted(true);
-                } else {
-                  event.target.unMute();
-                  setIsMuted(false);
-                }
-              }
+              // Mobile browsers commonly block autoplay with sound; always start muted and retry.
+              tryAutoplay();
+              setIsMuted(true);
+              queueAutoplayRetry();
               setIsReady(true);
               setIsPlaying(false);
               setCurrentSec(0);
@@ -585,7 +576,6 @@ export function ReelCard({
               syncDetectedDurationFromPlayer(event.target as YouTubePlayer);
               const state = event.data;
               const playerState = yt.PlayerState;
-              const shouldResumePlayback = autoplayEnabledRef.current || didUserInteractRef.current;
               if (state === playerState.PLAYING) {
                 clearAutoplayRetryTimer();
                 autoplayRetryCountRef.current = 0;
@@ -599,14 +589,13 @@ export function ReelCard({
                 syncProgress();
                 if (
                   isActive
-                  && shouldResumePlayback
                   && !manualPauseRequestedRef.current
                   && autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES
                 ) {
                   clearAutoplayRetryTimer();
                   autoplayRetryTimerRef.current = setTimeout(() => {
                     autoplayRetryTimerRef.current = null;
-                    if (cancelled || !isActive || manualPauseRequestedRef.current || !(autoplayEnabledRef.current || didUserInteractRef.current)) {
+                    if (cancelled || !isActive || manualPauseRequestedRef.current) {
                       return;
                     }
                     autoplayRetryCountRef.current += 1;
@@ -623,11 +612,12 @@ export function ReelCard({
                 }
               } else if (state === playerState.ENDED) {
                 clearAutoplayRetryTimer();
-                if (!shouldResumePlayback) {
+                if (autoplayEnabledRef.current && isActive && onRequestNextReel) {
                   setIsPlaying(false);
+                  setIsResumeMaskVisible(false);
                   setCurrentSec(0);
                   stopProgressTimer();
-                  event.target.seekTo(clipStart, true);
+                  onRequestNextReel();
                   return;
                 }
                 manualPauseRequestedRef.current = false;
@@ -638,7 +628,7 @@ export function ReelCard({
                 setCurrentSec(0);
                 scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
                 startProgressTimer();
-              } else if ((state === playerState.UNSTARTED || state === playerState.CUED) && isActive && shouldResumePlayback) {
+              } else if ((state === playerState.UNSTARTED || state === playerState.CUED) && isActive) {
                 // Retry autoplay for devices that initially report cued/unstarted.
                 manualPauseRequestedRef.current = false;
                 if (autoplayRetryCountRef.current < AUTOPLAY_MAX_RETRIES) {
@@ -802,47 +792,7 @@ export function ReelCard({
     const nextEnabled = !autoplayEnabled;
     autoplayEnabledRef.current = nextEnabled;
     onAutoplayEnabledChange(nextEnabled);
-    if (!nextEnabled) {
-      clearAutoplayRetryTimer();
-      return;
-    }
-    if (!isYouTubeVideo) {
-      return;
-    }
-    const player = playerRef.current;
-    if (!player || !isReady || isPlaying || manualPauseRequestedRef.current) {
-      return;
-    }
-    if (isMutedRef.current) {
-      player.mute();
-      setIsMuted(true);
-    } else {
-      player.unMute();
-      setIsMuted(false);
-    }
-    didUserInteractRef.current = true;
-    manualPauseRequestedRef.current = false;
-    showResumeMask(RESUME_MASK_MS);
-    scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
-    setIsSurfaceVisible(true);
-    player.seekTo(clipStart + clamp(currentSec, 0, clipDuration), true);
-    player.playVideo();
-    setIsPlaying(true);
-    startProgressTimer();
-  }, [
-    autoplayEnabled,
-    clearAutoplayRetryTimer,
-    clipDuration,
-    clipStart,
-    currentSec,
-    isPlaying,
-    isReady,
-    isYouTubeVideo,
-    onAutoplayEnabledChange,
-    scheduleSurfaceReveal,
-    showResumeMask,
-    startProgressTimer,
-  ]);
+  }, [autoplayEnabled, onAutoplayEnabledChange]);
 
   const handlePlaybackRateChange = useCallback((nextRate: number) => {
     playbackRateRef.current = nextRate;

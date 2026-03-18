@@ -212,8 +212,13 @@ FAST_MIN_REFINEMENT_TARGET_REELS = 8
 SLOW_MIN_REFINEMENT_TARGET_REELS = 10
 FAST_REFINEMENT_JOB_BURST_REELS = 8
 SLOW_REFINEMENT_JOB_BURST_REELS = 10
-REFINEMENT_STAGE_LONG_FORM = 3
-MAX_REFINEMENT_RECOVERY_STAGE = 6
+REFINEMENT_STAGE_ROOT_EXACT = 0
+REFINEMENT_STAGE_ROOT_COMPANION = 1
+REFINEMENT_STAGE_MULTI_CLIP_STRICT = 2
+REFINEMENT_STAGE_ANCHORED_ADJACENT = 3
+REFINEMENT_STAGE_MULTI_CLIP_EXPANDED = 4
+REFINEMENT_STAGE_RECOVERY_GRAPH = 5
+MAX_REFINEMENT_RECOVERY_STAGE = REFINEMENT_STAGE_RECOVERY_GRAPH
 
 VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
@@ -1521,8 +1526,8 @@ def _request_similarity_profile(subject_tag: str | None) -> dict[str, float]:
         fast_mode=False,
     )
     return {
-        "cross_video_similarity": float(novelty_profile.get("cross_video_similarity") or 0.92),
-        "same_video_similarity": float(novelty_profile.get("same_video_similarity") or 0.88),
+        "cross_video_similarity": float(novelty_profile.get("cross_video_similarity") or 0.9),
+        "same_video_similarity": float(novelty_profile.get("same_video_similarity") or 0.86),
         "breadth_class": breadth_class,
     }
 
@@ -1556,6 +1561,16 @@ def _request_source_surface_allowed(
     }:
         return False
     if page <= 2 and surface in {
+        "youtube_related",
+        "youtube_channel",
+        "duckduckgo_site",
+        "duckduckgo_quoted",
+        "bing_site",
+        "bing_quoted",
+        "local_cache",
+    }:
+        return False
+    if page <= 3 and surface in {
         "duckduckgo_site",
         "duckduckgo_quoted",
         "bing_site",
@@ -1697,11 +1712,13 @@ def _request_stage_bonus(reel: dict[str, Any], *, page: int) -> float:
 
 def _request_page_video_cap(reel: dict[str, Any], *, page: int) -> int:
     duration_sec = int(reel.get("video_duration_sec") or 0)
+    if page <= 1:
+        return 2
     if page <= 2:
-        return 4
-    if page <= 5:
-        return 8
-    return 12 if duration_sec > 20 * 60 else 8
+        return 3
+    if page <= 3:
+        return 5
+    return 10 if duration_sec > 20 * 60 else 8
 
 
 def _request_effective_min_relevance(
@@ -1736,13 +1753,17 @@ def _shape_request_page_reels(
     target_clip_duration_min_sec: int | None,
     target_clip_duration_max_sec: int | None,
 ) -> list[dict[str, Any]]:
+    target_visible_count = max(1, int(page or 1) * max(1, int(limit or 1)))
+    clip_min = target_clip_duration_min_sec
+    clip_max = target_clip_duration_max_sec
+
     serialized = _serialize_reels_for_request(
         ranked,
         min_relevance=min_relevance,
         preferred_video_duration=preferred_video_duration,
         target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
+        target_clip_duration_min_sec=clip_min,
+        target_clip_duration_max_sec=clip_max,
     )
     shaped = _shape_reels_for_request_context(
         serialized,
@@ -1751,6 +1772,55 @@ def _shape_request_page_reels(
         subject_tag=subject_tag,
         strict_topic_only=strict_topic_only,
     )
+
+    widened_clip_min = clip_min
+    widened_clip_max = clip_max
+    if len(shaped) < target_visible_count and (clip_min is not None or clip_max is not None):
+        if page <= 2:
+            widened_clip_min = max(0, int(clip_min or 0) - 8) if clip_min is not None else None
+            widened_clip_max = int(clip_max or 0) + 12 if clip_max is not None else None
+        else:
+            widened_clip_min = max(0, int(clip_min or 0) - 15) if clip_min is not None else None
+            widened_clip_max = int(clip_max or 0) + 20 if clip_max is not None else None
+        if widened_clip_min != clip_min or widened_clip_max != clip_max:
+            widened_serialized = _serialize_reels_for_request(
+                ranked,
+                min_relevance=min_relevance,
+                preferred_video_duration=preferred_video_duration,
+                target_clip_duration_sec=target_clip_duration_sec,
+                target_clip_duration_min_sec=widened_clip_min,
+                target_clip_duration_max_sec=widened_clip_max,
+            )
+            widened_shaped = _shape_reels_for_request_context(
+                widened_serialized,
+                page=page,
+                limit=limit,
+                subject_tag=subject_tag,
+                strict_topic_only=strict_topic_only,
+            )
+            shaped = _merge_request_reel_lists(shaped, widened_shaped)
+
+    if len(shaped) < target_visible_count:
+        relaxed_serialized = _filter_reels_by_min_relevance(ranked, min_relevance)
+        relaxed_shaped = _shape_reels_for_request_context(
+            relaxed_serialized,
+            page=page,
+            limit=limit,
+            subject_tag=subject_tag,
+            strict_topic_only=strict_topic_only,
+        )
+        shaped = _merge_request_reel_lists(shaped, relaxed_shaped)
+
+    if len(shaped) < target_visible_count and strict_topic_only and subject_tag:
+        relaxed_topic_shaped = _shape_reels_for_request_context(
+            _filter_reels_by_min_relevance(ranked, min_relevance),
+            page=page,
+            limit=limit,
+            subject_tag=subject_tag,
+            strict_topic_only=False,
+        )
+        shaped = _merge_request_reel_lists(shaped, relaxed_topic_shaped)
+
     if page <= 1 and strict_topic_only and subject_tag and len(shaped) < max(1, limit):
         emergency_min_relevance = max(0.27, float(min_relevance or 0.3) - 0.03)
         emergency_serialized = _serialize_reels_for_request(
@@ -1768,7 +1838,18 @@ def _shape_request_page_reels(
             subject_tag=subject_tag,
             strict_topic_only=strict_topic_only,
         )
-        return _merge_request_reel_lists(shaped, emergency_shaped)
+        shaped = _merge_request_reel_lists(shaped, emergency_shaped)
+
+    if len(shaped) < target_visible_count:
+        fallback_shaped = _shape_reels_for_request_context(
+            ranked,
+            page=page,
+            limit=limit,
+            subject_tag=subject_tag,
+            strict_topic_only=False,
+        )
+        shaped = _merge_request_reel_lists(shaped, fallback_shaped)
+
     return shaped
 
 
@@ -1865,15 +1946,21 @@ def _shape_reels_for_request_context(
         match = re.search(r"/embed/([^?&/]+)", video_url)
         video_id = match.group(1) if match else ""
         similarity_threshold = float(similarity_profile.get("cross_video_similarity") or 0.92)
-        if page > 2:
-            similarity_threshold = min(0.98, similarity_threshold + 0.01)
+        if page <= 1:
+            similarity_threshold = min(0.97, similarity_threshold + 0.03)
+        elif page <= 2:
+            similarity_threshold = min(0.96, similarity_threshold + 0.02)
+        elif page <= 3:
+            similarity_threshold = min(0.94, similarity_threshold + 0.01)
+        else:
+            similarity_threshold = max(0.84, similarity_threshold - 0.02)
         if any(_request_reel_similarity(item, prev) >= similarity_threshold for prev in shaped_rows):
             continue
         if video_id:
             current_count = per_video_counts.get(video_id, 0)
             if current_count >= _request_page_video_cap(item, page=page):
                 continue
-            if current_count >= 4 and not _request_diversity_ready(
+            if current_count >= (2 if page <= 1 else 3 if page <= 2 else 4 if page <= 3 else 6) and not _request_diversity_ready(
                 per_video_counts=per_video_counts,
                 per_anchor_counts=per_anchor_counts,
             ):
@@ -1884,11 +1971,11 @@ def _shape_reels_for_request_context(
             matched_companions = _request_matched_anchor_terms(text, page_one_companion_terms)
             matched_roots = _request_matched_anchor_terms(text, root_terms)
             candidate_anchor_keys = matched_companions or matched_roots or [str(subject_tag).strip()]
-            anchor_cap = 4 if page <= 2 else 6 if page <= 5 else 12
+            anchor_cap = 4 if page <= 1 else 5 if page <= 2 else 8 if page <= 3 else 12
             chosen_anchor = None
             for candidate_anchor in candidate_anchor_keys:
                 if (
-                    per_anchor_counts.get(candidate_anchor, 0) >= 4
+                    per_anchor_counts.get(candidate_anchor, 0) >= (3 if page <= 1 else 4 if page <= 2 else 6)
                     and not _request_diversity_ready(
                         per_video_counts=per_video_counts,
                         per_anchor_counts=per_anchor_counts,
@@ -1921,12 +2008,246 @@ def _fetch_generation_row(conn, generation_id: str | None) -> dict[str, Any] | N
     return fetch_one(conn, "SELECT * FROM reel_generations WHERE id = ?", (generation_id,))
 
 
-def _fetch_active_generation_row(conn, *, material_id: str, request_key: str) -> dict[str, Any] | None:
-    head = fetch_one(
+def _normalize_provider_stage(value: object) -> Literal["youtube", "youtube_graph", "youtube_external", "dailymotion", "wikimedia", "stock"]:
+    clean = str(value or "").strip().lower()
+    if clean in {"youtube", "youtube_graph", "youtube_external", "dailymotion", "wikimedia", "stock"}:
+        return clean  # type: ignore[return-value]
+    if clean in {"wikimedia_commons", "internet_archive", "pexels_video", "pixabay_video"}:
+        return "stock" if clean != "wikimedia_commons" else "wikimedia"
+    return "youtube"
+
+
+def _next_provider_stage(current_stage: object) -> Literal["dailymotion", "wikimedia", "stock"] | None:
+    current = _normalize_provider_stage(current_stage)
+    if current in {"youtube", "youtube_graph", "youtube_external"}:
+        return "dailymotion"
+    if current == "dailymotion":
+        return "wikimedia"
+    if current == "wikimedia":
+        return "stock"
+    return None
+
+
+def _search_status_provider_stage(
+    provider_stage: object,
+    *,
+    recovery_stage: int | None = None,
+) -> Literal["youtube", "youtube_graph", "youtube_external", "dailymotion", "wikimedia", "stock"]:
+    normalized = _normalize_provider_stage(provider_stage)
+    if normalized != "youtube":
+        return normalized
+    safe_recovery_stage = max(0, int(recovery_stage or 0))
+    if safe_recovery_stage > MAX_REFINEMENT_RECOVERY_STAGE:
+        return "youtube_external"
+    if safe_recovery_stage >= REFINEMENT_STAGE_RECOVERY_GRAPH:
+        return "youtube_graph"
+    return "youtube"
+
+
+def _fetch_generation_head_row(conn, *, material_id: str, request_key: str) -> dict[str, Any] | None:
+    return fetch_one(
         conn,
-        "SELECT active_generation_id FROM reel_generation_heads WHERE material_id = ? AND request_key = ?",
+        "SELECT * FROM reel_generation_heads WHERE material_id = ? AND request_key = ?",
         (material_id, request_key),
     )
+
+
+def _generation_head_row(
+    existing_row: dict[str, Any] | None,
+    *,
+    material_id: str,
+    request_key: str,
+) -> dict[str, Any]:
+    return {
+        "id": str((existing_row or {}).get("id") or _build_generation_head_id(material_id, request_key)),
+        "material_id": material_id,
+        "request_key": request_key,
+        "active_generation_id": str((existing_row or {}).get("active_generation_id") or ""),
+        "search_state": str((existing_row or {}).get("search_state") or "idle"),
+        "can_request_more": 1 if bool(_to_int((existing_row or {}).get("can_request_more"), 1)) else 0,
+        "exhausted_reason": str((existing_row or {}).get("exhausted_reason") or "") or None,
+        "provider_stage": _normalize_provider_stage((existing_row or {}).get("provider_stage")),
+        "provider_fallback_enabled": 1 if bool(_to_int((existing_row or {}).get("provider_fallback_enabled"), 0)) else 0,
+        "recovery_stage": max(0, _to_int((existing_row or {}).get("recovery_stage"), 0)),
+        "stage_exhausted_json": str((existing_row or {}).get("stage_exhausted_json") or "{}"),
+        "last_progress_at": str((existing_row or {}).get("last_progress_at") or "") or None,
+        "last_job_id": str((existing_row or {}).get("last_job_id") or "") or None,
+        "search_session_version": max(1, _to_int((existing_row or {}).get("search_session_version"), 1)),
+        "updated_at": str((existing_row or {}).get("updated_at") or now_iso()),
+    }
+
+
+def _upsert_generation_head(
+    conn,
+    *,
+    material_id: str,
+    request_key: str,
+    updates: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    row = _generation_head_row(
+        _fetch_generation_head_row(conn, material_id=material_id, request_key=request_key),
+        material_id=material_id,
+        request_key=request_key,
+    )
+    for key, value in (updates or {}).items():
+        if key == "provider_stage":
+            row[key] = _normalize_provider_stage(value)
+        elif key == "recovery_stage":
+            row[key] = max(0, _to_int(value, row["recovery_stage"]))
+        elif key == "search_session_version":
+            row[key] = max(1, _to_int(value, row["search_session_version"]))
+        elif key in {"can_request_more", "provider_fallback_enabled"}:
+            row[key] = 1 if bool(value) else 0
+        elif key == "stage_exhausted_json":
+            if isinstance(value, str):
+                row[key] = value or "{}"
+            else:
+                row[key] = dumps_json(_normalize_stage_exhausted(value))
+        elif key == "updated_at":
+            row[key] = str(value or row[key])
+        else:
+            row[key] = value
+    row["updated_at"] = str(row.get("updated_at") or now_iso())
+    if not str(row.get("stage_exhausted_json") or "").strip():
+        row["stage_exhausted_json"] = "{}"
+    try:
+        upsert(conn, "reel_generation_heads", row)
+    except sqlite3.OperationalError as exc:
+        if "no column named id" not in str(exc).lower():
+            raise
+        execute_modify(
+            conn,
+            """
+            INSERT INTO reel_generation_heads (material_id, request_key, active_generation_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(material_id, request_key) DO UPDATE SET
+                active_generation_id = excluded.active_generation_id,
+                updated_at = excluded.updated_at
+            """,
+            (
+                material_id,
+                request_key,
+                str(row.get("active_generation_id") or ""),
+                str(row.get("updated_at") or now_iso()),
+            ),
+        )
+    return row
+
+
+def _head_stage_exhausted(head_row: dict[str, Any] | None) -> dict[str, bool]:
+    if not head_row:
+        return {}
+    raw_value = head_row.get("stage_exhausted_json")
+    if isinstance(raw_value, str):
+        try:
+            parsed = json.loads(raw_value or "{}")
+        except json.JSONDecodeError:
+            parsed = {}
+        return _normalize_stage_exhausted(parsed)
+    return _normalize_stage_exhausted(raw_value)
+
+
+def _head_search_session_version(head_row: dict[str, Any] | None) -> int:
+    return max(1, _to_int((head_row or {}).get("search_session_version"), 1))
+
+
+def _search_status_from_head(
+    head_row: dict[str, Any] | None,
+    *,
+    job_row: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not head_row:
+        return {
+            "state": "idle",
+            "can_request_more": True,
+            "reason": None,
+            "provider_stage": "youtube",
+            "recovery_stage": 0,
+            "last_progress_at": None,
+        }
+    state = str(head_row.get("search_state") or "idle").strip().lower()
+    can_request_more = bool(_to_int(head_row.get("can_request_more"), 1))
+    reason = str(head_row.get("exhausted_reason") or "").strip() or None
+    recovery_stage = max(0, _to_int(head_row.get("recovery_stage"), 0))
+    provider_stage = _search_status_provider_stage(head_row.get("provider_stage"), recovery_stage=recovery_stage)
+    last_progress_at = _normalize_datetime_for_api(head_row.get("last_progress_at"))
+    job_status = str((job_row or {}).get("status") or "").strip().lower()
+    if state not in {"stalled", "exhausted", "failed"} and job_status in {"queued", "running"}:
+        state = "refining" if job_status == "running" else "active"
+    if state not in {"idle", "active", "refining", "stalled", "exhausted", "failed"}:
+        state = "idle"
+    return {
+        "state": state,
+        "can_request_more": can_request_more,
+        "reason": reason,
+        "provider_stage": provider_stage,
+        "recovery_stage": recovery_stage,
+        "last_progress_at": last_progress_at,
+    }
+
+
+def _job_activity_started_at(job_row: dict[str, Any] | None) -> datetime | None:
+    if not job_row:
+        return None
+    return _parse_optional_iso_datetime(job_row.get("started_at")) or _parse_optional_iso_datetime(job_row.get("created_at"))
+
+
+def _refinement_job_is_stale(job_row: dict[str, Any] | None) -> bool:
+    started_at = _job_activity_started_at(job_row)
+    if started_at is None:
+        return False
+    age_sec = (datetime.now(timezone.utc) - started_at).total_seconds()
+    return age_sec >= REFINEMENT_JOB_STALE_TIMEOUT_SEC
+
+
+def _update_head_for_search_state(
+    conn,
+    *,
+    material_id: str,
+    request_key: str,
+    search_state: str,
+    can_request_more: bool,
+    exhausted_reason: str | None = None,
+    provider_stage: object | None = None,
+    recovery_stage: int | None = None,
+    stage_exhausted: dict[str, bool] | None = None,
+    last_job_id: str | None = None,
+    last_progress_at: str | None = None,
+    provider_fallback_enabled: bool | None = None,
+    search_session_version: int | None = None,
+    active_generation_id: str | None = None,
+) -> dict[str, Any]:
+    updates: dict[str, Any] = {
+        "search_state": search_state,
+        "can_request_more": can_request_more,
+        "exhausted_reason": exhausted_reason,
+    }
+    if provider_stage is not None:
+        updates["provider_stage"] = provider_stage
+    if recovery_stage is not None:
+        updates["recovery_stage"] = recovery_stage
+    if stage_exhausted is not None:
+        updates["stage_exhausted_json"] = stage_exhausted
+    if last_job_id is not None:
+        updates["last_job_id"] = last_job_id
+    if last_progress_at is not None:
+        updates["last_progress_at"] = last_progress_at
+    if provider_fallback_enabled is not None:
+        updates["provider_fallback_enabled"] = provider_fallback_enabled
+    if search_session_version is not None:
+        updates["search_session_version"] = search_session_version
+    if active_generation_id is not None:
+        updates["active_generation_id"] = active_generation_id
+    return _upsert_generation_head(
+        conn,
+        material_id=material_id,
+        request_key=request_key,
+        updates=updates,
+    )
+
+
+def _fetch_active_generation_row(conn, *, material_id: str, request_key: str) -> dict[str, Any] | None:
+    head = _fetch_generation_head_row(conn, material_id=material_id, request_key=request_key)
     if not head:
         return None
     return _fetch_generation_row(conn, str(head.get("active_generation_id") or ""))
@@ -2719,7 +3040,12 @@ def _first_unexhausted_recovery_stage(stage_exhausted: dict[str, bool] | None) -
 
 
 def _refinement_stage_kind(recovery_stage: int) -> str:
-    return "window" if int(recovery_stage or 0) == REFINEMENT_STAGE_LONG_FORM else "source"
+    safe_stage = int(recovery_stage or 0)
+    return (
+        "window"
+        if safe_stage in {REFINEMENT_STAGE_MULTI_CLIP_STRICT, REFINEMENT_STAGE_MULTI_CLIP_EXPANDED}
+        else "source"
+    )
 
 
 def _visible_reel_clip_keys(reels: list[dict[str, Any]]) -> set[str]:
@@ -2729,6 +3055,86 @@ def _visible_reel_clip_keys(reels: list[dict[str, Any]]) -> set[str]:
         if clip_key:
             keys.add(clip_key)
     return keys
+
+
+def _infer_frontier_family_from_reel(reel: dict[str, Any]) -> str:
+    retrieval_stage = str(reel.get("retrieval_stage") or "").strip().lower()
+    query_strategy = str(reel.get("query_strategy") or "").strip().lower()
+    source_surface = str(reel.get("source_surface") or "").strip().lower()
+    if retrieval_stage == "high_precision" and query_strategy == "literal":
+        return "root_exact"
+    if source_surface in {
+        "youtube_channel",
+        "youtube_related",
+        "duckduckgo_site",
+        "duckduckgo_quoted",
+        "bing_site",
+        "bing_quoted",
+        "local_cache",
+    }:
+        return "recovery_graph"
+    if retrieval_stage == "recovery" or query_strategy == "recovery_adjacent":
+        return "anchored_adjacent"
+    return "root_companion"
+
+
+def _update_frontier_visible_growth(
+    conn,
+    *,
+    material_id: str,
+    request_key: str,
+    reels: list[dict[str, Any]],
+) -> None:
+    if not material_id or not request_key or not reels:
+        return
+    visible_by_family: dict[str, int] = {}
+    for reel in reels:
+        family = _infer_frontier_family_from_reel(reel)
+        visible_by_family[family] = visible_by_family.get(family, 0) + 1
+    updated_at = now_iso()
+    for family, count in visible_by_family.items():
+        if count <= 0:
+            continue
+        entry = fetch_one(
+            conn,
+            """
+            SELECT id, new_visible_reels
+            FROM request_frontier_entries
+            WHERE material_id = ?
+              AND request_key = ?
+              AND family_key LIKE ?
+              AND exhausted = 0
+            ORDER BY COALESCE(last_run_at, updated_at) DESC, updated_at DESC
+            LIMIT 1
+            """,
+            (material_id, request_key, f"{family}:%"),
+        )
+        if not entry:
+            entry = fetch_one(
+                conn,
+                """
+                SELECT id, new_visible_reels
+                FROM request_frontier_entries
+                WHERE material_id = ?
+                  AND request_key = ?
+                  AND family_key LIKE ?
+                ORDER BY COALESCE(last_run_at, updated_at) DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (material_id, request_key, f"{family}:%"),
+            )
+        if not entry:
+            continue
+        execute_modify(
+            conn,
+            """
+            UPDATE request_frontier_entries
+            SET new_visible_reels = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (max(0, int(entry.get("new_visible_reels") or 0)) + count, updated_at, str(entry.get("id") or "")),
+        )
 
 
 def _count_generation_unique_videos(conn, generation_id: str) -> int:
@@ -3330,6 +3736,17 @@ def _run_refinement_job(job_id: str) -> None:
             limit=safe_page_size_hint,
         )
         merged_visible_keys = _visible_reel_clip_keys(merged_reels)
+        new_visible_reels: list[dict[str, Any]] = []
+        for reel in merged_reels:
+            _reel_id, clip_key = _reel_identity_key(reel)
+            if clip_key and clip_key not in source_visible_keys:
+                new_visible_reels.append(reel)
+        _update_frontier_visible_growth(
+            conn,
+            material_id=str(job_row.get("material_id") or ""),
+            request_key=str(job_row.get("request_key") or ""),
+            reels=new_visible_reels,
+        )
         next_state = _advance_refinement_state(
             recovery_stage=safe_recovery_stage,
             stage_exhausted=normalized_stage_exhausted,
@@ -3338,7 +3755,7 @@ def _run_refinement_job(job_id: str) -> None:
             no_new_visible_reels_passes=safe_no_new_visible_reels_passes,
             new_unique_videos=_count_generation_unique_videos(conn, result_generation_id),
             new_unique_clip_windows=result_count,
-            new_unique_visible_reels=len(merged_visible_keys.difference(source_visible_keys)),
+            new_unique_visible_reels=len(new_visible_reels),
         )
         if len(merged_reels) < inventory_target_count and not next_state["all_stages_exhausted"]:
             _queue_refinement_if_needed(

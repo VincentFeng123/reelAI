@@ -244,6 +244,64 @@ CREATE TABLE IF NOT EXISTS retrieval_outcomes (
 
 CREATE INDEX IF NOT EXISTS idx_retrieval_outcomes_run ON retrieval_outcomes(run_id, created_at DESC);
 
+CREATE TABLE IF NOT EXISTS request_frontier_entries (
+    id TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    request_key TEXT NOT NULL,
+    family_key TEXT NOT NULL,
+    stage TEXT NOT NULL DEFAULT '',
+    query_text TEXT NOT NULL DEFAULT '',
+    source_family TEXT NOT NULL DEFAULT '',
+    seed_video_id TEXT NOT NULL DEFAULT '',
+    seed_channel_id TEXT NOT NULL DEFAULT '',
+    anchor_mode TEXT NOT NULL DEFAULT '',
+    runs INTEGER NOT NULL DEFAULT 0,
+    new_good_videos INTEGER NOT NULL DEFAULT 0,
+    new_accepted_reels INTEGER NOT NULL DEFAULT 0,
+    new_visible_reels INTEGER NOT NULL DEFAULT 0,
+    duplicate_rate REAL NOT NULL DEFAULT 0.0,
+    off_topic_rate REAL NOT NULL DEFAULT 0.0,
+    last_run_at TEXT,
+    cooldown_until TEXT,
+    exhausted INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(material_id) REFERENCES materials(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_request_frontier_entries_material_request_family
+ON request_frontier_entries(material_id, request_key, family_key);
+
+CREATE INDEX IF NOT EXISTS idx_request_frontier_entries_request_stage
+ON request_frontier_entries(material_id, request_key, stage, exhausted, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS request_video_mining_state (
+    id TEXT PRIMARY KEY,
+    material_id TEXT NOT NULL,
+    request_key TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    mining_state TEXT NOT NULL DEFAULT 'unmined',
+    quality_tier TEXT NOT NULL DEFAULT '',
+    transcript_fetched INTEGER NOT NULL DEFAULT 0,
+    windows_scanned INTEGER NOT NULL DEFAULT 0,
+    clusters_mined INTEGER NOT NULL DEFAULT 0,
+    accepted_clip_count INTEGER NOT NULL DEFAULT 0,
+    visible_clip_count INTEGER NOT NULL DEFAULT 0,
+    remaining_spans_json TEXT NOT NULL DEFAULT '[]',
+    last_mined_at TEXT,
+    exhausted INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(material_id) REFERENCES materials(id),
+    FOREIGN KEY(video_id) REFERENCES videos(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_request_video_mining_state_material_request_video
+ON request_video_mining_state(material_id, request_key, video_id);
+
+CREATE INDEX IF NOT EXISTS idx_request_video_mining_state_request_status
+ON request_video_mining_state(material_id, request_key, mining_state, exhausted, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS community_accounts (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL,

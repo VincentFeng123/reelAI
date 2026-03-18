@@ -67,14 +67,6 @@ type HistoryInfoSection = {
   title: string;
   fields: HistoryInfoField[];
 };
-type HistoryInfoPopoverState = {
-  materialId: string;
-  placement: "above" | "below";
-  insetRight: number;
-  insetTop?: number;
-  insetBottom?: number;
-  maxHeight: number;
-};
 
 const DEFAULT_SETTINGS_AVAILABILITY_STATE: SettingsAvailabilityState = {
   status: "checking",
@@ -334,33 +326,6 @@ function buildHistoryInfoSections(item: HistoryItem): HistoryInfoSection[] {
   ].filter((section) => section.fields.length > 0);
 }
 
-function buildHistoryInfoPopoverState(materialId: string, rect: DOMRect): HistoryInfoPopoverState {
-  const viewportPadding = 16;
-  const popoverGap = 10;
-  const desiredHeight = 360;
-  const spaceBelow = window.innerHeight - rect.bottom - viewportPadding - popoverGap;
-  const spaceAbove = rect.top - viewportPadding - popoverGap;
-  const shouldPlaceAbove = spaceBelow < desiredHeight && spaceAbove > spaceBelow;
-
-  if (shouldPlaceAbove) {
-    return {
-      materialId,
-      placement: "above",
-      insetRight: Math.max(viewportPadding, window.innerWidth - rect.right),
-      insetBottom: Math.max(viewportPadding, window.innerHeight - rect.top + popoverGap),
-      maxHeight: Math.max(220, spaceAbove),
-    };
-  }
-
-  return {
-    materialId,
-    placement: "below",
-    insetRight: Math.max(viewportPadding, window.innerWidth - rect.right),
-    insetTop: Math.max(viewportPadding, rect.bottom + popoverGap),
-    maxHeight: Math.max(220, spaceBelow),
-  };
-}
-
 function HomePageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -383,7 +348,7 @@ function HomePageContent() {
   const [topChromeGestureActive, setTopChromeGestureActive] = useState(false);
   const [searchPanelScrollable, setSearchPanelScrollable] = useState(false);
   const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
-  const [selectedHistoryInfoPopover, setSelectedHistoryInfoPopover] = useState<HistoryInfoPopoverState | null>(null);
+  const [selectedHistoryInfoId, setSelectedHistoryInfoId] = useState<string | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
   const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
@@ -644,8 +609,8 @@ function HomePageContent() {
     return historySorted.filter((item) => item.title.toLowerCase().includes(query));
   }, [historyQuery, historySorted]);
   const selectedHistoryInfoItem = useMemo(
-    () => (selectedHistoryInfoPopover ? history.find((item) => item.materialId === selectedHistoryInfoPopover.materialId) ?? null : null),
-    [history, selectedHistoryInfoPopover],
+    () => (selectedHistoryInfoId ? history.find((item) => item.materialId === selectedHistoryInfoId) ?? null : null),
+    [history, selectedHistoryInfoId],
   );
   const selectedHistoryInfoSections = useMemo(
     () => (selectedHistoryInfoItem ? buildHistoryInfoSections(selectedHistoryInfoItem) : []),
@@ -655,23 +620,6 @@ function HomePageContent() {
     () => (selectedHistoryInfoItem?.feedQuery?.trim() ? selectedHistoryInfoItem.feedQuery.trim() : null),
     [selectedHistoryInfoItem],
   );
-  const selectedHistoryInfoPopoverStyle = useMemo(() => {
-    if (!selectedHistoryInfoPopover) {
-      return undefined;
-    }
-    if (selectedHistoryInfoPopover.placement === "above") {
-      return {
-        right: `${selectedHistoryInfoPopover.insetRight}px`,
-        bottom: `${selectedHistoryInfoPopover.insetBottom ?? 16}px`,
-        maxHeight: `${selectedHistoryInfoPopover.maxHeight}px`,
-      };
-    }
-    return {
-      right: `${selectedHistoryInfoPopover.insetRight}px`,
-      top: `${selectedHistoryInfoPopover.insetTop ?? 16}px`,
-      maxHeight: `${selectedHistoryInfoPopover.maxHeight}px`,
-    };
-  }, [selectedHistoryInfoPopover]);
 
   const persistHistory = useCallback((next: HistoryItem[]) => {
     const scopedAccountId = resolveHistoryAccountId();
@@ -739,7 +687,7 @@ function HomePageContent() {
     setHistoryQuery("");
     setError(null);
     setActiveHistoryMenuId(null);
-    setSelectedHistoryInfoPopover(null);
+    setSelectedHistoryInfoId(null);
     if (typeof window !== "undefined") {
       if (scopedAccountId) {
         writeScopedHistorySnapshot(scopedAccountId, JSON.stringify([]));
@@ -934,7 +882,7 @@ function HomePageContent() {
     }
     setError(null);
     setActiveHistoryMenuId(null);
-    setSelectedHistoryInfoPopover(null);
+    setSelectedHistoryInfoId(null);
     setAccountMenuOpen(false);
     if (intent.clearHistoryQuery) {
       setHistoryQuery("");
@@ -969,7 +917,7 @@ function HomePageContent() {
 
   const openAccountScreen = useCallback(() => {
     setActiveHistoryMenuId(null);
-    setSelectedHistoryInfoPopover(null);
+    setSelectedHistoryInfoId(null);
     setAccountMenuOpen(false);
     forceCloseMobileSidebar();
     const returnTab = activeSidebarTab === "create" ? "edit" : activeSidebarTab;
@@ -1078,7 +1026,7 @@ function HomePageContent() {
         upsertHistory({ ...existing, updatedAt: Date.now() });
       }
       setActiveHistoryMenuId(null);
-      setSelectedHistoryInfoPopover(null);
+      setSelectedHistoryInfoId(null);
       forceCloseMobileSidebar();
       const savedFeedQuery = (existing?.feedQuery || "").trim();
       if (savedFeedQuery) {
@@ -1129,19 +1077,19 @@ function HomePageContent() {
       const next = historyRef.current.filter((item) => item.materialId !== materialId);
       persistHistory(next);
       setActiveHistoryMenuId((prev) => (prev === materialId ? null : prev));
-      setSelectedHistoryInfoPopover((prev) => (prev?.materialId === materialId ? null : prev));
+      setSelectedHistoryInfoId((prev) => (prev === materialId ? null : prev));
     },
     [persistHistory],
   );
 
   useEffect(() => {
-    if (!selectedHistoryInfoPopover) {
+    if (!selectedHistoryInfoId) {
       return;
     }
     if (!selectedHistoryInfoItem) {
-      setSelectedHistoryInfoPopover(null);
+      setSelectedHistoryInfoId(null);
     }
-  }, [selectedHistoryInfoItem, selectedHistoryInfoPopover]);
+  }, [selectedHistoryInfoId, selectedHistoryInfoItem]);
 
   useEffect(() => {
     if (!activeHistoryMenuId) {
@@ -1163,26 +1111,19 @@ function HomePageContent() {
   }, [activeHistoryMenuId]);
 
   useEffect(() => {
-    if (!selectedHistoryInfoPopover) {
+    if (!selectedHistoryInfoItem) {
       return;
     }
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setSelectedHistoryInfoPopover(null);
+        setSelectedHistoryInfoId(null);
       }
     };
-    const closePopover = () => {
-      setSelectedHistoryInfoPopover(null);
-    };
     window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("resize", closePopover);
-    window.addEventListener("scroll", closePopover, true);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("resize", closePopover);
-      window.removeEventListener("scroll", closePopover, true);
     };
-  }, [selectedHistoryInfoPopover]);
+  }, [selectedHistoryInfoItem]);
 
   useEffect(() => {
     if (!accountMenuOpen) {
@@ -1564,7 +1505,7 @@ function HomePageContent() {
                           type="button"
                           onClick={(event) => {
                             event.stopPropagation();
-                            setSelectedHistoryInfoPopover(buildHistoryInfoPopoverState(entry.materialId, event.currentTarget.getBoundingClientRect()));
+                            setSelectedHistoryInfoId(entry.materialId);
                             setActiveHistoryMenuId(null);
                           }}
                           className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
@@ -1963,16 +1904,15 @@ function HomePageContent() {
       {selectedHistoryInfoItem ? (
         <ViewportModalPortal>
           <div
-            className="fixed inset-0 z-[122]"
+            className="fixed inset-0 z-[122] flex items-center justify-center overflow-y-auto bg-black/70 px-4 py-6 backdrop-blur-[2px] transition-opacity duration-200 ease-out opacity-100"
             role="presentation"
-            onClick={() => setSelectedHistoryInfoPopover(null)}
+            onClick={() => setSelectedHistoryInfoId(null)}
           >
             <div
               role="dialog"
               aria-modal="true"
               aria-label={`${selectedHistoryInfoItem.title} history information`}
-              className="absolute flex w-[min(30rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-3xl border border-white/25 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
-              style={selectedHistoryInfoPopoverStyle}
+              className="w-full max-w-2xl rounded-3xl border border-zinc-600/35 bg-black p-5 text-white shadow-[0_18px_80px_rgba(0,0,0,0.5)] backdrop-blur-2xl transition-opacity duration-200 ease-out opacity-100 md:p-6"
               onClick={(event) => event.stopPropagation()}
             >
               <div className="flex items-start justify-between gap-4">
@@ -1982,7 +1922,7 @@ function HomePageContent() {
                 </div>
                 <button
                   type="button"
-                  onClick={() => setSelectedHistoryInfoPopover(null)}
+                  onClick={() => setSelectedHistoryInfoId(null)}
                   aria-label="Close"
                   className="inline-flex h-8 w-8 items-center justify-center text-white/80 transition-colors hover:text-white focus-visible:outline-none"
                 >
@@ -1991,7 +1931,7 @@ function HomePageContent() {
                   </svg>
                 </button>
               </div>
-              <div className="mt-4 min-h-0 flex-1 space-y-4 overflow-y-auto pr-1">
+              <div className="mt-4 max-h-[70vh] space-y-4 overflow-y-auto pr-1">
                 {selectedHistoryInfoSections.map((section) => (
                   <section key={section.title}>
                     <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/58">{section.title}</p>
@@ -1999,7 +1939,7 @@ function HomePageContent() {
                       {section.fields.map((field) => (
                         <div
                           key={`${section.title}-${field.label}`}
-                          className="rounded-2xl border border-white/12 bg-white/[0.04] px-3 py-3"
+                          className="rounded-2xl border border-zinc-800 bg-white/[0.04] px-3 py-3"
                         >
                           <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/52">{field.label}</p>
                           <p className="mt-1 break-words text-sm text-white/92">{field.value}</p>
@@ -2011,12 +1951,12 @@ function HomePageContent() {
                 {selectedHistoryInfoQuery ? (
                   <section>
                     <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/58">Saved feed query</p>
-                    <div className="mt-2 rounded-2xl border border-white/12 bg-white/[0.04] px-3 py-3">
+                    <div className="mt-2 rounded-2xl border border-zinc-800 bg-white/[0.04] px-3 py-3">
                       <p className="break-all font-mono text-[11px] leading-5 text-white/72">{selectedHistoryInfoQuery}</p>
                     </div>
                   </section>
                 ) : (
-                  <div className="rounded-2xl border border-white/12 bg-white/[0.04] px-4 py-3 text-sm text-white/72">
+                  <div className="rounded-2xl border border-zinc-800 bg-white/[0.04] px-4 py-3 text-sm text-white/72">
                     Detailed feed settings were not saved for this history item.
                   </div>
                 )}
@@ -2024,7 +1964,7 @@ function HomePageContent() {
               <div className="mt-4 flex items-center justify-end">
                 <button
                   type="button"
-                  onClick={() => setSelectedHistoryInfoPopover(null)}
+                  onClick={() => setSelectedHistoryInfoId(null)}
                   className="inline-flex min-w-[8rem] items-center justify-center whitespace-nowrap rounded-xl bg-white px-5 py-2.5 text-sm font-semibold text-black transition-colors hover:bg-white/90"
                 >
                   Close

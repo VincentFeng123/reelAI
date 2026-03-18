@@ -6,6 +6,9 @@ __pycache__/
 *.pyc
 backend/.venv/
 backend/data/
+data/*.db
+data/*.db-shm
+data/*.db-wal
 
 # Node
 node_modules/

@@ -852,6 +852,7 @@ function FeedPageInner() {
   const isGeneratingRef = useRef(false);
   const activeIndexRef = useRef(0);
   const reelsRef = useRef<Reel[]>([]);
+  const pendingAutoplayAdvanceRef = useRef(false);
   const stepLockUntilRef = useRef(0);
   const isTransitioningRef = useRef(false);
   const transitionUnlockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2026,6 +2027,7 @@ function FeedPageInner() {
       setGeneratingMore(false);
       zeroProgressAttemptCountRef.current = 0;
       bootstrapAttemptedRef.current = false;
+      pendingAutoplayAdvanceRef.current = false;
       pendingRefinementJobsRef.current.clear();
       setRecoveryPhase("idle");
       setLoading(false);
@@ -2074,6 +2076,7 @@ function FeedPageInner() {
     pendingResumeRef.current = resumeTarget;
     resumeAppliedRef.current = false;
     resumeLoadingRef.current = false;
+    pendingAutoplayAdvanceRef.current = false;
     recoveryAttemptedIdsRef.current.clear();
     setLoading(!restoredSession || restoredSession.reels.length === 0);
     updateSessionReels([]);
@@ -2937,6 +2940,7 @@ function FeedPageInner() {
 
   const jumpOneReel = useCallback(
     (direction: 1 | -1) => {
+      pendingAutoplayAdvanceRef.current = false;
       if (reels.length === 0) {
         return;
       }
@@ -2957,6 +2961,32 @@ function FeedPageInner() {
     },
     [beginSnapTransitionLock, maybeLoadMore, reels.length],
   );
+
+  const requestAutoplayAdvance = useCallback(() => {
+    if (reels.length === 0) {
+      return;
+    }
+    if (activeIndexRef.current < reels.length - 1) {
+      jumpOneReel(1);
+      return;
+    }
+    pendingAutoplayAdvanceRef.current = true;
+    maybeLoadMore();
+  }, [jumpOneReel, maybeLoadMore, reels.length]);
+
+  useEffect(() => {
+    if (!pendingAutoplayAdvanceRef.current) {
+      return;
+    }
+    if (activeIndex >= reels.length - 1) {
+      if (!hasMore && !canRequestMore) {
+        pendingAutoplayAdvanceRef.current = false;
+      }
+      return;
+    }
+    pendingAutoplayAdvanceRef.current = false;
+    jumpOneReel(1);
+  }, [activeIndex, canRequestMore, hasMore, jumpOneReel, reels.length]);
 
   const isControlTarget = useCallback((target: EventTarget | null): boolean => {
     if (!(target instanceof Element)) {
@@ -3500,6 +3530,7 @@ function FeedPageInner() {
                     onAutoplayEnabledChange={setAutoplayEnabled}
                     playbackRate={playbackRate}
                     onPlaybackRateChange={setPlaybackRate}
+                    onRequestNextReel={index === activeIndex ? requestAutoplayAdvance : undefined}
                     onOpenContent={index === activeIndex ? openMobileDetails : undefined}
                   />
                 </div>
