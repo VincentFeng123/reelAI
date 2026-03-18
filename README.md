@@ -285,8 +285,10 @@ From repo root:
    - `SMTP_FROM_EMAIL=...`
    - Optional: `SMTP_USE_TLS=1`, `SMTP_USE_SSL=0`
    - Optional: S3 variables if using object storage.
-4. Optional frontend variable:
-   - `NEXT_PUBLIC_API_BASE` (leave unset for same-origin `/api`; set only if pointing to a different backend URL)
+4. Optional frontend variables:
+   - `NEXT_PUBLIC_API_BASE` for explicit direct browser API calls.
+   - `NEXT_PUBLIC_DEPLOYED_API_BASE` for split deploys where the frontend is on Vercel and the long-running backend is elsewhere.
+   - If both are unset, local dev uses `http://127.0.0.1:8000`, and deployed browser traffic falls back to the production Railway backend URL baked into `src/lib/api.ts`.
 5. Deploy.
 
 Hosted community-account note:
@@ -298,6 +300,11 @@ How this works in one project:
 - Next.js serves the frontend from root (`src/...`).
 - Vercel runs Python API at `api/index.py` and `api/[...path].py`, both reusing `backend/app/main.py`.
 - Root `requirements.txt` pulls backend dependencies for the Python runtime.
+
+How this works in the current split deployment:
+- Vercel serves the frontend.
+- Railway should serve the long-running backend for reel generation and refinement.
+- Do not rely on Vercel same-origin `/api` for infinite-scroll retrieval depth. The Vercel Python runtime runs in serverless mode, which is appropriate for health/light endpoints but does not provide the same long-running refinement behavior as Railway.
 
 ### Verify
 

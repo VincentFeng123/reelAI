@@ -24,9 +24,26 @@ import {
 } from "@/lib/settings";
 
 const RAW_API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
-const DEV_DIRECT_API_BASE =
-  !RAW_API_BASE && process.env.NODE_ENV === "development" ? "http://127.0.0.1:8000" : "";
-const RESOLVED_API_BASE = (RAW_API_BASE || DEV_DIRECT_API_BASE).replace(/\/$/, "");
+const RAW_DEPLOYED_API_BASE = (process.env.NEXT_PUBLIC_DEPLOYED_API_BASE || "").replace(/\/$/, "");
+const DEFAULT_DEPLOYED_API_BASE = "https://reelai-production.up.railway.app";
+
+function resolveApiBase(): string {
+  if (RAW_API_BASE) {
+    return RAW_API_BASE;
+  }
+  if (process.env.NODE_ENV === "development") {
+    return "http://127.0.0.1:8000";
+  }
+  if (typeof window !== "undefined") {
+    const hostname = window.location.hostname.trim().toLowerCase();
+    if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
+      return RAW_DEPLOYED_API_BASE || DEFAULT_DEPLOYED_API_BASE;
+    }
+  }
+  return RAW_DEPLOYED_API_BASE;
+}
+
+const RESOLVED_API_BASE = resolveApiBase().replace(/\/$/, "");
 const BACKEND_DOWN_ERROR = RESOLVED_API_BASE
   ? `Cannot reach backend at ${RESOLVED_API_BASE}. Make sure the backend server is running.`
   : "Cannot reach backend. Check your deployment and API routes.";
