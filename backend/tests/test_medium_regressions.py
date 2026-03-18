@@ -4398,6 +4398,115 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertIn("cognitive bias", expansion["related_terms"])
         conn.close()
 
+    def test_reel_service_topic_expansion_observed_examples_use_first_seen_order(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        conn.execute(
+            """
+            INSERT INTO materials (
+                id, subject_tag, raw_text, source_type, source_path, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("material-observed", "calculus", "Topic: calculus", "topic", None, "2026-03-14T00:00:00+00:00"),
+        )
+        conn.execute(
+            """
+            INSERT INTO concepts (
+                id, material_id, title, keywords_json, summary, embedding_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "concept-observed",
+                "material-observed",
+                "Calculus",
+                json.dumps(["calculus"]),
+                "Core ideas in calculus.",
+                None,
+                "2026-03-14T00:00:01+00:00",
+            ),
+        )
+        conn.executemany(
+            """
+            INSERT INTO videos (
+                id, title, channel_title, description, duration_sec, view_count, is_creative_commons, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                ("video-observed-1", "Limits lecture", "Math", "Limits", 900, 0, 0, "2026-03-14T00:00:02+00:00"),
+                ("video-observed-2", "Derivatives lecture", "Math", "Derivatives", 900, 0, 0, "2026-03-14T00:00:03+00:00"),
+            ],
+        )
+        conn.executemany(
+            """
+            INSERT INTO reels (
+                id, generation_id, material_id, concept_id, video_id, video_url,
+                t_start, t_end, transcript_snippet, takeaways_json, base_score, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    "reel-observed-1",
+                    None,
+                    "material-observed",
+                    "concept-observed",
+                    "video-observed-1",
+                    "https://example.com/watch?v=video-observed-1",
+                    0.0,
+                    30.0,
+                    "Limits describe approach behavior.",
+                    json.dumps(["Limits"]),
+                    1.0,
+                    "2026-03-14T00:00:04+00:00",
+                ),
+                (
+                    "reel-observed-2",
+                    None,
+                    "material-observed",
+                    "concept-observed",
+                    "video-observed-1",
+                    "https://example.com/watch?v=video-observed-1",
+                    35.0,
+                    60.0,
+                    "Limits describe approach behavior.",
+                    json.dumps(["Limits duplicate"]),
+                    0.9,
+                    "2026-03-14T00:00:06+00:00",
+                ),
+                (
+                    "reel-observed-3",
+                    None,
+                    "material-observed",
+                    "concept-observed",
+                    "video-observed-2",
+                    "https://example.com/watch?v=video-observed-2",
+                    0.0,
+                    28.0,
+                    "Derivatives measure instantaneous change.",
+                    json.dumps(["Derivatives"]),
+                    1.1,
+                    "2026-03-14T00:00:05+00:00",
+                ),
+            ],
+        )
+        service = ReelService(embedding_service=None, youtube_service=None)
+
+        examples = service._topic_expansion_observed_examples(
+            conn,
+            material_id="material-observed",
+            generation_id=None,
+            limit=4,
+        )
+
+        self.assertEqual(
+            examples,
+            [
+                {"title": "Limits lecture", "snippet": "Limits describe approach behavior."},
+                {"title": "Derivatives lecture", "snippet": "Derivatives measure instantaneous change."},
+            ],
+        )
+        conn.close()
+
     def test_reel_service_query_dedupe_keeps_strongest_variant(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
         queries = [

@@ -7597,14 +7597,16 @@ class ReelService:
         rows = fetch_all(
             conn,
             f"""
-            SELECT DISTINCT
+            SELECT
                 COALESCE(v.title, '') AS title,
-                COALESCE(r.transcript_snippet, '') AS snippet
+                COALESCE(r.transcript_snippet, '') AS snippet,
+                MIN(COALESCE(r.created_at, '')) AS first_seen_at
             FROM reels r
             JOIN videos v ON v.id = r.video_id
             WHERE r.material_id = ?
               {generation_clause}
-            ORDER BY r.created_at ASC
+            GROUP BY COALESCE(v.title, ''), COALESCE(r.transcript_snippet, '')
+            ORDER BY first_seen_at ASC, title ASC, snippet ASC
             LIMIT ?
             """,
             tuple([*params, int(limit)]),
