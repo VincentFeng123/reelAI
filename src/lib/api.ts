@@ -17,6 +17,7 @@ import type {
 import type { StoredHistoryItem } from "@/lib/historyStorage";
 import {
   normalizeStudyReelsSettings,
+  readStudyReelsSettings,
   setActiveStudyReelsSettingsScope,
   type PreferredVideoDuration,
   type StudyReelsSettings,
@@ -1176,6 +1177,9 @@ function normalizeCommunitySettings(raw: unknown): StudyReelsSettings {
     defaultInputMode: row.default_input_mode as string | null | undefined,
     minRelevanceThreshold: row.min_relevance_threshold as string | number | null | undefined,
     startMuted: row.start_muted as string | boolean | null | undefined,
+    autoplayNextReel: (row.autoplay_next_reel as string | boolean | null | undefined)
+      ?? (row.autoplayNextReel as string | boolean | null | undefined)
+      ?? readStudyReelsSettings().autoplayNextReel,
     videoPoolMode: row.video_pool_mode as string | null | undefined,
     preferredVideoDuration: row.preferred_video_duration as string | null | undefined,
     targetClipDurationSec: row.target_clip_duration_sec as string | number | null | undefined,

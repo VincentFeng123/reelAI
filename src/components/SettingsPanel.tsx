@@ -97,11 +97,31 @@ export type SettingsAvailabilityModalSnapshot = {
 };
 
 function SettingsInfoTooltip({ text }: { text: string }) {
+  const triggerRef = useRef<HTMLSpanElement | null>(null);
+  const tooltipRef = useRef<HTMLSpanElement | null>(null);
+  const [placement, setPlacement] = useState<"top" | "bottom">("bottom");
+
+  const updatePlacement = useCallback(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const triggerRect = triggerRef.current?.getBoundingClientRect();
+    if (!triggerRect) {
+      return;
+    }
+    const tooltipHeight = tooltipRef.current?.offsetHeight ?? 48;
+    const spaceBelow = window.innerHeight - triggerRect.bottom;
+    setPlacement(spaceBelow < tooltipHeight + 16 ? "top" : "bottom");
+  }, []);
+
   return (
     <span className="group relative inline-flex shrink-0">
       <span
+        ref={triggerRef}
         tabIndex={0}
         aria-label={text}
+        onMouseEnter={updatePlacement}
+        onFocus={updatePlacement}
         onMouseLeave={(event) => {
           event.currentTarget.blur();
         }}
@@ -110,8 +130,11 @@ function SettingsInfoTooltip({ text }: { text: string }) {
         <i className="fa-solid fa-circle-info text-[11px]" aria-hidden="true" />
       </span>
       <span
+        ref={tooltipRef}
         role="tooltip"
-        className="pointer-events-none absolute left-1/2 top-full z-30 mt-1.5 w-max max-w-[220px] -translate-x-1/2 rounded-lg bg-black/90 px-3 py-2 text-[10px] font-medium leading-tight text-white/88 opacity-0 shadow-[0_10px_28px_rgba(0,0,0,0.45)] backdrop-blur-sm transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100"
+        className={`pointer-events-none absolute left-1/2 z-30 w-max max-w-[220px] -translate-x-1/2 rounded-lg bg-black/90 px-3 py-2 text-[10px] font-medium leading-tight text-white/88 opacity-0 shadow-[0_10px_28px_rgba(0,0,0,0.45)] backdrop-blur-sm transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100 ${
+          placement === "top" ? "bottom-full mb-1.5" : "top-full mt-1.5"
+        }`}
       >
         {text}
       </span>
@@ -242,6 +265,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
 ) {
   const [minRelevanceThreshold, setMinRelevanceThreshold] = useState(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
   const [startMuted, setStartMuted] = useState(DEFAULT_STUDY_REELS_SETTINGS.startMuted);
+  const [autoplayNextReel, setAutoplayNextReel] = useState(DEFAULT_STUDY_REELS_SETTINGS.autoplayNextReel);
   const [videoPoolMode, setVideoPoolMode] = useState<VideoPoolMode>(DEFAULT_STUDY_REELS_SETTINGS.videoPoolMode);
   const [preferredVideoDuration, setPreferredVideoDuration] = useState<PreferredVideoDuration>(
     DEFAULT_STUDY_REELS_SETTINGS.preferredVideoDuration,
@@ -637,6 +661,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   const applySavedSettings = useCallback((saved: StudyReelsSettings) => {
     setMinRelevanceThreshold(saved.minRelevanceThreshold);
     setStartMuted(saved.startMuted);
+    setAutoplayNextReel(saved.autoplayNextReel);
     setVideoPoolMode(saved.videoPoolMode);
     setPreferredVideoDuration(saved.preferredVideoDuration);
     setTargetClipDurationMinSec(saved.targetClipDurationMinSec);
@@ -762,6 +787,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   const resetPreferences = () => {
     setMinRelevanceThreshold(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
     setStartMuted(DEFAULT_STUDY_REELS_SETTINGS.startMuted);
+    setAutoplayNextReel(DEFAULT_STUDY_REELS_SETTINGS.autoplayNextReel);
     setVideoPoolMode(DEFAULT_STUDY_REELS_SETTINGS.videoPoolMode);
     setPreferredVideoDuration(DEFAULT_STUDY_REELS_SETTINGS.preferredVideoDuration);
     setTargetClipDurationMinSec(DEFAULT_STUDY_REELS_SETTINGS.targetClipDurationMinSec);
@@ -777,8 +803,8 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   };
 
   const settingsSummary = useMemo(() => {
-    return `Match ${minRelevanceThreshold.toFixed(2)}+ · ${poolSummaryLabel[videoPoolMode]} feed · ${durationSummaryLabel[preferredVideoDuration]} source videos · ${targetClipDurationMinSec}-${targetClipDurationMaxSec}s clips · ${startMuted ? "Muted" : "Sound on"}`;
-  }, [minRelevanceThreshold, preferredVideoDuration, startMuted, targetClipDurationMaxSec, targetClipDurationMinSec, videoPoolMode]);
+    return `Match ${minRelevanceThreshold.toFixed(2)}+ · ${poolSummaryLabel[videoPoolMode]} feed · ${durationSummaryLabel[preferredVideoDuration]} source videos · ${targetClipDurationMinSec}-${targetClipDurationMaxSec}s clips · ${startMuted ? "Muted" : "Sound on"} · ${autoplayNextReel ? "Auto-next on" : "Auto-next off"}`;
+  }, [autoplayNextReel, minRelevanceThreshold, preferredVideoDuration, startMuted, targetClipDurationMaxSec, targetClipDurationMinSec, videoPoolMode]);
 
   const hasUnsavedChanges = useMemo(() => {
     if (!savedPreferences) {
@@ -788,12 +814,14 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     return (
       savedPreferences.minRelevanceThreshold !== currentMinRelevance
       || savedPreferences.startMuted !== startMuted
+      || savedPreferences.autoplayNextReel !== autoplayNextReel
       || savedPreferences.videoPoolMode !== videoPoolMode
       || savedPreferences.preferredVideoDuration !== preferredVideoDuration
       || savedPreferences.targetClipDurationMinSec !== targetClipDurationMinSec
       || savedPreferences.targetClipDurationMaxSec !== targetClipDurationMaxSec
     );
   }, [
+    autoplayNextReel,
     minRelevanceThreshold,
     preferredVideoDuration,
     savedPreferences,
@@ -812,6 +840,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
       defaultInputMode: defaultInputModeForSave,
       minRelevanceThreshold,
       startMuted,
+      autoplayNextReel,
       videoPoolMode,
       preferredVideoDuration,
       targetClipDurationSec,
@@ -823,6 +852,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     onSettingsSaved?.(saved);
     void runAvailabilityCheck(saved);
   }, [
+    autoplayNextReel,
     defaultInputModeForSave,
     generationModeForChecks,
     onSettingsSaved,
@@ -841,6 +871,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     const saved = savedPreferences ?? readStudyReelsSettings();
     setMinRelevanceThreshold(saved.minRelevanceThreshold);
     setStartMuted(saved.startMuted);
+    setAutoplayNextReel(saved.autoplayNextReel);
     setVideoPoolMode(saved.videoPoolMode);
     setPreferredVideoDuration(saved.preferredVideoDuration);
     setTargetClipDurationMinSec(saved.targetClipDurationMinSec);
@@ -1276,6 +1307,26 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                 <span
                   className={`absolute top-0.5 h-[22px] w-[22px] rounded-full transition-transform duration-200 ${
                     startMuted ? "translate-x-[24px] bg-black" : "translate-x-[2px] bg-white"
+                  }`}
+                />
+              </button>
+            </div>
+            <div className="mt-4 flex items-center justify-between gap-4 border-t border-white/10 pt-4">
+              <div className="flex items-center gap-1.5">
+                <p className="text-sm font-semibold text-white/95">Autoplay next reel</p>
+                <SettingsInfoTooltip text="Automatically move to the next reel when the current one ends." />
+              </div>
+              <button
+                type="button"
+                onClick={() => setAutoplayNextReel((prev) => !prev)}
+                aria-pressed={autoplayNextReel}
+                className={`relative inline-flex h-7 w-12 shrink-0 rounded-full border transition-colors duration-200 ${
+                  autoplayNextReel ? "border-white bg-white" : "border-white/32 bg-black/50"
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 h-[22px] w-[22px] rounded-full transition-transform duration-200 ${
+                    autoplayNextReel ? "translate-x-[24px] bg-black" : "translate-x-[2px] bg-white"
                   }`}
                 />
               </button>

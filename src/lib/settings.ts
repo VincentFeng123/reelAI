@@ -10,6 +10,7 @@ export type StudyReelsSettings = {
   defaultInputMode: SearchInputMode;
   minRelevanceThreshold: number;
   startMuted: boolean;
+  autoplayNextReel: boolean;
   videoPoolMode: VideoPoolMode;
   preferredVideoDuration: PreferredVideoDuration;
   targetClipDurationSec: number;
@@ -44,6 +45,7 @@ export const DEFAULT_STUDY_REELS_SETTINGS: StudyReelsSettings = {
   defaultInputMode: "source",
   minRelevanceThreshold: 0.3,
   startMuted: true,
+  autoplayNextReel: false,
   videoPoolMode: "short-first",
   preferredVideoDuration: "any",
   targetClipDurationSec: 55,
@@ -56,6 +58,7 @@ type StudyReelsSettingsInput = {
   defaultInputMode?: SearchInputMode | string | null;
   minRelevanceThreshold?: number | string | null;
   startMuted?: boolean | string | null;
+  autoplayNextReel?: boolean | string | null;
   videoPoolMode?: VideoPoolMode | string | null;
   preferredVideoDuration?: PreferredVideoDuration | string | null;
   targetClipDurationSec?: number | string | null;
@@ -184,6 +187,7 @@ function parseScopedStudyReelsSettingsSnapshot(raw: string | null): StudyReelsSe
       defaultInputMode: row.defaultInputMode as string | null | undefined,
       minRelevanceThreshold: row.minRelevanceThreshold as string | number | null | undefined,
       startMuted: row.startMuted as string | boolean | null | undefined,
+      autoplayNextReel: row.autoplayNextReel as string | boolean | null | undefined,
       videoPoolMode: row.videoPoolMode as string | null | undefined,
       preferredVideoDuration: row.preferredVideoDuration as string | null | undefined,
       targetClipDurationSec: row.targetClipDurationSec as string | number | null | undefined,
@@ -275,6 +279,7 @@ export function normalizeStudyReelsSettings(raw: StudyReelsSettingsInput): Study
     defaultInputMode: toInputMode(raw.defaultInputMode),
     minRelevanceThreshold: Number(minRelevanceThreshold.toFixed(2)),
     startMuted: raw.startMuted !== false && raw.startMuted !== "0" && raw.startMuted !== "false",
+    autoplayNextReel: raw.autoplayNextReel !== false && raw.autoplayNextReel !== "0" && raw.autoplayNextReel !== "false",
     videoPoolMode: toVideoPoolMode(raw.videoPoolMode),
     preferredVideoDuration: toPreferredVideoDuration(raw.preferredVideoDuration),
     targetClipDurationSec: normalizedTarget,

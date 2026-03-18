@@ -347,7 +347,7 @@ function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapsh
         canRequestMore: row.canRequestMore !== false,
         generationMode: row.generationMode === "slow" ? "slow" : "fast",
         mutedPreference: row.mutedPreference !== false,
-        autoplayEnabled: row.autoplayEnabled !== false,
+        autoplayEnabled: row.autoplayEnabled === true || row.autoplayEnabled === "1" || row.autoplayEnabled === "true",
         playbackRate: normalizeFeedPlaybackRate(row.playbackRate),
         activeIndex,
         activeReelId: typeof row.activeReelId === "string" && row.activeReelId.trim() ? row.activeReelId.trim() : undefined,
@@ -830,7 +830,7 @@ function FeedPageInner() {
   const [mobileDetailsOpen, setMobileDetailsOpen] = useState(false);
   const [mobileDetailsClosing, setMobileDetailsClosing] = useState(false);
   const [mutedPreference, setMutedPreference] = useState(true);
-  const [autoplayEnabled, setAutoplayEnabled] = useState(true);
+  const [autoplayEnabled, setAutoplayEnabled] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [chatByReel, setChatByReel] = useState<Record<string, ChatMessage[]>>({});
   const [chatInput, setChatInput] = useState("");
@@ -874,6 +874,7 @@ function FeedPageInner() {
   const isFastTopUpRef = useRef(false);
   const mobileDetailsCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mutedRestoredFromSnapshotRef = useRef(false);
+  const autoplayRestoredFromSnapshotRef = useRef(false);
   const hydratedMaterialIdRef = useRef<string | null>(null);
   const materialIdsForFeedRef = useRef<string[]>([]);
   const settingsLoadSequenceRef = useRef(0);
@@ -1346,6 +1347,9 @@ function FeedPageInner() {
       }
       if (!mutedRestoredFromSnapshotRef.current) {
         setMutedPreference(mergedSettings.startMuted);
+      }
+      if (!autoplayRestoredFromSnapshotRef.current) {
+        setAutoplayEnabled(mergedSettings.autoplayNextReel);
       }
     };
 
@@ -1971,6 +1975,7 @@ function FeedPageInner() {
 
   useEffect(() => {
     mutedRestoredFromSnapshotRef.current = false;
+    autoplayRestoredFromSnapshotRef.current = false;
     if (!materialId) {
       materialIdsForFeedRef.current = [];
       hydratedMaterialIdRef.current = null;
@@ -2114,6 +2119,7 @@ function FeedPageInner() {
       setAutoplayEnabled(restoredSession.autoplayEnabled);
       setPlaybackRate(normalizeFeedPlaybackRate(restoredSession.playbackRate));
       mutedRestoredFromSnapshotRef.current = true;
+      autoplayRestoredFromSnapshotRef.current = true;
       if (restoredReels.length > 0) {
         const snapshotResume: FeedProgressEntry = {
           index: restoredIndex,

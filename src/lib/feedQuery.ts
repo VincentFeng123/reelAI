@@ -90,6 +90,7 @@ export function mergeSearchFeedQuerySettings(
     defaultInputMode: base.defaultInputMode,
     minRelevanceThreshold: override.minRelevanceThreshold ?? base.minRelevanceThreshold,
     startMuted: override.startMuted ?? base.startMuted,
+    autoplayNextReel: base.autoplayNextReel,
     videoPoolMode: override.videoPoolMode ?? base.videoPoolMode,
     preferredVideoDuration: override.preferredVideoDuration ?? base.preferredVideoDuration,
     targetClipDurationSec: override.targetClipDurationSec ?? base.targetClipDurationSec,

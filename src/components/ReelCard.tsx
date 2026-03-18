@@ -137,6 +137,7 @@ export function ReelCard({
   const autoplayRetryCountRef = useRef(0);
   const autoplayEnabledRef = useRef(autoplayEnabled);
   const playbackRateRef = useRef(playbackRate);
+  const didHandleClipEndRef = useRef(false);
   const didUserInteractRef = useRef(false);
   const manualPauseRequestedRef = useRef(false);
   const isMutedRef = useRef(mutedPreference);
@@ -209,6 +210,7 @@ export function ReelCard({
   }, [playbackRate]);
 
   useEffect(() => {
+    didHandleClipEndRef.current = false;
     setDetectedDurationSec(null);
   }, [reel.reel_id]);
 
@@ -343,6 +345,15 @@ export function ReelCard({
       syncDetectedDurationFromPlayer(player);
       const now = clamp(player.getCurrentTime(), clipStart, clipEnd);
       if (now >= clipEnd - 0.15) {
+        if (autoplayEnabledRef.current && isActive && onRequestNextReel && !didHandleClipEndRef.current) {
+          didHandleClipEndRef.current = true;
+          setIsPlaying(false);
+          setIsResumeMaskVisible(false);
+          setCurrentSec(clipDuration);
+          stopProgressTimer();
+          onRequestNextReel();
+          return;
+        }
         player.seekTo(clipStart, true);
         if (isActive) {
           player.playVideo();
@@ -351,7 +362,7 @@ export function ReelCard({
       const rel = clamp(now - clipStart, 0, clipDuration);
       setCurrentSec(rel);
     }, 160);
-  }, [clipDuration, clipEnd, clipStart, isActive, stopProgressTimer, syncDetectedDurationFromPlayer]);
+  }, [clipDuration, clipEnd, clipStart, isActive, onRequestNextReel, stopProgressTimer, syncDetectedDurationFromPlayer]);
 
   useEffect(() => {
     if (!isYouTubeVideo || !isActive || !isReady || !isPlaying) {
@@ -579,6 +590,7 @@ export function ReelCard({
               if (state === playerState.PLAYING) {
                 clearAutoplayRetryTimer();
                 autoplayRetryCountRef.current = 0;
+                didHandleClipEndRef.current = false;
                 manualPauseRequestedRef.current = false;
                 setIsPlaying(true);
                 startProgressTimer();
@@ -613,6 +625,7 @@ export function ReelCard({
               } else if (state === playerState.ENDED) {
                 clearAutoplayRetryTimer();
                 if (autoplayEnabledRef.current && isActive && onRequestNextReel) {
+                  didHandleClipEndRef.current = true;
                   setIsPlaying(false);
                   setIsResumeMaskVisible(false);
                   setCurrentSec(0);
@@ -816,6 +829,7 @@ export function ReelCard({
         return;
       }
       const rel = clamp(Number(event.target.value), 0, clipDuration);
+      didHandleClipEndRef.current = false;
       setCurrentSec(rel);
       manualPauseRequestedRef.current = false;
       player.seekTo(clipStart + rel, true);
