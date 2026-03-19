@@ -1950,7 +1950,7 @@ function HomePageContent() {
               }
               closeMobileSidebar();
             }}
-            className={`absolute bottom-5 left-4 top-7 w-[min(24rem,calc(100vw-2rem))] rounded-3xl bg-white/[0.08] px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.32)] backdrop-blur-[26px] backdrop-saturate-150 ${
+            className={`absolute bottom-4 left-4 top-6 w-[min(24rem,calc(100vw-2rem))] rounded-3xl bg-white/[0.08] px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.32)] backdrop-blur-[26px] backdrop-saturate-150 ${
               mobileSidebarClosing ? "animate-mobile-sidenav-out" : "animate-mobile-sidenav-in"
             }`}
           >
@@ -1984,7 +1984,7 @@ function HomePageContent() {
       ) : null}
 
       <div className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:mx-0 lg:max-w-none lg:pl-4 lg:grid lg:grid-cols-[280px_minmax(0,1fr)]">
-        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-white/[0.08] px-3 pt-3 pb-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.24)] backdrop-blur-[18px] backdrop-saturate-150 lg:mt-8 lg:mb-8 lg:flex lg:w-[280px] lg:justify-self-start lg:px-5 lg:pb-5">
+        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-white/[0.08] px-3 pt-3 pb-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.24)] backdrop-blur-[18px] backdrop-saturate-150 lg:mt-6 lg:mb-6 lg:flex lg:w-[280px] lg:justify-self-start lg:px-5 lg:pb-5">
           {sidebarPanelContent}
         </aside>
 
