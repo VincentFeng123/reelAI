@@ -373,6 +373,22 @@ function buildCommunitySetInformationParagraphs(set: CommunitySet, curatorLabel?
   ];
 }
 
+function matchesSetSearchQuery(set: CommunitySet, normalizedQuery: string): boolean {
+  if (set.title.toLowerCase().includes(normalizedQuery)) {
+    return true;
+  }
+  if (set.description.toLowerCase().includes(normalizedQuery)) {
+    return true;
+  }
+  if (set.curator.toLowerCase().includes(normalizedQuery)) {
+    return true;
+  }
+  if (set.tags.some((tag) => tag.toLowerCase().includes(normalizedQuery))) {
+    return true;
+  }
+  return set.reels.some((reel) => PLATFORM_LABEL[reel.platform].toLowerCase().includes(normalizedQuery));
+}
+
 function parseTimestampMs(value: unknown): number | null {
   if (typeof value === "number") {
     if (Number.isFinite(value) && value > 0) {
@@ -1019,7 +1035,7 @@ export function CommunityReelsPanel({
   const [featuredCarouselContentHeight, setFeaturedCarouselContentHeight] = useState(FEATURED_CAROUSEL_CONTENT_MIN_HEIGHT_FALLBACK);
   const [selectedDirectorySet, setSelectedDirectorySet] = useState<CommunitySet | null>(null);
   const [isDirectoryDetailOpen, setIsDirectoryDetailOpen] = useState(false);
-  const [query, setQuery] = useState("");
+  const [communityQuery, setCommunityQuery] = useState("");
   const [yourSetsQuery, setYourSetsQuery] = useState("");
   const [setTitle, setSetTitle] = useState("");
   const [setDescription, setSetDescription] = useState("");
@@ -1315,6 +1331,7 @@ export function CommunityReelsPanel({
   const needsCommunityAuth = requiresCommunityAuth && !communityAccount;
   const needsCommunityVerification = requiresCommunityAuth && communityAccount?.isVerified === false;
   const canManageYourSets = communityAccount?.isVerified === true;
+  const shouldShowYourSetsSearch = isYourSetsMode && shouldShowEditSetGrid && canManageYourSets;
   const normalizedInitialOpenSetId = initialOpenSetId?.trim() || "";
   const shouldSuppressDirectoryDuringRestore =
     mode === "community" && isVisible && Boolean(normalizedInitialOpenSetId) && isInitialDetailRestorePending;
@@ -1352,18 +1369,7 @@ export function CommunityReelsPanel({
     if (!normalized) {
       return orderedEditableSets;
     }
-    return orderedEditableSets.filter((set) => {
-      if (set.title.toLowerCase().includes(normalized)) {
-        return true;
-      }
-      if (set.description.toLowerCase().includes(normalized)) {
-        return true;
-      }
-      if (set.tags.some((tag) => tag.toLowerCase().includes(normalized))) {
-        return true;
-      }
-      return set.reels.some((reel) => PLATFORM_LABEL[reel.platform].toLowerCase().includes(normalized));
-    });
+    return orderedEditableSets.filter((set) => matchesSetSearchQuery(set, normalized));
   }, [orderedEditableSets, yourSetsQuery]);
   const activeEditableSet = useMemo(
     () => editableSets.find((set) => set.id === activeEditSetId) ?? null,
@@ -1385,26 +1391,12 @@ export function CommunityReelsPanel({
   }, [mode]);
 
   const filteredDirectorySets = useMemo(() => {
-    const normalized = query.trim().toLowerCase();
+    const normalized = communityQuery.trim().toLowerCase();
     if (!normalized) {
       return allSets;
     }
-    return allSets.filter((set) => {
-      if (set.title.toLowerCase().includes(normalized)) {
-        return true;
-      }
-      if (set.description.toLowerCase().includes(normalized)) {
-        return true;
-      }
-      if (set.curator.toLowerCase().includes(normalized)) {
-        return true;
-      }
-      if (set.tags.some((tag) => tag.includes(normalized))) {
-        return true;
-      }
-      return set.reels.some((reel) => PLATFORM_LABEL[reel.platform].toLowerCase().includes(normalized));
-    });
-  }, [allSets, query]);
+    return allSets.filter((set) => matchesSetSearchQuery(set, normalized));
+  }, [allSets, communityQuery]);
 
   const communityCategories = useMemo(() => {
     const tagCounts = new Map<string, number>();
@@ -1432,7 +1424,7 @@ export function CommunityReelsPanel({
   }, [activeCommunityCategory, communityCategories]);
 
   const categoryFilteredSets = useMemo(() => {
-    const hasQuery = query.trim().length > 0;
+    const hasQuery = communityQuery.trim().length > 0;
     if (hasQuery) {
       return filteredDirectorySets;
     }
@@ -1453,7 +1445,7 @@ export function CommunityReelsPanel({
       }
       return set.tags.some((tag) => tag.toLowerCase().includes(normalizedCategory));
     });
-  }, [activeCommunityCategory, filteredDirectorySets, query]);
+  }, [activeCommunityCategory, communityQuery, filteredDirectorySets]);
 
   useEffect(() => {
     if (featuredCarouselSets.length === 0) {
@@ -1557,10 +1549,11 @@ export function CommunityReelsPanel({
     };
   }, [featuredTransitionStage]);
 
-  const isSearchActive = query.trim().length > 0;
+  const isCommunitySearchActive = communityQuery.trim().length > 0;
+  const isYourSetsSearchActive = yourSetsQuery.trim().length > 0;
 
   useEffect(() => {
-    if (mode !== "community" || isSearchActive || featuredCarouselSets.length === 0) {
+    if (mode !== "community" || isCommunitySearchActive || featuredCarouselSets.length === 0) {
       return;
     }
     const measure = () => {
@@ -1601,7 +1594,7 @@ export function CommunityReelsPanel({
       window.removeEventListener("resize", measure);
       resizeObserver?.disconnect();
     };
-  }, [activeFeaturedIndex, featuredCarouselSets.length, featuredTransitionStage, isSearchActive, mode]);
+  }, [activeFeaturedIndex, featuredCarouselSets.length, featuredTransitionStage, isCommunitySearchActive, mode]);
 
   const directorySets = categoryFilteredSets;
   const detailCarouselCount = detailCarouselReels.length;
@@ -3329,8 +3322,8 @@ export function CommunityReelsPanel({
                   <div className="relative">
                     <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/38" />
                     <input
-                      value={query}
-                      onChange={(event) => setQuery(event.target.value)}
+                      value={communityQuery}
+                      onChange={(event) => setCommunityQuery(event.target.value)}
                       placeholder="Search community sets"
                       className="h-11 w-full rounded-[1.5rem] bg-white/[0.08] pl-11 pr-4 text-sm text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 placeholder:text-white/35 focus:bg-white/[0.12] sm:h-12 sm:rounded-[1.75rem] sm:pl-12"
                     />
@@ -3341,7 +3334,7 @@ export function CommunityReelsPanel({
 
             <div className="mt-3 min-h-0 flex-1 overflow-hidden md:mt-4">
               <div ref={communityScrollRef} className="balanced-scroll-gutter h-full min-h-0 space-y-4 overflow-y-auto pb-6 md:space-y-5 md:pb-8 lg:pb-10">
-            {!isSearchActive && featuredCarouselSets.length > 0 ? (
+            {!isCommunitySearchActive && featuredCarouselSets.length > 0 ? (
               <section className="group/featured relative overflow-hidden rounded-[1.5rem] bg-white/[0.07] p-4 pb-12 backdrop-blur-[18px] backdrop-saturate-150 max-[380px]:pb-10 sm:rounded-[2rem] sm:p-5 sm:pb-14 md:p-7 md:pb-16 lg:p-8">
                 {featuredCarouselSets.length > 1 ? (
                   <>
@@ -3443,7 +3436,7 @@ export function CommunityReelsPanel({
               </section>
             ) : null}
 
-            {!isSearchActive ? (
+            {!isCommunitySearchActive ? (
             <section className="flex items-center gap-2 overflow-x-auto pb-1">
               {communityCategories.map((category) => (
                 <button
@@ -3466,16 +3459,16 @@ export function CommunityReelsPanel({
               <div className="relative z-10">
               <div className="mb-2 flex items-center justify-between">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/60">
-                  {isSearchActive ? "Search Results" : "Community Directory"}
+                  {isCommunitySearchActive ? "Search Results" : "Community Directory"}
                 </p>
                 <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-white/45">{directorySets.length} sets</p>
               </div>
               {directorySets.length === 0 ? (
                 <p className="px-3 py-4 text-sm text-white/65">
-                  {isSearchActive ? "No sets matched your search." : "No sets matched that search."}
+                  {isCommunitySearchActive ? "No sets matched your search." : "No sets matched that search."}
                 </p>
               ) : (
-                <div className={isSearchActive ? "flex flex-col gap-2.5" : "grid gap-2.5 md:grid-cols-2 md:gap-x-4 md:gap-y-3 lg:gap-x-10"}>
+                <div className={isCommunitySearchActive ? "flex flex-col gap-2.5" : "grid gap-2.5 md:grid-cols-2 md:gap-x-4 md:gap-y-3 lg:gap-x-10"}>
                   {directorySets.map((set) => {
                     const reelCount = getSetReelCount(set);
                     return (
@@ -3615,9 +3608,7 @@ export function CommunityReelsPanel({
           <div className="flex min-h-0 flex-1 flex-col pt-1 md:pt-2">
             <div className="shrink-0">
               <div
-                className={`flex gap-3 md:-mx-2 md:flex-row md:items-center md:justify-between md:gap-4 lg:-mx-3 ${
-                  isYourSetsMode && shouldShowEditSetGrid ? "flex-col md:flex-row md:items-center md:justify-between" : "flex-col"
-                }`}
+                className="flex flex-col gap-3 md:-mx-2 md:flex-row md:items-center md:justify-between md:gap-4 lg:-mx-3"
               >
                 <div
                   className={
@@ -3653,9 +3644,9 @@ export function CommunityReelsPanel({
                     <span className="rounded-full border border-[#2b2b2b] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
                   </div>
                 </div>
-                {isYourSetsMode && shouldShowEditSetGrid && canManageYourSets ? (
-                  <div className="flex w-full flex-col items-stretch gap-2 px-2 sm:px-2 md:w-auto md:flex-row md:items-center md:justify-end md:px-0">
-                    <label className="block w-full md:w-[20.5rem] lg:w-[23rem]">
+                {shouldShowYourSetsSearch ? (
+                  <div className="flex w-full flex-col items-end gap-2 pr-2 sm:pr-2 md:w-auto md:flex-row md:flex-wrap md:items-center md:justify-end md:pr-2 lg:pr-2">
+                    <label className="block w-full self-stretch md:w-[20.5rem] md:self-auto lg:w-[23rem]">
                       <div className="relative">
                         <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/38" />
                         <input
@@ -3666,13 +3657,6 @@ export function CommunityReelsPanel({
                         />
                       </div>
                     </label>
-                    <button
-                      type="button"
-                      onClick={onOpenCreateSetFromGrid}
-                      className="inline-flex h-10 min-w-[8.25rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-xs font-semibold uppercase tracking-[0.08em] text-white/80 backdrop-blur-md transition hover:bg-white/10 hover:text-white"
-                    >
-                      Create Set
-                    </button>
                   </div>
                 ) : null}
               </div>
@@ -3738,15 +3722,20 @@ export function CommunityReelsPanel({
                     <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6">
                       <div className="relative z-10">
                         <div className="flex flex-wrap items-center justify-between gap-3">
-                          <div>
+                          <div className="flex flex-wrap items-center gap-2">
                             <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Your Created Sets</p>
+                            <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/72">
+                              {filteredEditableSets.length} set{filteredEditableSets.length === 1 ? "" : "s"}
+                            </span>
                           </div>
                           <div className="flex items-center">
-                            <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/72">
-                              {yourSetsQuery.trim()
-                                ? `${filteredEditableSets.length} result${filteredEditableSets.length === 1 ? "" : "s"}`
-                                : `${editableSets.length} set${editableSets.length === 1 ? "" : "s"}`}
-                            </span>
+                            <button
+                              type="button"
+                              onClick={onOpenCreateSetFromGrid}
+                              className="inline-flex h-10 min-w-[8.25rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black px-4 text-xs font-semibold uppercase tracking-[0.08em] text-white/80 backdrop-blur-md transition hover:bg-[#111] hover:text-white"
+                            >
+                              Create Set
+                            </button>
                           </div>
                         </div>
                         {filteredEditableSets.length > 0 ? (
@@ -3759,7 +3748,7 @@ export function CommunityReelsPanel({
                               return (
                                 <div
                                   key={`edit-set-grid-${set.id}`}
-                                  className="group relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-black/35 text-left transition hover:border-white/35 hover:bg-black/55"
+                                  className="group relative overflow-hidden rounded-2xl bg-black/35 text-left transition hover:bg-black/55"
                                 >
                                   <div
                                     data-your-set-actions="true"
@@ -3852,9 +3841,9 @@ export function CommunityReelsPanel({
                               );
                             })}
                           </div>
-                        ) : yourSetsQuery.trim() ? (
+                        ) : isYourSetsSearchActive ? (
                           <p className="mt-4 text-sm text-white/66">
-                            No matching sets. Try a different title, description, or tag.
+                            No sets matched your search.
                           </p>
                         ) : (
                           <p className="mt-4 text-sm text-white/66">
