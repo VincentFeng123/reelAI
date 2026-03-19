@@ -468,6 +468,7 @@ export function ReelCard({
     setCurrentSec(0);
     setIsPlaying(false);
     setIsReady(false);
+    isMutedRef.current = mutedPreference;
     setIsMuted(mutedPreference);
     setIsSurfaceVisible(false);
     setIsResumeMaskVisible(false);
@@ -542,6 +543,7 @@ export function ReelCard({
                   return;
                 }
                 event.target.mute();
+                isMutedRef.current = true;
                 setIsMuted(true);
                 event.target.seekTo(clipStart, true);
                 event.target.playVideo();
@@ -572,7 +574,6 @@ export function ReelCard({
               autoplayRetryCountRef.current = 0;
               // Mobile browsers commonly block autoplay with sound; always start muted and retry.
               tryAutoplay();
-              setIsMuted(true);
               queueAutoplayRetry();
               setIsReady(true);
               setIsPlaying(false);
@@ -715,13 +716,16 @@ export function ReelCard({
     }
     if (isTouchLikeDevice && !didUserInteractRef.current) {
       player.mute();
+      isMutedRef.current = true;
       setIsMuted(true);
       return;
     }
     if (mutedPreference) {
       player.mute();
+      isMutedRef.current = true;
     } else {
       player.unMute();
+      isMutedRef.current = false;
     }
   }, [isActive, isPlaying, isReady, mutedPreference, isTouchLikeDevice, isYouTubeVideo]);
 
@@ -737,6 +741,7 @@ export function ReelCard({
     clearAutoplayRetryTimer();
     if (!isPlaying && !mutedPreference) {
       player.unMute();
+      isMutedRef.current = false;
       setIsMuted(false);
     }
     if (isPlaying) {
@@ -782,9 +787,11 @@ export function ReelCard({
     const nextMuted = !isMuted;
     if (nextMuted) {
       player.mute();
+      isMutedRef.current = true;
       setIsMuted(true);
     } else {
       player.unMute();
+      isMutedRef.current = false;
       setIsMuted(false);
     }
     onMutedPreferenceChange(nextMuted);

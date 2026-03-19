@@ -3142,6 +3142,7 @@ function FeedPageInner() {
   const activeReel = reels[activeIndex] ?? null;
   const [descriptionExpanded, setDescriptionExpanded] = useState(false);
   const [descriptionHydrating, setDescriptionHydrating] = useState(false);
+  const atEndOfVisibleReels = reels.length > 0 && activeIndex >= reels.length - 1;
   const activeRecoveryRequest = recoveryPhase === "fetching-page" || recoveryPhase === "generating";
   const passiveBackgroundSearch =
     recoveryPhase === "waiting-refinement" || recoveryPhase === "retry-scheduled" || recoveryPhase === "recovering";
@@ -3152,9 +3153,9 @@ function FeedPageInner() {
     !activeRecoveryRequest &&
     !passiveBackgroundSearch &&
     !loading;
-  const activelyFindingMoreReels = reels.length > 0 && !noMoreReelsAvailable && activeRecoveryRequest;
+  const activelyFindingMoreReels = atEndOfVisibleReels && !noMoreReelsAvailable && activeRecoveryRequest;
   const passivelyFindingMoreReels =
-    reels.length > 0 && !noMoreReelsAvailable && !activelyFindingMoreReels && canRequestMore && passiveBackgroundSearch;
+    atEndOfVisibleReels && !noMoreReelsAvailable && !activelyFindingMoreReels && canRequestMore && passiveBackgroundSearch;
   const shouldKeepFeedEntryLoading = loading || (reels.length === 0 && bootstrappingFirstReels);
   const showLoadingScreen = useLoadingScreenGate(initialFeedScreenReady, {
     minimumVisibleMs: 1000,

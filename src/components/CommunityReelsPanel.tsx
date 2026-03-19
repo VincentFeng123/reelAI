@@ -3323,9 +3323,7 @@ export function CommunityReelsPanel({
             <div className="mt-3 min-h-0 flex-1 overflow-hidden md:mt-4">
               <div ref={communityScrollRef} className="balanced-scroll-gutter h-full min-h-0 space-y-4 overflow-y-auto pb-6 md:space-y-5 md:pb-8 lg:pb-10">
             {!isSearchActive && featuredCarouselSets.length > 0 ? (
-              <section className="group/featured relative overflow-hidden rounded-[1.5rem] border border-[#2b2b2b] bg-transparent p-4 pb-12 backdrop-blur-[4px] max-[380px]:pb-10 sm:rounded-[2rem] sm:p-5 sm:pb-14 md:p-7 md:pb-16 lg:p-8">
-                <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
-
+              <section className="group/featured relative overflow-hidden rounded-[1.5rem] bg-white/[0.07] p-4 pb-12 backdrop-blur-[18px] backdrop-saturate-150 max-[380px]:pb-10 sm:rounded-[2rem] sm:p-5 sm:pb-14 md:p-7 md:pb-16 lg:p-8">
                 {featuredCarouselSets.length > 1 ? (
                   <>
                     <button
@@ -3445,8 +3443,7 @@ export function CommunityReelsPanel({
             </section>
             ) : null}
 
-            <section className="relative overflow-hidden rounded-2xl bg-transparent px-3 pt-3 pb-3 backdrop-blur-[3px] sm:px-4 sm:pt-3.5 sm:pb-4">
-              <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+            <section className="relative overflow-hidden rounded-2xl bg-white/[0.07] px-3 pt-3 pb-3 backdrop-blur-[18px] backdrop-saturate-150 sm:px-4 sm:pt-3.5 sm:pb-4">
               <div className="relative z-10">
               <div className="mb-2 flex items-center justify-between">
                 <p className="text-[11px] font-semibold uppercase tracking-[0.1em] text-white/60">
@@ -3653,12 +3650,11 @@ export function CommunityReelsPanel({
               </div>
             </div>
 
-            <div className="mt-3 min-h-0 flex-1 overflow-hidden md:-mx-4 md:mt-4 lg:-mx-5">
+            <div className="mt-3 min-h-0 flex-1 overflow-hidden md:-mx-2 md:mt-4 lg:-mx-3">
               <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto pb-0">
                 {!isCommunityAuthReady ? (
                   <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
-                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-5 backdrop-blur-[4px]">
-                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                    <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-5 backdrop-blur-[18px] backdrop-saturate-150">
                       <div className="relative z-10">
                         <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Account</p>
                         <p className="mt-3 text-sm text-white/72">Loading your community account…</p>
@@ -3667,8 +3663,7 @@ export function CommunityReelsPanel({
                   </section>
                 ) : needsCommunityAuth ? (
                   <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
-                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6">
-                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                    <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6">
                       <div className="relative z-10 max-w-xl">
                         <div className="flex flex-wrap items-center gap-2">
                           <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Your Sets</p>
@@ -3682,8 +3677,7 @@ export function CommunityReelsPanel({
                   </section>
                 ) : needsCommunityVerification ? (
                   <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
-                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6">
-                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                    <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6">
                       <div className="relative z-10 max-w-xl">
                         <div className="flex flex-wrap items-center gap-2">
                           <p className="text-[11px] font-semibold uppercase tracking-[0.11em] text-white/70">Your Sets</p>
@@ -3713,8 +3707,7 @@ export function CommunityReelsPanel({
                   <>
                 {shouldShowEditSetGrid ? (
                   <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
-                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6">
-                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                    <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6">
                       <div className="relative z-10">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                           <div>
@@ -3842,8 +3835,7 @@ export function CommunityReelsPanel({
                 <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
                 <div className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,0.9fr)] lg:items-start">
                   <form onSubmit={onCreateSet} className="space-y-4 md:space-y-5">
-                    <div className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6">
-                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                    <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6">
                       <div className="relative z-10 space-y-5">
                       <label className="block">
                         <span className="mb-2 flex items-center justify-between gap-2 text-xs text-white/72">
@@ -3977,8 +3969,7 @@ export function CommunityReelsPanel({
                     </div>
                     </div>
 
-                    <div className="relative min-h-0 overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-3.5 pb-4 backdrop-blur-[4px] sm:p-4 sm:pb-5">
-                      <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                    <div className="relative min-h-0 overflow-hidden rounded-2xl bg-white/[0.07] p-3.5 pb-4 backdrop-blur-[18px] backdrop-saturate-150 sm:p-4 sm:pb-5">
                       <div className="relative z-10">
                       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                         <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-white/68">Embed Reels ({SUPPORTED_PLATFORMS_LABEL})</p>
@@ -4180,8 +4171,7 @@ export function CommunityReelsPanel({
                     )}
                   </form>
 
-                  <aside className="relative overflow-hidden rounded-2xl border border-[#2b2b2b] bg-transparent p-4 pb-5 backdrop-blur-[4px] sm:p-5 sm:pb-6 lg:sticky lg:top-3">
-                    <div className="pointer-events-none absolute inset-0 bg-white/[0.04]" />
+                  <aside className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6 lg:sticky lg:top-3">
                     <div className="relative z-10">
                       <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/62">Live Preview</p>
                       <div className="mt-3 overflow-hidden rounded-xl border border-[#2b2b2b] bg-black/45">

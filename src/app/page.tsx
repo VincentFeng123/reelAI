@@ -53,7 +53,7 @@ const SIDEBAR_INFO_TOOLTIP_FADE_MS = 180;
 const SIDEBAR_INFO_TOOLTIP_ANIMATE_IN_MS = 24;
 type GenerationMode = StoredHistoryItem["generationMode"];
 type HistorySource = StoredHistoryItem["source"];
-type SidebarTab = "search" | "community" | "create" | "edit" | "settings";
+type SidebarTab = "search" | "history" | "community" | "create" | "edit" | "settings";
 type SidebarSwitchIntent = {
   tab: SidebarTab;
   clearHistoryQuery?: boolean;
@@ -80,7 +80,7 @@ function normalizeSidebarTab(value: string | null): SidebarTab | null {
   if (value === "create" || value === "edit") {
     return "edit";
   }
-  if (value === "search" || value === "community" || value === "settings") {
+  if (value === "search" || value === "history" || value === "community" || value === "settings") {
     return value;
   }
   return null;
@@ -270,6 +270,9 @@ function formatHistoryInfoReturnTab(value: string | null | undefined): string | 
   if (normalized === "create" || normalized === "edit") {
     return "Your Sets";
   }
+  if (normalized === "history") {
+    return "Search History";
+  }
   return formatHistoryInfoToken(normalized);
 }
 
@@ -347,7 +350,8 @@ function HomePageContent() {
   const [topChromeOffset, setTopChromeOffset] = useState(false);
   const [topChromeGestureActive, setTopChromeGestureActive] = useState(false);
   const [searchPanelScrollable, setSearchPanelScrollable] = useState(false);
-  const [activeHistoryMenuId, setActiveHistoryMenuId] = useState<string | null>(null);
+  const [activeSidebarHistoryMenuId, setActiveSidebarHistoryMenuId] = useState<string | null>(null);
+  const [activeHistoryPageMenuId, setActiveHistoryPageMenuId] = useState<string | null>(null);
   const [selectedHistoryInfoId, setSelectedHistoryInfoId] = useState<string | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
@@ -679,6 +683,11 @@ function HomePageContent() {
     [persistHistory],
   );
 
+  const closeHistoryMenus = useCallback(() => {
+    setActiveSidebarHistoryMenuId(null);
+    setActiveHistoryPageMenuId(null);
+  }, []);
+
   const clearAllHistory = useCallback(() => {
     const scopedAccountId = resolveHistoryAccountId();
     historyMutationVersionRef.current += 1;
@@ -686,7 +695,7 @@ function HomePageContent() {
     setHistory([]);
     setHistoryQuery("");
     setError(null);
-    setActiveHistoryMenuId(null);
+    closeHistoryMenus();
     setSelectedHistoryInfoId(null);
     if (typeof window !== "undefined") {
       if (scopedAccountId) {
@@ -708,7 +717,7 @@ function HomePageContent() {
       window.localStorage.removeItem(FEED_PROGRESS_STORAGE_KEY);
       window.localStorage.removeItem(FEED_SESSION_STORAGE_KEY);
     }
-  }, [resolveHistoryAccountId]);
+  }, [closeHistoryMenus, resolveHistoryAccountId]);
 
   const clearMobileSidebarCloseTimer = useCallback(() => {
     if (mobileSidebarCloseTimerRef.current !== null) {
@@ -881,14 +890,14 @@ function HomePageContent() {
       clearCommunitySelectionFromUrl();
     }
     setError(null);
-    setActiveHistoryMenuId(null);
+    closeHistoryMenus();
     setSelectedHistoryInfoId(null);
     setAccountMenuOpen(false);
     if (intent.clearHistoryQuery) {
       setHistoryQuery("");
     }
     forceCloseMobileSidebar();
-  }, [activeSidebarTab, clearCommunitySelectionFromUrl, forceCloseMobileSidebar]);
+  }, [activeSidebarTab, clearCommunitySelectionFromUrl, closeHistoryMenus, forceCloseMobileSidebar]);
 
   const requestSidebarSwitch = useCallback(
     (intent: SidebarSwitchIntent) => {
@@ -916,13 +925,13 @@ function HomePageContent() {
   }, [requestSidebarSwitch]);
 
   const openAccountScreen = useCallback(() => {
-    setActiveHistoryMenuId(null);
+    closeHistoryMenus();
     setSelectedHistoryInfoId(null);
     setAccountMenuOpen(false);
     forceCloseMobileSidebar();
     const returnTab = activeSidebarTab === "create" ? "edit" : activeSidebarTab;
     router.push(`/account?return_tab=${returnTab}`);
-  }, [activeSidebarTab, forceCloseMobileSidebar, router]);
+  }, [activeSidebarTab, closeHistoryMenus, forceCloseMobileSidebar, router]);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -1025,7 +1034,7 @@ function HomePageContent() {
       if (existing) {
         upsertHistory({ ...existing, updatedAt: Date.now() });
       }
-      setActiveHistoryMenuId(null);
+      closeHistoryMenus();
       setSelectedHistoryInfoId(null);
       forceCloseMobileSidebar();
       const savedFeedQuery = (existing?.feedQuery || "").trim();
@@ -1045,7 +1054,11 @@ function HomePageContent() {
         }
       }
       const mode = existing?.generationMode ?? "fast";
-      const returnTab = activeSidebarTab === "community" || activeSidebarTab === "create" || activeSidebarTab === "edit" ? "community" : "search";
+      const returnTab = activeSidebarTab === "history"
+        ? "history"
+        : activeSidebarTab === "community" || activeSidebarTab === "create" || activeSidebarTab === "edit"
+          ? "community"
+          : "search";
       const nextParams = new URLSearchParams({
         material_id: materialId,
         generation_mode: mode,
@@ -1053,7 +1066,7 @@ function HomePageContent() {
       });
       router.push(`/feed?${nextParams.toString()}`);
     },
-    [activeSidebarTab, forceCloseMobileSidebar, router, upsertHistory],
+    [activeSidebarTab, closeHistoryMenus, forceCloseMobileSidebar, router, upsertHistory],
   );
 
   const toggleHistoryStar = useCallback(
@@ -1067,19 +1080,19 @@ function HomePageContent() {
         starred: !existing.starred,
         updatedAt: existing.updatedAt,
       });
-      setActiveHistoryMenuId(null);
+      closeHistoryMenus();
     },
-    [upsertHistory],
+    [closeHistoryMenus, upsertHistory],
   );
 
   const deleteHistoryItem = useCallback(
     (materialId: string) => {
       const next = historyRef.current.filter((item) => item.materialId !== materialId);
       persistHistory(next);
-      setActiveHistoryMenuId((prev) => (prev === materialId ? null : prev));
+      closeHistoryMenus();
       setSelectedHistoryInfoId((prev) => (prev === materialId ? null : prev));
     },
-    [persistHistory],
+    [closeHistoryMenus, persistHistory],
   );
 
   useEffect(() => {
@@ -1092,7 +1105,7 @@ function HomePageContent() {
   }, [selectedHistoryInfoId, selectedHistoryInfoItem]);
 
   useEffect(() => {
-    if (!activeHistoryMenuId) {
+    if (!activeSidebarHistoryMenuId && !activeHistoryPageMenuId) {
       return;
     }
     const onPointerDown = (event: PointerEvent) => {
@@ -1102,13 +1115,13 @@ function HomePageContent() {
       if (event.target.closest("[data-history-actions='true']")) {
         return;
       }
-      setActiveHistoryMenuId(null);
+      closeHistoryMenus();
     };
     window.addEventListener("pointerdown", onPointerDown);
     return () => {
       window.removeEventListener("pointerdown", onPointerDown);
     };
-  }, [activeHistoryMenuId]);
+  }, [activeHistoryPageMenuId, activeSidebarHistoryMenuId, closeHistoryMenus]);
 
   useEffect(() => {
     if (!selectedHistoryInfoItem) {
@@ -1299,7 +1312,8 @@ function HomePageContent() {
     [applySidebarSwitchIntent, pendingSaveSwitchUntilHeuristicClose, pendingSidebarSwitchIntent],
   );
   const isCommunityPanel = visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit";
-  const hasCommunityBackdrop = isCommunityPanel || visibleSidebarTab === "settings";
+  const usesCommunityShell = isCommunityPanel || visibleSidebarTab === "history";
+  const hasCommunityBackdrop = usesCommunityShell || visibleSidebarTab === "settings";
   const hideMobileTopControls = isCommunityPanel && communityDetailOpen;
   const [lastCommunityPanelMode, setLastCommunityPanelMode] = useState<"community" | "create" | "edit">("community");
 
@@ -1323,8 +1337,174 @@ function HomePageContent() {
     return <FullscreenLoadingScreen />;
   }
 
+  const historyPanelContent = (
+    <div className={visibleSidebarTab === "history" ? "flex h-full min-h-0 flex-col" : "hidden h-full min-h-0"}>
+      <div className="flex h-full min-h-0 flex-col px-5 pb-6 pt-[calc(max(env(safe-area-inset-top),0px)+5rem)] sm:px-6 md:px-8 lg:px-10 lg:pt-12">
+        <div className="shrink-0 text-center">
+          <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-white/52">Library</p>
+          <h2 className="mt-3 text-3xl font-semibold tracking-tight text-white sm:text-[2.5rem]">Search History</h2>
+          <p className="mt-3 text-sm text-white/58">Search your saved sessions and reopen them from here.</p>
+        </div>
+
+        <div className="mx-auto mt-8 w-full max-w-2xl shrink-0">
+          <div className="relative">
+            <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/38" aria-hidden="true" />
+            <input
+              value={historyQuery}
+              onChange={(event) => setHistoryQuery(event.target.value)}
+              placeholder="Search history..."
+              className="h-14 w-full rounded-[1.75rem] bg-white/[0.08] pl-12 pr-4 text-base text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 placeholder:text-white/35 focus:bg-white/[0.12]"
+            />
+          </div>
+
+          <div className="mt-3 flex items-center justify-between gap-3 text-xs text-white/52">
+            <p>
+              {historyQuery.trim()
+                ? `${filteredHistory.length} ${filteredHistory.length === 1 ? "result" : "results"}`
+                : `${historySorted.length} saved ${historySorted.length === 1 ? "session" : "sessions"}`}
+            </p>
+            {historySorted.length > 0 ? (
+              <button
+                type="button"
+                onClick={clearAllHistory}
+                aria-label="Clear history"
+                className="grid h-7 w-7 place-items-center rounded-full text-white/48 transition hover:bg-white/10 hover:text-white"
+              >
+                <i className="fa-solid fa-trash-can text-[11px]" aria-hidden="true" />
+              </button>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="mx-auto mt-8 min-h-0 w-full max-w-4xl flex-1 overflow-y-auto pb-2">
+          {historySorted.length === 0 ? (
+            <div className="grid min-h-full place-items-center px-4 py-12">
+              <div className="max-w-md text-center">
+                <p className="text-lg font-semibold text-white">No search history yet.</p>
+                <p className="mt-3 text-sm leading-6 text-white/58">
+                  Start a search or open a community reel set, and your recent sessions will show up here.
+                </p>
+              </div>
+            </div>
+          ) : filteredHistory.length === 0 ? (
+            <div className="grid min-h-full place-items-center px-4 py-12">
+              <div className="max-w-md text-center">
+                <p className="text-lg font-semibold text-white">No matching history items.</p>
+                <p className="mt-3 text-sm leading-6 text-white/58">Try a different title or clear the search box.</p>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-3 pb-4">
+              {filteredHistory.map((entry) => (
+                <div
+                  key={`history-${entry.materialId}`}
+                  className={`group relative ${activeHistoryPageMenuId === entry.materialId ? "z-40" : "z-0"}`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => openMaterialFeed(entry.materialId)}
+                    className="w-full rounded-[1.75rem] bg-white/[0.07] px-4 py-4 pr-14 text-left backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 hover:bg-white/[0.11] sm:px-5 sm:py-5"
+                  >
+                    <div className="flex items-start gap-3">
+                      <span className="mt-0.5 grid h-10 w-10 shrink-0 place-items-center rounded-2xl bg-black/30 text-white/78 transition-colors duration-200 group-hover:text-white">
+                        <i className={`fa-solid ${entry.source === "community" ? "fa-users" : "fa-magnifying-glass"} text-sm`} aria-hidden="true" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          {entry.starred ? <i className="fa-solid fa-star text-[11px] text-white/72 transition-colors group-hover:text-white" aria-hidden="true" /> : null}
+                          <p className="truncate text-sm font-semibold text-white sm:text-base">{entry.title}</p>
+                          <span
+                            className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] ${
+                              entry.source === "community"
+                                ? "bg-white/16 text-white/88"
+                                : "bg-black/45 text-white/62"
+                            }`}
+                          >
+                            {entry.source === "community" ? "Community" : entry.generationMode}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-xs text-white/48">{formatHistoryInfoDate(entry.updatedAt)}</p>
+                      </div>
+                    </div>
+                  </button>
+
+                  <div data-history-actions="true" className="absolute right-3 top-3 z-30">
+                    <button
+                      type="button"
+                      aria-label="History item actions"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        setActiveSidebarHistoryMenuId(null);
+                        setActiveHistoryPageMenuId((prev) => (prev === entry.materialId ? null : entry.materialId));
+                      }}
+                      data-force-visible={activeHistoryPageMenuId === entry.materialId ? "true" : undefined}
+                      className="grid h-8 w-8 place-items-center rounded-full text-white/62 transition hover:bg-white/10 hover:text-white"
+                    >
+                      <i className="fa-solid fa-ellipsis text-[12px]" aria-hidden="true" />
+                    </button>
+
+                    <div
+                      className={`absolute right-0 top-full z-50 mt-2 w-44 transition-opacity duration-180 ${
+                        activeHistoryPageMenuId === entry.materialId
+                          ? "pointer-events-auto opacity-100"
+                          : "pointer-events-none opacity-0"
+                      }`}
+                    >
+                      <div
+                        role="menu"
+                        className="overflow-hidden rounded-2xl bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)]"
+                      >
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setSelectedHistoryInfoId(entry.materialId);
+                            closeHistoryMenus();
+                          }}
+                          className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                        >
+                          <i className="fa-regular fa-circle-info text-[11px] text-white/80" aria-hidden="true" />
+                          More information
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            toggleHistoryStar(entry.materialId);
+                          }}
+                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                        >
+                          <i
+                            className={`fa-${entry.starred ? "solid" : "regular"} fa-star text-[11px] text-white/80`}
+                            aria-hidden="true"
+                          />
+                          {entry.starred ? "Unstar" : "Star"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            deleteHistoryItem(entry.materialId);
+                          }}
+                          className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                        >
+                          <i className="fa-regular fa-trash-can text-[11px] text-white/80" aria-hidden="true" />
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
   const sidebarPanelContent = (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-full min-h-0 flex-col lg:pt-2">
       <div className="mt-2 flex items-center justify-end gap-2 lg:mt-0 lg:justify-between">
         <span
           aria-hidden="true"
@@ -1341,7 +1521,7 @@ function HomePageContent() {
             type="button"
             onClick={startNewSearch}
             aria-label="Start new search"
-            className="grid h-8 w-8 place-items-center rounded-xl border border-white/15 bg-transparent text-sm font-semibold text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
+            className="grid h-8 w-8 place-items-center rounded-xl bg-transparent text-sm font-semibold text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
           >
             <span className="translate-x-[0.5px] -translate-y-[0.5px] leading-none">+</span>
           </button>
@@ -1356,8 +1536,8 @@ function HomePageContent() {
         <button
           type="button"
           onClick={startNewSearch}
-          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            visibleSidebarTab === "search" ? "border-white bg-white text-black" : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+          className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+            visibleSidebarTab === "search" ? "bg-white text-black" : "text-white/85 hover:bg-white/10 hover:text-white"
           }`}
         >
           <div className="flex h-full items-center justify-between gap-1.5">
@@ -1374,16 +1554,40 @@ function HomePageContent() {
 
       <div
         className="group relative mt-2"
+        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Browse your saved search sessions")}
+        onMouseLeave={onSidebarInfoHoverEnd}
+      >
+        <button
+          type="button"
+          onClick={() => switchSidebarTab("history")}
+          className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+            visibleSidebarTab === "history" ? "bg-white text-black" : "text-white/85 hover:bg-white/10 hover:text-white"
+          }`}
+        >
+          <div className="flex h-full items-center justify-between gap-1.5">
+            <p className="truncate font-semibold leading-none">Search History</p>
+            <i
+              className={`fa-solid fa-clock-rotate-left text-[11px] ${
+                visibleSidebarTab === "history" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+              }`}
+              aria-hidden="true"
+            />
+          </div>
+        </button>
+      </div>
+
+      <div
+        className="group relative mt-2"
         onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Curated reel sets from the community")}
         onMouseLeave={onSidebarInfoHoverEnd}
       >
         <button
           type="button"
           onClick={() => switchSidebarTab("community", { resetCommunityView: true })}
-          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+          className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
             visibleSidebarTab === "community"
-              ? "border-white bg-white text-black"
-              : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+              ? "bg-white text-black"
+              : "text-white/85 hover:bg-white/10 hover:text-white"
           }`}
         >
           <div className="flex h-full items-center justify-between gap-1.5">
@@ -1406,10 +1610,10 @@ function HomePageContent() {
         <button
           type="button"
           onClick={() => switchSidebarTab("edit")}
-          className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+          className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
             visibleSidebarTab === "edit" || visibleSidebarTab === "create"
-              ? "border-white bg-white text-black"
-              : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+              ? "bg-white text-black"
+              : "text-white/85 hover:bg-white/10 hover:text-white"
           }`}
         >
           <div className="flex h-full items-center justify-between gap-1.5">
@@ -1426,32 +1630,24 @@ function HomePageContent() {
         </button>
       </div>
 
-      <div className="mt-6">
-        <input
-          value={historyQuery}
-          onChange={(event) => setHistoryQuery(event.target.value)}
-          placeholder="Search history..."
-          className="h-9 w-full rounded-xl border border-white/20 bg-black/55 px-3 text-xs text-white outline-none placeholder:text-white/45 focus:border-white/45"
-        />
-      </div>
-
-      <div className="mt-4 min-h-0 flex-1 overflow-y-auto pr-1 lg:flex-[0.95]">
+      <div className="mt-4 min-h-0 flex-1 overflow-y-auto px-2.5 lg:flex-[0.95]">
         <div className="mb-2 flex items-center justify-between">
           <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">History</p>
           <button
             type="button"
             onClick={clearAllHistory}
-            className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60 transition hover:text-white"
+            aria-label="Clear history"
+            className="grid h-7 w-7 translate-x-1.5 place-items-center rounded-full text-white/60 transition hover:bg-white/10 hover:text-white"
           >
-            Clear History
+            <i className="fa-solid fa-trash-can text-[11px]" aria-hidden="true" />
           </button>
         </div>
         <div className="relative pb-1">
           <div className="relative space-y-1.5">
-            {filteredHistory.length === 0 ? (
+            {historySorted.length === 0 ? (
               <p className="text-xs text-zinc-400">No history yet.</p>
             ) : (
-              filteredHistory.map((entry) => (
+              historySorted.map((entry) => (
                 <div
                   key={`history-${entry.materialId}`}
                   className="group relative"
@@ -1459,7 +1655,7 @@ function HomePageContent() {
                   <button
                     type="button"
                     onClick={() => openMaterialFeed(entry.materialId)}
-                    className="h-9 w-full rounded-xl border border-white/15 bg-black/45 px-2.5 pr-10 text-left text-xs text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
+                    className="h-9 w-full rounded-xl bg-transparent px-2.5 pr-10 text-left text-xs text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
                   >
                     <div className="flex items-center gap-1.5">
                       {entry.starred ? <i className="fa-solid fa-star text-[10px] text-white/75 transition-colors group-hover:text-white" aria-hidden="true" /> : null}
@@ -1482,9 +1678,10 @@ function HomePageContent() {
                       aria-label="History item actions"
                       onClick={(event) => {
                         event.stopPropagation();
-                        setActiveHistoryMenuId((prev) => (prev === entry.materialId ? null : entry.materialId));
+                        setActiveHistoryPageMenuId(null);
+                        setActiveSidebarHistoryMenuId((prev) => (prev === entry.materialId ? null : entry.materialId));
                       }}
-                      data-force-visible={activeHistoryMenuId === entry.materialId ? "true" : undefined}
+                      data-force-visible={activeSidebarHistoryMenuId === entry.materialId ? "true" : undefined}
                       className="reveal-on-desktop-hover grid h-6 w-6 place-items-center rounded-md text-white/70 transition hover:bg-white/10 hover:text-white"
                     >
                       <i className="fa-solid fa-ellipsis text-[11px]" aria-hidden="true" />
@@ -1492,21 +1689,21 @@ function HomePageContent() {
 
                     <div
                       className={`absolute right-0 top-full z-30 mt-1 w-44 transition-opacity duration-180 ${
-                        activeHistoryMenuId === entry.materialId
+                        activeSidebarHistoryMenuId === entry.materialId
                           ? "pointer-events-auto opacity-100"
                           : "pointer-events-none opacity-0"
                       }`}
                     >
                       <div
                         role="menu"
-                        className="overflow-hidden rounded-2xl border border-white/15 bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)]"
+                        className="overflow-hidden rounded-2xl bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)]"
                       >
                         <button
                           type="button"
                           onClick={(event) => {
                             event.stopPropagation();
                             setSelectedHistoryInfoId(entry.materialId);
-                            setActiveHistoryMenuId(null);
+                            closeHistoryMenus();
                           }}
                           className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
                         >
@@ -1548,15 +1745,15 @@ function HomePageContent() {
         </div>
       </div>
 
-      <div className="mb-0 mt-auto pt-4 lg:mt-4 lg:pt-0">
+      <div className="mb-0 mt-auto pt-4 lg:pt-0">
         <div className="group relative">
           <button
             type="button"
             onClick={() => switchSidebarTab("settings")}
-            className={`h-9 w-full rounded-xl border bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+            className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
               visibleSidebarTab === "settings"
-                ? "border-white bg-white text-black"
-                : "border-white/15 text-white/85 hover:bg-white/10 hover:text-white"
+                ? "bg-white text-black"
+                : "text-white/85 hover:bg-white/10 hover:text-white"
             }`}
           >
             <div className="flex h-full items-center justify-between gap-1.5">
@@ -1582,7 +1779,7 @@ function HomePageContent() {
             >
               <div
                 role="menu"
-                className={`overflow-hidden rounded-2xl border border-white/15 bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] transition duration-180 ${
+                className={`overflow-hidden rounded-2xl bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] transition duration-180 ${
                   accountMenuOpen ? "pointer-events-auto translate-y-0 opacity-100" : "pointer-events-none translate-y-1 opacity-0"
                 }`}
               >
@@ -1619,7 +1816,7 @@ function HomePageContent() {
             type="button"
             onClick={() => {
               if (communityAccount) {
-                setActiveHistoryMenuId(null);
+                closeHistoryMenus();
                 setAccountMenuOpen((prev) => !prev);
                 return;
               }
@@ -1627,7 +1824,7 @@ function HomePageContent() {
             }}
             aria-haspopup={communityAccount ? "menu" : undefined}
             aria-expanded={communityAccount ? accountMenuOpen : undefined}
-            className="h-10 w-full rounded-xl border border-white/15 bg-transparent px-2.5 text-left text-xs text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
+            className="h-10 w-full rounded-xl bg-transparent px-2.5 text-left text-xs text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
           >
             <div className="flex h-full items-center justify-between gap-1.5">
               <p className="truncate font-semibold leading-none">
@@ -1682,7 +1879,7 @@ function HomePageContent() {
       ) : null}
       {sidebarInfoTooltip && !shouldDisableSidebarTooltips() ? (
         <div
-          className={`pointer-events-none fixed z-[90] max-w-[220px] rounded-lg border border-white/15 bg-black/95 px-2 py-1 text-left text-[10px] text-white/92 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-[opacity,transform] duration-[220ms] ease-out will-change-[transform,opacity] ${
+          className={`pointer-events-none fixed z-[90] max-w-[220px] rounded-lg bg-black/95 px-2 py-1 text-left text-[10px] text-white/92 shadow-[0_12px_30px_rgba(0,0,0,0.5)] backdrop-blur-sm transition-[opacity,transform] duration-[220ms] ease-out will-change-[transform,opacity] ${
             sidebarInfoTooltip.visible ? "translate-y-0 opacity-100" : "-translate-y-1.5 opacity-0"
           } ${sidebarInfoTooltip.align === "right" ? "origin-top-right -translate-x-full" : "origin-top-left"}`}
           style={{ left: `${sidebarInfoTooltip.left}px`, top: `${sidebarInfoTooltip.top}px` }}
@@ -1701,7 +1898,7 @@ function HomePageContent() {
       >
         <div
           className={`h-full w-full ${
-            visibleSidebarTab === "community" || visibleSidebarTab === "edit" || visibleSidebarTab === "settings"
+            visibleSidebarTab === "community" || visibleSidebarTab === "edit" || visibleSidebarTab === "settings" || visibleSidebarTab === "history"
               ? "bg-black"
               : visibleSidebarTab === "search"
                 ? "relative overflow-hidden bg-white/[0.05] backdrop-blur-[10px] backdrop-saturate-160"
@@ -1753,7 +1950,7 @@ function HomePageContent() {
               }
               closeMobileSidebar();
             }}
-            className={`absolute bottom-4 left-4 top-6 w-[min(24rem,calc(100vw-2rem))] rounded-3xl bg-black/30 px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.45)] backdrop-blur-[26px] backdrop-saturate-150 ${
+            className={`absolute bottom-5 left-4 top-7 w-[min(24rem,calc(100vw-2rem))] rounded-3xl bg-white/[0.08] px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.32)] backdrop-blur-[26px] backdrop-saturate-150 ${
               mobileSidebarClosing ? "animate-mobile-sidenav-out" : "animate-mobile-sidenav-in"
             }`}
           >
@@ -1786,24 +1983,20 @@ function HomePageContent() {
         </div>
       ) : null}
 
-      <div className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:mx-0 lg:max-w-none lg:pl-4 lg:grid lg:grid-cols-[280px_1px_minmax(0,1fr)]">
-        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-black/72 px-3 pt-3 pb-3 text-white lg:mt-8 lg:mb-2 lg:flex lg:w-[280px] lg:justify-self-start lg:px-5">
+      <div className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:mx-0 lg:max-w-none lg:pl-4 lg:grid lg:grid-cols-[280px_minmax(0,1fr)]">
+        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-white/[0.08] px-3 pt-3 pb-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.24)] backdrop-blur-[18px] backdrop-saturate-150 lg:mt-8 lg:mb-8 lg:flex lg:w-[280px] lg:justify-self-start lg:px-5 lg:pb-5">
           {sidebarPanelContent}
         </aside>
-
-        <div className="relative z-20 hidden h-full items-center justify-center lg:flex lg:translate-x-1">
-          <span className="h-[80%] w-px rounded-full bg-white/20" />
-        </div>
 
         <section
           className={`relative z-20 h-full min-h-0 w-full overflow-hidden rounded-3xl ${
             hasCommunityBackdrop ? "bg-transparent" : "bg-black/62"
           } ${
-            visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit"
+            usesCommunityShell
               ? "lg:mt-2 lg:mb-0"
               : "lg:my-2"
           } lg:max-w-[1280px] lg:justify-self-center ${
-            visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit"
+            usesCommunityShell
               ? "translate-x-0 md:translate-x-1 lg:translate-x-0 lg:w-[99%]"
               : "lg:w-[97%]"
           }`}
@@ -1816,6 +2009,7 @@ function HomePageContent() {
               onScrollabilityChange={onSearchPanelScrollabilityChange}
             />
           </div>
+          {historyPanelContent}
           <div
             className={
               visibleSidebarTab === "settings"
