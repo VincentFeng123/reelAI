@@ -318,6 +318,24 @@ CREATE TABLE IF NOT EXISTS community_accounts (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS community_signup_email_verifications (
+    id TEXT PRIMARY KEY,
+    owner_key_hash TEXT NOT NULL,
+    email TEXT NOT NULL,
+    email_normalized TEXT NOT NULL,
+    verified_at TEXT,
+    verification_code_hash TEXT,
+    verification_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_community_signup_email_verifications_owner_email
+ON community_signup_email_verifications(owner_key_hash, email_normalized);
+
+CREATE INDEX IF NOT EXISTS idx_community_signup_email_verifications_email_updated_at
+ON community_signup_email_verifications(email_normalized, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS community_sessions (
     id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,

@@ -225,6 +225,28 @@ class CommunitySetsResponse(BaseModel):
     sets: list[CommunitySetOut] = Field(default_factory=list)
 
 
+class CommunitySendSignupVerificationRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    username: str | None = Field(default=None, min_length=1, max_length=32)
+
+
+class CommunitySendSignupVerificationResponse(BaseModel):
+    email: str
+    verification_required: bool = True
+    verified: bool = False
+    verification_code_debug: str | None = None
+
+
+class CommunityVerifySignupEmailRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=254)
+    code: str = Field(min_length=4, max_length=16)
+
+
+class CommunityVerifySignupEmailResponse(BaseModel):
+    email: str
+    verified: bool = True
+
+
 class CommunityAuthRegisterRequest(BaseModel):
     username: str = Field(min_length=3, max_length=32)
     email: str = Field(min_length=3, max_length=254)

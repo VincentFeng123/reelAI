@@ -178,9 +178,29 @@ function communityOwnerHeaders(): HeadersInit {
   return ownerKey ? { [COMMUNITY_OWNER_HEADER]: ownerKey } : {};
 }
 
+function readCommunitySessionToken(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  try {
+    let sessionToken = (window.sessionStorage.getItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY) || "").trim();
+    if (sessionToken.length < 24) {
+      const legacyToken = (window.localStorage.getItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY) || "").trim();
+      if (legacyToken.length >= 24) {
+        sessionToken = legacyToken;
+        window.sessionStorage.setItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY, sessionToken);
+        window.localStorage.removeItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY);
+      }
+    }
+    return sessionToken;
+  } catch {
+    return "";
+  }
+}
+
 function communitySessionHeaders(): HeadersInit {
-  const session = readCommunityAuthSession();
-  return session?.sessionToken ? { [COMMUNITY_SESSION_HEADER]: session.sessionToken } : {};
+  const sessionToken = readCommunitySessionToken();
+  return sessionToken ? { [COMMUNITY_SESSION_HEADER]: sessionToken } : {};
 }
 
 function communityRequestHeaders(): HeadersInit {
@@ -211,7 +231,7 @@ function normalizeCommunityAccount(raw: unknown): CommunityAccount | null {
 }
 
 type StoredCommunityAuthSession = {
-  account: CommunityAccount;
+  account: CommunityAccount | null;
   sessionToken: string;
 };
 
@@ -235,12 +255,16 @@ function saveCommunityAuthSessionStorage(session: StoredCommunityAuthSession | n
     // Account metadata (non-secret) stays in localStorage for cross-tab display.
     // The session token goes in sessionStorage to limit XSS blast radius — an
     // attacker would need code running in the same tab to read it.
-    window.localStorage.setItem(COMMUNITY_ACCOUNT_STORAGE_KEY, JSON.stringify(session.account));
+    if (session.account) {
+      window.localStorage.setItem(COMMUNITY_ACCOUNT_STORAGE_KEY, JSON.stringify(session.account));
+    } else {
+      window.localStorage.removeItem(COMMUNITY_ACCOUNT_STORAGE_KEY);
+    }
     window.sessionStorage.setItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY, session.sessionToken);
-    setActiveStudyReelsSettingsScope(session.account.id);
+    setActiveStudyReelsSettingsScope(session.account?.id ?? null);
   } catch {
     // Ignore storage failures and keep the in-memory response path usable.
-    setActiveStudyReelsSettingsScope(session?.account.id ?? null);
+    setActiveStudyReelsSettingsScope(session?.account?.id ?? null);
   } finally {
     window.dispatchEvent(new Event(COMMUNITY_AUTH_CHANGED_EVENT));
   }
@@ -257,17 +281,7 @@ export function readCommunityAuthSession(): CommunityAuthSession | null {
   }
   try {
     const account = normalizeCommunityAccount(JSON.parse(window.localStorage.getItem(COMMUNITY_ACCOUNT_STORAGE_KEY) || "null"));
-    // Read token from sessionStorage (preferred) with localStorage migration fallback.
-    let sessionToken = (window.sessionStorage.getItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY) || "").trim();
-    if (sessionToken.length < 24) {
-      // Migrate legacy localStorage token if present.
-      const legacyToken = (window.localStorage.getItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY) || "").trim();
-      if (legacyToken.length >= 24) {
-        sessionToken = legacyToken;
-        window.sessionStorage.setItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY, sessionToken);
-        window.localStorage.removeItem(COMMUNITY_SESSION_TOKEN_STORAGE_KEY);
-      }
-    }
+    const sessionToken = readCommunitySessionToken();
     if (!account || sessionToken.length < 24) {
       return null;
     }
@@ -358,10 +372,73 @@ async function parseJsonResponse<T>(response: Response): Promise<T> {
   }
 }
 
+export async function sendCommunitySignupVerification(params: {
+  email: string;
+  username?: string;
+}): Promise<{ email: string; verified: boolean; verificationRequired: boolean; verificationCodeDebug: string | null }> {
+  const res = await safeFetch(apiUrl("/community/auth/send-signup-verification"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
+    },
+    body: JSON.stringify({
+      email: params.email,
+      username: params.username,
+    }),
+  });
+  const json = await parseJsonResponse<{
+    email?: unknown;
+    verified?: unknown;
+    verification_required?: unknown;
+    verification_code_debug?: unknown;
+  }>(res);
+  const email = typeof json?.email === "string" && json.email.trim() ? json.email.trim() : "";
+  if (!email) {
+    throw new Error("Backend returned an invalid verification response.");
+  }
+  return {
+    email,
+    verified: Boolean(json?.verified),
+    verificationRequired: Boolean(json?.verification_required),
+    verificationCodeDebug:
+      typeof json?.verification_code_debug === "string" && json.verification_code_debug.trim()
+        ? json.verification_code_debug.trim()
+        : null,
+  };
+}
+
+export async function verifyCommunitySignupEmail(params: {
+  email: string;
+  code: string;
+}): Promise<{ email: string; verified: boolean }> {
+  const res = await safeFetch(apiUrl("/community/auth/verify-signup-email"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
+    },
+    body: JSON.stringify({
+      email: params.email,
+      code: params.code,
+    }),
+  });
+  const json = await parseJsonResponse<{ email?: unknown; verified?: unknown }>(res);
+  const email = typeof json?.email === "string" && json.email.trim() ? json.email.trim() : "";
+  if (!email) {
+    throw new Error("Backend returned an invalid verification response.");
+  }
+  return {
+    email,
+    verified: Boolean(json?.verified),
+  };
+}
+
 export async function registerCommunityAccount(params: {
   username: string;
   email: string;
   password: string;
+  persistAccountWhenUnverified?: boolean;
 }): Promise<CommunityAuthSession> {
   const res = await safeFetch(apiUrl("/community/auth/register"), {
     method: "POST",
@@ -380,7 +457,10 @@ export async function registerCommunityAccount(params: {
     throw new Error("Backend returned an invalid auth response.");
   }
   saveCommunityAuthSessionStorage({
-    account: session.account,
+    account:
+      params.persistAccountWhenUnverified === false && (session.verificationRequired || session.account.isVerified === false)
+        ? null
+        : session.account,
     sessionToken: session.sessionToken,
   });
   return session;
@@ -389,6 +469,7 @@ export async function registerCommunityAccount(params: {
 export async function loginCommunityAccount(params: {
   username: string;
   password: string;
+  persistAccountWhenUnverified?: boolean;
 }): Promise<CommunityAuthSession> {
   const res = await safeFetch(apiUrl("/community/auth/login"), {
     method: "POST",
@@ -406,7 +487,10 @@ export async function loginCommunityAccount(params: {
     throw new Error("Backend returned an invalid auth response.");
   }
   saveCommunityAuthSessionStorage({
-    account: session.account,
+    account:
+      params.persistAccountWhenUnverified === false && (session.verificationRequired || session.account.isVerified === false)
+        ? null
+        : session.account,
     sessionToken: session.sessionToken,
   });
   return session;
@@ -430,13 +514,13 @@ export async function verifyCommunityAccount(params: {
   if (!account) {
     throw new Error("Backend returned an invalid verification response.");
   }
-  const stored = readCommunityAuthSession();
-  if (!stored?.sessionToken) {
+  const sessionToken = readCommunitySessionToken();
+  if (sessionToken.length < 24) {
     throw new Error("Session expired. Sign in again.");
   }
   saveCommunityAuthSessionStorage({
     account,
-    sessionToken: stored.sessionToken,
+    sessionToken,
   });
   return {
     account,
@@ -456,13 +540,13 @@ export async function resendCommunityVerification(): Promise<{ account: Communit
   if (!account) {
     throw new Error("Backend returned an invalid verification response.");
   }
-  const stored = readCommunityAuthSession();
-  if (!stored?.sessionToken) {
+  const sessionToken = readCommunitySessionToken();
+  if (sessionToken.length < 24) {
     throw new Error("Session expired. Sign in again.");
   }
   saveCommunityAuthSessionStorage({
     account,
-    sessionToken: stored.sessionToken,
+    sessionToken,
   });
   return {
     account,
@@ -493,13 +577,13 @@ export async function changeCommunityVerificationEmail(params: {
   if (!account) {
     throw new Error("Backend returned an invalid email-change response.");
   }
-  const stored = readCommunityAuthSession();
-  if (!stored?.sessionToken) {
+  const sessionToken = readCommunitySessionToken();
+  if (sessionToken.length < 24) {
     throw new Error("Session expired. Sign in again.");
   }
   saveCommunityAuthSessionStorage({
     account,
-    sessionToken: stored.sessionToken,
+    sessionToken,
   });
   return {
     account,

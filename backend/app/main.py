@@ -56,6 +56,8 @@ from .models import (
     CommunityAccountOut,
     CommunityChangePasswordRequest,
     CommunityResendVerificationResponse,
+    CommunitySendSignupVerificationRequest,
+    CommunitySendSignupVerificationResponse,
     CommunityHistoryItemOut,
     CommunityHistoryReplaceRequest,
     CommunityHistoryResponse,
@@ -68,6 +70,8 @@ from .models import (
     CommunitySetsResponse,
     CommunityVerifyAccountRequest,
     CommunityVerifyAccountResponse,
+    CommunityVerifySignupEmailRequest,
+    CommunityVerifySignupEmailResponse,
     FeedbackRequest,
     FeedbackResponse,
     FeedResponse,
@@ -714,13 +718,14 @@ def _warn_if_hosted_auth_email_is_unconfigured() -> None:
 
 
 def _send_community_verification_email(*, email: str, username: str, code: str) -> None:
+    greeting = f"@{username}" if str(username or "").strip() else "there"
     message = EmailMessage()
     message["Subject"] = "Verify your StudyReels account"
     message["From"] = settings.smtp_from_email.strip()
     message["To"] = email
     message.set_content(
         (
-            f"Hi @{username},\n\n"
+            f"Hi {greeting},\n\n"
             f"Your StudyReels verification code is: {code}\n\n"
             f"This code expires in {COMMUNITY_VERIFICATION_TTL_MINUTES} minutes.\n"
             "If you did not create this account, you can ignore this email.\n"
@@ -779,6 +784,99 @@ def _store_community_verification_code(conn, *, account_id: str) -> str:
 def _issue_community_verification_code(conn, *, account_id: str, email: str, username: str) -> str | None:
     code = _store_community_verification_code(conn, account_id=account_id)
     return _deliver_community_verification_code(email=email, username=username, code=code)
+
+
+def _community_signup_verification_id(*, owner_key_hash: str, email_normalized: str) -> str:
+    return hashlib.sha256(f"{owner_key_hash}:{email_normalized}".encode("utf-8")).hexdigest()
+
+
+def _load_community_signup_verification(conn, *, owner_key_hash: str, email_normalized: str) -> dict[str, object] | None:
+    verification_id = _community_signup_verification_id(owner_key_hash=owner_key_hash, email_normalized=email_normalized)
+    return fetch_one(
+        conn,
+        """
+        SELECT
+            id,
+            owner_key_hash,
+            email,
+            email_normalized,
+            verified_at,
+            verification_code_hash,
+            verification_expires_at,
+            created_at,
+            updated_at
+        FROM community_signup_email_verifications
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (verification_id,),
+    )
+
+
+def _community_signup_email_is_verified(row: dict[str, object] | None) -> bool:
+    if not row:
+        return False
+    return _parse_optional_iso_datetime(row.get("verified_at")) is not None
+
+
+def _store_community_signup_verification_code(
+    conn,
+    *,
+    owner_key_hash: str,
+    email: str,
+    email_normalized: str,
+) -> str:
+    verification_id = _community_signup_verification_id(owner_key_hash=owner_key_hash, email_normalized=email_normalized)
+    timestamp = now_iso()
+    code = _generate_community_verification_code()
+    code_hash = _hash_community_verification_code(code)
+    expires_at = _community_verification_expires_at_iso()
+    existing = _load_community_signup_verification(conn, owner_key_hash=owner_key_hash, email_normalized=email_normalized)
+    if existing:
+        execute_modify(
+            conn,
+            """
+            UPDATE community_signup_email_verifications
+            SET email = ?, email_normalized = ?, verified_at = NULL, verification_code_hash = ?, verification_expires_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (email, email_normalized, code_hash, expires_at, timestamp, verification_id),
+        )
+        return code
+    insert(
+        conn,
+        "community_signup_email_verifications",
+        {
+            "id": verification_id,
+            "owner_key_hash": owner_key_hash,
+            "email": email,
+            "email_normalized": email_normalized,
+            "verified_at": None,
+            "verification_code_hash": code_hash,
+            "verification_expires_at": expires_at,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        },
+    )
+    return code
+
+
+def _issue_community_signup_verification_code(
+    conn,
+    *,
+    owner_key_hash: str,
+    email: str,
+    email_normalized: str,
+    username: str | None,
+) -> str | None:
+    code = _store_community_signup_verification_code(
+        conn,
+        owner_key_hash=owner_key_hash,
+        email=email,
+        email_normalized=email_normalized,
+    )
+    delivery_username = str(username or "").strip()
+    return _deliver_community_verification_code(email=email, username=delivery_username, code=code)
 
 
 def _community_account_out(row: dict[str, object]) -> CommunityAccountOut:
@@ -4261,6 +4359,102 @@ def health() -> dict:
     return {"ok": True}
 
 
+@app.post("/api/community/auth/send-signup-verification", response_model=CommunitySendSignupVerificationResponse)
+def send_signup_verification_email(request: Request, payload: CommunitySendSignupVerificationRequest):
+    _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
+    email, email_normalized = _normalize_community_email(payload.email)
+    username = str(payload.username or "").strip() or None
+    verification_required = _community_email_verification_required()
+    if verification_required:
+        _require_hosted_verification_delivery_available()
+    with get_conn(transactional=True) as conn:
+        existing_email = fetch_one(
+            conn,
+            "SELECT id FROM community_accounts WHERE email_normalized = ? LIMIT 1",
+            (email_normalized,),
+        )
+        if existing_email:
+            raise HTTPException(status_code=409, detail=COMMUNITY_REGISTER_CONFLICT_DETAIL)
+        if not verification_required:
+            return CommunitySendSignupVerificationResponse(
+                email=email,
+                verification_required=False,
+                verified=True,
+                verification_code_debug=None,
+            )
+        owner_key_hash = _community_owner_hash_from_request(request)
+        existing_verification = _load_community_signup_verification(
+            conn,
+            owner_key_hash=owner_key_hash,
+            email_normalized=email_normalized,
+        )
+        if _community_signup_email_is_verified(existing_verification):
+            return CommunitySendSignupVerificationResponse(
+                email=str(existing_verification.get("email") or email).strip() or email,
+                verification_required=True,
+                verified=True,
+                verification_code_debug=None,
+            )
+        verification_code_debug = _issue_community_signup_verification_code(
+            conn,
+            owner_key_hash=owner_key_hash,
+            email=email,
+            email_normalized=email_normalized,
+            username=username,
+        )
+    return CommunitySendSignupVerificationResponse(
+        email=email,
+        verification_required=True,
+        verified=False,
+        verification_code_debug=verification_code_debug,
+    )
+
+
+@app.post("/api/community/auth/verify-signup-email", response_model=CommunityVerifySignupEmailResponse)
+def verify_signup_email(request: Request, payload: CommunityVerifySignupEmailRequest):
+    _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
+    email, email_normalized = _normalize_community_email(payload.email)
+    verification_code = str(payload.code or "").strip()
+    if not _community_email_verification_required():
+        return CommunityVerifySignupEmailResponse(email=email, verified=True)
+    with get_conn(transactional=True) as conn:
+        owner_key_hash = _community_owner_hash_from_request(request)
+        verification = _load_community_signup_verification(
+            conn,
+            owner_key_hash=owner_key_hash,
+            email_normalized=email_normalized,
+        )
+        if not verification:
+            raise HTTPException(status_code=400, detail="Send a verification code before trying to verify this email.")
+        if _community_signup_email_is_verified(verification):
+            return CommunityVerifySignupEmailResponse(
+                email=str(verification.get("email") or email).strip() or email,
+                verified=True,
+            )
+        _check_rate_limit_key(
+            f"community-verify-signup:{owner_key_hash}:{email_normalized}",
+            limit=COMMUNITY_VERIFY_PER_ACCOUNT_RATE_LIMIT,
+            window_sec=RATE_LIMIT_WINDOW_SEC,
+        )
+        expected_hash = str(verification.get("verification_code_hash") or "").strip()
+        expires_at = _parse_optional_iso_datetime(verification.get("verification_expires_at"))
+        if not expected_hash or expires_at is None or expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=400, detail="Verification code expired. Request a new code.")
+        if not secrets.compare_digest(expected_hash, _hash_community_verification_code(verification_code)):
+            raise HTTPException(status_code=400, detail="Verification code is incorrect.")
+        verified_at = now_iso()
+        execute_modify(
+            conn,
+            """
+            UPDATE community_signup_email_verifications
+            SET verified_at = ?, verification_code_hash = NULL, verification_expires_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (verified_at, verified_at, str(verification.get("id") or "")),
+        )
+    return CommunityVerifySignupEmailResponse(email=email, verified=True)
+
+
 @app.post("/api/community/auth/register", response_model=CommunityAuthSessionResponse, status_code=201)
 def register_community_account(request: Request, payload: CommunityAuthRegisterRequest):
     _enforce_rate_limit(request, "community-auth", limit=COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW)
@@ -4285,10 +4479,21 @@ def register_community_account(request: Request, payload: CommunityAuthRegisterR
         )
         if existing_identity:
             raise HTTPException(status_code=409, detail=COMMUNITY_REGISTER_CONFLICT_DETAIL)
+        verified_at = now_iso()
+        if verification_required:
+            owner_key_hash = legacy_claim_owner_key_hash or _community_owner_hash_from_request(request)
+            legacy_claim_owner_key_hash = owner_key_hash
+            pending_signup_verification = _load_community_signup_verification(
+                conn,
+                owner_key_hash=owner_key_hash,
+                email_normalized=email_normalized,
+            )
+            if not _community_signup_email_is_verified(pending_signup_verification):
+                raise HTTPException(status_code=403, detail="Verify your email before creating the account.")
+            verified_at = str(pending_signup_verification.get("verified_at") or "").strip() or verified_at
         account_id = str(uuid.uuid4())
         salt_hex = secrets.token_hex(16)
         timestamp = now_iso()
-        verified_at = None if verification_required else timestamp
         try:
             insert(
                 conn,
@@ -4313,20 +4518,17 @@ def register_community_account(request: Request, payload: CommunityAuthRegisterR
             raise HTTPException(status_code=409, detail=COMMUNITY_REGISTER_CONFLICT_DETAIL) from exc
         session_token = _create_community_session(conn, account_id)
         verification_code_debug = None
-        claimed_legacy_sets = 0
+        claimed_legacy_sets = _claim_legacy_community_sets_for_account(
+            conn,
+            request,
+            account_id=account_id,
+            legacy_claim_owner_key_hash=legacy_claim_owner_key_hash,
+        )
         if verification_required:
-            verification_code_debug = _issue_community_verification_code(
+            execute_modify(
                 conn,
-                account_id=account_id,
-                email=email,
-                username=username,
-            )
-        else:
-            claimed_legacy_sets = _claim_legacy_community_sets_for_account(
-                conn,
-                request,
-                account_id=account_id,
-                legacy_claim_owner_key_hash=legacy_claim_owner_key_hash,
+                "DELETE FROM community_signup_email_verifications WHERE id = ?",
+                (_community_signup_verification_id(owner_key_hash=legacy_claim_owner_key_hash or _community_owner_hash_from_request(request), email_normalized=email_normalized),),
             )
         account = {
             "id": account_id,
@@ -4338,7 +4540,7 @@ def register_community_account(request: Request, payload: CommunityAuthRegisterR
         account=_community_account_out(account),
         session_token=session_token,
         claimed_legacy_sets=max(0, claimed_legacy_sets),
-        verification_required=verification_required,
+        verification_required=False,
         verification_code_debug=verification_code_debug,
     )
 

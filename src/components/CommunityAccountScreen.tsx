@@ -1,6 +1,6 @@
 "use client";
 
-import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { type ChangeEvent, type ClipboardEvent as ReactClipboardEvent, type FormEvent, type KeyboardEvent as ReactKeyboardEvent, useCallback, useEffect, useRef, useState } from "react";
 
 import {
   changeCommunityVerificationEmail,
@@ -10,8 +10,11 @@ import {
   logoutCommunityAccount,
   registerCommunityAccount,
   resendCommunityVerification,
+  sendCommunitySignupVerification,
   verifyCommunityAccount,
+  verifyCommunitySignupEmail,
 } from "@/lib/api";
+import { ViewportModalPortal } from "@/components/ViewportModalPortal";
 import type { CommunityAccount } from "@/lib/types";
 
 type CommunityAccountScreenProps = {
@@ -24,6 +27,11 @@ type CommunityAccountScreenProps = {
 };
 
 const AUTH_MODE_FADE_MS = 160;
+const VERIFICATION_CODE_LENGTH = 6;
+
+function normalizeSignupEmailForComparison(value: string): string {
+  return value.trim().toLowerCase();
+}
 
 export function CommunityAccountScreen({
   account,
@@ -41,11 +49,16 @@ export function CommunityAccountScreen({
   const [verificationCode, setVerificationCode] = useState("");
   const [verificationCodeDebug, setVerificationCodeDebug] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [sendVerificationBusy, setSendVerificationBusy] = useState(false);
   const [verificationBusy, setVerificationBusy] = useState(false);
   const [resendBusy, setResendBusy] = useState(false);
   const [changeEmailBusy, setChangeEmailBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [isVerificationModalOpen, setIsVerificationModalOpen] = useState(false);
+  const [verificationFlow, setVerificationFlow] = useState<"account" | "signup" | null>(null);
+  const [pendingVerificationEmail, setPendingVerificationEmail] = useState<string | null>(null);
+  const [verifiedSignupEmail, setVerifiedSignupEmail] = useState<string | null>(null);
   const [authContentVisible, setAuthContentVisible] = useState(true);
   const [authModeTransitioning, setAuthModeTransitioning] = useState(false);
   const authModeTransitionTimerRef = useRef<number | null>(null);
@@ -61,10 +74,26 @@ export function CommunityAccountScreen({
   const [deleteAccountBusy, setDeleteAccountBusy] = useState(false);
   const [deleteAccountError, setDeleteAccountError] = useState<string | null>(null);
   const authSubmitInFlightRef = useRef(false);
+  const verificationDigitInputRefs = useRef<Array<HTMLInputElement | null>>([]);
+
+  const closeVerificationModal = useCallback(() => {
+    if (verificationBusy) {
+      return;
+    }
+    setIsVerificationModalOpen(false);
+    if (!account) {
+      setVerificationFlow(null);
+    }
+  }, [account, verificationBusy]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy && !verificationBusy && !resendBusy && !changeEmailBusy && !deleteAccountBusy) {
+      if (event.key === "Escape" && isVerificationModalOpen && !verificationBusy) {
+        event.preventDefault();
+        closeVerificationModal();
+        return;
+      }
+      if (event.key === "Escape" && !busy && !sendVerificationBusy && !verificationBusy && !resendBusy && !changeEmailBusy && !deleteAccountBusy) {
         onBack();
       }
     };
@@ -72,13 +101,17 @@ export function CommunityAccountScreen({
     return () => {
       window.removeEventListener("keydown", onKeyDown);
     };
-  }, [busy, changeEmailBusy, deleteAccountBusy, onBack, resendBusy, verificationBusy]);
+  }, [busy, changeEmailBusy, closeVerificationModal, deleteAccountBusy, isVerificationModalOpen, onBack, resendBusy, sendVerificationBusy, verificationBusy]);
 
   useEffect(() => {
     setPassword("");
     setError(null);
     setSuccess(null);
     setVerificationCode("");
+    setSendVerificationBusy(false);
+    setPendingVerificationEmail(null);
+    setVerificationFlow(null);
+    setVerifiedSignupEmail(null);
     setShowChangeEmail(false);
     setChangeEmailValue(account?.email ?? "");
     setChangeEmailPassword("");
@@ -110,6 +143,40 @@ export function CommunityAccountScreen({
   }, []);
 
   useEffect(() => {
+    if (verificationFlow === "account" && (!account || account.isVerified)) {
+      setIsVerificationModalOpen(false);
+      setVerificationFlow(null);
+    }
+  }, [account, verificationFlow]);
+
+  useEffect(() => {
+    if (!verifiedSignupEmail) {
+      return;
+    }
+    if (normalizeSignupEmailForComparison(email) !== verifiedSignupEmail) {
+      setVerifiedSignupEmail(null);
+    }
+  }, [email, verifiedSignupEmail]);
+
+  useEffect(() => {
+    if (!isVerificationModalOpen) {
+      return;
+    }
+    const focusIndex = Math.min(verificationCode.trim().length, VERIFICATION_CODE_LENGTH - 1);
+    const target = verificationDigitInputRefs.current[focusIndex];
+    if (!target) {
+      return;
+    }
+    const frameId = window.requestAnimationFrame(() => {
+      target.focus();
+      target.select();
+    });
+    return () => {
+      window.cancelAnimationFrame(frameId);
+    };
+  }, [isVerificationModalOpen, verificationCode]);
+
+  useEffect(() => {
     if (view === displayView) {
       return;
     }
@@ -130,9 +197,8 @@ export function CommunityAccountScreen({
     }, AUTH_MODE_FADE_MS);
   }, [displayView, view]);
 
-  const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (busy || authSubmitInFlightRef.current) {
+  const submitCommunityAuth = useCallback(async () => {
+    if (busy || sendVerificationBusy || authSubmitInFlightRef.current) {
       return;
     }
     const trimmedUsername = username.trim();
@@ -142,29 +208,49 @@ export function CommunityAccountScreen({
       setSuccess(null);
       return;
     }
+    if (authMode === "register" && normalizeSignupEmailForComparison(trimmedEmail) !== verifiedSignupEmail) {
+      setError("Verify your email before creating the account.");
+      setSuccess(null);
+      return;
+    }
     authSubmitInFlightRef.current = true;
     setBusy(true);
     setError(null);
     setSuccess(null);
     try {
       const session = authMode === "register"
-        ? await registerCommunityAccount({ username: trimmedUsername, email: trimmedEmail, password })
-        : await loginCommunityAccount({ username: trimmedUsername, password });
-      onAccountChange(session.account);
+        ? await registerCommunityAccount({
+          username: trimmedUsername,
+          email: trimmedEmail,
+          password,
+        })
+        : await loginCommunityAccount({
+          username: trimmedUsername,
+          password,
+          persistAccountWhenUnverified: false,
+        });
       setPassword("");
+      setVerificationCode("");
       setVerificationCodeDebug(session.verificationCodeDebug ?? null);
       if (session.verificationRequired || !session.account.isVerified) {
         const targetEmail = session.account.email ?? (authMode === "register" ? trimmedEmail : "");
+        setPendingVerificationEmail(targetEmail || null);
+        setVerificationFlow("account");
+        setIsVerificationModalOpen(true);
         setSuccess(
           targetEmail
-            ? `${authMode === "register" ? "Account created" : "Signed in"}. Enter the verification code sent to ${targetEmail}.`
-            : `${authMode === "register" ? "Account created" : "Signed in"}. Verify your email to unlock Your Sets.`,
+            ? null
+            : "Verify your email to unlock Your Sets.",
         );
       } else if (session.claimedLegacySets > 0) {
+        onAccountChange(session.account);
+        setVerifiedSignupEmail(null);
         setSuccess(
           `${authMode === "register" ? "Account created" : "Signed in"} and linked ${session.claimedLegacySets} existing set${session.claimedLegacySets === 1 ? "" : "s"} from this device.`,
         );
       } else {
+        onAccountChange(session.account);
+        setVerifiedSignupEmail(null);
         setSuccess(authMode === "register" ? "Account created." : "Signed in.");
       }
     } catch (submitError) {
@@ -174,7 +260,82 @@ export function CommunityAccountScreen({
       authSubmitInFlightRef.current = false;
       setBusy(false);
     }
+  }, [authMode, busy, email, onAccountChange, password, sendVerificationBusy, username, verifiedSignupEmail]);
+
+  const onSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    await submitCommunityAuth();
   };
+
+  const onSendVerificationEmail = async () => {
+    if (busy || sendVerificationBusy) {
+      return;
+    }
+    const trimmedEmail = email.trim();
+    if (!trimmedEmail) {
+      setError("Enter your email address.");
+      setSuccess(null);
+      return;
+    }
+    setSendVerificationBusy(true);
+    setError(null);
+    setSuccess(null);
+    try {
+      const result = await sendCommunitySignupVerification({
+        email: trimmedEmail,
+        username: username.trim() || undefined,
+      });
+      setVerificationCode("");
+      setVerificationCodeDebug(result.verificationCodeDebug);
+      setPendingVerificationEmail(result.email);
+      if (result.verified || !result.verificationRequired) {
+        setVerifiedSignupEmail(normalizeSignupEmailForComparison(result.email));
+        setVerificationFlow(null);
+        setIsVerificationModalOpen(false);
+        setSuccess("Email verified. Click Create Account to continue.");
+      } else {
+        setVerifiedSignupEmail(null);
+        setVerificationFlow("signup");
+        setIsVerificationModalOpen(true);
+        setSuccess(null);
+      }
+    } catch (submitError) {
+      setError(submitError instanceof Error ? submitError.message : "Could not send a verification code.");
+      setSuccess(null);
+    } finally {
+      setSendVerificationBusy(false);
+    }
+  };
+
+  const onSignupEmailChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const nextEmail = event.target.value;
+    const nextNormalizedEmail = normalizeSignupEmailForComparison(nextEmail);
+    setEmail(nextEmail);
+    if (
+      verifiedSignupEmail === null
+      && pendingVerificationEmail === null
+      && verificationFlow !== "signup"
+      && verificationCodeDebug === null
+    ) {
+      return;
+    }
+    if (
+      verifiedSignupEmail !== nextNormalizedEmail
+      || pendingVerificationEmail !== null
+      || verificationFlow === "signup"
+      || verificationCodeDebug !== null
+    ) {
+      setVerifiedSignupEmail(null);
+      setPendingVerificationEmail(null);
+      setVerificationCode("");
+      setVerificationCodeDebug(null);
+      setSuccess(null);
+      if (verificationFlow === "signup") {
+        setVerificationFlow(null);
+        setIsVerificationModalOpen(false);
+      }
+    }
+  }, [pendingVerificationEmail, verificationCodeDebug, verificationFlow, verifiedSignupEmail]);
 
   const onSignOut = async () => {
     if (busy || verificationBusy || resendBusy || changeEmailBusy || changePasswordBusy || deleteAccountBusy) {
@@ -265,10 +426,34 @@ export function CommunityAccountScreen({
     setError(null);
     setSuccess(null);
     try {
+      if (verificationFlow === "signup") {
+        const targetEmail = (pendingVerificationEmail || email).trim();
+        if (!targetEmail) {
+          throw new Error("Enter your email address before verifying.");
+        }
+        const result = await verifyCommunitySignupEmail({
+          email: targetEmail,
+          code: trimmedCode,
+        });
+        if (!result.verified) {
+          throw new Error("Verification code is incorrect.");
+        }
+        setVerifiedSignupEmail(normalizeSignupEmailForComparison(result.email));
+        setVerificationCode("");
+        setVerificationCodeDebug(null);
+        setPendingVerificationEmail(result.email);
+        setVerificationFlow(null);
+        setIsVerificationModalOpen(false);
+        setSuccess("Email verified. Click Create Account to continue.");
+        return;
+      }
       const result = await verifyCommunityAccount({ code: trimmedCode });
       onAccountChange(result.account);
       setVerificationCode("");
       setVerificationCodeDebug(null);
+      setPendingVerificationEmail(null);
+      setVerificationFlow(null);
+      setIsVerificationModalOpen(false);
       if (result.claimedLegacySets > 0) {
         setSuccess(`Account verified and linked ${result.claimedLegacySets} existing set${result.claimedLegacySets === 1 ? "" : "s"} from this device.`);
       } else {
@@ -293,6 +478,10 @@ export function CommunityAccountScreen({
       const result = await resendCommunityVerification();
       onAccountChange(result.account);
       setVerificationCodeDebug(result.verificationCodeDebug);
+      setVerificationCode("");
+      setPendingVerificationEmail(result.account.email ?? null);
+      setVerificationFlow("account");
+      setIsVerificationModalOpen(true);
       setSuccess(
         result.account.email
           ? `Sent a new verification code to ${result.account.email}.`
@@ -329,7 +518,10 @@ export function CommunityAccountScreen({
       setChangeEmailPassword("");
       setVerificationCode("");
       setVerificationCodeDebug(result.verificationCodeDebug);
+      setPendingVerificationEmail(result.account.email ?? null);
       setShowChangeEmail(false);
+      setVerificationFlow("account");
+      setIsVerificationModalOpen(true);
       setSuccess(
         result.account.email
           ? `Verification email updated. Enter the code sent to ${result.account.email}.`
@@ -355,6 +547,12 @@ export function CommunityAccountScreen({
     setError(null);
     setSuccess(null);
     setVerificationCodeDebug(null);
+    setVerificationCode("");
+    setSendVerificationBusy(false);
+    setPendingVerificationEmail(null);
+    setVerificationFlow(null);
+    setVerifiedSignupEmail(null);
+    setIsVerificationModalOpen(false);
     setShowChangeEmail(false);
     setChangeEmailPassword("");
     authSubmitInFlightRef.current = false;
@@ -371,6 +569,62 @@ export function CommunityAccountScreen({
       });
     }, AUTH_MODE_FADE_MS);
   }, [authMode, authModeTransitioning]);
+
+  const verificationDigits = Array.from({ length: VERIFICATION_CODE_LENGTH }, (_, index) => verificationCode[index] ?? "");
+
+  const focusVerificationDigit = useCallback((index: number) => {
+    const target = verificationDigitInputRefs.current[index];
+    if (!target) {
+      return;
+    }
+    target.focus();
+    target.select();
+  }, []);
+
+  const normalizeVerificationDigits = useCallback((value: string) => value.replace(/\D/g, "").slice(0, VERIFICATION_CODE_LENGTH), []);
+
+  const onVerificationDigitChange = useCallback((index: number, event: ChangeEvent<HTMLInputElement>) => {
+    const nextDigits = normalizeVerificationDigits(event.target.value);
+    if (!nextDigits) {
+      setVerificationCode((prev) => prev.slice(0, index));
+      return;
+    }
+    setVerificationCode((prev) => `${normalizeVerificationDigits(prev).slice(0, index)}${nextDigits}`.slice(0, VERIFICATION_CODE_LENGTH));
+    const nextFocusIndex = Math.min(index + nextDigits.length, VERIFICATION_CODE_LENGTH - 1);
+    window.requestAnimationFrame(() => {
+      focusVerificationDigit(nextFocusIndex);
+    });
+  }, [focusVerificationDigit, normalizeVerificationDigits]);
+
+  const onVerificationDigitKeyDown = useCallback((index: number, event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === "Backspace" && !verificationDigits[index] && index > 0) {
+      event.preventDefault();
+      setVerificationCode((prev) => prev.slice(0, Math.max(0, index - 1)));
+      focusVerificationDigit(index - 1);
+      return;
+    }
+    if (event.key === "ArrowLeft" && index > 0) {
+      event.preventDefault();
+      focusVerificationDigit(index - 1);
+      return;
+    }
+    if (event.key === "ArrowRight" && index < VERIFICATION_CODE_LENGTH - 1) {
+      event.preventDefault();
+      focusVerificationDigit(index + 1);
+    }
+  }, [focusVerificationDigit, verificationDigits]);
+
+  const onVerificationDigitPaste = useCallback((event: ReactClipboardEvent<HTMLInputElement>) => {
+    const pastedDigits = normalizeVerificationDigits(event.clipboardData.getData("text"));
+    if (!pastedDigits) {
+      return;
+    }
+    event.preventDefault();
+    setVerificationCode(pastedDigits);
+    window.requestAnimationFrame(() => {
+      focusVerificationDigit(Math.min(pastedDigits.length, VERIFICATION_CODE_LENGTH - 1));
+    });
+  }, [focusVerificationDigit, normalizeVerificationDigits]);
 
   const backLabel = displayView === "default" ? "Back to ReelAI" : "Back to Account Manager";
 
@@ -390,7 +644,7 @@ export function CommunityAccountScreen({
         <button
           type="button"
           onClick={onBack}
-          className="inline-flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition hover:text-white"
+          className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition-colors hover:bg-white/10"
         >
           <i className="fa-solid fa-arrow-left text-[10px]" aria-hidden="true" />
           {backLabel}
@@ -399,7 +653,7 @@ export function CommunityAccountScreen({
 
       <div className="relative z-10 h-full w-full lg:flex lg:items-center lg:justify-center lg:px-10 lg:py-8">
         <div className="h-full w-full lg:h-auto lg:max-w-[1080px] xl:max-w-[1120px]">
-          <div className="h-full overflow-hidden bg-black/22 backdrop-blur-[22px] lg:h-auto lg:rounded-[32px] lg:border lg:border-[#8c8c95]/45 lg:shadow-[0_32px_140px_rgba(10,5,20,0.42)]">
+          <div className="h-full overflow-hidden bg-white/[0.07] backdrop-blur-[18px] backdrop-saturate-150 lg:h-auto lg:rounded-[32px] lg:shadow-[0_32px_140px_rgba(10,5,20,0.38)]">
             <div className="grid h-full w-full lg:h-[min(82dvh,680px)] lg:grid-cols-[minmax(0,0.94fr)_minmax(320px,0.96fr)]">
             <section className="order-2 flex min-h-full bg-transparent px-6 pb-8 pt-24 sm:px-10 sm:pt-28 lg:order-1 lg:px-12 lg:py-10 xl:px-14 xl:py-12">
               <div className="mx-auto flex h-full w-full max-w-[360px] flex-col">
@@ -407,7 +661,7 @@ export function CommunityAccountScreen({
                   <button
                     type="button"
                     onClick={onBack}
-                    className="hidden items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition hover:text-white lg:inline-flex"
+                    className="hidden items-center gap-2 rounded-full px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-white transition-colors hover:bg-white/10 lg:inline-flex"
                   >
                     <i className="fa-solid fa-arrow-left text-[10px]" aria-hidden="true" />
                     {backLabel}
@@ -687,14 +941,26 @@ export function CommunityAccountScreen({
                       {isRegister ? (
                         <label className="block">
                           <span className="mb-1.5 block text-sm font-medium text-white">Email</span>
-                          <input
-                            type="email"
-                            value={email}
-                            onChange={(event) => setEmail(event.target.value)}
-                            autoComplete="email"
-                            placeholder="you@example.com"
-                            className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
-                          />
+                          <div className="relative">
+                            <input
+                              type="email"
+                              value={email}
+                              onChange={onSignupEmailChange}
+                              autoComplete="email"
+                              placeholder="you@example.com"
+                              className="community-auth-input h-12 w-full rounded-[12px] bg-[#404040] px-4 pr-[5.75rem] text-sm text-white outline-none placeholder:text-white placeholder:opacity-100 backdrop-blur-[10px]"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => {
+                                void onSendVerificationEmail();
+                              }}
+                              disabled={busy || sendVerificationBusy || !email.trim()}
+                              className="absolute right-1.5 top-1/2 inline-flex h-9 -translate-y-1/2 items-center justify-center rounded-[10px] bg-black px-3 text-[11px] font-semibold uppercase tracking-[0.08em] text-white transition-colors duration-150 enabled:hover:bg-[#181818] disabled:cursor-not-allowed disabled:bg-black/35 disabled:text-white/40 disabled:transition-none"
+                            >
+                              Send
+                            </button>
+                          </div>
                         </label>
                       ) : null}
                       <label className="block">
@@ -714,7 +980,7 @@ export function CommunityAccountScreen({
                       </div>
                       <button
                         type="submit"
-                        disabled={busy}
+                        disabled={busy || sendVerificationBusy}
                         className="inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45"
                       >
                         {busy
@@ -773,6 +1039,75 @@ export function CommunityAccountScreen({
         </div>
         </div>
       </div>
+      {isVerificationModalOpen ? (
+        <ViewportModalPortal>
+          <div
+            className="fixed inset-0 z-[140] flex items-center justify-center bg-black/72 px-4 py-6 backdrop-blur-[4px]"
+            role="presentation"
+            onClick={closeVerificationModal}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Verify account"
+              className="w-full max-w-md rounded-[28px] bg-[#111111] p-5 text-white shadow-[0_28px_90px_rgba(0,0,0,0.52)] sm:p-6"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <button
+                  type="button"
+                  onClick={closeVerificationModal}
+                  disabled={verificationBusy}
+                  className="inline-flex items-center gap-2 rounded-full px-3 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/72 transition hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <i className="fa-solid fa-arrow-left text-[10px]" aria-hidden="true" />
+                  Return
+                </button>
+              </div>
+
+              <div className="mt-5">
+                <h2 className="text-2xl font-semibold tracking-[-0.04em] text-white">Enter verification code</h2>
+              </div>
+
+              <form onSubmit={onVerifyAccount} className="mt-6">
+                <div className="grid grid-cols-6 gap-2 sm:gap-3">
+                  {verificationDigits.map((digit, index) => (
+                    <input
+                      key={`verification-digit-${index}`}
+                      ref={(node) => {
+                        verificationDigitInputRefs.current[index] = node;
+                      }}
+                      value={digit}
+                      onChange={(event) => onVerificationDigitChange(index, event)}
+                      onKeyDown={(event) => onVerificationDigitKeyDown(index, event)}
+                      onPaste={onVerificationDigitPaste}
+                      inputMode="numeric"
+                      autoComplete={index === 0 ? "one-time-code" : "off"}
+                      aria-label={`Verification digit ${index + 1}`}
+                      maxLength={VERIFICATION_CODE_LENGTH}
+                      className="h-14 w-full rounded-[14px] bg-[#2c2c2c] text-center text-xl font-semibold text-white outline-none transition focus:bg-[#343434]"
+                    />
+                  ))}
+                </div>
+
+                {verificationCodeDebug ? (
+                  <p className="mt-4 text-sm text-[#f6d38b]">Local debug code: {verificationCodeDebug}</p>
+                ) : null}
+                {error ? <p className="mt-4 text-sm text-[#ffb4b4]">{error}</p> : null}
+                {success ? <p className="mt-4 text-sm text-[#9ef8cb]">{success}</p> : null}
+
+                <button
+                  type="submit"
+                  disabled={verificationBusy || verificationCode.trim().length !== VERIFICATION_CODE_LENGTH}
+                  className="mt-5 inline-flex h-12 w-full items-center justify-center rounded-[14px] bg-[#1f1f1f] px-5 text-sm font-semibold text-white transition hover:bg-[#2a2a2a] disabled:cursor-not-allowed disabled:bg-[#1f1f1f]/45 disabled:text-white/35"
+                >
+                  {verificationBusy ? "Verifying..." : verificationFlow === "signup" ? "Verify Email" : "Verify"}
+                </button>
+              </form>
+            </div>
+          </div>
+        </ViewportModalPortal>
+      ) : null}
     </main>
   );
 }
