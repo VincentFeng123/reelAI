@@ -1529,7 +1529,7 @@ function HomePageContent() {
       </div>
 
       <div
-        className="group relative mt-3"
+        className="group relative mt-2"
         onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Start a new chat session")}
         onMouseLeave={onSidebarInfoHoverEnd}
       >
@@ -1553,7 +1553,7 @@ function HomePageContent() {
       </div>
 
       <div
-        className="group relative mt-2"
+        className="group relative mt-1"
         onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Browse your saved search sessions")}
         onMouseLeave={onSidebarInfoHoverEnd}
       >
@@ -1577,7 +1577,7 @@ function HomePageContent() {
       </div>
 
       <div
-        className="group relative mt-2"
+        className="group relative mt-1"
         onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Curated reel sets from the community")}
         onMouseLeave={onSidebarInfoHoverEnd}
       >
@@ -1603,7 +1603,7 @@ function HomePageContent() {
       </div>
 
       <div
-        className="group relative mt-2"
+        className="group relative mt-1"
         onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Create and edit your community sets")}
         onMouseLeave={onSidebarInfoHoverEnd}
       >
@@ -1630,7 +1630,7 @@ function HomePageContent() {
         </button>
       </div>
 
-      <div className="mt-4 min-h-0 flex-1 overflow-y-auto px-2.5 lg:flex-[0.95]">
+      <div className="mt-3 min-h-0 flex-1 overflow-y-auto px-2.5 lg:flex-[0.95]">
         <div className="mb-2 flex items-center justify-between">
           <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">History</p>
           <button
@@ -1643,7 +1643,7 @@ function HomePageContent() {
           </button>
         </div>
         <div className="relative pb-1">
-          <div className="relative space-y-1.5">
+          <div className="relative space-y-1">
             {historySorted.length === 0 ? (
               <p className="text-xs text-zinc-400">No history yet.</p>
             ) : (
@@ -1745,7 +1745,7 @@ function HomePageContent() {
         </div>
       </div>
 
-      <div className="mb-0 mt-auto pt-4 lg:pt-0">
+      <div className="mb-0 mt-auto pt-3 lg:pt-0">
         <div className="group relative">
           <button
             type="button"
@@ -1769,7 +1769,7 @@ function HomePageContent() {
         </div>
         <div
           data-account-actions="true"
-          className="group relative mt-2"
+          className="group relative mt-1"
         >
           {communityAccount ? (
             <div

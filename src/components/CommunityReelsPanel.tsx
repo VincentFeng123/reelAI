@@ -3603,8 +3603,8 @@ export function CommunityReelsPanel({
                 <div
                   className={
                     isYourSetsMode && shouldShowEditSetGrid
-                      ? "min-w-0 flex-1 pl-2 md:w-auto md:pl-2 lg:pl-2"
-                      : "w-full pl-5 sm:pl-6 md:w-auto md:pl-6 lg:pl-2"
+                      ? "min-w-0 flex-1 pl-7 sm:pl-8 md:w-auto md:pl-10 lg:pl-5"
+                      : "w-full pl-7 sm:pl-8 md:w-auto md:pl-10 lg:pl-5"
                   }
                 >
                   <div
@@ -3650,7 +3650,7 @@ export function CommunityReelsPanel({
               </div>
             </div>
 
-            <div className="mt-3 min-h-0 flex-1 overflow-hidden md:-mx-2 md:mt-4 lg:-mx-3">
+            <div className="mt-3 min-h-0 flex-1 overflow-hidden md:-mx-1.5 md:mt-4 lg:-mx-2.5">
               <div className="balanced-scroll-gutter h-full min-h-0 overflow-y-auto pb-0">
                 {!isCommunityAuthReady ? (
                   <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
@@ -3706,7 +3706,7 @@ export function CommunityReelsPanel({
                 ) : (
                   <>
                 {shouldShowEditSetGrid ? (
-                  <section className="rounded-3xl px-1 pt-1 pb-2 sm:px-2 sm:pt-2 sm:pb-3 md:px-3 md:pt-3 md:pb-4">
+                  <section className="rounded-3xl px-0 pt-1 pb-2 sm:px-1 sm:pt-2 sm:pb-3 md:px-2 md:pt-3 md:pb-4">
                     <div className="relative overflow-hidden rounded-2xl bg-white/[0.07] p-4 pb-5 backdrop-blur-[18px] backdrop-saturate-150 sm:p-5 sm:pb-6">
                       <div className="relative z-10">
                         <div className="flex flex-wrap items-center justify-between gap-3">
