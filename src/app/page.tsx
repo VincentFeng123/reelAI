@@ -1368,7 +1368,7 @@ function HomePageContent() {
                 type="button"
                 onClick={clearAllHistory}
                 aria-label="Clear history"
-                className="grid h-7 w-7 place-items-center rounded-full text-white/48 transition hover:bg-white/10 hover:text-white"
+                className="grid h-7 w-7 place-items-center rounded-lg text-white/48 transition hover:bg-white/10 hover:text-white"
               >
                 <i className="fa-solid fa-trash-can text-[11px]" aria-hidden="true" />
               </button>
@@ -1438,7 +1438,7 @@ function HomePageContent() {
                         setActiveHistoryPageMenuId((prev) => (prev === entry.materialId ? null : entry.materialId));
                       }}
                       data-force-visible={activeHistoryPageMenuId === entry.materialId ? "true" : undefined}
-                      className="grid h-8 w-8 place-items-center rounded-full text-white/62 transition hover:bg-white/10 hover:text-white"
+                      className="grid h-8 w-8 place-items-center rounded-lg text-white/62 transition hover:bg-white/10 hover:text-white"
                     >
                       <i className="fa-solid fa-ellipsis text-[12px]" aria-hidden="true" />
                     </button>
@@ -1637,7 +1637,7 @@ function HomePageContent() {
             type="button"
             onClick={clearAllHistory}
             aria-label="Clear history"
-            className="grid h-7 w-7 translate-x-1.5 place-items-center rounded-full text-white/60 transition hover:bg-white/10 hover:text-white"
+            className="grid h-7 w-7 translate-x-1.5 place-items-center rounded-lg text-white/60 transition hover:bg-white/10 hover:text-white"
           >
             <i className="fa-solid fa-trash-can text-[11px]" aria-hidden="true" />
           </button>

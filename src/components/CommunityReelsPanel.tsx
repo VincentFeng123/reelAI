@@ -1020,6 +1020,7 @@ export function CommunityReelsPanel({
   const [selectedDirectorySet, setSelectedDirectorySet] = useState<CommunitySet | null>(null);
   const [isDirectoryDetailOpen, setIsDirectoryDetailOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [yourSetsQuery, setYourSetsQuery] = useState("");
   const [setTitle, setSetTitle] = useState("");
   const [setDescription, setSetDescription] = useState("");
   const [setTags, setSetTags] = useState("");
@@ -1346,6 +1347,24 @@ export function CommunityReelsPanel({
     }
     return [...starred, ...regular];
   }, [editableSets, starredSetIdSet]);
+  const filteredEditableSets = useMemo(() => {
+    const normalized = yourSetsQuery.trim().toLowerCase();
+    if (!normalized) {
+      return orderedEditableSets;
+    }
+    return orderedEditableSets.filter((set) => {
+      if (set.title.toLowerCase().includes(normalized)) {
+        return true;
+      }
+      if (set.description.toLowerCase().includes(normalized)) {
+        return true;
+      }
+      if (set.tags.some((tag) => tag.toLowerCase().includes(normalized))) {
+        return true;
+      }
+      return set.reels.some((reel) => PLATFORM_LABEL[reel.platform].toLowerCase().includes(normalized));
+    });
+  }, [orderedEditableSets, yourSetsQuery]);
   const activeEditableSet = useMemo(
     () => editableSets.find((set) => set.id === activeEditSetId) ?? null,
     [activeEditSetId, editableSets],
@@ -3308,12 +3327,12 @@ export function CommunityReelsPanel({
                 </div>
                 <label className="mx-auto block w-[calc(100%-0.25rem)] self-stretch md:mx-0 md:mr-5 md:w-[20.5rem] md:self-auto lg:mr-3 lg:w-[23rem]">
                   <div className="relative">
-                    <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/45" />
+                    <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/38" />
                     <input
                       value={query}
                       onChange={(event) => setQuery(event.target.value)}
                       placeholder="Search community sets"
-                      className="h-11 w-full rounded-xl border border-white/20 bg-black/35 pl-11 pr-4 text-sm text-white outline-none placeholder:text-white/45 focus:border-white/40 sm:h-12 sm:pl-12"
+                      className="h-11 w-full rounded-[1.5rem] bg-white/[0.08] pl-11 pr-4 text-sm text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 placeholder:text-white/35 focus:bg-white/[0.12] sm:h-12 sm:rounded-[1.75rem] sm:pl-12"
                     />
                   </div>
                 </label>
@@ -3597,7 +3616,7 @@ export function CommunityReelsPanel({
             <div className="shrink-0">
               <div
                 className={`flex gap-3 md:-mx-2 md:flex-row md:items-center md:justify-between md:gap-4 lg:-mx-3 ${
-                  isYourSetsMode && shouldShowEditSetGrid ? "flex-row items-center justify-between" : "flex-col"
+                  isYourSetsMode && shouldShowEditSetGrid ? "flex-col md:flex-row md:items-center md:justify-between" : "flex-col"
                 }`}
               >
                 <div
@@ -3634,17 +3653,26 @@ export function CommunityReelsPanel({
                     <span className="rounded-full border border-[#2b2b2b] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/55">Beta</span>
                   </div>
                 </div>
-                {((isYourSetsMode && shouldShowEditSetGrid && canManageYourSets) || (requiresCommunityAuth && canManageYourSets)) ? (
-                  <div className="flex flex-wrap items-center justify-center gap-2 pr-2 sm:pr-2 md:justify-end md:pr-2 lg:pr-2">
-                    {isYourSetsMode && shouldShowEditSetGrid && canManageYourSets ? (
-                      <button
-                        type="button"
-                        onClick={onOpenCreateSetFromGrid}
-                        className="inline-flex h-10 min-w-[8.25rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-xs font-semibold uppercase tracking-[0.08em] text-white/80 backdrop-blur-md transition hover:bg-white/10 hover:text-white"
-                      >
-                        Create Set
-                      </button>
-                    ) : null}
+                {isYourSetsMode && shouldShowEditSetGrid && canManageYourSets ? (
+                  <div className="flex w-full flex-col items-stretch gap-2 px-2 sm:px-2 md:w-auto md:flex-row md:items-center md:justify-end md:px-0">
+                    <label className="block w-full md:w-[20.5rem] lg:w-[23rem]">
+                      <div className="relative">
+                        <i className="fa-solid fa-magnifying-glass pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-sm text-white/38" />
+                        <input
+                          value={yourSetsQuery}
+                          onChange={(event) => setYourSetsQuery(event.target.value)}
+                          placeholder="Search your sets"
+                          className="h-11 w-full rounded-[1.5rem] bg-white/[0.08] pl-11 pr-4 text-sm text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 placeholder:text-white/35 focus:bg-white/[0.12] sm:h-12 sm:rounded-[1.75rem] sm:pl-12"
+                        />
+                      </div>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={onOpenCreateSetFromGrid}
+                      className="inline-flex h-10 min-w-[8.25rem] items-center justify-center rounded-xl border border-[#2b2b2b] bg-black/35 px-4 text-xs font-semibold uppercase tracking-[0.08em] text-white/80 backdrop-blur-md transition hover:bg-white/10 hover:text-white"
+                    >
+                      Create Set
+                    </button>
                   </div>
                 ) : null}
               </div>
@@ -3715,13 +3743,15 @@ export function CommunityReelsPanel({
                           </div>
                           <div className="flex items-center">
                             <span className="rounded-full border border-[#2b2b2b] bg-black/45 px-3 py-1 text-[10px] font-semibold uppercase tracking-[0.09em] text-white/72">
-                              {editableSets.length} set{editableSets.length === 1 ? "" : "s"}
+                              {yourSetsQuery.trim()
+                                ? `${filteredEditableSets.length} result${filteredEditableSets.length === 1 ? "" : "s"}`
+                                : `${editableSets.length} set${editableSets.length === 1 ? "" : "s"}`}
                             </span>
                           </div>
                         </div>
-                        {orderedEditableSets.length > 0 ? (
+                        {filteredEditableSets.length > 0 ? (
                           <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-                            {orderedEditableSets.map((set) => {
+                            {filteredEditableSets.map((set) => {
                               const reelCount = getSetReelCount(set);
                               const isStarred = starredSetIdSet.has(set.id);
                               const isDeleting = deletingSetId === set.id;
@@ -3822,6 +3852,10 @@ export function CommunityReelsPanel({
                               );
                             })}
                           </div>
+                        ) : yourSetsQuery.trim() ? (
+                          <p className="mt-4 text-sm text-white/66">
+                            No matching sets. Try a different title, description, or tag.
+                          </p>
                         ) : (
                           <p className="mt-4 text-sm text-white/66">
                             No sets yet. Use Create Set to publish your first one.
