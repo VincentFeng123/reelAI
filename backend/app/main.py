@@ -686,6 +686,8 @@ def _community_verification_debug_mode_enabled() -> bool:
 
 
 def _community_verification_email_is_configured() -> bool:
+    if settings.resend_api_key.strip() and settings.smtp_from_email.strip():
+        return True
     return bool(settings.smtp_host.strip() and settings.smtp_from_email.strip())
 
 
@@ -720,18 +722,34 @@ def _warn_if_hosted_auth_email_is_unconfigured() -> None:
 
 def _send_community_verification_email(*, email: str, username: str, code: str) -> None:
     greeting = f"@{username}" if str(username or "").strip() else "there"
-    message = EmailMessage()
-    message["Subject"] = "Verify your StudyReels account"
-    message["From"] = settings.smtp_from_email.strip()
-    message["To"] = email
-    message.set_content(
-        (
-            f"Hi {greeting},\n\n"
-            f"Your StudyReels verification code is: {code}\n\n"
-            f"This code expires in {COMMUNITY_VERIFICATION_TTL_MINUTES} minutes.\n"
-            "If you did not create this account, you can ignore this email.\n"
-        )
+    subject = "Verify your StudyReels account"
+    body = (
+        f"Hi {greeting},\n\n"
+        f"Your StudyReels verification code is: {code}\n\n"
+        f"This code expires in {COMMUNITY_VERIFICATION_TTL_MINUTES} minutes.\n"
+        "If you did not create this account, you can ignore this email.\n"
     )
+    from_email = settings.smtp_from_email.strip()
+
+    # Use Resend HTTP API if configured (avoids SMTP port blocking on PaaS).
+    resend_api_key = settings.resend_api_key.strip()
+    if resend_api_key:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {resend_api_key}"},
+            json={"from": from_email, "to": [email], "subject": subject, "text": body},
+            timeout=15,
+        )
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(f"Resend API error {resp.status_code}: {resp.text}")
+        return
+
+    # Fallback: SMTP
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = from_email
+    message["To"] = email
+    message.set_content(body)
 
     smtp_host = settings.smtp_host.strip()
     smtp_port = max(1, int(settings.smtp_port))

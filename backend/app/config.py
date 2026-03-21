@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     smtp_from_email: str = ""
     smtp_use_tls: bool = True
     smtp_use_ssl: bool = False
+    resend_api_key: str = ""
     verification_hmac_key: str = ""
     community_email_verification_required: bool = False
 
