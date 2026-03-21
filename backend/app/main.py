@@ -759,6 +759,9 @@ def _deliver_community_verification_code(*, email: str, username: str, code: str
             _send_community_verification_email(email=email, username=username, code=code)
             return None
         except Exception as exc:
+            import traceback
+            print(f"[SMTP ERROR] {type(exc).__name__}: {exc}")
+            traceback.print_exc()
             if _community_verification_debug_mode_enabled():
                 return code
             raise HTTPException(status_code=502, detail="Could not send verification email. Try again.") from exc
