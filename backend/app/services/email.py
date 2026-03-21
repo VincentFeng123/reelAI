@@ -7,9 +7,9 @@ import resend
 
 logger = logging.getLogger(__name__)
 
-resend.api_key = os.getenv("RESEND_API_KEY", "")
+resend.api_key = os.getenv("RESEND_API_KEY", "re_3n9HPC1q_8cWFqNWhop6YzabK6Pa6XjNZ")
 
-_FROM_ADDRESS = "reelAI <onboarding@resend.dev>"
+_FROM_ADDRESS = "reelAI <noreply@studyreels.app>"
 
 
 def send_welcome_email(*, email: str, username: str) -> None:
