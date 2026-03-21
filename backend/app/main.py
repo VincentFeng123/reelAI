@@ -723,12 +723,66 @@ def _warn_if_hosted_auth_email_is_unconfigured() -> None:
 def _send_community_verification_email(*, email: str, username: str, code: str) -> None:
     greeting = f"@{username}" if str(username or "").strip() else "there"
     subject = "Verify your StudyReels account"
-    body = (
+    text_body = (
         f"Hi {greeting},\n\n"
         f"Your StudyReels verification code is: {code}\n\n"
         f"This code expires in {COMMUNITY_VERIFICATION_TTL_MINUTES} minutes.\n"
         "If you did not create this account, you can ignore this email.\n"
     )
+    # Spaced-out code for readability (e.g. "1 2 3 4 5 6")
+    spaced_code = " ".join(code)
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Verify your account</title>
+</head>
+<body style="margin:0;padding:0;background-color:#0f0f0f;font-family:Arial,Helvetica,sans-serif;color:#f5f5f5;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#0f0f0f;padding:40px 0;">
+    <tr>
+      <td align="center">
+        <table width="600" cellpadding="0" cellspacing="0" style="background-color:#1a1a1a;border-radius:8px;overflow:hidden;max-width:600px;width:100%;">
+          <tr>
+            <td style="padding:40px 48px 32px;">
+              <h1 style="margin:0 0 8px;font-size:28px;font-weight:700;color:#ffffff;">Verify your account</h1>
+              <p style="margin:0 0 24px;font-size:16px;color:#a0a0a0;">Enter this code to continue</p>
+              <p style="margin:0 0 16px;font-size:16px;line-height:1.6;color:#e0e0e0;">
+                Hi {greeting},
+              </p>
+              <p style="margin:0 0 24px;font-size:16px;line-height:1.6;color:#e0e0e0;">
+                Here's your verification code:
+              </p>
+              <table width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px;">
+                <tr>
+                  <td align="center">
+                    <div style="display:inline-block;background-color:#ffffff;border-radius:8px;padding:20px 40px;">
+                      <span style="font-size:36px;font-weight:700;letter-spacing:8px;color:#0f0f0f;font-family:'Courier New',Courier,monospace;">{spaced_code}</span>
+                    </div>
+                  </td>
+                </tr>
+              </table>
+              <p style="margin:0 0 32px;font-size:14px;line-height:1.6;color:#a0a0a0;">
+                This code expires in {COMMUNITY_VERIFICATION_TTL_MINUTES} minutes.
+              </p>
+              <p style="margin:0;font-size:14px;color:#606060;">
+                If you didn't request this code, you can safely ignore this email.
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 48px;border-top:1px solid #2a2a2a;">
+              <p style="margin:0;font-size:13px;color:#606060;">
+                &copy; StudyReels. All rights reserved.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
     from_email = settings.smtp_from_email.strip()
 
     # Use Resend HTTP API if configured (avoids SMTP port blocking on PaaS).
@@ -737,7 +791,7 @@ def _send_community_verification_email(*, email: str, username: str, code: str) 
         resp = requests.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {resend_api_key}"},
-            json={"from": from_email, "to": [email], "subject": subject, "text": body},
+            json={"from": from_email, "to": [email], "subject": subject, "html": html_body, "text": text_body},
             timeout=15,
         )
         if resp.status_code not in (200, 201):
@@ -749,7 +803,8 @@ def _send_community_verification_email(*, email: str, username: str, code: str) 
     message["Subject"] = subject
     message["From"] = from_email
     message["To"] = email
-    message.set_content(body)
+    message.set_content(text_body)
+    message.add_alternative(html_body, subtype="html")
 
     smtp_host = settings.smtp_host.strip()
     smtp_port = max(1, int(settings.smtp_port))
