@@ -4460,18 +4460,6 @@ def send_signup_verification_email(request: Request, payload: CommunitySendSignu
                 verification_code_debug=None,
             )
         owner_key_hash = _community_owner_hash_from_request(request)
-        existing_verification = _load_community_signup_verification(
-            conn,
-            owner_key_hash=owner_key_hash,
-            email_normalized=email_normalized,
-        )
-        if _community_signup_email_is_verified(existing_verification):
-            return CommunitySendSignupVerificationResponse(
-                email=str(existing_verification.get("email") or email).strip() or email,
-                verification_required=True,
-                verified=True,
-                verification_code_debug=None,
-            )
         verification_code_debug = _issue_community_signup_verification_code(
             conn,
             owner_key_hash=owner_key_hash,
