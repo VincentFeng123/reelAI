@@ -757,7 +757,7 @@ def _send_community_verification_email(*, email: str, username: str, code: str) 
                 <tr>
                   <td align="center">
                     <div style="display:inline-block;background-color:#ffffff;border-radius:8px;padding:20px 40px;">
-                      <span style="font-size:36px;font-weight:700;letter-spacing:8px;color:#0f0f0f;font-family:'Courier New',Courier,monospace;">{spaced_code}</span>
+                      <span style="font-size:36px;font-weight:600;letter-spacing:10px;color:#0f0f0f;font-family:Arial,Helvetica,sans-serif;">{spaced_code}</span>
                     </div>
                   </td>
                 </tr>
