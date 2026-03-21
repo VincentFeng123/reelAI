@@ -1,6 +1,6 @@
 "use client";
 
-import { type DragEvent, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type DragEvent, type FormEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
 import { uploadMaterial } from "@/lib/api";
@@ -122,6 +122,7 @@ type UploadPanelProps = {
   onScrollOffsetChange?: (isOffset: boolean) => void;
   onScrollGesture?: () => void;
   onScrollabilityChange?: (isScrollable: boolean) => void;
+  heroTitleRef?: RefObject<HTMLHeadingElement | null>;
 };
 
 function buildMaterialTitle(params: { topic: string; text: string; fileName: string }): string {
@@ -139,7 +140,7 @@ function buildMaterialTitle(params: { topic: string; text: string; fileName: str
   return "New Study Session";
 }
 
-export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollGesture, onScrollabilityChange }: UploadPanelProps) {
+export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollGesture, onScrollabilityChange, heroTitleRef }: UploadPanelProps) {
   const router = useRouter();
   const touchStartYRef = useRef<number | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
@@ -372,16 +373,29 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         const isScrollable = event.currentTarget.scrollHeight - event.currentTarget.clientHeight > 1;
         onScrollOffsetChange?.(isScrollable && event.currentTarget.scrollTop > 0);
       }}
-      className="flex h-full w-full flex-col justify-center overflow-x-visible overflow-y-auto px-6 py-6 md:overflow-hidden md:px-10 md:py-8 lg:px-5"
+      className="mx-auto flex h-full w-full flex-col justify-center overflow-x-visible overflow-y-auto px-6 py-6 md:overflow-x-visible md:overflow-y-hidden md:px-10 md:py-8 lg:max-w-[1040px] lg:px-5"
     >
-      <header className="relative mb-4 text-center">
+      <header className="relative mb-4 overflow-visible text-center">
         <img
           src="/logo.png"
           alt="StudyReels logo"
           className="relative z-20 mx-auto hidden h-4 w-[4.75rem] max-w-[26vw] translate-y-16 object-cover opacity-70 md:block"
         />
         <div className="mt-8 md:mt-20">
-          <h1 className="relative z-[1] text-[clamp(3.2rem,12vw,8.25rem)] font-black leading-[0.9] tracking-tight text-[#e8e6fc]/30">Study Reels</h1>
+          <h1
+            ref={heroTitleRef}
+            className="relative z-[1] inline-block overflow-visible px-[0.12em] py-[0.12em] text-[clamp(2.9rem,10.4vw,7.7rem)] font-black leading-[0.96] tracking-tight"
+          >
+            <span
+              aria-hidden="true"
+              className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 whitespace-nowrap px-[0.04em] py-[0.08em] text-white/30 blur-[12px] opacity-45"
+            >
+              Study Reels
+            </span>
+            <span className="relative whitespace-nowrap text-white/[0.56] [text-shadow:0_0_18px_rgba(255,255,255,0.08),0_0_44px_rgba(255,255,255,0.03)]">
+              Study Reels
+            </span>
+          </h1>
           <p className="relative z-20 mt-5 text-sm text-white/68">Pick a mode, add your material, and start your short study feed.</p>
         </div>
       </header>
@@ -396,7 +410,11 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
 
       <div className="relative z-20 mt-8 max-w-[300px] md:mt-2 md:max-w-[390px]">
         <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Input Mode</p>
-        <div role="tablist" aria-label="Select input mode" className="relative grid w-full grid-cols-3 rounded-2xl border border-white/25 bg-black/45 p-1">
+        <div
+          role="tablist"
+          aria-label="Select input mode"
+          className="relative grid w-full grid-cols-3 rounded-2xl border border-white/15 bg-white/[0.08] p-1 backdrop-blur-[18px] backdrop-saturate-150"
+        >
           <span
             aria-hidden="true"
             className="pointer-events-none absolute bottom-1 left-1 top-1 w-[calc((100%-8px)/3)] rounded-xl bg-white transition-transform duration-300 ease-out"
@@ -430,10 +448,10 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
             <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Topics</label>
             <div className="h-full min-h-[160px] md:min-h-[175px] flex flex-col gap-2 overflow-y-auto">
               {topics.map((t, i) => (
-                <div key={i} className="flex items-center gap-3 pr-1">
-                  <div className="w-full rounded-2xl border border-white/30 bg-black/42 backdrop-blur-xl transition focus-within:border-white/65">
+                <div key={i} className="pr-1">
+                  <div className="relative w-full rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 focus-within:bg-white/[0.12]">
                     <input
-                      className="h-12 w-full rounded-2xl border-0 bg-transparent px-4 text-sm text-white outline-none placeholder:text-white/40"
+                      className="h-12 w-full rounded-2xl border-0 bg-transparent px-4 pr-11 text-sm text-white outline-none placeholder:text-white/40"
                       placeholder={i === 0 ? "e.g. linear regression" : "e.g. another topic"}
                       value={t}
                       onChange={(e) => {
@@ -442,17 +460,17 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
                         setTopics(next);
                       }}
                     />
+                    {topics.length > 1 ? (
+                      <button
+                        type="button"
+                        onClick={() => setTopics(topics.filter((_, j) => j !== i))}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-white/60 transition-colors duration-200 hover:text-white"
+                        aria-label="Remove topic"
+                      >
+                        <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
+                      </button>
+                    ) : null}
                   </div>
-                  {topics.length > 1 ? (
-                    <button
-                      type="button"
-                      onClick={() => setTopics(topics.filter((_, j) => j !== i))}
-                      className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-white/25 bg-black/40 text-white/80 backdrop-blur-xl transition hover:bg-black/55 hover:text-white"
-                      aria-label="Remove topic"
-                    >
-                      <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
-                    </button>
-                  ) : null}
                 </div>
               ))}
               <button
@@ -470,7 +488,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         {inputMode === "source" ? (
           <>
             <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Text</label>
-            <div className="h-full rounded-2xl border border-white/30 bg-black/42 backdrop-blur-xl transition focus-within:border-white/65">
+            <div className="h-full rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 focus-within:bg-white/[0.12]">
               <textarea
                 className="h-full min-h-[160px] w-full resize-none overflow-y-auto rounded-2xl border-0 bg-transparent p-5 text-sm leading-relaxed text-white outline-none placeholder:text-white/40 md:min-h-[175px]"
                 placeholder="Paste notes, textbook text, or any material here..."
@@ -492,11 +510,11 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
               }}
               onDragLeave={() => setIsDraggingFile(false)}
               onDrop={onFileDrop}
-              className={`flex h-full min-h-[160px] w-full cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed bg-black/42 p-6 text-center text-white outline-none backdrop-blur-xl transition md:min-h-[175px] ${
-                isDraggingFile ? "border-white/70 bg-black/52" : "border-white/30"
+              className={`flex h-full min-h-[160px] w-full cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed bg-white/[0.08] p-6 text-center text-white outline-none backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 md:min-h-[175px] ${
+                isDraggingFile ? "border-white/30 bg-white/[0.12]" : "border-white/15"
               }`}
             >
-              <span className="grid h-12 w-12 place-items-center rounded-full border border-white/25 bg-black/45 text-white/85">
+              <span className="grid h-12 w-12 place-items-center rounded-full border border-white/15 bg-white/[0.08] text-white/85 backdrop-blur-[18px] backdrop-saturate-150">
                 <i className="fa-solid fa-arrow-up-from-bracket text-base" aria-hidden="true" />
               </span>
               <p className={`mt-4 max-w-[90%] truncate text-sm font-semibold ${selectedFileName ? "text-white" : "text-white/85"}`}>
@@ -513,7 +531,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
           <div className="w-full md:max-w-[220px]">
             <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Generation Speed</label>
-            <div className="relative grid h-12 grid-cols-2 items-center rounded-2xl border border-white/25 bg-black/45 p-1">
+            <div className="relative grid h-12 grid-cols-2 items-center rounded-2xl border border-white/15 bg-white/[0.08] p-1 backdrop-blur-[18px] backdrop-saturate-150">
               <span
                 aria-hidden="true"
                 className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%-4px)] rounded-xl bg-white transition-transform duration-300 ease-out ${

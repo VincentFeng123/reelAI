@@ -465,10 +465,10 @@ textarea:-webkit-autofill:focus {
 
 .volumetric-light-canvas {
   position: fixed;
-  top: 0;
+  top: -30%;
   right: 0;
   width: 100%;
-  height: 100%;
+  height: 130%;
   opacity: 0.96;
   overflow: hidden;
   isolation: isolate;

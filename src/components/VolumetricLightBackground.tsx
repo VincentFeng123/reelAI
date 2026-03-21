@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { type RefObject, useEffect, useRef } from "react";
 
 const VERTEX_SHADER = `#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
@@ -25,12 +25,20 @@ precision mediump float;
 
 varying vec2 vUv;
 uniform float uTime;
+uniform float uTimeScale;
 uniform vec2 uResolution;
 uniform float uLogoScale;
 uniform vec2 uOffset;
+uniform float uAmbientFlow;
+uniform float uLuminanceBoost;
 uniform sampler2D uNoiseTexture;
 uniform sampler2D uLogoTexture;
 uniform sampler2D uTrailTexture;
+uniform sampler2D uTitleMaskTexture;
+uniform vec4 uTitleBounds;
+uniform vec2 uFlowDirection;
+
+#define EFFECT_TIME (uTime * uTimeScale)
 
 //Star brightness
 #define STAR 5.0
@@ -71,6 +79,12 @@ uniform sampler2D uTrailTexture;
 // Trail strength (0.0 = no trail, 1.0 = full strength)
 #define TRAIL_STRENGTH 0.4
 
+// Title-driven airflow tuning
+#define TITLE_DRAG_STRENGTH 0.11
+#define TITLE_CURL_STRENGTH 0.16
+#define TITLE_WAKE_STRENGTH 0.18
+#define TITLE_SHADOW 0.08
+
 // Dither intensity
 #define DITHER 0.01
 // Dither texture resolution
@@ -88,13 +102,75 @@ vec2 turbulence(vec2 p, float freq, float num) {
     for (float i = 0.0; i < STAR_NUM; i++) {
         if (i >= num) break;
 
-        vec2 pos = p + turb + STAR_SPEED * i * uTime * STAR_VEL;
-        float phase = freq * (pos * rot).y + STAR_SPEED * uTime * freq;
+        vec2 pos = p + turb + STAR_SPEED * i * EFFECT_TIME * STAR_VEL;
+        float phase = freq * (pos * rot).y + STAR_SPEED * EFFECT_TIME * freq;
         turb += rot[0] * sin(phase) / freq;
         rot *= mat2(0.6, -0.8, 0.8, 0.6);
         freq *= STAR_EXP;
     }
     return turb;
+}
+
+vec2 titleBoundsSize() {
+    return max(uTitleBounds.zw - uTitleBounds.xy, vec2(0.0001));
+}
+
+float sampleTitleMask(vec2 uv) {
+    vec2 boundsSize = uTitleBounds.zw - uTitleBounds.xy;
+    if (boundsSize.x <= 0.0 || boundsSize.y <= 0.0) {
+        return 0.0;
+    }
+
+    vec2 maskUv = (uv - uTitleBounds.xy) / boundsSize;
+    if (maskUv.x < 0.0 || maskUv.x > 1.0 || maskUv.y < 0.0 || maskUv.y > 1.0) {
+        return 0.0;
+    }
+    return texture2D(uTitleMaskTexture, maskUv).a;
+}
+
+vec2 sampleTitleGradient(vec2 uv) {
+    vec2 texel = 1.0 / max(titleBoundsSize() * uResolution, vec2(1.0));
+    float left = sampleTitleMask(uv - vec2(texel.x, 0.0));
+    float right = sampleTitleMask(uv + vec2(texel.x, 0.0));
+    float down = sampleTitleMask(uv - vec2(0.0, texel.y));
+    float up = sampleTitleMask(uv + vec2(0.0, texel.y));
+    return 0.5 * vec2(right - left, up - down);
+}
+
+float sampleTitleWake(vec2 uv, vec2 flowDir) {
+    float wakeNear = sampleTitleMask(uv - flowDir * 0.012);
+    float wakeMid = sampleTitleMask(uv - flowDir * 0.030);
+    float wakeFar = sampleTitleMask(uv - flowDir * 0.065);
+    return 0.55 * wakeNear + 0.30 * wakeMid + 0.15 * wakeFar;
+}
+
+float sampleTitleEnvelope(vec2 uv, vec2 flowDir) {
+    vec2 size = uTitleBounds.zw - uTitleBounds.xy;
+    if (size.x <= 0.0 || size.y <= 0.0) {
+        return 0.0;
+    }
+    vec2 center = 0.5 * (uTitleBounds.xy + uTitleBounds.zw);
+    vec2 flowPerp = vec2(-flowDir.y, flowDir.x);
+    vec2 local = uv - center;
+    vec2 halfSize = 0.5 * size;
+    float along = dot(local, flowDir) / max(halfSize.x + 0.07, 0.0001);
+    float across = dot(local, flowPerp) / max(halfSize.y + 0.09, 0.0001);
+    return exp(-1.8 * along * along - 2.8 * across * across);
+}
+
+float sampleTitleFrontField(vec2 uv, vec2 flowDir) {
+    vec2 size = uTitleBounds.zw - uTitleBounds.xy;
+    if (size.x <= 0.0 || size.y <= 0.0) {
+        return 0.0;
+    }
+    vec2 center = 0.5 * (uTitleBounds.xy + uTitleBounds.zw);
+    vec2 flowPerp = vec2(-flowDir.y, flowDir.x);
+    vec2 halfSize = 0.5 * size;
+    vec2 frontCenter = center - flowDir * (halfSize.x * 0.95 + 0.025);
+    vec2 local = uv - frontCenter;
+    float along = dot(local, flowDir) / max(halfSize.x * 0.65 + 0.04, 0.0001);
+    float across = dot(local, flowPerp) / max(halfSize.y * 1.5 + 0.06, 0.0001);
+    return exp(-5.5 * along * along - 2.4 * across * across);
 }
 
 // Star background
@@ -113,7 +189,7 @@ vec3 star(inout vec2 p) {
     right.x *= STAR_STRETCH * uResolution.x / uResolution.y;
     // Apply turbulence
     // Variable turbulence intensity
-    float factor = 1.0 + 0.4 * sin(9.0 * suv.y) * sin(5.0 * (suv.x + 5.0 * uTime * STAR_SPEED));
+    float factor = 1.0 + 0.4 * sin(9.0 * suv.y) * sin(5.0 * (suv.x + 5.0 * EFFECT_TIME * STAR_SPEED));
     vec2 turb = right + factor * STAR_AMP * turbulence(right, STAR_FREQ, STAR_NUM);
     // Shift top and bottom edges
     turb.x -= STAR_CURVE * suv.y * suv.y;
@@ -123,7 +199,7 @@ vec3 star(inout vec2 p) {
     float atten = fade * max(0.5 * turb.x, -turb.x);
 
     // Flare time
-    float ft = 0.4 * uTime;
+    float ft = 0.4 * EFFECT_TIME;
     // Flare position
     vec2 fp = 8.0 * (turb + 0.5 * STAR_VEL * ft);
     fp *= mat2(0.4, -0.3, 0.3, 0.4);
@@ -139,9 +215,9 @@ vec3 star(inout vec2 p) {
     const vec3 chrom = vec3(0.0, 0.1, 0.2);
     // Color rays
     col *= exp(p.x *
-                cos(turb.y * 5.0 + 0.4 * (uTime + turb.x * 1.0) + chrom) *
-                cos(turb.y * 7.0 - 0.5 * (uTime - turb.x * 1.5) + chrom) *
-                cos(turb.y * 9.0 + 0.6 * (uTime + turb.x * 2.0) + chrom)
+                cos(turb.y * 5.0 + 0.4 * (EFFECT_TIME + turb.x * 1.0) + chrom) *
+                cos(turb.y * 7.0 - 0.5 * (EFFECT_TIME - turb.x * 1.5) + chrom) *
+                cos(turb.y * 9.0 + 0.6 * (EFFECT_TIME + turb.x * 2.0) + chrom)
         );
 
     return col;
@@ -160,6 +236,20 @@ void main() {
 
     // Signed screen uvs [-1, +1]
     vec2 suv = vUv * 2.0 - 1.0;
+    vec2 flowDir = normalize(uFlowDirection + vec2(0.00001, 0.0));
+    vec2 flowPerp = vec2(-flowDir.y, flowDir.x);
+    vec2 titleCenter = 0.5 * (uTitleBounds.xy + uTitleBounds.zw);
+    float titleMask = sampleTitleMask(vUv);
+    vec2 titleGrad = sampleTitleGradient(vUv);
+    float titleEdge = clamp(length(titleGrad) * 6.0, 0.0, 1.0);
+    vec2 titleNormal = length(titleGrad) > 0.00001 ? normalize(titleGrad) : vec2(0.0);
+    float titleEnvelope = sampleTitleEnvelope(vUv, flowDir);
+    float titleAhead = sampleTitleFrontField(vUv, flowDir) * (1.0 - titleMask);
+    float titleWake = sampleTitleWake(vUv, flowDir) * (1.0 - titleMask);
+    float sideSign = dot(vUv - titleCenter, flowPerp) >= 0.0 ? 1.0 : -1.0;
+    vec2 splitCurl = flowPerp * sideSign * (0.95 * titleAhead + 0.35 * titleEnvelope + 0.45 * titleEdge) * (1.0 - titleMask);
+    vec2 titleDeflect = titleNormal - flowDir * max(dot(titleNormal, flowDir), 0.0);
+    float obstacle = smoothstep(0.08, 0.45, titleMask);
 
     // Compute logo scale (aspect ratio corrected)
     vec2 scale = max(uLogoScale, 1.0 - (LOGO_RATIO / 4.0)) * ratio * vec2(LOGO_RATIO, -1.0);
@@ -213,12 +303,19 @@ void main() {
         distort += dir * logo.b * (1.0 - logo.b);
     }
 
+    distort += TITLE_CURL_STRENGTH * splitCurl * ratio;
+    distort += TITLE_DRAG_STRENGTH * (titleEdge + 0.35 * titleEnvelope + 0.45 * titleWake + 0.7 * titleAhead) * titleDeflect * ratio;
+    distort += 0.03 * titleWake * flowDir * ratio;
+
     // Star
     vec2 starUv = vUv + distort;
     // Add trail distortion
     starUv += 0.3 * (trailTex.rg - 0.5) * trailTex.b * ratio;
+    starUv += 0.14 * splitCurl * ratio;
+    starUv += 0.06 * titleWake * flowDir * ratio;
     // Get star color
     vec3 col = star(starUv);
+    col += 0.22 * uAmbientFlow * vec3(0.34, 0.46, 0.95) * pow(clamp(trailTex.a, 0.0, 1.0), 1.2);
 
     // Vertical vignette
     float vig = 1.0 - abs(suv.y);
@@ -250,6 +347,13 @@ void main() {
     col += (1.0 - col) * rim * rim;
     // Add trail
     col += TRAIL_STRENGTH * hue * pow(trailTex.aaa, TRAIL_EXP);
+    // Add title airflow wake
+    col += TITLE_WAKE_STRENGTH * hue * pow(titleWake, 1.6) * (0.25 + 0.75 * trailTex.a);
+    col += 0.035 * hue * pow(titleEnvelope * (1.0 - obstacle), 2.2);
+    col *= mix(1.0, uLuminanceBoost, clamp(0.35 + 0.85 * trailTex.a, 0.0, 1.0));
+    col = min(col, vec3(1.0));
+    // Subtle attenuation inside the title obstacle so the wake reads around it
+    col *= 1.0 - TITLE_SHADOW * obstacle;
     // Logo mask
     float a = smoothstep(1.0, 0.2, logo.a);
     col.rgb = a * col.rgb + (1.0 - a);
@@ -269,14 +373,21 @@ precision mediump float;
 
 varying vec2 vUv;
 uniform float uTime;
+uniform float uTimeScale;
 uniform float uDeltaTime;
 uniform float uLogoScale;
 uniform vec2 uMouse;
 uniform vec2 uMouseVelocity;
 uniform vec2 uResolution;
+uniform float uAmbientFlow;
 uniform sampler2D uNoiseTexture;
 uniform sampler2D uPreviousFrame;
 uniform sampler2D uLogoTexture;
+uniform sampler2D uTitleMaskTexture;
+uniform vec4 uTitleBounds;
+uniform vec2 uFlowDirection;
+
+#define EFFECT_TIME (uTime * uTimeScale)
 
 // Trail falloff (higher = narrower)
 #define TRAIL_FALLOFF 9000.0
@@ -307,18 +418,87 @@ uniform sampler2D uLogoTexture;
 #define TURB_FREQ 50.0
 #define TURB_EXP 1.3
 
+// Title-driven airflow tuning
+#define TITLE_FLOW_SPEED 0.0009
+#define TITLE_DEFLECT_STRENGTH 0.06
+#define TITLE_CURL_STRENGTH 0.12
+#define TITLE_WAKE_STRENGTH 0.34
+#define TITLE_INTERIOR_DAMPING 0.82
+
 vec2 turbulence(vec2 p) {
     mat2 rot = mat2(0.6, -0.8, 0.8, 0.6);
     vec2 turb = vec2(0.0);
     float freq = TURB_FREQ;
     for (float i = 0.0; i < TURB_NUM; i++) {
-        vec2 pos = p + TURB_SPEED * i * uTime * TURB_VEL;
-        float phase = freq * (pos * rot).y + TURB_SPEED * uTime * freq * 0.1;
+        vec2 pos = p + TURB_SPEED * i * EFFECT_TIME * TURB_VEL;
+        float phase = freq * (pos * rot).y + TURB_SPEED * EFFECT_TIME * freq * 0.1;
         turb += rot[0] * sin(phase) / freq;
         rot *= mat2(0.6, -0.8, 0.8, 0.6);
         freq *= TURB_EXP;
     }
     return turb;
+}
+
+vec2 titleBoundsSize() {
+    return max(uTitleBounds.zw - uTitleBounds.xy, vec2(0.0001));
+}
+
+float sampleTitleMask(vec2 uv) {
+    vec2 boundsSize = uTitleBounds.zw - uTitleBounds.xy;
+    if (boundsSize.x <= 0.0 || boundsSize.y <= 0.0) {
+        return 0.0;
+    }
+
+    vec2 maskUv = (uv - uTitleBounds.xy) / boundsSize;
+    if (maskUv.x < 0.0 || maskUv.x > 1.0 || maskUv.y < 0.0 || maskUv.y > 1.0) {
+        return 0.0;
+    }
+    return texture2D(uTitleMaskTexture, maskUv).a;
+}
+
+vec2 sampleTitleGradient(vec2 uv) {
+    vec2 texel = 1.0 / max(titleBoundsSize() * uResolution, vec2(1.0));
+    float left = sampleTitleMask(uv - vec2(texel.x, 0.0));
+    float right = sampleTitleMask(uv + vec2(texel.x, 0.0));
+    float down = sampleTitleMask(uv - vec2(0.0, texel.y));
+    float up = sampleTitleMask(uv + vec2(0.0, texel.y));
+    return 0.5 * vec2(right - left, up - down);
+}
+
+float sampleTitleWake(vec2 uv, vec2 flowDir) {
+    float wakeNear = sampleTitleMask(uv - flowDir * 0.012);
+    float wakeMid = sampleTitleMask(uv - flowDir * 0.030);
+    float wakeFar = sampleTitleMask(uv - flowDir * 0.065);
+    return 0.55 * wakeNear + 0.30 * wakeMid + 0.15 * wakeFar;
+}
+
+float sampleTitleEnvelope(vec2 uv, vec2 flowDir) {
+    vec2 size = uTitleBounds.zw - uTitleBounds.xy;
+    if (size.x <= 0.0 || size.y <= 0.0) {
+        return 0.0;
+    }
+    vec2 center = 0.5 * (uTitleBounds.xy + uTitleBounds.zw);
+    vec2 flowPerp = vec2(-flowDir.y, flowDir.x);
+    vec2 local = uv - center;
+    vec2 halfSize = 0.5 * size;
+    float along = dot(local, flowDir) / max(halfSize.x + 0.07, 0.0001);
+    float across = dot(local, flowPerp) / max(halfSize.y + 0.09, 0.0001);
+    return exp(-1.8 * along * along - 2.8 * across * across);
+}
+
+float sampleTitleFrontField(vec2 uv, vec2 flowDir) {
+    vec2 size = uTitleBounds.zw - uTitleBounds.xy;
+    if (size.x <= 0.0 || size.y <= 0.0) {
+        return 0.0;
+    }
+    vec2 center = 0.5 * (uTitleBounds.xy + uTitleBounds.zw);
+    vec2 flowPerp = vec2(-flowDir.y, flowDir.x);
+    vec2 halfSize = 0.5 * size;
+    vec2 frontCenter = center - flowDir * (halfSize.x * 0.95 + 0.025);
+    vec2 local = uv - frontCenter;
+    float along = dot(local, flowDir) / max(halfSize.x * 0.65 + 0.04, 0.0001);
+    float across = dot(local, flowPerp) / max(halfSize.y * 1.5 + 0.06, 0.0001);
+    return exp(-5.5 * along * along - 2.4 * across * across);
 }
 
 void main() {
@@ -335,22 +515,42 @@ void main() {
         logo = texture2D(uLogoTexture, logoUV);
     }
 
+    vec2 flowDir = normalize(uFlowDirection + vec2(0.00001, 0.0));
+    vec2 flowPerp = vec2(-flowDir.y, flowDir.x);
+    vec2 titleCenter = 0.5 * (uTitleBounds.xy + uTitleBounds.zw);
+    float titleMask = sampleTitleMask(vUv);
+    vec2 titleGrad = sampleTitleGradient(vUv);
+    float titleEdge = clamp(length(titleGrad) * 6.0, 0.0, 1.0);
+    vec2 titleNormal = length(titleGrad) > 0.00001 ? normalize(titleGrad) : vec2(0.0);
+    float obstacle = smoothstep(0.08, 0.50, titleMask);
+    float titleEnvelope = sampleTitleEnvelope(vUv, flowDir);
+    float titleAhead = sampleTitleFrontField(vUv, flowDir) * (1.0 - obstacle);
+    float titleWake = sampleTitleWake(vUv, flowDir) * (1.0 - obstacle);
+    float sideSign = dot(vUv - titleCenter, flowPerp) >= 0.0 ? 1.0 : -1.0;
+    vec2 splitCurl = flowPerp * sideSign * (1.0 * titleAhead + 0.35 * titleEnvelope + 0.45 * titleEdge) * (1.0 - obstacle);
+    vec2 titleDeflect = titleNormal - flowDir * max(dot(titleNormal, flowDir), 0.0);
+
     // Delta rate
     float delta = 144.0 * uDeltaTime;
     // Scroll velocity
-    vec2 scroll = SCROLL_SPEED * vec2(1.0, vUv.y - 0.5) * ratio;
+    vec2 scroll = (SCROLL_SPEED * vec2(1.0, vUv.y - 0.5) + TITLE_FLOW_SPEED * flowDir) * ratio;
     // Turbulent distortion vector
     vec2 turb = turbulence((vUv + scroll) / ratio);
     // Distortion velocity
     vec2 distort = DISTORT_SPEED * turb;
+    distort += TITLE_CURL_STRENGTH * splitCurl;
+    distort += TITLE_DEFLECT_STRENGTH * (titleEdge + 0.35 * titleEnvelope + 0.5 * titleWake + 0.7 * titleAhead) * titleDeflect;
+    distort += 0.03 * titleWake * flowDir;
     // Add logo twirl and pull
     distort -= LOGO_TWIRL * (logo.rg - 0.6) * mat2(0, -1, 1, 0) * (logo.g - 0.5) * logo.b;
     distort -= LOGO_PULL * (logo.rg - 0.6) * logo.b * logo.b;
     // Distorted UVs
     vec2 distortedUv = vUv + delta * scroll + delta * distort * ratio;
+    distortedUv += 0.015 * obstacle * titleNormal;
 
     // Sample previous frame with distortion
     vec4 prev = texture2D(uPreviousFrame, distortedUv);
+    prev = mix(prev, vec4(0.5, 0.5, 0.0, 0.0), TITLE_INTERIOR_DAMPING * obstacle);
 
     // Create trail effect based on mouse velocity and position
     // Mouse trail start and end points
@@ -381,7 +581,7 @@ void main() {
     vig *= 0.5 + 0.5 * suv.x;
 
     // Sample noise for dithered falloff
-    vec2 nuv = gl_FragCoord.xy / 64.0 + uTime * vec2(7.1, 9.1);
+    vec2 nuv = gl_FragCoord.xy / 64.0 + EFFECT_TIME * vec2(7.1, 9.1);
     float noise = texture2D(uNoiseTexture, nuv).r;
 
     // Falloff exponents
@@ -390,9 +590,23 @@ void main() {
     fade = exp(-2.0 * fade * uDeltaTime);
     // Mix previous frame with current trail
     vec4 decay = mix(vec4(0.5, 0.5, 0.0, 0.0), prev, fade);
+    decay = mix(decay, prev, 0.12 * titleWake);
 
     //Set output color
     vec4 col = decay;
+
+    float streamBand = 0.5 + 0.5 * sin(12.0 * (vUv.y + 0.16 * EFFECT_TIME) + 7.5 * turb.x);
+    float eddyBand = 0.5 + 0.5 * cos(9.0 * (vUv.x - 0.12 * EFFECT_TIME) - 8.0 * turb.y);
+    float ambientWake = uAmbientFlow * clamp(0.58 * streamBand + 0.42 * eddyBand, 0.0, 1.0);
+    vec2 ambientVel = normalize(flowDir + 0.95 * flowPerp * sin(6.0 * (vUv.y + 0.18 * EFFECT_TIME) + 11.0 * turb.x));
+    col.rg += (0.5 - abs(col.rg - 0.5)) * (0.22 * ambientWake * ambientVel);
+    col.ba += ambientWake * (1.0 - col.ba) * vec2(0.24, 0.14);
+
+    vec2 wakeVel = 0.15 * flowDir + 0.35 * titleDeflect + 1.0 * splitCurl;
+    float wakeField = titleWake + 0.75 * titleAhead + 0.35 * titleEnvelope;
+    col.rg += (0.5 - abs(col.rg - 0.5)) * (TITLE_WAKE_STRENGTH * wakeField * wakeVel);
+    col.ba += wakeField * (1.0 - col.ba) * vec2(0.55, 0.42);
+    col = mix(col, vec4(0.5, 0.5, 0.0, 0.0), 0.45 * obstacle);
 
     //Trail velocity
     vec2 vel = (-trailB) / (0.01 + length(trailB));
@@ -417,6 +631,9 @@ type RenderUniforms = {
   noiseTexture: WebGLUniformLocation | null;
   logoTexture: WebGLUniformLocation | null;
   trailTexture: WebGLUniformLocation | null;
+  titleMaskTexture: WebGLUniformLocation | null;
+  titleBounds: WebGLUniformLocation | null;
+  flowDirection: WebGLUniformLocation | null;
 };
 
 type TrailUniforms = {
@@ -429,10 +646,139 @@ type TrailUniforms = {
   noiseTexture: WebGLUniformLocation | null;
   previousFrame: WebGLUniformLocation | null;
   logoTexture: WebGLUniformLocation | null;
+  titleMaskTexture: WebGLUniformLocation | null;
+  titleBounds: WebGLUniformLocation | null;
+  flowDirection: WebGLUniformLocation | null;
 };
+
+type TitleBounds = [number, number, number, number];
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function parseCssPixelValue(value: string): number {
+  const parsed = Number.parseFloat(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function buildCanvasFont(style: CSSStyleDeclaration): string {
+  if (style.font.trim()) {
+    return style.font;
+  }
+  const fontStyle = style.fontStyle || "normal";
+  const fontVariant = style.fontVariant || "normal";
+  const fontWeight = style.fontWeight || "400";
+  const fontSize = style.fontSize || "16px";
+  const lineHeight = style.lineHeight && style.lineHeight !== "normal" ? `/${style.lineHeight}` : "";
+  const fontFamily = style.fontFamily || "sans-serif";
+  return `${fontStyle} ${fontVariant} ${fontWeight} ${fontSize}${lineHeight} ${fontFamily}`;
+}
+
+function measureTrackedText(context: CanvasRenderingContext2D, text: string, letterSpacing: number): number {
+  if (!text) {
+    return 0;
+  }
+  const baseWidth = context.measureText(text).width;
+  return baseWidth + Math.max(0, text.length - 1) * letterSpacing;
+}
+
+function fillTrackedText(context: CanvasRenderingContext2D, text: string, startX: number, baselineY: number, letterSpacing: number) {
+  if (!text) {
+    return;
+  }
+  let x = startX;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    context.fillText(char, x, baselineY);
+    x += context.measureText(char).width + letterSpacing;
+  }
+}
+
+function rasterizeTitleMask(element: HTMLElement): HTMLCanvasElement | null {
+  const text = element.textContent?.trim();
+  const rect = element.getBoundingClientRect();
+  if (!text || rect.width < 2 || rect.height < 2) {
+    return null;
+  }
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+  canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return null;
+  }
+
+  const style = window.getComputedStyle(element);
+  const fontSize = Math.max(parseCssPixelValue(style.fontSize), 1);
+  const letterSpacing = parseCssPixelValue(style.letterSpacing);
+  const textAlign = style.textAlign === "right" || style.textAlign === "end"
+    ? "right"
+    : style.textAlign === "left" || style.textAlign === "start"
+      ? "left"
+      : "center";
+
+  context.scale(dpr, dpr);
+  context.clearRect(0, 0, rect.width, rect.height);
+  context.fillStyle = "#ffffff";
+  context.textBaseline = "alphabetic";
+  context.font = buildCanvasFont(style);
+
+  const trackedWidth = measureTrackedText(context, text, letterSpacing);
+  const metrics = context.measureText(text);
+  const ascent = metrics.actualBoundingBoxAscent || fontSize * 0.8;
+  const descent = metrics.actualBoundingBoxDescent || fontSize * 0.2;
+  const baselineY = (rect.height - (ascent + descent)) * 0.5 + ascent;
+
+  let startX = 0;
+  if (textAlign === "center") {
+    startX = (rect.width - trackedWidth) * 0.5;
+  } else if (textAlign === "right") {
+    startX = rect.width - trackedWidth;
+  }
+
+  fillTrackedText(context, text, startX, baselineY, letterSpacing);
+  return canvas;
+}
+
+function updateTextureFromCanvas(gl: GL, texture: WebGLTexture, source: TexImageSource) {
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function fillTransparentTexture(gl: GL, texture: WebGLTexture, pixel?: Uint8Array) {
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, pixel ?? new Uint8Array([0, 0, 0, 0]));
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function measureTitleBounds(element: HTMLElement, canvas: HTMLCanvasElement): TitleBounds | null {
+  const canvasRect = canvas.getBoundingClientRect();
+  const titleRect = element.getBoundingClientRect();
+  if (canvasRect.width < 1 || canvasRect.height < 1 || titleRect.width < 1 || titleRect.height < 1) {
+    return null;
+  }
+
+  const minX = clamp((titleRect.left - canvasRect.left) / canvasRect.width, 0, 1);
+  const maxX = clamp((titleRect.right - canvasRect.left) / canvasRect.width, 0, 1);
+  const minY = clamp(1 - (titleRect.bottom - canvasRect.top) / canvasRect.height, 0, 1);
+  const maxY = clamp(1 - (titleRect.top - canvasRect.top) / canvasRect.height, 0, 1);
+
+  if (maxX <= minX || maxY <= minY) {
+    return null;
+  }
+
+  return [minX, minY, maxX, maxY];
 }
 
 function createShader(gl: GL, type: number, source: string): WebGLShader | null {
@@ -570,7 +916,11 @@ function loadTexture(gl: GL, path: string, repeat: boolean, maxTextureSize: numb
   });
 }
 
-export function VolumetricLightBackground() {
+type VolumetricLightBackgroundProps = {
+  titleElementRef?: RefObject<HTMLHeadingElement | null>;
+};
+
+export function VolumetricLightBackground({ titleElementRef }: VolumetricLightBackgroundProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -642,6 +992,9 @@ export function VolumetricLightBackground() {
       noiseTexture: gl.getUniformLocation(renderProgram, "uNoiseTexture"),
       logoTexture: gl.getUniformLocation(renderProgram, "uLogoTexture"),
       trailTexture: gl.getUniformLocation(renderProgram, "uTrailTexture"),
+      titleMaskTexture: gl.getUniformLocation(renderProgram, "uTitleMaskTexture"),
+      titleBounds: gl.getUniformLocation(renderProgram, "uTitleBounds"),
+      flowDirection: gl.getUniformLocation(renderProgram, "uFlowDirection"),
     };
 
     const trailUniforms: TrailUniforms = {
@@ -654,6 +1007,9 @@ export function VolumetricLightBackground() {
       noiseTexture: gl.getUniformLocation(trailProgram, "uNoiseTexture"),
       logoTexture: gl.getUniformLocation(trailProgram, "uLogoTexture"),
       previousFrame: gl.getUniformLocation(trailProgram, "uPreviousFrame"),
+      titleMaskTexture: gl.getUniformLocation(trailProgram, "uTitleMaskTexture"),
+      titleBounds: gl.getUniformLocation(trailProgram, "uTitleBounds"),
+      flowDirection: gl.getUniformLocation(trailProgram, "uFlowDirection"),
     };
 
     const setUniform1f = (location: WebGLUniformLocation | null, value: number) => {
@@ -674,6 +1030,12 @@ export function VolumetricLightBackground() {
       }
     };
 
+    const setUniform4f = (location: WebGLUniformLocation | null, x: number, y: number, z: number, w: number) => {
+      if (location !== null) {
+        gl.uniform4f(location, x, y, z, w);
+      }
+    };
+
     let trailTextures: [WebGLTexture, WebGLTexture] | null = null;
     let trailFramebuffers: [WebGLFramebuffer, WebGLFramebuffer] | null = null;
     let pingPongIndex = 0;
@@ -683,10 +1045,11 @@ export function VolumetricLightBackground() {
 
     let noiseTexture: WebGLTexture | null = null;
     let logoTexture: WebGLTexture | null = null;
-    let currentLogoPath = "";
+    let titleMaskTexture: WebGLTexture | null = null;
 
     let disposed = false;
     let rafId = 0;
+    let titleTextureRafId = 0;
     let lastTime = 0;
     let frameCount = 0;
     let fpsWindowStart = performance.now();
@@ -696,17 +1059,58 @@ export function VolumetricLightBackground() {
 
     const mouse = [0.5, 0.5];
     const mouseSmoothed = [0.5, 0.5];
+    const zeroTitleBounds: TitleBounds = [0, 0, 0, 0];
+    const flowDirection: [number, number] = [1, 0];
 
     const maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE) as number;
+    const getTitleElement = () => titleElementRef?.current ?? null;
 
-    const selectLogoPath = () => {
-      if (canvas.width >= 900) {
-        return "/images/logo.png";
+    const readTitleBounds = (): TitleBounds => {
+      const titleElement = getTitleElement();
+      if (!titleElement) {
+        return zeroTitleBounds;
       }
-      if (canvas.width >= 450) {
-        return "/images/logoHalf.png";
+      return measureTitleBounds(titleElement, canvas) ?? zeroTitleBounds;
+    };
+
+    const applyTitleUniforms = (bounds: TitleBounds) => {
+      gl.useProgram(renderProgram);
+      setUniform4f(renderUniforms.titleBounds, bounds[0], bounds[1], bounds[2], bounds[3]);
+      setUniform2f(renderUniforms.flowDirection, flowDirection[0], flowDirection[1]);
+
+      gl.useProgram(trailProgram);
+      setUniform4f(trailUniforms.titleBounds, bounds[0], bounds[1], bounds[2], bounds[3]);
+      setUniform2f(trailUniforms.flowDirection, flowDirection[0], flowDirection[1]);
+    };
+
+    const refreshTitleMaskTexture = () => {
+      if (!titleMaskTexture) {
+        return;
       }
-      return "/images/logoQuat.png";
+
+      const titleElement = getTitleElement();
+      if (!titleElement) {
+        fillTransparentTexture(gl, titleMaskTexture);
+        return;
+      }
+
+      const maskCanvas = rasterizeTitleMask(titleElement);
+      if (!maskCanvas) {
+        fillTransparentTexture(gl, titleMaskTexture);
+        return;
+      }
+
+      updateTextureFromCanvas(gl, titleMaskTexture, maskCanvas);
+    };
+
+    const scheduleTitleMaskRefresh = () => {
+      if (disposed || titleTextureRafId !== 0) {
+        return;
+      }
+      titleTextureRafId = window.requestAnimationFrame(() => {
+        titleTextureRafId = 0;
+        refreshTitleMaskTexture();
+      });
     };
 
     const applyStaticUniforms = () => {
@@ -719,6 +1123,8 @@ export function VolumetricLightBackground() {
       gl.useProgram(trailProgram);
       setUniform2f(trailUniforms.resolution, canvas.width, canvas.height);
       setUniform1f(trailUniforms.logoScale, 0.5);
+
+      applyTitleUniforms(readTitleBounds());
     };
 
     const ensureTrailTargets = () => {
@@ -758,6 +1164,7 @@ export function VolumetricLightBackground() {
       canvas.height = height;
       ensureTrailTargets();
       applyStaticUniforms();
+      scheduleTitleMaskRefresh();
     };
 
     const toNormalizedMouse = (clientX: number, clientY: number) => {
@@ -831,6 +1238,7 @@ export function VolumetricLightBackground() {
       const mouseVelocity: [number, number] = [mouse[0] - mouseSmoothed[0], mouse[1] - mouseSmoothed[1]];
       mouseSmoothed[0] += mouseVelocity[0];
       mouseSmoothed[1] += mouseVelocity[1];
+      const titleBounds = readTitleBounds();
 
       const nextIndex = (pingPongIndex + 1) % 2;
 
@@ -841,6 +1249,8 @@ export function VolumetricLightBackground() {
       setUniform1f(trailUniforms.deltaTime, deltaTime);
       setUniform2f(trailUniforms.mouse, mouse[0], mouse[1]);
       setUniform2f(trailUniforms.mouseVelocity, mouseVelocity[0], mouseVelocity[1]);
+      setUniform4f(trailUniforms.titleBounds, titleBounds[0], titleBounds[1], titleBounds[2], titleBounds[3]);
+      setUniform2f(trailUniforms.flowDirection, flowDirection[0], flowDirection[1]);
 
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, noiseTexture);
@@ -854,12 +1264,18 @@ export function VolumetricLightBackground() {
       gl.bindTexture(gl.TEXTURE_2D, logoTexture);
       setUniform1i(trailUniforms.logoTexture, 2);
 
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, titleMaskTexture);
+      setUniform1i(trailUniforms.titleMaskTexture, 3);
+
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
       gl.bindFramebuffer(gl.FRAMEBUFFER, null);
       gl.viewport(0, 0, canvas.width, canvas.height);
       gl.useProgram(renderProgram);
       setUniform1f(renderUniforms.time, now * 0.001);
+      setUniform4f(renderUniforms.titleBounds, titleBounds[0], titleBounds[1], titleBounds[2], titleBounds[3]);
+      setUniform2f(renderUniforms.flowDirection, flowDirection[0], flowDirection[1]);
 
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, noiseTexture);
@@ -873,6 +1289,10 @@ export function VolumetricLightBackground() {
       gl.bindTexture(gl.TEXTURE_2D, trailTextures[nextIndex]);
       setUniform1i(renderUniforms.trailTexture, 2);
 
+      gl.activeTexture(gl.TEXTURE3);
+      gl.bindTexture(gl.TEXTURE_2D, titleMaskTexture);
+      setUniform1i(renderUniforms.titleMaskTexture, 3);
+
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       pingPongIndex = nextIndex;
     };
@@ -882,13 +1302,17 @@ export function VolumetricLightBackground() {
     // Create a 1x1 transparent fallback for the logo texture
     const fallbackLogo = gl.createTexture();
     if (fallbackLogo) {
-      gl.bindTexture(gl.TEXTURE_2D, fallbackLogo);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE,
-        new Uint8Array([153, 153, 0, 0])); // neutral direction, zero mask/alpha
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      fillTransparentTexture(gl, fallbackLogo, new Uint8Array([153, 153, 0, 0]));
       ownedTextures.push(fallbackLogo);
       logoTexture = fallbackLogo;
+    }
+
+    const fallbackTitleMask = gl.createTexture();
+    if (fallbackTitleMask) {
+      fillTransparentTexture(gl, fallbackTitleMask);
+      ownedTextures.push(fallbackTitleMask);
+      titleMaskTexture = fallbackTitleMask;
+      scheduleTitleMaskRefresh();
     }
 
     void loadTexture(gl, "/images/noise.png", true, maxTextureSize)
@@ -906,6 +1330,22 @@ export function VolumetricLightBackground() {
         console.error(error);
       });
 
+    const titleElement = getTitleElement();
+    const titleResizeObserver = typeof ResizeObserver !== "undefined" && titleElement
+      ? new ResizeObserver(() => {
+          scheduleTitleMaskRefresh();
+        })
+      : null;
+    if (titleResizeObserver && titleElement) {
+      titleResizeObserver.observe(titleElement);
+    }
+
+    void document.fonts.ready.then(() => {
+      if (!disposed) {
+        scheduleTitleMaskRefresh();
+      }
+    });
+
     window.addEventListener("mousemove", onMouseMove, { passive: true });
     window.addEventListener("touchmove", onTouchMove, { passive: true });
     window.addEventListener("resize", resizeCanvas);
@@ -916,10 +1356,14 @@ export function VolumetricLightBackground() {
     return () => {
       disposed = true;
       window.cancelAnimationFrame(rafId);
+      if (titleTextureRafId !== 0) {
+        window.cancelAnimationFrame(titleTextureRafId);
+      }
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("touchmove", onTouchMove);
       window.removeEventListener("resize", resizeCanvas);
       document.removeEventListener("visibilitychange", onVisibilityChange);
+      titleResizeObserver?.disconnect();
 
       for (const buffer of ownedBuffers) {
         gl.deleteBuffer(buffer);
@@ -934,7 +1378,7 @@ export function VolumetricLightBackground() {
         gl.deleteProgram(program);
       }
     };
-  }, []);
+  }, [titleElementRef]);
 
   return (
     <div ref={containerRef} className="volumetric-light-canvas" aria-hidden="true">

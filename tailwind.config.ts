@@ -13,6 +13,9 @@ const config: Config = {
         sky: "#D9F2F7",
         pop: "#FF6B35",
         mint: "#2EC4B6",
+        zinc: {
+          925: "#111113",
+        },
       },
       keyframes: {
         rise: {

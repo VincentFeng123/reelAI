@@ -44,6 +44,7 @@ const FEED_PROGRESS_STORAGE_KEY = "studyreels-feed-progress";
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const ACTIVE_SIDEBAR_TAB_SESSION_KEY = "studyreels-active-sidebar-tab";
 const ACTIVE_COMMUNITY_SET_ID_SESSION_KEY = "studyreels-active-community-set-id";
+const DESKTOP_SIDEBAR_COLLAPSED_SESSION_KEY = "studyreels-desktop-sidebar-collapsed";
 const MAX_HISTORY_ITEMS = 120;
 const MOBILE_SIDEBAR_CLOSE_MS = 260;
 const TOP_CHROME_GESTURE_WINDOW_MS = 220;
@@ -354,6 +355,7 @@ function HomePageContent() {
   const [activeHistoryPageMenuId, setActiveHistoryPageMenuId] = useState<string | null>(null);
   const [selectedHistoryInfoId, setSelectedHistoryInfoId] = useState<string | null>(null);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [desktopSidebarCollapsed, setDesktopSidebarCollapsed] = useState(false);
   const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>("search");
   const [sidebarTabHydrated, setSidebarTabHydrated] = useState(false);
   const [activeCommunitySetId, setActiveCommunitySetId] = useState<string | null>(null);
@@ -371,6 +373,7 @@ function HomePageContent() {
   const [sidebarInfoTooltip, setSidebarInfoTooltip] = useState<{ text: string; left: number; top: number; visible: boolean; align: "left" | "right" } | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const historyRef = useRef<HistoryItem[]>([]);
+  const searchHeroTitleRef = useRef<HTMLHeadingElement | null>(null);
   const settingsPanelRef = useRef<SettingsPanelHandle | null>(null);
   const communityDraftExitActionsRef = useRef<CommunityDraftExitActions | null>(null);
   const hasProcessedInitialSidebarHydrationRef = useRef(false);
@@ -557,6 +560,13 @@ function HomePageContent() {
   }, [forcedCommunitySetId, forcedSidebarTab]);
 
   useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    setDesktopSidebarCollapsed(window.sessionStorage.getItem(DESKTOP_SIDEBAR_COLLAPSED_SESSION_KEY) === "1");
+  }, []);
+
+  useEffect(() => {
     if (!sidebarTabHydrated) {
       return;
     }
@@ -594,6 +604,13 @@ function HomePageContent() {
     }
     safeStorageRemoveItem(window.sessionStorage, ACTIVE_COMMUNITY_SET_ID_SESSION_KEY);
   }, [activeCommunitySetId, sidebarTabHydrated]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    safeStorageSetItem(window.sessionStorage, DESKTOP_SIDEBAR_COLLAPSED_SESSION_KEY, desktopSidebarCollapsed ? "1" : "0");
+  }, [desktopSidebarCollapsed]);
 
   const historySorted = useMemo(
     () =>
@@ -924,6 +941,14 @@ function HomePageContent() {
     requestSidebarSwitch({ tab: "search", clearHistoryQuery: true });
   }, [requestSidebarSwitch]);
 
+  const toggleDesktopSidebarCollapsed = useCallback(() => {
+    closeHistoryMenus();
+    setAccountMenuOpen(false);
+    clearSidebarInfoTooltipTimers();
+    setSidebarInfoTooltip(null);
+    setDesktopSidebarCollapsed((prev) => !prev);
+  }, [clearSidebarInfoTooltipTimers, closeHistoryMenus]);
+
   const openAccountScreen = useCallback(() => {
     closeHistoryMenus();
     setSelectedHistoryInfoId(null);
@@ -1205,6 +1230,101 @@ function HomePageContent() {
     },
     [requestSidebarSwitch],
   );
+  const sidebarPrimaryActions = [
+    {
+      key: "search",
+      label: "Search",
+      tooltip: "Start a new chat session",
+      iconClassName: "fa-solid fa-magnifying-glass",
+      isActive: visibleSidebarTab === "search",
+      onClick: startNewSearch,
+    },
+    {
+      key: "history",
+      label: "Search History",
+      tooltip: "Browse your saved search sessions",
+      iconClassName: "fa-solid fa-clock-rotate-left",
+      isActive: visibleSidebarTab === "history",
+      onClick: () => switchSidebarTab("history"),
+    },
+    {
+      key: "community",
+      label: "Community Reels",
+      tooltip: "Curated reel sets from the community",
+      iconClassName: "fa-solid fa-users",
+      isActive: visibleSidebarTab === "community",
+      onClick: () => switchSidebarTab("community", { resetCommunityView: true }),
+    },
+    {
+      key: "edit",
+      label: "Your Sets",
+      tooltip: "Create and edit your community sets",
+      iconClassName: "fa-solid fa-pen-to-square",
+      isActive: visibleSidebarTab === "edit" || visibleSidebarTab === "create",
+      onClick: () => switchSidebarTab("edit"),
+    },
+  ] as const;
+  const settingsSidebarAction = {
+    label: "Settings",
+    tooltip: "Open settings",
+    iconClassName: "fa-solid fa-gear",
+    isActive: visibleSidebarTab === "settings",
+    onClick: () => switchSidebarTab("settings"),
+  } as const;
+  const renderSidebarActionButton = (
+    action: {
+      label: string;
+      tooltip: string;
+      iconClassName: string;
+      isActive: boolean;
+      onClick: () => void;
+    },
+    options?: { collapsed?: boolean; className?: string },
+  ) => {
+    const collapsed = options?.collapsed ?? false;
+    const wrapperClassName = options?.className ?? "";
+    return (
+      <div
+        className={`group relative ${wrapperClassName}`.trim()}
+        onMouseEnter={(event) => onSidebarInfoHoverStart(event, action.tooltip)}
+        onMouseLeave={onSidebarInfoHoverEnd}
+      >
+        <button
+          type="button"
+          onClick={action.onClick}
+          aria-label={action.label}
+          className={
+            collapsed
+              ? `grid h-9 w-9 place-items-center rounded-xl bg-transparent transition-colors duration-200 ${
+                action.isActive ? "bg-white text-black" : "text-white/85 hover:bg-white/10 hover:text-white"
+              }`
+              : `h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
+                action.isActive ? "bg-white text-black" : "text-white/85 hover:bg-white/10 hover:text-white"
+              }`
+          }
+        >
+          {collapsed ? (
+            <i
+              className={`${action.iconClassName} text-[11px] ${
+                action.isActive ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+              }`}
+              aria-hidden="true"
+            />
+          ) : (
+            <div className="flex h-full items-center justify-between gap-1.5">
+              <p className="truncate font-semibold leading-none">{action.label}</p>
+              <i
+                className={`${action.iconClassName} text-[11px] ${
+                  action.isActive ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
+                }`}
+                aria-hidden="true"
+              />
+            </div>
+          )}
+        </button>
+      </div>
+    );
+  };
   const openYourSetsFromAccountMenu = useCallback(() => {
     setAccountMenuOpen(false);
     switchSidebarTab("edit");
@@ -1313,7 +1433,9 @@ function HomePageContent() {
   );
   const isCommunityPanel = visibleSidebarTab === "community" || visibleSidebarTab === "create" || visibleSidebarTab === "edit";
   const usesCommunityShell = isCommunityPanel || visibleSidebarTab === "history";
-  const hasCommunityBackdrop = usesCommunityShell || visibleSidebarTab === "settings";
+  const showSearchVolumetricBackground = false;
+  const showSearchCommunityBackdrop = visibleSidebarTab === "search";
+  const hasCommunityBackdrop = usesCommunityShell || visibleSidebarTab === "settings" || showSearchCommunityBackdrop;
   const hideMobileTopControls = isCommunityPanel && communityDetailOpen;
   const [lastCommunityPanelMode, setLastCommunityPanelMode] = useState<"community" | "create" | "edit">("community");
 
@@ -1331,6 +1453,7 @@ function HomePageContent() {
         ? "edit"
         : "community";
   const activeSettingsAvailabilityState = settingsAvailabilityModalSnapshot?.state ?? DEFAULT_SETTINGS_AVAILABILITY_STATE;
+  const desktopSidebarWidthPx = desktopSidebarCollapsed ? 72 : 264;
   const showLoadingScreen = useLoadingScreenGate(sidebarTabHydrated, { minimumVisibleMs: 2000 });
 
   if (showLoadingScreen) {
@@ -1513,7 +1636,7 @@ function HomePageContent() {
           R
         </span>
         <div
-          className="group relative"
+          className="group relative lg:hidden"
           onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Start a new search", "right")}
           onMouseLeave={onSidebarInfoHoverEnd}
         >
@@ -1526,109 +1649,37 @@ function HomePageContent() {
             <span className="translate-x-[0.5px] -translate-y-[0.5px] leading-none">+</span>
           </button>
         </div>
+        <div
+          className="group relative hidden lg:block"
+          onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Collapse sidebar", "right")}
+          onMouseLeave={onSidebarInfoHoverEnd}
+        >
+          <button
+            type="button"
+            onClick={toggleDesktopSidebarCollapsed}
+            aria-label="Collapse sidebar"
+            className="grid h-8 w-8 place-items-center rounded-xl bg-transparent text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
+          >
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="18"
+              height="18"
+              viewBox="0 0 20 20"
+              aria-hidden="true"
+              className="max-md:hidden"
+            >
+              <rect x="3.5" y="4" width="13" height="12" rx="2.25" fill="none" stroke="currentColor" strokeWidth="1.4" />
+              <path d="M8 4.75v10.5" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+            </svg>
+          </button>
+        </div>
       </div>
 
-      <div
-        className="group relative mt-2"
-        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Start a new chat session")}
-        onMouseLeave={onSidebarInfoHoverEnd}
-      >
-        <button
-          type="button"
-          onClick={startNewSearch}
-          className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            visibleSidebarTab === "search" ? "bg-white text-black" : "text-white/85 hover:bg-white/10 hover:text-white"
-          }`}
-        >
-          <div className="flex h-full items-center justify-between gap-1.5">
-            <p className="truncate font-semibold leading-none">Search</p>
-            <i
-              className={`fa-solid fa-magnifying-glass text-[11px] ${
-                visibleSidebarTab === "search" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
-              }`}
-              aria-hidden="true"
-            />
-          </div>
-        </button>
-      </div>
-
-      <div
-        className="group relative mt-1"
-        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Browse your saved search sessions")}
-        onMouseLeave={onSidebarInfoHoverEnd}
-      >
-        <button
-          type="button"
-          onClick={() => switchSidebarTab("history")}
-          className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            visibleSidebarTab === "history" ? "bg-white text-black" : "text-white/85 hover:bg-white/10 hover:text-white"
-          }`}
-        >
-          <div className="flex h-full items-center justify-between gap-1.5">
-            <p className="truncate font-semibold leading-none">Search History</p>
-            <i
-              className={`fa-solid fa-clock-rotate-left text-[11px] ${
-                visibleSidebarTab === "history" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
-              }`}
-              aria-hidden="true"
-            />
-          </div>
-        </button>
-      </div>
-
-      <div
-        className="group relative mt-1"
-        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Curated reel sets from the community")}
-        onMouseLeave={onSidebarInfoHoverEnd}
-      >
-        <button
-          type="button"
-          onClick={() => switchSidebarTab("community", { resetCommunityView: true })}
-          className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            visibleSidebarTab === "community"
-              ? "bg-white text-black"
-              : "text-white/85 hover:bg-white/10 hover:text-white"
-          }`}
-        >
-          <div className="flex h-full items-center justify-between gap-1.5">
-            <p className="truncate font-semibold leading-none">Community Reels</p>
-            <i
-              className={`fa-solid fa-users text-[11px] ${
-                visibleSidebarTab === "community" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
-              }`}
-              aria-hidden="true"
-            />
-          </div>
-        </button>
-      </div>
-
-      <div
-        className="group relative mt-1"
-        onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Create and edit your community sets")}
-        onMouseLeave={onSidebarInfoHoverEnd}
-      >
-        <button
-          type="button"
-          onClick={() => switchSidebarTab("edit")}
-          className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-            visibleSidebarTab === "edit" || visibleSidebarTab === "create"
-              ? "bg-white text-black"
-              : "text-white/85 hover:bg-white/10 hover:text-white"
-          }`}
-        >
-          <div className="flex h-full items-center justify-between gap-1.5">
-            <p className="truncate font-semibold leading-none">Your Sets</p>
-            <i
-              className={`fa-solid fa-pen-to-square text-[11px] ${
-                visibleSidebarTab === "edit" || visibleSidebarTab === "create"
-                  ? "text-black/80"
-                  : "text-white/74 transition-colors duration-200 group-hover:text-white"
-              }`}
-              aria-hidden="true"
-            />
-          </div>
-        </button>
-      </div>
+      {sidebarPrimaryActions.map((action, index) => (
+        <div key={action.key}>
+          {renderSidebarActionButton(action, { className: index === 0 ? "mt-2" : "mt-1" })}
+        </div>
+      ))}
 
       <div className="mt-3 min-h-0 flex-1 overflow-y-auto px-2.5 lg:flex-[0.95]">
         <div className="mb-2 flex items-center justify-between">
@@ -1746,27 +1797,7 @@ function HomePageContent() {
       </div>
 
       <div className="mb-0 mt-auto pt-3 lg:pt-0">
-        <div className="group relative">
-          <button
-            type="button"
-            onClick={() => switchSidebarTab("settings")}
-            className={`h-9 w-full rounded-xl bg-transparent px-2.5 text-left text-xs transition-colors duration-200 ${
-              visibleSidebarTab === "settings"
-                ? "bg-white text-black"
-                : "text-white/85 hover:bg-white/10 hover:text-white"
-            }`}
-          >
-            <div className="flex h-full items-center justify-between gap-1.5">
-              <p className="truncate font-semibold leading-none">Settings</p>
-              <i
-                className={`fa-solid fa-gear text-[11px] ${
-                  visibleSidebarTab === "settings" ? "text-black/80" : "text-white/74 transition-colors duration-200 group-hover:text-white"
-                }`}
-                aria-hidden="true"
-              />
-            </div>
-          </button>
-        </div>
+        {renderSidebarActionButton(settingsSidebarAction)}
         <div
           data-account-actions="true"
           className="group relative mt-1"
@@ -1845,11 +1876,130 @@ function HomePageContent() {
     </div>
   );
 
+  const collapsedDesktopSidebarPanelContent = (
+    <div className="flex h-full min-h-0 flex-col items-center lg:pt-2">
+      <div className="mt-2 flex w-full items-center justify-center lg:mt-0">
+        <div
+          className="group relative"
+          onMouseEnter={(event) => onSidebarInfoHoverStart(event, "Expand sidebar")}
+          onMouseLeave={onSidebarInfoHoverEnd}
+        >
+          <button
+            type="button"
+            onClick={toggleDesktopSidebarCollapsed}
+            aria-label="Expand sidebar"
+            className="relative grid h-8 w-8 place-items-center rounded-xl bg-transparent text-white/90 transition-colors duration-200 hover:bg-white/10 hover:text-white"
+          >
+            <span
+              aria-hidden="true"
+              className="text-xl font-black leading-none tracking-tight text-white/58 transition-[opacity,transform] duration-150 group-hover:scale-90 group-hover:opacity-0"
+            >
+              R
+            </span>
+            <i
+              className="fa-solid fa-chevron-right absolute text-[11px] opacity-0 transition-[opacity,transform] duration-150 group-hover:scale-100 group-hover:opacity-100"
+              aria-hidden="true"
+            />
+          </button>
+        </div>
+      </div>
+
+      <div className="flex min-h-0 w-full flex-1 flex-col">
+        <div className="flex flex-col items-center">
+          {sidebarPrimaryActions.map((action, index) => (
+            <div key={action.key} className={`flex w-full justify-center ${index === 0 ? "mt-2" : "mt-1"}`}>
+              {renderSidebarActionButton(action, { collapsed: true })}
+            </div>
+          ))}
+        </div>
+
+        <div className="mb-0 mt-auto flex w-full flex-col items-center pt-3 lg:pt-0">
+          {renderSidebarActionButton(settingsSidebarAction, { collapsed: true })}
+          <div
+            data-account-actions="true"
+            className="group relative mt-1 flex w-full justify-center"
+            onMouseEnter={(event) => onSidebarInfoHoverStart(
+              event,
+              communityAccount ? `@${communityAccount.username}` : "Login or sign up",
+            )}
+            onMouseLeave={onSidebarInfoHoverEnd}
+          >
+            {communityAccount ? (
+              <div
+                className={`absolute bottom-0 left-full z-30 ml-3 w-44 ${
+                  accountMenuOpen ? "pointer-events-auto" : "pointer-events-none"
+                }`}
+              >
+                <div
+                  role="menu"
+                  className={`overflow-hidden rounded-2xl bg-black p-1.5 shadow-[0_20px_48px_rgba(0,0,0,0.45)] transition duration-180 ${
+                    accountMenuOpen ? "pointer-events-auto translate-y-0 opacity-100" : "pointer-events-none translate-x-1 opacity-0"
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={openAccountScreen}
+                    className="flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                  >
+                    <i className="fa-regular fa-id-badge text-[11px] text-white/75" aria-hidden="true" />
+                    Manage Account
+                  </button>
+                  <button
+                    type="button"
+                    onClick={openYourSetsFromAccountMenu}
+                    className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                  >
+                    <i className="fa-regular fa-folder-open text-[11px] text-white/75" aria-hidden="true" />
+                    Your Sets
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void onAccountMenuSignOut();
+                    }}
+                    className="mt-1 flex w-full items-center gap-2.5 rounded-xl px-3 py-2 text-left text-xs text-white/90 transition hover:bg-white/10"
+                  >
+                    <i className="fa-solid fa-right-from-bracket text-[11px] text-white/75" aria-hidden="true" />
+                    Log Out
+                  </button>
+                </div>
+              </div>
+            ) : null}
+            <button
+              type="button"
+              onClick={() => {
+                if (communityAccount) {
+                  closeHistoryMenus();
+                  setAccountMenuOpen((prev) => !prev);
+                  return;
+                }
+                openAccountScreen();
+              }}
+              aria-label={communityAccount ? `@${communityAccount.username}` : "Login or sign up"}
+              aria-haspopup={communityAccount ? "menu" : undefined}
+              aria-expanded={communityAccount ? accountMenuOpen : undefined}
+              className="grid h-10 w-10 place-items-center rounded-xl bg-transparent text-white/85 transition-colors duration-200 hover:bg-white/10 hover:text-white"
+            >
+              <i
+                className={`text-[12px] ${
+                  communityAccount
+                    ? `fa-solid ${accountMenuOpen ? "fa-chevron-up" : "fa-user"} text-white/74 transition-colors duration-200 group-hover:text-white`
+                    : "fa-solid fa-right-to-bracket text-white/74 transition-colors duration-200 group-hover:text-white"
+                }`}
+                aria-hidden="true"
+              />
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
   return (
     <main onScroll={onMainScroll} className="home-hero-shell fixed inset-0 h-[100dvh] overflow-x-hidden overflow-y-auto lg:overflow-hidden">
-      {visibleSidebarTab === "search" ? (
+      {showSearchVolumetricBackground ? (
         <div className="absolute -top-[28%] -right-[0%] bottom-0 z-[2] w-[100%]">
-          <VolumetricLightBackground />
+          <VolumetricLightBackground titleElementRef={searchHeroTitleRef} />
         </div>
       ) : null}
       {hasCommunityBackdrop ? (
@@ -1950,7 +2100,7 @@ function HomePageContent() {
               }
               closeMobileSidebar();
             }}
-            className={`absolute bottom-4 left-4 top-6 w-[min(24rem,calc(100vw-2rem))] rounded-3xl bg-white/[0.06] px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.32)] backdrop-blur-[26px] backdrop-saturate-150 ${
+            className={`absolute bottom-4 left-4 top-6 w-[min(23rem,calc(100vw-2rem))] rounded-3xl bg-white/[0.06] px-3 pb-3 pt-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.32)] backdrop-blur-[26px] backdrop-saturate-150 ${
               mobileSidebarClosing ? "animate-mobile-sidenav-out" : "animate-mobile-sidenav-in"
             }`}
           >
@@ -1983,9 +2133,36 @@ function HomePageContent() {
         </div>
       ) : null}
 
-      <div className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:mx-0 lg:max-w-none lg:pl-4 lg:grid lg:grid-cols-[280px_minmax(0,1fr)]">
-        <aside className="relative z-20 hidden min-h-0 flex-col rounded-3xl bg-white/[0.06] px-3 pt-3 pb-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.24)] backdrop-blur-[18px] backdrop-saturate-150 lg:mt-6 lg:mb-6 lg:flex lg:w-[280px] lg:justify-self-start lg:px-5 lg:pb-5">
-          {sidebarPanelContent}
+      <div
+        className="relative z-20 mx-auto h-full min-h-0 w-full max-w-[1680px] lg:mx-0 lg:max-w-none lg:pl-4 lg:grid lg:transition-[grid-template-columns] lg:duration-[460ms] lg:ease-[cubic-bezier(0.22,1,0.36,1)]"
+        style={{ gridTemplateColumns: `minmax(0, ${desktopSidebarWidthPx}px) minmax(0, 1fr)` }}
+      >
+        <aside
+          className={`relative z-20 hidden min-h-0 flex-col rounded-3xl bg-white/[0.06] px-3 pt-3 pb-3 text-white shadow-[0_0_40px_rgba(0,0,0,0.24)] backdrop-blur-[18px] backdrop-saturate-150 lg:mt-6 lg:mb-6 lg:flex lg:justify-self-start lg:transition-[width,padding] lg:duration-[460ms] lg:ease-[cubic-bezier(0.22,1,0.36,1)] ${
+            desktopSidebarCollapsed ? "lg:px-3 lg:pb-5" : "lg:px-5 lg:pb-5"
+          }`}
+          style={{ width: `${desktopSidebarWidthPx}px` }}
+        >
+          <div className="relative h-full min-h-0 w-full">
+            <div
+              aria-hidden={desktopSidebarCollapsed}
+              inert={desktopSidebarCollapsed}
+              className={`absolute inset-0 transition-[opacity,transform] duration-[360ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                desktopSidebarCollapsed ? "pointer-events-none -translate-x-5 opacity-0" : "translate-x-0 opacity-100"
+              }`}
+            >
+              {sidebarPanelContent}
+            </div>
+            <div
+              aria-hidden={!desktopSidebarCollapsed}
+              inert={!desktopSidebarCollapsed}
+              className={`absolute inset-0 transition-[opacity,transform] duration-[360ms] ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                desktopSidebarCollapsed ? "translate-x-0 opacity-100" : "pointer-events-none -translate-x-3 opacity-0"
+              }`}
+            >
+              {collapsedDesktopSidebarPanelContent}
+            </div>
+          </div>
         </aside>
 
         <section
@@ -1995,10 +2172,12 @@ function HomePageContent() {
             usesCommunityShell
               ? "lg:mt-2 lg:mb-0"
               : "lg:my-2"
-          } lg:max-w-[1280px] lg:justify-self-center ${
+          } lg:max-w-[1280px] lg:justify-self-center lg:transition-[transform,width,max-width] lg:duration-[460ms] lg:ease-[cubic-bezier(0.22,1,0.36,1)] ${
             usesCommunityShell
-              ? "translate-x-0 md:translate-x-1 lg:translate-x-0 lg:w-[99%]"
-              : "lg:w-[97%]"
+              ? "translate-x-0 md:translate-x-1 lg:translate-x-0"
+              : ""
+          } ${
+            usesCommunityShell ? "lg:w-[99%]" : "lg:w-[97%]"
           }`}
         >
           <div className={visibleSidebarTab === "search" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
@@ -2007,6 +2186,7 @@ function HomePageContent() {
               onScrollOffsetChange={onSearchPanelScrollOffsetChange}
               onScrollGesture={triggerTopChromeGesture}
               onScrollabilityChange={onSearchPanelScrollabilityChange}
+              heroTitleRef={searchHeroTitleRef}
             />
           </div>
           {historyPanelContent}
