@@ -83,7 +83,6 @@ from .models import (
     ReelsGenerateRequest,
     ReelsGenerateResponse,
 )
-from .services.email import send_welcome_email
 from .services.embeddings import EmbeddingService
 from .services.material_intelligence import MaterialIntelligenceService
 from .services.parsers import ParseError, extract_text_from_file
@@ -4537,7 +4536,6 @@ def register_community_account(request: Request, payload: CommunityAuthRegisterR
             "email": email,
             "verified_at": verified_at,
         }
-    send_welcome_email(email=email, username=username)
     return CommunityAuthSessionResponse(
         account=_community_account_out(account),
         session_token=session_token,
