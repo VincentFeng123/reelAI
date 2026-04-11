@@ -5121,6 +5121,197 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual(rows[0]["duration_sec"], 754)
         self.assertEqual(rows[0]["view_count"], 18_000)
 
+    def test_youtube_service_extract_search_data_handles_reel_item_renderer_shorts(self) -> None:
+        """Shorts returned via reelItemRenderer should parse into rows with is_shorts=True."""
+        service = YouTubeService()
+        rows = service._extract_videos_from_search_data(
+            {
+                "contents": [
+                    {
+                        "reelItemRenderer": {
+                            "videoId": "shorts12345",
+                            "headline": {"simpleText": "Quick calc review"},
+                            "accessibility": {
+                                "accessibilityData": {"label": "Quick calc review"}
+                            },
+                            "navigationEndpoint": {
+                                "reelWatchEndpoint": {"videoId": "shorts12345"}
+                            },
+                            "viewCountText": {"simpleText": "250K views"},
+                        }
+                    }
+                ]
+            },
+            max_results=3,
+            video_duration="short",
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "shorts12345")
+        self.assertTrue(rows[0]["is_shorts"])
+        # Shorts without a lengthText get a sensible default so duration
+        # scoring doesn't treat unknown as long-form.
+        self.assertGreater(rows[0]["duration_sec"], 0)
+        self.assertLessEqual(rows[0]["duration_sec"], 60)
+        self.assertEqual(rows[0]["view_count"], 250_000)
+
+    def test_youtube_service_extract_search_data_handles_shorts_lockup_view_model(self) -> None:
+        """
+        The newer shortsLockupViewModel shape (rolled out late 2024) should
+        also parse into rows with is_shorts=True.
+        """
+        service = YouTubeService()
+        rows = service._extract_videos_from_search_data(
+            {
+                "contents": [
+                    {
+                        "shortsLockupViewModel": {
+                            "entityId": "yt-reel-shorts99999",
+                            "onTap": {
+                                "innertubeCommand": {
+                                    "reelWatchEndpoint": {"videoId": "shortsvm001"}
+                                }
+                            },
+                            "overlayMetadata": {
+                                "primaryText": {"content": "Python list comprehension"},
+                                "secondaryText": {"content": "1.2M views"},
+                            },
+                        }
+                    }
+                ]
+            },
+            max_results=3,
+            video_duration="short",
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], "shortsvm001")
+        self.assertEqual(rows[0]["title"], "Python list comprehension")
+        self.assertTrue(rows[0]["is_shorts"])
+        self.assertEqual(rows[0]["view_count"], 1_200_000)
+
+    def test_youtube_service_fetch_search_html_retries_after_captcha_gate(self) -> None:
+        """
+        If YouTube returns a consent / CAPTCHA page on the first UA, the
+        fetch path should detect it, try another UA, and return the clean
+        body. If every attempt returns a gate page, it should return ''.
+        """
+        service = YouTubeService()
+
+        class FakeResponse:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            def raise_for_status(self) -> None:
+                pass
+
+        call_log: list[str] = []
+        clean_html = (
+            "<html><script>var ytInitialData = {"
+            '"responseContext":{},"contents":{"twoColumnSearchResultsRenderer":'
+            '{"primaryContents":{"sectionListRenderer":{"contents":[]}}}}};'
+            "</script></html>"
+        )
+        gate_html = (
+            "<html><title>Before you continue to YouTube</title>"
+            "<body>Please confirm you're not a bot.</body></html>"
+        )
+
+        def fake_session_get(url: str, *, deadline: float | None = None, **kwargs: object) -> FakeResponse:
+            headers = kwargs.get("headers") or {}
+            call_log.append(str((headers or {}).get("User-Agent", "")))
+            # First UA returns the gate, second UA returns clean HTML.
+            if len(call_log) == 1:
+                return FakeResponse(gate_html)
+            return FakeResponse(clean_html)
+
+        service._session_get = fake_session_get  # type: ignore[method-assign]
+        html = service._fetch_search_html("cell biology")
+        self.assertEqual(html, clean_html)
+        self.assertEqual(len(call_log), 2)
+        # The two attempts should use different UA strings.
+        self.assertNotEqual(call_log[0], call_log[1])
+
+    def test_youtube_service_fetch_search_via_innertube_merges_continuation(self) -> None:
+        """
+        The InnerTube primary path should parse the first page, follow the
+        continuation token if the first page was thin, and merge the two
+        into a single deduped row list.
+        """
+        service = YouTubeService()
+        first_page = {
+            "contents": {
+                "twoColumnSearchResultsRenderer": {
+                    "primaryContents": {
+                        "sectionListRenderer": {
+                            "contents": [
+                                {
+                                    "videoRenderer": {
+                                        "videoId": "pagea000001",
+                                        "title": {"runs": [{"text": "First page hit"}]},
+                                        "ownerText": {"runs": [{"text": "Channel A"}]},
+                                        "lengthText": {"simpleText": "5:00"},
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        second_page = {
+            "onResponseReceivedCommands": [
+                {
+                    "appendContinuationItemsAction": {
+                        "continuationItems": [
+                            {
+                                "videoRenderer": {
+                                    "videoId": "pageb000002",
+                                    "title": {"runs": [{"text": "Second page hit"}]},
+                                    "ownerText": {"runs": [{"text": "Channel B"}]},
+                                    "lengthText": {"simpleText": "6:00"},
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        def fake_session_post(url: str, *, deadline: float | None = None, **kwargs: object):  # type: ignore[override]
+            class FakeResponse:
+                def __init__(self, payload: dict[str, object]) -> None:
+                    self._payload = payload
+
+                def raise_for_status(self) -> None:
+                    pass
+
+                def json(self) -> dict[str, object]:
+                    return self._payload
+
+            body = kwargs.get("json") or {}
+            if isinstance(body, dict) and body.get("continuation"):
+                return FakeResponse(second_page)
+            return FakeResponse(first_page)
+
+        service._session_post = fake_session_post  # type: ignore[method-assign]
+
+        # Force the continuation path by monkeypatching the token extractor
+        # so the InnerTube primary path actually follows a continuation.
+        def fake_extract_token(data: dict[str, object] | None) -> str | None:
+            if data is first_page:
+                return "CONTINUATION_TOKEN_1"
+            return None
+
+        service._extract_search_continuation_token = fake_extract_token  # type: ignore[method-assign]
+
+        rows = service._fetch_search_via_innertube(
+            "calculus derivative",
+            max_results=5,
+            video_duration=None,
+        )
+        ids = [row["id"] for row in rows]
+        self.assertIn("pagea000001", ids)
+        self.assertIn("pageb000002", ids)
+
     def test_youtube_service_search_without_data_api_uses_graph_before_external(self) -> None:
         service = YouTubeService()
         graph_calls: list[str] = []

@@ -52,7 +52,11 @@ def parse_iso8601_duration(value: str) -> int:
 
 
 class YouTubeService:
-    SEARCH_CACHE_VERSION = 4
+    # Bump this whenever the scraper's normalization / renderer-handling /
+    # source-field shape changes, so cached rows from an older scraper don't
+    # get served through the new downstream filters. v5: Shorts renderer
+    # support + InnerTube primary path + continuation pagination.
+    SEARCH_CACHE_VERSION = 5
     SEARCH_CACHE_TTL_SEC = 24 * 60 * 60  # 24 hours
     SEARCH_CACHE_EMPTY_TTL_SEC = 15 * 60  # 15 minutes for empty results
     DATA_API_MAX_PAGES = 10
@@ -138,6 +142,50 @@ class YouTubeService:
         "shorts",
     )
 
+    # Rotation pool for User-Agent. YouTube has been sampling requests per-UA
+    # to detect scrapers — rotating across real, currently-shipping Chrome
+    # builds is a cheap way to avoid a sticky single-UA block. All of these
+    # are real desktop strings from Chrome releases in early 2026.
+    _USER_AGENT_POOL: tuple[str, ...] = (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    )
+
+    # The well-known InnerTube web client API key. It's been stable for years
+    # and is what youtube.com itself ships in its bootstrap JS. We still try
+    # to harvest a per-session key from the search HTML when possible (see
+    # `_extract_innertube_config`), but this is a safe fallback so we can
+    # hit the InnerTube API immediately on the first request without any
+    # HTML scraping step.
+    _INNERTUBE_API_KEY_FALLBACK = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+    _INNERTUBE_CLIENT_VERSION_FALLBACK = "2.20250101.00.00"
+    _INNERTUBE_ENDPOINT = "https://www.youtube.com/youtubei/v1/search"
+
+    # Regexes used to detect YouTube's bot-gate / CAPTCHA pages so we can
+    # back off cleanly instead of parsing an empty ytInitialData.
+    _CAPTCHA_MARKERS: tuple[re.Pattern[str], ...] = (
+        re.compile(r"unusual\s+traffic", re.IGNORECASE),
+        re.compile(r"confirm\s+you(?:['’]re|\s+are)\s+not\s+a\s+(?:bot|robot)", re.IGNORECASE),
+        re.compile(r"<title>\s*Before you continue\s*to YouTube", re.IGNORECASE),
+        re.compile(r"consent\.youtube\.com", re.IGNORECASE),
+    )
+
+    # Markers we search for in a YouTube results page to pull `ytInitialData`.
+    # YouTube has shipped multiple inline-assignment variants over the years;
+    # the list is ordered by current prevalence so we find the real one fast.
+    _INITIAL_DATA_MARKERS: tuple[str, ...] = (
+        "var ytInitialData = ",
+        "window[\"ytInitialData\"] = ",
+        'window["ytInitialData"] = ',
+        "ytInitialData = ",
+    )
+
     def __init__(self) -> None:
         settings = get_settings()
         self.api_key = settings.youtube_api_key
@@ -163,15 +211,45 @@ class YouTubeService:
         )
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
+        # Consent cookie bypasses YouTube's EU/GDPR consent wall. Without this,
+        # requests from Railway's EU-routed egress (and any IP geo-mapped to
+        # the EU) get 302'd to consent.youtube.com which returns HTML without
+        # any ytInitialData payload, so our parser silently yields zero rows.
+        # The cookie value is YouTube's well-known "YES, I consent, everything
+        # else default" token that's been stable since 2022.
+        self._session.cookies.set(
+            "CONSENT",
+            "YES+cb.20210328-17-p0.en+FX+000",
+            domain=".youtube.com",
+        )
         self._session.headers.update(
             {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                "User-Agent": self._USER_AGENT_POOL[0],
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,image/apng,*/*;q=0.8"
                 ),
                 "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Site": "none",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-User": "?1",
+                "Sec-Fetch-Dest": "document",
+                "sec-ch-ua": (
+                    '"Not A(Brand";v="99", "Google Chrome";v="132", "Chromium";v="132"'
+                ),
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"macOS"',
             }
         )
+        # Harvested once per process on first HTML fetch (see
+        # _refresh_innertube_config). Falls back to the well-known constants
+        # at the class level when harvesting fails.
+        self._innertube_api_key: str | None = None
+        self._innertube_client_version: str | None = None
+        self._innertube_lock = threading.Lock()
 
     def _session_get(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
         return self._session.get(
@@ -869,13 +947,64 @@ class YouTubeService:
         deadline: float | None,
         retrieval_profile: RetrievalProfile = "deep",
     ) -> list[dict[str, Any]]:
-        if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_html"):
-            return []
-        html = self._fetch_search_html(search_query, deadline=deadline)
-        if not html:
+        if self._deadline_exceeded(deadline):
             return []
 
         rows: list[dict[str, Any]] = []
+
+        # Strategy 1 (fastest, most robust): hit YouTube's InnerTube search
+        # API directly. Returns structured JSON without any HTML scraping,
+        # and the payload shape has been stable for years. We only fall
+        # through to HTML scraping if InnerTube fails entirely (network
+        # error, non-JSON body, zero-row response).
+        if not self._network_backoff_active("youtube_innertube"):
+            innertube_rows = self._fetch_search_via_innertube(
+                search_query,
+                max_results=target_pool,
+                video_duration=video_duration,
+                deadline=deadline,
+            )
+            if innertube_rows:
+                self._annotate_search_rows(
+                    innertube_rows,
+                    search_source=variant_surface,
+                    retrieval_strategy=retrieval_strategy,
+                    retrieval_stage=retrieval_stage,
+                    search_query=search_query,
+                )
+                rows = self._merge_unique_videos(rows, innertube_rows, None)
+                if len(rows) >= target_pool:
+                    return self._finalize_search_rows(
+                        rows,
+                        query=search_query,
+                        max_results=target_pool,
+                        video_duration=video_duration,
+                    )
+
+        # Strategy 2: scrape `youtube.com/results?search_query=...` HTML.
+        # Used as a fallback when InnerTube doesn't return enough rows or is
+        # rate-limited. Still honors the youtube_html network backoff.
+        if self._network_backoff_active("youtube_html"):
+            if rows:
+                return self._finalize_search_rows(
+                    rows,
+                    query=search_query,
+                    max_results=target_pool,
+                    video_duration=video_duration,
+                )
+            return []
+
+        html = self._fetch_search_html(search_query, deadline=deadline)
+        if not html:
+            if rows:
+                return self._finalize_search_rows(
+                    rows,
+                    query=search_query,
+                    max_results=target_pool,
+                    video_duration=video_duration,
+                )
+            return []
+
         initial_data = self._extract_yt_initial_data(html)
         parsed = self._extract_videos_from_search_data(
             initial_data,
@@ -1840,21 +1969,230 @@ class YouTubeService:
             return self._clean_query_text(f"{exact_core} {suffix}")
         return exact_core
 
+    def _looks_like_captcha_html(self, html: str) -> bool:
+        """Detect YouTube's consent / bot-gate / unusual-traffic pages."""
+        if not html:
+            return False
+        sample = html[:4096]
+        return any(pattern.search(sample) for pattern in self._CAPTCHA_MARKERS)
+
+    def _search_page_cache_key(self, search_query: str) -> str:
+        return f"youtube_search_html::{search_query.strip().lower()}"
+
     def _fetch_search_html(self, search_query: str, deadline: float | None = None) -> str:
+        """
+        Fetch the raw `youtube.com/results` HTML for a search query.
+
+        Robustness layers:
+          1. Short-circuit on deadline / network backoff / previously-cached response.
+          2. Try up to three times with different User-Agents, bailing on the
+             first response that contains a parseable `ytInitialData`.
+          3. Detect CAPTCHA / consent-wall HTML and treat it as a failure
+             instead of returning it (downstream parsers would silently yield
+             zero rows).
+          4. Cache the successful HTML body in-memory for 15 min so variant
+             queries hitting the same page don't cause extra network.
+
+        Returns an empty string if every attempt fails.
+        """
         if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_html"):
             return ""
+
+        cache_key = self._search_page_cache_key(search_query)
+        cached = self._cache_get_text(cache_key, ttl_sec=self.WATCH_PAGE_CACHE_TTL_SEC)
+        if cached:
+            return cached
+
+        base_params = {
+            "search_query": search_query,
+            # Force English locale in parsing (`hl=en&gl=US`) so downstream
+            # text parsers (view count, duration, published-at) can rely on
+            # English wording regardless of the request's geo-route.
+            "hl": "en",
+            "gl": "US",
+        }
+
+        last_failure: Exception | None = None
+        for attempt_index, user_agent in enumerate(self._USER_AGENT_POOL[:3]):
+            if self._deadline_exceeded(deadline):
+                break
+            if attempt_index > 0 and self._network_backoff_active("youtube_html"):
+                break
+            try:
+                resp = self._session_get(
+                    "https://www.youtube.com/results",
+                    params=base_params,
+                    deadline=deadline,
+                    headers={"User-Agent": user_agent},
+                )
+                resp.raise_for_status()
+                body = resp.text
+                if self._looks_like_captcha_html(body):
+                    # Don't count a CAPTCHA as a success for backoff purposes;
+                    # it's YouTube telling us to slow down.
+                    last_failure = RuntimeError(
+                        "youtube search returned consent / CAPTCHA gate"
+                    )
+                    continue
+                if not body or "ytInitialData" not in body:
+                    last_failure = RuntimeError(
+                        "youtube search HTML missing ytInitialData"
+                    )
+                    continue
+                self._note_request_success("youtube_html")
+                self._cache_set_text(cache_key, body)
+                # Opportunistically harvest innertube config for future calls.
+                self._refresh_innertube_config(body)
+                return body
+            except requests.RequestException as exc:
+                last_failure = exc
+                self._note_request_failure(exc, scope="youtube_html")
+                # Keep retrying with the next UA; don't bail on the first
+                # transient failure.
+                continue
+
+        if last_failure is not None:
+            logger.debug(
+                "youtube_html fetch failed for %r after %d attempts: %s",
+                search_query,
+                min(3, len(self._USER_AGENT_POOL)),
+                last_failure,
+            )
+        return ""
+
+    def _refresh_innertube_config(self, html: str) -> None:
+        """
+        Pull `INNERTUBE_API_KEY` + `INNERTUBE_CLIENT_VERSION` out of a freshly
+        fetched YouTube HTML page so subsequent InnerTube API calls use the
+        exact keys YouTube's own frontend is currently shipping. Falls back
+        to the class-level constants silently if extraction fails.
+        """
         try:
-            resp = self._session_get(
-                "https://www.youtube.com/results",
-                params={"search_query": search_query},
+            api_key, client_version = self._extract_innertube_config(html)
+        except Exception:
+            return
+        if not api_key and not client_version:
+            return
+        with self._innertube_lock:
+            if api_key:
+                self._innertube_api_key = api_key
+            if client_version:
+                self._innertube_client_version = client_version
+
+    def _current_innertube_config(self) -> tuple[str, str]:
+        with self._innertube_lock:
+            api_key = self._innertube_api_key or self._INNERTUBE_API_KEY_FALLBACK
+            client_version = (
+                self._innertube_client_version or self._INNERTUBE_CLIENT_VERSION_FALLBACK
+            )
+        return api_key, client_version
+
+    def _fetch_search_via_innertube(
+        self,
+        search_query: str,
+        *,
+        max_results: int,
+        video_duration: str | None,
+        deadline: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Call YouTube's InnerTube search API directly (no HTML scraping).
+
+        Much faster and much more robust than scraping `results?search_query=`:
+          * Returns a clean JSON payload that's schema-stable for months.
+          * Doesn't rely on any of `ytInitialData`'s inline-script markers.
+          * Follows continuation tokens trivially so we can pull 100+ results
+            with a couple of extra POSTs if needed.
+
+        Returns a list of video row dicts in the same shape as
+        `_video_row_from_renderer`. Empty list on any failure.
+        """
+        if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_innertube"):
+            return []
+
+        api_key, client_version = self._current_innertube_config()
+        body: dict[str, Any] = {
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": client_version,
+                    "hl": "en",
+                    "gl": "US",
+                    "utcOffsetMinutes": 0,
+                }
+            },
+            "query": search_query,
+        }
+
+        # Map our normalized duration preference to InnerTube's filter param.
+        # Params are opaque base64 blobs in practice, but the EgIQAQ / EgIYAg
+        # / EgIYAw / EgIYBA set is well-known for type=video and duration
+        # filters (short < 4min, medium 4-20min, long > 20min).
+        if video_duration == "short":
+            body["params"] = "EgIYAQ%3D%3D"
+        elif video_duration == "medium":
+            body["params"] = "EgIYAw%3D%3D"
+        elif video_duration == "long":
+            body["params"] = "EgIYAg%3D%3D"
+
+        try:
+            resp = self._session_post(
+                f"{self._INNERTUBE_ENDPOINT}?key={api_key}&prettyPrint=false",
+                json=body,
                 deadline=deadline,
+                headers={
+                    "Content-Type": "application/json",
+                    "Origin": "https://www.youtube.com",
+                    "Referer": "https://www.youtube.com/",
+                    "x-youtube-client-name": "1",
+                    "x-youtube-client-version": client_version,
+                    "User-Agent": self._USER_AGENT_POOL[0],
+                },
             )
             resp.raise_for_status()
-            self._note_request_success("youtube_html")
-            return resp.text
+            data = resp.json()
+            self._note_request_success("youtube_innertube")
         except requests.RequestException as exc:
-            self._note_request_failure(exc, scope="youtube_html")
-            return ""
+            self._note_request_failure(exc, scope="youtube_innertube")
+            return []
+        except ValueError:
+            # Non-JSON body (likely a bot-gate HTML page served through the
+            # API endpoint, which does happen occasionally).
+            return []
+
+        if not isinstance(data, dict):
+            return []
+
+        rows = self._extract_videos_from_search_data(
+            data=data,
+            max_results=max_results,
+            video_duration=video_duration,
+        )
+        if not rows:
+            return []
+
+        # Follow one round of continuation to bulk out the result set if the
+        # first response was thin. Not strictly necessary but it's cheap and
+        # helps for rare topics.
+        if len(rows) < max_results:
+            continuation = self._extract_search_continuation_token(data)
+            if continuation:
+                extra = self._fetch_search_continuation(
+                    continuation,
+                    api_key,
+                    client_version,
+                    deadline=deadline,
+                )
+                if isinstance(extra, dict):
+                    extra_rows = self._extract_videos_from_search_data(
+                        data=extra,
+                        max_results=max_results - len(rows),
+                        video_duration=video_duration,
+                    )
+                    if extra_rows:
+                        rows = self._merge_unique_videos(rows, extra_rows, None)
+
+        return rows[:max_results]
 
     def _fallback_video_row(self, video_id: str) -> dict[str, Any]:
         return {
@@ -2292,8 +2630,25 @@ class YouTubeService:
         return data
 
     def _extract_yt_initial_data(self, html: str) -> dict[str, Any] | None:
-        markers = ["var ytInitialData = ", "ytInitialData = "]
-        for marker in markers:
+        """
+        Pull `ytInitialData` out of a YouTube HTML page.
+
+        Robustness layers:
+          1. Try every known inline-assignment marker. YouTube has shipped
+             `var ytInitialData = ...`, `window["ytInitialData"] = ...`, and
+             plain `ytInitialData = ...` over the years, sometimes multiple
+             variants on the same page.
+          2. Fall back to a regex-based `<script>` body scrape if no marker
+             hits — occasionally YouTube wraps the assignment with an IIFE
+             or splits it across lines in a way that confuses the naive
+             substring match.
+          3. Never raise on malformed JSON — every parse attempt is a best
+             effort and we keep trying the next marker.
+        """
+        if not html:
+            return None
+
+        for marker in self._INITIAL_DATA_MARKERS:
             idx = html.find(marker)
             if idx < 0:
                 continue
@@ -2309,6 +2664,28 @@ class YouTubeService:
                     return loaded
             except json.JSONDecodeError:
                 continue
+
+        # Fallback: search every <script> tag body for a JSON blob that looks
+        # like ytInitialData (has both `responseContext` and `contents` keys
+        # at the top level). This is slower but catches pages where YouTube
+        # has gotten creative with the assignment syntax.
+        for script_body in re.findall(r"<script[^>]*>([\s\S]*?)</script>", html):
+            if "responseContext" not in script_body or "contents" not in script_body:
+                continue
+            match = re.search(r"(\{\"responseContext\"[\s\S]*?)(?:;\s*</script|$)", script_body)
+            if not match:
+                continue
+            candidate = match.group(1)
+            brace_end = self._balanced_json_object(candidate, 0)
+            if not brace_end:
+                continue
+            try:
+                loaded = json.loads(brace_end)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(loaded, dict) and loaded.get("contents"):
+                return loaded
+
         return None
 
     def _balanced_json_object(self, value: str, start_idx: int) -> str | None:
@@ -2336,17 +2713,76 @@ class YouTubeService:
                     return value[start_idx : i + 1]
         return None
 
+    # Every known renderer key that wraps a video in an InnerTube / ytInitialData
+    # response. We yield (kind, renderer_dict) so the row extractor can pick
+    # the right parsing path. "shorts_lockup" and "lockup" are the new
+    # unified viewModel shapes that replaced `reelItemRenderer` for some
+    # surfaces in late 2024 / early 2025.
+    _VIDEO_RENDERER_KEYS: tuple[tuple[str, str], ...] = (
+        ("video", "videoRenderer"),
+        ("video", "compactVideoRenderer"),
+        ("video", "gridVideoRenderer"),
+        ("video", "playlistVideoRenderer"),
+        ("video", "movingThumbnailRenderer"),
+        ("shorts", "reelItemRenderer"),
+        ("shorts_lockup", "shortsLockupViewModel"),
+        ("lockup", "lockupViewModel"),
+    )
+
     def _iter_video_renderers(self, node: Any):
+        """
+        Walk a nested InnerTube response and yield every video-like renderer.
+
+        Backward-compatible: still yields plain renderer dicts so existing
+        callers (including the unit tests on `_extract_videos_from_search_data`)
+        keep working. New code can get the same dicts and route them by
+        shape through `_video_row_from_renderer`.
+        """
         if isinstance(node, dict):
-            for renderer_key in ("videoRenderer", "compactVideoRenderer", "gridVideoRenderer"):
-                video_renderer = node.get(renderer_key)
-                if isinstance(video_renderer, dict):
-                    yield video_renderer
+            for _kind, renderer_key in self._VIDEO_RENDERER_KEYS:
+                renderer = node.get(renderer_key)
+                if isinstance(renderer, dict):
+                    yield renderer
             for child in node.values():
                 yield from self._iter_video_renderers(child)
         elif isinstance(node, list):
             for item in node:
                 yield from self._iter_video_renderers(item)
+
+    def _extract_video_id_from_renderer(self, renderer: dict[str, Any]) -> str:
+        """Find the 11-char video id on any renderer shape we support."""
+        direct = renderer.get("videoId")
+        if isinstance(direct, str) and direct.strip():
+            return direct.strip()
+
+        # shortsLockupViewModel: onTap.innertubeCommand.reelWatchEndpoint.videoId
+        on_tap = renderer.get("onTap")
+        if isinstance(on_tap, dict):
+            inner = on_tap.get("innertubeCommand")
+            if isinstance(inner, dict):
+                reel_endpoint = inner.get("reelWatchEndpoint") or inner.get("watchEndpoint")
+                if isinstance(reel_endpoint, dict):
+                    vid = reel_endpoint.get("videoId")
+                    if isinstance(vid, str) and vid.strip():
+                        return vid.strip()
+
+        # lockupViewModel: contentId (when contentType is VIDEO)
+        content_type = renderer.get("contentType")
+        if isinstance(content_type, str) and "VIDEO" in content_type.upper():
+            content_id = renderer.get("contentId")
+            if isinstance(content_id, str) and content_id.strip():
+                return content_id.strip()
+
+        # Generic nested navigation endpoint fallback
+        nav = renderer.get("navigationEndpoint")
+        if isinstance(nav, dict):
+            watch = nav.get("watchEndpoint") or nav.get("reelWatchEndpoint")
+            if isinstance(watch, dict):
+                vid = watch.get("videoId")
+                if isinstance(vid, str) and vid.strip():
+                    return vid.strip()
+
+        return ""
 
     def _first_run_text(self, runs: Any) -> str:
         if not isinstance(runs, list):
@@ -2427,29 +2863,91 @@ class YouTubeService:
                 return snippet
         return ""
 
+    def _is_shorts_renderer(self, renderer: dict[str, Any]) -> bool:
+        """True if the renderer represents a YouTube Short (vertical < 60s)."""
+        # reelItemRenderer is always a Short.
+        if "reelItemRenderer" in renderer:
+            return True
+        # shortsLockupViewModel — newer unified Shorts shape.
+        if "shortsLockupViewModel" in renderer:
+            return True
+        # Direct shape detection — callers sometimes hand us the inner dict.
+        if renderer.get("navigationEndpoint", {}).get("reelWatchEndpoint"):
+            return True
+        on_tap = renderer.get("onTap") or {}
+        if isinstance(on_tap, dict):
+            inner = on_tap.get("innertubeCommand") or {}
+            if isinstance(inner, dict) and "reelWatchEndpoint" in inner:
+                return True
+        # lockupViewModel with SHORTS contentType.
+        content_type = renderer.get("contentType")
+        if isinstance(content_type, str) and "SHORT" in content_type.upper():
+            return True
+        return False
+
     def _video_row_from_renderer(
         self,
         renderer: dict[str, Any],
         *,
         video_duration: str | None,
     ) -> dict[str, Any] | None:
-        video_id = renderer.get("videoId")
-        if not isinstance(video_id, str) or not video_id.strip():
+        """
+        Normalize any supported renderer shape into a single video-row dict.
+
+        Handles the classic video renderers (videoRenderer, compactVideoRenderer,
+        gridVideoRenderer, playlistVideoRenderer), reelItemRenderer for Shorts,
+        and the newer shortsLockupViewModel / lockupViewModel unified shapes
+        that YouTube started rolling out in late 2024. Returns None if the
+        renderer is missing an id, fails the duration filter, or is a
+        non-video surface (channel, playlist, etc).
+        """
+        video_id = self._extract_video_id_from_renderer(renderer)
+        if not video_id:
             return None
 
-        duration_text = self._text_value(renderer.get("lengthText")) or self._thumbnail_overlay_duration_text(renderer)
+        is_shorts = self._is_shorts_renderer(renderer)
+
+        # Duration extraction is renderer-specific. Shorts renderers don't
+        # carry a `lengthText`, so we default their known-max (60s) and let
+        # the ranking downstream treat them correctly. Classic renderers use
+        # `lengthText` or the overlay-status fallback.
+        duration_text = (
+            self._text_value(renderer.get("lengthText"))
+            or self._thumbnail_overlay_duration_text(renderer)
+        )
         duration_sec = self._parse_duration_text(duration_text)
+        if is_shorts and duration_sec == 0:
+            # YouTube Shorts are capped at 60s. Use 45 as a sensible
+            # midpoint so duration-based scoring doesn't treat unknown as
+            # long-form.
+            duration_sec = 45
+
         if not self._duration_matches(duration_sec, video_duration):
             return None
 
-        title = self._text_value(renderer.get("title")) or "Untitled"
+        # Title on the new viewModel shapes lives under `metadata.lockupMetadataViewModel.title`
+        # or directly under a `headline` field for Shorts. Try the old
+        # `title` field first so classic renderers don't regress.
+        title = (
+            self._text_value(renderer.get("title"))
+            or self._text_value(renderer.get("headline"))
+            or self._extract_lockup_title(renderer)
+            or "Untitled"
+        )
+
         channel = (
             self._text_value(renderer.get("ownerText"))
             or self._text_value(renderer.get("shortBylineText"))
             or self._text_value(renderer.get("longBylineText"))
+            or self._extract_lockup_byline(renderer)
         )
-        view_text = self._text_value(renderer.get("viewCountText")) or self._text_value(renderer.get("shortViewCountText"))
+        view_text = (
+            self._text_value(renderer.get("viewCountText"))
+            or self._text_value(renderer.get("shortViewCountText"))
+            or self._extract_lockup_view_count_text(renderer)
+        )
         published_text = self._text_value(renderer.get("publishedTimeText"))
+
         return {
             "id": video_id,
             "title": title,
@@ -2460,10 +2958,74 @@ class YouTubeService:
             "view_count": self._parse_view_count_text(view_text),
             "published_at": self._parse_published_time_text(published_text),
             "is_creative_commons": False,
+            "is_shorts": is_shorts,
             "seed_video_id": "",
             "seed_channel_id": "",
             "crawl_depth": 0,
         }
+
+    def _extract_lockup_title(self, renderer: dict[str, Any]) -> str:
+        """Pull a title out of a `lockupViewModel` / `shortsLockupViewModel`."""
+        metadata = renderer.get("metadata")
+        if isinstance(metadata, dict):
+            inner = metadata.get("lockupMetadataViewModel") or {}
+            if isinstance(inner, dict):
+                title_node = inner.get("title") or {}
+                if isinstance(title_node, dict):
+                    content = title_node.get("content")
+                    if isinstance(content, str) and content.strip():
+                        return content.strip()
+
+        # shortsLockupViewModel.overlayMetadata.primaryText.content
+        overlay_metadata = renderer.get("overlayMetadata")
+        if isinstance(overlay_metadata, dict):
+            primary = overlay_metadata.get("primaryText") or {}
+            if isinstance(primary, dict):
+                content = primary.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+
+        accessibility = renderer.get("accessibilityText")
+        if isinstance(accessibility, str) and accessibility.strip():
+            return accessibility.strip()
+
+        return ""
+
+    def _extract_lockup_byline(self, renderer: dict[str, Any]) -> str:
+        """Pull a channel/byline out of a lockup viewModel."""
+        metadata = renderer.get("metadata")
+        if isinstance(metadata, dict):
+            inner = metadata.get("lockupMetadataViewModel") or {}
+            if isinstance(inner, dict):
+                rows = inner.get("metadata") or {}
+                if isinstance(rows, dict):
+                    content_metadata = rows.get("contentMetadataViewModel") or {}
+                    if isinstance(content_metadata, dict):
+                        metadata_rows = content_metadata.get("metadataRows") or []
+                        for row in metadata_rows:
+                            if not isinstance(row, dict):
+                                continue
+                            parts = row.get("metadataParts") or []
+                            for part in parts:
+                                if not isinstance(part, dict):
+                                    continue
+                                text = part.get("text") or {}
+                                if isinstance(text, dict):
+                                    content = text.get("content")
+                                    if isinstance(content, str) and content.strip():
+                                        return content.strip()
+        return ""
+
+    def _extract_lockup_view_count_text(self, renderer: dict[str, Any]) -> str:
+        """Pull a view-count string out of a Shorts/lockup viewModel for parsing."""
+        overlay_metadata = renderer.get("overlayMetadata")
+        if isinstance(overlay_metadata, dict):
+            secondary = overlay_metadata.get("secondaryText") or {}
+            if isinstance(secondary, dict):
+                content = secondary.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+        return ""
 
     def _parse_duration_text(self, value: str) -> int:
         if not value:
