@@ -29,6 +29,35 @@ class YouTubeApiRequestError(RuntimeError):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Scraping constants
+# ---------------------------------------------------------------------------
+# A YouTube video ID is always exactly 11 characters, chosen from:
+#   uppercase letters, lowercase letters, digits, "-" and "_"
+# This pattern is the single source of truth. If we ever see something that
+# claims to be a video ID but doesn't match, we reject it — that's a cheap
+# guardrail against YouTube changing its format, against accidentally picking
+# up unrelated junk from the HTML (e.g. a 40-char tracking hash), and against
+# injecting garbage into the rest of the pipeline.
+YOUTUBE_VIDEO_ID_CHARSET = r"[A-Za-z0-9_-]"
+YOUTUBE_VIDEO_ID_PATTERN = rf"{YOUTUBE_VIDEO_ID_CHARSET}{{11}}"
+YOUTUBE_VIDEO_ID_REGEX = re.compile(rf"^{YOUTUBE_VIDEO_ID_PATTERN}$")
+# Used when scanning raw HTML for fallback IDs — the JSON escapes ensure we
+# only match IDs that appear in a proper `"videoId":"xxxxxxxxxxx"` context,
+# not arbitrary 11-char tokens that happen to look like a YouTube ID.
+_VIDEO_ID_IN_JSON_REGEX = re.compile(rf'"videoId"\s*:\s*"({YOUTUBE_VIDEO_ID_PATTERN})"')
+
+
+def _is_valid_youtube_video_id(value: Any) -> bool:
+    """Return True iff *value* is a string matching the YouTube video ID format.
+
+    Centralising this check keeps every caller honest — anywhere we extract a
+    video ID from HTML or JSON, we should filter through this gate before
+    using it as a dict key, inserting it into the DB, or returning it.
+    """
+    return isinstance(value, str) and bool(YOUTUBE_VIDEO_ID_REGEX.match(value))
+
+
 RetrievalProfile = Literal["bootstrap", "deep"]
 GraphProfile = Literal["off", "light", "deep"]
 
@@ -60,19 +89,46 @@ class YouTubeService:
     DATA_API_POOL_CAP = 760
     SEARCH_VARIANTS_LIMIT = 16
     PRIMARY_VARIANT_LIMIT = 3
-    HTML_MAX_PAGES = 6
-    HTML_MAX_PAGES_DEEP = 10
+    # ---- pagination depth (speed vs. recall trade-off) ----
+    # Each page is one extra HTTP roundtrip via the continuation API, so
+    # halving the depth roughly halves the time spent in continuation
+    # fetches. Empirically, pages 1-3 contain nearly all of the results we
+    # end up using after ranking — pages 4-10 are high-latency low-yield.
+    # Reduced from 6 → 3 (fast) and 10 → 6 (deep) for faster generation.
+    HTML_MAX_PAGES = 3
+    HTML_MAX_PAGES_DEEP = 6
     HTML_POOL_MULTIPLIER = 8
     HTML_POOL_CAP = 600
-    SEARCH_SURFACE_WORKERS = 4
-    VIDEO_DETAILS_WORKERS = 3
-    DUCKDUCKGO_PAGE_OFFSETS = (0, 30, 60, 90, 120, 150, 180, 210)
-    BING_FIRST_OFFSETS = (0, 20, 40, 60, 80, 100, 120, 140)
-    REQUEST_TIMEOUT_SEC = 8.0
-    SEARCH_TIME_BUDGET_SEC = 12.0
+    # ---- worker pool sizes ----
+    # These control how many HTTP requests are in flight at once. Bigger
+    # pools = faster for multi-query batches, but too big triggers
+    # YouTube's rate limiter. These values were bumped from 4/3 to 6/5 —
+    # safely under the rate-limit threshold we've observed, while shaving
+    # real time off concurrent queries.
+    SEARCH_SURFACE_WORKERS = 6
+    VIDEO_DETAILS_WORKERS = 5
+    # ---- external fallback depth ----
+    # DuckDuckGo and Bing only run when YouTube fails. Before: 8 pages each
+    # (240/160 offset sweep). Cut to 4 pages because the fallback is mostly
+    # about rescuing a few IDs — not a full re-crawl — and each additional
+    # page there costs an HTTP roundtrip to a third-party search engine.
+    DUCKDUCKGO_PAGE_OFFSETS = (0, 30, 60, 90)
+    BING_FIRST_OFFSETS = (0, 20, 40, 60)
+    # ---- timeouts ----
+    # A hung YouTube request blocks an entire worker thread. With a short
+    # timeout we fail fast and let the caller retry or fall through to an
+    # alternative strategy, instead of burning 8 full seconds on a dead
+    # connection. Reduced 8 → 5 for per-request, 12 → 8 for total budget.
+    REQUEST_TIMEOUT_SEC = 5.0
+    SEARCH_TIME_BUDGET_SEC = 8.0
     NETWORK_BACKOFF_SEC = 45.0
     NETWORK_BACKOFF_FAILURE_THRESHOLD = 3
-    SESSION_POOL_SIZE = 24
+    # ---- connection pool ----
+    # Must be at least as large as the maximum number of concurrent HTTP
+    # requests we'll ever have in flight: search workers + transcript
+    # workers + video-details workers + continuation pages. Previously 24
+    # was a bottleneck when everything ran at once. 48 gives us headroom.
+    SESSION_POOL_SIZE = 48
     WATCH_PAGE_CACHE_TTL_SEC = 15 * 60
     CHANNEL_PAGE_CACHE_TTL_SEC = 15 * 60
     QUERY_VARIANT_EXACT_MIN_TOKENS = 3
@@ -89,7 +145,10 @@ class YouTubeService:
     GRAPH_DEEP_STAGE_MAX_SEC = 4.5
     GRAPH_RELATED_SURFACE = "youtube_related"
     GRAPH_CHANNEL_SURFACE = "youtube_channel"
-    GRAPH_FETCH_WORKERS = 4
+    # Bumped from 4 → 6 to match the rest of the pool sizes. Graph fetches
+    # (related + channel videos) run on a separate phase budget, so making
+    # them more parallel is a pure win when multiple seeds are expanded.
+    GRAPH_FETCH_WORKERS = 6
     SEARCH_QUERY_NOISE_TOKENS = {
         "basic",
         "basics",
@@ -904,17 +963,29 @@ class YouTubeService:
                 video_duration=video_duration,
             )
 
+        # Last-ditch fallback strategy: scan the HTML directly for anything
+        # that looks like a `"videoId":"xxxxxxxxxxx"` pair. This is much less
+        # accurate than walking ytInitialData — we get no titles, durations,
+        # or channels, and we can pick up unrelated mentions (e.g. a video
+        # embedded in a description). But it often recovers at least *some*
+        # results when YouTube changes its markup in a way that breaks the
+        # primary path. The downstream scorer will deprioritise these rows
+        # because their metadata is empty.
         ids: list[str] = []
         seen_ids: set[str] = set()
-        for video_id in re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', html):
-            if video_id in seen_ids:
+        for match in _VIDEO_ID_IN_JSON_REGEX.finditer(html):
+            video_id = match.group(1)
+            # Double-check with the canonical validator; the regex is already
+            # strict but this keeps the contract explicit and consistent with
+            # every other code path.
+            if not _is_valid_youtube_video_id(video_id) or video_id in seen_ids:
                 continue
             seen_ids.add(video_id)
             ids.append(video_id)
             if len(ids) >= target_pool:
                 break
         if ids:
-            fallback_rows = [self._fallback_video_row(video_id) for video_id in ids]
+            fallback_rows = [row for row in (self._fallback_video_row(vid) for vid in ids) if row]
             self._annotate_search_rows(
                 fallback_rows,
                 search_source=variant_surface,
@@ -1567,6 +1638,12 @@ class YouTubeService:
         return anchored_rows
 
     def _fetch_watch_html(self, video_id: str, *, deadline: float | None) -> str:
+        # Validate the ID before we send it. A bad ID on the query string would
+        # just cause YouTube to serve an "unavailable" page, which would waste
+        # a request AND poison the cache under a bogus key.
+        if not _is_valid_youtube_video_id(video_id):
+            logger.debug("Skipping watch HTML fetch — invalid video ID: %r", video_id)
+            return ""
         cache_key = f"watch:{video_id}"
         cached = self._cache_get_text(cache_key, ttl_sec=self.WATCH_PAGE_CACHE_TTL_SEC)
         if cached is not None:
@@ -1585,10 +1662,25 @@ class YouTubeService:
         except requests.RequestException as exc:
             self._note_request_failure(exc, scope="youtube_html")
             return ""
+        # A successful response can still be useless if YouTube served us a
+        # consent wall, a captcha, or an empty shell — those are shorter than
+        # a real watch page. We log (not raise) so the caller can still fall
+        # through to alternative strategies, but future-you gets a breadcrumb.
+        if not payload or len(payload) < 5000:
+            logger.warning(
+                "Watch page fetch returned suspiciously small HTML: video_id=%s bytes=%d",
+                video_id,
+                len(payload),
+            )
         self._cache_set_text(cache_key, payload)
         return payload
 
     def _fetch_channel_videos_html(self, channel_id: str, *, deadline: float | None) -> str:
+        # Channel IDs all start with "UC" and are exactly 24 chars. Validate
+        # before sending — prevents path injection and cache-key pollution.
+        if not isinstance(channel_id, str) or not re.match(r"^UC[A-Za-z0-9_-]{22}$", channel_id):
+            logger.debug("Skipping channel fetch — invalid channel ID: %r", channel_id)
+            return ""
         cache_key = f"channel_videos:{channel_id}"
         cached = self._cache_get_text(cache_key, ttl_sec=self.CHANNEL_PAGE_CACHE_TTL_SEC)
         if cached is not None:
@@ -1606,6 +1698,12 @@ class YouTubeService:
         except requests.RequestException as exc:
             self._note_request_failure(exc, scope="youtube_html")
             return ""
+        if not payload or len(payload) < 5000:
+            logger.warning(
+                "Channel videos fetch returned suspiciously small HTML: channel_id=%s bytes=%d",
+                channel_id,
+                len(payload),
+            )
         self._cache_set_text(cache_key, payload)
         return payload
 
@@ -1841,22 +1939,52 @@ class YouTubeService:
         return exact_core
 
     def _fetch_search_html(self, search_query: str, deadline: float | None = None) -> str:
+        # Guard against empty queries. YouTube would happily return its
+        # trending page for "", which would contaminate the cache and skew
+        # every downstream scorer.
+        clean_query = str(search_query or "").strip()
+        if not clean_query:
+            logger.debug("Skipping search HTML fetch — empty query")
+            return ""
         if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_html"):
             return ""
         try:
             resp = self._session_get(
                 "https://www.youtube.com/results",
-                params={"search_query": search_query},
+                params={"search_query": clean_query},
                 deadline=deadline,
             )
             resp.raise_for_status()
             self._note_request_success("youtube_html")
-            return resp.text
         except requests.RequestException as exc:
             self._note_request_failure(exc, scope="youtube_html")
             return ""
+        payload = resp.text or ""
+        # Heuristic sanity check — a real YouTube results page is typically
+        # 300-800KB. Anything under a few KB is almost always a consent
+        # interstitial, a rate-limit stub, or an empty body. We still return
+        # whatever we got (the extractor may still salvage something), but we
+        # warn so the root cause shows up in logs instead of as a mysterious
+        # empty list.
+        if len(payload) < 5000:
+            logger.warning(
+                "Search HTML fetch returned suspiciously small payload: query=%r bytes=%d",
+                self._query_preview(clean_query),
+                len(payload),
+            )
+        return payload
 
-    def _fallback_video_row(self, video_id: str) -> dict[str, Any]:
+    def _fallback_video_row(self, video_id: str) -> dict[str, Any] | None:
+        """Create a bare-bones row from just a video ID.
+
+        Used when primary scraping fails and we can only recover raw IDs.
+        Returns None for invalid IDs so callers don't have to double-check.
+        The title is synthesised as "YouTube Video <id>" so the UI has
+        *something* to render — the real title will typically be filled in
+        later when the row is hydrated via a different path.
+        """
+        if not _is_valid_youtube_video_id(video_id):
+            return None
         return {
             "id": video_id,
             "title": f"YouTube Video {video_id}",
@@ -2236,10 +2364,68 @@ class YouTubeService:
                 yield from self._iter_continuation_tokens(item)
 
     def _extract_innertube_config(self, html: str) -> tuple[str | None, str | None]:
-        api_match = re.search(r'"INNERTUBE_API_KEY":"([^"]+)"', html)
-        client_match = re.search(r'"INNERTUBE_CLIENT_VERSION":"([^"]+)"', html)
-        api_key = api_match.group(1).strip() if api_match else None
-        client_version = client_match.group(1).strip() if client_match else None
+        """Pull the InnerTube API key and client version out of a YouTube HTML page.
+
+        When you want to paginate YouTube search results (more than the first
+        page), you can't keep re-fetching the HTML — you instead POST a
+        continuation token to YouTube's internal InnerTube API. To call it,
+        you need two credentials that YouTube bakes into every page:
+          - INNERTUBE_API_KEY        — the public API key
+          - INNERTUBE_CLIENT_VERSION — the client version string
+
+        Both change over time, so we scrape them out of the page on every
+        fetch rather than hard-coding them. We try multiple regex patterns
+        because YouTube formats them slightly differently depending on the
+        page (e.g. in quoted JSON vs a bare assignment).
+        """
+        if not html:
+            return (None, None)
+
+        # For each field, try the patterns in order from most-specific to
+        # fallback. `re.search` scans the whole HTML, so the order here is
+        # about robustness, not performance.
+        api_key_patterns = (
+            r'"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"',
+            r'innertubeApiKey"\s*:\s*"([^"]+)"',
+            r'INNERTUBE_API_KEY\s*=\s*"([^"]+)"',
+        )
+        client_version_patterns = (
+            r'"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"',
+            r'innertubeClientVersion"\s*:\s*"([^"]+)"',
+            r'INNERTUBE_CLIENT_VERSION\s*=\s*"([^"]+)"',
+        )
+
+        api_key: str | None = None
+        for pattern in api_key_patterns:
+            match = re.search(pattern, html)
+            if match:
+                candidate = match.group(1).strip()
+                # A real InnerTube key is ~39 chars of url-safe base64.
+                # Reject empty strings and absurd lengths so we don't POST
+                # garbage.
+                if 20 <= len(candidate) <= 80:
+                    api_key = candidate
+                    break
+
+        client_version: str | None = None
+        for pattern in client_version_patterns:
+            match = re.search(pattern, html)
+            if match:
+                candidate = match.group(1).strip()
+                # Versions look like "2.20240214.00.00" — a few numeric
+                # segments. We don't enforce the exact shape (YouTube could
+                # reformat it), but we do guard against empty or oversized
+                # values.
+                if candidate and len(candidate) < 40:
+                    client_version = candidate
+                    break
+
+        if html and not api_key:
+            logger.debug(
+                "INNERTUBE_API_KEY not found in HTML — continuation pagination will be skipped "
+                "(html_bytes=%d)",
+                len(html),
+            )
         return (api_key, client_version)
 
     def _fetch_search_continuation(
@@ -2292,11 +2478,48 @@ class YouTubeService:
         return data
 
     def _extract_yt_initial_data(self, html: str) -> dict[str, Any] | None:
-        markers = ["var ytInitialData = ", "ytInitialData = "]
+        """Pull the ytInitialData JSON blob out of a YouTube HTML page.
+
+        YouTube embeds its initial render state as a JavaScript variable in a
+        <script> tag. The blob has been given a few different names over the
+        years, so we try several known markers in order. Each marker is the
+        literal text that appears just before the opening "{" of the JSON
+        object. If one marker is missing, we fall through to the next — this
+        is the primary line of defence against YouTube renaming the variable.
+
+        Why scan for markers instead of using a proper HTML parser?
+        - The blob lives inside a <script> tag, so HTML parsers don't help us
+          get to the JSON any faster.
+        - ytInitialData is a top-level assignment and is always followed by
+          a balanced JSON object, so simple string scanning is reliable AND
+          dependency-free (educational bonus: you can see every step).
+        - If YouTube ever changes the format more drastically, you'll see a
+          loud warning in the logs pointing here.
+        """
+        if not html:
+            return None
+
+        # Ordered from most-common (as of current scraping) to fallbacks.
+        # Having more than one means a single server-side rename doesn't
+        # instantly break everything.
+        markers = (
+            "var ytInitialData = ",
+            "window[\"ytInitialData\"] = ",
+            "window['ytInitialData'] = ",
+            "ytInitialData = ",
+            # Some consent-wall / mobile layouts inline the data without a
+            # variable declaration at all. This last marker is the weakest
+            # (could match inside a string), but we only use it when every
+            # stronger marker has already failed.
+            "\"ytInitialData\":",
+        )
+
+        tried_any = False
         for marker in markers:
             idx = html.find(marker)
             if idx < 0:
                 continue
+            tried_any = True
             start = html.find("{", idx + len(marker))
             if start < 0:
                 continue
@@ -2305,10 +2528,32 @@ class YouTubeService:
                 continue
             try:
                 loaded = json.loads(payload)
-                if isinstance(loaded, dict):
-                    return loaded
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as exc:
+                # Don't give up yet — keep trying the remaining markers.
+                # A JSON decode failure on one marker usually means we
+                # matched inside a string literal (common for the weak
+                # "\"ytInitialData\":" marker).
+                logger.debug(
+                    "ytInitialData marker %r matched but JSON decode failed: %s",
+                    marker,
+                    exc,
+                )
                 continue
+            if isinstance(loaded, dict):
+                return loaded
+
+        if tried_any:
+            logger.warning(
+                "ytInitialData marker(s) found but no usable JSON object could be extracted "
+                "(html_bytes=%d). YouTube may have changed its embedding format.",
+                len(html),
+            )
+        else:
+            logger.warning(
+                "ytInitialData marker not found in HTML (html_bytes=%d). "
+                "YouTube may have renamed the variable or served a consent wall.",
+                len(html),
+            )
         return None
 
     def _balanced_json_object(self, value: str, start_idx: int) -> str | None:
@@ -2336,9 +2581,43 @@ class YouTubeService:
                     return value[start_idx : i + 1]
         return None
 
+    # The keys YouTube uses for "here is a video entry" inside ytInitialData.
+    # Each one represents the same concept (a single video in a list) but the
+    # surrounding component determines which key shows up:
+    #   videoRenderer         → standard search / list result
+    #   compactVideoRenderer  → the "up next" sidebar on a watch page
+    #   gridVideoRenderer     → the grid layout on channel pages
+    #   playlistVideoRenderer → entries inside a playlist
+    #   reelItemRenderer      → Shorts shelf entries
+    #   shortsLockupViewModel → newer Shorts layout (uses a slightly different
+    #                           shape; we still try because some sub-fields
+    #                           we read will simply be missing and the row
+    #                           will be filtered out later rather than crash)
+    # Adding a new key here is the cheapest way to recover lost results when
+    # YouTube ships a UI change.
+    _VIDEO_RENDERER_KEYS: tuple[str, ...] = (
+        "videoRenderer",
+        "compactVideoRenderer",
+        "gridVideoRenderer",
+        "playlistVideoRenderer",
+        "reelItemRenderer",
+        "shortsLockupViewModel",
+    )
+
     def _iter_video_renderers(self, node: Any):
+        """Walk a JSON tree and yield every video renderer we find.
+
+        The ytInitialData structure is deeply nested and changes shape based
+        on which surface (search / watch / channel) it came from. Rather than
+        hard-code a path like `contents.twoColumnSearchResultsRenderer.…`,
+        we do a tree walk that doesn't care about the surrounding structure
+        — we just look for the leaf dictionaries that describe individual
+        videos. This is strictly more resilient because YouTube can reshuffle
+        its wrappers without breaking us, as long as the leaf nodes keep the
+        same names.
+        """
         if isinstance(node, dict):
-            for renderer_key in ("videoRenderer", "compactVideoRenderer", "gridVideoRenderer"):
+            for renderer_key in self._VIDEO_RENDERER_KEYS:
                 video_renderer = node.get(renderer_key)
                 if isinstance(video_renderer, dict):
                     yield video_renderer
@@ -2433,28 +2712,80 @@ class YouTubeService:
         *,
         video_duration: str | None,
     ) -> dict[str, Any] | None:
-        video_id = renderer.get("videoId")
-        if not isinstance(video_id, str) or not video_id.strip():
-            return None
+        """Turn a raw YouTube renderer dict into a normalized video row.
 
-        duration_text = self._text_value(renderer.get("lengthText")) or self._thumbnail_overlay_duration_text(renderer)
+        A "renderer" is YouTube's term for one UI component — in our case,
+        one video tile. Each one carries the data the page would use to draw
+        that tile: title, channel, thumbnail, duration, view count, etc.
+
+        We return None when:
+          1. The video ID is missing or doesn't match the 11-char format.
+             This is a hard requirement — without a valid ID, there's
+             nothing the rest of the pipeline can do with the row.
+          2. The duration is known and doesn't match the caller's filter.
+             (If the duration is unknown, we keep the row and let later
+             scoring decide.)
+        """
+        # --- 1. ID validation ---
+        # We don't trust the JSON blindly: validate the shape BEFORE doing any
+        # other work, so that a malformed row fails fast and cheaply.
+        raw_video_id = renderer.get("videoId")
+        if not _is_valid_youtube_video_id(raw_video_id):
+            # Shorts renderers sometimes stash the ID on a sub-field instead
+            # of the top-level `videoId`. Try a couple of common alternates
+            # before giving up.
+            for alt_key in ("onTap", "entityId", "navigationEndpoint"):
+                node = renderer.get(alt_key)
+                candidate = self._probe_video_id_from_subtree(node)
+                if candidate:
+                    raw_video_id = candidate
+                    break
+        if not _is_valid_youtube_video_id(raw_video_id):
+            return None
+        video_id: str = raw_video_id  # type: ignore[assignment]
+
+        # --- 2. Duration (optional filter) ---
+        # The duration text can appear in two places depending on the
+        # renderer type. We try the primary location first, then fall back
+        # to the overlay badge that appears on the thumbnail. We never guess
+        # — if neither is present we treat the duration as unknown (0).
+        duration_text = (
+            self._text_value(renderer.get("lengthText"))
+            or self._thumbnail_overlay_duration_text(renderer)
+        )
         duration_sec = self._parse_duration_text(duration_text)
         if not self._duration_matches(duration_sec, video_duration):
             return None
 
+        # --- 3. Title, channel, metadata — all with tolerant fallbacks ---
+        # Title is almost always present but we default to "Untitled" rather
+        # than failing the whole row. A missing title is usually a layout
+        # change, not missing content — we'd rather surface the video.
         title = self._text_value(renderer.get("title")) or "Untitled"
-        channel = (
+
+        # Channel name lives under one of several keys depending on surface.
+        # We try them in the most-specific-first order and accept the first
+        # non-empty result.
+        channel_title = (
             self._text_value(renderer.get("ownerText"))
             or self._text_value(renderer.get("shortBylineText"))
             or self._text_value(renderer.get("longBylineText"))
+            or ""
         )
-        view_text = self._text_value(renderer.get("viewCountText")) or self._text_value(renderer.get("shortViewCountText"))
+
+        # View count: try the full text first, then the abbreviated variant.
+        view_text = (
+            self._text_value(renderer.get("viewCountText"))
+            or self._text_value(renderer.get("shortViewCountText"))
+            or ""
+        )
         published_text = self._text_value(renderer.get("publishedTimeText"))
+
         return {
             "id": video_id,
             "title": title,
             "channel_id": self._extract_channel_id_from_renderer(renderer),
-            "channel_title": channel,
+            "channel_title": channel_title,
             "description": self._renderer_description_text(renderer),
             "duration_sec": duration_sec,
             "view_count": self._parse_view_count_text(view_text),
@@ -2464,6 +2795,34 @@ class YouTubeService:
             "seed_channel_id": "",
             "crawl_depth": 0,
         }
+
+    def _probe_video_id_from_subtree(self, node: Any, *, max_depth: int = 4) -> str | None:
+        """Recursively look for a string matching the YouTube video ID format.
+
+        Used as a fallback when a renderer stores its ID on a nested field
+        instead of top-level `videoId` (this happens with newer Shorts
+        renderers like shortsLockupViewModel). We limit depth so a deeply
+        nested blob can't turn into a slow walk.
+        """
+        if max_depth <= 0:
+            return None
+        if isinstance(node, str):
+            return node if _is_valid_youtube_video_id(node) else None
+        if isinstance(node, dict):
+            for key in ("videoId", "id"):
+                candidate = node.get(key)
+                if _is_valid_youtube_video_id(candidate):
+                    return candidate  # type: ignore[return-value]
+            for value in node.values():
+                found = self._probe_video_id_from_subtree(value, max_depth=max_depth - 1)
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for item in node:
+                found = self._probe_video_id_from_subtree(item, max_depth=max_depth - 1)
+                if found:
+                    return found
+        return None
 
     def _parse_duration_text(self, value: str) -> int:
         if not value:
@@ -2540,76 +2899,144 @@ class YouTubeService:
         return duration_sec > 20 * 60
 
     def _search_via_duckduckgo(self, query: str, max_results: int, deadline: float | None = None) -> list[str]:
-        ids: list[str] = []
-        seen: set[str] = set()
+        """Fallback search using DuckDuckGo's HTML results page.
 
-        for offset in self.DUCKDUCKGO_PAGE_OFFSETS:
-            if self._deadline_exceeded(deadline) or self._network_backoff_active("duckduckgo"):
-                break
-            try:
-                resp = self._session_get(
-                    "https://duckduckgo.com/html/",
-                    params={"q": f"site:youtube.com/watch {query}", "s": offset},
-                    deadline=deadline,
-                )
-                resp.raise_for_status()
-                self._note_request_success("duckduckgo")
-            except requests.RequestException as exc:
-                self._note_request_failure(exc, scope="duckduckgo")
-                continue
+        Why this exists:
+          Even when YouTube's own search breaks (blocked, consent wall,
+          rate-limited), we can often still find relevant videos by
+          searching DuckDuckGo with `site:youtube.com/watch` — that filter
+          forces every result to be a YouTube watch URL we can extract an
+          ID from.
 
-            html = resp.text
-            candidates = re.findall(r'href="([^"]+)"', html)
-            for href in candidates:
-                normalized = href.replace("&amp;", "&")
-                if "uddg=" in normalized:
-                    parsed = urlparse(normalized)
-                    unwrapped = parse_qs(parsed.query).get("uddg", [""])[0]
-                    if unwrapped:
-                        normalized = unquote(unwrapped)
-
-                video_id = self._extract_video_id_from_url(normalized)
-                if not video_id or video_id in seen:
-                    continue
-                seen.add(video_id)
-                ids.append(video_id)
-                if len(ids) >= max_results:
-                    return ids
-        return ids
+        Why the `uddg=` unwrapping step:
+          DuckDuckGo wraps every outbound link through its own redirect
+          (for privacy tracking). The real URL is inside the `uddg` query
+          parameter, URL-encoded. We unwrap it before trying to extract a
+          video ID, otherwise we'd always see a duckduckgo.com host.
+        """
+        return self._collect_youtube_ids_from_html_search(
+            scope="duckduckgo",
+            url="https://duckduckgo.com/html/",
+            query=f"site:youtube.com/watch {query}",
+            pages=self.DUCKDUCKGO_PAGE_OFFSETS,
+            param_builder=lambda page_param, search_q: {"q": search_q, "s": page_param},
+            max_results=max_results,
+            deadline=deadline,
+            unwrap_redirect=True,
+        )
 
     def _search_via_bing(self, query: str, max_results: int, deadline: float | None = None) -> list[str]:
+        """Fallback search using Bing's HTML results page.
+
+        Same strategy as DuckDuckGo — `site:youtube.com/watch` restricts
+        every result to something we can extract an ID from. Bing doesn't
+        wrap URLs through a redirect, so no unwrapping step is needed.
+        """
+        return self._collect_youtube_ids_from_html_search(
+            scope="bing",
+            url="https://www.bing.com/search",
+            query=f"site:youtube.com/watch {query}",
+            pages=self.BING_FIRST_OFFSETS,
+            param_builder=lambda page_param, search_q: {
+                "q": search_q,
+                "count": 50,
+                "first": page_param,
+            },
+            max_results=max_results,
+            deadline=deadline,
+            unwrap_redirect=False,
+        )
+
+    def _collect_youtube_ids_from_html_search(
+        self,
+        *,
+        scope: str,
+        url: str,
+        query: str,
+        pages: tuple[int, ...],
+        param_builder: Any,
+        max_results: int,
+        deadline: float | None,
+        unwrap_redirect: bool,
+    ) -> list[str]:
+        """Shared loop for the DuckDuckGo and Bing fallbacks.
+
+        Extracting this into a helper does three things:
+          1. Removes the copy-pasted loop from both searchers (easier to
+             improve one place, not two).
+          2. Lets us filter the raw `href=` candidates more aggressively
+             (only hrefs that look like YouTube or a known redirector).
+          3. Gives us one place to add logging for empty results.
+        """
         ids: list[str] = []
         seen: set[str] = set()
-        for first in self.BING_FIRST_OFFSETS:
-            if self._deadline_exceeded(deadline) or self._network_backoff_active("bing"):
+
+        # Pre-compile a narrower regex so we ignore every link on the page
+        # that can't possibly be a YouTube watch URL. This matters because
+        # search pages have hundreds of irrelevant links (ads, navigation,
+        # "related searches") and we'd otherwise burn CPU parsing them all.
+        href_regex = re.compile(
+            r'href="((?:https?:)?//(?:[^"]*?youtu(?:be\.com|\.be)[^"]*|[^"]*?uddg=[^"]*))"',
+            re.IGNORECASE,
+        )
+
+        for page_param in pages:
+            if self._deadline_exceeded(deadline) or self._network_backoff_active(scope):
                 break
             try:
                 resp = self._session_get(
-                    "https://www.bing.com/search",
-                    params={
-                        "q": f"site:youtube.com/watch {query}",
-                        "count": 50,
-                        "first": first,
-                    },
+                    url,
+                    params=param_builder(page_param, query),
                     deadline=deadline,
                 )
                 resp.raise_for_status()
-                self._note_request_success("bing")
+                self._note_request_success(scope)
             except requests.RequestException as exc:
-                self._note_request_failure(exc, scope="bing")
+                self._note_request_failure(exc, scope=scope)
                 continue
 
-            html = resp.text
-            candidates = re.findall(r'href="([^"]+)"', html)
-            for href in candidates:
+            html = resp.text or ""
+            if len(html) < 2000:
+                # A tiny HTML body from a search engine almost always means
+                # we were rate-limited or served a captcha. Log it, skip the
+                # page, but keep trying the next offset — pagination may
+                # recover further down.
+                logger.debug(
+                    "%s returned small payload (bytes=%d) on page=%s",
+                    scope,
+                    len(html),
+                    page_param,
+                )
+                continue
+
+            for match in href_regex.finditer(html):
+                href = match.group(1)
+                # HTML entities in the href (like &amp;) need to be turned
+                # back into their real characters before URL parsing will
+                # behave. This single replace handles the most common case.
                 normalized = href.replace("&amp;", "&")
+                if normalized.startswith("//"):
+                    normalized = "https:" + normalized
+
+                if unwrap_redirect and "uddg=" in normalized:
+                    parsed = urlparse(normalized)
+                    wrapped = parse_qs(parsed.query).get("uddg", [""])[0]
+                    if wrapped:
+                        normalized = unquote(wrapped)
+
                 video_id = self._extract_video_id_from_url(normalized)
-                if not video_id or video_id in seen:
+                if not _is_valid_youtube_video_id(video_id) or video_id in seen:
                     continue
-                seen.add(video_id)
-                ids.append(video_id)
+                seen.add(video_id)  # type: ignore[arg-type]
+                ids.append(video_id)  # type: ignore[arg-type]
                 if len(ids) >= max_results:
                     return ids
+        if not ids:
+            logger.debug(
+                "%s fallback returned no video IDs for query=%r",
+                scope,
+                self._query_preview(query),
+            )
         return ids
 
     def _extract_video_id_from_url(self, value: str) -> str | None:
