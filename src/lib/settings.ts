@@ -1,7 +1,7 @@
 "use client";
 
 export type GenerationMode = "slow" | "fast";
-export type SearchInputMode = "topic" | "source" | "file";
+export type SearchInputMode = "topic" | "source" | "file" | "url";
 export type VideoPoolMode = "short-first" | "balanced" | "long-form";
 export type PreferredVideoDuration = "any" | "short" | "medium" | "long";
 
@@ -16,6 +16,12 @@ export type StudyReelsSettings = {
   targetClipDurationSec: number;
   targetClipDurationMinSec: number;
   targetClipDurationMaxSec: number;
+  /**
+   * When true, topic/text/file submits go through /api/ingest/search (real scraping
+   * of YouTube + Instagram + TikTok). When false, they fall back to the legacy
+   * /api/material → YouTube-only pipeline. Local-only, persisted client-side.
+   */
+  multiPlatformSearch: boolean;
 };
 
 export const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
@@ -51,6 +57,7 @@ export const DEFAULT_STUDY_REELS_SETTINGS: StudyReelsSettings = {
   targetClipDurationSec: 55,
   targetClipDurationMinSec: 20,
   targetClipDurationMaxSec: 55,
+  multiPlatformSearch: true,
 };
 
 type StudyReelsSettingsInput = {
@@ -64,6 +71,7 @@ type StudyReelsSettingsInput = {
   targetClipDurationSec?: number | string | null;
   targetClipDurationMinSec?: number | string | null;
   targetClipDurationMaxSec?: number | string | null;
+  multiPlatformSearch?: boolean | string | null;
 };
 
 let activeSettingsScopeMemoryFallback: string | null = null;
@@ -73,6 +81,8 @@ function toGenerationMode(value: string | null | undefined): GenerationMode {
 }
 
 function toInputMode(value: string | null | undefined): SearchInputMode {
+  // `url` is intentionally excluded — it's a legacy/internal value that the settings
+  // picker no longer exposes. Any persisted `url` default falls back to `source`.
   if (value === "topic" || value === "file") {
     return value;
   }
@@ -193,6 +203,7 @@ function parseScopedStudyReelsSettingsSnapshot(raw: string | null): StudyReelsSe
       targetClipDurationSec: row.targetClipDurationSec as string | number | null | undefined,
       targetClipDurationMinSec: row.targetClipDurationMinSec as string | number | null | undefined,
       targetClipDurationMaxSec: row.targetClipDurationMaxSec as string | number | null | undefined,
+      multiPlatformSearch: row.multiPlatformSearch as string | boolean | null | undefined,
     });
   } catch {
     return null;
@@ -274,6 +285,15 @@ export function normalizeStudyReelsSettings(raw: StudyReelsSettingsInput): Study
     ? Math.round(clampNumber(targetClipDurationSec, targetClipDurationMinSec, targetClipDurationMaxSec, midpointTarget))
     : midpointTarget;
 
+  // `multiPlatformSearch` defaults to true when missing or ambiguous so existing
+  // persisted settings (which never stored this field) auto-upgrade to the new behavior.
+  const multiPlatformSearch =
+    raw.multiPlatformSearch === false ||
+    raw.multiPlatformSearch === "false" ||
+    raw.multiPlatformSearch === "0"
+      ? false
+      : true;
+
   return {
     generationMode: toGenerationMode(raw.generationMode),
     defaultInputMode: toInputMode(raw.defaultInputMode),
@@ -285,6 +305,7 @@ export function normalizeStudyReelsSettings(raw: StudyReelsSettingsInput): Study
     targetClipDurationSec: normalizedTarget,
     targetClipDurationMinSec,
     targetClipDurationMaxSec,
+    multiPlatformSearch,
   };
 }
 

@@ -36,6 +36,9 @@ export type Reel = {
   video_duration_sec?: number;
   clip_duration_sec?: number;
   community_has_explicit_end?: boolean;
+  // Optional attribution line populated by POST /api/ingest/url. Older responses
+  // (from /api/feed, /api/reels/generate) do not include this field.
+  source_attribution?: string | null;
 };
 
 export type CaptionCue = {
@@ -120,6 +123,94 @@ export type ChatMessage = {
 
 export type ChatResponse = {
   answer: string;
+};
+
+// POST /api/ingest/url — backend reel ingestion pipeline (YouTube / Instagram / TikTok).
+
+export type IngestUrlRequest = {
+  source_url: string;
+  material_id?: string | null;
+  concept_id?: string | null;
+  target_clip_duration_sec?: number;
+  target_clip_duration_min_sec?: number;
+  target_clip_duration_max_sec?: number;
+  language?: string;
+};
+
+/** Mirror of `backend/app/ingestion/models.py:IngestMetadata`. All fields optional. */
+export type IngestMetadata = {
+  platform: "yt" | "ig" | "tt";
+  source_id: string;
+  source_url: string;
+  playback_url: string;
+  title?: string;
+  description?: string;
+  author_handle?: string;
+  author_name?: string;
+  author_url?: string;
+  duration_sec?: number | null;
+  thumbnail_url?: string;
+  upload_date_iso?: string | null;
+  view_count?: number | null;
+  like_count?: number | null;
+  comment_count?: number | null;
+  repost_count?: number | null;
+  hashtags?: string[];
+  categories?: string[];
+  audio_title?: string;
+  audio_artist?: string;
+  language?: string;
+  location?: string;
+  is_private?: boolean;
+  is_live?: boolean;
+};
+
+export type IngestResult = {
+  reel: Reel;
+  metadata: IngestMetadata;
+  terms_notice: string;
+  trace_id: string;
+};
+
+// POST /api/ingest/search — topic-based multi-platform discovery.
+
+export type IngestSearchRequest = {
+  query: string;
+  platforms?: Array<"yt" | "ig" | "tt">;
+  max_per_platform?: number;
+  material_id?: string | null;
+  concept_id?: string | null;
+  target_clip_duration_sec?: number;
+  target_clip_duration_min_sec?: number;
+  target_clip_duration_max_sec?: number;
+  language?: string;
+  /** Bare source_id strings of reels the client already has — pagination for infinite scroll. */
+  exclude_video_ids?: string[];
+};
+
+export type IngestSearchItem = {
+  platform: "yt" | "ig" | "tt";
+  source_url: string;
+  status: "ok" | "error" | "skipped" | "rate_limited";
+  reel?: Reel | null;
+  metadata?: IngestMetadata | null;
+  error?: string | null;
+};
+
+export type IngestSearchResult = {
+  query: string;
+  material_id: string;
+  platforms: Array<"yt" | "ig" | "tt">;
+  per_platform_resolved: Record<string, number>;
+  per_platform_succeeded: Record<string, number>;
+  per_platform_failed: Record<string, number>;
+  per_platform_errors: Record<string, string>;
+  total_resolved: number;
+  succeeded: number;
+  failed: number;
+  items: IngestSearchItem[];
+  terms_notice: string;
+  trace_id: string;
 };
 
 export type CommunityReelPlatform = "youtube" | "instagram" | "tiktok";

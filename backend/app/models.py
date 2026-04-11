@@ -352,6 +352,7 @@ class CommunitySettingsPayload(BaseModel):
     target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
     target_clip_duration_min_sec: int = Field(default=20, ge=15, le=180)
     target_clip_duration_max_sec: int = Field(default=55, ge=15, le=180)
+    autoplay_next_reel: bool = False
 
     @model_validator(mode="after")
     def validate_clip_duration_bounds(self) -> "CommunitySettingsPayload":
@@ -366,3 +367,43 @@ class CommunitySettingsPayload(BaseModel):
 
 class CommunitySettingsResponse(CommunitySettingsPayload):
     pass
+
+
+class CommunityStarredSetsPayload(BaseModel):
+    set_ids: list[str] = []
+
+
+class CommunityStarredSetsResponse(BaseModel):
+    set_ids: list[str] = []
+
+
+class CommunityFeedSnapshotPayload(BaseModel):
+    snapshot: dict = {}
+
+
+class CommunityFeedSnapshotsResponse(BaseModel):
+    snapshots: dict[str, dict] = {}
+
+
+class CommunityDraftPayload(BaseModel):
+    draft: dict = {}
+
+
+class CommunityDraftsResponse(BaseModel):
+    drafts: dict[str, dict] = {}
+
+
+class CommunityMaterialSeedsPayload(BaseModel):
+    seeds: dict[str, dict] = {}
+
+
+class CommunityMaterialSeedsResponse(BaseModel):
+    seeds: dict[str, dict] = {}
+
+
+class CommunityMaterialGroupsPayload(BaseModel):
+    groups: dict[str, dict] = {}
+
+
+class CommunityMaterialGroupsResponse(BaseModel):
+    groups: dict[str, dict] = {}

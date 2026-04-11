@@ -399,6 +399,7 @@ CREATE TABLE IF NOT EXISTS community_account_settings (
     target_clip_duration_sec INTEGER NOT NULL DEFAULT 55,
     target_clip_duration_min_sec INTEGER NOT NULL DEFAULT 20,
     target_clip_duration_max_sec INTEGER NOT NULL DEFAULT 55,
+    autoplay_next_reel INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(account_id) REFERENCES community_accounts(id)
 );
@@ -449,6 +450,45 @@ CREATE TABLE IF NOT EXISTS llm_cache (
     cache_key TEXT PRIMARY KEY,
     response_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS community_starred_sets (
+    account_id TEXT NOT NULL,
+    set_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, set_id)
+);
+
+CREATE TABLE IF NOT EXISTS community_feed_snapshots (
+    account_id TEXT NOT NULL,
+    material_key TEXT NOT NULL,
+    snapshot_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, material_key)
+);
+
+CREATE TABLE IF NOT EXISTS community_drafts (
+    account_id TEXT NOT NULL,
+    draft_key TEXT NOT NULL,
+    draft_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, draft_key)
+);
+
+CREATE TABLE IF NOT EXISTS community_material_seeds (
+    account_id TEXT NOT NULL,
+    material_id TEXT NOT NULL,
+    seed_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, material_id)
+);
+
+CREATE TABLE IF NOT EXISTS community_material_groups (
+    account_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    group_json TEXT NOT NULL DEFAULT '{}',
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (account_id, group_id)
 );
 """
 
@@ -708,6 +748,7 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS visibility TEXT")
                 cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS active_index INTEGER")
                 cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS active_reel_id TEXT")
+                cur.execute("ALTER TABLE community_account_settings ADD COLUMN IF NOT EXISTS autoplay_next_reel INTEGER NOT NULL DEFAULT 0")
                 cur.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR BTRIM(updated_at) = ''")
                 cur.execute(
                     """
@@ -837,6 +878,10 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE community_material_history ADD COLUMN active_reel_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_account_settings ADD COLUMN autoplay_next_reel INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:

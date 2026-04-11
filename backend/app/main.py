@@ -55,6 +55,14 @@ from .models import (
     CommunityAuthSessionResponse,
     CommunityAccountOut,
     CommunityChangePasswordRequest,
+    CommunityDraftPayload,
+    CommunityDraftsResponse,
+    CommunityFeedSnapshotPayload,
+    CommunityFeedSnapshotsResponse,
+    CommunityMaterialGroupsPayload,
+    CommunityMaterialGroupsResponse,
+    CommunityMaterialSeedsPayload,
+    CommunityMaterialSeedsResponse,
     CommunityResendVerificationResponse,
     CommunitySendSignupVerificationRequest,
     CommunitySendSignupVerificationResponse,
@@ -63,6 +71,8 @@ from .models import (
     CommunityHistoryResponse,
     CommunitySettingsPayload,
     CommunitySettingsResponse,
+    CommunityStarredSetsPayload,
+    CommunityStarredSetsResponse,
     CommunityReelOut,
     CommunitySetCreateRequest,
     CommunitySetOut,
@@ -87,10 +97,30 @@ from .services.email import send_welcome_email
 from .services.embeddings import EmbeddingService
 from .services.material_intelligence import MaterialIntelligenceService
 from .services.parsers import ParseError, extract_text_from_file
+from .services.openai_client import build_openai_client
 from .services.reels import GenerationCancelledError, ReelService
 from .services.storage import get_storage
 from .services.text_utils import chunk_text, normalize_whitespace
 from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8601_duration
+
+from .ingestion.errors import (
+    DownloadError as IngestDownloadError,
+    IngestError,
+    RateLimitedError as IngestRateLimitedError,
+    SegmentationError as IngestSegmentationError,
+    ServerlessUnavailable as IngestServerlessUnavailable,
+    TranscriptionError as IngestTranscriptionError,
+    UnsupportedSourceError as IngestUnsupportedSourceError,
+)
+from .ingestion.models import (
+    IngestFeedRequest,
+    IngestFeedResult,
+    IngestRequest,
+    IngestResult,
+    IngestSearchRequest,
+    IngestSearchResult,
+)
+from .ingestion.pipeline import IngestionPipeline
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -205,6 +235,28 @@ material_intelligence_service = MaterialIntelligenceService()
 youtube_service = YouTubeService()
 reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service)
 SERVERLESS_MODE = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
+
+# Longer-timeout OpenAI client for the ingestion pipeline (Whisper uploads + AI summaries
+# need more than the 8s budget EmbeddingService uses). Gated behind the same SERVERLESS_MODE
+# check the rest of the codebase uses; the pipeline itself also refuses to run in serverless
+# unless ALLOW_OPENAI_IN_SERVERLESS=1 is set.
+_ingest_openai_client = build_openai_client(
+    api_key=settings.openai_api_key,
+    timeout=60.0,
+    enabled=bool(
+        settings.openai_enabled
+        and settings.openai_api_key
+        and (not SERVERLESS_MODE or os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1")
+    ),
+)
+ingestion_pipeline = IngestionPipeline(
+    youtube_service=youtube_service,
+    embedding_service=embedding_service,
+    openai_client=_ingest_openai_client,
+    settings=settings,
+    serverless_mode=SERVERLESS_MODE,
+)
+
 REFINEMENT_JOB_WORKERS = 2
 _refinement_jobs_lock = threading.Lock()
 _refinement_job_executor = None if SERVERLESS_MODE else ThreadPoolExecutor(max_workers=REFINEMENT_JOB_WORKERS)
@@ -273,6 +325,9 @@ COMMUNITY_LOGIN_PER_USERNAME_RATE_LIMIT = 8
 COMMUNITY_VERIFY_PER_ACCOUNT_RATE_LIMIT = 5
 COMMUNITY_HISTORY_RATE_LIMIT_PER_WINDOW = 90
 COMMUNITY_SETTINGS_RATE_LIMIT_PER_WINDOW = 90
+INGEST_URL_RATE_LIMIT_PER_WINDOW = 6
+INGEST_FEED_RATE_LIMIT_PER_WINDOW = 2
+INGEST_SEARCH_RATE_LIMIT_PER_WINDOW = 3
 MAX_COMMUNITY_HISTORY_ITEMS = 120
 _rate_limit_lock = threading.Lock()
 _rate_limit_hits: dict[str, deque[float]] = {}
@@ -1405,6 +1460,7 @@ def _serialize_community_settings(row: dict | None) -> CommunitySettingsResponse
         source.get("target_clip_duration_min_sec", DEFAULT_SETTINGS_TARGET_CLIP_DURATION_MIN_SEC),
         source.get("target_clip_duration_max_sec", DEFAULT_SETTINGS_TARGET_CLIP_DURATION_MAX_SEC),
     )
+    autoplay_next_reel = bool(source.get("autoplay_next_reel", False))
     return CommunitySettingsResponse(
         generation_mode=generation_mode,  # type: ignore[arg-type]
         default_input_mode=default_input_mode,
@@ -1415,6 +1471,7 @@ def _serialize_community_settings(row: dict | None) -> CommunitySettingsResponse
         target_clip_duration_sec=target_clip_duration_sec,
         target_clip_duration_min_sec=target_clip_duration_min_sec,
         target_clip_duration_max_sec=target_clip_duration_max_sec,
+        autoplay_next_reel=autoplay_next_reel,
     )
 
 
@@ -5183,6 +5240,188 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
     }
 
 
+def _ingest_error_to_http(exc: IngestError) -> HTTPException:
+    """Map an IngestError to the appropriate HTTPException. Shared by both ingest endpoints."""
+    status = int(getattr(exc, "status_code", 500) or 500)
+    detail_payload: dict[str, Any] = {
+        "error": exc.__class__.__name__,
+        "message": exc.message,
+    }
+    if exc.detail:
+        detail_payload["detail"] = exc.detail
+    headers: dict[str, str] = {}
+    if isinstance(exc, IngestRateLimitedError):
+        retry = max(1, int(round(exc.retry_after_sec)))
+        headers["Retry-After"] = str(retry)
+    http_exc = HTTPException(status_code=status, detail=detail_payload)
+    if headers:
+        http_exc.headers = headers
+    return http_exc
+
+
+@app.post("/api/ingest/url", response_model=IngestResult)
+def ingest_url_endpoint(request: Request, payload: IngestRequest) -> IngestResult:
+    """
+    Download + process a single reel URL (YouTube / Instagram / TikTok) and persist a
+    ReelOut-compatible record. See `app/ingestion/__init__.py` for the full design notes
+    and legal posture.
+    """
+    _enforce_rate_limit(request, "ingest-url", limit=INGEST_URL_RATE_LIMIT_PER_WINDOW)
+    if SERVERLESS_MODE and os.getenv("ALLOW_OPENAI_IN_SERVERLESS") != "1":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "ServerlessUnavailable",
+                "message": "Reel ingestion is disabled in serverless mode.",
+            },
+        )
+
+    try:
+        result = ingestion_pipeline.ingest_url(
+            source_url=payload.source_url,
+            material_id=payload.material_id,
+            concept_id=payload.concept_id,
+            target_clip_duration_sec=payload.target_clip_duration_sec,
+            target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
+            target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+            language=payload.language,
+        )
+    except (
+        IngestUnsupportedSourceError,
+        IngestDownloadError,
+        IngestTranscriptionError,
+        IngestSegmentationError,
+        IngestServerlessUnavailable,
+        IngestRateLimitedError,
+    ) as exc:
+        logger.warning(
+            "ingest_url failed: %s",
+            json.dumps(
+                {
+                    "source_url": payload.source_url,
+                    "error": exc.__class__.__name__,
+                    "message": exc.message,
+                },
+                sort_keys=True,
+            ),
+        )
+        raise _ingest_error_to_http(exc) from exc
+    except IngestError as exc:
+        logger.exception("ingest_url crashed for %s", payload.source_url)
+        raise _ingest_error_to_http(exc) from exc
+    return result
+
+
+@app.post("/api/ingest/search", response_model=IngestSearchResult)
+def ingest_search_endpoint(request: Request, payload: IngestSearchRequest) -> IngestSearchResult:
+    """
+    Topic-based multi-platform search. Resolves YouTube + Instagram + TikTok search
+    results via yt-dlp's native extractors, dedups against `exclude_video_ids` for
+    infinite-scroll pagination, and ingests each resolved URL through the full pipeline
+    (Whisper fallback, silence-aware cuts, full metadata). Per-platform failures are
+    non-fatal — the response carries `per_platform_errors` so the client can surface
+    which platform went down.
+    """
+    _enforce_rate_limit(request, "ingest-search", limit=INGEST_SEARCH_RATE_LIMIT_PER_WINDOW)
+    if SERVERLESS_MODE and os.getenv("ALLOW_OPENAI_IN_SERVERLESS") != "1":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "ServerlessUnavailable",
+                "message": "Reel ingestion is disabled in serverless mode.",
+            },
+        )
+
+    try:
+        result = ingestion_pipeline.ingest_search(
+            query=payload.query,
+            platforms=payload.platforms,
+            max_per_platform=payload.max_per_platform,
+            material_id=payload.material_id,
+            concept_id=payload.concept_id,
+            target_clip_duration_sec=payload.target_clip_duration_sec,
+            target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
+            target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+            language=payload.language,
+            exclude_video_ids=payload.exclude_video_ids,
+        )
+    except (
+        IngestUnsupportedSourceError,
+        IngestDownloadError,
+        IngestServerlessUnavailable,
+        IngestRateLimitedError,
+    ) as exc:
+        logger.warning(
+            "ingest_search failed: %s",
+            json.dumps(
+                {
+                    "query": payload.query,
+                    "platforms": payload.platforms,
+                    "error": exc.__class__.__name__,
+                    "message": exc.message,
+                },
+                sort_keys=True,
+            ),
+        )
+        raise _ingest_error_to_http(exc) from exc
+    except IngestError as exc:
+        logger.exception("ingest_search crashed for query=%s", payload.query)
+        raise _ingest_error_to_http(exc) from exc
+    return result
+
+
+@app.post("/api/ingest/feed", response_model=IngestFeedResult)
+def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> IngestFeedResult:
+    """
+    Resolve a profile / hashtag / playlist URL to a bounded list of individual reel URLs
+    and ingest each in a small thread pool. Per-item failures are recorded in the response
+    (`items[*].status == "error"`) rather than aborting the whole call.
+    """
+    _enforce_rate_limit(request, "ingest-feed", limit=INGEST_FEED_RATE_LIMIT_PER_WINDOW)
+    if SERVERLESS_MODE and os.getenv("ALLOW_OPENAI_IN_SERVERLESS") != "1":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "ServerlessUnavailable",
+                "message": "Reel ingestion is disabled in serverless mode.",
+            },
+        )
+
+    try:
+        result = ingestion_pipeline.ingest_feed(
+            feed_url=payload.feed_url,
+            max_items=payload.max_items,
+            material_id=payload.material_id,
+            concept_id=payload.concept_id,
+            target_clip_duration_sec=payload.target_clip_duration_sec,
+            target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
+            target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+            language=payload.language,
+        )
+    except (
+        IngestUnsupportedSourceError,
+        IngestDownloadError,
+        IngestServerlessUnavailable,
+        IngestRateLimitedError,
+    ) as exc:
+        logger.warning(
+            "ingest_feed failed: %s",
+            json.dumps(
+                {
+                    "feed_url": payload.feed_url,
+                    "error": exc.__class__.__name__,
+                    "message": exc.message,
+                },
+                sort_keys=True,
+            ),
+        )
+        raise _ingest_error_to_http(exc) from exc
+    except IngestError as exc:
+        logger.exception("ingest_feed crashed for %s", payload.feed_url)
+        raise _ingest_error_to_http(exc) from exc
+    return result
+
+
 @app.post("/api/reels/generate-stream")
 async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest):
     _enforce_rate_limit(request, "reels-generate", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
@@ -6045,7 +6284,8 @@ def get_community_settings(request: Request):
                 preferred_video_duration,
                 target_clip_duration_sec,
                 target_clip_duration_min_sec,
-                target_clip_duration_max_sec
+                target_clip_duration_max_sec,
+                autoplay_next_reel
             FROM community_account_settings
             WHERE account_id = ?
             """,
@@ -6074,6 +6314,7 @@ def replace_community_settings(request: Request, payload: CommunitySettingsPaylo
                 "target_clip_duration_sec": normalized.target_clip_duration_sec,
                 "target_clip_duration_min_sec": normalized.target_clip_duration_min_sec,
                 "target_clip_duration_max_sec": normalized.target_clip_duration_max_sec,
+                "autoplay_next_reel": 1 if normalized.autoplay_next_reel else 0,
                 "updated_at": now_iso(),
             },
             pk="account_id",
@@ -6403,6 +6644,197 @@ def delete_community_set_via_post(request: Request, set_id: str):
     # Fallback for deployments/proxies that block DELETE with 405.
     _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
     return _delete_community_set_impl(request, set_id)
+
+
+# ---------------------------------------------------------------------------
+# Community Starred Sets
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/community/starred-sets", response_model=CommunityStarredSetsResponse)
+def get_community_starred_sets(request: Request):
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        rows = fetch_all(conn, "SELECT set_id FROM community_starred_sets WHERE account_id = ?", (str(account["id"]),))
+    return CommunityStarredSetsResponse(set_ids=[r["set_id"] for r in rows])
+
+
+@app.put("/api/community/starred-sets", response_model=CommunityStarredSetsResponse)
+def replace_community_starred_sets(request: Request, payload: CommunityStarredSetsPayload):
+    _enforce_rate_limit(request, "community-starred-sets", limit=90)
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        aid = str(account["id"])
+        execute_modify(conn, "DELETE FROM community_starred_sets WHERE account_id = ?", (aid,))
+        ts = now_iso()
+        for sid in payload.set_ids[:200]:  # cap at 200
+            insert(conn, "community_starred_sets", {"account_id": aid, "set_id": sid.strip(), "created_at": ts})
+    return CommunityStarredSetsResponse(set_ids=payload.set_ids[:200])
+
+
+# ---------------------------------------------------------------------------
+# Community Feed Snapshots
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/community/feed-snapshots")
+def get_community_feed_snapshots(request: Request):
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        rows = fetch_all(conn, "SELECT material_key, snapshot_json FROM community_feed_snapshots WHERE account_id = ? ORDER BY updated_at DESC LIMIT 50", (str(account["id"]),))
+    snapshots = {}
+    for r in rows:
+        try:
+            snapshots[r["material_key"]] = json.loads(r["snapshot_json"])
+        except Exception:
+            pass
+    return {"snapshots": snapshots}
+
+
+@app.put("/api/community/feed-snapshots/{key:path}")
+def upsert_community_feed_snapshot(key: str, request: Request, payload: CommunityFeedSnapshotPayload):
+    _enforce_rate_limit(request, "community-feed-snapshots", limit=90)
+    clean_key = key.strip()[:200]
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        aid = str(account["id"])
+        upsert(conn, "community_feed_snapshots", {
+            "account_id": aid,
+            "material_key": clean_key,
+            "snapshot_json": json.dumps(payload.snapshot),
+            "updated_at": now_iso(),
+        }, pk=["account_id", "material_key"])
+    return {"status": "ok"}
+
+
+@app.delete("/api/community/feed-snapshots/{key:path}")
+def delete_community_feed_snapshot(key: str, request: Request):
+    clean_key = key.strip()[:200]
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        execute_modify(conn, "DELETE FROM community_feed_snapshots WHERE account_id = ? AND material_key = ?", (str(account["id"]), clean_key))
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Community Drafts
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/community/drafts")
+def get_community_drafts(request: Request):
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        rows = fetch_all(conn, "SELECT draft_key, draft_json FROM community_drafts WHERE account_id = ? ORDER BY updated_at DESC LIMIT 50", (str(account["id"]),))
+    drafts = {}
+    for r in rows:
+        try:
+            drafts[r["draft_key"]] = json.loads(r["draft_json"])
+        except Exception:
+            pass
+    return {"drafts": drafts}
+
+
+@app.put("/api/community/drafts/{key:path}")
+def upsert_community_draft(key: str, request: Request, payload: CommunityDraftPayload):
+    _enforce_rate_limit(request, "community-drafts", limit=90)
+    clean_key = key.strip()[:200]
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        upsert(conn, "community_drafts", {
+            "account_id": str(account["id"]),
+            "draft_key": clean_key,
+            "draft_json": json.dumps(payload.draft),
+            "updated_at": now_iso(),
+        }, pk=["account_id", "draft_key"])
+    return {"status": "ok"}
+
+
+@app.delete("/api/community/drafts/{key:path}")
+def delete_community_draft(key: str, request: Request):
+    clean_key = key.strip()[:200]
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        execute_modify(conn, "DELETE FROM community_drafts WHERE account_id = ? AND draft_key = ?", (str(account["id"]), clean_key))
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Community Material Seeds
+# ---------------------------------------------------------------------------
+
+MAX_MATERIAL_SEEDS = 120
+
+
+@app.get("/api/community/material-seeds")
+def get_community_material_seeds(request: Request):
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        rows = fetch_all(conn, "SELECT material_id, seed_json FROM community_material_seeds WHERE account_id = ? ORDER BY updated_at DESC LIMIT ?", (str(account["id"]), MAX_MATERIAL_SEEDS))
+    seeds = {}
+    for r in rows:
+        try:
+            seeds[r["material_id"]] = json.loads(r["seed_json"])
+        except Exception:
+            pass
+    return {"seeds": seeds}
+
+
+@app.put("/api/community/material-seeds")
+def replace_community_material_seeds(request: Request, payload: CommunityMaterialSeedsPayload):
+    _enforce_rate_limit(request, "community-material-seeds", limit=90)
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        aid = str(account["id"])
+        execute_modify(conn, "DELETE FROM community_material_seeds WHERE account_id = ?", (aid,))
+        ts = now_iso()
+        for mid, seed in list(payload.seeds.items())[:MAX_MATERIAL_SEEDS]:
+            insert(conn, "community_material_seeds", {
+                "account_id": aid,
+                "material_id": mid.strip()[:500],
+                "seed_json": json.dumps(seed),
+                "updated_at": seed.get("updated_at", ts) if isinstance(seed, dict) else ts,
+            })
+    return {"seeds": payload.seeds}
+
+
+# ---------------------------------------------------------------------------
+# Community Material Groups
+# ---------------------------------------------------------------------------
+
+MAX_MATERIAL_GROUPS = 80
+
+
+@app.get("/api/community/material-groups")
+def get_community_material_groups(request: Request):
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        rows = fetch_all(conn, "SELECT group_id, group_json FROM community_material_groups WHERE account_id = ? ORDER BY updated_at DESC LIMIT ?", (str(account["id"]), MAX_MATERIAL_GROUPS))
+    groups = {}
+    for r in rows:
+        try:
+            groups[r["group_id"]] = json.loads(r["group_json"])
+        except Exception:
+            pass
+    return {"groups": groups}
+
+
+@app.put("/api/community/material-groups")
+def replace_community_material_groups(request: Request, payload: CommunityMaterialGroupsPayload):
+    _enforce_rate_limit(request, "community-material-groups", limit=90)
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        aid = str(account["id"])
+        execute_modify(conn, "DELETE FROM community_material_groups WHERE account_id = ?", (aid,))
+        ts = now_iso()
+        for gid, group in list(payload.groups.items())[:MAX_MATERIAL_GROUPS]:
+            insert(conn, "community_material_groups", {
+                "account_id": aid,
+                "group_id": gid.strip()[:500],
+                "group_json": json.dumps(group),
+                "updated_at": group.get("updated_at", ts) if isinstance(group, dict) else ts,
+            })
+    return {"groups": payload.groups}
 
 
 def _register_non_api_route_aliases() -> None:

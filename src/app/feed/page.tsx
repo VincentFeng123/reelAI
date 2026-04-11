@@ -462,6 +462,21 @@ function hasCompactedDescriptionText(reel: Reel): boolean {
   return false;
 }
 
+/** Format a caption timestamp as `M:SS` or `H:MM:SS`. Mirrors iOS FeedView helper. */
+function formatCaptionTimestamp(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    return "0:00";
+  }
+  const total = Math.round(seconds);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  }
+  return `${minutes}:${String(secs).padStart(2, "0")}`;
+}
+
 function selectStoredSessionWindow(reels: Reel[], activeIndex: number, maxReels: number): { reels: Reel[]; activeIndex: number } {
   if (reels.length <= maxReels) {
     return { reels, activeIndex: clamp(activeIndex, 0, Math.max(0, reels.length - 1)) };
@@ -774,6 +789,16 @@ function FeedPageInner() {
   const router = useRouter();
   const feedRouteKey = params.toString();
   const materialId = params.get("material_id") || "";
+  // Materials created by the new ingestion pipeline cannot be served by the legacy
+  // /api/reels/generate-stream or /api/feed paths — their reels are persisted via
+  // /api/ingest/search or /api/ingest/url and primed into the feed session snapshot
+  // in `UploadPanel.primeFeedSessionSnapshot`. We short-circuit every bootstrap /
+  // load-more / generate path for these materials so the feed renders the primed
+  // reels and never calls the broken legacy APIs.
+  const isIngestMaterial = useMemo(() => {
+    const id = (materialId || "").trim();
+    return id.startsWith("ingest-search:") || id === "ingest-scratch";
+  }, [materialId]);
   const generationModeParam = params.get("generation_mode");
   const communitySetIdParam = params.get("community_set_id") || "";
   const communitySetTitleParam = params.get("community_set_title") || "";
@@ -1823,6 +1848,15 @@ function FeedPageInner() {
     if (!settingsScopeReady || feedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
       return [];
     }
+    // Ingest-search / ingest-scratch materials cannot be served by the legacy
+    // /api/reels/generate-stream. Their reels come from /api/ingest/* and are
+    // already primed into the feed session via `primeFeedSessionSnapshot` in
+    // UploadPanel.tsx. Bail out before making any request.
+    if (isIngestMaterial) {
+      setCanRequestMore(false);
+      setFeedPagesExhausted(true);
+      return [];
+    }
     const searchScope = activeSearchScopeRef.current;
     const tuning = getFeedTuningSettings();
     const batchSize = isFastGeneration ? 10 : 14;
@@ -1962,6 +1996,7 @@ function FeedPageInner() {
     hasPendingRefinementForFeed,
     interleaveReelBatches,
     isFastGeneration,
+    isIngestMaterial,
     isSearchScopeActive,
     markRecoveryProgress,
     materialId,
@@ -2131,6 +2166,20 @@ function FeedPageInner() {
         }
       }
       setSessionHydrated(true);
+    }
+    // Ingest materials: never fall through to /api/feed — the primed snapshot IS the
+    // whole feed. If hydration somehow produced no reels, show the empty state; we
+    // can't recover from an ingest-search material through the legacy API.
+    const currentIsIngest =
+      materialId.startsWith("ingest-search:") || materialId === "ingest-scratch";
+    if (currentIsIngest) {
+      setCanRequestMore(false);
+      setFeedPagesExhausted(true);
+      if (!restoredSession || restoredSession.reels.length === 0) {
+        setLoading(false);
+        setSessionHydrated(true);
+      }
+      return;
     }
     if (!restoredSession || restoredSession.reels.length === 0) {
       void loadPage(1, { autofill: true });
@@ -2459,6 +2508,15 @@ function FeedPageInner() {
       if (!materialId || isGeneratingRef.current || !canRequestMore) {
         return;
       }
+      // Ingest materials: feed is pre-populated via the primed session snapshot.
+      // Do not trigger any legacy generate calls — they cannot service ingest
+      // sentinel materials and return "material_id not found".
+      if (isIngestMaterial) {
+        setBootstrappingFirstReels(false);
+        setCanRequestMore(false);
+        setFeedPagesExhausted(true);
+        return;
+      }
       const searchScope = activeSearchScopeRef.current;
       setBootstrappingFirstReels(true);
       try {
@@ -2472,7 +2530,7 @@ function FeedPageInner() {
         }
       }
     },
-    [canRequestMore, generationMode, isSearchScopeActive, materialId, requestMore, runFastTopUp],
+    [canRequestMore, generationMode, isIngestMaterial, isSearchScopeActive, materialId, requestMore, runFastTopUp],
   );
 
   useEffect(() => {
@@ -2486,11 +2544,22 @@ function FeedPageInner() {
     ) {
       return;
     }
+    // Ingest materials never enter the legacy bootstrap loop — primed snapshot only.
+    if (isIngestMaterial) {
+      bootstrapAttemptedRef.current = true;
+      return;
+    }
     bootstrapAttemptedRef.current = true;
     void bootstrapFirstReels(false);
-  }, [bootstrapFirstReels, bootstrappingFirstReels, feedNeedsBootstrapTopUp, loading, materialId, shouldBlockOnPendingRefinement]);
+  }, [bootstrapFirstReels, bootstrappingFirstReels, feedNeedsBootstrapTopUp, isIngestMaterial, loading, materialId, shouldBlockOnPendingRefinement]);
 
   const maybeLoadMore = useCallback(() => {
+    // Ingest materials: the primed session snapshot IS the whole feed. Don't call
+    // requestMore or loadPage — both hit the legacy /api/reels/generate-stream or
+    // /api/feed paths that cannot service an ingest-search sentinel.
+    if (isIngestMaterial) {
+      return;
+    }
     if (canRequestMore && !isGeneratingRef.current && feedNeedsBootstrapTopUp()) {
       if (shouldBlockOnPendingRefinement()) {
         return;
@@ -2521,7 +2590,7 @@ function FeedPageInner() {
         }
       })();
     }
-  }, [canRequestMore, feedNeedsBootstrapTopUp, generationMode, hasMore, loadPage, page, requestMore, runFastTopUp, shouldBlockOnPendingRefinement]);
+  }, [canRequestMore, feedNeedsBootstrapTopUp, generationMode, hasMore, isIngestMaterial, loadPage, page, requestMore, runFastTopUp, shouldBlockOnPendingRefinement]);
 
   const runBackgroundRecovery = useCallback(async () => {
     if (
@@ -2533,6 +2602,10 @@ function FeedPageInner() {
       || isFetchingRef.current
       || isGeneratingRef.current
     ) {
+      return;
+    }
+    // Ingest materials are static: no recovery possible, no legacy API to call.
+    if (isIngestMaterial) {
       return;
     }
     isBackgroundRecoveryRunningRef.current = true;
@@ -2571,6 +2644,7 @@ function FeedPageInner() {
     getFeedMaterialIds,
     hasMore,
     hasPendingRefinementForFeed,
+    isIngestMaterial,
     loadPage,
     materialId,
     page,
@@ -3653,6 +3727,45 @@ function FeedPageInner() {
                   ) : null}
                 </div>
 
+                {(activeReel.captions && activeReel.captions.length > 0) || (activeReel.transcript_snippet && activeReel.transcript_snippet.trim()) ? (
+                  <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Transcript</p>
+                      {activeReel.captions && activeReel.captions.length > 0 ? (
+                        <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/60">
+                          {activeReel.captions.length} cues
+                        </span>
+                      ) : null}
+                    </div>
+                    {activeReel.captions && activeReel.captions.length > 0 ? (
+                      <div className="max-h-64 overflow-y-auto pr-1">
+                        <ul className="flex flex-col gap-1.5">
+                          {activeReel.captions.map((cue, idx) => (
+                            <li
+                              key={`mobile-cue-${activeReel.reel_id}-${idx}`}
+                              className="flex items-start gap-2"
+                            >
+                              <span className="w-11 shrink-0 font-mono text-[10px] font-semibold leading-snug text-white/55">
+                                {formatCaptionTimestamp(cue.start)}
+                              </span>
+                              <span className="flex-1 break-words leading-snug [overflow-wrap:anywhere]">
+                                {cue.text}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : (
+                      <p className="break-words leading-snug [overflow-wrap:anywhere]">
+                        {activeReel.transcript_snippet}
+                      </p>
+                    )}
+                    {activeReel.source_attribution ? (
+                      <p className="mt-2 text-[10px] text-white/55">Source: {activeReel.source_attribution}</p>
+                    ) : null}
+                  </div>
+                ) : null}
+
               </div>
             </div>
           ) : null}
@@ -3699,7 +3812,7 @@ function FeedPageInner() {
                   />
                 </div>
 
-                <div className="mt-3 mb-0 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
                   <div className="mb-1 flex items-center justify-between gap-2">
                     <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Why This Matches</p>
                     {typeof activeReel.relevance_score === "number" ? (
@@ -3722,6 +3835,45 @@ function FeedPageInner() {
                     </div>
                   ) : null}
                 </div>
+
+                {(activeReel.captions && activeReel.captions.length > 0) || (activeReel.transcript_snippet && activeReel.transcript_snippet.trim()) ? (
+                  <div className="mt-3 mb-0 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                    <div className="mb-1 flex items-center justify-between gap-2">
+                      <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Transcript</p>
+                      {activeReel.captions && activeReel.captions.length > 0 ? (
+                        <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-white/60">
+                          {activeReel.captions.length} cues
+                        </span>
+                      ) : null}
+                    </div>
+                    {activeReel.captions && activeReel.captions.length > 0 ? (
+                      <div className="max-h-72 overflow-y-auto pr-1">
+                        <ul className="flex flex-col gap-1.5">
+                          {activeReel.captions.map((cue, idx) => (
+                            <li
+                              key={`desktop-cue-${activeReel.reel_id}-${idx}`}
+                              className="flex items-start gap-2"
+                            >
+                              <span className="w-11 shrink-0 font-mono text-[10px] font-semibold leading-snug text-white/55">
+                                {formatCaptionTimestamp(cue.start)}
+                              </span>
+                              <span className="flex-1 break-words leading-snug [overflow-wrap:anywhere]">
+                                {cue.text}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : (
+                      <p className="break-words leading-snug [overflow-wrap:anywhere]">
+                        {activeReel.transcript_snippet}
+                      </p>
+                    )}
+                    {activeReel.source_attribution ? (
+                      <p className="mt-2 text-[10px] text-white/55">Source: {activeReel.source_attribution}</p>
+                    ) : null}
+                  </div>
+                ) : null}
                 <div aria-hidden="true" className="h-1 shrink-0" />
 
               </div>

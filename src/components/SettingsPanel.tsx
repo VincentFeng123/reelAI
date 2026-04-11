@@ -266,6 +266,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   const [minRelevanceThreshold, setMinRelevanceThreshold] = useState(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
   const [startMuted, setStartMuted] = useState(DEFAULT_STUDY_REELS_SETTINGS.startMuted);
   const [autoplayNextReel, setAutoplayNextReel] = useState(DEFAULT_STUDY_REELS_SETTINGS.autoplayNextReel);
+  const [multiPlatformSearch, setMultiPlatformSearch] = useState(DEFAULT_STUDY_REELS_SETTINGS.multiPlatformSearch);
   const [videoPoolMode, setVideoPoolMode] = useState<VideoPoolMode>(DEFAULT_STUDY_REELS_SETTINGS.videoPoolMode);
   const [preferredVideoDuration, setPreferredVideoDuration] = useState<PreferredVideoDuration>(
     DEFAULT_STUDY_REELS_SETTINGS.preferredVideoDuration,
@@ -662,6 +663,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     setMinRelevanceThreshold(saved.minRelevanceThreshold);
     setStartMuted(saved.startMuted);
     setAutoplayNextReel(saved.autoplayNextReel);
+    setMultiPlatformSearch(saved.multiPlatformSearch);
     setVideoPoolMode(saved.videoPoolMode);
     setPreferredVideoDuration(saved.preferredVideoDuration);
     setTargetClipDurationMinSec(saved.targetClipDurationMinSec);
@@ -788,6 +790,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     setMinRelevanceThreshold(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
     setStartMuted(DEFAULT_STUDY_REELS_SETTINGS.startMuted);
     setAutoplayNextReel(DEFAULT_STUDY_REELS_SETTINGS.autoplayNextReel);
+    setMultiPlatformSearch(DEFAULT_STUDY_REELS_SETTINGS.multiPlatformSearch);
     setVideoPoolMode(DEFAULT_STUDY_REELS_SETTINGS.videoPoolMode);
     setPreferredVideoDuration(DEFAULT_STUDY_REELS_SETTINGS.preferredVideoDuration);
     setTargetClipDurationMinSec(DEFAULT_STUDY_REELS_SETTINGS.targetClipDurationMinSec);
@@ -815,6 +818,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
       savedPreferences.minRelevanceThreshold !== currentMinRelevance
       || savedPreferences.startMuted !== startMuted
       || savedPreferences.autoplayNextReel !== autoplayNextReel
+      || savedPreferences.multiPlatformSearch !== multiPlatformSearch
       || savedPreferences.videoPoolMode !== videoPoolMode
       || savedPreferences.preferredVideoDuration !== preferredVideoDuration
       || savedPreferences.targetClipDurationMinSec !== targetClipDurationMinSec
@@ -823,6 +827,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   }, [
     autoplayNextReel,
     minRelevanceThreshold,
+    multiPlatformSearch,
     preferredVideoDuration,
     savedPreferences,
     startMuted,
@@ -846,6 +851,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
       targetClipDurationSec,
       targetClipDurationMinSec,
       targetClipDurationMaxSec,
+      multiPlatformSearch,
     });
     setSavedPreferences(saved);
     showNotice("Settings saved and applied.");
@@ -857,6 +863,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     generationModeForChecks,
     onSettingsSaved,
     minRelevanceThreshold,
+    multiPlatformSearch,
     preferredVideoDuration,
     runAvailabilityCheck,
     settingsHydrated,
@@ -872,6 +879,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     setMinRelevanceThreshold(saved.minRelevanceThreshold);
     setStartMuted(saved.startMuted);
     setAutoplayNextReel(saved.autoplayNextReel);
+    setMultiPlatformSearch(saved.multiPlatformSearch);
     setVideoPoolMode(saved.videoPoolMode);
     setPreferredVideoDuration(saved.preferredVideoDuration);
     setTargetClipDurationMinSec(saved.targetClipDurationMinSec);
@@ -1327,6 +1335,31 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                 <span
                   className={`absolute top-0.5 h-[22px] w-[22px] rounded-full transition-transform duration-200 ${
                     autoplayNextReel ? "translate-x-[24px] bg-black" : "translate-x-[2px] bg-white"
+                  }`}
+                />
+              </button>
+            </div>
+            <div className="mt-4 flex items-start justify-between gap-4 border-t border-white/10 pt-4">
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <p className="text-sm font-semibold text-white/95">Search all platforms</p>
+                  <SettingsInfoTooltip text="When on, topic / text / file submits scrape real reels from YouTube, Instagram, and TikTok. When off, searches use the legacy YouTube-only pipeline (faster, narrower coverage)." />
+                </div>
+                <p className="mt-1 text-[11px] text-white/58">
+                  {multiPlatformSearch ? "YouTube + Instagram + TikTok" : "YouTube only (faster)"}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMultiPlatformSearch((prev) => !prev)}
+                aria-pressed={multiPlatformSearch}
+                className={`relative mt-0.5 inline-flex h-7 w-12 shrink-0 rounded-full border transition-colors duration-200 ${
+                  multiPlatformSearch ? "border-white bg-white" : "border-white/32 bg-black/50"
+                }`}
+              >
+                <span
+                  className={`absolute top-0.5 h-[22px] w-[22px] rounded-full transition-transform duration-200 ${
+                    multiPlatformSearch ? "translate-x-[24px] bg-black" : "translate-x-[2px] bg-white"
                   }`}
                 />
               </button>

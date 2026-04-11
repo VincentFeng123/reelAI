@@ -6,6 +6,10 @@ import type {
   CommunitySet,
   CommunityReelPlatform,
   FeedResponse,
+  IngestResult,
+  IngestSearchRequest,
+  IngestSearchResult,
+  IngestUrlRequest,
   MaterialResponse,
   Reel,
   RefinementStatusResponse,
@@ -759,6 +763,119 @@ export async function generateReels(params: GenerateReelsParams): Promise<ReelsG
   return parseJsonResponse<ReelsGenerateResponse>(res);
 }
 
+// Maps the web app's settings-friendly camelCase to the snake_case the backend expects.
+type IngestUrlParams = {
+  sourceUrl: string;
+  materialId?: string | null;
+  conceptId?: string | null;
+  targetClipDurationSec?: number;
+  targetClipDurationMinSec?: number;
+  targetClipDurationMaxSec?: number;
+  language?: string;
+  signal?: AbortSignal;
+};
+
+/**
+ * POST /api/ingest/url — downloads the reel server-side, runs the full ingestion
+ * pipeline (yt-dlp → ffmpeg → transcript with Whisper fallback → silence-aware clip
+ * window → metadata extraction), and persists a ReelOut-compatible record under
+ * the `ingest-scratch` sentinel material when no material_id is supplied.
+ *
+ * Uses a 180-second timeout because the Whisper fallback path can take 20-60s for
+ * longer reels (the backend uploads the audio to OpenAI).
+ */
+type IngestSearchParams = {
+  query: string;
+  platforms?: Array<"yt" | "ig" | "tt">;
+  maxPerPlatform?: number;
+  materialId?: string | null;
+  conceptId?: string | null;
+  targetClipDurationSec?: number;
+  targetClipDurationMinSec?: number;
+  targetClipDurationMaxSec?: number;
+  language?: string;
+  excludeVideoIds?: string[];
+  signal?: AbortSignal;
+};
+
+/**
+ * POST /api/ingest/search — topic-based multi-platform search across YouTube,
+ * Instagram, and TikTok. For each platform, yt-dlp resolves reel URLs via its
+ * native search extractors; each URL then flows through the same ingest_url
+ * pipeline (Whisper fallback, smart cuts, full metadata).
+ *
+ * Uses a 300s timeout because a 3-platform search of 4 reels each can take
+ * 1-3 minutes when Whisper is hit on every item. For infinite-scroll pagination,
+ * pass every already-seen reel's bare `source_id` in `excludeVideoIds`.
+ *
+ * Per-platform failures are non-fatal — the response carries `per_platform_errors`
+ * so the client can surface which platform went down.
+ */
+export async function ingestSearch(params: IngestSearchParams): Promise<IngestSearchResult> {
+  const body: IngestSearchRequest = {
+    query: params.query,
+    platforms: params.platforms,
+    max_per_platform: Number.isFinite(params.maxPerPlatform)
+      ? Math.round(params.maxPerPlatform as number)
+      : undefined,
+    material_id: params.materialId ?? undefined,
+    concept_id: params.conceptId ?? undefined,
+    target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec)
+      ? Math.round(params.targetClipDurationSec as number)
+      : undefined,
+    target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
+      ? Math.round(params.targetClipDurationMinSec as number)
+      : undefined,
+    target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
+      ? Math.round(params.targetClipDurationMaxSec as number)
+      : undefined,
+    language: params.language,
+    exclude_video_ids: params.excludeVideoIds,
+  };
+
+  const res = await safeFetch(apiUrl("/ingest/search"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal: params.signal,
+    timeoutMs: 300_000,
+  });
+
+  return parseJsonResponse<IngestSearchResult>(res);
+}
+
+export async function ingestUrl(params: IngestUrlParams): Promise<IngestResult> {
+  const body: IngestUrlRequest = {
+    source_url: params.sourceUrl,
+    material_id: params.materialId ?? undefined,
+    concept_id: params.conceptId ?? undefined,
+    target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec)
+      ? Math.round(params.targetClipDurationSec as number)
+      : undefined,
+    target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
+      ? Math.round(params.targetClipDurationMinSec as number)
+      : undefined,
+    target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
+      ? Math.round(params.targetClipDurationMaxSec as number)
+      : undefined,
+    language: params.language,
+  };
+
+  const res = await safeFetch(apiUrl("/ingest/url"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal: params.signal,
+    timeoutMs: 180_000,
+  });
+
+  return parseJsonResponse<IngestResult>(res);
+}
+
 export async function generateReelsStream(
   params: GenerateReelsParams & {
     signal?: AbortSignal;
@@ -1256,6 +1373,9 @@ function normalizeCommunitySettings(raw: unknown): StudyReelsSettings {
     return normalizeStudyReelsSettings({});
   }
   const row = raw as Record<string, unknown>;
+  // `multiPlatformSearch` is local-only (server doesn't store it), so we preserve
+  // whatever the client already has. Same pattern as `autoplayNextReel`.
+  const localSettings = readStudyReelsSettings();
   return normalizeStudyReelsSettings({
     generationMode: row.generation_mode as string | null | undefined,
     defaultInputMode: row.default_input_mode as string | null | undefined,
@@ -1263,12 +1383,13 @@ function normalizeCommunitySettings(raw: unknown): StudyReelsSettings {
     startMuted: row.start_muted as string | boolean | null | undefined,
     autoplayNextReel: (row.autoplay_next_reel as string | boolean | null | undefined)
       ?? (row.autoplayNextReel as string | boolean | null | undefined)
-      ?? readStudyReelsSettings().autoplayNextReel,
+      ?? localSettings.autoplayNextReel,
     videoPoolMode: row.video_pool_mode as string | null | undefined,
     preferredVideoDuration: row.preferred_video_duration as string | null | undefined,
     targetClipDurationSec: row.target_clip_duration_sec as string | number | null | undefined,
     targetClipDurationMinSec: row.target_clip_duration_min_sec as string | number | null | undefined,
     targetClipDurationMaxSec: row.target_clip_duration_max_sec as string | number | null | undefined,
+    multiPlatformSearch: localSettings.multiPlatformSearch,
   });
 }
 

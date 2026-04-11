@@ -3,23 +3,64 @@
 import { type DragEvent, type FormEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { uploadMaterial } from "@/lib/api";
+import { ingestSearch, ingestUrl, uploadMaterial } from "@/lib/api";
 import { safeStorageSetItem } from "@/lib/browserStorage";
 import { buildSearchFeedQuery } from "@/lib/feedQuery";
 import { type GenerationMode, type SearchInputMode, readStudyReelsSettings, subscribeToStudyReelsSettings } from "@/lib/settings";
+import type { Reel } from "@/lib/types";
 
 const MATERIAL_SEEDS_STORAGE_KEY = "studyreels-material-seeds";
 const MATERIAL_GROUPS_STORAGE_KEY = "studyreels-material-groups";
 const MAX_MATERIAL_SEEDS = 120;
 const MAX_MATERIAL_GROUPS = 80;
 const MAX_SEED_TEXT_CHARS = 16000;
+const INGEST_SENTINEL_MATERIAL_ID = "ingest-scratch";
+// Must stay in sync with FEED_SESSION_STORAGE_KEY in src/app/feed/page.tsx — both
+// read/write the same localStorage key. Priming the session snapshot here lets the
+// feed page hydrate with ingested reels on mount instead of calling the legacy
+// /api/reels/generate-stream path on an ingest-search/ingest-scratch sentinel
+// material (which cannot be served by the old pipeline and returns "not found").
+const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 type InputMode = SearchInputMode;
 
 const INPUT_MODE_OPTIONS: Array<{ value: InputMode; label: string }> = [
   { value: "topic", label: "Topic" },
   { value: "source", label: "Text" },
   { value: "file", label: "File Upload" },
+  { value: "url", label: "Reel URL" },
 ];
+
+const INGEST_URL_HOST_ALLOWLIST = new Set([
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "youtu.be",
+  "music.youtube.com",
+  "instagram.com",
+  "www.instagram.com",
+  "tiktok.com",
+  "www.tiktok.com",
+  "vm.tiktok.com",
+  "m.tiktok.com",
+]);
+
+/**
+ * Lightweight client-side sanity check so we don't POST every keystroke to the backend.
+ * The backend still does the authoritative host check via the yt-dlp adapter.
+ */
+function isLikelyIngestUrl(raw: string): boolean {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return false;
+  }
+  const candidate = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    const parsed = new URL(candidate);
+    return INGEST_URL_HOST_ALLOWLIST.has(parsed.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
 
 type MaterialSeed = {
   topic?: string;
@@ -125,6 +166,83 @@ type UploadPanelProps = {
   heroTitleRef?: RefObject<HTMLHeadingElement | null>;
 };
 
+/**
+ * Minimal shape of the feed-page's `FeedSessionSnapshot` stored under
+ * `FEED_SESSION_STORAGE_KEY`. Intentionally duplicated here rather than imported
+ * from `src/app/feed/page.tsx` (which is a Next.js page module). Field names must
+ * exactly match `feed/page.tsx` or hydration will silently fail.
+ */
+type PrimedFeedSessionSnapshot = {
+  reels: Reel[];
+  page: number;
+  total: number;
+  canRequestMore: boolean;
+  generationMode: GenerationMode;
+  mutedPreference: boolean;
+  autoplayEnabled: boolean;
+  playbackRate: number;
+  activeIndex: number;
+  activeReelId?: string;
+  updatedAt: number;
+};
+
+/**
+ * Write a snapshot into localStorage under the feed page's session key so that
+ * `feed/page.tsx`'s hydration on mount picks up the primed reels and skips the
+ * legacy generate path. Robust against localStorage quota failures (they're
+ * silently ignored — the feed page will fall through to its normal bootstrap
+ * flow, which our `isIngestMaterial` short-circuit in the feed page also handles).
+ */
+function primeFeedSessionSnapshot(
+  materialId: string,
+  reels: Reel[],
+  activeReelId: string | undefined,
+  settings: ReturnType<typeof readStudyReelsSettings>,
+): void {
+  if (typeof window === "undefined" || reels.length === 0) {
+    return;
+  }
+  let activeIndex = 0;
+  if (activeReelId) {
+    const found = reels.findIndex((r) => r.reel_id === activeReelId);
+    if (found >= 0) {
+      activeIndex = found;
+    }
+  }
+  const snapshot: PrimedFeedSessionSnapshot = {
+    reels,
+    page: 1,
+    total: reels.length,
+    canRequestMore: false,
+    generationMode: settings.generationMode,
+    mutedPreference: settings.startMuted,
+    autoplayEnabled: settings.autoplayNextReel,
+    playbackRate: 1,
+    activeIndex,
+    activeReelId,
+    updatedAt: Date.now(),
+  };
+  try {
+    const raw = window.localStorage.getItem(FEED_SESSION_STORAGE_KEY);
+    let existing: Record<string, unknown> = {};
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          existing = parsed as Record<string, unknown>;
+        }
+      } catch {
+        existing = {};
+      }
+    }
+    existing[materialId] = snapshot;
+    safeStorageSetItem(window.localStorage, FEED_SESSION_STORAGE_KEY, JSON.stringify(existing));
+  } catch {
+    // Ignore storage failures — the feed page will still handle ingest materials
+    // correctly via its isIngestMaterial short-circuit.
+  }
+}
+
 function buildMaterialTitle(params: { topic: string; text: string; fileName: string }): string {
   const topic = params.topic.trim();
   if (topic) {
@@ -147,6 +265,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
   const [topics, setTopics] = useState<string[]>([""]);
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | undefined>();
+  const [reelUrl, setReelUrl] = useState("");
   const [inputMode, setInputMode] = useState<InputMode>("source");
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -174,8 +293,11 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
     if (inputMode === "source") {
       return !text.trim();
     }
+    if (inputMode === "url") {
+      return !isLikelyIngestUrl(reelUrl);
+    }
     return !file;
-  }, [file, inputMode, loading, text, topics]);
+  }, [file, inputMode, loading, reelUrl, text, topics]);
 
   const onSubmit = useCallback(async (event: FormEvent) => {
     event.preventDefault();
@@ -185,6 +307,249 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
     try {
       const activeSettings = readStudyReelsSettings();
       const generationModeForSearch = activeSettings.generationMode;
+      const useMultiPlatformSearch = activeSettings.multiPlatformSearch;
+
+      // Shared helper: navigate to the feed scoped to the ingestSearch-returned
+      // material and persist a local seed so the history panel shows the entry.
+      const launchMultiPlatformFeed = async (params: {
+        query: string;
+        title: string;
+        topic?: string;
+        firstReelId?: string;
+        materialId: string;
+      }) => {
+        if (typeof window !== "undefined") {
+          const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
+          seeds[params.materialId] = {
+            topic: params.topic,
+            text: undefined,
+            title: params.title,
+            updatedAt: Date.now(),
+          };
+          const ordered = Object.entries(seeds)
+            .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+            .slice(0, MAX_MATERIAL_SEEDS);
+          safeStorageSetItem(window.localStorage, MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
+        }
+        if (onMaterialCreated) {
+          const feedQuery = buildSearchFeedQuery({
+            materialId: params.materialId,
+            generationMode: generationModeForSearch,
+            returnTab: "search",
+            settings: activeSettings,
+          });
+          await onMaterialCreated({
+            materialId: params.materialId,
+            title: params.title,
+            topic: params.topic,
+            generationMode: generationModeForSearch,
+            feedQuery,
+          });
+        }
+        const searchFeedQuery = buildSearchFeedQuery({
+          materialId: params.materialId,
+          generationMode: generationModeForSearch,
+          returnTab: "search",
+          settings: activeSettings,
+        });
+        const suffix = params.firstReelId
+          ? `&active_reel_id=${encodeURIComponent(params.firstReelId)}`
+          : "";
+        router.push(`/feed?${searchFeedQuery}${suffix}`);
+      };
+
+      // Topic / text / file with multi-platform search ON: route through
+      // /api/ingest/search so we get real scraping across YouTube, Instagram, and
+      // TikTok. Topic is the simplest (topic text IS the query). Text and file need
+      // a two-step flow: upload via /api/material first so the backend's LLM concept
+      // extractor can turn prose/files into useful search terms, then call ingestSearch
+      // with the top concept titles joined as the query.
+      // Helper: extract successful reels from an IngestSearchResult into a flat Reel[].
+      const collectSuccessfulReels = (items: Array<{ status: string; reel?: Reel | null | undefined }>): Reel[] => {
+        const out: Reel[] = [];
+        for (const item of items) {
+          if (item.status === "ok" && item.reel) {
+            out.push(item.reel);
+          }
+        }
+        return out;
+      };
+
+      if (useMultiPlatformSearch && inputMode === "topic") {
+        const topicList = topics.map((t) => t.trim()).filter(Boolean);
+        const combinedQuery = topicList.join(" ").trim();
+        if (!combinedQuery) {
+          throw new Error("Enter a topic before searching.");
+        }
+        const searchResult = await ingestSearch({
+          query: combinedQuery,
+          platforms: ["yt", "ig", "tt"],
+          maxPerPlatform: 4,
+          targetClipDurationSec: activeSettings.targetClipDurationSec,
+          targetClipDurationMinSec: activeSettings.targetClipDurationMinSec,
+          targetClipDurationMaxSec: activeSettings.targetClipDurationMaxSec,
+        });
+        const successfulReels = collectSuccessfulReels(searchResult.items);
+        if (successfulReels.length === 0) {
+          throw new Error(`No reels found for “${combinedQuery}”. Try a different topic.`);
+        }
+        const materialId = searchResult.material_id || "ingest-search:unknown";
+        const firstReelId = successfulReels[0]?.reel_id;
+        primeFeedSessionSnapshot(materialId, successfulReels, firstReelId, activeSettings);
+        await launchMultiPlatformFeed({
+          query: combinedQuery,
+          title: combinedQuery.slice(0, 58),
+          topic: combinedQuery,
+          firstReelId,
+          materialId,
+        });
+        setTopics([""]);
+        return;
+      }
+
+      if (useMultiPlatformSearch && inputMode === "source") {
+        const trimmedText = text.trim();
+        if (!trimmedText) {
+          throw new Error("Enter some text before searching.");
+        }
+        const material = await uploadMaterial({ text: trimmedText });
+        const conceptTitles = (material.extracted_concepts ?? [])
+          .slice(0, 3)
+          .map((c) => (c?.title ?? "").trim())
+          .filter(Boolean);
+        const query = conceptTitles.length > 0
+          ? conceptTitles.join(" ")
+          : trimmedText.replace(/\s+/g, " ").slice(0, 180);
+        const searchResult = await ingestSearch({
+          query,
+          platforms: ["yt", "ig", "tt"],
+          maxPerPlatform: 4,
+          targetClipDurationSec: activeSettings.targetClipDurationSec,
+          targetClipDurationMinSec: activeSettings.targetClipDurationMinSec,
+          targetClipDurationMaxSec: activeSettings.targetClipDurationMaxSec,
+        });
+        const successfulReels = collectSuccessfulReels(searchResult.items);
+        if (successfulReels.length === 0) {
+          throw new Error("No reels found for your text. Try a different source.");
+        }
+        const materialId = searchResult.material_id || "ingest-search:unknown";
+        const firstReelId = successfulReels[0]?.reel_id;
+        const title = trimmedText.replace(/\s+/g, " ").slice(0, 58);
+        primeFeedSessionSnapshot(materialId, successfulReels, firstReelId, activeSettings);
+        await launchMultiPlatformFeed({
+          query,
+          title: title || "Study Session",
+          firstReelId,
+          materialId,
+        });
+        setText("");
+        return;
+      }
+
+      if (useMultiPlatformSearch && inputMode === "file") {
+        if (!file) {
+          throw new Error("Pick a file before searching.");
+        }
+        const material = await uploadMaterial({ file });
+        const conceptTitles = (material.extracted_concepts ?? [])
+          .slice(0, 3)
+          .map((c) => (c?.title ?? "").trim())
+          .filter(Boolean);
+        const fileName = file.name;
+        const query = conceptTitles.length > 0
+          ? conceptTitles.join(" ")
+          : fileName.replace(/\.[^.]+$/, "").replace(/[_\-]+/g, " ").slice(0, 180);
+        const searchResult = await ingestSearch({
+          query,
+          platforms: ["yt", "ig", "tt"],
+          maxPerPlatform: 4,
+          targetClipDurationSec: activeSettings.targetClipDurationSec,
+          targetClipDurationMinSec: activeSettings.targetClipDurationMinSec,
+          targetClipDurationMaxSec: activeSettings.targetClipDurationMaxSec,
+        });
+        const successfulReels = collectSuccessfulReels(searchResult.items);
+        if (successfulReels.length === 0) {
+          throw new Error("No reels found for your file. Try a different document.");
+        }
+        const materialId = searchResult.material_id || "ingest-search:unknown";
+        const firstReelId = successfulReels[0]?.reel_id;
+        primeFeedSessionSnapshot(materialId, successfulReels, firstReelId, activeSettings);
+        await launchMultiPlatformFeed({
+          query,
+          title: fileName.slice(0, 58),
+          firstReelId,
+          materialId,
+        });
+        setFile(undefined);
+        return;
+      }
+
+      // URL ingest path diverges completely from the material-upload path: we call
+      // /api/ingest/url instead of /api/material, then land on the feed scoped to
+      // the `ingest-scratch` sentinel material so prior ingests form a scrollable feed.
+      if (inputMode === "url") {
+        const trimmed = reelUrl.trim();
+        const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+        const result = await ingestUrl({
+          sourceUrl: normalized,
+          targetClipDurationSec: activeSettings.targetClipDurationSec,
+          targetClipDurationMinSec: activeSettings.targetClipDurationMinSec,
+          targetClipDurationMaxSec: activeSettings.targetClipDurationMaxSec,
+        });
+        const ingestedReel = result.reel;
+        const ingestedMetadata = result.metadata;
+        const ingestMaterialId = ingestedReel.material_id || INGEST_SENTINEL_MATERIAL_ID;
+        const ingestTitle =
+          (ingestedReel.video_title?.trim() ||
+            ingestedMetadata.title?.trim() ||
+            (ingestedMetadata.author_handle ? `@${ingestedMetadata.author_handle}` : "") ||
+            "Ingested reel").slice(0, 58);
+
+        // Prime the feed snapshot with the single ingested reel so the feed page's
+        // bootstrap hydrates with it and skips the legacy generate path.
+        primeFeedSessionSnapshot(ingestMaterialId, [ingestedReel], ingestedReel.reel_id, activeSettings);
+
+        if (typeof window !== "undefined") {
+          const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
+          seeds[ingestMaterialId] = {
+            topic: undefined,
+            text: undefined,
+            title: ingestTitle,
+            updatedAt: Date.now(),
+          };
+          const ordered = Object.entries(seeds)
+            .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
+            .slice(0, MAX_MATERIAL_SEEDS);
+          safeStorageSetItem(window.localStorage, MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
+        }
+
+        if (onMaterialCreated) {
+          const feedQuery = buildSearchFeedQuery({
+            materialId: ingestMaterialId,
+            generationMode: generationModeForSearch,
+            returnTab: "search",
+            settings: activeSettings,
+          });
+          await onMaterialCreated({
+            materialId: ingestMaterialId,
+            title: ingestTitle,
+            topic: undefined,
+            generationMode: generationModeForSearch,
+            feedQuery,
+          });
+        }
+
+        const ingestFeedQuery = buildSearchFeedQuery({
+          materialId: ingestMaterialId,
+          generationMode: generationModeForSearch,
+          returnTab: "search",
+          settings: activeSettings,
+        });
+        router.push(`/feed?${ingestFeedQuery}&active_reel_id=${encodeURIComponent(ingestedReel.reel_id)}`);
+        setReelUrl("");
+        return;
+      }
+
       const topicList = inputMode === "topic" ? topics.map((t) => t.trim()).filter(Boolean) : [];
       const topicValue = topicList.join(", ");
       const textValue = inputMode === "source" ? text.trim() : "";
@@ -289,7 +654,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
     } finally {
       setLoading(false);
     }
-  }, [file, inputMode, onMaterialCreated, router, text, topics]);
+  }, [file, inputMode, onMaterialCreated, reelUrl, router, text, topics]);
 
   const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
@@ -408,16 +773,16 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         onChange={(e) => setFile(e.target.files?.[0])}
       />
 
-      <div className="relative z-20 mt-8 max-w-[300px] md:mt-2 md:max-w-[390px]">
+      <div className="relative z-20 mt-8 max-w-[300px] md:mt-2 md:max-w-[430px]">
         <p className="mb-2 text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Input Mode</p>
         <div
           role="tablist"
           aria-label="Select input mode"
-          className="relative grid w-full grid-cols-3 rounded-2xl border border-white/15 bg-white/[0.08] p-1 backdrop-blur-[18px] backdrop-saturate-150"
+          className="relative grid w-full grid-cols-4 rounded-2xl border border-white/15 bg-white/[0.08] p-1 backdrop-blur-[18px] backdrop-saturate-150"
         >
           <span
             aria-hidden="true"
-            className="pointer-events-none absolute bottom-1 left-1 top-1 w-[calc((100%-8px)/3)] rounded-xl bg-white transition-transform duration-300 ease-out"
+            className="pointer-events-none absolute bottom-1 left-1 top-1 w-[calc((100%-8px)/4)] rounded-xl bg-white transition-transform duration-300 ease-out"
             style={{
               transform: `translateX(${INPUT_MODE_OPTIONS.findIndex((option) => option.value === inputMode) * 100}%)`,
             }}
@@ -432,7 +797,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
                 setInputMode(option.value);
                 setError(null);
               }}
-              className={`relative z-10 rounded-xl px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.07em] transition-colors md:px-3 md:py-2 md:text-xs ${
+              className={`relative z-10 rounded-xl px-1.5 py-1.5 text-[10px] font-semibold uppercase tracking-[0.05em] transition-colors md:px-2.5 md:py-2 md:text-[11px] ${
                 inputMode === option.value ? "text-black" : "text-white/80 hover:text-white"
               }`}
             >
@@ -522,6 +887,30 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
               </p>
               <p className="mt-1 text-xs text-white/58">{selectedFileName ? "Click to replace file" : "Or click to browse (PDF, DOCX, TXT)"}</p>
             </label>
+          </>
+        ) : null}
+
+        {inputMode === "url" ? (
+          <>
+            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Reel URL</label>
+            <div className="h-full flex flex-col gap-3">
+              <div className="rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 focus-within:bg-white/[0.12]">
+                <input
+                  type="url"
+                  inputMode="url"
+                  autoComplete="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
+                  className="h-12 w-full rounded-2xl border-0 bg-transparent px-4 text-sm text-white outline-none placeholder:text-white/40"
+                  placeholder="Paste an Instagram, TikTok, or YouTube URL"
+                  value={reelUrl}
+                  onChange={(e) => setReelUrl(e.target.value)}
+                />
+              </div>
+              <p className="px-1 text-[11px] leading-snug text-white/55">
+                Downloads, transcribes (Whisper fallback if needed), and extracts a clip with full metadata. Public reels only.
+              </p>
+            </div>
           </>
         ) : null}
       </div>
