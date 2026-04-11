@@ -396,6 +396,53 @@ def _parse_ip_literal(raw_value: str) -> str | None:
         return None
 
 
+# Trusted reverse-proxy CIDRs whose X-Forwarded-For / CF-Connecting-IP / X-Real-IP
+# headers we will honor. Anything not in this list is treated as a direct peer and
+# any forwarded-IP headers are ignored — this prevents attackers from spoofing
+# `X-Forwarded-For: 1.2.3.4` to escape per-IP rate limits when the service is
+# exposed directly. Configure via the `TRUSTED_PROXY_CIDRS` env var as a
+# comma-separated list. Loopback and RFC1918 ranges are always trusted so local
+# development and intra-cluster traffic continues to work.
+_LOCAL_TRUSTED_CIDRS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+)
+
+
+def _load_trusted_proxy_cidrs() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    raw = str(os.getenv("TRUSTED_PROXY_CIDRS") or "").strip()
+    extra: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+    if raw:
+        for token in raw.split(","):
+            clean = token.strip()
+            if not clean:
+                continue
+            try:
+                extra.append(ipaddress.ip_network(clean, strict=False))
+            except ValueError:
+                logger.warning("Ignoring invalid TRUSTED_PROXY_CIDRS entry: %s", clean)
+    return (*_LOCAL_TRUSTED_CIDRS, *extra)
+
+
+_TRUSTED_PROXY_CIDRS = _load_trusted_proxy_cidrs()
+
+
+def _peer_is_trusted_proxy(peer_host: str) -> bool:
+    candidate = str(peer_host or "").strip()
+    if not candidate:
+        return False
+    try:
+        peer_ip = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return any(peer_ip in net for net in _TRUSTED_PROXY_CIDRS)
+
+
 def _extract_forwarded_ip(request: Request) -> str | None:
     for header_name in ("cf-connecting-ip", "x-real-ip"):
         raw = request.headers.get(header_name, "").strip()
@@ -424,11 +471,17 @@ def _extract_forwarded_ip(request: Request) -> str | None:
 
 def _client_ip(request: Request) -> str:
     peer_host = request.client.host if request.client and request.client.host else ""
-    if not peer_host:
-        return _extract_forwarded_ip(request) or "unknown"
-    if not _is_public_host(peer_host):
-        return _extract_forwarded_ip(request) or peer_host
-    return peer_host
+    if peer_host and _peer_is_trusted_proxy(peer_host):
+        # Only honor forwarded-IP headers from trusted proxies. Attackers with a
+        # direct connection to the server cannot forge X-Forwarded-For to escape
+        # rate limits.
+        forwarded = _extract_forwarded_ip(request)
+        if forwarded:
+            return forwarded
+        return peer_host
+    if peer_host:
+        return peer_host
+    return "unknown"
 
 
 def _sweep_rate_limit_buckets(now: float, window_sec: float) -> None:
@@ -519,8 +572,45 @@ def _check_rate_limit_key_persistent(key: str, *, limit: int, window_sec: float)
         )
 
 
+def _rate_limit_identity_key(request: Request) -> str:
+    """
+    Preferred rate-limit bucket key for a request. Uses the owner key hash when
+    present (per-device identity, survives IP changes, can't be shared across
+    malicious peers), and falls back to the trusted-proxy client IP otherwise.
+    """
+    owner_hash = _community_owner_hash_from_request_optional(request)
+    if owner_hash:
+        return f"owner:{owner_hash}"
+    return f"ip:{_client_ip(request)}"
+
+
 def _enforce_rate_limit(request: Request, scope: str, *, limit: int, window_sec: float = RATE_LIMIT_WINDOW_SEC) -> None:
-    _check_rate_limit_key(f"{scope}:{_client_ip(request)}", limit=limit, window_sec=window_sec)
+    _check_rate_limit_key(
+        f"{scope}:{_rate_limit_identity_key(request)}",
+        limit=limit,
+        window_sec=window_sec,
+    )
+
+
+def _require_community_client_identity(request: Request) -> str:
+    """
+    Require the caller to identify themselves with an owner key. Returns the
+    owner key hash. Raises 401 if the header is missing so anonymous bots can't
+    hit expensive retrieval endpoints.
+
+    Every shipped client (iOS + webapp) auto-generates and persists an owner
+    key on first launch, so this is transparent to real users. The owner key
+    is still a weak identifier — a determined attacker can generate arbitrary
+    keys — but it closes casual API scraping and gives us a per-device bucket
+    for rate limiting.
+    """
+    owner_hash = _community_owner_hash_from_request_optional(request)
+    if not owner_hash:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing client identity header.",
+        )
+    return owner_hash
 
 
 def _normalize_owner_key(raw_key: str | None) -> str:
@@ -3114,7 +3204,14 @@ def _normalize_excluded_video_ids(values: list[str] | tuple[str, ...] | set[str]
 def _parse_excluded_video_ids_param(raw_value: str | None) -> list[str]:
     if not raw_value:
         return []
-    return _normalize_excluded_video_ids(raw_value.split(","))
+    # Cap raw input length and the resulting list to keep a malicious client
+    # from sending a megabyte of exclusion IDs.
+    if len(raw_value) > 16_000:
+        raw_value = raw_value[:16_000]
+    normalized = _normalize_excluded_video_ids(raw_value.split(","))
+    if len(normalized) > 500:
+        normalized = normalized[-500:]
+    return normalized
 
 
 def _short_debug_token(value: str | None, *, limit: int = 12) -> str | None:
@@ -5180,6 +5277,7 @@ async def create_material(
 
 @app.post("/api/reels/generate", response_model=ReelsGenerateResponse)
 def generate_reels(request: Request, payload: ReelsGenerateRequest):
+    _require_community_client_identity(request)
     _enforce_rate_limit(request, "reels-generate", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
@@ -5196,6 +5294,10 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
     with get_conn() as conn:
         material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
         if not material:
+            # Keep the string detail form so existing deployed clients that
+            # substring-match on "material_id not found" continue to work.
+            # iOS/web clients should prefer HTTP 404 + this marker over
+            # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
 
         effective_generation_mode: Literal["slow", "fast"] = "fast" if SERVERLESS_MODE else payload.generation_mode
@@ -5424,6 +5526,7 @@ def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> Ingest
 
 @app.post("/api/reels/generate-stream")
 async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest):
+    _require_community_client_identity(request)
     _enforce_rate_limit(request, "reels-generate", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
@@ -5440,17 +5543,33 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
     with get_conn() as conn:
         material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
         if not material:
+            # Keep the string detail form so existing deployed clients that
+            # substring-match on "material_id not found" continue to work.
+            # iOS/web clients should prefer HTTP 404 + this marker over
+            # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
 
     effective_generation_mode: Literal["slow", "fast"] = "fast" if SERVERLESS_MODE else payload.generation_mode
 
     async def event_stream():
-        event_queue: Queue[dict[str, Any] | None] = Queue()
+        # Bounded queue so a slow client back-pressures into the worker instead of
+        # letting it allocate unbounded memory ahead of the network drain.
+        event_queue: Queue[dict[str, Any] | None] = Queue(maxsize=256)
         emitted_reels: set[tuple[str, str]] = set()
         cancel_event = threading.Event()
+        # Hard wall-clock deadline for the whole generation so a runaway LLM /
+        # YouTube call cannot bill OpenAI credits forever for a disconnected client.
+        STREAM_DEADLINE_SEC = 25.0 if SERVERLESS_MODE else 90.0
+        deadline = time.monotonic() + STREAM_DEADLINE_SEC
 
         def emit_event(event: dict[str, Any]) -> None:
-            event_queue.put(event)
+            try:
+                event_queue.put(event, timeout=STREAM_DEADLINE_SEC)
+            except Exception:
+                # If the queue is still full after the deadline the client has
+                # almost certainly gone away. Signal cancel and drop the event
+                # rather than blocking the worker thread indefinitely.
+                cancel_event.set()
 
         def emit_reel(reel: dict[str, Any]) -> None:
             reel_id, clip_key = _reel_identity_key(reel)
@@ -5459,6 +5578,14 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
                 return
             emitted_reels.add(identity)
             emit_event({"type": "reel", "reel": reel})
+
+        def should_cancel_or_deadline() -> bool:
+            if cancel_event.is_set():
+                return True
+            if time.monotonic() >= deadline:
+                cancel_event.set()
+                return True
+            return False
 
         def run_generation() -> None:
             try:
@@ -5481,7 +5608,7 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
                         page_hint=1,
                         on_reel_created=emit_reel,
                         emit_existing_reels=True,
-                        should_cancel=cancel_event.is_set,
+                        should_cancel=should_cancel_or_deadline,
                     )
                 emit_event(
                     {
@@ -5549,6 +5676,7 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
 
 @app.get("/api/reels/refinement-status/{job_id}", response_model=RefinementStatusResponse)
 def refinement_status(request: Request, job_id: str):
+    _require_community_client_identity(request)
     _enforce_rate_limit(
         request,
         "reels-refinement-status",
@@ -5768,6 +5896,7 @@ def _probe_material_viability(
 
 @app.post("/api/reels/can-generate", response_model=ReelsCanGenerateResponse)
 def can_generate_reels(request: Request, payload: ReelsGenerateRequest):
+    _require_community_client_identity(request)
     _enforce_rate_limit(request, "reels-can-generate", limit=REELS_RATE_LIMIT_PER_WINDOW)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
@@ -5781,6 +5910,10 @@ def can_generate_reels(request: Request, payload: ReelsGenerateRequest):
     with get_conn() as conn:
         material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
         if not material:
+            # Keep the string detail form so existing deployed clients that
+            # substring-match on "material_id not found" continue to work.
+            # iOS/web clients should prefer HTTP 404 + this marker over
+            # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
 
         try:
@@ -5837,6 +5970,7 @@ def can_generate_reels(request: Request, payload: ReelsGenerateRequest):
 
 @app.post("/api/reels/can-generate-any", response_model=ReelsCanGenerateAnyResponse)
 def can_generate_reels_any(request: Request, payload: ReelsCanGenerateAnyRequest):
+    _require_community_client_identity(request)
     _enforce_rate_limit(request, "reels-can-generate-any", limit=REELS_RATE_LIMIT_PER_WINDOW)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
@@ -5966,6 +6100,7 @@ def can_generate_reels_any(request: Request, payload: ReelsCanGenerateAnyRequest
 
 @app.get("/api/feed", response_model=FeedResponse)
 def feed(
+    request: Request,
     material_id: str,
     page: int = 1,
     limit: int = 5,
@@ -5981,8 +6116,14 @@ def feed(
     target_clip_duration_max_sec: int | None = None,
     exclude_video_ids: str = "",
 ):
+    _require_community_client_identity(request)
+    _enforce_rate_limit(request, "feed", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
     if page < 1:
         page = 1
+    # Cap page to bound _ranked_request_reels's cumulative-page loop (O(page))
+    # so an anonymous caller cannot exhaust CPU/memory with ?page=1000000.
+    if page > 200:
+        page = 200
     if limit < 1:
         limit = 1
     if limit > 25:
@@ -5995,6 +6136,10 @@ def feed(
     with get_conn() as conn:
         material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
         if not material:
+            # Keep the string detail form so existing deployed clients that
+            # substring-match on "material_id not found" continue to work.
+            # iOS/web clients should prefer HTTP 404 + this marker over
+            # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
 
         fast_mode = generation_mode == "fast"
@@ -6113,22 +6258,32 @@ def chat(request: Request, payload: ChatRequest):
 
 @app.post("/api/reels/feedback", response_model=FeedbackResponse)
 def feedback(request: Request, payload: FeedbackRequest):
+    _require_community_client_identity(request)
     _enforce_rate_limit(request, "feedback", limit=FEEDBACK_RATE_LIMIT_PER_WINDOW)
+    clean_reel_id = str(payload.reel_id or "").strip()
+    if not clean_reel_id or len(clean_reel_id) > 128:
+        raise HTTPException(status_code=400, detail="Invalid reel_id.")
     with get_conn(transactional=True) as conn:
-        exists = fetch_all(conn, "SELECT id FROM reels WHERE id = ?", (payload.reel_id,))
+        # Existence check + write under a single transaction so a concurrent
+        # delete of the reel can't race us into writing an orphan feedback row.
+        exists = fetch_one(
+            conn,
+            "SELECT id FROM reels WHERE id = ? LIMIT 1",
+            (clean_reel_id,),
+        )
         if not exists:
             raise HTTPException(status_code=404, detail="reel_id not found")
 
         reel_service.record_feedback(
             conn,
-            reel_id=payload.reel_id,
+            reel_id=clean_reel_id,
             helpful=payload.helpful,
             confusing=payload.confusing,
             rating=payload.rating,
             saved=payload.saved,
         )
 
-    return {"status": "ok", "reel_id": payload.reel_id}
+    return {"status": "ok", "reel_id": clean_reel_id}
 
 
 @app.get("/api/community/reels/duration")

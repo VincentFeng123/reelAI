@@ -761,7 +761,9 @@ class ReelService:
     QUERY_RETRIEVAL_WORKERS_SLOW = 6
     TRANSCRIPT_FETCH_WORKERS_FAST = 6
     TRANSCRIPT_FETCH_WORKERS_SLOW = 6
-    RANKED_FEED_CACHE_VERSION = 3
+    # Bump whenever the cached row shape changes so stale entries are invalidated.
+    # v4: video_id retained on response rows (was stripped in v3).
+    RANKED_FEED_CACHE_VERSION = 4
     REFILL_STAGE_EXACT_ROOT = 0
     REFILL_STAGE_ROOT_COMPANION = 1
     REFILL_STAGE_MULTI_CLIP_STRICT = 2
@@ -809,11 +811,26 @@ class ReelService:
             return f"{prefix}generation_id = ?", (generation_id,)
         return f"{prefix}material_id = ? AND COALESCE({prefix}generation_id, '') = ''", (material_id,)
 
-    def _ranked_feed_cache_key(self, *, material_id: str, generation_id: str | None, fast_mode: bool) -> str:
+    def _ranked_feed_cache_key(
+        self,
+        *,
+        material_id: str,
+        generation_id: str | None,
+        fast_mode: bool,
+        subject_tag: str | None = None,
+        strict_topic_only: bool = False,
+    ) -> str:
+        # Include subject_tag + strict_topic_only in the key because ranked_feed's
+        # relevance gates (`_passes_relevance_gate`, strict topic filter, hard-
+        # blocked check) consult them and their output is baked into the cached
+        # rows. Without this the cache would return stale pre-filtered data when
+        # the caller's context (topic/source) changed.
         payload = {
             "material_id": material_id,
             "generation_id": generation_id or "",
             "fast_mode": bool(fast_mode),
+            "subject_tag": (subject_tag or "").strip().lower(),
+            "strict_topic_only": bool(strict_topic_only),
             "version": self.RANKED_FEED_CACHE_VERSION,
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -906,11 +923,15 @@ class ReelService:
         generation_id: str | None,
         fast_mode: bool,
         source_fingerprint: str,
+        subject_tag: str | None = None,
+        strict_topic_only: bool = False,
     ) -> list[dict[str, Any]] | None:
         cache_key = self._ranked_feed_cache_key(
             material_id=material_id,
             generation_id=generation_id,
             fast_mode=fast_mode,
+            subject_tag=subject_tag,
+            strict_topic_only=strict_topic_only,
         )
         cached = fetch_one(
             conn,
@@ -936,6 +957,8 @@ class ReelService:
         fast_mode: bool,
         source_fingerprint: str,
         reels: list[dict[str, Any]],
+        subject_tag: str | None = None,
+        strict_topic_only: bool = False,
     ) -> None:
         timestamp = now_iso()
         upsert(
@@ -946,6 +969,8 @@ class ReelService:
                     material_id=material_id,
                     generation_id=generation_id,
                     fast_mode=fast_mode,
+                    subject_tag=subject_tag,
+                    strict_topic_only=strict_topic_only,
                 ),
                 "material_id": material_id,
                 "generation_id": generation_id or "",
@@ -9577,6 +9602,8 @@ class ReelService:
             generation_id=generation_id,
             fast_mode=fast_mode,
             source_fingerprint=source_fingerprint,
+            subject_tag=subject_tag,
+            strict_topic_only=strict_topic_only,
         )
         if cached is not None:
             return cached
@@ -9647,7 +9674,6 @@ class ReelService:
             )
             if enrichable_video_ids:
                 details_by_id = self.youtube_service.video_details(enrichable_video_ids)
-                persisted_video_ids: set[str] = set()
                 for row in reel_rows:
                     video_id = str(row.get("video_id") or "").strip()
                     if not video_id:
@@ -9657,27 +9683,18 @@ class ReelService:
                     current_description = self._clean_video_description(str(row.get("video_description") or ""))
                     if len(detail_description) <= len(current_description):
                         continue
+                    # In-memory only: patch the row we're about to rank so this
+                    # request sees the richer metadata, but do NOT persist back
+                    # to the `videos` table from a read path. Persistence was
+                    # causing concurrent-read-path races (two requests each
+                    # hitting the YouTube API + upserting) and could also
+                    # regress fields like `is_creative_commons` when `detail`
+                    # was partially populated. Write-back belongs in the
+                    # ingestion / refinement pipelines, not here.
                     row["video_title"] = str(detail.get("title") or row.get("video_title") or "").strip()
                     row["video_channel_title"] = str(detail.get("channel_title") or row.get("video_channel_title") or "").strip()
                     row["video_description"] = detail_description
                     row["video_duration_sec"] = int(detail.get("duration_sec") or row.get("video_duration_sec") or 0)
-                    if video_id in persisted_video_ids:
-                        continue
-                    persisted_video_ids.add(video_id)
-                    upsert(
-                        conn,
-                        "videos",
-                        {
-                            "id": video_id,
-                            "title": str(detail.get("title") or row.get("video_title") or "").strip() or "Untitled",
-                            "channel_title": str(detail.get("channel_title") or row.get("video_channel_title") or "").strip(),
-                            "description": detail_description,
-                            "duration_sec": int(detail.get("duration_sec") or row.get("video_duration_sec") or 0),
-                            "view_count": int(detail.get("view_count") or 0),
-                            "is_creative_commons": 1 if detail.get("license") == "creativeCommon" else 0,
-                            "created_at": now_iso(),
-                        },
-                    )
 
         concept_signal_totals: dict[str, list[float]] = {}
         for row in reel_rows:
@@ -9901,7 +9918,11 @@ class ReelService:
         response_rows: list[dict[str, Any]] = []
         for item in deduped:
             clean_item = dict(item)
-            video_id = str(clean_item.pop("video_id", "") or "")
+            # Keep video_id on the response row so downstream filters (notably
+            # main._ranked_request_reels's exclude_video_ids filter) can match
+            # on it. Stripping it here silently defeated client pagination.
+            video_id = str(clean_item.get("video_id") or "")
+            clean_item["video_id"] = video_id
             clean_item["captions"] = self._build_caption_cues(
                 transcript=transcript_by_video.get(video_id, []),
                 clip_start=float(clean_item.get("t_start") or 0.0),
@@ -9917,5 +9938,7 @@ class ReelService:
             fast_mode=fast_mode,
             source_fingerprint=source_fingerprint,
             reels=response_rows,
+            subject_tag=subject_tag,
+            strict_topic_only=strict_topic_only,
         )
         return response_rows

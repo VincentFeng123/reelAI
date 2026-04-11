@@ -723,11 +723,36 @@ type GenerateReelsParams = {
   targetClipDurationMaxSec?: number;
 };
 
+// Max number of IDs we send on any request. After a long session the client's
+// seen-source-video list can grow to hundreds; joining all of them into a
+// comma-separated query string risks a Request-URI-Too-Large response from some
+// proxies. Keep the most recent ones (they're the likeliest duplicates).
+const MAX_EXCLUDED_VIDEO_IDS = 250;
+// Any "video_id" longer than this is almost certainly a full URL (non-YouTube
+// community reel). The backend can't match on URLs, so skip them.
+const VIDEO_ID_MAX_LEN = 32;
+const VIDEO_ID_RE = /^[A-Za-z0-9_-]+$/;
+
 function normalizeVideoIdList(values: string[] | undefined): string[] {
   if (!Array.isArray(values)) {
     return [];
   }
-  return Array.from(new Set(values.map((value) => String(value || "").trim()).filter(Boolean)));
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const rawValue of values) {
+    const clean = String(rawValue || "").trim();
+    if (!clean || clean.length > VIDEO_ID_MAX_LEN || !VIDEO_ID_RE.test(clean)) {
+      continue;
+    }
+    if (seen.has(clean)) {
+      continue;
+    }
+    seen.add(clean);
+    normalized.push(clean);
+  }
+  return normalized.length > MAX_EXCLUDED_VIDEO_IDS
+    ? normalized.slice(normalized.length - MAX_EXCLUDED_VIDEO_IDS)
+    : normalized;
 }
 
 function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<string, unknown> {
@@ -756,6 +781,9 @@ export async function generateReels(params: GenerateReelsParams): Promise<ReelsG
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      // Backend requires an owner-key identity header on reels endpoints to
+      // rate-limit per-device and block anonymous API scraping.
+      ...communityOwnerHeaders(),
     },
     body: JSON.stringify(buildGenerateReelsRequestBody(params)),
   });
@@ -887,6 +915,7 @@ export async function generateReelsStream(
     headers: {
       "Content-Type": "application/json",
       Accept: "application/x-ndjson",
+      ...communityOwnerHeaders(),
     },
     body: JSON.stringify(buildGenerateReelsRequestBody(params)),
     signal: params.signal,
@@ -973,6 +1002,7 @@ export async function checkReelsCanGenerate(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
     },
     body: JSON.stringify({
       material_id: params.materialId,
@@ -1012,6 +1042,7 @@ export async function checkReelsCanGenerateAny(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
     },
     body: JSON.stringify({
       material_ids: materialIds,
@@ -1078,6 +1109,9 @@ export async function fetchFeed(params: {
 
   const res = await safeFetch(`${apiUrl("/feed")}?${query}`, {
     cache: "no-store",
+    headers: {
+      ...communityOwnerHeaders(),
+    },
     signal: params.signal,
     timeoutMs: 45_000,
   });
@@ -1088,6 +1122,9 @@ export async function fetchFeed(params: {
 export async function fetchRefinementStatus(jobId: string, options?: { signal?: AbortSignal }): Promise<RefinementStatusResponse> {
   const res = await safeFetch(apiUrl(`/reels/refinement-status/${encodeURIComponent(jobId)}`), {
     cache: "no-store",
+    headers: {
+      ...communityOwnerHeaders(),
+    },
     signal: options?.signal,
   });
   return parseJsonResponse<RefinementStatusResponse>(res);
@@ -1104,6 +1141,7 @@ export async function sendFeedback(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
     },
     body: JSON.stringify({
       reel_id: params.reelId,

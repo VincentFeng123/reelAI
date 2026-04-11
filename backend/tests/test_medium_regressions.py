@@ -3434,6 +3434,10 @@ class MediumRegressionTests(unittest.TestCase):
 
         with mock.patch.object(main_module, "_enforce_rate_limit"), mock.patch.object(
             main_module,
+            "_require_community_client_identity",
+            return_value="owner-hash",
+        ), mock.patch.object(
+            main_module,
             "_submit_refinement_job",
             return_value=True,
         ) as submit_job, mock.patch.object(main_module, "get_conn") as patched_get_conn:
@@ -5654,12 +5658,25 @@ class MediumRegressionTests(unittest.TestCase):
                 "reason": "matched concept terms",
             }
 
+        original_description = conn.execute(
+            "SELECT description FROM videos WHERE id = ?", ("video-ranked",)
+        ).fetchone()[0]
+
         with mock.patch.object(service, "_score_text_relevance", side_effect=fake_score_text_relevance):
             ranked = service.ranked_feed(conn, "material-ranked", fast_mode=True)
 
+        # The ranked row gets the enriched description in-memory so the current
+        # request sees richer metadata …
         self.assertEqual(ranked[0]["video_description"], full_description)
-        updated_description = conn.execute("SELECT description FROM videos WHERE id = ?", ("video-ranked",)).fetchone()
-        self.assertEqual(updated_description[0], full_description)
+        # … but ranked_feed is a read path and must NOT mutate the `videos`
+        # table. Persistence of enriched YouTube metadata belongs in the
+        # ingestion / refinement pipelines, where write-backs can't race two
+        # concurrent ranking calls against each other or regress
+        # `is_creative_commons` from a partial details payload.
+        unchanged_description = conn.execute(
+            "SELECT description FROM videos WHERE id = ?", ("video-ranked",)
+        ).fetchone()
+        self.assertEqual(unchanged_description[0], original_description)
         youtube_service.video_details.assert_called_once_with(["video-ranked"])
         conn.close()
 
@@ -6323,6 +6340,11 @@ class MediumRegressionTests(unittest.TestCase):
                     "material_id": "material-1",
                     "num_reels": 2,
                     "generation_mode": "fast",
+                },
+                headers={
+                    # Reels retrieval endpoints now require an owner-key
+                    # identity header to block anonymous API scraping.
+                    "X-StudyReels-Owner-Key": "a" * 32,
                 },
             )
 

@@ -158,12 +158,26 @@ export function ReelCard({
   const videoProvider = useMemo(() => detectVideoProvider(reel.video_url), [reel.video_url]);
   const isYouTubeVideo = videoProvider === "youtube";
   const isCommunityImported = (reel.relevance_reason || "").trim() === "Opened from a community set.";
+  // Upper bound from the server-reported video duration (when present). This
+  // protects against malformed t_start / t_end (e.g. timestamps past the
+  // actual video length) that would otherwise leave the player stuck in
+  // BUFFERING forever.
+  const videoDurationCap =
+    Number.isFinite(reel.video_duration_sec) && Number(reel.video_duration_sec) > 0
+      ? Math.max(1, Number(reel.video_duration_sec) - 0.5)
+      : Number.POSITIVE_INFINITY;
   const clipStartRaw = Number(reel.t_start);
   const clipEndRaw = Number(reel.t_end);
-  const clipStart = Number.isFinite(clipStartRaw) && clipStartRaw >= 0 ? clipStartRaw : 0;
+  const clipStart =
+    Number.isFinite(clipStartRaw) && clipStartRaw >= 0
+      ? Math.min(videoDurationCap, clipStartRaw)
+      : 0;
   const configuredClipEnd =
     Number.isFinite(clipEndRaw) && clipEndRaw > clipStart
-      ? clipEndRaw
+      ? Math.min(
+          Number.isFinite(videoDurationCap) ? videoDurationCap + 0.5 : clipEndRaw,
+          clipEndRaw,
+        )
       : clipStart + 1;
   const configuredClipDuration = Math.max(0, configuredClipEnd - clipStart);
   const hasClipDurationMetadata = Number.isFinite(reel.clip_duration_sec) && Number(reel.clip_duration_sec) > 0;
