@@ -3,7 +3,7 @@
 import { type DragEvent, type FormEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { ingestSearch, ingestUrl, uploadMaterial } from "@/lib/api";
+import { ingestUrl, uploadMaterial } from "@/lib/api";
 import { safeStorageSetItem } from "@/lib/browserStorage";
 import { buildSearchFeedQuery } from "@/lib/feedQuery";
 import { type GenerationMode, type SearchInputMode, readStudyReelsSettings, subscribeToStudyReelsSettings } from "@/lib/settings";
@@ -307,182 +307,16 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
     try {
       const activeSettings = readStudyReelsSettings();
       const generationModeForSearch = activeSettings.generationMode;
-      const useMultiPlatformSearch = activeSettings.multiPlatformSearch;
 
-      // Shared helper: navigate to the feed scoped to the ingestSearch-returned
-      // material and persist a local seed so the history panel shows the entry.
-      const launchMultiPlatformFeed = async (params: {
-        query: string;
-        title: string;
-        topic?: string;
-        firstReelId?: string;
-        materialId: string;
-      }) => {
-        if (typeof window !== "undefined") {
-          const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
-          seeds[params.materialId] = {
-            topic: params.topic,
-            text: undefined,
-            title: params.title,
-            updatedAt: Date.now(),
-          };
-          const ordered = Object.entries(seeds)
-            .sort((a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0))
-            .slice(0, MAX_MATERIAL_SEEDS);
-          safeStorageSetItem(window.localStorage, MATERIAL_SEEDS_STORAGE_KEY, JSON.stringify(Object.fromEntries(ordered)));
-        }
-        if (onMaterialCreated) {
-          const feedQuery = buildSearchFeedQuery({
-            materialId: params.materialId,
-            generationMode: generationModeForSearch,
-            returnTab: "search",
-            settings: activeSettings,
-          });
-          await onMaterialCreated({
-            materialId: params.materialId,
-            title: params.title,
-            topic: params.topic,
-            generationMode: generationModeForSearch,
-            feedQuery,
-          });
-        }
-        const searchFeedQuery = buildSearchFeedQuery({
-          materialId: params.materialId,
-          generationMode: generationModeForSearch,
-          returnTab: "search",
-          settings: activeSettings,
-        });
-        const suffix = params.firstReelId
-          ? `&active_reel_id=${encodeURIComponent(params.firstReelId)}`
-          : "";
-        router.push(`/feed?${searchFeedQuery}${suffix}`);
-      };
-
-      // Topic / text / file with multi-platform search ON: route through
-      // /api/ingest/search so we get real scraping across YouTube, Instagram, and
-      // TikTok. Topic is the simplest (topic text IS the query). Text and file need
-      // a two-step flow: upload via /api/material first so the backend's LLM concept
-      // extractor can turn prose/files into useful search terms, then call ingestSearch
-      // with the top concept titles joined as the query.
-      // Helper: extract successful reels from an IngestSearchResult into a flat Reel[].
-      const collectSuccessfulReels = (items: Array<{ status: string; reel?: Reel | null | undefined }>): Reel[] => {
-        const out: Reel[] = [];
-        for (const item of items) {
-          if (item.status === "ok" && item.reel) {
-            out.push(item.reel);
-          }
-        }
-        return out;
-      };
-
-      if (useMultiPlatformSearch && inputMode === "topic") {
-        const topicList = topics.map((t) => t.trim()).filter(Boolean);
-        const combinedQuery = topicList.join(" ").trim();
-        if (!combinedQuery) {
-          throw new Error("Enter a topic before searching.");
-        }
-        const searchResult = await ingestSearch({
-          query: combinedQuery,
-          platforms: ["yt", "ig", "tt"],
-          maxPerPlatform: 4,
-          targetClipDurationSec: activeSettings.targetClipDurationSec,
-          targetClipDurationMinSec: activeSettings.targetClipDurationMinSec,
-          targetClipDurationMaxSec: activeSettings.targetClipDurationMaxSec,
-        });
-        const successfulReels = collectSuccessfulReels(searchResult.items);
-        if (successfulReels.length === 0) {
-          throw new Error(`No reels found for “${combinedQuery}”. Try a different topic.`);
-        }
-        const materialId = searchResult.material_id || "ingest-search:unknown";
-        const firstReelId = successfulReels[0]?.reel_id;
-        primeFeedSessionSnapshot(materialId, successfulReels, firstReelId, activeSettings);
-        await launchMultiPlatformFeed({
-          query: combinedQuery,
-          title: combinedQuery.slice(0, 58),
-          topic: combinedQuery,
-          firstReelId,
-          materialId,
-        });
-        setTopics([""]);
-        return;
-      }
-
-      if (useMultiPlatformSearch && inputMode === "source") {
-        const trimmedText = text.trim();
-        if (!trimmedText) {
-          throw new Error("Enter some text before searching.");
-        }
-        const material = await uploadMaterial({ text: trimmedText });
-        const conceptTitles = (material.extracted_concepts ?? [])
-          .slice(0, 3)
-          .map((c) => (c?.title ?? "").trim())
-          .filter(Boolean);
-        const query = conceptTitles.length > 0
-          ? conceptTitles.join(" ")
-          : trimmedText.replace(/\s+/g, " ").slice(0, 180);
-        const searchResult = await ingestSearch({
-          query,
-          platforms: ["yt", "ig", "tt"],
-          maxPerPlatform: 4,
-          targetClipDurationSec: activeSettings.targetClipDurationSec,
-          targetClipDurationMinSec: activeSettings.targetClipDurationMinSec,
-          targetClipDurationMaxSec: activeSettings.targetClipDurationMaxSec,
-        });
-        const successfulReels = collectSuccessfulReels(searchResult.items);
-        if (successfulReels.length === 0) {
-          throw new Error("No reels found for your text. Try a different source.");
-        }
-        const materialId = searchResult.material_id || "ingest-search:unknown";
-        const firstReelId = successfulReels[0]?.reel_id;
-        const title = trimmedText.replace(/\s+/g, " ").slice(0, 58);
-        primeFeedSessionSnapshot(materialId, successfulReels, firstReelId, activeSettings);
-        await launchMultiPlatformFeed({
-          query,
-          title: title || "Study Session",
-          firstReelId,
-          materialId,
-        });
-        setText("");
-        return;
-      }
-
-      if (useMultiPlatformSearch && inputMode === "file") {
-        if (!file) {
-          throw new Error("Pick a file before searching.");
-        }
-        const material = await uploadMaterial({ file });
-        const conceptTitles = (material.extracted_concepts ?? [])
-          .slice(0, 3)
-          .map((c) => (c?.title ?? "").trim())
-          .filter(Boolean);
-        const fileName = file.name;
-        const query = conceptTitles.length > 0
-          ? conceptTitles.join(" ")
-          : fileName.replace(/\.[^.]+$/, "").replace(/[_\-]+/g, " ").slice(0, 180);
-        const searchResult = await ingestSearch({
-          query,
-          platforms: ["yt", "ig", "tt"],
-          maxPerPlatform: 4,
-          targetClipDurationSec: activeSettings.targetClipDurationSec,
-          targetClipDurationMinSec: activeSettings.targetClipDurationMinSec,
-          targetClipDurationMaxSec: activeSettings.targetClipDurationMaxSec,
-        });
-        const successfulReels = collectSuccessfulReels(searchResult.items);
-        if (successfulReels.length === 0) {
-          throw new Error("No reels found for your file. Try a different document.");
-        }
-        const materialId = searchResult.material_id || "ingest-search:unknown";
-        const firstReelId = successfulReels[0]?.reel_id;
-        primeFeedSessionSnapshot(materialId, successfulReels, firstReelId, activeSettings);
-        await launchMultiPlatformFeed({
-          query,
-          title: fileName.slice(0, 58),
-          firstReelId,
-          materialId,
-        });
-        setFile(undefined);
-        return;
-      }
+      // NOTE: the multi-platform /api/ingest/search path is disabled. It routes
+      // through yt-dlp which (a) bounces on IG/TT robots.txt and (b) hits
+      // YouTube bot-detection from Railway's data-center IPs. All topic / text
+      // / file submits fall through to the legacy /api/material +
+      // /api/reels/generate-stream flow below, which uses the HTML-scraping
+      // path in YouTubeService._search_without_data_api — free, no API key,
+      // no server-side video download, works on cloud IPs. The
+      // `multiPlatformSearch` setting in SettingsPanel is kept for backward
+      // compat but has no effect on submit routing.
 
       // URL ingest path diverges completely from the material-upload path: we call
       // /api/ingest/url instead of /api/material, then land on the feed scoped to
