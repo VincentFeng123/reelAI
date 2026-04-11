@@ -1121,29 +1121,31 @@ class ConceptClusterAnchoringTests(unittest.TestCase):
         self.assertLessEqual(seg.t_end, 100.0,
                              f"end {seg.t_end} runs into the next topic")
 
-    def test_two_separate_clusters_return_two_segments(self) -> None:
+    def test_two_separate_clusters_bridge_at_midpoint(self) -> None:
         """
-        Two clusters of the same concept that are MORE than MAX_GAP_SEC apart
-        should produce TWO separate clips — the creator returned to the topic
-        later in the video.
+        Two clusters of the same concept whose gap is ≤ MERGE_GAP_SEC (120s)
+        should be bridged: clip A's t_end and clip B's t_start meet at the
+        gap midpoint, so playing them back-to-back is temporally continuous
+        in source time. They're still TWO separate clips (not merged) and
+        emitted in time order.
         """
         transcript = [
             *[
                 {"start": float(i * 5), "duration": 5.0, "text": f"intro {i}"}
                 for i in range(4)
             ],
-            # First cluster: 20-60s (mentions at 20, 25, 30, 35, 40)
+            # First cluster: 20-45s (mentions at 20, 25, 30, 35, 40)
             {"start": 20.0, "duration": 5.0, "text": "let's introduce recursion now"},
             {"start": 25.0, "duration": 5.0, "text": "recursion calls itself with smaller input"},
             {"start": 30.0, "duration": 5.0, "text": "recursion needs a base case"},
             {"start": 35.0, "duration": 5.0, "text": "recursion can replace iteration"},
             {"start": 40.0, "duration": 5.0, "text": "recursion uses the call stack"},
-            # 90s of unrelated content (gap > MAX_GAP_SEC)
+            # 100s of unrelated content (gap > MAX_GAP_SEC=60 but ≤ MERGE_GAP_SEC=120)
             *[
                 {"start": float(45 + i * 5), "duration": 5.0, "text": f"loops and other stuff {i}"}
                 for i in range(20)
             ],
-            # Second cluster: 145-180s (mentions at 145, 150, 155, 160)
+            # Second cluster: 145-165s (mentions at 145, 150, 155, 160)
             {"start": 145.0, "duration": 5.0, "text": "now let's revisit recursion with a real example"},
             {"start": 150.0, "duration": 5.0, "text": "recursion in tree traversal is the canonical case"},
             {"start": 155.0, "duration": 5.0, "text": "recursion makes the code much shorter here"},
@@ -1164,13 +1166,195 @@ class ConceptClusterAnchoringTests(unittest.TestCase):
         )
         self.assertEqual(len(segments), 2,
                          f"expected 2 clusters, got {segments}")
-        # Both segments must lie in their respective cluster windows.
-        starts = sorted(seg.t_start for seg in segments)
-        ends = sorted(seg.t_end for seg in segments)
-        self.assertLess(starts[0], 60, f"first cluster start out of range: {starts[0]}")
-        self.assertGreater(starts[1], 100, f"second cluster start too early: {starts[1]}")
-        self.assertLess(ends[0], 120, f"first cluster end runs into the gap: {ends[0]}")
-        self.assertGreaterEqual(ends[1], 160, f"second cluster end too early: {ends[1]}")
+        # CONTIGUITY GUARANTEE: clip A's t_end must equal clip B's t_start
+        # (within rounding) so playback is continuous across the boundary.
+        clip_a, clip_b = segments[0], segments[1]
+        self.assertLess(clip_a.t_start, clip_b.t_start,
+                        "clips are not in time order")
+        self.assertAlmostEqual(
+            clip_a.t_end, clip_b.t_start, places=2,
+            msg=f"clips not contiguous: A.t_end={clip_a.t_end}, B.t_start={clip_b.t_start}",
+        )
+        # Clip A's start lies in the natural cluster A region, before the gap
+        self.assertLess(clip_a.t_start, 50, f"clip A start out of range: {clip_a.t_start}")
+        # Clip B's end lies in the natural cluster B region, past the gap
+        self.assertGreaterEqual(clip_b.t_end, 160,
+                                f"clip B end too early: {clip_b.t_end}")
+        # The shared boundary must be in the gap region (between cluster A's
+        # last mention end at ~45s and cluster B's first mention at ~145s)
+        self.assertGreater(clip_a.t_end, 45,
+                           f"shared boundary {clip_a.t_end} is in cluster A's content")
+        self.assertLess(clip_a.t_end, 145,
+                        f"shared boundary {clip_a.t_end} is in cluster B's content")
+
+    def test_far_apart_clusters_stay_disjoint(self) -> None:
+        """
+        Two clusters whose gap exceeds MERGE_GAP_SEC (120s) should NOT be
+        bridged — pulling the user through 3+ minutes of unrelated content
+        just to make playback contiguous would defeat the purpose of
+        topic-anchored clipping.
+        """
+        transcript = [
+            *[
+                {"start": float(i * 5), "duration": 5.0, "text": f"intro {i}"}
+                for i in range(4)
+            ],
+            # First cluster: 20-45s
+            {"start": 20.0, "duration": 5.0, "text": "ok we'll discuss kotlin now"},
+            {"start": 25.0, "duration": 5.0, "text": "kotlin is concise"},
+            {"start": 30.0, "duration": 5.0, "text": "kotlin has null safety"},
+            {"start": 35.0, "duration": 5.0, "text": "kotlin compiles to jvm bytecode"},
+            {"start": 40.0, "duration": 5.0, "text": "kotlin interoperates with java"},
+            # 200s of unrelated content (gap WAY > MERGE_GAP_SEC)
+            *[
+                {"start": float(45 + i * 5), "duration": 5.0, "text": f"random topic {i}"}
+                for i in range(40)
+            ],
+            # Second cluster: 245-265s
+            {"start": 245.0, "duration": 5.0, "text": "let me return to kotlin briefly"},
+            {"start": 250.0, "duration": 5.0, "text": "kotlin coroutines are the killer feature"},
+            {"start": 255.0, "duration": 5.0, "text": "kotlin coroutines unify async and sync code"},
+            {"start": 260.0, "duration": 5.0, "text": "kotlin scope functions are also handy"},
+            *[
+                {"start": float(265 + i * 5), "duration": 5.0, "text": f"wrap up {i}"}
+                for i in range(10)
+            ],
+        ]
+        segments = self.service._topic_cut_segments_for_concept(
+            transcript=transcript,
+            video_id="aircAruvnKk",
+            video_duration_sec=320,
+            clip_min_len=30,
+            clip_max_len=200,
+            max_segments=5,
+            concept_terms=["kotlin"],
+        )
+        self.assertEqual(len(segments), 2,
+                         f"expected 2 disjoint clusters, got {segments}")
+        clip_a, clip_b = segments[0], segments[1]
+        # Clips remain in time order
+        self.assertLess(clip_a.t_start, clip_b.t_start)
+        # And they are NOT bridged — there's still a real gap between them
+        self.assertLess(clip_a.t_end, clip_b.t_start - 50,
+                        f"far-apart clusters got bridged: A.t_end={clip_a.t_end}, B.t_start={clip_b.t_start}")
+
+    def test_three_consecutive_clusters_form_a_continuous_chain(self) -> None:
+        """
+        Three clusters from the same video, each gap > MAX_GAP_SEC (so they
+        DON'T merge into one cluster) but ≤ MERGE_GAP_SEC (so they DO bridge
+        at the gap midpoints), should form a continuous chain:
+        A.t_end == B.t_start, B.t_end == C.t_start.
+        """
+        # Use 70s of unrelated content between each cluster: gap > 60s
+        # (above MAX_GAP_SEC so distinct clusters) and < 120s (below
+        # MERGE_GAP_SEC so they bridge).
+        transcript = [
+            *[
+                {"start": float(i * 5), "duration": 5.0, "text": f"intro {i}"}
+                for i in range(4)
+            ],
+            # Cluster A: 20-40s (4 mentions of trie)
+            {"start": 20.0, "duration": 5.0, "text": "let's start with trie basics"},
+            {"start": 25.0, "duration": 5.0, "text": "trie stores strings as a prefix tree"},
+            {"start": 30.0, "duration": 5.0, "text": "trie supports fast prefix lookups"},
+            {"start": 35.0, "duration": 5.0, "text": "trie nodes have children per character"},
+            # 70s gap of unrelated content (40s + 5s + 70s = 115s)
+            *[
+                {"start": float(45 + i * 5), "duration": 5.0, "text": f"middle filler {i}"}
+                for i in range(14)
+            ],
+            # Cluster B: 115-135s (4 mentions)
+            {"start": 115.0, "duration": 5.0, "text": "now trie performance considerations"},
+            {"start": 120.0, "duration": 5.0, "text": "trie lookup is order key length"},
+            {"start": 125.0, "duration": 5.0, "text": "trie uses more memory than a hash table"},
+            {"start": 130.0, "duration": 5.0, "text": "trie iteration is naturally sorted"},
+            # 70s gap (135 + 5 + 70 = 210)
+            *[
+                {"start": float(140 + i * 5), "duration": 5.0, "text": f"more middle {i}"}
+                for i in range(14)
+            ],
+            # Cluster C: 210-230s (4 mentions)
+            {"start": 210.0, "duration": 5.0, "text": "finally trie applications in autocomplete"},
+            {"start": 215.0, "duration": 5.0, "text": "trie powers spell checkers"},
+            {"start": 220.0, "duration": 5.0, "text": "compressed trie is called a radix tree"},
+            {"start": 225.0, "duration": 5.0, "text": "trie pairs well with longest common prefix"},
+            *[
+                {"start": float(230 + i * 5), "duration": 5.0, "text": f"end {i}"}
+                for i in range(8)
+            ],
+        ]
+        segments = self.service._topic_cut_segments_for_concept(
+            transcript=transcript,
+            video_id="aircAruvnKk",
+            video_duration_sec=270,
+            clip_min_len=30,
+            clip_max_len=300,
+            max_segments=5,
+            concept_terms=["trie"],
+        )
+        self.assertEqual(len(segments), 3,
+                         f"expected 3 clusters in a chain, got {segments}")
+        # CONTIGUOUS CHAIN: each clip's t_end must equal the next's t_start
+        for i in range(len(segments) - 1):
+            self.assertAlmostEqual(
+                segments[i].t_end, segments[i + 1].t_start, places=2,
+                msg=(f"chain break between clip {i} and clip {i+1}: "
+                     f"t_end={segments[i].t_end}, next.t_start={segments[i + 1].t_start}"),
+            )
+        # And in time order
+        starts = [s.t_start for s in segments]
+        self.assertEqual(starts, sorted(starts),
+                         "segments are not in time order")
+
+    def test_segments_emitted_in_time_order(self) -> None:
+        """
+        Even when clusters have very different densities (which would sort
+        them differently if we were ranking), the final emission must be in
+        time order so the user sees them in narrative sequence.
+        """
+        transcript = [
+            *[
+                {"start": float(i * 5), "duration": 5.0, "text": f"intro {i}"}
+                for i in range(4)
+            ],
+            # Cluster A — 4 mentions (lower density)
+            {"start": 20.0, "duration": 5.0, "text": "early discussion of streams"},
+            {"start": 25.0, "duration": 5.0, "text": "streams in java"},
+            {"start": 30.0, "duration": 5.0, "text": "streams are lazy"},
+            {"start": 35.0, "duration": 5.0, "text": "streams pipeline operations"},
+            # gap
+            *[
+                {"start": float(40 + i * 5), "duration": 5.0, "text": f"middle {i}"}
+                for i in range(15)
+            ],
+            # Cluster B — 8 mentions (higher density)
+            {"start": 115.0, "duration": 5.0, "text": "deep dive into streams now"},
+            {"start": 120.0, "duration": 5.0, "text": "streams have terminal operations"},
+            {"start": 125.0, "duration": 5.0, "text": "streams have intermediate operations"},
+            {"start": 130.0, "duration": 5.0, "text": "streams are not collections"},
+            {"start": 135.0, "duration": 5.0, "text": "streams compose nicely"},
+            {"start": 140.0, "duration": 5.0, "text": "parallel streams use fork join pool"},
+            {"start": 145.0, "duration": 5.0, "text": "infinite streams are possible"},
+            {"start": 150.0, "duration": 5.0, "text": "streams must be consumed once"},
+            *[
+                {"start": float(155 + i * 5), "duration": 5.0, "text": f"end {i}"}
+                for i in range(10)
+            ],
+        ]
+        segments = self.service._topic_cut_segments_for_concept(
+            transcript=transcript,
+            video_id="aircAruvnKk",
+            video_duration_sec=210,
+            clip_min_len=30,
+            clip_max_len=200,
+            max_segments=5,
+            concept_terms=["streams"],
+        )
+        self.assertGreaterEqual(len(segments), 2)
+        # Even though cluster B has more mentions, cluster A must be emitted
+        # first because it appears earlier in the source video.
+        self.assertLess(segments[0].t_start, segments[1].t_start,
+                        f"segments are not in time order: {segments}")
 
     def test_single_mention_outside_intro_is_dropped(self) -> None:
         """

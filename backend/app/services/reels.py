@@ -8954,6 +8954,13 @@ class ReelService:
         MIN_CLUSTER_MENTIONS = 2
         LEAD_IN_CUES = 2
         TAIL_BUFFER_SEC = 1.5
+        # When multiple clusters from the same video survive, the user wants
+        # them to play back-to-back without temporal gaps. We bridge adjacent
+        # clusters whose gap is ≤ MERGE_GAP_SEC by extending each window's
+        # boundary to the gap midpoint. Beyond this distance, the clusters
+        # are too far apart to be perceived as the same continuous discussion
+        # and we leave them disjoint.
+        MERGE_GAP_SEC = 120.0
 
         if not concept_terms or not transcript:
             return []
@@ -9016,24 +9023,24 @@ class ReelService:
         if not clusters:
             return []
 
-        # Sort clusters by density (mention count first, then by length) so
-        # the most substantive discussion windows take priority.
+        # Step 1: rank clusters by density (mention count) and take the
+        # `max_segments` most substantive ones. The user might have asked
+        # for fewer reels than we have clusters; density is the right
+        # selection criterion because it reflects how much of the video
+        # is actually about the topic.
         clusters.sort(key=lambda c: (-len(c), c[0]))
+        selected = clusters[:max_segments]
 
-        # Compute cluster boundary helpers we'll need below.
-        cluster_starts = [cue_starts[c[0]] for c in clusters]
-        cluster_starts_sorted = sorted(cluster_starts)
-
-        segments: list[SegmentMatch] = []
-        for cluster in clusters:
-            if len(segments) >= max_segments:
-                break
-
+        # Step 2: compute the initial (t_start, t_end) for each selected
+        # cluster. t_start is the first mention with up to LEAD_IN_CUES of
+        # lead-in (capped by the intro buffer); t_end is the last mention
+        # plus TAIL_BUFFER_SEC for the speaker to finish their sentence.
+        # We do NOT yet bridge to neighbors — that's step 3.
+        windows: list[dict[str, Any]] = []
+        for cluster in selected:
             first_mention = cluster[0]
             last_mention = cluster[-1]
 
-            # Lead-in: walk back up to LEAD_IN_CUES cues to catch the
-            # introductory phrase, but never cross the intro buffer.
             lead_idx = first_mention
             for _ in range(LEAD_IN_CUES):
                 candidate = lead_idx - 1
@@ -9046,50 +9053,86 @@ class ReelService:
             t_start = cue_starts[lead_idx]
             t_end = cue_ends[last_mention] + TAIL_BUFFER_SEC
 
-            # Don't extend t_end into the next cluster's intro phrase.
-            for next_start in cluster_starts_sorted:
-                if next_start > cue_starts[last_mention] + 1.0:
-                    if t_end > next_start - 0.5:
-                        t_end = max(cue_ends[last_mention], next_start - 0.5)
-                    break
-
-            # Clamp to video duration.
             if video_duration_sec and video_duration_sec > 0:
                 t_end = min(t_end, float(video_duration_sec))
 
+            windows.append({
+                "cluster": cluster,
+                "t_start": t_start,
+                "t_end": t_end,
+                "natural_start": t_start,  # remember the unmerged values for fallbacks
+                "natural_end": t_end,
+            })
+
+        # Step 3: sort by time so we can walk neighbors. The user wants the
+        # clips to come out in narrative order — first discussion first,
+        # later discussion later — so they appear "side by side" in the feed
+        # in the same order the YouTuber said them.
+        windows.sort(key=lambda w: w["t_start"])
+
+        # Step 4: bridge adjacent clusters by extending each pair to meet at
+        # the midpoint of the gap between them, but ONLY when the gap is
+        # ≤ MERGE_GAP_SEC. Larger gaps probably contain a different topic
+        # and we don't want to drag the user through it just to make playback
+        # contiguous. The result: when iOS or web plays the clips back to
+        # back, source-time progresses continuously across the cluster
+        # boundary instead of jumping forward.
+        for i in range(len(windows) - 1):
+            a = windows[i]
+            b = windows[i + 1]
+            gap = b["t_start"] - a["t_end"]
+            if gap <= 0:
+                # Already touching or overlapping (the LEAD_IN_CUES walk
+                # might have made them adjacent). Ensure no overlap by
+                # taking the average.
+                shared = (a["t_end"] + b["t_start"]) / 2.0
+                a["t_end"] = shared
+                b["t_start"] = shared
+                continue
+            if gap > MERGE_GAP_SEC:
+                continue
+            midpoint = (a["t_end"] + b["t_start"]) / 2.0
+            a["t_end"] = midpoint
+            b["t_start"] = midpoint
+
+        # Step 5: per-window guardrails — minimum length, optional split for
+        # too-long windows. Now in time order, with bridged boundaries.
+        segments: list[SegmentMatch] = []
+        next_chunk_index = 0
+        for win_idx, win in enumerate(windows):
+            t_start = float(win["t_start"])
+            t_end = float(win["t_end"])
+            cluster = win["cluster"]
+
+            # Min-length guardrail: if the window is too short (the cluster
+            # was tiny and there was no neighbor to bridge to), expand the
+            # END outward, never the START — the user explicitly wants the
+            # clip to begin at the topic introduction.
             duration = t_end - t_start
             if duration < clip_min_len:
-                # Try expanding the END outward toward the natural end of the
-                # discussion (or the next cluster boundary, whichever is
-                # closer). We never expand the START because the user
-                # explicitly wants the clip to begin at the topic introduction.
                 deficit = clip_min_len - duration
                 new_end = t_end + deficit
                 if video_duration_sec and video_duration_sec > 0:
                     new_end = min(new_end, float(video_duration_sec))
-                # Don't run into the next cluster.
-                for next_start in cluster_starts_sorted:
-                    if next_start > t_start + 1.0 and new_end > next_start - 0.5:
-                        new_end = next_start - 0.5
-                        break
+                # Don't run into the next bridged window.
+                if win_idx + 1 < len(windows):
+                    next_start = float(windows[win_idx + 1]["t_start"])
+                    if new_end > next_start - 0.1:
+                        new_end = next_start - 0.1
                 t_end = max(t_end, new_end)
                 duration = t_end - t_start
                 if duration < clip_min_len:
-                    # Couldn't reach min length without overlapping the next
-                    # cluster — drop this one rather than emit a too-short clip.
+                    # Couldn't reach min length — drop rather than emit a
+                    # too-short clip.
                     continue
 
-            # Split if too long: keep the topic intact by emitting equal-length
-            # sub-parts that all fall inside the cluster's natural window.
+            # Max-length guardrail: split too-long windows into equal parts.
             sub_windows: list[tuple[float, float]] = []
             if duration > clip_max_len:
                 import math
                 num_parts = int(math.ceil(duration / clip_max_len))
                 part_dur = duration / num_parts
                 if part_dur < clip_min_len:
-                    # The user's [min, max] range can't fit equal sub-parts.
-                    # Keep the natural cluster window — better than dropping
-                    # substantive discussion content.
                     sub_windows = [(t_start, t_end)]
                 else:
                     for i in range(num_parts):
@@ -9099,10 +9142,7 @@ class ReelService:
             else:
                 sub_windows = [(t_start, t_end)]
 
-            for sub_idx, (a, b) in enumerate(sub_windows):
-                if len(segments) >= max_segments:
-                    break
-
+            for a, b in sub_windows:
                 text_parts: list[str] = []
                 for i in range(len(cue_starts)):
                     if cue_starts[i] < a - 0.01:
@@ -9115,20 +9155,21 @@ class ReelService:
                     continue
 
                 # Density-weighted score: clusters with more mentions rank
-                # higher. The rest of the pipeline still does concept-embedding
-                # ranking on top of this, so the absolute number doesn't
-                # matter much — only the ordering within this video.
+                # higher. The downstream concept-embedding ranker still
+                # adjusts this, so the absolute number doesn't matter much
+                # — only the ordering within this video.
                 density_score = 0.4 + min(0.5, 0.05 * len(cluster))
 
                 segments.append(
                     SegmentMatch(
-                        chunk_index=len(segments),
+                        chunk_index=next_chunk_index,
                         t_start=float(a),
                         t_end=float(b),
                         text=joined_text,
                         score=density_score,
                     )
                 )
+                next_chunk_index += 1
 
         return segments
 
