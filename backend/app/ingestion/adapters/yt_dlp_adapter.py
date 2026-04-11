@@ -365,6 +365,31 @@ class YtDlpAdapter(BaseAdapter):
                 detail=str(_YT_DLP_IMPORT_ERROR),
             )
 
+    # YouTube data-center IP workaround.
+    #
+    # Since 2024-2025 YouTube has been aggressively blocking the default
+    # extractor when called from cloud IP ranges (AWS/GCP/Railway/etc),
+    # failing with "Video unavailable. This content isn't available."
+    #
+    # yt-dlp's upstream recommendation as of 2026 is to add `web_embedded`
+    # and `mweb` to the player_client list. The `default` value keeps
+    # yt-dlp's current stable default (which changes release to release as
+    # YouTube patches holes), and the extra clients are tried as fallbacks
+    # when the default rejects the request. See:
+    #   https://github.com/yt-dlp/yt-dlp/pull/14693  (temp workaround)
+    #   https://github.com/yt-dlp/yt-dlp/issues/16150 (client status)
+    #
+    # This is the cheapest fix for the cloud-IP block; it doesn't work for
+    # every video (age-gated + login-required still fail) but it unblocks
+    # the common case without needing a proxy or cookies. yt-dlp must be
+    # reasonably recent for these client names to exist — see
+    # backend/requirements.txt for the pinned version.
+    _YOUTUBE_EXTRACTOR_ARGS: dict[str, dict[str, list[str]]] = {
+        "youtube": {
+            "player_client": ["default", "web_embedded", "mweb"],
+        },
+    }
+
     def _ydl_opts_for_resolve(self, workspace: Path) -> dict[str, Any]:
         return {
             "format": f"bestvideo[height<={self._max_height}]+bestaudio/best[height<={self._max_height}]",
@@ -382,6 +407,7 @@ class YtDlpAdapter(BaseAdapter):
             "writeautomaticsub": True,
             "subtitleslangs": ["en", "en-US", "en-GB"],
             "subtitlesformat": "vtt",
+            "extractor_args": self._YOUTUBE_EXTRACTOR_ARGS,
             "http_headers": {
                 "User-Agent": USER_AGENT,
             },
@@ -399,6 +425,7 @@ class YtDlpAdapter(BaseAdapter):
             "nocheckcertificate": False,
             "socket_timeout": self._socket_timeout,
             "retries": self._retries,
+            "extractor_args": self._YOUTUBE_EXTRACTOR_ARGS,
             "http_headers": {
                 "User-Agent": USER_AGENT,
             },

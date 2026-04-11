@@ -459,7 +459,11 @@ class IngestionPipeline:
         is handled correctly by ingest_url() via load_existing_reel.
         """
         effective_trace = set_trace_id(trace_id or new_trace_id())
-        effective_platforms: list[PlatformLiteral] = list(platforms) if platforms else ["yt", "ig", "tt"]
+        # Default to YouTube only. Instagram and TikTok robots.txt explicitly
+        # disallow the ReelAIBot user agent, so resolving them from here would
+        # always bounce at the robots.txt check in yt_dlp_adapter. Callers can
+        # still opt in by passing a platforms list explicitly.
+        effective_platforms: list[PlatformLiteral] = list(platforms) if platforms else ["yt"]
         exclude = {str(v).strip() for v in (exclude_video_ids or []) if v}
 
         log_event(

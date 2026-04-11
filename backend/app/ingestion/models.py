@@ -142,16 +142,22 @@ class IngestFeedResult(BaseModel):
 
 class IngestSearchRequest(BaseModel):
     """
-    Topic-based search across YouTube + Instagram + TikTok.
+    Topic-based search, currently YouTube-only.
 
-    Each platform is resolved independently (via yt-dlp's native search extractors)
-    then every resolved URL is processed through the same ingest_url pipeline, so
-    search results get Whisper fallback, silence-aware cuts, and full metadata just
-    like a manually pasted URL.
+    The adapter still supports Instagram + TikTok but the default is YouTube
+    because IG/TT robots.txt explicitly disallows bots (User-Agent: ReelAIBot
+    in the good-faith crawler config at ingestion/__init__.py) so those
+    platforms would bounce at the robots.txt check anyway. Callers who want
+    IG/TT can still opt in by passing `platforms` explicitly and accepting
+    the legal/ToS posture.
+
+    Each resolved URL is processed through the same ingest_url pipeline, so
+    search results get Whisper fallback, silence-aware cuts, and full metadata
+    just like a manually pasted URL.
     """
 
     query: str = Field(min_length=1, max_length=500)
-    platforms: list[PlatformLiteral] = Field(default_factory=lambda: ["yt", "ig", "tt"])
+    platforms: list[PlatformLiteral] = Field(default_factory=lambda: ["yt"])
     max_per_platform: int = Field(default=5, ge=1, le=15)
     material_id: str | None = Field(default=None, max_length=240)
     concept_id: str | None = Field(default=None, max_length=240)
