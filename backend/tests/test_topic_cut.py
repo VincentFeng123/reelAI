@@ -840,8 +840,9 @@ class TopicCutSegmentsForConceptHelperTests(unittest.TestCase):
             _topic_cut_segments_for_concept = ReelService._topic_cut_segments_for_concept
         self.service = _StubService()
 
-    def test_long_form_returns_topic_segments(self) -> None:
-        # No concept_terms → no concept-anchoring, all topics returned.
+    def test_long_form_with_concept_returns_clustered_segments(self) -> None:
+        # The new helper is concept-driven: it requires concept_terms to
+        # produce any output. Pass real concept terms and expect clusters.
         segments = self.service._topic_cut_segments_for_concept(
             transcript=self.transcript_dicts,
             video_id="aircAruvnKk",
@@ -849,9 +850,10 @@ class TopicCutSegmentsForConceptHelperTests(unittest.TestCase):
             clip_min_len=30,
             clip_max_len=120,
             max_segments=10,
+            concept_terms=["carbonara", "spaghetti"],
         )
         self.assertGreaterEqual(len(segments), 1,
-                                f"expected ≥1 topic_cut segment, got {segments}")
+                                f"expected ≥1 cluster segment, got {segments}")
         for seg in segments:
             self.assertGreater(seg.t_end, seg.t_start)
             self.assertGreaterEqual(seg.t_end - seg.t_start, 30)
@@ -859,7 +861,8 @@ class TopicCutSegmentsForConceptHelperTests(unittest.TestCase):
             self.assertTrue(seg.text)
 
     def test_returns_empty_for_short_video(self) -> None:
-        # A 50-second "video" — topic_cut classifies as Short via duration.
+        # A 50-second "video" — too short to contain a cluster of mentions
+        # outside the intro buffer.
         short_transcript = self.transcript_dicts[:10]  # ~50s
         segments = self.service._topic_cut_segments_for_concept(
             transcript=short_transcript,
@@ -868,6 +871,7 @@ class TopicCutSegmentsForConceptHelperTests(unittest.TestCase):
             clip_min_len=15,
             clip_max_len=60,
             max_segments=5,
+            concept_terms=["carbonara"],
         )
         self.assertEqual(segments, [])
 
@@ -879,17 +883,51 @@ class TopicCutSegmentsForConceptHelperTests(unittest.TestCase):
             clip_min_len=30,
             clip_max_len=60,
             max_segments=5,
+            concept_terms=["anything"],
         )
         self.assertEqual(segments, [])
 
+    def test_returns_empty_when_no_concept_terms(self) -> None:
+        # The new helper is concept-driven only — no concept_terms → no
+        # output. The caller's legacy fallback (select_segments etc.) picks
+        # up the slack so we never silently emit zero reels.
+        segments = self.service._topic_cut_segments_for_concept(
+            transcript=self.transcript_dicts,
+            video_id="aircAruvnKk",
+            video_duration_sec=300,
+            clip_min_len=30,
+            clip_max_len=120,
+            max_segments=10,
+            concept_terms=None,
+        )
+        self.assertEqual(segments, [])
+        segments_empty = self.service._topic_cut_segments_for_concept(
+            transcript=self.transcript_dicts,
+            video_id="aircAruvnKk",
+            video_duration_sec=300,
+            clip_min_len=30,
+            clip_max_len=120,
+            max_segments=10,
+            concept_terms=[],
+        )
+        self.assertEqual(segments_empty, [])
 
-class ConceptAnchoredRefinementTests(unittest.TestCase):
+
+class ConceptClusterAnchoringTests(unittest.TestCase):
     """
-    The `concept_terms` parameter must:
-      1. Restrict the output to topics that mention the concept ≥2 times.
-      2. Refine the t_start to the first matching cue (with optional 1-cue lead-in).
-      3. Refine the t_end to the last matching cue.
-      4. Drop topics with no concept mentions entirely.
+    The `concept_terms` parameter drives concept-mention clustering with the
+    following hard guarantees:
+
+      1. Mentions in the first INTRO_BUFFER_SEC of the video are skipped — a
+         name-drop in the welcome sequence cannot anchor a clip.
+      2. Mentions are clustered into runs where consecutive mentions are
+         within MAX_GAP_SEC. Isolated mentions (gap > MAX_GAP_SEC) don't form
+         a cluster and produce no clip.
+      3. Each cluster needs at least MIN_CLUSTER_MENTIONS (=2) mentions —
+         single mentions are passing references, not topic content.
+      4. The clip starts at (cluster_first_mention - up to 2 cues of lead-in)
+         and ends at (cluster_last_mention + tail buffer).
+      5. Topics with no concept mentions are dropped entirely.
     """
 
     def setUp(self) -> None:
@@ -905,7 +943,7 @@ class ConceptAnchoredRefinementTests(unittest.TestCase):
             _topic_cut_segments_for_concept = ReelService._topic_cut_segments_for_concept
         self.service = _StubService()
 
-    def test_pasta_concept_returns_only_pasta_topics(self) -> None:
+    def test_pasta_concept_returns_only_pasta_segments(self) -> None:
         segments = self.service._topic_cut_segments_for_concept(
             transcript=self.transcript_dicts,
             video_id="aircAruvnKk",
@@ -918,15 +956,15 @@ class ConceptAnchoredRefinementTests(unittest.TestCase):
         self.assertGreaterEqual(len(segments), 1,
                                 "expected ≥1 pasta segment, got nothing")
         # Every returned segment must lie in the pasta half (0-150s) — the JS
-        # half (150-300s) contains zero pasta vocabulary so concept-anchoring
-        # must drop it.
+        # half (150-300s) contains zero pasta vocabulary so the cluster cannot
+        # extend into it.
         for seg in segments:
             self.assertLess(seg.t_start, 160,
                             f"pasta segment leaked into JS half: {seg}")
             self.assertLessEqual(seg.t_end, 160,
                                  f"pasta segment ends in JS half: {seg}")
 
-    def test_js_concept_returns_only_js_topics(self) -> None:
+    def test_js_concept_returns_only_js_segments(self) -> None:
         segments = self.service._topic_cut_segments_for_concept(
             transcript=self.transcript_dicts,
             video_id="aircAruvnKk",
@@ -938,14 +976,11 @@ class ConceptAnchoredRefinementTests(unittest.TestCase):
         )
         self.assertGreaterEqual(len(segments), 1,
                                 "expected ≥1 JS segment, got nothing")
-        # Every returned segment must lie in the JS half (≥150s).
         for seg in segments:
             self.assertGreaterEqual(seg.t_start, 140,
                                     f"JS segment leaked into pasta half: {seg}")
 
     def test_unrelated_concept_returns_nothing(self) -> None:
-        # Concept terms that appear in NEITHER half — every topic should be
-        # dropped (the relevance hard-guarantee).
         segments = self.service._topic_cut_segments_for_concept(
             transcript=self.transcript_dicts,
             video_id="aircAruvnKk",
@@ -958,91 +993,211 @@ class ConceptAnchoredRefinementTests(unittest.TestCase):
         self.assertEqual(segments, [],
                          f"expected empty list for unrelated concept, got {segments}")
 
-    def test_refined_clip_starts_near_first_concept_mention(self) -> None:
-        # Use a single distinctive concept term whose first mention is in the
-        # MIDDLE of a topic, not at the start. The refined t_start should land
-        # near that mention (within 1 cue lead-in), not at the topic boundary.
-        segments = self.service._topic_cut_segments_for_concept(
-            transcript=self.transcript_dicts,
-            video_id="aircAruvnKk",
-            video_duration_sec=300,
-            clip_min_len=30,
-            clip_max_len=200,
-            max_segments=10,
-            concept_terms=["devtools"],  # appears in cues 31 and elsewhere in JS half
-        )
-        self.assertGreaterEqual(len(segments), 1)
-        # The first segment's t_start should be close to where "devtools" first
-        # appears (~155s for cue 31), not 0 or 150.
-        # With 1-cue lead-in, we expect the start to be at or just before
-        # the cue containing the first "devtools" mention.
-        first_mention_indices = [
-            i for i, c in enumerate(self.transcript_dicts)
-            if "devtools" in c["text"].lower()
-        ]
-        if first_mention_indices:
-            expected_start_floor = max(0, (first_mention_indices[0] - 1)) * 5.0
-            for seg in segments:
-                # The refined start should not be earlier than first_mention - 1 cue
-                # AND not later than first_mention itself.
-                self.assertGreaterEqual(
-                    seg.t_start, expected_start_floor - 0.5,
-                    f"refined start {seg.t_start} is earlier than first mention - 1 cue ({expected_start_floor})",
-                )
-
-    def test_no_concept_terms_returns_unrefined_topic_boundaries(self) -> None:
-        # When concept_terms is None or empty, the helper falls back to
-        # returning topic_cut's natural boundaries unrefined.
-        segments_none = self.service._topic_cut_segments_for_concept(
-            transcript=self.transcript_dicts,
-            video_id="aircAruvnKk",
-            video_duration_sec=300,
-            clip_min_len=30,
-            clip_max_len=200,
-            max_segments=10,
-            concept_terms=None,
-        )
-        segments_empty = self.service._topic_cut_segments_for_concept(
-            transcript=self.transcript_dicts,
-            video_id="aircAruvnKk",
-            video_duration_sec=300,
-            clip_min_len=30,
-            clip_max_len=200,
-            max_segments=10,
-            concept_terms=[],
-        )
-        self.assertGreaterEqual(len(segments_none), 1)
-        self.assertGreaterEqual(len(segments_empty), 1)
-        # None and [] should produce equivalent output (same topic boundaries).
-        self.assertEqual(
-            [(s.t_start, s.t_end) for s in segments_none],
-            [(s.t_start, s.t_end) for s in segments_empty],
-        )
-
-    def test_single_mention_topic_is_dropped(self) -> None:
-        # Inject a transcript where the concept is mentioned only ONCE inside
-        # a topic. The helper should drop it (≥2 mentions required).
+    def test_intro_only_mention_is_skipped(self) -> None:
+        """
+        The user reported clips landing on the video intro because creators
+        name-drop the topic in the first 15s ("today we'll talk about X").
+        This test guarantees that a single intro-mention CANNOT produce a
+        clip — only mentions AFTER INTRO_BUFFER_SEC are eligible to anchor
+        a cluster.
+        """
         transcript = [
-            {"start": i * 5.0, "duration": 5.0, "text": text}
-            for i, text in enumerate([
-                # Topic A: 30 cues about cooking
-                *(f"cooking step {i}" for i in range(30)),
-                # Topic B: 30 cues about JavaScript with EXACTLY ONE mention of "rust"
-                *(f"javascript line {i}" for i in range(15)),
-                "actually let me mention rust briefly",
-                *(f"javascript line {i}" for i in range(15, 30)),
-            ])
+            # 0-15s: video intro that name-drops the concept exactly once
+            {"start": 0.0, "duration": 5.0, "text": "Hi everyone welcome to the channel"},
+            {"start": 5.0, "duration": 5.0, "text": "Today we will talk about backpropagation in detail"},
+            {"start": 10.0, "duration": 5.0, "text": "Let's get started right now"},
+            # 15-180s: long unrelated content (cooking)
+            *[
+                {"start": float(15 + i * 5), "duration": 5.0, "text": f"cooking step number {i}"}
+                for i in range(33)
+            ],
         ]
         segments = self.service._topic_cut_segments_for_concept(
             transcript=transcript,
             video_id="aircAruvnKk",
-            video_duration_sec=300,
+            video_duration_sec=180,
             clip_min_len=30,
-            clip_max_len=200,
-            max_segments=10,
+            clip_max_len=120,
+            max_segments=5,
+            concept_terms=["backpropagation"],
+        )
+        # Only the intro mentions backpropagation. Intro mentions are skipped.
+        # No cluster of ≥2 mentions exists outside the intro → no segments.
+        self.assertEqual(segments, [],
+                         f"intro mention should not anchor a clip; got {segments}")
+
+    def test_isolated_mentions_do_not_form_cluster(self) -> None:
+        """
+        Two mentions of the concept that are >MAX_GAP_SEC (60s) apart should
+        NOT cluster. This catches the case where a creator briefly references
+        the concept twice in unrelated parts of the video without actually
+        discussing it as a topic.
+        """
+        transcript = [
+            {"start": 0.0, "duration": 5.0, "text": "intro intro intro"},
+            {"start": 5.0, "duration": 5.0, "text": "more intro stuff"},
+            {"start": 10.0, "duration": 5.0, "text": "still intro"},
+            # Mention #1 at 20s — well after the intro buffer
+            {"start": 20.0, "duration": 5.0, "text": "and we briefly mention rust here"},
+            # 80 seconds of unrelated content
+            *[
+                {"start": float(25 + i * 5), "duration": 5.0, "text": f"unrelated content {i}"}
+                for i in range(20)
+            ],
+            # Mention #2 at 125s — gap of 100s, > MAX_GAP_SEC
+            {"start": 125.0, "duration": 5.0, "text": "a passing comment about rust again"},
+            # More unrelated content
+            *[
+                {"start": float(130 + i * 5), "duration": 5.0, "text": f"more unrelated {i}"}
+                for i in range(10)
+            ],
+        ]
+        segments = self.service._topic_cut_segments_for_concept(
+            transcript=transcript,
+            video_id="aircAruvnKk",
+            video_duration_sec=180,
+            clip_min_len=30,
+            clip_max_len=120,
+            max_segments=5,
             concept_terms=["rust"],
         )
-        # Only 1 mention → topic dropped → no segments returned.
+        # 2 mentions but they don't cluster → no segments
+        self.assertEqual(segments, [],
+                         f"isolated mentions should not form a cluster; got {segments}")
+
+    def test_dense_cluster_returns_segment(self) -> None:
+        """
+        A run of multiple consecutive concept mentions within MAX_GAP_SEC
+        of each other should produce exactly one clip whose start lands
+        near the first mention and whose end lands near the last mention.
+        """
+        transcript = [
+            # Intro that name-drops the concept (should NOT anchor)
+            {"start": 0.0, "duration": 5.0, "text": "today we'll cover dijkstra"},
+            {"start": 5.0, "duration": 5.0, "text": "but first some announcements"},
+            {"start": 10.0, "duration": 5.0, "text": "ok let's begin"},
+            # 15-60s: unrelated background
+            *[
+                {"start": float(15 + i * 5), "duration": 5.0, "text": f"background point {i}"}
+                for i in range(9)
+            ],
+            # 60-120s: dense cluster of mentions (the actual topic)
+            {"start": 60.0, "duration": 5.0, "text": "now let's actually study dijkstra's algorithm"},
+            {"start": 65.0, "duration": 5.0, "text": "dijkstra works on weighted graphs"},
+            {"start": 70.0, "duration": 5.0, "text": "the dijkstra approach uses a priority queue"},
+            {"start": 75.0, "duration": 5.0, "text": "we initialize distances and relax edges"},
+            {"start": 80.0, "duration": 5.0, "text": "dijkstra is greedy and always picks the smallest"},
+            {"start": 85.0, "duration": 5.0, "text": "the dijkstra runtime is O of E log V"},
+            # 90s: topic ends, transition to next subject
+            *[
+                {"start": float(90 + i * 5), "duration": 5.0, "text": f"next topic point {i}"}
+                for i in range(20)
+            ],
+        ]
+        segments = self.service._topic_cut_segments_for_concept(
+            transcript=transcript,
+            video_id="aircAruvnKk",
+            video_duration_sec=200,
+            clip_min_len=30,
+            clip_max_len=200,
+            max_segments=5,
+            concept_terms=["dijkstra"],
+        )
+        self.assertEqual(len(segments), 1,
+                         f"expected exactly 1 cluster, got {segments}")
+        seg = segments[0]
+        # Start must be after the intro buffer (15s) and at or before the first
+        # cluster mention (60s), accounting for up to 2 cues of lead-in (10s).
+        self.assertGreaterEqual(seg.t_start, 15.0,
+                                f"start {seg.t_start} is in the intro buffer")
+        self.assertLessEqual(seg.t_start, 60.0,
+                             f"start {seg.t_start} is after the first cluster mention (60s)")
+        self.assertGreaterEqual(seg.t_start, 50.0,
+                                f"start {seg.t_start} is too far before the cluster (>2 cue lead-in)")
+        # End must be at or after the last mention (90s) and not run into the
+        # next-topic content. Allow some tail buffer.
+        self.assertGreaterEqual(seg.t_end, 90.0,
+                                f"end {seg.t_end} is before the last cluster mention (90s)")
+        self.assertLessEqual(seg.t_end, 100.0,
+                             f"end {seg.t_end} runs into the next topic")
+
+    def test_two_separate_clusters_return_two_segments(self) -> None:
+        """
+        Two clusters of the same concept that are MORE than MAX_GAP_SEC apart
+        should produce TWO separate clips — the creator returned to the topic
+        later in the video.
+        """
+        transcript = [
+            *[
+                {"start": float(i * 5), "duration": 5.0, "text": f"intro {i}"}
+                for i in range(4)
+            ],
+            # First cluster: 20-60s (mentions at 20, 25, 30, 35, 40)
+            {"start": 20.0, "duration": 5.0, "text": "let's introduce recursion now"},
+            {"start": 25.0, "duration": 5.0, "text": "recursion calls itself with smaller input"},
+            {"start": 30.0, "duration": 5.0, "text": "recursion needs a base case"},
+            {"start": 35.0, "duration": 5.0, "text": "recursion can replace iteration"},
+            {"start": 40.0, "duration": 5.0, "text": "recursion uses the call stack"},
+            # 90s of unrelated content (gap > MAX_GAP_SEC)
+            *[
+                {"start": float(45 + i * 5), "duration": 5.0, "text": f"loops and other stuff {i}"}
+                for i in range(20)
+            ],
+            # Second cluster: 145-180s (mentions at 145, 150, 155, 160)
+            {"start": 145.0, "duration": 5.0, "text": "now let's revisit recursion with a real example"},
+            {"start": 150.0, "duration": 5.0, "text": "recursion in tree traversal is the canonical case"},
+            {"start": 155.0, "duration": 5.0, "text": "recursion makes the code much shorter here"},
+            {"start": 160.0, "duration": 5.0, "text": "recursion really shines for divide and conquer"},
+            *[
+                {"start": float(165 + i * 5), "duration": 5.0, "text": f"wrap up {i}"}
+                for i in range(10)
+            ],
+        ]
+        segments = self.service._topic_cut_segments_for_concept(
+            transcript=transcript,
+            video_id="aircAruvnKk",
+            video_duration_sec=220,
+            clip_min_len=30,
+            clip_max_len=200,
+            max_segments=5,
+            concept_terms=["recursion"],
+        )
+        self.assertEqual(len(segments), 2,
+                         f"expected 2 clusters, got {segments}")
+        # Both segments must lie in their respective cluster windows.
+        starts = sorted(seg.t_start for seg in segments)
+        ends = sorted(seg.t_end for seg in segments)
+        self.assertLess(starts[0], 60, f"first cluster start out of range: {starts[0]}")
+        self.assertGreater(starts[1], 100, f"second cluster start too early: {starts[1]}")
+        self.assertLess(ends[0], 120, f"first cluster end runs into the gap: {ends[0]}")
+        self.assertGreaterEqual(ends[1], 160, f"second cluster end too early: {ends[1]}")
+
+    def test_single_mention_outside_intro_is_dropped(self) -> None:
+        """
+        Even outside the intro buffer, a SINGLE concept mention is not enough.
+        We require ≥MIN_CLUSTER_MENTIONS (=2) for substantive discussion.
+        """
+        transcript = [
+            *[
+                {"start": float(i * 5), "duration": 5.0, "text": f"unrelated {i}"}
+                for i in range(40)
+            ],
+            # Exactly one mention at the 200s mark
+            {"start": 200.0, "duration": 5.0, "text": "by the way kotlin is interesting"},
+            *[
+                {"start": float(205 + i * 5), "duration": 5.0, "text": f"more unrelated {i}"}
+                for i in range(10)
+            ],
+        ]
+        segments = self.service._topic_cut_segments_for_concept(
+            transcript=transcript,
+            video_id="aircAruvnKk",
+            video_duration_sec=260,
+            clip_min_len=30,
+            clip_max_len=120,
+            max_segments=5,
+            concept_terms=["kotlin"],
+        )
         self.assertEqual(segments, [])
 
 

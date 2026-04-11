@@ -8893,57 +8893,82 @@ class ReelService:
         concept_terms: list[str] | None = None,
     ) -> list[SegmentMatch]:
         """
-        Build SegmentMatch candidates by running `services.topic_cut` on the
-        transcript and refining each TopicReel to the user's concept window.
+        Cut a long-form video at the moments where the user's concept is
+        actually being discussed, not where it's name-dropped in the intro.
 
-        This is the topic-aware replacement for the legacy `select_segments` /
-        `_fast_segments_from_transcript` selection step. Two-pass strategy:
+        Strategy: **concept-mention clustering** with intro-skip.
 
-        1. **Topic boundary detection.** topic_cut identifies natural topic
-           boundaries (LLM / sentence-transformers / Jaccard heuristic in that
-           precedence order — chapters are unavailable here because the search
-           hot-path doesn't carry yt-dlp info_dicts).
+        1. Skip the first INTRO_BUFFER_SEC of every video. The opening of a
+           YouTube video almost always contains "today we'll talk about X"
+           where X is the concept name — that's a name-drop, not a topic.
+           Anchoring on it produces clips that are nothing but the welcome
+           sequence, which was the bug the user reported.
 
-        2. **Concept-anchored refinement.** Within each topic boundary, we
-           scan transcript cues for explicit concept-term mentions and refine:
-             * `t_start` = the start of the FIRST cue mentioning the concept,
-               minus 1 cue of lead-in to capture the introductory sentence
-               ("Now let's talk about X" — where X is the concept term)
-             * `t_end` = the end of the LAST cue mentioning the concept
-           Both clamped within the original topic boundaries. Any topic with
-           fewer than 2 concept mentions is dropped — that's the hard guarantee
-           that every emitted clip is genuinely about the user's search.
+        2. Walk the transcript and mark every cue that mentions any concept
+           term (using `normalize_terms` from segmenter.py so plurals/stems
+           still match — same semantics as the rest of the relevance ranker).
+
+        3. **Cluster** consecutive mentions whose gap is ≤ MAX_GAP_SEC. A
+           cluster is a contiguous run of mentions that belong to the same
+           discussion. Isolated mentions (gap > MAX_GAP_SEC from neighbors)
+           don't form a cluster — they're passing references, not topic
+           content. This is the key insight that fixes the "clip is just
+           the intro" bug: the intro contains ONE mention of the concept,
+           which can never form a cluster of two.
+
+        4. Drop clusters with fewer than MIN_CLUSTER_MENTIONS mentions —
+           this is the hard relevance guarantee that every clip is
+           substantively about the user's search.
+
+        5. For each surviving cluster:
+             * `t_start` = the start of the cue containing the FIRST mention
+               in the cluster, with up to LEAD_IN_CUES of lead-in to catch
+               introductory phrases like "Now let's talk about X". Lead-in
+               cues that fall inside INTRO_BUFFER_SEC are excluded.
+             * `t_end` = the end of the cue containing the LAST mention in
+               the cluster, padded with TAIL_BUFFER_SEC for the speaker to
+               finish their sentence.
+             * Apply duration guardrails: if shorter than `clip_min_len`,
+               expand the END outward (capped at the next cluster's start).
+               If longer than `clip_max_len`, split into equal sub-parts.
+
+        6. Sort clusters by mention count (densest first) and take the top
+           `max_segments`.
+
+        Returns [] when:
+          * concept_terms is None or empty (caller should fall back)
+          * the transcript is empty
+          * no cluster meets the density threshold
+        The caller handles the empty case by falling through to the legacy
+        embedding-based `select_segments` path so we never silently emit
+        zero reels for a video with a transcript.
 
         For YouTube Shorts the caller should NOT invoke this method — the
-        existing `use_full_short_clip` path handles those by emitting the full
-        video. We respect the user's `clip_min_len`/`clip_max_len` knobs as
-        soft caps via topic_cut's split-on-too-long behavior.
-
-        Returns [] when topic_cut produces no usable segments OR when no topic
-        contains enough concept mentions — the caller should fall back to the
-        legacy embedding-based path so we never emit zero reels for a video
-        that has a transcript.
+        existing `use_full_short_clip` path handles those by emitting the
+        full video.
         """
-        # Local import to avoid pulling topic_cut into reels.py at module load
-        # (the file already takes long enough to import). topic_cut is a small
-        # pure-Python module so the cost is one-time per process.
-        from .topic_cut import (
-            cues_from_ingest_cues,
-            cut_video_into_topic_reels,
-        )
+        # Tunables — kept as locals so callers (and tests) can patch them
+        # without touching module state.
+        INTRO_BUFFER_SEC = 15.0
+        MAX_GAP_SEC = 60.0
+        MIN_CLUSTER_MENTIONS = 2
+        LEAD_IN_CUES = 2
+        TAIL_BUFFER_SEC = 1.5
 
-        # The transcript here is the legacy `[{"start": float, "duration": float,
-        # "text": str}, ...]` shape used everywhere in reels.py. topic_cut wants
-        # `TranscriptCue(start, duration, text)` dataclasses; build a tiny adapter
-        # that exposes the .start/.end/.text attrs cues_from_ingest_cues expects.
-        class _Cue:
-            __slots__ = ("start", "end", "text")
-            def __init__(self, start: float, end: float, text: str) -> None:
-                self.start = start
-                self.end = end
-                self.text = text
+        if not concept_terms or not transcript:
+            return []
 
-        ingest_cues: list[_Cue] = []
+        concept_token_set = normalize_terms(concept_terms)
+        if not concept_token_set:
+            return []
+
+        # Compact representation of the transcript for the clustering loop.
+        # We materialize parallel arrays so we can index by position cheaply.
+        cue_starts: list[float] = []
+        cue_ends: list[float] = []
+        cue_texts: list[str] = []
+        mention_idxs: list[int] = []
+
         for entry in transcript:
             try:
                 start = float(entry.get("start") or 0.0)
@@ -8953,154 +8978,158 @@ class ReelService:
             text = str(entry.get("text") or "").replace("\n", " ").strip()
             if not text:
                 continue
-            ingest_cues.append(_Cue(start=start, end=start + max(duration, 0.01), text=text))
+            cue_idx = len(cue_starts)
+            cue_starts.append(start)
+            cue_ends.append(start + max(duration, 0.01))
+            cue_texts.append(text)
 
-        if not ingest_cues:
+            # Skip mentions in the video intro entirely. The intro mention is
+            # almost always a name-drop ("today we'll talk about X") and is
+            # NOT where the substantive discussion happens.
+            if start < INTRO_BUFFER_SEC:
+                continue
+
+            cue_token_set = normalize_terms([text])
+            if concept_token_set & cue_token_set:
+                mention_idxs.append(cue_idx)
+
+        if len(mention_idxs) < MIN_CLUSTER_MENTIONS:
             return []
 
-        topic_cues = cues_from_ingest_cues(ingest_cues)
-        try:
-            classification, topic_reels = cut_video_into_topic_reels(
-                video_id,
-                duration_sec=float(video_duration_sec or 0.0),
-                # No info_dict here — the search-discovery hot path doesn't
-                # have one. Chapters are unavailable in this code path; topic
-                # boundaries come from LLM/semantic/heuristic.
-                openai_client=self.openai_client,
-                use_llm=False,
-                transcript=topic_cues,
-                # Soft cap: respect the user's preferred clip length range.
-                # topic_cut splits topics longer than max into equal sub-parts.
-                min_reel_sec=float(max(15, clip_min_len)),
-                max_reel_sec=float(max(clip_min_len + 1, clip_max_len)),
-            )
-        except Exception:
-            logger.exception(
-                "topic_cut failed for video_id=%s; caller should fall back",
-                video_id,
-            )
+        # Cluster consecutive mentions: a cluster ends when the gap between
+        # two mentions exceeds MAX_GAP_SEC. The intuition is that if the
+        # creator hasn't mentioned the concept for a full minute, they've
+        # moved to a different topic.
+        clusters: list[list[int]] = []
+        current: list[int] = [mention_idxs[0]]
+        for prev, curr in zip(mention_idxs, mention_idxs[1:]):
+            gap = cue_starts[curr] - cue_ends[prev]
+            if gap <= MAX_GAP_SEC:
+                current.append(curr)
+            else:
+                if len(current) >= MIN_CLUSTER_MENTIONS:
+                    clusters.append(current)
+                current = [curr]
+        if len(current) >= MIN_CLUSTER_MENTIONS:
+            clusters.append(current)
+
+        if not clusters:
             return []
 
-        if classification.is_short or not topic_reels:
-            return []
+        # Sort clusters by density (mention count first, then by length) so
+        # the most substantive discussion windows take priority.
+        clusters.sort(key=lambda c: (-len(c), c[0]))
 
-        # Pre-tokenize the user's concept terms once. We use the existing
-        # `normalize_terms` helper from segmenter.py so the matching semantics
-        # match the rest of the relevance pipeline (handles plurals, stems,
-        # etc.). When concept_terms is empty we skip refinement entirely and
-        # return topic boundaries as-is — the downstream relevance ranker will
-        # still filter, just with looser cuts.
-        concept_token_set = normalize_terms(concept_terms or []) if concept_terms else set()
-        require_refinement = bool(concept_token_set)
+        # Compute cluster boundary helpers we'll need below.
+        cluster_starts = [cue_starts[c[0]] for c in clusters]
+        cluster_starts_sorted = sorted(cluster_starts)
 
         segments: list[SegmentMatch] = []
-        for idx, reel in enumerate(topic_reels):
+        for cluster in clusters:
             if len(segments) >= max_segments:
                 break
 
-            # Walk the cues inside this topic and find every cue that mentions
-            # any concept term. We bisect-style by linear scan because cues are
-            # already sorted by start time and there are typically <500 of them.
-            matching_indices: list[int] = []
-            cue_texts: list[str] = []
-            for cue_idx, entry in enumerate(transcript):
-                try:
-                    start = float(entry.get("start") or 0.0)
-                except (TypeError, ValueError):
-                    continue
-                if start < reel.t_start - 0.01:
-                    continue
-                if start > reel.t_end + 0.01:
+            first_mention = cluster[0]
+            last_mention = cluster[-1]
+
+            # Lead-in: walk back up to LEAD_IN_CUES cues to catch the
+            # introductory phrase, but never cross the intro buffer.
+            lead_idx = first_mention
+            for _ in range(LEAD_IN_CUES):
+                candidate = lead_idx - 1
+                if candidate < 0:
                     break
-                text = str(entry.get("text") or "").replace("\n", " ").strip()
-                if not text:
-                    continue
-                cue_texts.append(text)
-                if require_refinement:
-                    cue_token_set = normalize_terms([text])
-                    if concept_token_set & cue_token_set:
-                        matching_indices.append(cue_idx)
+                if cue_starts[candidate] < INTRO_BUFFER_SEC:
+                    break
+                lead_idx = candidate
 
-            if not cue_texts:
-                continue
+            t_start = cue_starts[lead_idx]
+            t_end = cue_ends[last_mention] + TAIL_BUFFER_SEC
 
-            t_start = float(reel.t_start)
-            t_end = float(reel.t_end)
+            # Don't extend t_end into the next cluster's intro phrase.
+            for next_start in cluster_starts_sorted:
+                if next_start > cue_starts[last_mention] + 1.0:
+                    if t_end > next_start - 0.5:
+                        t_end = max(cue_ends[last_mention], next_start - 0.5)
+                    break
 
-            if require_refinement:
-                # Hard guarantee: at least 2 concept mentions inside the topic.
-                # 1 mention is too noisy — can be a passing reference. ≥2
-                # mentions means the topic substantively discusses the concept.
-                if len(matching_indices) < 2:
-                    continue
+            # Clamp to video duration.
+            if video_duration_sec and video_duration_sec > 0:
+                t_end = min(t_end, float(video_duration_sec))
 
-                first_cue_idx = matching_indices[0]
-                last_cue_idx = matching_indices[-1]
-
-                # Anchor t_start to the first matching cue, with up to 1 cue of
-                # lead-in to capture introductory phrases like "Now let's talk
-                # about X" where X is the concept term.
-                lead_idx = max(0, first_cue_idx - 1)
-                while lead_idx < first_cue_idx:
-                    lead_entry = transcript[lead_idx]
-                    try:
-                        lead_start = float(lead_entry.get("start") or 0.0)
-                    except (TypeError, ValueError):
-                        lead_idx += 1
-                        continue
-                    if lead_start >= reel.t_start - 0.01:
+            duration = t_end - t_start
+            if duration < clip_min_len:
+                # Try expanding the END outward toward the natural end of the
+                # discussion (or the next cluster boundary, whichever is
+                # closer). We never expand the START because the user
+                # explicitly wants the clip to begin at the topic introduction.
+                deficit = clip_min_len - duration
+                new_end = t_end + deficit
+                if video_duration_sec and video_duration_sec > 0:
+                    new_end = min(new_end, float(video_duration_sec))
+                # Don't run into the next cluster.
+                for next_start in cluster_starts_sorted:
+                    if next_start > t_start + 1.0 and new_end > next_start - 0.5:
+                        new_end = next_start - 0.5
                         break
-                    lead_idx += 1
-
-                refined_start_entry = transcript[lead_idx]
-                refined_end_entry = transcript[last_cue_idx]
-                try:
-                    refined_start = float(refined_start_entry.get("start") or 0.0)
-                except (TypeError, ValueError):
-                    refined_start = reel.t_start
-                try:
-                    end_start = float(refined_end_entry.get("start") or 0.0)
-                    end_dur = float(refined_end_entry.get("duration") or 0.0)
-                except (TypeError, ValueError):
-                    end_start, end_dur = reel.t_end, 0.0
-                refined_end = end_start + max(end_dur, 0.5)
-
-                # Clamp to the original topic window.
-                t_start = max(reel.t_start, refined_start)
-                t_end = min(reel.t_end, refined_end)
-                if t_end <= t_start:
+                t_end = max(t_end, new_end)
+                duration = t_end - t_start
+                if duration < clip_min_len:
+                    # Couldn't reach min length without overlapping the next
+                    # cluster — drop this one rather than emit a too-short clip.
                     continue
 
-                # If the refined window is too short, expand outward toward the
-                # topic boundary. Prefer expanding the END (more context after
-                # the discussion) over the START (we want to begin near the
-                # introduction).
-                refined_duration = t_end - t_start
-                if refined_duration < clip_min_len:
-                    deficit = clip_min_len - refined_duration
-                    new_end = min(reel.t_end, t_end + deficit)
-                    if new_end - t_start < clip_min_len:
-                        new_start = max(reel.t_start, t_start - (clip_min_len - (new_end - t_start)))
-                        t_start = new_start
-                    t_end = new_end
-                    if t_end - t_start < clip_min_len:
-                        # Topic window itself is shorter than clip_min_len —
-                        # let the downstream normalizer handle it.
+            # Split if too long: keep the topic intact by emitting equal-length
+            # sub-parts that all fall inside the cluster's natural window.
+            sub_windows: list[tuple[float, float]] = []
+            if duration > clip_max_len:
+                import math
+                num_parts = int(math.ceil(duration / clip_max_len))
+                part_dur = duration / num_parts
+                if part_dur < clip_min_len:
+                    # The user's [min, max] range can't fit equal sub-parts.
+                    # Keep the natural cluster window — better than dropping
+                    # substantive discussion content.
+                    sub_windows = [(t_start, t_end)]
+                else:
+                    for i in range(num_parts):
+                        a = t_start + i * part_dur
+                        b = t_end if i == num_parts - 1 else (t_start + (i + 1) * part_dur)
+                        sub_windows.append((a, b))
+            else:
+                sub_windows = [(t_start, t_end)]
+
+            for sub_idx, (a, b) in enumerate(sub_windows):
+                if len(segments) >= max_segments:
+                    break
+
+                text_parts: list[str] = []
+                for i in range(len(cue_starts)):
+                    if cue_starts[i] < a - 0.01:
                         continue
+                    if cue_starts[i] > b + 0.01:
+                        break
+                    text_parts.append(cue_texts[i])
+                joined_text = " ".join(text_parts).strip()
+                if not joined_text:
+                    continue
 
-            joined_text = " ".join(cue_texts).strip()
-            if not joined_text:
-                joined_text = reel.label or "topic clip"
+                # Density-weighted score: clusters with more mentions rank
+                # higher. The rest of the pipeline still does concept-embedding
+                # ranking on top of this, so the absolute number doesn't
+                # matter much — only the ordering within this video.
+                density_score = 0.4 + min(0.5, 0.05 * len(cluster))
 
-            segments.append(
-                SegmentMatch(
-                    chunk_index=idx,
-                    t_start=float(t_start),
-                    t_end=float(t_end),
-                    text=joined_text,
-                    score=0.5,  # neutral starting score; ranked downstream
+                segments.append(
+                    SegmentMatch(
+                        chunk_index=len(segments),
+                        t_start=float(a),
+                        t_end=float(b),
+                        text=joined_text,
+                        score=density_score,
+                    )
                 )
-            )
+
         return segments
 
     def _is_vague_concept(self, title: str, keywords: list[str], summary: str) -> bool:
