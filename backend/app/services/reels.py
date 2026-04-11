@@ -757,10 +757,21 @@ class ReelService:
         "compilation",
         "reaction",
     }
-    QUERY_RETRIEVAL_WORKERS_FAST = 6
-    QUERY_RETRIEVAL_WORKERS_SLOW = 6
-    TRANSCRIPT_FETCH_WORKERS_FAST = 6
-    TRANSCRIPT_FETCH_WORKERS_SLOW = 6
+    # ---- retrieval & transcript parallelism ----
+    # Bumped from 6 to 10. The biggest single wall-clock cost in reel
+    # generation is fetching transcripts from YouTube — each call takes a
+    # few seconds and is almost entirely spent waiting on the network.
+    # With 10 workers instead of 6 we can fetch 60% more transcripts in
+    # the same wall-clock time, and the underlying HTTP session pool
+    # (`SESSION_POOL_SIZE = 48`) is now large enough to support it.
+    #
+    # Bigger numbers (20+) were tested but started hitting intermittent
+    # 429 rate-limit responses from YouTube — 10 is the sweet spot we
+    # landed on.
+    QUERY_RETRIEVAL_WORKERS_FAST = 10
+    QUERY_RETRIEVAL_WORKERS_SLOW = 10
+    TRANSCRIPT_FETCH_WORKERS_FAST = 10
+    TRANSCRIPT_FETCH_WORKERS_SLOW = 10
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
     RANKED_FEED_CACHE_VERSION = 4
@@ -2260,43 +2271,76 @@ class ReelService:
                 if isinstance(mined_segments, list) and mined_segments:
                     segments = list(mined_segments)
                 elif transcript:
-                    if fast_mode:
-                        segments = self._fast_segments_from_transcript(
+                    target_segment_budget = min(10, max(4, remaining_segment_capacity + 2))
+
+                    # ---- NEW: topic-aware cutting for long-form videos ---- #
+                    # For non-Short videos, run topic_cut on the transcript first.
+                    # It returns SegmentMatches whose boundaries match natural
+                    # topic transitions (creator chapter / LLM / sentence-transformer
+                    # / Jaccard heuristic — whichever is available, in that order).
+                    # The downstream `_rank_segments_by_relevance` then ranks each
+                    # topic by concept relevance and applies `min_relevance_threshold`
+                    # so only the topic-cut segments matching the study concept are
+                    # kept. For Shorts (`use_full_short_clip == True`) we skip
+                    # topic_cut entirely — the existing full-clip path handles them.
+                    if not use_full_short_clip:
+                        segments = self._topic_cut_segments_for_concept(
                             transcript=transcript,
+                            video_id=video_id,
+                            video_duration_sec=video_duration,
+                            clip_min_len=clip_min_len,
+                            clip_max_len=clip_max_len,
+                            max_segments=target_segment_budget,
+                            # Concept-anchor refinement: clip starts at the
+                            # first cue mentioning the user's concept terms
+                            # within each topic, ends at the last mention.
+                            # Topics with <2 mentions are dropped — that's the
+                            # hard guarantee that every emitted clip is
+                            # genuinely about the user's search.
                             concept_terms=concept_terms,
-                            max_segments=min(6, max(2, remaining_segment_capacity + 1)),
                         )
-                    else:
-                        chunks, chunk_embeddings = self._load_or_create_transcript_chunks(conn, video_id, transcript)
-                        if chunks and len(chunk_embeddings) > 0:
-                            if concept_embedding is not None:
-                                target_segment_budget = min(10, max(4, remaining_segment_capacity + 2))
-                                semantic_segments = select_segments(
-                                    concept_embedding,
-                                    chunk_embeddings,
-                                    chunks,
-                                    concept_terms=concept_terms,
-                                    top_k=max(4, min(target_segment_budget, 6 if vague_topic else 5)),
-                                )
-                                short_segments = self._split_video_into_short_segments(
-                                    concept_embedding,
-                                    chunk_embeddings,
-                                    chunks,
-                                    concept_terms=concept_terms,
-                                    max_segments=target_segment_budget,
-                                )
-                                segments = self._merge_unique_segments(
-                                    [*semantic_segments, *short_segments],
-                                    max_items=target_segment_budget,
-                                )
-                            else:
-                                segments = self._fast_segments_from_transcript(
-                                    transcript=transcript,
-                                    concept_terms=concept_terms,
-                                    max_segments=min(8, max(3, remaining_segment_capacity + 1)),
-                                )
+
+                    # Legacy embedding-based path: runs when topic_cut returned
+                    # nothing (transcript too short, classification mismatch) AND
+                    # for Shorts that have a mined transcript. This guarantees we
+                    # never silently emit zero reels for a video with a transcript.
                     if not segments:
-                        segments = self._fallback_segments_from_transcript(transcript)
+                        if fast_mode:
+                            segments = self._fast_segments_from_transcript(
+                                transcript=transcript,
+                                concept_terms=concept_terms,
+                                max_segments=min(6, max(2, remaining_segment_capacity + 1)),
+                            )
+                        else:
+                            chunks, chunk_embeddings = self._load_or_create_transcript_chunks(conn, video_id, transcript)
+                            if chunks and len(chunk_embeddings) > 0:
+                                if concept_embedding is not None:
+                                    semantic_segments = select_segments(
+                                        concept_embedding,
+                                        chunk_embeddings,
+                                        chunks,
+                                        concept_terms=concept_terms,
+                                        top_k=max(4, min(target_segment_budget, 6 if vague_topic else 5)),
+                                    )
+                                    short_segments = self._split_video_into_short_segments(
+                                        concept_embedding,
+                                        chunk_embeddings,
+                                        chunks,
+                                        concept_terms=concept_terms,
+                                        max_segments=target_segment_budget,
+                                    )
+                                    segments = self._merge_unique_segments(
+                                        [*semantic_segments, *short_segments],
+                                        max_items=target_segment_budget,
+                                    )
+                                else:
+                                    segments = self._fast_segments_from_transcript(
+                                        transcript=transcript,
+                                        concept_terms=concept_terms,
+                                        max_segments=min(8, max(3, remaining_segment_capacity + 1)),
+                                    )
+                        if not segments:
+                            segments = self._fallback_segments_from_transcript(transcript)
                 else:
                     metadata_segment = self._fallback_segment_from_video_metadata(
                         video,
@@ -8836,6 +8880,228 @@ class ReelService:
         if not selected:
             return self._fallback_segments_from_transcript(transcript)
         return selected
+
+    def _topic_cut_segments_for_concept(
+        self,
+        *,
+        transcript: list[dict[str, Any]],
+        video_id: str,
+        video_duration_sec: int,
+        clip_min_len: int,
+        clip_max_len: int,
+        max_segments: int,
+        concept_terms: list[str] | None = None,
+    ) -> list[SegmentMatch]:
+        """
+        Build SegmentMatch candidates by running `services.topic_cut` on the
+        transcript and refining each TopicReel to the user's concept window.
+
+        This is the topic-aware replacement for the legacy `select_segments` /
+        `_fast_segments_from_transcript` selection step. Two-pass strategy:
+
+        1. **Topic boundary detection.** topic_cut identifies natural topic
+           boundaries (LLM / sentence-transformers / Jaccard heuristic in that
+           precedence order — chapters are unavailable here because the search
+           hot-path doesn't carry yt-dlp info_dicts).
+
+        2. **Concept-anchored refinement.** Within each topic boundary, we
+           scan transcript cues for explicit concept-term mentions and refine:
+             * `t_start` = the start of the FIRST cue mentioning the concept,
+               minus 1 cue of lead-in to capture the introductory sentence
+               ("Now let's talk about X" — where X is the concept term)
+             * `t_end` = the end of the LAST cue mentioning the concept
+           Both clamped within the original topic boundaries. Any topic with
+           fewer than 2 concept mentions is dropped — that's the hard guarantee
+           that every emitted clip is genuinely about the user's search.
+
+        For YouTube Shorts the caller should NOT invoke this method — the
+        existing `use_full_short_clip` path handles those by emitting the full
+        video. We respect the user's `clip_min_len`/`clip_max_len` knobs as
+        soft caps via topic_cut's split-on-too-long behavior.
+
+        Returns [] when topic_cut produces no usable segments OR when no topic
+        contains enough concept mentions — the caller should fall back to the
+        legacy embedding-based path so we never emit zero reels for a video
+        that has a transcript.
+        """
+        # Local import to avoid pulling topic_cut into reels.py at module load
+        # (the file already takes long enough to import). topic_cut is a small
+        # pure-Python module so the cost is one-time per process.
+        from .topic_cut import (
+            cues_from_ingest_cues,
+            cut_video_into_topic_reels,
+        )
+
+        # The transcript here is the legacy `[{"start": float, "duration": float,
+        # "text": str}, ...]` shape used everywhere in reels.py. topic_cut wants
+        # `TranscriptCue(start, duration, text)` dataclasses; build a tiny adapter
+        # that exposes the .start/.end/.text attrs cues_from_ingest_cues expects.
+        class _Cue:
+            __slots__ = ("start", "end", "text")
+            def __init__(self, start: float, end: float, text: str) -> None:
+                self.start = start
+                self.end = end
+                self.text = text
+
+        ingest_cues: list[_Cue] = []
+        for entry in transcript:
+            try:
+                start = float(entry.get("start") or 0.0)
+                duration = float(entry.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            text = str(entry.get("text") or "").replace("\n", " ").strip()
+            if not text:
+                continue
+            ingest_cues.append(_Cue(start=start, end=start + max(duration, 0.01), text=text))
+
+        if not ingest_cues:
+            return []
+
+        topic_cues = cues_from_ingest_cues(ingest_cues)
+        try:
+            classification, topic_reels = cut_video_into_topic_reels(
+                video_id,
+                duration_sec=float(video_duration_sec or 0.0),
+                # No info_dict here — the search-discovery hot path doesn't
+                # have one. Chapters are unavailable in this code path; topic
+                # boundaries come from LLM/semantic/heuristic.
+                openai_client=self.openai_client,
+                use_llm=False,
+                transcript=topic_cues,
+                # Soft cap: respect the user's preferred clip length range.
+                # topic_cut splits topics longer than max into equal sub-parts.
+                min_reel_sec=float(max(15, clip_min_len)),
+                max_reel_sec=float(max(clip_min_len + 1, clip_max_len)),
+            )
+        except Exception:
+            logger.exception(
+                "topic_cut failed for video_id=%s; caller should fall back",
+                video_id,
+            )
+            return []
+
+        if classification.is_short or not topic_reels:
+            return []
+
+        # Pre-tokenize the user's concept terms once. We use the existing
+        # `normalize_terms` helper from segmenter.py so the matching semantics
+        # match the rest of the relevance pipeline (handles plurals, stems,
+        # etc.). When concept_terms is empty we skip refinement entirely and
+        # return topic boundaries as-is — the downstream relevance ranker will
+        # still filter, just with looser cuts.
+        concept_token_set = normalize_terms(concept_terms or []) if concept_terms else set()
+        require_refinement = bool(concept_token_set)
+
+        segments: list[SegmentMatch] = []
+        for idx, reel in enumerate(topic_reels):
+            if len(segments) >= max_segments:
+                break
+
+            # Walk the cues inside this topic and find every cue that mentions
+            # any concept term. We bisect-style by linear scan because cues are
+            # already sorted by start time and there are typically <500 of them.
+            matching_indices: list[int] = []
+            cue_texts: list[str] = []
+            for cue_idx, entry in enumerate(transcript):
+                try:
+                    start = float(entry.get("start") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if start < reel.t_start - 0.01:
+                    continue
+                if start > reel.t_end + 0.01:
+                    break
+                text = str(entry.get("text") or "").replace("\n", " ").strip()
+                if not text:
+                    continue
+                cue_texts.append(text)
+                if require_refinement:
+                    cue_token_set = normalize_terms([text])
+                    if concept_token_set & cue_token_set:
+                        matching_indices.append(cue_idx)
+
+            if not cue_texts:
+                continue
+
+            t_start = float(reel.t_start)
+            t_end = float(reel.t_end)
+
+            if require_refinement:
+                # Hard guarantee: at least 2 concept mentions inside the topic.
+                # 1 mention is too noisy — can be a passing reference. ≥2
+                # mentions means the topic substantively discusses the concept.
+                if len(matching_indices) < 2:
+                    continue
+
+                first_cue_idx = matching_indices[0]
+                last_cue_idx = matching_indices[-1]
+
+                # Anchor t_start to the first matching cue, with up to 1 cue of
+                # lead-in to capture introductory phrases like "Now let's talk
+                # about X" where X is the concept term.
+                lead_idx = max(0, first_cue_idx - 1)
+                while lead_idx < first_cue_idx:
+                    lead_entry = transcript[lead_idx]
+                    try:
+                        lead_start = float(lead_entry.get("start") or 0.0)
+                    except (TypeError, ValueError):
+                        lead_idx += 1
+                        continue
+                    if lead_start >= reel.t_start - 0.01:
+                        break
+                    lead_idx += 1
+
+                refined_start_entry = transcript[lead_idx]
+                refined_end_entry = transcript[last_cue_idx]
+                try:
+                    refined_start = float(refined_start_entry.get("start") or 0.0)
+                except (TypeError, ValueError):
+                    refined_start = reel.t_start
+                try:
+                    end_start = float(refined_end_entry.get("start") or 0.0)
+                    end_dur = float(refined_end_entry.get("duration") or 0.0)
+                except (TypeError, ValueError):
+                    end_start, end_dur = reel.t_end, 0.0
+                refined_end = end_start + max(end_dur, 0.5)
+
+                # Clamp to the original topic window.
+                t_start = max(reel.t_start, refined_start)
+                t_end = min(reel.t_end, refined_end)
+                if t_end <= t_start:
+                    continue
+
+                # If the refined window is too short, expand outward toward the
+                # topic boundary. Prefer expanding the END (more context after
+                # the discussion) over the START (we want to begin near the
+                # introduction).
+                refined_duration = t_end - t_start
+                if refined_duration < clip_min_len:
+                    deficit = clip_min_len - refined_duration
+                    new_end = min(reel.t_end, t_end + deficit)
+                    if new_end - t_start < clip_min_len:
+                        new_start = max(reel.t_start, t_start - (clip_min_len - (new_end - t_start)))
+                        t_start = new_start
+                    t_end = new_end
+                    if t_end - t_start < clip_min_len:
+                        # Topic window itself is shorter than clip_min_len —
+                        # let the downstream normalizer handle it.
+                        continue
+
+            joined_text = " ".join(cue_texts).strip()
+            if not joined_text:
+                joined_text = reel.label or "topic clip"
+
+            segments.append(
+                SegmentMatch(
+                    chunk_index=idx,
+                    t_start=float(t_start),
+                    t_end=float(t_end),
+                    text=joined_text,
+                    score=0.5,  # neutral starting score; ranked downstream
+                )
+            )
+        return segments
 
     def _is_vague_concept(self, title: str, keywords: list[str], summary: str) -> bool:
         title_terms = normalize_terms([title])

@@ -196,11 +196,68 @@ class IngestSearchResult(BaseModel):
     trace_id: str
 
 
+# --------------------------------------------------------------------- #
+# Topic-aware multi-reel cut (POST /api/ingest/topic-cut)
+# --------------------------------------------------------------------- #
+
+
+class IngestTopicCutRequest(BaseModel):
+    """
+    Request payload for `POST /api/ingest/topic-cut`.
+
+    Unlike the legacy `/api/ingest/url`, this endpoint cuts a long-form video
+    into MULTIPLE per-topic reels (one per topic the creator introduces and
+    transitions away from). The clip-duration knobs are intentionally absent —
+    the topic boundaries determine the clip lengths, not a fixed budget.
+
+    `material_id` and `concept_id` are optional. When omitted the pipeline
+    routes the resulting reels under the existing ingestion sentinel material
+    so they're browsable via `/api/feed?material_id=ingest-scratch`.
+    """
+
+    source_url: str = Field(min_length=1, max_length=2000)
+    material_id: str | None = Field(default=None, max_length=240)
+    concept_id: str | None = Field(default=None, max_length=240)
+    language: str = Field(default="en", min_length=2, max_length=8)
+    use_llm: bool = Field(
+        default=True,
+        description=(
+            "If False, skip the LLM topic-segmentation pass and use the "
+            "lexical-novelty heuristic only. Useful for offline runs / tests."
+        ),
+    )
+
+
+class IngestTopicCutResult(BaseModel):
+    """
+    Response payload for `POST /api/ingest/topic-cut`.
+
+    For YouTube Shorts, `reels` is empty and `is_short` is True — the caller
+    should leave the original video untouched per the topic-cut contract.
+
+    For long-form videos, `reels` carries one entry per topic the cutter
+    identified. Each entry decodes cleanly into the iOS `Reel` struct via the
+    existing decoder, so no client-side schema changes are required.
+    """
+
+    source_url: str
+    video_id: str
+    is_short: bool
+    classification_reason: str
+    duration_sec: float
+    reel_count: int
+    reels: list[ReelOutWithAttribution]
+    metadata: IngestMetadata | None = None
+    terms_notice: str
+    trace_id: str
+
+
 __all__ = [
     "PlatformLiteral",
     "IngestRequest",
     "IngestFeedRequest",
     "IngestSearchRequest",
+    "IngestTopicCutRequest",
     "IngestTranscriptCue",
     "IngestSegment",
     "IngestMetadata",
@@ -210,4 +267,5 @@ __all__ = [
     "IngestFeedResult",
     "IngestSearchItem",
     "IngestSearchResult",
+    "IngestTopicCutResult",
 ]

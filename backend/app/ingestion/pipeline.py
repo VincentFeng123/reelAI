@@ -62,6 +62,7 @@ from .models import (
     IngestSearchItem,
     IngestSearchResult,
     IngestSegment,
+    IngestTopicCutResult,
     IngestTranscriptCue,
     PlatformLiteral,
     ReelOutWithAttribution,
@@ -337,6 +338,304 @@ class IngestionPipeline:
             terms_notice=TERMS_NOTICE,
             trace_id=effective_trace,
         )
+
+    # --------------------------------------------------------------------- #
+    # Topic-aware multi-reel cut
+    # --------------------------------------------------------------------- #
+
+    def ingest_topic_cut(
+        self,
+        *,
+        source_url: str,
+        material_id: str | None = None,
+        concept_id: str | None = None,
+        language: str = "en",
+        use_llm: bool = True,
+        trace_id: str | None = None,
+    ) -> IngestTopicCutResult:
+        """
+        Topic-aware variant of `ingest_url` that emits MULTIPLE reels per video.
+
+        Reuses the existing download → transcribe machinery, then hands the
+        cues to `services.topic_cut.cut_video_into_topic_reels` which:
+          1. Classifies the video as Short or long-form (Shorts are returned
+             with an empty `reels` list — caller leaves them alone).
+          2. For long-form: asks the LLM to identify topic boundaries by cue
+             index, snaps the boundaries to natural cue gaps, and drops any
+             segment outside [30s, 12min].
+          3. Falls back to the lexical-novelty heuristic if no OpenAI client
+             is available or the LLM call fails.
+
+        Each TopicReel is then persisted via the same sentinel-material path
+        used by `_persist_ingest`, producing a list of `ReelOutWithAttribution`
+        rows that decode cleanly into the iOS `Reel` struct.
+
+        Concurrency note: this method is single-threaded — topic segmentation
+        is one LLM call, persistence is one transaction. The pipeline-wide
+        rate limiter is acquired once per video, just like `ingest_url`.
+        """
+        # Local import to break the import cycle: services.topic_cut imports
+        # nothing from the ingestion package, but we don't want this module to
+        # take on a top-level dependency on services either.
+        from ..services.topic_cut import (
+            VideoClassification,
+            cues_from_ingest_cues,
+            cut_video_into_topic_reels,
+        )
+
+        effective_trace = set_trace_id(trace_id or new_trace_id())
+        log_event(
+            logger,
+            logging.INFO,
+            "ingest_topic_cut_start",
+            source_url=source_url,
+            material_id=material_id,
+            concept_id=concept_id,
+            use_llm=use_llm,
+        )
+        started = time.monotonic()
+
+        self._preflight()
+
+        adapter = self._pick_adapter(source_url)
+        platform: PlatformCode = adapter.platform_for(source_url)
+        self._rate_limiter.acquire(platform)
+
+        with TempWorkspace() as workspace:
+            adapter_result = adapter.resolve(source_url, workspace)
+            metadata = map_info_dict_to_metadata(
+                adapter_result.info_dict,
+                platform=platform,
+                source_url=source_url,
+                source_id=adapter_result.source_id,
+                playback_url=adapter_result.playback_url,
+            )
+
+            duration_sec = metadata.duration_sec
+            if not duration_sec or duration_sec <= 0:
+                try:
+                    duration_sec = probe_duration(adapter_result.video_path)
+                    metadata = metadata.model_copy(update={"duration_sec": duration_sec})
+                except DownloadError as exc:
+                    raise DownloadError(
+                        "Could not determine video duration",
+                        detail=exc.detail or exc.message,
+                    ) from exc
+
+            try:
+                cues = self._transcribe_with_conn(
+                    platform=platform,
+                    source_id=adapter_result.source_id,
+                    info_dict=adapter_result.info_dict,
+                    video_path=adapter_result.video_path,
+                    workspace=workspace,
+                    language=language,
+                )
+            except (TranscriptionError, ServerlessUnavailable):
+                raise
+            except Exception as exc:
+                raise TranscriptionError("unexpected error during transcription", detail=str(exc)) from exc
+
+            if not cues:
+                raise TranscriptionError("no transcript cues were produced")
+
+            # Stash the info_dict so we can pass it (and its `chapters` key)
+            # to topic_cut after the workspace exits. Most ingest paths only
+            # need the metadata that map_info_dict_to_metadata extracted, but
+            # topic_cut wants the raw `chapters` list which we've never
+            # propagated until now.
+            info_dict_snapshot: dict[str, Any] = dict(adapter_result.info_dict or {})
+
+        # Outside the workspace ctx-manager: the temp dir + downloaded video are
+        # gone, but cues + metadata are pure-Python and survive.
+        topic_cues = cues_from_ingest_cues(cues)
+        classification, topic_reels = cut_video_into_topic_reels(
+            source_url,
+            duration_sec=float(duration_sec or 0.0),
+            openai_client=self._openai_client,
+            use_llm=use_llm,
+            transcript=topic_cues,
+            info_dict=info_dict_snapshot,
+        )
+
+        persisted_reels: list[ReelOutWithAttribution] = []
+        if not classification.is_short and topic_reels:
+            persisted_reels = self._persist_topic_reels(
+                topic_reels=topic_reels,
+                cues=cues,
+                adapter_result=adapter_result,
+                metadata=metadata,
+                material_id=material_id,
+                concept_id=concept_id,
+            )
+
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        log_event(
+            logger,
+            logging.INFO,
+            "ingest_topic_cut_completed",
+            source_url=source_url,
+            video_id=classification.video_id,
+            platform=platform,
+            is_short=classification.is_short,
+            reel_count=len(persisted_reels),
+            elapsed_ms=elapsed_ms,
+        )
+
+        return IngestTopicCutResult(
+            source_url=source_url,
+            video_id=classification.video_id,
+            is_short=classification.is_short,
+            classification_reason=classification.reason,
+            duration_sec=float(classification.duration_sec or duration_sec or 0.0),
+            reel_count=len(persisted_reels),
+            reels=persisted_reels,
+            metadata=metadata,
+            terms_notice=TERMS_NOTICE,
+            trace_id=effective_trace,
+        )
+
+    def _persist_topic_reels(
+        self,
+        *,
+        topic_reels: list[Any],  # list[TopicReel] — typed as Any to avoid the import
+        cues: list[IngestTranscriptCue],
+        adapter_result: AdapterResult,
+        metadata: IngestMetadata,
+        material_id: str | None,
+        concept_id: str | None,
+    ) -> list[ReelOutWithAttribution]:
+        """
+        Insert each TopicReel as a `reels` row and return the client-facing
+        ReelOutWithAttribution list.
+
+        Mirrors `_persist_ingest` per-row but in a single shared transaction so
+        a 12-reel video doesn't open 12 connections. Each reel is uniquely
+        keyed by `(material_id, video_id, t_start, t_end)`; if a duplicate
+        sneaks through (e.g. a re-ingest of the same URL), we reuse the
+        existing row's reel_id.
+        """
+        from .persistence import build_video_id  # local import per the existing pattern
+
+        video_id = build_video_id(adapter_result.platform, adapter_result.source_id)
+        attribution = format_attribution(metadata)
+        out: list[ReelOutWithAttribution] = []
+
+        with get_conn(transactional=True) as conn:
+            effective_material_id = material_id or ensure_sentinel_material(conn)
+            effective_concept_id = concept_id or ensure_sentinel_concept(conn, effective_material_id)
+            upsert_video(
+                conn,
+                platform=adapter_result.platform,
+                source_id=adapter_result.source_id,
+                metadata=metadata,
+            )
+
+            for tr in topic_reels:
+                clip_start = float(tr.t_start)
+                clip_end = float(tr.t_end)
+
+                if adapter_result.platform == "yt":
+                    video_url = (
+                        f"https://www.youtube.com/embed/{adapter_result.source_id}"
+                        f"?start={int(clip_start)}&end={int(clip_end)}"
+                        "&modestbranding=1&rel=0&playsinline=1"
+                    )
+                else:
+                    video_url = adapter_result.playback_url
+
+                snippet = snippet_for_window(cues, clip_start, clip_end, max_chars=700)
+                takeaways = build_takeaways_for_ingest(
+                    concept_title=tr.label or metadata.title or "",
+                    transcript_snippet=snippet,
+                    hashtags=metadata.hashtags,
+                    limit=3,
+                )
+
+                # Per-segment AI summary, cached on disk via `brief_ai_summary`'s
+                # llm_cache key. Skipping the LLM here when no client is configured
+                # is fine — the topic_cut label is already a usable headline.
+                ai_summary = brief_ai_summary(
+                    conn,
+                    openai_client=self._openai_client,
+                    concept_title=tr.label or metadata.title or "",
+                    video_title=metadata.title or "",
+                    video_description=metadata.description,
+                    transcript_snippet=snippet,
+                    takeaways=takeaways,
+                    cache_key_suffix=(
+                        f"topic_cut:{adapter_result.platform}:"
+                        f"{adapter_result.source_id}:{int(clip_start)}-{int(clip_end)}"
+                    ),
+                )
+
+                reel_id = f"topic-{uuid.uuid4().hex[:16]}"
+                inserted = upsert_reel_row(
+                    conn,
+                    reel_id=reel_id,
+                    material_id=effective_material_id,
+                    concept_id=effective_concept_id,
+                    video_id=video_id,
+                    video_url=video_url,
+                    t_start=clip_start,
+                    t_end=clip_end,
+                    transcript_snippet=snippet,
+                    takeaways=takeaways,
+                    base_score=1.0,
+                )
+                if not inserted:
+                    existing = load_existing_reel(
+                        conn,
+                        material_id=effective_material_id,
+                        video_id=video_id,
+                        t_start=clip_start,
+                        t_end=clip_end,
+                    )
+                    if existing:
+                        reel_id = existing["id"]
+
+                store_ingest_metadata_blob(conn, reel_id=reel_id, metadata=metadata)
+
+                clip_captions = [
+                    {"start": cue.start, "end": cue.end, "text": cue.text}
+                    for cue in cues
+                    if cue.text and clip_start <= cue.start <= clip_end
+                ]
+                clip_duration = max(0.0, clip_end - clip_start)
+
+                out.append(
+                    ReelOutWithAttribution(
+                        reel_id=reel_id,
+                        material_id=effective_material_id,
+                        concept_id=effective_concept_id,
+                        concept_title=tr.label or metadata.title or "",
+                        video_title=metadata.title or "",
+                        video_description=metadata.description,
+                        ai_summary=ai_summary,
+                        video_url=video_url,
+                        t_start=clip_start,
+                        t_end=clip_end,
+                        transcript_snippet=snippet,
+                        takeaways=takeaways,
+                        captions=clip_captions,
+                        score=1.0,
+                        relevance_score=None,
+                        discovery_score=None,
+                        clipability_score=1.0,
+                        query_strategy="topic_cut",
+                        retrieval_stage="topic_cut",
+                        source_surface=f"ingest:{adapter_result.platform}:topic_cut",
+                        matched_terms=[],
+                        relevance_reason=tr.summary or "",
+                        concept_position=None,
+                        total_concepts=None,
+                        video_duration_sec=int(metadata.duration_sec) if metadata.duration_sec else None,
+                        clip_duration_sec=float(clip_duration),
+                        source_attribution=attribution,
+                    )
+                )
+
+        return out
 
     # --------------------------------------------------------------------- #
     # Feed ingest

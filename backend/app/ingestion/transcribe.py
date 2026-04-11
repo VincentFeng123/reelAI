@@ -1,13 +1,19 @@
 """
-Transcript extraction with a three-strategy fallback chain:
+Transcript extraction with a four-strategy fallback chain:
 
     1. YouTube only: reuse the existing `YouTubeService.get_transcript` (caches via
        `transcript_cache` table; free; best quality when captions are authored).
     2. Any platform: parse yt-dlp's scraped subtitles from the `info_dict`
        (`automatic_captions` / `subtitles`). Free; ~90% of IG Reels with captions and
        most English YouTube videos land here.
-    3. Fallback: OpenAI Whisper API (`whisper-1`) on the extracted audio. Paid
-       (~$0.006/min) but works on anything that has speech.
+    3. faster-whisper running LOCALLY on the extracted audio. Free; runs on
+       CPU via CTranslate2; downloads a small model (~80 MB for `base.en`) on
+       first use to `~/.cache/huggingface/hub/`. Tried before the paid OpenAI
+       path so users without an OpenAI key still get usable transcripts.
+       Skipped silently if `faster-whisper` is not installed.
+    4. Fallback: OpenAI Whisper API (`whisper-1`) on the extracted audio. Paid
+       (~$0.006/min) but works on anything that has speech. Used only when
+       both 1-3 fail OR an OpenAI client is explicitly preferred.
 
 Results are cached in the existing `llm_cache` table under key
 `ingest_transcript:{platform}:{source_id}` so repeated ingests of the same URL skip
@@ -18,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -33,6 +40,16 @@ logger: logging.Logger = get_ingest_logger(__name__)
 _TRANSCRIPT_CACHE_PREFIX = "ingest_transcript:"
 _WHISPER_MODEL = "whisper-1"
 _WHISPER_MAX_FILE_BYTES = 24 * 1024 * 1024  # 24 MiB (Whisper API caps at 25 MiB)
+
+# faster-whisper local model size. Override with FASTER_WHISPER_MODEL env var.
+# Sizes (rough downloads): tiny.en=39MB, base.en=74MB, small.en=244MB,
+# medium.en=769MB, large-v3=2.9GB. base.en is the sweet spot for quality/speed
+# on CPU — small.en is noticeably better but ~3x slower.
+_FASTER_WHISPER_MODEL = os.environ.get("FASTER_WHISPER_MODEL", "base.en")
+# CPU is the safe default. Set FASTER_WHISPER_DEVICE=cuda to use GPU.
+_FASTER_WHISPER_DEVICE = os.environ.get("FASTER_WHISPER_DEVICE", "cpu")
+# int8 quantization gives ~2x speed on CPU with negligible accuracy loss.
+_FASTER_WHISPER_COMPUTE_TYPE = os.environ.get("FASTER_WHISPER_COMPUTE_TYPE", "int8")
 
 
 def _serialize_cues(cues: list[IngestTranscriptCue]) -> str:
@@ -229,7 +246,103 @@ def _cues_from_info_dict_subtitles(info: dict[str, Any], language: str) -> list[
 
 
 # --------------------------------------------------------------------- #
-# Strategy 3: OpenAI Whisper API
+# Strategy 3: faster-whisper running LOCALLY (free, no API)
+# --------------------------------------------------------------------- #
+
+
+def _load_faster_whisper_model() -> Any | None:
+    """
+    Lazy-load and cache the faster-whisper model. Returns None if the package
+    isn't installed or model loading fails — every caller is expected to
+    handle None gracefully and fall through to the OpenAI Whisper API path.
+
+    The first call downloads the model (~80 MB for base.en) to
+    `~/.cache/huggingface/hub/`. Subsequent calls reuse the cached weights so
+    only the first transcription pays the cold-start cost.
+    """
+    cache = getattr(_load_faster_whisper_model, "_cache", None)
+    if cache is not None:
+        return cache
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except Exception:
+        logger.debug("faster-whisper is not installed; local Whisper path disabled")
+        _load_faster_whisper_model._cache = None  # type: ignore[attr-defined]
+        return None
+    try:
+        model = WhisperModel(
+            _FASTER_WHISPER_MODEL,
+            device=_FASTER_WHISPER_DEVICE,
+            compute_type=_FASTER_WHISPER_COMPUTE_TYPE,
+        )
+    except Exception:
+        logger.exception(
+            "failed to load faster-whisper model %s on device=%s",
+            _FASTER_WHISPER_MODEL, _FASTER_WHISPER_DEVICE,
+        )
+        _load_faster_whisper_model._cache = None  # type: ignore[attr-defined]
+        return None
+    _load_faster_whisper_model._cache = model  # type: ignore[attr-defined]
+    return model
+
+
+def _faster_whisper_transcribe(
+    audio_path: Path,
+    *,
+    language: str,
+) -> list[IngestTranscriptCue] | None:
+    """
+    Transcribe `audio_path` with faster-whisper running locally.
+
+    Returns:
+      * `list[IngestTranscriptCue]` on success.
+      * None if faster-whisper isn't installed or the model fails to load —
+        the caller falls through to the OpenAI Whisper API path.
+      * Raises TranscriptionError if the model loaded but the transcription
+        itself failed (e.g. corrupt audio file). The caller treats this as
+        a hard failure for this strategy and moves on.
+
+    `language` is passed through to faster-whisper as a hint. The English-only
+    models (`*.en`) ignore it; multilingual models use it to bias detection.
+    """
+    model = _load_faster_whisper_model()
+    if model is None:
+        return None
+
+    try:
+        size = audio_path.stat().st_size
+    except OSError as exc:
+        raise TranscriptionError("extracted audio file is missing", detail=str(exc)) from exc
+    if size == 0:
+        raise TranscriptionError("extracted audio file is empty")
+
+    try:
+        # `transcribe` returns a generator of segments + an `info` object.
+        # Iterating the generator drives the actual decoding work.
+        segments_iter, _info = model.transcribe(
+            str(audio_path),
+            language=language if language else None,
+            beam_size=1,
+            vad_filter=True,
+        )
+        cues: list[IngestTranscriptCue] = []
+        for seg in segments_iter:
+            text = (getattr(seg, "text", "") or "").strip()
+            if not text:
+                continue
+            start = float(getattr(seg, "start", 0.0))
+            end = float(getattr(seg, "end", start))
+            cues.append(IngestTranscriptCue(start=start, end=max(end, start + 0.01), text=text))
+    except Exception as exc:
+        raise TranscriptionError("faster-whisper transcription failed", detail=str(exc)) from exc
+
+    if not cues:
+        raise TranscriptionError("faster-whisper produced no usable segments")
+    return cues
+
+
+# --------------------------------------------------------------------- #
+# Strategy 4: OpenAI Whisper API
 # --------------------------------------------------------------------- #
 
 
@@ -359,25 +472,62 @@ def transcribe(
         )
         return cues
 
-    # Strategy 4: Whisper API fallback
+    # Strategy 4: faster-whisper running LOCALLY (free, no API).
+    # We try this BEFORE the paid OpenAI Whisper API so users without an
+    # OpenAI key still get usable transcripts. Skipped silently if the package
+    # isn't installed — the OpenAI path picks up the slack.
+    audio_path = workspace / "audio_16k.wav"
+    audio_extracted = False
+
+    def _ensure_audio_extracted() -> None:
+        nonlocal audio_extracted
+        if audio_extracted:
+            return
+        try:
+            extract_audio_wav(video_path, audio_path)
+        except Exception as exc:
+            raise TranscriptionError(
+                "Could not extract audio for Whisper fallback",
+                detail=str(exc),
+            ) from exc
+        audio_extracted = True
+
+    try:
+        # Probe whether faster-whisper is even available before extracting
+        # audio (audio extraction is ~50ms but worth skipping if neither
+        # whisper backend can run).
+        if _load_faster_whisper_model() is not None:
+            _ensure_audio_extracted()
+            local_cues = _faster_whisper_transcribe(audio_path, language=language)
+            if local_cues:
+                _store_cache(conn, cache_key, local_cues)
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "transcript_from_faster_whisper",
+                    platform=platform,
+                    source_id=source_id,
+                    count=len(local_cues),
+                    model=_FASTER_WHISPER_MODEL,
+                )
+                return local_cues
+    except TranscriptionError:
+        logger.exception(
+            "faster-whisper transcribe failed for %s:%s; falling back to OpenAI Whisper",
+            platform, source_id,
+        )
+
+    # Strategy 5: OpenAI Whisper API fallback (paid)
     if serverless_mode and not allow_openai_in_serverless:
         raise ServerlessUnavailable(
             "Whisper fallback is unavailable in serverless mode. Set ALLOW_OPENAI_IN_SERVERLESS=1 to override."
         )
     if openai_client is None:
         raise TranscriptionError(
-            "No transcript available from platform sources and Whisper is not configured."
+            "No transcript available from platform sources and neither faster-whisper nor OpenAI Whisper is configured."
         )
 
-    audio_path = workspace / "audio_16k.wav"
-    try:
-        extract_audio_wav(video_path, audio_path)
-    except Exception as exc:
-        raise TranscriptionError(
-            "Could not extract audio for Whisper fallback",
-            detail=str(exc),
-        ) from exc
-
+    _ensure_audio_extracted()
     cues = _whisper_transcribe(audio_path, openai_client=openai_client, language=language)
     _store_cache(conn, cache_key, cues)
     log_event(

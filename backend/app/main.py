@@ -119,6 +119,8 @@ from .ingestion.models import (
     IngestResult,
     IngestSearchRequest,
     IngestSearchResult,
+    IngestTopicCutRequest,
+    IngestTopicCutResult,
 )
 from .ingestion.pipeline import IngestionPipeline
 
@@ -328,6 +330,10 @@ COMMUNITY_SETTINGS_RATE_LIMIT_PER_WINDOW = 90
 INGEST_URL_RATE_LIMIT_PER_WINDOW = 6
 INGEST_FEED_RATE_LIMIT_PER_WINDOW = 2
 INGEST_SEARCH_RATE_LIMIT_PER_WINDOW = 3
+# Topic-cut runs one Whisper-or-cached transcribe + one chat-completions call
+# per video, so it's strictly cheaper than ingest_feed (which loops over many
+# items). 6/window matches /api/ingest/url's budget for one full video.
+INGEST_TOPIC_CUT_RATE_LIMIT_PER_WINDOW = 6
 MAX_COMMUNITY_HISTORY_ITEMS = 120
 _rate_limit_lock = threading.Lock()
 _rate_limit_hits: dict[str, deque[float]] = {}
@@ -1319,9 +1325,35 @@ def _normalize_duration_seconds(value: object) -> float | None:
 
 
 def _extract_duration_from_html(html: str) -> float | None:
+    """Pull a video's duration (in seconds) out of raw HTML.
+
+    The function tries several strategies in order of how reliable they are.
+    Each strategy returns as soon as it finds a match, so adding more of
+    them costs nothing for the common case. Strategies are ordered so the
+    ones that *usually* work first come first — this keeps the latency low.
+
+    Strategies (in order):
+      1. OpenGraph `<meta property="video:duration" content="...">` — the
+         most portable format, used by YouTube, Twitter, Facebook, etc.
+      2. Schema.org `itemprop="duration"` — used by sites that follow the
+         microdata spec.
+      3. YouTube internal `"lengthSeconds":"..."` — YouTube-specific but
+         extremely reliable when present.
+      4. JSON-LD `"duration":"PT..."` — ISO-8601 durations embedded in
+         <script type="application/ld+json"> blocks. Schema.org standard.
+      5. Instagram / TikTok `"video_duration":N` (and variants) — these
+         platforms don't expose OpenGraph durations consistently, but
+         their SSR payloads include this field.
+      6. Generic `"duration": <number>` — last-resort, accepts anything
+         numeric labelled "duration" inside a JSON blob.
+    """
     if not html:
         return None
 
+    # -- Strategy 1: OpenGraph meta tag -----------------------------------
+    # The `content` attribute can appear before or after the `property`
+    # attribute, and the spec allows either single or double quotes, so we
+    # keep four variants rather than hand-writing one monster regex.
     meta_duration_patterns = [
         r'<meta[^>]*property=["\']video:duration["\'][^>]*content=["\'](\d+(?:\.\d+)?)["\'][^>]*>',
         r'<meta[^>]*content=["\'](\d+(?:\.\d+)?)["\'][^>]*property=["\']video:duration["\'][^>]*>',
@@ -1336,12 +1368,38 @@ def _extract_duration_from_html(html: str) -> float | None:
         if duration is not None:
             return duration
 
+    # -- Strategy 2: Schema.org microdata ---------------------------------
+    # Used by sites that publish structured data directly in the DOM.
+    itemprop_match = re.search(
+        r'itemprop=["\']duration["\'][^>]*content=["\']([^"\']+)["\']',
+        html,
+        flags=re.IGNORECASE,
+    )
+    if itemprop_match:
+        raw = itemprop_match.group(1).strip()
+        # Could be either an ISO-8601 duration ("PT1M30S") or a plain number.
+        if raw.upper().startswith("P"):
+            iso_seconds = parse_iso8601_duration(raw)
+            duration = _normalize_duration_seconds(iso_seconds)
+            if duration is not None:
+                return duration
+        else:
+            duration = _normalize_duration_seconds(raw)
+            if duration is not None:
+                return duration
+
+    # -- Strategy 3: YouTube-specific lengthSeconds -----------------------
+    # Embedded in YouTube's player config; extremely reliable when it's
+    # present. The value is always a quoted integer string.
     length_seconds_match = re.search(r'"lengthSeconds"\s*:\s*"(\d{1,7})"', html)
     if length_seconds_match:
         duration = _normalize_duration_seconds(length_seconds_match.group(1))
         if duration is not None:
             return duration
 
+    # -- Strategy 4: JSON-LD ISO-8601 duration ----------------------------
+    # Schema.org says `duration` on a VideoObject is an ISO-8601 string
+    # starting with "P" (e.g. "PT1M30S" = 1 minute 30 seconds).
     json_ld_duration = re.search(r'"duration"\s*:\s*"((?:P|PT)[^"]+)"', html, flags=re.IGNORECASE)
     if json_ld_duration:
         iso_duration = parse_iso8601_duration(json_ld_duration.group(1))
@@ -1349,6 +1407,29 @@ def _extract_duration_from_html(html: str) -> float | None:
         if duration is not None:
             return duration
 
+    # -- Strategy 5: Instagram / TikTok SSR payloads ----------------------
+    # Instagram uses `"video_duration":N` (a float, in seconds) and TikTok
+    # sometimes exposes `"duration":N` on a video object inside its __NEXT_DATA__
+    # blob. Both are unquoted numbers, distinct from the JSON-LD variant.
+    ig_tt_patterns = (
+        r'"video_duration"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+        r'"videoDuration"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+        # TikTok SIGI_STATE often uses "duration" (in seconds) inside a
+        # videoObject — same key as Strategy 6 but we match it here first
+        # when it looks like an integer of seconds, not ISO-8601.
+    )
+    for pattern in ig_tt_patterns:
+        match = re.search(pattern, html)
+        if not match:
+            continue
+        duration = _normalize_duration_seconds(match.group(1))
+        if duration is not None:
+            return duration
+
+    # -- Strategy 6: Generic `"duration": <number>` ------------------------
+    # Catch-all for any unknown JSON payload that exposes a numeric duration
+    # labelled plainly. We run this LAST because the word "duration" is
+    # common and could collide with non-video fields earlier in the page.
     generic_numeric_duration = re.search(r'"duration"\s*:\s*([0-9]{1,7}(?:\.[0-9]+)?)', html)
     if generic_numeric_duration:
         duration = _normalize_duration_seconds(generic_numeric_duration.group(1))
@@ -1359,8 +1440,27 @@ def _extract_duration_from_html(html: str) -> float | None:
 
 
 def _fetch_duration_from_source_page(source_url: str) -> float | None:
+    """Fetch a source URL and try to extract the video duration from the HTML.
+
+    Why manual redirect handling?
+      We don't let requests follow redirects automatically because each new
+      location has to pass our host allow-list check (YouTube, Instagram,
+      TikTok only). Blindly following redirects would let an attacker feed
+      us a `bit.ly` or shortener URL that redirects to an internal service.
+      Manually stepping through redirects lets us re-validate every hop.
+
+    Edge cases we handle:
+      - Network/transport failure → log and return None (caller displays
+        a generic "couldn't determine duration" message, not a crash)
+      - Missing Location header on a 3xx → treat as a dead end
+      - Redirect that lands on a disallowed host → reject it
+      - Rate-limit (429) / server error (5xx) → log and return None so the
+        caller knows not to retry aggressively
+      - Oversized HTML → we slice to 900KB which is more than enough for
+        any <head> + initial JSON payload, and protects against huge pages
+    """
     current_url = source_url
-    for _ in range(MAX_DURATION_FETCH_REDIRECTS + 1):
+    for hop in range(MAX_DURATION_FETCH_REDIRECTS + 1):
         try:
             response = requests.get(
                 current_url,
@@ -1374,23 +1474,85 @@ def _fetch_duration_from_source_page(source_url: str) -> float | None:
                     "Accept-Language": "en-US,en;q=0.9",
                 },
             )
-        except requests.RequestException:
+        except requests.Timeout:
+            logger.info(
+                "Duration fetch timed out after %.1fs: url=%s hop=%d",
+                COMMUNITY_REEL_DURATION_TIMEOUT_SEC,
+                current_url,
+                hop,
+            )
             return None
-        if 300 <= response.status_code < 400:
+        except requests.RequestException as exc:
+            logger.info(
+                "Duration fetch transport error: url=%s hop=%d type=%s error=%s",
+                current_url,
+                hop,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+        status = response.status_code
+
+        # Handle 3xx manually so we can re-validate the redirect target
+        # against the host allow-list.
+        if 300 <= status < 400:
             location = str(response.headers.get("Location") or "").strip()
             if not location:
+                logger.debug("Duration fetch got %d but no Location header: url=%s", status, current_url)
                 return None
             try:
                 current_url = _normalize_community_duration_source_url(urljoin(current_url, location))
-            except HTTPException:
+            except HTTPException as exc:
+                # Host allow-list rejected the redirect target. That's not
+                # a crash — it's the safety valve doing its job.
+                logger.info(
+                    "Duration fetch redirect rejected: url=%s location=%s reason=%s",
+                    current_url,
+                    location,
+                    exc.detail,
+                )
                 return None
             continue
-        try:
-            response.raise_for_status()
-        except requests.RequestException:
+
+        # Explicit handling for common failure modes, each with its own log
+        # line so you can tell them apart in production.
+        if status == 404:
+            logger.debug("Duration fetch got 404 (video likely deleted/private): url=%s", current_url)
             return None
-        html = response.text[:900_000]
-        return _extract_duration_from_html(html)
+        if status == 429:
+            logger.warning("Duration fetch was rate-limited (429): url=%s", current_url)
+            return None
+        if 500 <= status < 600:
+            logger.info("Duration fetch got server error %d: url=%s", status, current_url)
+            return None
+        if status >= 400:
+            logger.debug("Duration fetch got HTTP %d: url=%s", status, current_url)
+            return None
+
+        # Some platforms (Instagram especially) return a tiny skeleton
+        # response when the content is private or deleted — the status is
+        # 200 but the body has no useful data. We still try to extract,
+        # but log a debug hint if the body is suspiciously small.
+        body_text = response.text or ""
+        if len(body_text) < 1000:
+            logger.debug(
+                "Duration fetch body is very small (%d bytes) — may be private or removed: url=%s",
+                len(body_text),
+                current_url,
+            )
+        html = body_text[:900_000]
+        duration = _extract_duration_from_html(html)
+        if duration is None:
+            logger.debug(
+                "Duration extraction returned no value for url=%s (html_bytes=%d). "
+                "Add a new pattern to _extract_duration_from_html if this should have worked.",
+                current_url,
+                len(html),
+            )
+        return duration
+    # Exceeded redirect budget.
+    logger.info("Duration fetch exceeded redirect budget: original_url=%s", source_url)
     return None
 
 
@@ -5410,6 +5572,61 @@ def ingest_url_endpoint(request: Request, payload: IngestRequest) -> IngestResul
         raise _ingest_error_to_http(exc) from exc
     except IngestError as exc:
         logger.exception("ingest_url crashed for %s", payload.source_url)
+        raise _ingest_error_to_http(exc) from exc
+    return result
+
+
+@app.post("/api/ingest/topic-cut", response_model=IngestTopicCutResult)
+def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutRequest) -> IngestTopicCutResult:
+    """
+    Topic-aware variant of `/api/ingest/url`. Same download + transcribe path,
+    but instead of returning ONE clip per video this endpoint returns one reel
+    per topic the creator introduces (Shorts are returned with `reels: []` and
+    `is_short: true` so the caller can leave them untouched).
+
+    Each entry in `reels` decodes cleanly into the iOS `Reel` struct via the
+    existing decoder — no client schema changes are required.
+    """
+    _enforce_rate_limit(request, "ingest-topic-cut", limit=INGEST_TOPIC_CUT_RATE_LIMIT_PER_WINDOW)
+    if SERVERLESS_MODE and os.getenv("ALLOW_OPENAI_IN_SERVERLESS") != "1":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "ServerlessUnavailable",
+                "message": "Topic-cut ingestion is disabled in serverless mode.",
+            },
+        )
+
+    try:
+        result = ingestion_pipeline.ingest_topic_cut(
+            source_url=payload.source_url,
+            material_id=payload.material_id,
+            concept_id=payload.concept_id,
+            language=payload.language,
+            use_llm=payload.use_llm,
+        )
+    except (
+        IngestUnsupportedSourceError,
+        IngestDownloadError,
+        IngestTranscriptionError,
+        IngestSegmentationError,
+        IngestServerlessUnavailable,
+        IngestRateLimitedError,
+    ) as exc:
+        logger.warning(
+            "ingest_topic_cut failed: %s",
+            json.dumps(
+                {
+                    "source_url": payload.source_url,
+                    "error": exc.__class__.__name__,
+                    "message": exc.message,
+                },
+                sort_keys=True,
+            ),
+        )
+        raise _ingest_error_to_http(exc) from exc
+    except IngestError as exc:
+        logger.exception("ingest_topic_cut crashed for %s", payload.source_url)
         raise _ingest_error_to_http(exc) from exc
     return result
 
