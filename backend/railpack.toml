@@ -1,2 +1,2 @@
 [install]
-system = ["ffmpeg"]
+system = ["ffmpeg", "ffprobe"]
