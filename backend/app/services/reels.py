@@ -8949,11 +8949,11 @@ class ReelService:
         """
         # Tunables — kept as locals so callers (and tests) can patch them
         # without touching module state.
-        INTRO_BUFFER_SEC = 15.0
+        INTRO_BUFFER_SEC = 5.0
         MAX_GAP_SEC = 60.0
         MIN_CLUSTER_MENTIONS = 2
-        LEAD_IN_CUES = 2
-        TAIL_BUFFER_SEC = 1.5
+        LEAD_IN_CUES = 0
+        TAIL_BUFFER_SEC = 1.0
         # When multiple clusters from the same video survive, the user wants
         # them to play back-to-back without temporal gaps. We bridge adjacent
         # clusters whose gap is ≤ MERGE_GAP_SEC by extending each window's
@@ -9041,16 +9041,9 @@ class ReelService:
             first_mention = cluster[0]
             last_mention = cluster[-1]
 
-            lead_idx = first_mention
-            for _ in range(LEAD_IN_CUES):
-                candidate = lead_idx - 1
-                if candidate < 0:
-                    break
-                if cue_starts[candidate] < INTRO_BUFFER_SEC:
-                    break
-                lead_idx = candidate
-
-            t_start = cue_starts[lead_idx]
+            # Fixed 1-second lead-in before the first mention for a clean
+            # entry point, replacing the old variable LEAD_IN_CUES walk.
+            t_start = max(0.0, cue_starts[first_mention] - 1.0)
             t_end = cue_ends[last_mention] + TAIL_BUFFER_SEC
 
             if video_duration_sec and video_duration_sec > 0:
@@ -9653,12 +9646,12 @@ class ReelService:
         max_len: int = 60,
         allow_exceed_max: bool = False,
         allow_below_min: bool = False,
-    ) -> tuple[int, int] | None:
+    ) -> tuple[float, float] | None:
         if min_len < 1:
             min_len = 1
 
-        start_sec = max(0, int(float(t_start)))
-        end_sec = max(start_sec + 1, int(float(t_end)))
+        start_sec = max(0.0, round(float(t_start), 2))
+        end_sec = max(start_sec + 1.0, round(float(t_end), 2))
 
         if max_len > 0 and not allow_exceed_max and end_sec - start_sec > max_len:
             end_sec = start_sec + max_len

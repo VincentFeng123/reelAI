@@ -47,16 +47,17 @@ def normalize_clip_window(
     max_len: int = 60,
     allow_exceed_max: bool = False,
     allow_below_min: bool = False,
-) -> tuple[int, int] | None:
+) -> tuple[float, float] | None:
     """
-    Copied verbatim from `reels.py:9286-9325` with `self` removed. Do NOT edit without
-    keeping the original in sync, or rip the original out once the refactor merges.
+    Copied verbatim from `reels.py:_normalize_clip_window` with `self` removed.
+    Do NOT edit without keeping the original in sync, or rip the original out
+    once the refactor merges. Uses float precision to preserve sub-second timestamps.
     """
     if min_len < 1:
         min_len = 1
 
-    start_sec = max(0, int(float(t_start)))
-    end_sec = max(start_sec + 1, int(float(t_end)))
+    start_sec = max(0.0, round(float(t_start), 2))
+    end_sec = max(start_sec + 1.0, round(float(t_end), 2))
 
     if max_len > 0 and not allow_exceed_max and end_sec - start_sec > max_len:
         end_sec = start_sec + max_len
@@ -102,7 +103,7 @@ def _snap_to_boundary(
     *,
     cues: Sequence[IngestTranscriptCue],
     silence_ranges: Sequence[tuple[float, float]],
-    max_adjust: float = 1.5,
+    max_adjust: float = 1.0,
 ) -> float:
     """
     Move `raw_time` to the nearest transcript-gap OR silence-range boundary within

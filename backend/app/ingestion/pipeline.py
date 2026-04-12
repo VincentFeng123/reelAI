@@ -351,6 +351,7 @@ class IngestionPipeline:
         concept_id: str | None = None,
         language: str = "en",
         use_llm: bool = True,
+        query: str | None = None,
         trace_id: str | None = None,
     ) -> IngestTopicCutResult:
         """
@@ -451,6 +452,7 @@ class IngestionPipeline:
         topic_cues = cues_from_ingest_cues(cues)
         classification, topic_reels = cut_video_into_topic_reels(
             source_url,
+            query=query,
             duration_sec=float(duration_sec or 0.0),
             openai_client=self._openai_client,
             use_llm=use_llm,
@@ -719,6 +721,111 @@ class IngestionPipeline:
         )
 
     # --------------------------------------------------------------------- #
+    # Topic-cut variant for search — multiple query-filtered reels per URL
+    # --------------------------------------------------------------------- #
+
+    def _ingest_url_with_topic_cut(
+        self,
+        *,
+        source_url: str,
+        query: str,
+        material_id: str | None = None,
+        concept_id: str | None = None,
+        language: str = "en",
+        trace_id: str | None = None,
+    ) -> list[ReelOutWithAttribution]:
+        """
+        Download + transcribe + topic-cut a single URL, returning only the
+        topic reels that match *query*.  Used by `ingest_search` to produce
+        multiple precise clips per video instead of a single heuristic window.
+
+        Falls back to the standard `ingest_url` (single clip) when topic-cut
+        produces no results (e.g. Shorts, missing transcript, all topics
+        filtered out).
+        """
+        from ..services.topic_cut import (
+            cues_from_ingest_cues,
+            cut_video_into_topic_reels,
+        )
+
+        effective_trace = set_trace_id(trace_id or new_trace_id())
+        self._preflight()
+
+        adapter = self._pick_adapter(source_url)
+        platform: PlatformCode = adapter.platform_for(source_url)
+        self._rate_limiter.acquire(platform)
+
+        with TempWorkspace() as workspace:
+            adapter_result = adapter.resolve(source_url, workspace)
+            metadata = map_info_dict_to_metadata(
+                adapter_result.info_dict,
+                platform=platform,
+                source_url=source_url,
+                source_id=adapter_result.source_id,
+                playback_url=adapter_result.playback_url,
+            )
+
+            duration_sec = metadata.duration_sec
+            if not duration_sec or duration_sec <= 0:
+                try:
+                    duration_sec = probe_duration(adapter_result.video_path)
+                    metadata = metadata.model_copy(update={"duration_sec": duration_sec})
+                except DownloadError as exc:
+                    raise DownloadError(
+                        "Could not determine video duration",
+                        detail=exc.detail or exc.message,
+                    ) from exc
+
+            try:
+                cues = self._transcribe_with_conn(
+                    platform=platform,
+                    source_id=adapter_result.source_id,
+                    info_dict=adapter_result.info_dict,
+                    video_path=adapter_result.video_path,
+                    workspace=workspace,
+                    language=language,
+                )
+            except (TranscriptionError, ServerlessUnavailable):
+                raise
+            except Exception as exc:
+                raise TranscriptionError(
+                    "unexpected error during transcription", detail=str(exc)
+                ) from exc
+
+            if not cues:
+                raise TranscriptionError("no transcript cues were produced")
+
+            info_dict_snapshot: dict[str, Any] = dict(adapter_result.info_dict or {})
+
+        # Outside workspace — temp dir is gone, cues + metadata survive.
+        topic_cues = cues_from_ingest_cues(cues)
+        classification, topic_reels = cut_video_into_topic_reels(
+            source_url,
+            query=query,
+            duration_sec=float(duration_sec or 0.0),
+            openai_client=self._openai_client,
+            use_llm=True,
+            transcript=topic_cues,
+            info_dict=info_dict_snapshot,
+        )
+
+        if not classification.is_short and topic_reels:
+            persisted = self._persist_topic_reels(
+                topic_reels=topic_reels,
+                cues=cues,
+                adapter_result=adapter_result,
+                metadata=metadata,
+                material_id=material_id,
+                concept_id=concept_id,
+            )
+            if persisted:
+                return persisted
+
+        # Fallback: topic-cut produced nothing usable (Short, no transcript,
+        # all topics filtered out). Return empty — caller handles gracefully.
+        return []
+
+    # --------------------------------------------------------------------- #
     # Topic search — multi-platform fan-out
     # --------------------------------------------------------------------- #
 
@@ -870,7 +977,41 @@ class IngestionPipeline:
             # cleanly to this concept from the legacy `/api/feed` endpoint.
             effective_concept_id = concept_id or f"{effective_material_id}:concept"
 
-        def _ingest_one(platform: PlatformLiteral, reel_url: str) -> IngestSearchItem:
+        def _ingest_one(platform: PlatformLiteral, reel_url: str) -> list[IngestSearchItem]:
+            # Try the topic-cut path first (YouTube only) — produces multiple
+            # query-filtered reels per video.  Falls back to the legacy single-
+            # clip path when topic-cut returns nothing.
+            if platform == "yt":
+                try:
+                    reels = self._ingest_url_with_topic_cut(
+                        source_url=reel_url,
+                        query=query,
+                        material_id=effective_material_id,
+                        concept_id=effective_concept_id,
+                        language=language,
+                        trace_id=effective_trace,
+                    )
+                    if reels:
+                        return [
+                            IngestSearchItem(
+                                platform=platform,
+                                source_url=reel_url,
+                                status="ok",
+                                reel=r,
+                                metadata=None,
+                            )
+                            for r in reels
+                        ]
+                    # topic-cut returned nothing (Short, all topics filtered) —
+                    # fall through to legacy single-clip path below.
+                except Exception:
+                    logger.debug(
+                        "topic-cut failed for %s, falling back to ingest_url",
+                        reel_url,
+                        exc_info=True,
+                    )
+
+            # Legacy single-clip fallback (also the primary path for IG/TT).
             try:
                 result = self.ingest_url(
                     source_url=reel_url,
@@ -882,13 +1023,13 @@ class IngestionPipeline:
                     language=language,
                     trace_id=effective_trace,
                 )
-                return IngestSearchItem(
+                return [IngestSearchItem(
                     platform=platform,
                     source_url=reel_url,
                     status="ok",
                     reel=result.reel,
                     metadata=result.metadata,
-                )
+                )]
             except RateLimitedError as exc:
                 logger.warning(
                     "search item rate-limited platform=%s url=%s retry_after=%s",
@@ -896,12 +1037,12 @@ class IngestionPipeline:
                     reel_url,
                     exc.retry_after_sec,
                 )
-                return IngestSearchItem(
+                return [IngestSearchItem(
                     platform=platform,
                     source_url=reel_url,
                     status="rate_limited",
                     error=exc.message,
-                )
+                )]
             except IngestError as exc:
                 logger.warning(
                     "search item failed platform=%s url=%s error=%s",
@@ -909,20 +1050,20 @@ class IngestionPipeline:
                     reel_url,
                     exc.message,
                 )
-                return IngestSearchItem(
+                return [IngestSearchItem(
                     platform=platform,
                     source_url=reel_url,
                     status="error",
                     error=exc.message,
-                )
+                )]
             except Exception as exc:
                 logger.exception("search item crashed platform=%s url=%s", platform, reel_url)
-                return IngestSearchItem(
+                return [IngestSearchItem(
                     platform=platform,
                     source_url=reel_url,
                     status="error",
                     error=str(exc),
-                )
+                )]
 
         items: list[IngestSearchItem] = []
         if resolved_urls:
@@ -933,20 +1074,21 @@ class IngestionPipeline:
             for future in as_completed(future_to_key):
                 platform, url = future_to_key[future]
                 try:
-                    item = future.result()
+                    batch = future.result()
                 except Exception as exc:
                     logger.exception("search future raised unexpectedly platform=%s", platform)
-                    item = IngestSearchItem(
+                    batch = [IngestSearchItem(
                         platform=platform,
                         source_url=url,
                         status="error",
                         error=str(exc),
-                    )
-                items.append(item)
-                if item.status == "ok":
-                    per_platform_succeeded[item.platform] = per_platform_succeeded.get(item.platform, 0) + 1
-                else:
-                    per_platform_failed[item.platform] = per_platform_failed.get(item.platform, 0) + 1
+                    )]
+                for item in batch:
+                    items.append(item)
+                    if item.status == "ok":
+                        per_platform_succeeded[item.platform] = per_platform_succeeded.get(item.platform, 0) + 1
+                    else:
+                        per_platform_failed[item.platform] = per_platform_failed.get(item.platform, 0) + 1
 
         # Order items deterministically: resolved order, not completion order.
         url_to_order = {url: idx for idx, (_p, url) in enumerate(resolved_urls)}

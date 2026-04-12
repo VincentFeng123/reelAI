@@ -5675,6 +5675,7 @@ def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutRequest) 
             concept_id=payload.concept_id,
             language=payload.language,
             use_llm=payload.use_llm,
+            query=payload.query,
         )
     except (
         IngestUnsupportedSourceError,

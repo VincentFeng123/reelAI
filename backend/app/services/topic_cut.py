@@ -95,7 +95,7 @@ MAX_TOPIC_REEL_SEC = 12 * 60
 # Cue snap tolerance — we'll move a t_start/t_end up to this many seconds to
 # land on a real transcript-cue boundary so the clip doesn't begin or end
 # mid-sentence.
-SNAP_TOLERANCE_SEC = 2.0
+SNAP_TOLERANCE_SEC = 1.5
 
 # Default LLM model. Mirrors `Settings.openai_chat_model`. Cheap, fast, fits
 # any single-video transcript in one call.
@@ -568,6 +568,8 @@ Your job: identify every distinct TOPIC the creator covers, and for each one ret
 Rules:
 - A new topic begins when the creator clearly introduces a new subject ("Now let's talk about X", "The next thing is Y", a new chapter, a new question, a new demo). Not when X is merely mentioned in passing.
 - A topic ends at the LAST cue still on that subject — i.e. the cue right before the creator transitions away. NOT the first cue of the next topic.
+- Place boundaries precisely at transitions: `start_idx` is the FIRST cue where the creator begins the new topic (not the preceding segue or "let's move on"). `end_idx` is the LAST cue still discussing this topic (not the first cue of the next topic).
+- Prefer tighter boundaries — it is better to trim half a sentence of transition than to include 10 seconds of the wrong topic.
 - Each clip must be SELF-CONTAINED: a viewer who saw nothing else of the video should still understand what's being discussed. If a section depends on the previous topic to make sense, include it as part of the previous topic instead of starting a new clip.
 - Skip intros, outros, sponsor reads, and "subscribe / like" call-outs — do NOT return them as topics.
 - Topics must not overlap and must be in ascending order.
@@ -1150,8 +1152,8 @@ def _topic_reels_from_chapters(
     abs_max_cap = max(max_reel_sec, MAX_TOPIC_REEL_SEC)
 
     for t_start_sec, t_end_sec, label, summary in chapter_segments:
-        t_start = float(t_start_sec)
-        t_end = float(t_end_sec)
+        t_start = max(0.0, float(t_start_sec) - 1.0)
+        t_end = float(t_end_sec) + 1.0
         if t_end <= t_start:
             continue
 
@@ -1237,6 +1239,88 @@ def _topic_reels_from_chapters(
     return cleaned
 
 
+# --------------------------------------------------------------------------- #
+# Query-based topic relevance filtering
+# --------------------------------------------------------------------------- #
+
+# Minimum combined score for a topic reel to be considered relevant to the
+# user's search query.  Kept low because Jaccard on short labels is naturally
+# sparse; the transcript overlap (weight 0.5) does most of the heavy lifting.
+_MIN_QUERY_RELEVANCE = 0.03
+
+
+def _tokenize_for_relevance(text: str) -> set[str]:
+    """Lowercase, strip stopwords, keep tokens ≥3 chars — same spirit as `_cue_tokens`."""
+    return {
+        tok
+        for tok in re.findall(r"[a-z][a-z']{2,}", text.lower())
+        if tok not in _STOPWORDS
+    }
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _filter_reels_by_query(
+    reels: list[TopicReel],
+    query: str,
+    *,
+    cues: Sequence[TranscriptCue],
+) -> list[TopicReel]:
+    """
+    Score each TopicReel against the user's search *query* and keep only
+    relevant ones.  Scoring blends:
+
+      * label match  (0.4) — Jaccard of query tokens vs. reel label tokens
+      * transcript   (0.5) — Jaccard of query tokens vs. transcript text
+                              between cue_start_idx and cue_end_idx
+      * summary      (0.1) — Jaccard of query tokens vs. reel summary
+
+    If ALL reels fall below the threshold, the single highest-scoring reel is
+    returned so we never silently discard every topic for a video that has content.
+    """
+    query_tokens = _tokenize_for_relevance(query)
+    if not query_tokens:
+        return reels  # no meaningful query — return all
+
+    scored: list[tuple[float, TopicReel]] = []
+    for reel in reels:
+        label_score = _jaccard(query_tokens, _tokenize_for_relevance(reel.label))
+
+        # Build transcript text for this reel's cue range.
+        transcript_text = ""
+        if reel.cue_start_idx >= 0 and reel.cue_end_idx >= 0:
+            transcript_text = " ".join(
+                cues[i].text
+                for i in range(
+                    max(0, reel.cue_start_idx),
+                    min(len(cues), reel.cue_end_idx + 1),
+                )
+            )
+        transcript_score = _jaccard(query_tokens, _tokenize_for_relevance(transcript_text))
+
+        summary_score = _jaccard(query_tokens, _tokenize_for_relevance(reel.summary))
+
+        combined = 0.4 * label_score + 0.5 * transcript_score + 0.1 * summary_score
+        scored.append((combined, reel))
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    # Keep reels above the relevance threshold.
+    kept = [reel for score, reel in scored if score >= _MIN_QUERY_RELEVANCE]
+
+    # Fallback: never return empty — keep the best match.
+    if not kept and scored:
+        kept = [scored[0][1]]
+
+    # Restore chronological order.
+    kept.sort(key=lambda r: r.t_start)
+    return kept
+
+
 def _snap_segments_to_cues(
     raw_segments: Iterable[tuple[int, int, str, str]],
     cues: Sequence[TranscriptCue],
@@ -1272,16 +1356,15 @@ def _snap_segments_to_cues(
     for s_idx, e_idx, label, summary in raw_segments:
         s_idx = max(0, min(last_idx, int(s_idx)))
         e_idx = max(s_idx, min(last_idx, int(e_idx)))
-        t_start = cues[s_idx].start
-        t_end = cues[e_idx].end
+        t_start = max(0.0, cues[s_idx].start - 1.0)
+        t_end = cues[e_idx].end + 1.0
 
-        # Try to snap t_end backward to the gap between cues[e_idx] and cues[e_idx+1]
+        # Try to snap t_end to the gap between cues[e_idx] and cues[e_idx+1]
+        # if the gap falls within tolerance of our +1s offset.
         if e_idx + 1 < len(cues):
             gap_start = cues[e_idx].end
             gap_end = cues[e_idx + 1].start
             if gap_end > gap_start:
-                # Land mid-gap if the gap is wide enough — this is the most
-                # natural place to cut.
                 snapped = (gap_start + gap_end) / 2.0
                 if abs(snapped - t_end) <= SNAP_TOLERANCE_SEC:
                     t_end = snapped
@@ -1347,6 +1430,7 @@ def _snap_segments_to_cues(
 def cut_video_into_topic_reels(
     url_or_id: str,
     *,
+    query: str | None = None,
     duration_sec: float | None = None,
     openai_client: Any | None = None,
     model: str = DEFAULT_MODEL,
@@ -1438,6 +1522,8 @@ def cut_video_into_topic_reels(
             max_reel_sec=max_reel_sec,
         )
         if chapter_reels:
+            if query and chapter_reels:
+                chapter_reels = _filter_reels_by_query(chapter_reels, query, cues=transcript or [])
             logger.info(
                 "video %s cut from %d YouTube chapters → %d reels (free path)",
                 video_id, len(chapters), len(chapter_reels),
@@ -1507,6 +1593,8 @@ def cut_video_into_topic_reels(
         min_reel_sec=min_reel_sec,
         max_reel_sec=max_reel_sec,
     )
+    if query and reels:
+        reels = _filter_reels_by_query(reels, query, cues=transcript)
     return classification, reels
 
 

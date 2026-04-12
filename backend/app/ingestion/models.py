@@ -226,6 +226,15 @@ class IngestTopicCutRequest(BaseModel):
             "lexical-novelty heuristic only. Useful for offline runs / tests."
         ),
     )
+    query: str | None = Field(
+        default=None,
+        max_length=500,
+        description=(
+            "When provided, only topic reels relevant to this search query "
+            "are returned. Uses token-overlap scoring on labels, summaries, "
+            "and transcript text."
+        ),
+    )
 
 
 class IngestTopicCutResult(BaseModel):
