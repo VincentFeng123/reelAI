@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
 from queue import Empty, Queue
+from collections.abc import Iterable
 from typing import Any, Callable, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 
@@ -75,6 +76,8 @@ from .models import (
     CommunityStarredSetsResponse,
     CommunityReelOut,
     CommunitySetCreateRequest,
+    CommunitySetFeedbackRequest,
+    CommunitySetFeedbackResponse,
     CommunitySetOut,
     CommunitySetUpdateRequest,
     CommunitySetsResponse,
@@ -4596,7 +4599,19 @@ def _compute_updated_label(updated_at_iso: str | None) -> str:
     return f"Last Edited: {years} year{'s' if years != 1 else ''} ago"
 
 
-def _serialize_community_set(row: dict) -> CommunitySetOut:
+def _serialize_community_set(
+    row: dict,
+    *,
+    viewer_vote: str | None = None,
+) -> CommunitySetOut:
+    """Build the wire-format `CommunitySetOut` for a single row.
+
+    `viewer_vote` is the calling user's vote on this set — one of
+    ``"like"`` / ``"dislike"`` / ``None`` — used to fill the
+    ``viewer_liked`` / ``viewer_disliked`` response fields. Anonymous
+    callers (no session) just pass ``None`` and both flags come back
+    False.
+    """
     tags_raw = row.get("tags_json")
     reels_raw = row.get("reels_json")
     try:
@@ -4647,6 +4662,7 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
 
     reel_count = max(len(reels), _to_int(row.get("reel_count"), len(reels)))
     likes = max(0, _to_int(row.get("likes"), 0))
+    dislikes = max(0, _to_int(row.get("dislikes"), 0))
     learners = max(0, _to_int(row.get("learners"), 1))
     created_at = _normalize_datetime_for_api(row.get("created_at"))
     updated_at = _normalize_datetime_for_api(row.get("updated_at")) or created_at
@@ -4655,6 +4671,10 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
     thumbnail_url = str(row.get("thumbnail_url") or "").strip()
     if not thumbnail_url:
         thumbnail_url = "/images/community/ai-systems.svg"
+
+    normalized_vote = str(viewer_vote or "").strip().lower()
+    viewer_liked = normalized_vote == "like"
+    viewer_disliked = normalized_vote == "dislike"
 
     return CommunitySetOut(
         id=str(row.get("id") or ""),
@@ -4665,6 +4685,9 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
         reel_count=reel_count,
         curator=curator,
         likes=likes,
+        dislikes=dislikes,
+        viewer_liked=viewer_liked,
+        viewer_disliked=viewer_disliked,
         learners=learners,
         updated_label=updated_label,
         updated_at=updated_at,
@@ -4672,6 +4695,54 @@ def _serialize_community_set(row: dict) -> CommunitySetOut:
         thumbnail_url=thumbnail_url,
         featured=bool(_to_int(row.get("featured"), 0)),
     )
+
+
+def _fetch_viewer_votes_by_set_id(
+    conn: Any,
+    *,
+    account_id: str | None,
+    set_ids: Iterable[str],
+) -> dict[str, str]:
+    """Return ``{set_id: vote}`` for the given account across ``set_ids``.
+
+    Returns an empty dict if ``account_id`` is falsy or no rows match.
+    Used by the list endpoints so each `CommunitySetOut` knows whether
+    the calling viewer has already voted on it.
+    """
+    if not account_id:
+        return {}
+    unique_ids = [sid for sid in {str(sid) for sid in set_ids if sid}]
+    if not unique_ids:
+        return {}
+    placeholders = ", ".join(["?"] * len(unique_ids))
+    rows = fetch_all(
+        conn,
+        f"""
+        SELECT set_id, vote
+        FROM community_set_votes
+        WHERE account_id = ? AND set_id IN ({placeholders})
+        """,
+        (str(account_id), *unique_ids),
+    )
+    return {
+        str(row.get("set_id") or ""): str(row.get("vote") or "").strip().lower()
+        for row in rows
+        if row.get("set_id")
+    }
+
+
+def _try_get_community_account(conn: Any, request: Request) -> dict[str, object] | None:
+    """Optional variant of `_require_authenticated_community_account`.
+
+    Returns ``None`` instead of raising when the session header is
+    missing, malformed, or expired. Used by read endpoints that want to
+    personalize their response (e.g. filling `viewer_liked`) without
+    forcing the caller to be signed in.
+    """
+    try:
+        return _require_authenticated_community_account(conn, request)
+    except HTTPException:
+        return None
 
 
 def _serialize_community_history_item(row: dict) -> CommunityHistoryItemOut:
@@ -6516,9 +6587,12 @@ def get_community_reel_duration(request: Request, source_url: str):
 
 
 @app.get("/api/community/sets", response_model=CommunitySetsResponse)
-def list_community_sets(limit: int = 160):
+def list_community_sets(request: Request, limit: int = 160):
     safe_limit = max(1, min(limit, 300))
-    with get_conn() as conn:
+    with get_conn(transactional=True) as conn:
+        # Optional auth: anonymous callers still get the list, but they
+        # won't see `viewer_liked` / `viewer_disliked` toggles populated.
+        viewer_account = _try_get_community_account(conn, request)
         rows = fetch_all(
             conn,
             """
@@ -6531,6 +6605,7 @@ def list_community_sets(limit: int = 160):
                 reel_count,
                 curator,
                 likes,
+                dislikes,
                 learners,
                 updated_label,
                 updated_at,
@@ -6544,7 +6619,15 @@ def list_community_sets(limit: int = 160):
             """,
             (PUBLIC_COMMUNITY_VISIBILITY, PUBLIC_COMMUNITY_VISIBILITY, safe_limit),
         )
-    sets = [_serialize_community_set(row) for row in rows]
+        viewer_votes = _fetch_viewer_votes_by_set_id(
+            conn,
+            account_id=str(viewer_account["id"]) if viewer_account else None,
+            set_ids=(row.get("id") for row in rows),
+        )
+    sets = [
+        _serialize_community_set(row, viewer_vote=viewer_votes.get(str(row.get("id") or "")))
+        for row in rows
+    ]
     return {"sets": sets}
 
 
@@ -6565,6 +6648,7 @@ def list_my_community_sets(request: Request, limit: int = 160):
                 reel_count,
                 curator,
                 likes,
+                dislikes,
                 learners,
                 updated_label,
                 updated_at,
@@ -6578,7 +6662,18 @@ def list_my_community_sets(request: Request, limit: int = 160):
             """,
             (str(account["id"]), safe_limit),
         )
-    sets = [_serialize_community_set(row) for row in rows]
+        # The owner is also the viewer for this list — show their own
+        # votes on their own sets, so the detail view's thumbs buttons
+        # reflect state consistently across both tabs.
+        viewer_votes = _fetch_viewer_votes_by_set_id(
+            conn,
+            account_id=str(account["id"]),
+            set_ids=(row.get("id") for row in rows),
+        )
+    sets = [
+        _serialize_community_set(row, viewer_vote=viewer_votes.get(str(row.get("id") or "")))
+        for row in rows
+    ]
     return {"sets": sets}
 
 
@@ -6761,6 +6856,7 @@ def create_community_set(request: Request, payload: CommunitySetCreateRequest):
                 "reel_count": len(reels_payload),
                 "curator": curator,
                 "likes": 0,
+                "dislikes": 0,
                 "learners": 1,
                 "updated_label": updated_label,
                 "thumbnail_url": thumbnail_url,
@@ -6784,6 +6880,7 @@ def create_community_set(request: Request, payload: CommunitySetCreateRequest):
                 reel_count,
                 curator,
                 likes,
+                dislikes,
                 learners,
                 updated_label,
                 updated_at,
@@ -6875,6 +6972,7 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
                 owner_account_id,
                 visibility,
                 likes,
+                dislikes,
                 learners,
                 featured,
                 created_at
@@ -6912,6 +7010,7 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
                 "reel_count": len(reels_payload),
                 "curator": curator,
                 "likes": max(0, _to_int(existing.get("likes"), 0)),
+                "dislikes": max(0, _to_int(existing.get("dislikes"), 0)),
                 "learners": max(0, _to_int(existing.get("learners"), 1)),
                 "updated_label": updated_label,
                 "thumbnail_url": thumbnail_url,
@@ -6935,6 +7034,7 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
                 reel_count,
                 curator,
                 likes,
+                dislikes,
                 learners,
                 updated_label,
                 updated_at,
@@ -7016,6 +7116,112 @@ def delete_community_set_via_post(request: Request, set_id: str):
     # Fallback for deployments/proxies that block DELETE with 405.
     _enforce_rate_limit(request, "community-write", limit=COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW)
     return _delete_community_set_impl(request, set_id)
+
+
+@app.post(
+    "/api/community/sets/{set_id}/feedback",
+    response_model=CommunitySetFeedbackResponse,
+)
+def record_community_set_feedback(
+    request: Request,
+    set_id: str,
+    payload: CommunitySetFeedbackRequest,
+):
+    """Upsert the caller's like/dislike vote on a community set and
+    return the freshly-recomputed aggregate totals along with the
+    viewer's new vote state.
+
+    - ``liked=True, disliked=False`` → store a 'like' row
+    - ``liked=False, disliked=True`` → store a 'dislike' row
+    - ``liked=False, disliked=False`` → clear any prior vote
+    - ``liked=True, disliked=True`` → 400 (mutually exclusive)
+
+    Aggregate ``likes`` / ``dislikes`` columns on ``community_sets``
+    are recomputed from the per-user ``community_set_votes`` table on
+    every write, so the totals can never drift away from the row-level
+    truth.
+    """
+    _enforce_rate_limit(request, "community-set-feedback", limit=120)
+
+    if payload.liked and payload.disliked:
+        raise HTTPException(
+            status_code=400,
+            detail="A set cannot be liked and disliked at the same time.",
+        )
+
+    normalized_set_id = set_id.strip()
+    if not normalized_set_id:
+        raise HTTPException(status_code=400, detail="set_id is required.")
+
+    with get_conn(transactional=True) as conn:
+        account = _require_authenticated_community_account(conn, request)
+        account_id = str(account["id"])
+
+        existing = fetch_one(
+            conn,
+            "SELECT id FROM community_sets WHERE id = ? LIMIT 1",
+            (normalized_set_id,),
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="Community set not found.")
+
+        # Clear any prior vote for (account, set), then write the new
+        # one. DELETE-then-INSERT is simpler than a cross-dialect UPSERT
+        # here, and stays correct because the whole block is inside a
+        # single transaction.
+        execute_modify(
+            conn,
+            "DELETE FROM community_set_votes WHERE account_id = ? AND set_id = ?",
+            (account_id, normalized_set_id),
+        )
+
+        new_vote: str | None = None
+        if payload.liked:
+            new_vote = "like"
+        elif payload.disliked:
+            new_vote = "dislike"
+
+        if new_vote is not None:
+            insert(
+                conn,
+                "community_set_votes",
+                {
+                    "account_id": account_id,
+                    "set_id": normalized_set_id,
+                    "vote": new_vote,
+                    "created_at": now_iso(),
+                },
+            )
+
+        # Recount authoritative totals from the votes table.
+        totals = fetch_one(
+            conn,
+            """
+            SELECT
+                SUM(CASE WHEN vote = 'like' THEN 1 ELSE 0 END) AS like_total,
+                SUM(CASE WHEN vote = 'dislike' THEN 1 ELSE 0 END) AS dislike_total
+            FROM community_set_votes
+            WHERE set_id = ?
+            """,
+            (normalized_set_id,),
+        )
+        likes_total = max(0, _to_int((totals or {}).get("like_total"), 0))
+        dislikes_total = max(0, _to_int((totals or {}).get("dislike_total"), 0))
+
+        execute_modify(
+            conn,
+            "UPDATE community_sets SET likes = ?, dislikes = ? WHERE id = ?",
+            (likes_total, dislikes_total, normalized_set_id),
+        )
+
+    return CommunitySetFeedbackResponse(
+        status="ok",
+        set_id=normalized_set_id,
+        likes=likes_total,
+        dislikes=dislikes_total,
+        viewer_liked=new_vote == "like",
+        viewer_disliked=new_vote == "dislike",
+    )
 
 
 # ---------------------------------------------------------------------------

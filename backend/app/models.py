@@ -258,6 +258,14 @@ class CommunitySetOut(BaseModel):
     reel_count: int
     curator: str
     likes: int
+    # Aggregate dislike count. Defaulted so old clients that decode this
+    # model without the new field still work and new rows start at 0.
+    dislikes: int = 0
+    # Whether the authenticated viewer has liked / disliked this set.
+    # Both default to False for anonymous listings; mutual exclusion is
+    # enforced on write — at most one can be true for a given (user, set).
+    viewer_liked: bool = False
+    viewer_disliked: bool = False
     learners: int
     updated_label: str
     updated_at: str | None = None
@@ -268,6 +276,23 @@ class CommunitySetOut(BaseModel):
 
 class CommunitySetsResponse(BaseModel):
     sets: list[CommunitySetOut] = Field(default_factory=list)
+
+
+class CommunitySetFeedbackRequest(BaseModel):
+    # The user's intended vote state *after* this call. To un-vote a
+    # set, send `liked=False, disliked=False`. The server enforces
+    # mutual exclusion — sending both as True is a 400.
+    liked: bool = False
+    disliked: bool = False
+
+
+class CommunitySetFeedbackResponse(BaseModel):
+    status: str
+    set_id: str
+    likes: int
+    dislikes: int
+    viewer_liked: bool
+    viewer_disliked: bool
 
 
 class CommunitySendSignupVerificationRequest(BaseModel):

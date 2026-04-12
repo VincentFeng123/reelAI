@@ -357,6 +357,7 @@ CREATE TABLE IF NOT EXISTS community_sets (
     reel_count INTEGER NOT NULL DEFAULT 0,
     curator TEXT NOT NULL,
     likes INTEGER NOT NULL DEFAULT 0,
+    dislikes INTEGER NOT NULL DEFAULT 0,
     learners INTEGER NOT NULL DEFAULT 1,
     updated_label TEXT NOT NULL,
     thumbnail_url TEXT NOT NULL,
@@ -369,6 +370,22 @@ CREATE TABLE IF NOT EXISTS community_sets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_community_sets_featured_created_at ON community_sets(featured DESC, created_at DESC);
+
+-- Per-account vote on a community set. `vote` is 'like' or 'dislike';
+-- mutual exclusion is enforced at write time (there is at most one row
+-- per (account_id, set_id), and toggling a vote rewrites it). Aggregate
+-- counts on `community_sets.likes` / `community_sets.dislikes` are
+-- recomputed from this table each time a vote is recorded so the
+-- numbers can never drift.
+CREATE TABLE IF NOT EXISTS community_set_votes (
+    account_id TEXT NOT NULL,
+    set_id TEXT NOT NULL,
+    vote TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (account_id, set_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_community_set_votes_set_id ON community_set_votes(set_id);
 
 CREATE TABLE IF NOT EXISTS community_material_history (
     account_id TEXT NOT NULL,
@@ -746,6 +763,7 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS owner_key_hash TEXT")
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS owner_account_id TEXT")
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS visibility TEXT")
+                cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS dislikes INTEGER NOT NULL DEFAULT 0")
                 cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS active_index INTEGER")
                 cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS active_reel_id TEXT")
                 cur.execute("ALTER TABLE community_account_settings ADD COLUMN IF NOT EXISTS autoplay_next_reel INTEGER NOT NULL DEFAULT 0")
@@ -870,6 +888,10 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE community_sets ADD COLUMN visibility TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_sets ADD COLUMN dislikes INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:
