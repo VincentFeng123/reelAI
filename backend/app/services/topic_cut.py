@@ -101,10 +101,11 @@ SNAP_TOLERANCE_SEC = 1.5
 # any single-video transcript in one call.
 DEFAULT_MODEL = "gpt-4o-mini"
 
-# Hard cap on transcript cues sent to the LLM. ~3000 cues ≈ 4 hours of speech;
+# Hard cap on transcript cues sent to the LLM. ~6000 cues ≈ 8 hours of speech;
 # beyond that we fall back to the heuristic (and warn) rather than risk a
-# token-limit error.
-MAX_CUES_FOR_LLM = 3000
+# token-limit error. Raised from 3000 to 6000 — Gemini Flash and Llama 3
+# handle large contexts well.
+MAX_CUES_FOR_LLM = 6000
 
 
 # --------------------------------------------------------------------------- #
@@ -565,21 +566,30 @@ You will receive a numbered transcript. Each line has the format:
 
 Your job: identify every distinct TOPIC the creator covers, and for each one return the cue index where they FIRST INTRODUCE it and the cue index where they LAST DISCUSS it before moving on.
 
-Rules:
-- A new topic begins when the creator clearly introduces a new subject ("Now let's talk about X", "The next thing is Y", a new chapter, a new question, a new demo). Not when X is merely mentioned in passing.
-- A topic ends at the LAST cue still on that subject — i.e. the cue right before the creator transitions away. NOT the first cue of the next topic.
-- Place boundaries precisely at transitions: `start_idx` is the FIRST cue where the creator begins the new topic (not the preceding segue or "let's move on"). `end_idx` is the LAST cue still discussing this topic (not the first cue of the next topic).
-- Prefer tighter boundaries — it is better to trim half a sentence of transition than to include 10 seconds of the wrong topic.
-- Each clip must be SELF-CONTAINED: a viewer who saw nothing else of the video should still understand what's being discussed. If a section depends on the previous topic to make sense, include it as part of the previous topic instead of starting a new clip.
+Rules for TOPIC INTRODUCTIONS (start_idx):
+- A topic INTRODUCTION is when the creator begins SUSTAINED discussion of a new subject. Strong signals include phrases like "Now let me show you", "The next concept is", "Moving on to", "Let's dive into", "So what is X?", a new chapter, a new question, or a new demo.
+- A mere passing reference ("as we discussed earlier", "similar to X", "which relates to Y") is NOT a topic introduction. The creator must be setting context for a new discussion, not referencing a previous one.
+- `start_idx` must be the FIRST cue where the creator begins the new topic — NOT the preceding segue cue like "let's move on" or "alright so". Start at the actual substance.
+
+Rules for TOPIC ENDINGS (end_idx):
+- `end_idx` is the LAST cue where the creator is ACTIVELY discussing this topic — NOT the first cue of the next topic.
+- Look for transition signals: "Alright so", "Moving on", "Next up", "So that covers", "Now let's talk about something else", or a noticeable pause followed by new vocabulary.
+- Place end_idx on the cue BEFORE such a transition signal, not on the transition itself.
+- Prefer ending at a complete sentence rather than mid-thought — if the creator finishes their point 1-2 cues before the transition phrase, end there.
+
+General rules:
+- Each segment should span at least 10 cues of substantive content. If you have fewer, consider whether it's a passing reference rather than a true topic.
+- Each clip must be SELF-CONTAINED: a viewer should understand the discussion without seeing the rest of the video.
 - Skip intros, outros, sponsor reads, and "subscribe / like" call-outs — do NOT return them as topics.
 - Topics must not overlap and must be in ascending order.
-- If the entire video is one continuous monolithic topic (e.g. a single proof, a single demo with no breaks), return ONE segment spanning the substantive part.
+- If the entire video is one continuous monolithic topic, return ONE segment spanning the substantive part.
 - A label must be 4-9 words and describe the topic, not the action ("Diagonalizing 3x3 matrices", not "He talks about matrices").
+- Prefer tighter, more precise boundaries — it is better to trim a transition sentence than to include 10 seconds of the wrong topic.
 
 Return JSON only, in this exact shape:
 {
     "segments": [
-        {"start_idx": <int>, "end_idx": <int>, "label": "<topic label>", "summary": "<one short sentence>"}
+        {"start_idx": <int>, "end_idx": <int>, "label": "<topic label>", "summary": "<one short sentence>", "confidence": <float 0.0-1.0>}
     ]
 }
 No prose outside the JSON."""
@@ -654,6 +664,215 @@ def _llm_topic_segments(
             continue
         out.append((s, e, label, summary))
     return out
+
+
+def _parse_llm_segments_json(raw: str) -> list[tuple[int, int, str, str]]:
+    """Parse the JSON response from any LLM into (start_idx, end_idx, label, summary) tuples."""
+    payload = json.loads(raw)
+    segments_raw = payload.get("segments")
+    if not isinstance(segments_raw, list):
+        raise ValueError(f"LLM returned no segments: {raw[:200]}")
+
+    out: list[tuple[int, int, str, str]] = []
+    for seg in segments_raw:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            s = int(seg.get("start_idx"))
+            e = int(seg.get("end_idx"))
+        except (TypeError, ValueError):
+            continue
+        label = str(seg.get("label") or "").strip()
+        summary = str(seg.get("summary") or "").strip()
+        if not label:
+            continue
+        out.append((s, e, label, summary))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Gemini Flash (free tier: 15 RPM, 1M tokens/day)
+# --------------------------------------------------------------------------- #
+
+
+def _build_gemini_client() -> Any | None:
+    """Build a Google Gemini client from GEMINI_API_KEY if available."""
+    api_key = os.environ.get("GEMINI_API_KEY") or ""
+    if not api_key:
+        return None
+    try:
+        import google.generativeai as genai
+    except ImportError:
+        logger.debug("google-generativeai is not installed; Gemini path disabled")
+        return None
+    try:
+        genai.configure(api_key=api_key)
+        return genai
+    except Exception:
+        logger.exception("could not configure Gemini client")
+        return None
+
+
+def _llm_topic_segments_gemini(
+    cues: Sequence[TranscriptCue],
+    *,
+    genai_module: Any,
+    model: str = "gemini-2.0-flash",
+) -> list[tuple[int, int, str, str]]:
+    """
+    Identify topic boundaries using Google Gemini Flash (free tier).
+    Same prompt and output format as the OpenAI path.
+    """
+    rendered = _render_transcript_for_llm(cues)
+    user_msg = (
+        "Here is the full transcript of a long-form YouTube video. "
+        "Identify topic segments per the rules in the system prompt.\n\n"
+        f"{rendered}"
+    )
+
+    model_obj = genai_module.GenerativeModel(
+        model_name=model,
+        system_instruction=_SYSTEM_PROMPT,
+        generation_config=genai_module.GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+    response = model_obj.generate_content(user_msg)
+    raw = response.text or "{}"
+    return _parse_llm_segments_json(raw)
+
+
+# --------------------------------------------------------------------------- #
+# Groq / Llama 3 (free tier fallback)
+# --------------------------------------------------------------------------- #
+
+
+def _build_groq_client() -> Any | None:
+    """Build a Groq client from GROQ_API_KEY if available."""
+    api_key = os.environ.get("GROQ_API_KEY") or ""
+    if not api_key:
+        return None
+    try:
+        from groq import Groq
+    except ImportError:
+        logger.debug("groq package is not installed; Groq path disabled")
+        return None
+    try:
+        return Groq(api_key=api_key)
+    except Exception:
+        logger.exception("could not build Groq client")
+        return None
+
+
+def _llm_topic_segments_groq(
+    cues: Sequence[TranscriptCue],
+    *,
+    groq_client: Any,
+    model: str = "llama-3.3-70b-versatile",
+) -> list[tuple[int, int, str, str]]:
+    """
+    Identify topic boundaries using Groq (Llama 3, free tier).
+    Uses the OpenAI-compatible chat completions API.
+    """
+    rendered = _render_transcript_for_llm(cues)
+    user_msg = (
+        "Here is the full transcript of a long-form YouTube video. "
+        "Identify topic segments per the rules in the system prompt.\n\n"
+        f"{rendered}"
+    )
+
+    response = groq_client.chat.completions.create(
+        model=model,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+    raw = response.choices[0].message.content or "{}"
+    return _parse_llm_segments_json(raw)
+
+
+# --------------------------------------------------------------------------- #
+# Two-pass boundary refinement
+# --------------------------------------------------------------------------- #
+
+_REFINE_PROMPT = """You are refining topic boundaries in a YouTube transcript.
+
+I have identified a topic segment labeled "{label}". Below are the cues around the proposed START boundary (cues {start_range}) and END boundary (cues {end_range}).
+
+START BOUNDARY CUES:
+{start_cues}
+
+END BOUNDARY CUES:
+{end_cues}
+
+For the START: which cue index is the EXACT first cue where the creator begins discussing "{label}"? Look for where they set context or introduce the topic, not transition phrases from the previous topic.
+
+For the END: which cue index is the EXACT last cue where the creator is still discussing "{label}"? Look for the last substantive cue before they transition away. End at a complete sentence.
+
+Return JSON only:
+{{"refined_start_idx": <int>, "refined_end_idx": <int>}}"""
+
+
+def _refine_boundaries_llm(
+    segments: list[tuple[int, int, str, str]],
+    cues: Sequence[TranscriptCue],
+    *,
+    llm_call: Any,
+) -> list[tuple[int, int, str, str]]:
+    """
+    Two-pass refinement: for each segment, extract a small window around each
+    boundary and ask the LLM for the EXACT cue index. `llm_call` is a callable
+    that accepts a user prompt string and returns the raw text response.
+
+    Returns the same segments with refined start/end indices.
+    """
+    refined: list[tuple[int, int, str, str]] = []
+    window = 5  # cues before/after the boundary
+
+    for s_idx, e_idx, label, summary in segments:
+        try:
+            start_lo = max(0, s_idx - window)
+            start_hi = min(len(cues) - 1, s_idx + window)
+            end_lo = max(0, e_idx - window)
+            end_hi = min(len(cues) - 1, e_idx + window)
+
+            start_cue_text = "\n".join(
+                f"[{i} {_format_timestamp(cues[i].start)}] {cues[i].text}"
+                for i in range(start_lo, start_hi + 1)
+            )
+            end_cue_text = "\n".join(
+                f"[{i} {_format_timestamp(cues[i].start)}] {cues[i].text}"
+                for i in range(end_lo, end_hi + 1)
+            )
+
+            prompt = _REFINE_PROMPT.format(
+                label=label,
+                start_range=f"{start_lo}-{start_hi}",
+                end_range=f"{end_lo}-{end_hi}",
+                start_cues=start_cue_text,
+                end_cues=end_cue_text,
+            )
+
+            raw = llm_call(prompt)
+            payload = json.loads(raw)
+            new_s = int(payload.get("refined_start_idx", s_idx))
+            new_e = int(payload.get("refined_end_idx", e_idx))
+
+            # Sanity check: refined indices must be within the window range
+            if start_lo <= new_s <= start_hi:
+                s_idx = new_s
+            if end_lo <= new_e <= end_hi:
+                e_idx = new_e
+        except Exception:
+            logger.debug("boundary refinement failed for segment '%s'; keeping original", label)
+
+        refined.append((s_idx, e_idx, label, summary))
+
+    return refined
 
 
 # --------------------------------------------------------------------------- #
@@ -1264,6 +1483,41 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b)
 
 
+def _compute_semantic_scores(
+    query: str,
+    texts: list[str],
+) -> list[float] | None:
+    """
+    Compute cosine similarity between query and each text using the local
+    sentence-transformer (all-MiniLM-L6-v2). Returns None if the model
+    is not available (falls back to Jaccard-only scoring).
+    """
+    model = _load_sentence_transformer()
+    if model is None:
+        return None
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        all_texts = [query] + texts
+        embeddings = model.encode(
+            all_texts,
+            batch_size=32,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        query_vec = embeddings[0]
+        text_vecs = embeddings[1:]
+        # Cosine similarity with normalized vectors = dot product
+        scores = (text_vecs @ query_vec).tolist()
+        return scores
+    except Exception:
+        logger.debug("semantic scoring failed; falling back to Jaccard")
+        return None
+
+
 def _filter_reels_by_query(
     reels: list[TopicReel],
     query: str,
@@ -1272,11 +1526,16 @@ def _filter_reels_by_query(
 ) -> list[TopicReel]:
     """
     Score each TopicReel against the user's search *query* and keep only
-    relevant ones.  Scoring blends:
+    relevant ones. Uses a hybrid scoring approach:
 
+    When sentence-transformer is available (free, local):
+      * semantic cosine similarity (0.60) — captures meaning, not just word overlap
+      * label Jaccard (0.25)
+      * summary Jaccard (0.15)
+
+    Fallback (Jaccard-only):
       * label match  (0.4) — Jaccard of query tokens vs. reel label tokens
       * transcript   (0.5) — Jaccard of query tokens vs. transcript text
-                              between cue_start_idx and cue_end_idx
       * summary      (0.1) — Jaccard of query tokens vs. reel summary
 
     If ALL reels fall below the threshold, the single highest-scoring reel is
@@ -1286,11 +1545,9 @@ def _filter_reels_by_query(
     if not query_tokens:
         return reels  # no meaningful query — return all
 
-    scored: list[tuple[float, TopicReel]] = []
+    # Build transcript text for each reel.
+    reel_transcripts: list[str] = []
     for reel in reels:
-        label_score = _jaccard(query_tokens, _tokenize_for_relevance(reel.label))
-
-        # Build transcript text for this reel's cue range.
         transcript_text = ""
         if reel.cue_start_idx >= 0 and reel.cue_end_idx >= 0:
             transcript_text = " ".join(
@@ -1300,11 +1557,27 @@ def _filter_reels_by_query(
                     min(len(cues), reel.cue_end_idx + 1),
                 )
             )
-        transcript_score = _jaccard(query_tokens, _tokenize_for_relevance(transcript_text))
+        reel_transcripts.append(transcript_text)
 
+    # Try semantic scoring (free, local sentence-transformer)
+    semantic_scores = _compute_semantic_scores(query, reel_transcripts)
+
+    scored: list[tuple[float, TopicReel]] = []
+    for i, reel in enumerate(reels):
+        label_score = _jaccard(query_tokens, _tokenize_for_relevance(reel.label))
         summary_score = _jaccard(query_tokens, _tokenize_for_relevance(reel.summary))
 
-        combined = 0.4 * label_score + 0.5 * transcript_score + 0.1 * summary_score
+        if semantic_scores is not None:
+            # Semantic path: cosine similarity dominates
+            sem_score = max(0.0, semantic_scores[i])
+            combined = 0.25 * label_score + 0.15 * summary_score + 0.60 * sem_score
+        else:
+            # Jaccard fallback
+            transcript_score = _jaccard(
+                query_tokens, _tokenize_for_relevance(reel_transcripts[i])
+            )
+            combined = 0.4 * label_score + 0.5 * transcript_score + 0.1 * summary_score
+
         scored.append((combined, reel))
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
@@ -1321,6 +1594,37 @@ def _filter_reels_by_query(
     return kept
 
 
+_SENTENCE_END_RE = re.compile(r"[.?!][\s\"']*$")
+
+
+def _find_sentence_end_cue(
+    cues: Sequence[TranscriptCue],
+    anchor_idx: int,
+    *,
+    scan_backward: bool = True,
+    max_scan: int = 3,
+) -> int | None:
+    """
+    Scan up to `max_scan` cues from `anchor_idx` looking for a cue whose text
+    ends with sentence-ending punctuation (. ? !). Returns the cue index if
+    found, None otherwise.
+
+    When `scan_backward=True`, scans from anchor_idx toward 0 (for end boundaries).
+    When `scan_backward=False`, scans from anchor_idx toward len(cues) (for start boundaries).
+    """
+    if scan_backward:
+        for i in range(anchor_idx, max(anchor_idx - max_scan, -1), -1):
+            if 0 <= i < len(cues) and _SENTENCE_END_RE.search(cues[i].text.strip()):
+                return i
+    else:
+        for i in range(anchor_idx, min(anchor_idx + max_scan, len(cues))):
+            # For start boundaries: find a cue that begins a new sentence
+            # (the PREVIOUS cue ends with sentence-ending punctuation).
+            if i > 0 and _SENTENCE_END_RE.search(cues[i - 1].text.strip()):
+                return i
+    return None
+
+
 def _snap_segments_to_cues(
     raw_segments: Iterable[tuple[int, int, str, str]],
     cues: Sequence[TranscriptCue],
@@ -1335,16 +1639,13 @@ def _snap_segments_to_cues(
 
     For each (start_idx, end_idx, label, summary):
       * clamp start_idx and end_idx to valid bounds
-      * derive t_start from cues[start_idx].start
-      * derive t_end from cues[end_idx].end (the END of the last cue, not the
-        start of the next one — that's the moment the speaker stops talking
-        about this topic)
-      * if there's a natural pause within ±SNAP_TOLERANCE_SEC of t_end (a gap
-        between two consecutive cues), nudge t_end to that pause so the cut
-        lands on silence
+      * snap start_idx FORWARD to the nearest cue that begins a new sentence
+      * snap end_idx BACKWARD to the nearest cue that ends a sentence
+      * derive t_start and t_end from the snapped cue boundaries
+      * if there's a natural pause within ±SNAP_TOLERANCE_SEC, nudge to the
+        gap midpoint so the cut lands on silence
       * drop the segment if it's outside [MIN_TOPIC_REEL_SEC, MAX_TOPIC_REEL_SEC]
-      * sort + de-dup overlapping segments (LLMs occasionally return ranges
-        that share a cue or two)
+      * sort + de-dup overlapping segments
     """
     if not cues:
         return []
@@ -1356,6 +1657,20 @@ def _snap_segments_to_cues(
     for s_idx, e_idx, label, summary in raw_segments:
         s_idx = max(0, min(last_idx, int(s_idx)))
         e_idx = max(s_idx, min(last_idx, int(e_idx)))
+
+        # Sentence-boundary snapping: try to land on natural sentence edges.
+        # For the END: scan backward from e_idx to find a cue that ends with
+        # sentence-ending punctuation — this ensures clips end after a complete thought.
+        sentence_end = _find_sentence_end_cue(cues, e_idx, scan_backward=True)
+        if sentence_end is not None and sentence_end >= s_idx:
+            e_idx = sentence_end
+
+        # For the START: scan forward from s_idx to find a cue that begins a
+        # new sentence (previous cue ends with punctuation).
+        sentence_start = _find_sentence_end_cue(cues, s_idx, scan_backward=False)
+        if sentence_start is not None and sentence_start <= e_idx:
+            s_idx = sentence_start
+
         t_start = max(0.0, cues[s_idx].start - 1.0)
         t_end = cues[e_idx].end + 1.0
 
@@ -1435,6 +1750,7 @@ def cut_video_into_topic_reels(
     openai_client: Any | None = None,
     model: str = DEFAULT_MODEL,
     use_llm: bool = True,
+    refine_boundaries: bool = True,
     transcript: Sequence[TranscriptCue] | None = None,
     info_dict: dict[str, Any] | None = None,
     min_reel_sec: float = MIN_TOPIC_REEL_SEC,
@@ -1543,29 +1859,104 @@ def cut_video_into_topic_reels(
         )
         return classification, []
 
-    # ---- Path 2: LLM topic segmentation (paid, best quality). ---------- #
+    # ---- Path 2: LLM topic segmentation (free-tier first). ------------- #
+    # Fallback chain: Gemini Flash (free) → Groq/Llama 3 (free) → OpenAI (paid, optional)
     raw_segments: list[tuple[int, int, str, str]] = []
-    if use_llm:
-        client = openai_client or _maybe_build_openai_client()
-        if client is None:
-            logger.info(
-                "no OpenAI client available; trying free semantic path next"
-            )
-        elif len(transcript) > MAX_CUES_FOR_LLM:
-            logger.warning(
-                "transcript has %d cues, exceeds MAX_CUES_FOR_LLM=%d; "
-                "trying free semantic path instead",
-                len(transcript), MAX_CUES_FOR_LLM,
-            )
-        else:
+    if use_llm and len(transcript) <= MAX_CUES_FOR_LLM:
+        # 2a: Google Gemini Flash (free tier: 15 RPM, 1M tokens/day)
+        gemini = _build_gemini_client()
+        if gemini:
             try:
-                raw_segments = _llm_topic_segments(transcript, openai_client=client, model=model)
+                raw_segments = _llm_topic_segments_gemini(transcript, genai_module=gemini)
+                if raw_segments:
+                    logger.info(
+                        "video %s segmented via Gemini Flash → %d segments",
+                        video_id, len(raw_segments),
+                    )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "LLM topic segmentation failed for video %s; trying free semantic path",
+                    "Gemini topic segmentation failed for video %s; trying Groq next",
                     video_id,
                 )
                 raw_segments = []
+
+        # 2b: Groq / Llama 3 (free tier fallback)
+        if not raw_segments:
+            groq = _build_groq_client()
+            if groq:
+                try:
+                    raw_segments = _llm_topic_segments_groq(transcript, groq_client=groq)
+                    if raw_segments:
+                        logger.info(
+                            "video %s segmented via Groq/Llama 3 → %d segments",
+                            video_id, len(raw_segments),
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Groq topic segmentation failed for video %s; trying OpenAI next",
+                        video_id,
+                    )
+                    raw_segments = []
+
+        # 2c: OpenAI (paid, optional last resort for LLM path)
+        if not raw_segments:
+            client = openai_client or _maybe_build_openai_client()
+            if client:
+                try:
+                    raw_segments = _llm_topic_segments(transcript, openai_client=client, model=model)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "OpenAI topic segmentation failed for video %s; trying semantic path",
+                        video_id,
+                    )
+                    raw_segments = []
+
+        # Two-pass boundary refinement: refine LLM segment boundaries with
+        # a cheap second LLM call per segment boundary (tiny 10-cue windows).
+        if raw_segments and refine_boundaries:
+            def _make_llm_call(prompt: str) -> str:
+                """Route refinement call through the same free-tier chain."""
+                gemini_mod = _build_gemini_client()
+                if gemini_mod:
+                    try:
+                        m = gemini_mod.GenerativeModel(
+                            model_name="gemini-2.0-flash",
+                            generation_config=gemini_mod.GenerationConfig(
+                                response_mime_type="application/json",
+                                temperature=0.0,
+                            ),
+                        )
+                        return m.generate_content(prompt).text or "{}"
+                    except Exception:
+                        pass
+                groq_c = _build_groq_client()
+                if groq_c:
+                    try:
+                        resp = groq_c.chat.completions.create(
+                            model="llama-3.3-70b-versatile",
+                            temperature=0.0,
+                            response_format={"type": "json_object"},
+                            messages=[{"role": "user", "content": prompt}],
+                        )
+                        return resp.choices[0].message.content or "{}"
+                    except Exception:
+                        pass
+                return "{}"
+
+            try:
+                raw_segments = _refine_boundaries_llm(
+                    raw_segments, transcript, llm_call=_make_llm_call,
+                )
+                logger.info("refined boundaries for %d segments", len(raw_segments))
+            except Exception:
+                logger.debug("boundary refinement failed; keeping original segments")
+
+    elif use_llm and len(transcript) > MAX_CUES_FOR_LLM:
+        logger.warning(
+            "transcript has %d cues, exceeds MAX_CUES_FOR_LLM=%d; "
+            "trying free semantic path instead",
+            len(transcript), MAX_CUES_FOR_LLM,
+        )
 
     # ---- Path 3: Local sentence-transformer embeddings (free, near-LLM). #
     # This is the "free LLM-equivalent": a small ~80 MB MiniLM model runs in

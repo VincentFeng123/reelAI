@@ -418,6 +418,22 @@ def _whisper_transcribe(
 # --------------------------------------------------------------------- #
 
 
+def _check_transcript_coverage(
+    cues: list[IngestTranscriptCue],
+    video_duration_sec: float | None,
+    *,
+    min_coverage: float = 0.85,
+) -> float:
+    """
+    Compute what fraction of the video the transcript covers.
+    Returns coverage ratio (0.0-1.0+). Returns 1.0 when duration is unknown.
+    """
+    if not cues or not video_duration_sec or video_duration_sec <= 0:
+        return 1.0
+    last_cue_end = max(cue.end for cue in cues)
+    return last_cue_end / video_duration_sec
+
+
 def transcribe(
     conn: Any,
     *,
@@ -431,6 +447,7 @@ def transcribe(
     language: str = "en",
     serverless_mode: bool = False,
     allow_openai_in_serverless: bool = False,
+    video_duration_sec: float | None = None,
 ) -> list[IngestTranscriptCue]:
     """
     Return a timestamped transcript for the ingested reel.
@@ -439,10 +456,17 @@ def transcribe(
       (1) cache hit
       (2) YouTube service (yt platform only) — reuses existing cache
       (3) yt-dlp scraped subtitles from the info_dict
-      (4) Whisper API fallback (refused in SERVERLESS_MODE unless explicitly overridden)
+      (4) faster-whisper running LOCALLY (free, no API)
+      (5) OpenAI Whisper API fallback (paid, refused in SERVERLESS_MODE unless overridden)
+
+    When `video_duration_sec` is provided, each strategy's output is checked for
+    transcript coverage (last cue end / video duration). If coverage is below 85%,
+    the strategy is treated as insufficient and the next one is tried. The best
+    result (highest coverage) is kept as a final fallback if no strategy reaches 85%.
 
     Raises `TranscriptionError` if every strategy fails AND Whisper is unavailable.
     """
+    MIN_COVERAGE = 0.85
     cache_key = _cache_key(platform, source_id, language)
 
     cached = _load_cached(conn, cache_key)
@@ -450,27 +474,52 @@ def transcribe(
         log_event(logger, logging.INFO, "transcript_cache_hit", platform=platform, source_id=source_id, count=len(cached))
         return cached
 
+    # Track best result across strategies for coverage fallback.
+    best_cues: list[IngestTranscriptCue] = []
+    best_coverage: float = 0.0
+
+    def _try_accept(cues: list[IngestTranscriptCue], strategy_name: str) -> list[IngestTranscriptCue] | None:
+        """Accept cues if coverage ≥ 85%, otherwise stash as best-so-far and return None."""
+        nonlocal best_cues, best_coverage
+        if not cues:
+            return None
+        coverage = _check_transcript_coverage(cues, video_duration_sec)
+        if coverage > best_coverage:
+            best_coverage = coverage
+            best_cues = cues
+        if coverage < MIN_COVERAGE and video_duration_sec and video_duration_sec > 0:
+            logger.warning(
+                "transcript from %s covers %.0f%% of video (%.0fs / %.0fs); "
+                "trying next strategy for better coverage",
+                strategy_name, coverage * 100,
+                max(cue.end for cue in cues), video_duration_sec,
+            )
+            return None
+        return cues
+
     # Strategy 2: YouTube transcript service
     if platform == "yt":
         cues = _cues_from_youtube_service(conn, youtube_service, source_id)
-        if cues:
-            _store_cache(conn, cache_key, cues)
-            log_event(logger, logging.INFO, "transcript_from_youtube_service", source_id=source_id, count=len(cues))
-            return cues
+        accepted = _try_accept(cues, "youtube_service")
+        if accepted:
+            _store_cache(conn, cache_key, accepted)
+            log_event(logger, logging.INFO, "transcript_from_youtube_service", source_id=source_id, count=len(accepted))
+            return accepted
 
     # Strategy 3: yt-dlp scraped subtitles
     cues = _cues_from_info_dict_subtitles(info_dict, language)
-    if cues:
-        _store_cache(conn, cache_key, cues)
+    accepted = _try_accept(cues, "yt_dlp_subs")
+    if accepted:
+        _store_cache(conn, cache_key, accepted)
         log_event(
             logger,
             logging.INFO,
             "transcript_from_yt_dlp_subs",
             platform=platform,
             source_id=source_id,
-            count=len(cues),
+            count=len(accepted),
         )
-        return cues
+        return accepted
 
     # Strategy 4: faster-whisper running LOCALLY (free, no API).
     # We try this BEFORE the paid OpenAI Whisper API so users without an
@@ -500,17 +549,19 @@ def transcribe(
             _ensure_audio_extracted()
             local_cues = _faster_whisper_transcribe(audio_path, language=language)
             if local_cues:
-                _store_cache(conn, cache_key, local_cues)
-                log_event(
-                    logger,
-                    logging.INFO,
-                    "transcript_from_faster_whisper",
-                    platform=platform,
-                    source_id=source_id,
-                    count=len(local_cues),
-                    model=_FASTER_WHISPER_MODEL,
-                )
-                return local_cues
+                accepted = _try_accept(local_cues, "faster_whisper")
+                if accepted:
+                    _store_cache(conn, cache_key, accepted)
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "transcript_from_faster_whisper",
+                        platform=platform,
+                        source_id=source_id,
+                        count=len(accepted),
+                        model=_FASTER_WHISPER_MODEL,
+                    )
+                    return accepted
     except TranscriptionError:
         logger.exception(
             "faster-whisper transcribe failed for %s:%s; falling back to OpenAI Whisper",
@@ -519,10 +570,28 @@ def transcribe(
 
     # Strategy 5: OpenAI Whisper API fallback (paid)
     if serverless_mode and not allow_openai_in_serverless:
+        # Before failing, check if we have a best-effort result from earlier strategies.
+        if best_cues:
+            logger.warning(
+                "Whisper unavailable in serverless mode; returning best-effort transcript "
+                "(%.0f%% coverage, %d cues)",
+                best_coverage * 100, len(best_cues),
+            )
+            _store_cache(conn, cache_key, best_cues)
+            return best_cues
         raise ServerlessUnavailable(
             "Whisper fallback is unavailable in serverless mode. Set ALLOW_OPENAI_IN_SERVERLESS=1 to override."
         )
     if openai_client is None:
+        # Return best-effort result if we have one, even if coverage is low.
+        if best_cues:
+            logger.warning(
+                "No Whisper client configured; returning best-effort transcript "
+                "(%.0f%% coverage, %d cues)",
+                best_coverage * 100, len(best_cues),
+            )
+            _store_cache(conn, cache_key, best_cues)
+            return best_cues
         raise TranscriptionError(
             "No transcript available from platform sources and neither faster-whisper nor OpenAI Whisper is configured."
         )

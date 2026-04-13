@@ -2273,32 +2273,36 @@ class ReelService:
                 elif transcript:
                     target_segment_budget = min(10, max(4, remaining_segment_capacity + 2))
 
-                    # ---- NEW: topic-aware cutting for long-form videos ---- #
-                    # For non-Short videos, run topic_cut on the transcript first.
-                    # It returns SegmentMatches whose boundaries match natural
-                    # topic transitions (creator chapter / LLM / sentence-transformer
-                    # / Jaccard heuristic — whichever is available, in that order).
-                    # The downstream `_rank_segments_by_relevance` then ranks each
-                    # topic by concept relevance and applies `min_relevance_threshold`
-                    # so only the topic-cut segments matching the study concept are
-                    # kept. For Shorts (`use_full_short_clip == True`) we skip
-                    # topic_cut entirely — the existing full-clip path handles them.
+                    # ---- Topic-boundary cutting for long-form videos ---- #
+                    # For non-Short videos, use topic_cut.py for precise boundary
+                    # detection: YouTube Chapters → Gemini/Groq LLM → sentence-
+                    # transformer → Jaccard heuristic. Each clip starts where the
+                    # creator introduces a topic and ends when they transition away.
+                    # Falls back to mention-clustering if topic_cut returns nothing.
                     if not use_full_short_clip:
-                        segments = self._topic_cut_segments_for_concept(
+                        segments = self._topic_boundary_segments_for_concept(
                             transcript=transcript,
                             video_id=video_id,
                             video_duration_sec=video_duration,
                             clip_min_len=clip_min_len,
                             clip_max_len=clip_max_len,
                             max_segments=target_segment_budget,
-                            # Concept-anchor refinement: clip starts at the
-                            # first cue mentioning the user's concept terms
-                            # within each topic, ends at the last mention.
-                            # Topics with <2 mentions are dropped — that's the
-                            # hard guarantee that every emitted clip is
-                            # genuinely about the user's search.
                             concept_terms=concept_terms,
+                            concept_title=str(concept.get("title") or ""),
+                            info_dict=video.get("info_dict"),
                         )
+                        # Fallback to keyword-mention clustering when topic-boundary
+                        # detection returns nothing (Short, no transcript, etc.)
+                        if not segments:
+                            segments = self._topic_cut_segments_for_concept(
+                                transcript=transcript,
+                                video_id=video_id,
+                                video_duration_sec=video_duration,
+                                clip_min_len=clip_min_len,
+                                clip_max_len=clip_max_len,
+                                max_segments=target_segment_budget,
+                                concept_terms=concept_terms,
+                            )
 
                     # Legacy embedding-based path: runs when topic_cut returned
                     # nothing (transcript too short, classification mismatch) AND
@@ -2372,6 +2376,18 @@ class ReelService:
                     raise_if_cancelled()
                     if use_full_short_clip:
                         clip_window = self._full_short_clip_window(video_duration)
+                    elif getattr(segment, "source", "legacy") == "topic_cut":
+                        # Topic-cut segments have already been precisely snapped to
+                        # sentence boundaries by topic_cut.py — skip the refinement
+                        # step which can shift boundaries by up to 6 seconds.
+                        clip_window = self._normalize_clip_window(
+                            segment.t_start,
+                            segment.t_end,
+                            video_duration,
+                            min_len=clip_min_len,
+                            max_len=clip_max_len,
+                            allow_exceed_max=True,
+                        )
                     elif transcript:
                         clip_window = self._refine_clip_window_from_transcript(
                             transcript=transcript,
@@ -9165,6 +9181,114 @@ class ReelService:
                 next_chunk_index += 1
 
         return segments
+
+    def _topic_boundary_segments_for_concept(
+        self,
+        *,
+        transcript: list[dict[str, Any]],
+        video_id: str,
+        video_duration_sec: int,
+        clip_min_len: int,
+        clip_max_len: int,
+        max_segments: int,
+        concept_terms: list[str] | None = None,
+        concept_title: str = "",
+        info_dict: dict[str, Any] | None = None,
+    ) -> list[SegmentMatch]:
+        """
+        Use the proper topic-boundary detection from `topic_cut.py` to find
+        segments where the creator INTRODUCES and TRANSITIONS AWAY from topics,
+        then filter by concept relevance.
+
+        This replaces `_topic_cut_segments_for_concept` as the primary path:
+        - Chapters → Gemini/Groq LLM → sentence-transformer → Jaccard heuristic
+        - Semantic + Jaccard relevance filtering against the user's concept
+        - Sentence-boundary snapping for precise cuts
+
+        Falls back to [] when:
+        - No transcript available
+        - Video is a Short
+        - topic_cut produces no usable segments
+        The caller falls through to `_topic_cut_segments_for_concept` when empty.
+        """
+        if not transcript or not concept_terms:
+            return []
+
+        from .topic_cut import (
+            TranscriptCue as TopicCutCue,
+            cut_video_into_topic_reels,
+        )
+
+        # Convert reels.py transcript format → topic_cut.TranscriptCue
+        tc_cues: list[TopicCutCue] = []
+        for entry in transcript:
+            try:
+                start = float(entry.get("start") or 0.0)
+                duration = float(entry.get("duration") or 0.0)
+                text = str(entry.get("text") or "").replace("\n", " ").strip()
+            except (TypeError, ValueError):
+                continue
+            if not text:
+                continue
+            tc_cues.append(TopicCutCue(start=start, duration=max(duration, 0.01), text=text))
+
+        if not tc_cues:
+            return []
+
+        # Build a query from concept_title + concept_terms for relevance filtering.
+        query = concept_title or " ".join(concept_terms[:5])
+
+        try:
+            classification, topic_reels = cut_video_into_topic_reels(
+                video_id,
+                query=query,
+                duration_sec=float(video_duration_sec) if video_duration_sec else None,
+                use_llm=True,
+                refine_boundaries=True,
+                transcript=tc_cues,
+                info_dict=info_dict,
+                min_reel_sec=max(clip_min_len, 15),
+                max_reel_sec=max(clip_max_len, 60),
+            )
+        except Exception:
+            logger.exception(
+                "topic_cut.cut_video_into_topic_reels failed for video %s",
+                video_id,
+            )
+            return []
+
+        if not topic_reels:
+            return []
+
+        # Convert TopicReel → SegmentMatch with source="topic_cut"
+        segments: list[SegmentMatch] = []
+        for i, tr in enumerate(topic_reels):
+            # Build text from cues within this reel's time range.
+            text_parts: list[str] = []
+            for entry in transcript:
+                try:
+                    start = float(entry.get("start") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if start < tr.t_start - 0.01:
+                    continue
+                if start > tr.t_end + 0.01:
+                    break
+                text_parts.append(str(entry.get("text") or "").strip())
+            joined_text = " ".join(text_parts).strip()
+
+            segments.append(
+                SegmentMatch(
+                    chunk_index=i,
+                    t_start=float(tr.t_start),
+                    t_end=float(tr.t_end),
+                    text=joined_text or tr.label,
+                    score=1.0,
+                    source="topic_cut",
+                )
+            )
+
+        return segments[:max_segments]
 
     def _is_vague_concept(self, title: str, keywords: list[str], summary: str) -> bool:
         title_terms = normalize_terms([title])

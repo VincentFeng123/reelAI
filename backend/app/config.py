@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_embed_model: str = "text-embedding-3-small"
     openai_chat_model: str = "gpt-4o-mini"
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-2.0-flash"
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
     youtube_api_key: str = ""
     retrieval_engine_v2_enabled: bool = True
     retrieval_tier2_enabled: bool = False

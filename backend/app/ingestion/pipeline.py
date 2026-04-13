@@ -254,6 +254,7 @@ class IngestionPipeline:
                     video_path=adapter_result.video_path,
                     workspace=workspace,
                     language=language,
+                    video_duration_sec=float(duration_sec) if duration_sec else None,
                 )
             except (TranscriptionError, ServerlessUnavailable):
                 raise
@@ -431,6 +432,7 @@ class IngestionPipeline:
                     video_path=adapter_result.video_path,
                     workspace=workspace,
                     language=language,
+                    video_duration_sec=float(duration_sec) if duration_sec else None,
                 )
             except (TranscriptionError, ServerlessUnavailable):
                 raise
@@ -784,6 +786,7 @@ class IngestionPipeline:
                     video_path=adapter_result.video_path,
                     workspace=workspace,
                     language=language,
+                    video_duration_sec=float(duration_sec) if duration_sec else None,
                 )
             except (TranscriptionError, ServerlessUnavailable):
                 raise
@@ -1203,6 +1206,7 @@ class IngestionPipeline:
         video_path: Path,
         workspace: Path,
         language: str,
+        video_duration_sec: float | None = None,
     ) -> list[IngestTranscriptCue]:
         with get_conn() as conn:
             return transcribe(
@@ -1217,6 +1221,7 @@ class IngestionPipeline:
                 language=language,
                 serverless_mode=self._serverless_mode,
                 allow_openai_in_serverless=self._allow_openai_in_serverless,
+                video_duration_sec=video_duration_sec,
             )
 
     def _persist_ingest(

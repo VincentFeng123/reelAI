@@ -19,6 +19,7 @@ class SegmentMatch:
     t_end: float
     text: str
     score: float
+    source: str = "legacy"  # "legacy" or "topic_cut" — determines post-processing
 
 
 def chunk_transcript(entries: list[dict], target_sec: int = 22, min_sec: int = 15, max_sec: int = 30) -> list[TranscriptChunk]:
