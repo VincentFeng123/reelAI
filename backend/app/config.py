@@ -51,6 +51,19 @@ class Settings(BaseSettings):
     verification_hmac_key: str = ""
     community_email_verification_required: bool = False
 
+    # Proxy configuration for YouTube scraping.
+    # Supports: direct proxy URLs, rotating proxy services (Bright Data, ScrapingBee),
+    # and SOCKS5 proxies.
+    # Format: "http://user:pass@proxy:port" or "socks5://user:pass@proxy:port"
+    # Multiple proxies: comma-separated for rotation.
+    proxy_urls: str = ""  # e.g. "http://user:pass@brd.superproxy.io:22225"
+    # ScrapingBee API key (if using ScrapingBee as proxy service)
+    scrapingbee_api_key: str = ""
+    # Enable proxy for youtube_transcript_api calls
+    proxy_transcripts: bool = True
+    # Enable proxy for YouTube search HTML scraping
+    proxy_search: bool = True
+
 
 @lru_cache
 def get_settings() -> Settings:

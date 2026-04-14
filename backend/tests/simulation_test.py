@@ -135,44 +135,78 @@ def assess_educational_quality(title: str, description: str, text: str) -> tuple
     """Assess if the video is genuinely educational."""
     title_lower = title.lower()
     desc_lower = description.lower()
-    text_lower = text.lower() if text else ""
+    combined = f"{title_lower} {desc_lower}"
 
     # Red flags for non-educational content
     red_flags = ['reaction', 'vlog', 'unboxing', 'prank', 'challenge', 'asmr',
-                 'gameplay', 'lets play', 'mukbang', 'haul', 'grwm']
+                 'gameplay', 'lets play', 'mukbang', 'haul', 'grwm', 'top 10',
+                 'ranking every', 'tier list']
     for flag in red_flags:
-        if flag in title_lower or flag in desc_lower:
-            return False, f"Red flag: '{flag}' in title/description"
+        if flag in title_lower:
+            return False, f"Red flag: '{flag}' in title"
 
-    # Educational signals
-    edu_signals = 0
+    edu_signals = 0.0
     reasons = []
 
-    if any(w in title_lower for w in ['explained', 'tutorial', 'lecture', 'lesson', 'course', 'learn']):
-        edu_signals += 1
-        reasons.append("educational keyword in title")
-    if any(w in desc_lower for w in ['learn', 'education', 'course', 'academy', 'university', 'professor']):
-        edu_signals += 1
-        reasons.append("educational keyword in description")
+    # Title keywords (broad set)
+    title_edu_words = ['explained', 'tutorial', 'lecture', 'lesson', 'course', 'learn',
+                       'introduction', 'intro', 'how', 'what is', 'guide', 'basics',
+                       'chapter', 'part', 'fundamentals', 'overview', 'crash course',
+                       'made simple', 'made easy', 'for beginners', '101', 'animated',
+                       'animation', 'documentary', 'science', 'history', 'math']
+    title_hits = sum(1 for w in title_edu_words if w in title_lower)
+    if title_hits >= 1:
+        edu_signals += 0.5 + 0.2 * min(3, title_hits)
+        reasons.append(f"educational keywords in title ({title_hits})")
+
+    # Description keywords
+    desc_edu_words = ['learn', 'education', 'course', 'academy', 'university',
+                      'professor', 'subscribe', 'khan', 'mit', 'ted', 'lecture',
+                      'patreon', 'support', 'free', 'practice']
+    desc_hits = sum(1 for w in desc_edu_words if w in desc_lower)
+    if desc_hits >= 1:
+        edu_signals += 0.3 + 0.15 * min(3, desc_hits)
+        reasons.append(f"educational keywords in description ({desc_hits})")
+
+    # Description structure signals
     if re.search(r'\d{1,2}:\d{2}', description):
-        edu_signals += 1
+        edu_signals += 0.5
         reasons.append("has timestamps in description")
     if len(description) > 200:
-        edu_signals += 1
+        edu_signals += 0.4
         reasons.append("detailed description")
+    if 'http' in desc_lower:
+        edu_signals += 0.2
+        reasons.append("has links")
 
-    # Check transcript for educational structure
+    # Title structure patterns (numbered series, "Part N", etc.)
+    if re.search(r'\b(part|chapter|lecture|episode|module|unit)\s+\d', title_lower):
+        edu_signals += 0.5
+        reasons.append("series structure in title")
+    if re.search(r'^\d+\.?\s+', title_lower):
+        edu_signals += 0.3
+        reasons.append("numbered title")
+
+    # Known educational channels in title/description
+    known_edu = ['khan academy', 'crash course', 'ted', 'mit', 'national geographic',
+                 'simplilearn', 'freeschool', 'amoeba sisters', 'veritasium',
+                 '3blue1brown', 'brilliant', 'kurzgesagt', 'minutephysics']
+    if any(ch in combined for ch in known_edu):
+        edu_signals += 1.0
+        reasons.append("known educational channel")
+
+    # Transcript vocabulary (when full transcript available)
     if text:
         words = text.split()
-        unique_ratio = len(set(w.lower() for w in words)) / max(1, len(words))
-        if unique_ratio > 0.35:
-            edu_signals += 1
-            reasons.append(f"vocabulary diversity: {unique_ratio:.2f}")
         if len(words) > 50:
-            edu_signals += 1
+            unique_ratio = len(set(w.lower() for w in words)) / max(1, len(words))
+            if unique_ratio > 0.35:
+                edu_signals += 0.5
+                reasons.append(f"vocabulary diversity: {unique_ratio:.2f}")
+            edu_signals += 0.3
             reasons.append(f"substantive transcript ({len(words)} words)")
 
-    is_edu = edu_signals >= 2
+    is_edu = edu_signals >= 1.0
     return is_edu, "; ".join(reasons) if reasons else "no educational signals"
 
 

@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -21,6 +22,76 @@ from youtube_transcript_api._errors import (
 
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
+
+
+# ---------------------------------------------------------------------------
+# Proxy rotation & stealth helpers
+# ---------------------------------------------------------------------------
+# Rotating User-Agent pool — cycle through realistic browser fingerprints to
+# avoid bot detection by YouTube.  The pool is intentionally small (fewer
+# unique fingerprints = fewer "never-seen-before" signals) and only includes
+# Chrome on mainstream OSes to match YouTube's normal traffic profile.
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+]
+
+# Realistic browser headers to accompany each request.
+_STEALTH_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "max-age=0",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+
+def _random_user_agent() -> str:
+    return random.choice(_USER_AGENTS)
+
+
+class _ProxyRotator:
+    """Thread-safe round-robin proxy rotator.
+
+    Accepts a comma-separated list of proxy URLs. Each call to ``next()``
+    returns the next proxy in rotation.  If the list is empty, returns
+    ``None`` (no proxy).
+    """
+
+    def __init__(self, proxy_urls_csv: str) -> None:
+        self._proxies: list[str] = [
+            p.strip() for p in (proxy_urls_csv or "").split(",") if p.strip()
+        ]
+        self._idx = 0
+        self._lock = threading.Lock()
+
+    @property
+    def available(self) -> bool:
+        return len(self._proxies) > 0
+
+    def next(self) -> dict[str, str] | None:
+        if not self._proxies:
+            return None
+        with self._lock:
+            proxy = self._proxies[self._idx % len(self._proxies)]
+            self._idx += 1
+        return {"http": proxy, "https": proxy}
+
+    def all(self) -> list[str]:
+        return list(self._proxies)
 from .transcript_validation import validate_transcript
 
 logger = logging.getLogger(__name__)
@@ -201,7 +272,6 @@ class YouTubeService:
     def __init__(self) -> None:
         settings = get_settings()
         self.api_key = settings.youtube_api_key
-        self.transcript_api = YouTubeTranscriptApi()
         self.empty_transcript_ttl_sec = 6 * 60 * 60
         self._network_backoff_until = 0.0
         self._network_backoff_lock = threading.Lock()
@@ -215,6 +285,27 @@ class YouTubeService:
         self.retrieval_debug_logging = bool(settings.retrieval_debug_logging)
         self.search_time_budget_sec = 3.5 if self.serverless_mode else self.SEARCH_TIME_BUDGET_SEC
         self.request_timeout_sec = 2.5 if self.serverless_mode else self.REQUEST_TIMEOUT_SEC
+
+        # ---- Proxy rotation ------------------------------------------------
+        self._proxy_rotator = _ProxyRotator(settings.proxy_urls)
+        self._proxy_search = settings.proxy_search and self._proxy_rotator.available
+        self._proxy_transcripts = settings.proxy_transcripts and self._proxy_rotator.available
+        if self._proxy_rotator.available:
+            logger.info(
+                "Proxy rotation enabled: %d proxies, search=%s, transcripts=%s",
+                len(self._proxy_rotator.all()),
+                self._proxy_search,
+                self._proxy_transcripts,
+            )
+
+        # ---- Transcript API with optional proxy ----------------------------
+        if self._proxy_transcripts and self._proxy_rotator.available:
+            first_proxy = self._proxy_rotator.all()[0]
+            self.transcript_api = YouTubeTranscriptApi(proxies={"https": first_proxy, "http": first_proxy})
+        else:
+            self.transcript_api = YouTubeTranscriptApi()
+
+        # ---- HTTP session with stealth headers + optional proxy ------------
         self._session = requests.Session()
         adapter = HTTPAdapter(
             pool_connections=self.SESSION_POOL_SIZE,
@@ -223,17 +314,16 @@ class YouTubeService:
         )
         self._session.mount("https://", adapter)
         self._session.mount("http://", adapter)
-        self._session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-        )
+        self._session.headers.update(_STEALTH_HEADERS)
+        self._session.headers["User-Agent"] = _random_user_agent()
 
     def _session_get(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
+        # Rotate User-Agent and optionally proxy per request.
+        self._session.headers["User-Agent"] = _random_user_agent()
+        if self._proxy_search and "proxies" not in kwargs:
+            proxy = self._proxy_rotator.next()
+            if proxy:
+                kwargs["proxies"] = proxy
         return self._session.get(
             url,
             timeout=self._request_timeout(deadline),
@@ -241,6 +331,11 @@ class YouTubeService:
         )
 
     def _session_post(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
+        self._session.headers["User-Agent"] = _random_user_agent()
+        if self._proxy_search and "proxies" not in kwargs:
+            proxy = self._proxy_rotator.next()
+            if proxy:
+                kwargs["proxies"] = proxy
         return self._session.post(
             url,
             timeout=self._request_timeout(deadline),
@@ -3288,14 +3383,34 @@ class YouTubeService:
                     return []
 
         transcript: list[dict[str, Any]] = []
-        try:
-            transcript = self.transcript_api.fetch(video_id, languages=["en"]).to_raw_data()
-        except NoTranscriptFound:
-            transcript = self._fallback_any_transcript(video_id)
-        except (TranscriptsDisabled, VideoUnavailable):
-            transcript = []
-        except Exception:
-            transcript = []
+        # Retry with proxy rotation on IP blocks.
+        max_attempts = 3 if self._proxy_transcripts else 1
+        for attempt in range(max_attempts):
+            try:
+                api = self.transcript_api
+                # On retry, build a fresh API client with the next proxy.
+                if attempt > 0 and self._proxy_rotator.available:
+                    proxy = self._proxy_rotator.next()
+                    if proxy:
+                        api = YouTubeTranscriptApi(proxies=proxy)
+                        logger.info("Transcript retry %d/%d with proxy for video_id=%s", attempt + 1, max_attempts, video_id)
+                transcript = api.fetch(video_id, languages=["en"]).to_raw_data()
+                break  # success
+            except NoTranscriptFound:
+                transcript = self._fallback_any_transcript(video_id)
+                break
+            except (TranscriptsDisabled, VideoUnavailable):
+                transcript = []
+                break
+            except Exception as exc:
+                exc_name = type(exc).__name__
+                if "IpBlocked" in exc_name and attempt < max_attempts - 1:
+                    logger.warning("IP blocked fetching transcript for %s, rotating proxy (attempt %d)", video_id, attempt + 1)
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                if attempt == max_attempts - 1:
+                    logger.warning("All transcript attempts failed for %s: %s", video_id, exc_name)
+                transcript = []
 
         # Compute coverage metadata for downstream consumers.
         coverage_ratio: float | None = None
