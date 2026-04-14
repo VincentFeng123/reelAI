@@ -1121,24 +1121,29 @@ def _is_unique_violation(exc: Exception) -> bool:
     return getattr(exc, "sqlstate", "") == "23505"
 
 
-def upsert(conn: Any, table: str, data: dict[str, Any], pk: str = "id") -> None:
+def upsert(conn: Any, table: str, data: dict[str, Any], pk: str | list[str] = "id") -> None:
     if not _SAFE_SQL_IDENTIFIER_RE.fullmatch(table):
         raise ValueError(f"Unsafe table name: {table!r}")
-    if not _SAFE_SQL_IDENTIFIER_RE.fullmatch(pk):
-        raise ValueError(f"Unsafe primary key name: {pk!r}")
+    # Normalize pk to a list for composite key support.
+    pk_cols: list[str] = [pk] if isinstance(pk, str) else list(pk)
+    for p in pk_cols:
+        if not _SAFE_SQL_IDENTIFIER_RE.fullmatch(p):
+            raise ValueError(f"Unsafe primary key name: {p!r}")
+    pk_set = set(pk_cols)
     cols = list(data.keys())
     for col in cols:
         if not _SAFE_SQL_IDENTIFIER_RE.fullmatch(col):
             raise ValueError(f"Unsafe column name: {col!r}")
     placeholders = ", ".join(["?"] * len(cols))
-    assignments = ", ".join([f"{c}=excluded.{c}" for c in cols if c != pk])
+    assignments = ", ".join([f"{c}=excluded.{c}" for c in cols if c not in pk_set])
+    conflict_cols = ", ".join(pk_cols)
     if assignments:
         sql = (
             f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) "
-            f"ON CONFLICT({pk}) DO UPDATE SET {assignments}"
+            f"ON CONFLICT({conflict_cols}) DO UPDATE SET {assignments}"
         )
     else:
-        sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) ON CONFLICT({pk}) DO NOTHING"
+        sql = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders}) ON CONFLICT({conflict_cols}) DO NOTHING"
 
     values = [data[c] for c in cols]
     is_pg = _is_postgres_conn(conn)
