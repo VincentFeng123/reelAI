@@ -806,8 +806,8 @@ def init_db() -> None:
                 cur.execute(
                     "CREATE INDEX IF NOT EXISTS idx_community_sets_visibility_featured_updated_at ON community_sets(visibility, featured DESC, updated_at DESC)"
                 )
-            cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS coverage_ratio REAL")
-            cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS cue_count INTEGER")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS coverage_ratio REAL")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS cue_count INTEGER")
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             conn.commit()
