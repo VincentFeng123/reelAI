@@ -352,6 +352,42 @@ class ReelService:
         "songs",
         "vevo",
     }
+    # Channels that use academic-sounding names but produce entertainment.
+    # Checked against lowercased channel_title.
+    KNOWN_ENTERTAINMENT_CHANNELS = {
+        "the game theorists",
+        "game theory",
+        "matpat",
+        "film theory",
+        "food theory",
+        "style theory",
+        "the film theorists",
+        "the food theorists",
+        "the style theorists",
+        "vsauce2",
+        "vsauce3",
+        "bright side",
+        "5-minute crafts",
+        "watchmojo",
+        "watchmojo.com",
+        "screen rant",
+        "looper",
+    }
+    # Title patterns that indicate gaming/entertainment, not education.
+    ENTERTAINMENT_TITLE_PATTERNS = (
+        "doomed to die",
+        "is actually",
+        "isn't what you think",
+        "you won't believe",
+        "secret ending",
+        "easter egg",
+        "fan theory",
+        "creepypasta",
+        "horror game",
+        "top 10",
+        "top 5",
+        "ranking every",
+    )
     AMBIGUOUS_CONCEPT_TOKENS = {
         "atom",
         "atoms",
@@ -6660,8 +6696,15 @@ class ReelService:
         normalized_subject = self._clean_query_text(subject_tag or "").lower()
         metadata_tokens = normalize_terms([title, description, channel_title])
 
-        if " provided to youtube " in lowered:
+        # Block known entertainment channels that mimic academic names.
+        channel_lower = channel_title.strip().lower()
+        if channel_lower in self.KNOWN_ENTERTAINMENT_CHANNELS:
             return True
+        # Block entertainment title patterns.
+        title_lower = title.strip().lower()
+        if any(p in title_lower for p in self.ENTERTAINMENT_TITLE_PATTERNS):
+            return True
+        if " provided to youtube " in lowered:
         if normalized_subject == "calculus" and " lambda calculus " in lowered:
             return True
         if normalized_subject:
@@ -7248,6 +7291,9 @@ class ReelService:
     def _infer_channel_tier(self, channel: str, title: str) -> str:
         if channel.strip() in self.KNOWN_EDUCATIONAL_CHANNELS:
             return "known_educational"
+        # Block known entertainment channels that use academic-sounding names.
+        if channel.strip().lower() in self.KNOWN_ENTERTAINMENT_CHANNELS:
+            return "low_quality_compilation"
         hay = f"{channel} {title}"
         # Low-quality must be checked before education to prevent false positives
         # (e.g., "VEVO Academy" shouldn't classify as education).
