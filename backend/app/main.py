@@ -7507,6 +7507,17 @@ def _simulation_assess_educational(reel: dict[str, Any]) -> tuple[bool, str]:
         signals += 1.0
         reasons.append("known educational channel (in metadata)")
 
+    # Channel name contains educational keywords (e.g., "Physics Videos", "Geo History")
+    if ch_lower and not any(ch in ch_lower for ch in _SIMULATION_KNOWN_EDU_CHANNELS):
+        _edu_ch_words = ['science', 'physics', 'history', 'biology', 'chemistry',
+                         'math', 'education', 'professor', 'academy', 'lecture',
+                         'engineering', 'medical', 'learning', 'tutorial',
+                         'university', 'institute', 'geographic']
+        ch_edu_hits = sum(1 for w in _edu_ch_words if w in ch_lower)
+        if ch_edu_hits >= 1:
+            signals += 0.5
+            reasons.append(f"edu channel name ({channel_name})")
+
     # Title keywords
     title_edu = ['explained', 'tutorial', 'lecture', 'lesson', 'course', 'learn',
                  'introduction', 'intro', 'how', 'what is', 'guide', 'basics',

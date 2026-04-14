@@ -177,6 +177,17 @@ def assess_educational_quality(
         edu_signals += 1.0
         reasons.append("known educational channel (in metadata)")
 
+    # Channel name contains educational keywords (e.g., "Physics Videos", "Geo History")
+    if channel_lower and not any(ch in channel_lower for ch in known_edu):
+        edu_channel_words = ['science', 'physics', 'history', 'biology', 'chemistry',
+                             'math', 'education', 'professor', 'academy', 'lecture',
+                             'engineering', 'medical', 'learning', 'tutorial',
+                             'university', 'institute', 'geographic']
+        ch_hits = sum(1 for w in edu_channel_words if w in channel_lower)
+        if ch_hits >= 1:
+            edu_signals += 0.5
+            reasons.append(f"educational channel name ({channel_name})")
+
     # Signal 2: Title keywords
     title_edu_words = ['explained', 'tutorial', 'lecture', 'lesson', 'course', 'learn',
                        'introduction', 'intro', 'how', 'what is', 'guide', 'basics',
