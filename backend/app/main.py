@@ -7457,20 +7457,67 @@ _SIMULATION_DEFAULT_TOPICS = [
     {"subject": "Mathematics", "text": "Mathematics is the abstract science of number, quantity, and space. Major branches include algebra, calculus, geometry, and statistics.", "tier": "ultra-broad"},
 ]
 
-_SIMULATION_KNOWN_EDU_CHANNELS = {
-    '3blue1brown', 'amoeba sisters', 'bozeman science', 'brilliant',
-    'bright side of mathematics', 'cgp grey', 'computerphile', 'crash course',
-    'domain of science', 'dr. becky', 'dr. trefor bazett', 'engineerguy',
-    'fireship', 'freecodecamp', 'jbstatistics', 'khan academy', 'kurzgesagt',
-    'lumen learning', 'mark rober', 'mathologer', 'minutephysics',
-    'mit opencourseware', 'nancypi', 'national geographic', 'numberphile',
-    'organic chemistry tutor', 'patrickjmt', 'pbs space time', 'physics girl',
-    'professor dave explains', 'professor leonard', 'real engineering',
-    'science click', 'scishow', 'sixty symbols', 'smarter every day',
-    'stand-up maths', 'steve mould', 'ted-ed', 'the coding train',
-    'the engineer guy', 'the organic chemistry tutor', 'tibees', 'tom scott',
-    'two minute papers', 'veritasium', 'vsauce', 'zach star',
-    'mit', 'ted', 'simplilearn', 'freeschool', 'pbs', 'pbs eons',
+_SIMULATION_KNOWN_EDU_CHANNELS: set[str] = {
+    # Math
+    '3blue1brown', 'blackpenredpen', 'dr. trefor bazett', 'eddie woo',
+    'mathologer', 'mindyourdecisions', 'nancypi', 'numberphile', 'patrickjmt',
+    'pbs infinite series', 'professor leonard', 'stand-up maths', 'think twice',
+    'tibees', 'tipping point math', 'vihart', 'zach star',
+    # Physics
+    'fermilab', 'minutephysics', 'physics explained', 'physics girl',
+    'physics videos by eugene', 'scienceclic english', 'sixty symbols',
+    'the science asylum',
+    # Chemistry
+    'nilered', 'nileblue', 'nurdrage', 'organic chemistry tutor',
+    'periodic videos', 'the organic chemistry tutor', 'tmp chem',
+    # Biology
+    'amoeba sisters', 'animalogic', 'atlas pro', 'bbc earth',
+    'deep look', 'journey to the microcosmos', 'mbari',
+    'national geographic', 'nature on pbs', 'nick zentner', 'pbs eons',
+    'stated clearly', 'tierzoo',
+    # Medicine
+    'chubbyemu', 'institute of human anatomy', 'ninja nerd',
+    # General Science
+    'alpha phoenix', 'be smart', 'domain of science', 'kyle hill',
+    'minute earth', 'real science', 'sci show', 'scishow', 'scishow space',
+    'smarter every day', 'smartereveryday', 'steve mould', 'the action lab',
+    'up and atom', 'veritasium',
+    # Space
+    'anton petrov', 'astrum', 'cool worlds', 'dr. becky',
+    'everyday astronaut', 'pbs space time', 'sabine hossenfelder', 'scott manley',
+    # Engineering
+    'engineerguy', 'engineering explained', 'practical engineering',
+    'real engineering', 'the engineering mindset',
+    # Electronics
+    'bigclivedotcom', 'curiousmarc', 'eevblog', 'electroboom',
+    'technology connections',
+    # Computer Science
+    'ben eater', 'computerphile', 'deepmind', 'fireship',
+    'liveoverflow', 'neso academy', 'sebastian lague', 'the coding train',
+    'two minute papers', 'welch labs',
+    # Coding
+    'freecodecamp', 'kevin powell', 'programming with mosh',
+    'the net ninja', 'web dev simplified',
+    # Lectures
+    'bozeman science', 'crash course', 'khan academy', 'lumen learning',
+    'mit opencourseware', 'professor dave explains', 'yalecourses',
+    # General Explanation
+    'cgp grey', 'half as interesting', 'kurzgesagt', 'lemmino',
+    'reallifelore', 'ted-ed', 'tom scott', 'vox', 'vsauce', 'vsauce2',
+    'wendover productions',
+    # Experiments & Building
+    'applied science', 'mark rober', 'stuffmadehere', 'tech ingredients',
+    # History
+    'extra credits', 'fall of civilizations', 'historia civilis',
+    'kings and generals', 'knowledgia', 'oversimplified',
+    "sam o'nella academy", 'the great war', 'the history guy',
+    'timeghost history',
+    # Other
+    'bright side of mathematics', 'brilliant', 'captain disillusion',
+    'jbstatistics', 'not just bikes', 'the royal institution',
+    'simplilearn', 'dw documentary', 'frontline pbs',
+    # Short aliases
+    'mit', 'ted', 'pbs',
 }
 
 _SIMULATION_RED_FLAGS = frozenset([
