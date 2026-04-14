@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from ..db import DatabaseIntegrityError, dumps_json, fetch_one, loads_json, now_iso, upsert
+from ..services.transcript_validation import validate_transcript
 from .errors import ServerlessUnavailable, TranscriptionError
 from .ffmpeg_tools import extract_audio_wav
 from .logging_config import get_ingest_logger, log_event
@@ -424,14 +425,16 @@ def _check_transcript_coverage(
     *,
     min_coverage: float = 0.85,
 ) -> float:
-    """
-    Compute what fraction of the video the transcript covers.
-    Returns coverage ratio (0.0-1.0+). Returns 1.0 when duration is unknown.
+    """Compute what fraction of the video the transcript covers.
+
+    Delegates to the shared ``validate_transcript`` module for the actual
+    calculation, but returns the simple coverage ratio that the fallback
+    chain in :func:`transcribe` expects.
     """
     if not cues or not video_duration_sec or video_duration_sec <= 0:
         return 1.0
-    last_cue_end = max(cue.end for cue in cues)
-    return last_cue_end / video_duration_sec
+    quality = validate_transcript(cues, video_duration_sec, min_coverage=min_coverage)
+    return quality.coverage_ratio
 
 
 def transcribe(

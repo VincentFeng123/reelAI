@@ -27,6 +27,7 @@ from .segmenter import (
     select_segments,
 )
 from .topic_expansion import TopicExpansionService
+from .transcript_validation import TranscriptQuality, validate_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -556,30 +557,83 @@ class ReelService:
         "podcast": -0.03,
         "low_quality_compilation": -0.11,
     }
+    # ----------------------------------------------------------------------- #
+    # Scoring rubric — documents the weights used in _score_video_candidate.
+    # Not used programmatically (yet); exists for transparency and auditability.
+    # The discovery_feature_score weights sum to ~1.28 (normalised by 1.15+stage).
+    # final_score = 0.74 * discovery + 0.26 * clipability
+    # ----------------------------------------------------------------------- #
+    SCORING_RUBRIC: dict[str, tuple[float, str]] = {
+        # Discovery sub-features (weight, description)
+        "semantic_title":              (0.26, "Embedding similarity: title vs concept terms"),
+        "semantic_description":        (0.18, "Embedding similarity: description vs concept terms"),
+        "specific_concept_anchor":     (0.13, "Anchor-term presence in metadata"),
+        "query_alignment":             (0.12, "How well title/desc match the query text"),
+        "strategy_prior":              (0.10, "Historical keep-rate for the search strategy"),
+        "channel_quality":             (0.10, "Channel tier + feedback + engagement"),
+        "educational_intent":          (0.10, "Structural edu signals (6-signal composite)"),
+        "root_topic_alignment":        (0.09, "Root-topic term overlap"),
+        "duration_fit":                (0.08, "Duration matches preferred range"),
+        "visual_intent_match":         (0.05, "Visual scene spec keyword overlap"),
+        "freshness_fit":               (0.04, "Publication recency"),
+        "engagement_fit":              (0.03, "View-count signal"),
+        # Top-level composite
+        "clipability":                 (0.26, "Metadata-based clip potential (in final_score)"),
+        "discovery":                   (0.74, "Aggregate discovery score (in final_score)"),
+        # Post-hoc modifiers (applied as penalties/gates, not additive weights)
+        "lexicon_noise":               (-0.22, "Penalty for off-topic/lexicon-conflict tokens"),
+        "source_prior":                (1.0,  "Multiplicative factor by search source"),
+        "transcript_coverage":         (0.0,  "Soft penalty when coverage < 90% (applied post-discovery)"),
+        "llm_relevance":               (0.0,  "Pre-filter gate: drops clearly irrelevant candidates"),
+    }
     KNOWN_EDUCATIONAL_CHANNELS: set[str] = {
         "3blue1brown",
         "amoeba sisters",
         "bozeman science",
+        "brilliant",
         "bright side of mathematics",
         "cgp grey",
+        "computerphile",
         "crash course",
+        "domain of science",
+        "dr. becky",
         "dr. trefor bazett",
+        "engineerguy",
+        "fireship",
         "freecodecamp",
+        "jbstatistics",
         "khan academy",
         "kurzgesagt",
         "lumen learning",
+        "mark rober",
         "mathologer",
+        "minutephysics",
         "mit opencourseware",
+        "nancypi",
         "numberphile",
         "organic chemistry tutor",
+        "patrickjmt",
+        "pbs space time",
+        "physics girl",
         "professor dave explains",
         "professor leonard",
+        "real engineering",
+        "science click",
         "scishow",
+        "sixty symbols",
         "smarter every day",
+        "stand-up maths",
+        "steve mould",
         "ted-ed",
         "the coding train",
+        "the engineer guy",
         "the organic chemistry tutor",
+        "tibees",
+        "tom scott",
+        "two minute papers",
         "veritasium",
+        "vsauce",
+        "zach star",
     }
     RISKY_SEARCH_SOURCES = {
         "bing_quoted",
@@ -2156,6 +2210,21 @@ class ReelService:
             else:
                 ranked_candidates = stage_candidates[: max(12, transcript_budget * 2)]
 
+            # LLM relevance pre-filter: drops clearly irrelevant candidates before
+            # the expensive transcript-fetch step. Only runs in non-fast mode.
+            if not fast_mode and self.openai_client and ranked_candidates:
+                pre_filter_count = len(ranked_candidates)
+                ranked_candidates = self._llm_relevance_prefilter(
+                    conn,
+                    candidates=ranked_candidates,
+                    concept_text=str(concept.get("title") or ""),
+                    subject_tag=subject_tag,
+                    context_terms=context_terms,
+                )
+                retrieval_metrics["llm_prefilter_dropped"] = int(
+                    retrieval_metrics.get("llm_prefilter_dropped", 0)
+                ) + (pre_filter_count - len(ranked_candidates))
+
             transcript_candidates = ranked_candidates[:transcript_budget]
             retrieval_metrics["clip_candidate_videos"] = max(
                 int(retrieval_metrics.get("clip_candidate_videos") or 0),
@@ -2245,6 +2314,7 @@ class ReelService:
                     )
                 )
                 transcript_ranking: dict[str, Any] | None = None
+                transcript_quality: TranscriptQuality | None = None
                 if transcript:
                     transcript_ranking = self._score_transcript_alignment(
                         conn,
@@ -2266,6 +2336,17 @@ class ReelService:
                         float(ranking.get("clipability_score") or 0.0)
                         + 0.18 * float(transcript_ranking.get("clipability_signal") or 0.0),
                     )
+                    # Soft penalty for poor transcript coverage.
+                    transcript_quality = validate_transcript(
+                        transcript, float(video_duration) if video_duration else None,
+                    )
+                    if not transcript_quality.is_adequate and transcript_quality.coverage_ratio < 0.90:
+                        coverage_penalty = max(0.0, 0.90 - transcript_quality.coverage_ratio)
+                        ranking["discovery_score"] = max(
+                            0.0,
+                            float(ranking.get("discovery_score") or 0.0) * (1.0 - coverage_penalty),
+                        )
+                    ranking["transcript_coverage"] = transcript_quality.coverage_ratio
 
                 segments: list[SegmentMatch] = []
                 mined_segments = candidate.get("mined_segments")
@@ -2457,6 +2538,7 @@ class ReelService:
                         retrieval_profile=safe_retrieval_profile,
                         fast_mode=fast_mode,
                         page_hint=safe_page_hint,
+                        transcript_quality=transcript_quality,
                     )
                     if not quality_floor_passes:
                         retrieval_metrics[quality_floor_reason] = int(retrieval_metrics.get(quality_floor_reason) or 0) + 1
@@ -6449,17 +6531,89 @@ class ReelService:
             "skip_semantic_description": fast_mode and (strong_query or len(concept_hits) >= 2 or phrase_hits > 0),
         }
 
-    def _educational_intent_score(self, video: dict[str, Any]) -> float:
-        metadata_tokens = normalize_terms(
-            [
-                str(video.get("title") or ""),
-                str(video.get("description") or ""),
-                str(video.get("channel_title") or ""),
-            ]
-        )
-        education_hits = len(metadata_tokens.intersection(self.EDUCATIONAL_CUE_TERMS))
-        entertainment_hits = len(metadata_tokens.intersection(self.ENTERTAINMENT_CONFLICT_TOKENS))
-        score = 0.5 + 0.08 * min(3, education_hits) - 0.12 * min(3, entertainment_hits)
+    def _educational_intent_score(self, video: dict[str, Any], transcript: list[dict[str, Any]] | None = None) -> float:
+        """Score educational quality 0.0-1.0 using metadata + optional transcript signals.
+
+        Six weighted signals:
+          1. Keyword presence (0.15) — existing edu/entertainment token matching
+          2. Title structure  (0.20) — regex patterns for structured educational content
+          3. Description depth (0.15) — length + timestamp markers + link presence
+          4. Duration band     (0.10) — 5-30 min educational sweet spot
+          5. Channel tier      (0.20) — _infer_channel_tier mapped to 0-1
+          6. Transcript vocab  (0.20) — unique word ratio (optional, when available)
+        """
+        title = str(video.get("title") or "")
+        description = str(video.get("description") or "")
+        channel = str(video.get("channel_title") or "")
+        duration = int(video.get("duration_sec") or 0)
+
+        score = 0.0
+
+        # Signal 1: Keyword presence (0.15)
+        metadata_tokens = normalize_terms([title, description, channel])
+        edu_hits = len(metadata_tokens.intersection(self.EDUCATIONAL_CUE_TERMS))
+        ent_hits = len(metadata_tokens.intersection(self.ENTERTAINMENT_CONFLICT_TOKENS))
+        keyword_score = 0.5 + 0.1 * min(3, edu_hits) - 0.15 * min(3, ent_hits)
+        score += 0.15 * max(0.0, min(1.0, keyword_score))
+
+        # Signal 2: Title structure patterns (0.20)
+        structure_score = 0.3
+        title_lower = title.lower()
+        if re.search(r'\b(?:part|chapter|lecture|episode|module|unit)\s+\d', title_lower):
+            structure_score = 0.9
+        if re.search(r'\b(?:explained|introduction to|overview of|fundamentals of)\b', title_lower):
+            structure_score = max(structure_score, 0.8)
+        if re.search(r'\b(?:how to|step.by.step|beginner|complete guide)\b', title_lower):
+            structure_score = max(structure_score, 0.7)
+        if re.search(r'\b(?:worked example|problem set|practice)\b', title_lower):
+            structure_score = max(structure_score, 0.75)
+        score += 0.20 * structure_score
+
+        # Signal 3: Description depth (0.15)
+        desc_len = len(description)
+        has_timestamps = bool(re.search(r'\d{1,2}:\d{2}', description))
+        has_links = 'http' in description.lower()
+        desc_score = min(1.0, desc_len / 800)
+        if has_timestamps:
+            desc_score = min(1.0, desc_score + 0.2)
+        if has_links:
+            desc_score = min(1.0, desc_score + 0.1)
+        score += 0.15 * desc_score
+
+        # Signal 4: Duration appropriateness (0.10)
+        if 300 <= duration <= 1800:
+            dur_score = 0.9
+        elif 180 <= duration <= 3600:
+            dur_score = 0.6
+        elif duration > 3600:
+            dur_score = 0.5
+        elif duration > 0:
+            dur_score = 0.2
+        else:
+            dur_score = 0.4  # unknown duration
+        score += 0.10 * dur_score
+
+        # Signal 5: Channel tier (0.20)
+        tier = self._infer_channel_tier(channel.lower(), title_lower)
+        tier_scores = {
+            "known_educational": 1.0, "education": 0.85, "tutorial": 0.7,
+            "news": 0.6, "podcast": 0.4, "stock_footage": 0.3,
+            "low_quality_compilation": 0.1,
+        }
+        score += 0.20 * tier_scores.get(tier, 0.5)
+
+        # Signal 6: Transcript vocabulary richness (0.20, optional)
+        if transcript and len(transcript) > 10:
+            words = " ".join(str(c.get("text", "")) for c in transcript[:200]).split()
+            if len(words) > 20:
+                unique_ratio = len(set(w.lower() for w in words)) / len(words)
+                vocab_score = min(1.0, unique_ratio / 0.5)
+                score += 0.20 * vocab_score
+            else:
+                score = score / 0.80  # redistribute weight
+        else:
+            score = score / 0.80  # redistribute weight
+
         return float(max(0.0, min(1.0, score)))
 
     def _looks_like_language_subject(self, subject_tag: str | None) -> bool:
@@ -6936,9 +7090,18 @@ class ReelService:
         retrieval_profile: RetrievalProfile,
         fast_mode: bool,
         page_hint: int,
+        transcript_quality: TranscriptQuality | None = None,
     ) -> tuple[bool, str]:
         if float(relevance_context.get("score") or 0.0) < self._quality_floor_min_relevance(page_hint=page_hint):
             return (False, "low_relevance")
+        # Reject clips when transcript coverage is very poor.
+        if transcript_quality is not None and transcript_quality.coverage_ratio < 0.50:
+            return (False, "low_transcript_coverage")
+        if transcript_quality is not None and transcript_quality.largest_gap_sec > 20.0:
+            clip_start = float(clip_context.get("clip_start_sec") or 0.0)
+            clip_end = clip_start + float(clip_context.get("clip_duration_sec") or 0.0)
+            if clip_start > 0 and clip_end > clip_start and transcript_quality.largest_gap_sec > (clip_end - clip_start) * 0.5:
+                return (False, "low_transcript_coverage")
         self_containment = self._clip_self_containment_score(
             text=str(clip_context.get("text") or ""),
             clip_duration_sec=float(clip_context.get("clip_duration_sec") or 0.0),
@@ -6990,6 +7153,16 @@ class ReelService:
         bucket = self._infer_channel_tier(channel=channel, title=title)
         bonus = float(self.CHANNEL_QUALITY_BONUS.get(bucket, 0.0))
         base = float(max(0.0, min(1.0, 0.6 + bonus)))
+        # Engagement signal: high views/minute suggests popular educational content.
+        # view_count is available from HTML renderer data (no API key needed).
+        view_count = int(video.get("view_count") or 0)
+        duration_sec = int(video.get("duration_sec") or 0)
+        if view_count > 0 and duration_sec > 60:
+            views_per_min = view_count / max(1, duration_sec / 60)
+            if views_per_min > 10000:
+                base = min(1.0, base + 0.05)
+            elif views_per_min < 10:
+                base = max(0.0, base - 0.03)
         # Fix T: Boost/penalize channels based on user feedback
         if conn is not None and channel:
             feedback_factor = self._feedback_channel_factor(conn, channel)
@@ -7076,21 +7249,125 @@ class ReelService:
         if channel.strip() in self.KNOWN_EDUCATIONAL_CHANNELS:
             return "known_educational"
         hay = f"{channel} {title}"
-        if any(token in hay for token in ["news", "times", "bbc", "cnn", "reuters", "al jazeera", "pbs"]):
-            return "news"
-        if any(token in hay for token in ["academy", "course", "university", "education", "science", "explained"]):
-            return "education"
-        if any(token in hay for token in ["stock", "footage", "cinematic", "film", "camera"]):
-            return "stock_footage"
-        if any(token in hay for token in ["tutorial", "how to", "walkthrough", "demo"]):
-            return "tutorial"
+        # Low-quality must be checked before education to prevent false positives
+        # (e.g., "VEVO Academy" shouldn't classify as education).
         if any(token in hay for token in ["vevo", "official audio", "lyrics", "karaoke", "remix"]):
             return "low_quality_compilation"
-        if any(token in hay for token in ["compilation", "best moments", "reaction", "clips"]):
+        if any(token in hay for token in ["compilation", "best moments", "reaction", "clips", "tiktok", "meme"]):
             return "low_quality_compilation"
+        if any(token in hay for token in ["news", "times", "bbc", "cnn", "reuters", "al jazeera", "pbs"]):
+            return "news"
+        # Use word-boundary-aware matching for "academy" to avoid false positives
+        # like "Academy Awards" or gaming channel names containing "academy".
+        if any(token in hay for token in ["course", "university", "opencourseware", "explained"]):
+            return "education"
+        if re.search(r'\b(?:academy|education|science)\b', hay) and not any(
+            noise in hay for noise in ["gaming", "awards", "beauty", "sport", "fitness"]
+        ):
+            return "education"
+        if any(token in hay for token in ["stock", "footage", "cinematic"]):
+            return "stock_footage"
+        if any(token in hay for token in ["tutorial", "how to", "walkthrough", "demo", "masterclass"]):
+            return "tutorial"
         if "podcast" in hay:
             return "podcast"
         return "tutorial"
+
+    def _llm_relevance_prefilter(
+        self,
+        conn,
+        *,
+        candidates: list[dict[str, Any]],
+        concept_text: str,
+        subject_tag: str | None,
+        context_terms: list[str],
+    ) -> list[dict[str, Any]]:
+        """Filter candidates using an LLM. Drops clearly irrelevant videos.
+
+        Only runs when ``self.openai_client`` is available.  On any failure,
+        all candidates pass through (graceful degradation).  Results are cached
+        in ``llm_cache`` to avoid repeated API calls for the same candidate set.
+        """
+        if not self.openai_client or not candidates:
+            return candidates
+
+        BATCH_SIZE = 8
+        results: list[dict[str, Any]] = []
+
+        for batch_start in range(0, len(candidates), BATCH_SIZE):
+            batch = candidates[batch_start : batch_start + BATCH_SIZE]
+            video_list = "\n".join(
+                f"{i + 1}. Title: {str((c.get('video') or {}).get('title', 'N/A'))[:120]} | "
+                f"Channel: {str((c.get('video') or {}).get('channel_title', 'N/A'))[:60]} | "
+                f"Duration: {int((c.get('video') or {}).get('duration_sec', 0))}s"
+                for i, c in enumerate(batch)
+            )
+
+            user_prompt = (
+                f"Target concept: {concept_text}\n"
+                f"Subject area: {subject_tag or 'General'}\n"
+                f"Context: {', '.join(context_terms[:10])}\n\n"
+                "Rate each video's educational relevance to the target concept.\n"
+                'Return JSON: {"ratings": [{"index": 1, "relevant": true, "confidence": 0.8, "reason": "brief"}]}\n\n'
+                "Rules:\n"
+                "- relevant = the video likely contains substantive educational content about the concept\n"
+                "- Music, vlogs, reactions, compilations = not relevant\n"
+                "- Tangential matches (e.g., dental calculus vs math calculus) = not relevant\n"
+                "- Videos that teach, explain, demonstrate the concept = relevant\n\n"
+                f"Videos:\n{video_list}"
+            )
+
+            cache_payload = f"llm_prefilter_v1|{self.chat_model}|{user_prompt}"
+            cache_key = f"llm_prefilter:{hashlib.sha256(cache_payload.encode('utf-8')).hexdigest()[:40]}"
+
+            try:
+                cached = fetch_one(conn, "SELECT response_json FROM llm_cache WHERE cache_key = ?", (cache_key,))
+                if cached and cached.get("response_json"):
+                    ratings = json.loads(cached["response_json"])
+                else:
+                    response = self.openai_client.chat.completions.create(
+                        model=self.chat_model,
+                        temperature=0.0,
+                        response_format={"type": "json_object"},
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "You are an educational content classifier. Always respond with valid JSON.",
+                            },
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+                    raw = response.choices[0].message.content or "{}"
+                    ratings = json.loads(raw)
+                    upsert(
+                        conn,
+                        "llm_cache",
+                        {
+                            "cache_key": cache_key,
+                            "response_json": dumps_json(ratings),
+                            "created_at": now_iso(),
+                        },
+                        pk="cache_key",
+                    )
+
+                for rating in ratings.get("ratings", []):
+                    idx = int(rating.get("index", 0)) - 1
+                    if 0 <= idx < len(batch):
+                        batch[idx]["llm_relevance"] = float(rating.get("confidence", 0.5))
+                        batch[idx]["llm_relevant"] = bool(rating.get("relevant", True))
+                results.extend(batch)
+            except Exception:
+                logger.debug("LLM pre-filter failed for batch; passing all candidates through", exc_info=True)
+                for c in batch:
+                    c["llm_relevance"] = 0.5
+                    c["llm_relevant"] = True
+                results.extend(batch)
+
+        # Only drop candidates the LLM is confident are NOT relevant.
+        return [
+            c for c in results
+            if c.get("llm_relevant", True) or float(c.get("llm_relevance", 0.5)) > 0.7
+        ]
 
     def _score_clipability_from_metadata(self, video: dict[str, Any], strategy: str) -> float:
         duration_sec = int(video.get("duration_sec") or 0)

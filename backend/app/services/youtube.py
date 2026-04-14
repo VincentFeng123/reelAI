@@ -21,6 +21,7 @@ from youtube_transcript_api._errors import (
 
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
+from .transcript_validation import validate_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -3242,13 +3243,35 @@ class YouTubeService:
             ),
         )
 
-    def get_transcript(self, conn, video_id: str) -> list[dict[str, Any]]:
+    def get_transcript(
+        self, conn, video_id: str, *, video_duration_sec: float | None = None,
+    ) -> list[dict[str, Any]]:
         if conn is None:
             with get_conn() as local_conn:
-                return self._get_transcript_with_conn(local_conn, video_id)
-        return self._get_transcript_with_conn(conn, video_id)
+                return self._get_transcript_with_conn(
+                    local_conn, video_id, video_duration_sec=video_duration_sec,
+                )
+        return self._get_transcript_with_conn(
+            conn, video_id, video_duration_sec=video_duration_sec,
+        )
 
-    def _get_transcript_with_conn(self, conn, video_id: str) -> list[dict[str, Any]]:
+    def get_transcript_quality(self, conn, video_id: str) -> dict[str, Any] | None:
+        """Return cached coverage metadata for a transcript, or ``None``."""
+        row = fetch_one(
+            conn,
+            "SELECT coverage_ratio, cue_count FROM transcript_cache WHERE video_id = ?",
+            (video_id,),
+        )
+        if row and row.get("coverage_ratio") is not None:
+            return {
+                "coverage_ratio": float(row["coverage_ratio"]),
+                "cue_count": int(row.get("cue_count") or 0),
+            }
+        return None
+
+    def _get_transcript_with_conn(
+        self, conn, video_id: str, *, video_duration_sec: float | None = None,
+    ) -> list[dict[str, Any]]:
         cached = fetch_one(conn, "SELECT transcript_json, created_at FROM transcript_cache WHERE video_id = ?", (video_id,))
         if cached:
             try:
@@ -3274,16 +3297,23 @@ class YouTubeService:
         except Exception:
             transcript = []
 
-        upsert(
-            conn,
-            "transcript_cache",
-            {
-                "video_id": video_id,
-                "transcript_json": dumps_json(transcript),
-                "created_at": now_iso(),
-            },
-            pk="video_id",
-        )
+        # Compute coverage metadata for downstream consumers.
+        coverage_ratio: float | None = None
+        cue_count = len(transcript)
+        if transcript:
+            quality = validate_transcript(transcript, video_duration_sec)
+            coverage_ratio = quality.coverage_ratio
+
+        row_data: dict[str, Any] = {
+            "video_id": video_id,
+            "transcript_json": dumps_json(transcript),
+            "created_at": now_iso(),
+        }
+        if coverage_ratio is not None:
+            row_data["coverage_ratio"] = coverage_ratio
+        if cue_count:
+            row_data["cue_count"] = cue_count
+        upsert(conn, "transcript_cache", row_data, pk="video_id")
         return transcript
 
     def _parse_cache_time(self, value: str) -> datetime | None:

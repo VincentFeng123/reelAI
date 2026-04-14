@@ -68,6 +68,8 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qs, urlparse
 
+from .transcript_validation import TranscriptQuality, validate_transcript
+
 logger = logging.getLogger(__name__)
 
 
@@ -692,18 +694,12 @@ def _render_transcript_for_llm(cues: Sequence[TranscriptCue]) -> str:
 # --------------------------------------------------------------------------- #
 # Transcript coverage validation
 # --------------------------------------------------------------------------- #
+# Delegates to the shared ``transcript_validation`` module. The local alias
+# ``TranscriptValidation`` and wrapper ``_validate_transcript_coverage`` keep
+# existing callers working without changes.
 
-
-@dataclass
-class TranscriptValidation:
-    """Result of :func:`_validate_transcript_coverage`."""
-    coverage_ratio: float
-    largest_gap_sec: float
-    first_cue_delay_sec: float
-    empty_cue_count: int
-    avg_cue_duration: float
-    is_adequate: bool
-    warnings: list[str] = field(default_factory=list)
+# Re-export the shared type under the old name used by callers in this module.
+TranscriptValidation = TranscriptQuality
 
 
 def _validate_transcript_coverage(
@@ -713,72 +709,23 @@ def _validate_transcript_coverage(
     min_coverage_ratio: float = 0.80,
     max_gap_sec: float = 30.0,
     max_first_cue_delay_sec: float = 10.0,
-) -> TranscriptValidation:
+) -> TranscriptQuality:
     """Check whether the transcript adequately covers the video.
 
-    Returns a :class:`TranscriptValidation` with coverage stats.  When any
-    metric is outside acceptable bounds, ``is_adequate`` is ``False`` and
-    ``warnings`` is populated.  The caller decides whether to proceed (with
-    metadata flags) or abort.
+    Delegates to the shared :func:`validate_transcript` module.  Returns a
+    :class:`TranscriptQuality` (aliased as ``TranscriptValidation`` for
+    backward compatibility) with coverage stats.
     """
-    warnings: list[str] = []
-
-    if not cues:
-        return TranscriptValidation(
-            coverage_ratio=0.0, largest_gap_sec=0.0, first_cue_delay_sec=0.0,
-            empty_cue_count=0, avg_cue_duration=0.0, is_adequate=False,
-            warnings=["Transcript has no cues"],
-        )
-
-    # --- basic stats ---
-    first_cue_delay = cues[0].start
-    last_cue_end = cues[-1].end
-    durations = [max(0.0, c.end - c.start) for c in cues]
-    avg_dur = sum(durations) / len(durations) if durations else 0.0
-    empty_count = sum(1 for c in cues if len(c.text.strip()) < 2)
-
-    # --- largest gap between consecutive cues ---
-    largest_gap = 0.0
-    for i in range(1, len(cues)):
-        gap = cues[i].start - cues[i - 1].end
-        if gap > largest_gap:
-            largest_gap = gap
-
-    # --- coverage ratio ---
-    effective_duration = video_duration_sec if (video_duration_sec and video_duration_sec > 0) else last_cue_end
-    coverage = last_cue_end / effective_duration if effective_duration > 0 else 1.0
-
-    # --- assemble warnings ---
-    if coverage < min_coverage_ratio:
-        warnings.append(
-            f"Transcript covers {coverage:.0%} of {effective_duration:.0f}s video "
-            f"(last cue ends at {last_cue_end:.1f}s)"
-        )
-    if largest_gap > max_gap_sec:
-        warnings.append(f"Largest gap between cues is {largest_gap:.1f}s (threshold {max_gap_sec:.0f}s)")
-    if first_cue_delay > max_first_cue_delay_sec:
-        warnings.append(f"First cue starts at {first_cue_delay:.1f}s (threshold {max_first_cue_delay_sec:.0f}s)")
-    if empty_count > len(cues) * 0.1:
-        warnings.append(f"{empty_count}/{len(cues)} cues are empty or very short")
-    if avg_dur > 30.0:
-        warnings.append(f"Average cue duration is {avg_dur:.1f}s (unusually long, may indicate chunked captions)")
-    if avg_dur < 0.1 and len(cues) > 10:
-        warnings.append(f"Average cue duration is {avg_dur:.3f}s (unusually short)")
-
-    is_adequate = len(warnings) == 0
-
-    for w in warnings:
-        logger.warning("transcript validation: %s", w)
-
-    return TranscriptValidation(
-        coverage_ratio=round(coverage, 4),
-        largest_gap_sec=round(largest_gap, 2),
-        first_cue_delay_sec=round(first_cue_delay, 2),
-        empty_cue_count=empty_count,
-        avg_cue_duration=round(avg_dur, 3),
-        is_adequate=is_adequate,
-        warnings=warnings,
+    quality = validate_transcript(
+        cues,
+        video_duration_sec,
+        min_coverage=min_coverage_ratio,
+        max_gap_sec=max_gap_sec,
+        max_first_delay_sec=max_first_cue_delay_sec,
     )
+    for w in quality.warnings:
+        logger.warning("transcript validation: %s", w)
+    return quality
 
 
 # -- Timestamp-based segment tuple:
