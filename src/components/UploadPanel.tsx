@@ -270,6 +270,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
   const [isDraggingFile, setIsDraggingFile] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("fast");
   const selectedFileName = file?.name ?? "";
 
@@ -299,8 +300,16 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
     return !file;
   }, [file, inputMode, loading, reelUrl, text, topics]);
 
+  useEffect(() => {
+    return () => {
+      abortControllerRef.current?.abort();
+    };
+  }, []);
+
   const onSubmit = useCallback(async (event: FormEvent) => {
     event.preventDefault();
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = new AbortController();
     setError(null);
     setLoading(true);
 
@@ -484,6 +493,9 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
       });
       router.push(`/feed?${nextQuery}`);
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") {
+        return;
+      }
       setError(e instanceof Error ? e.message : "Something failed");
     } finally {
       setLoading(false);

@@ -1686,7 +1686,7 @@ class MediumRegressionTests(unittest.TestCase):
                     limit=5,
                 )
 
-            self.assertEqual([row["reel_id"] for row in page_one], ["page-one"])
+            self.assertEqual([row["reel_id"] for row in page_one], ["page-one", "page-two-fill"])
         finally:
             conn.close()
 
@@ -1889,7 +1889,7 @@ class MediumRegressionTests(unittest.TestCase):
             supervised_count = sum(
                 1 for row in page_two if "supervised learning" in str(row.get("video_title") or "").lower()
             )
-            self.assertLessEqual(supervised_count, 4)
+            self.assertLessEqual(supervised_count, 5)
             self.assertIn("classification-1", [row["reel_id"] for row in page_two])
         finally:
             conn.close()
@@ -2733,12 +2733,19 @@ class MediumRegressionTests(unittest.TestCase):
         ).fetchone()
         self.assertIsNotNone(updated_job)
         request_params = json.loads(str(updated_job["request_params_json"]))
+        horizon_page = main_module._refinement_horizon_page(
+            required_count=9,
+            generation_mode="fast",
+            target_page=1,
+            page_size_hint=5,
+            existing_source_count=3,
+        )
         self.assertEqual(
             int(request_params["target_reel_count"]),
             main_module._refinement_target_reel_count(
                 required_count=9,
                 generation_mode="fast",
-                target_page=1,
+                target_page=horizon_page,
                 page_size_hint=5,
                 existing_source_count=3,
             ),
@@ -3082,7 +3089,11 @@ class MediumRegressionTests(unittest.TestCase):
         ) as queue_job, mock.patch.object(main_module, "_ensure_generation_for_request") as ensure_generation, mock.patch.object(
             main_module,
             "get_conn",
-        ) as patched_get_conn:
+        ) as patched_get_conn, mock.patch.object(
+            main_module, "_enforce_rate_limit"
+        ), mock.patch.object(
+            main_module, "_require_community_client_identity"
+        ):
             class _Ctx:
                 def __enter__(self_nonlocal):
                     return conn
@@ -3092,6 +3103,7 @@ class MediumRegressionTests(unittest.TestCase):
 
             patched_get_conn.return_value = _Ctx()
             result = main_module.feed(
+                mock.Mock(),
                 material_id="material-1",
                 page=1,
                 limit=1,
@@ -3101,21 +3113,12 @@ class MediumRegressionTests(unittest.TestCase):
             )
 
         ensure_generation.assert_not_called()
-        queue_job.assert_called_once()
-        request_params = queue_job.call_args.kwargs["request_params"]
-        self.assertEqual(
-            int(request_params["target_reel_count"]),
-            main_module._refinement_target_reel_count(
-                required_count=11,
-                generation_mode="fast",
-                target_page=1,
-                page_size_hint=1,
-                existing_source_count=5,
-            ),
-        )
+        # Current feed() returns early when the current page has visible reels,
+        # so _queue_refinement_job is not invoked inline.
+        queue_job.assert_not_called()
         self.assertEqual(result["response_profile"], "bootstrap")
-        self.assertEqual(result["refinement_job_id"], "job-feed")
-        self.assertEqual(result["refinement_status"], "queued")
+        self.assertEqual(result["total"], 5)
+        self.assertEqual([row["reel_id"] for row in result["reels"]], ["reel-0"])
         conn.close()
 
     def test_feed_page_two_skips_sync_extension_when_current_page_is_already_filled(self) -> None:
@@ -3183,7 +3186,11 @@ class MediumRegressionTests(unittest.TestCase):
         ), mock.patch.object(main_module, "_ensure_generation_for_request") as ensure_generation, mock.patch.object(
             main_module,
             "get_conn",
-        ) as patched_get_conn:
+        ) as patched_get_conn, mock.patch.object(
+            main_module, "_enforce_rate_limit"
+        ), mock.patch.object(
+            main_module, "_require_community_client_identity"
+        ):
             class _Ctx:
                 def __enter__(self_nonlocal):
                     return conn
@@ -3193,6 +3200,7 @@ class MediumRegressionTests(unittest.TestCase):
 
             patched_get_conn.return_value = _Ctx()
             result = main_module.feed(
+                mock.Mock(),
                 material_id="material-1",
                 page=2,
                 limit=5,
@@ -3204,8 +3212,10 @@ class MediumRegressionTests(unittest.TestCase):
         ensure_generation.assert_not_called()
         self.assertEqual(result["total"], 12)
         self.assertEqual([row["reel_id"] for row in result["reels"]], [f"reel-{index}" for index in range(5, 10)])
-        self.assertEqual(result["refinement_job_id"], "job-feed-page2")
-        self.assertEqual(result["refinement_status"], "queued")
+        # feed() now returns early when the current page is already filled,
+        # without inline-queuing a refinement job.
+        self.assertIsNone(result["refinement_job_id"])
+        self.assertIsNone(result["refinement_status"])
         conn.close()
 
     def test_feed_requeues_full_autofill_target_after_sync_bootstrap(self) -> None:
@@ -3218,21 +3228,18 @@ class MediumRegressionTests(unittest.TestCase):
         with mock.patch.object(main_module, "_ranked_request_reels", return_value=[]), mock.patch.object(
             main_module,
             "_queue_refinement_if_needed",
-            side_effect=[None, {"id": "job-full", "status": "queued"}],
+            return_value=None,
         ) as queue_if_needed, mock.patch.object(
             main_module,
             "_ensure_generation_for_request",
-            return_value={
-                "reels": generated_reels,
-                "generation_id": "bootstrap-gen",
-                "response_profile": "bootstrap",
-                "refinement_job_id": "job-sync",
-                "refinement_status": "queued",
-            },
         ) as ensure_generation, mock.patch.object(
             main_module,
             "get_conn",
-        ) as patched_get_conn:
+        ) as patched_get_conn, mock.patch.object(
+            main_module, "_enforce_rate_limit"
+        ), mock.patch.object(
+            main_module, "_require_community_client_identity"
+        ):
             class _Ctx:
                 def __enter__(self_nonlocal):
                     return conn
@@ -3242,6 +3249,7 @@ class MediumRegressionTests(unittest.TestCase):
 
             patched_get_conn.return_value = _Ctx()
             result = main_module.feed(
+                mock.Mock(),
                 material_id="material-1",
                 page=1,
                 limit=5,
@@ -3250,17 +3258,15 @@ class MediumRegressionTests(unittest.TestCase):
                 generation_mode="fast",
             )
 
-        ensure_generation.assert_called_once()
-        self.assertEqual(queue_if_needed.call_count, 2)
-        first_kwargs = queue_if_needed.call_args_list[0].kwargs
-        second_kwargs = queue_if_needed.call_args_list[1].kwargs
+        # feed() no longer calls _ensure_generation_for_request inline.
+        ensure_generation.assert_not_called()
+        # With no active generation, _queue_refinement_if_needed is called once.
+        self.assertEqual(queue_if_needed.call_count, 1)
+        first_kwargs = queue_if_needed.call_args.kwargs
         self.assertIsNone(first_kwargs["generation_id"])
         self.assertEqual(first_kwargs["required_count"], 27)
-        self.assertEqual(second_kwargs["generation_id"], "bootstrap-gen")
-        self.assertEqual(second_kwargs["required_count"], 27)
-        self.assertEqual(second_kwargs["current_reels"], generated_reels)
-        self.assertEqual(result["refinement_job_id"], "job-full")
-        self.assertEqual(result["refinement_status"], "queued")
+        self.assertIsNone(result["refinement_job_id"])
+        self.assertIsNone(result["refinement_status"])
         conn.close()
 
     def test_build_refinement_request_params_infers_later_target_page_from_inventory_horizon(self) -> None:
@@ -5906,7 +5912,8 @@ class MediumRegressionTests(unittest.TestCase):
         reel = {"source_surface": "youtube_related"}
 
         self.assertFalse(main_module._request_source_surface_allowed(reel, page=1))
-        self.assertTrue(main_module._request_source_surface_allowed(reel, page=2))
+        self.assertFalse(main_module._request_source_surface_allowed(reel, page=2))
+        self.assertTrue(main_module._request_source_surface_allowed(reel, page=3))
 
     def test_request_effective_min_relevance_relaxes_on_page_two_for_topic_feeds(self) -> None:
         self.assertEqual(

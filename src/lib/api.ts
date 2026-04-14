@@ -32,26 +32,39 @@ const RAW_API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "")
 const RAW_DEPLOYED_API_BASE = (process.env.NEXT_PUBLIC_DEPLOYED_API_BASE || "").replace(/\/$/, "");
 const DEFAULT_DEPLOYED_API_BASE = "https://reelai-production.up.railway.app";
 
+let _cachedApiBase: string | null = null;
 function resolveApiBase(): string {
+  if (_cachedApiBase !== null) {
+    return _cachedApiBase;
+  }
+  let base: string;
   if (RAW_API_BASE) {
-    return RAW_API_BASE;
-  }
-  if (process.env.NODE_ENV === "development") {
-    return "http://127.0.0.1:8000";
-  }
-  if (typeof window !== "undefined") {
+    base = RAW_API_BASE;
+  } else if (process.env.NODE_ENV === "development") {
+    base = "http://127.0.0.1:8000";
+  } else if (typeof window !== "undefined") {
     const hostname = window.location.hostname.trim().toLowerCase();
     if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
-      return RAW_DEPLOYED_API_BASE || DEFAULT_DEPLOYED_API_BASE;
+      base = RAW_DEPLOYED_API_BASE || DEFAULT_DEPLOYED_API_BASE;
+    } else {
+      base = RAW_DEPLOYED_API_BASE;
     }
+  } else {
+    base = RAW_DEPLOYED_API_BASE;
   }
-  return RAW_DEPLOYED_API_BASE;
+  _cachedApiBase = base.replace(/\/$/, "");
+  return _cachedApiBase;
 }
 
-const RESOLVED_API_BASE = resolveApiBase().replace(/\/$/, "");
-const BACKEND_DOWN_ERROR = RESOLVED_API_BASE
-  ? `Cannot reach backend at ${RESOLVED_API_BASE}. Make sure the backend server is running.`
-  : "Cannot reach backend. Check your deployment and API routes.";
+function getResolvedApiBase(): string {
+  return resolveApiBase();
+}
+function getBackendDownError(): string {
+  const base = getResolvedApiBase();
+  return base
+    ? `Cannot reach backend at ${base}. Make sure the backend server is running.`
+    : "Cannot reach backend. Check your deployment and API routes.";
+}
 const COMMUNITY_OWNER_KEY_STORAGE_KEY = "studyreels-community-owner-key";
 export const COMMUNITY_OWNED_SET_IDS_STORAGE_KEY = "studyreels-community-owned-set-ids";
 const COMMUNITY_ACCOUNT_STORAGE_KEY = "studyreels-community-account";
@@ -63,10 +76,11 @@ let communityOwnerKeyMemoryFallback: string | null = null;
 
 function apiUrl(path: string): string {
   const cleanPath = path.startsWith("/") ? path : `/${path}`;
-  if (!RESOLVED_API_BASE) {
+  const base = getResolvedApiBase();
+  if (!base) {
     return `/api${cleanPath}`;
   }
-  const cleanBase = RESOLVED_API_BASE.replace(/\/$/, "");
+  const cleanBase = base.replace(/\/$/, "");
   if (cleanBase.endsWith("/api")) {
     return `${cleanBase}${cleanPath}`;
   }
@@ -103,8 +117,12 @@ function createCommunityOwnerKey(): string {
   }
   // crypto is unavailable — generate a best-effort key from multiple entropy
   // sources. This path only runs in very old or non-browser environments.
+  // WARNING: Math.random() is not cryptographically secure.
+  if (typeof console !== "undefined" && console.warn) {
+    console.warn("StudyReels: crypto API unavailable, falling back to Math.random for owner key generation. This is not cryptographically secure.");
+  }
   const segments: string[] = [];
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 8; i++) {
     segments.push(Math.random().toString(36).slice(2, 10));
   }
   return segments.join("-");
@@ -1752,7 +1770,7 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
       }
       throw new Error("Request was interrupted.");
     }
-    throw new TransportError(BACKEND_DOWN_ERROR);
+    throw new TransportError(getBackendDownError());
   } finally {
     if (timeoutId) {
       clearTimeout(timeoutId);

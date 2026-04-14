@@ -144,6 +144,7 @@ class TopicReel:
     summary: str = ""
     cue_start_idx: int = -1
     cue_end_idx: int = -1
+    relevance_score: float | None = None
 
     @property
     def duration_sec(self) -> float:
@@ -154,6 +155,8 @@ class TopicReel:
         d["duration_sec"] = round(self.duration_sec, 2)
         d["t_start"] = round(self.t_start, 2)
         d["t_end"] = round(self.t_end, 2)
+        if self.relevance_score is not None:
+            d["relevance_score"] = round(self.relevance_score, 3)
         return d
 
 
@@ -559,7 +562,7 @@ def classify_video(
 # --------------------------------------------------------------------------- #
 
 
-_SYSTEM_PROMPT = """You are a precise video editor cutting long-form YouTube videos into self-contained topic clips.
+_SYSTEM_PROMPT_LEGACY = """You are a precise video editor cutting long-form YouTube videos into self-contained topic clips.
 
 You will receive a numbered transcript. Each line has the format:
     [<idx> <mm:ss>] <speech>
@@ -595,6 +598,71 @@ Return JSON only, in this exact shape:
 No prose outside the JSON."""
 
 
+def _build_system_prompt(*, query: str | None = None) -> str:
+    """Build the timestamp-based topic segmentation system prompt.
+
+    When *query* is provided the prompt also instructs the LLM to return a
+    ``relevance_score`` (0.0-1.0) per segment indicating how relevant it is
+    to the user's search.
+    """
+    query_block = ""
+    if query:
+        query_block = f"""
+The user is searching for: "{query}"
+For each segment, also return a "relevance_score" (float 0.0-1.0) indicating
+how relevant this segment is to the user's query.
+  1.0 = directly and substantively addresses the query topic.
+  0.5 = partially related or tangentially relevant.
+  0.0 = completely unrelated.
+Score based on semantic relevance, not just keyword overlap."""
+
+    relevance_field = ', "relevance_score": <float 0.0-1.0>' if query else ""
+
+    return f"""You are a precise video editor cutting long-form YouTube videos into self-contained topic clips.
+
+You will receive a transcript. Each line has the format:
+    [<start_seconds>-<end_seconds>s] <speech>
+
+For example: [45.2-48.7s] And that brings us to the concept of gradient descent.
+
+Your job: identify every distinct TOPIC the creator covers, and for each one return the EXACT start and end timestamps where they discuss it.
+{query_block}
+Rules for TOPIC STARTS (start_time):
+- A topic START is when the creator begins SUSTAINED discussion of a new subject. Strong signals include phrases like "Now let me show you", "The next concept is", "Moving on to", "Let's dive into", "So what is X?", a new chapter, a new question, or a new demo.
+- A mere passing reference ("as we discussed earlier", "similar to X", "which relates to Y") is NOT a topic start. The creator must be setting context for a new discussion, not referencing a previous one.
+- start_time must be the timestamp of the FIRST cue where the creator begins the new topic — NOT the preceding segue cue like "let's move on" or "alright so". Start at the actual substance.
+
+Rules for TOPIC ENDS (end_time):
+- end_time is the END timestamp of the LAST cue where the creator is ACTIVELY discussing this topic — NOT the start of the next topic's first cue.
+- Look for transition signals: "Alright so", "Moving on", "Next up", "So that covers", "Now let's talk about something else", or a noticeable pause followed by new vocabulary.
+- Place end_time on the cue BEFORE such a transition signal, not on the transition itself.
+- Prefer ending at a complete sentence rather than mid-thought.
+
+IMPORTANT: start_time and end_time MUST be exact timestamp values that appear in the transcript's [X.X-Y.Ys] ranges. For start_time, use the START value of a cue. For end_time, use the END value of a cue. Do not interpolate or invent timestamps.
+
+Edge-case handling:
+- REVISITED TOPICS: If the creator returns to a topic they discussed earlier, treat each occurrence as a SEPARATE segment. Append "(continued)" or "(part 2)" to the label for later occurrences. Do NOT merge non-contiguous discussions.
+- BRIEF TANGENTS: A tangent shorter than roughly 10 seconds that interrupts a topic should be ABSORBED into the surrounding topic, not treated as its own segment. Only create a separate segment for tangents that last at least 15 seconds with substantive content.
+- INTROS: Skip any intro (channel branding, "hey guys welcome back", recap of previous episodes). If the intro contains a preview or table of contents, skip it — the actual discussion appears later.
+- OUTROS: Skip any outro ("don't forget to like and subscribe", "thanks for watching", sign-off).
+- SPONSOR READS: Skip sponsor segments ("this video is brought to you by", "use code X for 20% off"). These are NOT topics.
+
+General rules:
+- Each clip must be SELF-CONTAINED: a viewer should understand the discussion without seeing the rest of the video.
+- Topics must not overlap and must be in ascending chronological order.
+- If the entire video is one continuous monolithic topic, return ONE segment spanning the substantive part.
+- A label must be 4-9 words and describe the topic, not the action ("Diagonalizing 3x3 matrices", not "He talks about matrices").
+- Prefer tighter, more precise boundaries — it is better to trim a transition sentence than to include 10 seconds of the wrong topic.
+
+Return JSON only, in this exact shape:
+{{
+    "segments": [
+        {{"start_time": <float>, "end_time": <float>, "topic_label": "<4-9 word label>", "summary": "<one short sentence>", "confidence": <float 0.0-1.0>{relevance_field}}}
+    ]
+}}
+No prose outside the JSON."""
+
+
 def _format_timestamp(seconds: float) -> str:
     seconds = max(0, int(seconds))
     if seconds >= 3600:
@@ -608,11 +676,167 @@ def _format_timestamp(seconds: float) -> str:
 
 
 def _render_transcript_for_llm(cues: Sequence[TranscriptCue]) -> str:
-    """Render `cues` as `[idx mm:ss] text` lines, one per cue."""
+    """Render cues as `[start-end s] text` lines with precise timestamps.
+
+    Format: ``[45.2-48.7s] Hello everyone...``
+
+    Both start and end times are exposed so the LLM can pick precise
+    boundaries for both segment starts and ends.
+    """
     return "\n".join(
-        f"[{i} {_format_timestamp(cue.start)}] {cue.text}"
-        for i, cue in enumerate(cues)
+        f"[{cue.start:.1f}-{cue.end:.1f}s] {cue.text}"
+        for cue in cues
     )
+
+
+# --------------------------------------------------------------------------- #
+# Transcript coverage validation
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class TranscriptValidation:
+    """Result of :func:`_validate_transcript_coverage`."""
+    coverage_ratio: float
+    largest_gap_sec: float
+    first_cue_delay_sec: float
+    empty_cue_count: int
+    avg_cue_duration: float
+    is_adequate: bool
+    warnings: list[str] = field(default_factory=list)
+
+
+def _validate_transcript_coverage(
+    cues: Sequence[TranscriptCue],
+    video_duration_sec: float | None,
+    *,
+    min_coverage_ratio: float = 0.80,
+    max_gap_sec: float = 30.0,
+    max_first_cue_delay_sec: float = 10.0,
+) -> TranscriptValidation:
+    """Check whether the transcript adequately covers the video.
+
+    Returns a :class:`TranscriptValidation` with coverage stats.  When any
+    metric is outside acceptable bounds, ``is_adequate`` is ``False`` and
+    ``warnings`` is populated.  The caller decides whether to proceed (with
+    metadata flags) or abort.
+    """
+    warnings: list[str] = []
+
+    if not cues:
+        return TranscriptValidation(
+            coverage_ratio=0.0, largest_gap_sec=0.0, first_cue_delay_sec=0.0,
+            empty_cue_count=0, avg_cue_duration=0.0, is_adequate=False,
+            warnings=["Transcript has no cues"],
+        )
+
+    # --- basic stats ---
+    first_cue_delay = cues[0].start
+    last_cue_end = cues[-1].end
+    durations = [max(0.0, c.end - c.start) for c in cues]
+    avg_dur = sum(durations) / len(durations) if durations else 0.0
+    empty_count = sum(1 for c in cues if len(c.text.strip()) < 2)
+
+    # --- largest gap between consecutive cues ---
+    largest_gap = 0.0
+    for i in range(1, len(cues)):
+        gap = cues[i].start - cues[i - 1].end
+        if gap > largest_gap:
+            largest_gap = gap
+
+    # --- coverage ratio ---
+    effective_duration = video_duration_sec if (video_duration_sec and video_duration_sec > 0) else last_cue_end
+    coverage = last_cue_end / effective_duration if effective_duration > 0 else 1.0
+
+    # --- assemble warnings ---
+    if coverage < min_coverage_ratio:
+        warnings.append(
+            f"Transcript covers {coverage:.0%} of {effective_duration:.0f}s video "
+            f"(last cue ends at {last_cue_end:.1f}s)"
+        )
+    if largest_gap > max_gap_sec:
+        warnings.append(f"Largest gap between cues is {largest_gap:.1f}s (threshold {max_gap_sec:.0f}s)")
+    if first_cue_delay > max_first_cue_delay_sec:
+        warnings.append(f"First cue starts at {first_cue_delay:.1f}s (threshold {max_first_cue_delay_sec:.0f}s)")
+    if empty_count > len(cues) * 0.1:
+        warnings.append(f"{empty_count}/{len(cues)} cues are empty or very short")
+    if avg_dur > 30.0:
+        warnings.append(f"Average cue duration is {avg_dur:.1f}s (unusually long, may indicate chunked captions)")
+    if avg_dur < 0.1 and len(cues) > 10:
+        warnings.append(f"Average cue duration is {avg_dur:.3f}s (unusually short)")
+
+    is_adequate = len(warnings) == 0
+
+    for w in warnings:
+        logger.warning("transcript validation: %s", w)
+
+    return TranscriptValidation(
+        coverage_ratio=round(coverage, 4),
+        largest_gap_sec=round(largest_gap, 2),
+        first_cue_delay_sec=round(first_cue_delay, 2),
+        empty_cue_count=empty_count,
+        avg_cue_duration=round(avg_dur, 3),
+        is_adequate=is_adequate,
+        warnings=warnings,
+    )
+
+
+# -- Timestamp-based segment tuple:
+#    (start_time, end_time, label, summary, relevance_score_or_None)
+_SegmentTuple = tuple[float, float, str, str, float | None]
+
+
+def _strip_code_fences(raw: str) -> str:
+    """Strip markdown code fences that some LLMs wrap around JSON."""
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    return raw
+
+
+def _parse_llm_segments_json(raw: str) -> list[_SegmentTuple]:
+    """Parse timestamp-based JSON from any LLM into segment tuples.
+
+    Expected JSON shape::
+
+        {"segments": [{"start_time": 45.2, "end_time": 312.8,
+                        "topic_label": "...", "summary": "...",
+                        "confidence": 0.9, "relevance_score": 0.85}]}
+
+    Returns ``(start_time, end_time, label, summary, relevance_score)``
+    tuples.  ``relevance_score`` is ``None`` when the field is absent.
+    """
+    raw = _strip_code_fences(raw)
+    payload = json.loads(raw)
+    segments_raw = payload.get("segments")
+    if not isinstance(segments_raw, list):
+        raise ValueError(f"LLM returned no segments: {raw[:200]}")
+
+    out: list[_SegmentTuple] = []
+    for seg in segments_raw:
+        if not isinstance(seg, dict):
+            continue
+        try:
+            s = float(seg.get("start_time"))
+            e = float(seg.get("end_time"))
+        except (TypeError, ValueError):
+            continue
+        if s < 0 or e < 0 or s >= e:
+            continue
+        label = str(seg.get("topic_label") or seg.get("label") or "").strip()
+        summary = str(seg.get("summary") or "").strip()
+        if not label:
+            continue
+        rel = seg.get("relevance_score")
+        relevance: float | None = None
+        if rel is not None:
+            try:
+                relevance = max(0.0, min(1.0, float(rel)))
+            except (TypeError, ValueError):
+                pass
+        out.append((s, e, label, summary, relevance))
+    return out
 
 
 def _llm_topic_segments(
@@ -620,14 +844,16 @@ def _llm_topic_segments(
     *,
     openai_client: Any,
     model: str = DEFAULT_MODEL,
-) -> list[tuple[int, int, str, str]]:
+    query: str | None = None,
+) -> list[_SegmentTuple]:
     """
-    Ask the LLM to identify topic boundaries by cue index.
+    Ask the LLM to identify topic boundaries by timestamp.
 
-    Returns a list of (start_idx, end_idx, label, summary). May raise on API
-    errors so the caller can decide whether to fall back to the heuristic.
+    Returns a list of (start_time, end_time, label, summary, relevance).
+    May raise on API errors so the caller can fall back.
     """
     rendered = _render_transcript_for_llm(cues)
+    system_prompt = _build_system_prompt(query=query)
     user_msg = (
         "Here is the full transcript of a long-form YouTube video. "
         "Identify topic segments per the rules in the system prompt.\n\n"
@@ -639,55 +865,12 @@ def _llm_topic_segments(
         temperature=0.1,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
         ],
     )
     raw = response.choices[0].message.content or "{}"
-    payload = json.loads(raw)
-    segments_raw = payload.get("segments")
-    if not isinstance(segments_raw, list):
-        raise ValueError(f"LLM returned no segments: {raw[:200]}")
-
-    out: list[tuple[int, int, str, str]] = []
-    for seg in segments_raw:
-        if not isinstance(seg, dict):
-            continue
-        try:
-            s = int(seg.get("start_idx"))
-            e = int(seg.get("end_idx"))
-        except (TypeError, ValueError):
-            continue
-        label = str(seg.get("label") or "").strip()
-        summary = str(seg.get("summary") or "").strip()
-        if not label:
-            continue
-        out.append((s, e, label, summary))
-    return out
-
-
-def _parse_llm_segments_json(raw: str) -> list[tuple[int, int, str, str]]:
-    """Parse the JSON response from any LLM into (start_idx, end_idx, label, summary) tuples."""
-    payload = json.loads(raw)
-    segments_raw = payload.get("segments")
-    if not isinstance(segments_raw, list):
-        raise ValueError(f"LLM returned no segments: {raw[:200]}")
-
-    out: list[tuple[int, int, str, str]] = []
-    for seg in segments_raw:
-        if not isinstance(seg, dict):
-            continue
-        try:
-            s = int(seg.get("start_idx"))
-            e = int(seg.get("end_idx"))
-        except (TypeError, ValueError):
-            continue
-        label = str(seg.get("label") or "").strip()
-        summary = str(seg.get("summary") or "").strip()
-        if not label:
-            continue
-        out.append((s, e, label, summary))
-    return out
+    return _parse_llm_segments_json(raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -718,12 +901,14 @@ def _llm_topic_segments_gemini(
     *,
     genai_module: Any,
     model: str = "gemini-2.0-flash",
-) -> list[tuple[int, int, str, str]]:
+    query: str | None = None,
+) -> list[_SegmentTuple]:
     """
     Identify topic boundaries using Google Gemini Flash (free tier).
-    Same prompt and output format as the OpenAI path.
+    Returns timestamp-based segment tuples with optional relevance scores.
     """
     rendered = _render_transcript_for_llm(cues)
+    system_prompt = _build_system_prompt(query=query)
     user_msg = (
         "Here is the full transcript of a long-form YouTube video. "
         "Identify topic segments per the rules in the system prompt.\n\n"
@@ -732,7 +917,7 @@ def _llm_topic_segments_gemini(
 
     model_obj = genai_module.GenerativeModel(
         model_name=model,
-        system_instruction=_SYSTEM_PROMPT,
+        system_instruction=system_prompt,
         generation_config=genai_module.GenerationConfig(
             response_mime_type="application/json",
             temperature=0.1,
@@ -770,12 +955,14 @@ def _llm_topic_segments_groq(
     *,
     groq_client: Any,
     model: str = "llama-3.3-70b-versatile",
-) -> list[tuple[int, int, str, str]]:
+    query: str | None = None,
+) -> list[_SegmentTuple]:
     """
     Identify topic boundaries using Groq (Llama 3, free tier).
-    Uses the OpenAI-compatible chat completions API.
+    Returns timestamp-based segment tuples with optional relevance scores.
     """
     rendered = _render_transcript_for_llm(cues)
+    system_prompt = _build_system_prompt(query=query)
     user_msg = (
         "Here is the full transcript of a long-form YouTube video. "
         "Identify topic segments per the rules in the system prompt.\n\n"
@@ -787,7 +974,7 @@ def _llm_topic_segments_groq(
         temperature=0.1,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_msg},
         ],
     )
@@ -1523,20 +1710,22 @@ def _filter_reels_by_query(
     query: str,
     *,
     cues: Sequence[TranscriptCue],
+    transcript_validation: TranscriptValidation | None = None,
 ) -> list[TopicReel]:
     """
     Score each TopicReel against the user's search *query* and keep only
-    relevant ones. Uses a hybrid scoring approach:
+    relevant ones.
 
-    When sentence-transformer is available (free, local):
-      * semantic cosine similarity (0.60) — captures meaning, not just word overlap
-      * label Jaccard (0.25)
-      * summary Jaccard (0.15)
+    Uses **adaptive blending** when the reel already carries an LLM-assigned
+    ``relevance_score``:
 
-    Fallback (Jaccard-only):
-      * label match  (0.4) — Jaccard of query tokens vs. reel label tokens
-      * transcript   (0.5) — Jaccard of query tokens vs. transcript text
-      * summary      (0.1) — Jaccard of query tokens vs. reel summary
+    * Strong transcript (coverage >= 0.80) + specific query (>= 3 tokens):
+      trust LLM more (70% LLM, 30% local signals).
+    * Weak transcript or vague query: trust local signals more
+      (30% LLM, 70% local signals).
+
+    When ``relevance_score`` is ``None`` the original local-only scoring
+    applies unchanged.
 
     If ALL reels fall below the threshold, the single highest-scoring reel is
     returned so we never silently discard every topic for a video that has content.
@@ -1544,6 +1733,15 @@ def _filter_reels_by_query(
     query_tokens = _tokenize_for_relevance(query)
     if not query_tokens:
         return reels  # no meaningful query — return all
+
+    # Determine adaptive blend weight based on transcript quality + query specificity.
+    has_strong_transcript = (
+        transcript_validation is not None
+        and transcript_validation.coverage_ratio >= 0.80
+        and transcript_validation.largest_gap_sec <= 30.0
+    )
+    has_specific_query = len(query_tokens) >= 3
+    llm_weight = 0.70 if (has_strong_transcript and has_specific_query) else 0.30
 
     # Build transcript text for each reel.
     reel_transcripts: list[str] = []
@@ -1567,16 +1765,21 @@ def _filter_reels_by_query(
         label_score = _jaccard(query_tokens, _tokenize_for_relevance(reel.label))
         summary_score = _jaccard(query_tokens, _tokenize_for_relevance(reel.summary))
 
+        # Compute local signal score.
         if semantic_scores is not None:
-            # Semantic path: cosine similarity dominates
             sem_score = max(0.0, semantic_scores[i])
-            combined = 0.25 * label_score + 0.15 * summary_score + 0.60 * sem_score
+            local_score = 0.25 * label_score + 0.15 * summary_score + 0.60 * sem_score
         else:
-            # Jaccard fallback
             transcript_score = _jaccard(
                 query_tokens, _tokenize_for_relevance(reel_transcripts[i])
             )
-            combined = 0.4 * label_score + 0.5 * transcript_score + 0.1 * summary_score
+            local_score = 0.4 * label_score + 0.5 * transcript_score + 0.1 * summary_score
+
+        # Blend with LLM relevance score when available.
+        if reel.relevance_score is not None:
+            combined = llm_weight * reel.relevance_score + (1.0 - llm_weight) * local_score
+        else:
+            combined = local_score
 
         scored.append((combined, reel))
 
@@ -1738,6 +1941,172 @@ def _snap_segments_to_cues(
 
 
 # --------------------------------------------------------------------------- #
+# Timestamp-based directional snapping (new pipeline for LLM results)
+# --------------------------------------------------------------------------- #
+
+
+def _validate_timestamp_against_cues(
+    timestamp: float,
+    cues: Sequence[TranscriptCue],
+    *,
+    epsilon: float = 1.0,
+    check_start: bool = True,
+) -> bool:
+    """Check whether *timestamp* is within *epsilon* of an actual cue boundary.
+
+    When *check_start* is True, matches against ``cue.start`` values.
+    When False, matches against ``cue.end`` values.
+    """
+    for cue in cues:
+        ref = cue.start if check_start else cue.end
+        if abs(ref - timestamp) <= epsilon:
+            return True
+    return False
+
+
+def _snap_timestamps_to_cues(
+    raw_segments: Iterable[_SegmentTuple],
+    cues: Sequence[TranscriptCue],
+    *,
+    video_id: str,
+    video_duration_sec: float | None,
+    min_reel_sec: float = MIN_TOPIC_REEL_SEC,
+    max_reel_sec: float = MAX_TOPIC_REEL_SEC,
+    timestamp_epsilon: float = 1.0,
+) -> list[TopicReel]:
+    """Resolve LLM-returned timestamps into final TopicReel records.
+
+    Uses **directional snapping** to avoid leaking neighbouring topics:
+
+    * ``start_time`` -> first cue whose ``.start >= returned_timestamp``
+      (snap forward so we never include the tail of the previous topic).
+    * ``end_time``   -> last cue whose ``.end <= returned_timestamp``
+      (snap backward so we never include the head of the next topic).
+
+    After snapping, an optional sentence-boundary expansion pass widens the
+    clip by up to 3 cues if a natural sentence boundary exists just outside.
+
+    Segments whose timestamps do not match any real cue boundary within
+    *timestamp_epsilon* are coerced to the nearest valid boundary (with a
+    warning), not silently dropped.  Only segments that fail duration
+    guardrails after snapping are discarded.
+    """
+    if not cues:
+        return []
+
+    abs_max_cap = max(max_reel_sec, MAX_TOPIC_REEL_SEC)
+    candidates: list[TopicReel] = []
+
+    for start_time, end_time, label, summary, relevance in raw_segments:
+        # --- Validate that timestamps match real cue boundaries ----------- #
+        if not _validate_timestamp_against_cues(start_time, cues, epsilon=timestamp_epsilon, check_start=True):
+            logger.debug(
+                "start_time %.1f does not match any cue start within %.1fs; coercing",
+                start_time, timestamp_epsilon,
+            )
+        if not _validate_timestamp_against_cues(end_time, cues, epsilon=timestamp_epsilon, check_start=False):
+            logger.debug(
+                "end_time %.1f does not match any cue end within %.1fs; coercing",
+                end_time, timestamp_epsilon,
+            )
+
+        # --- Directional snap: start forward, end backward ---------------- #
+        # start -> first cue whose .start >= start_time
+        s_idx = 0
+        for i, cue in enumerate(cues):
+            if cue.start >= start_time - 0.01:
+                s_idx = i
+                break
+        else:
+            s_idx = len(cues) - 1
+
+        # end -> last cue whose .end <= end_time
+        e_idx = s_idx
+        for i in range(len(cues) - 1, s_idx - 1, -1):
+            if cues[i].end <= end_time + 0.01:
+                e_idx = i
+                break
+
+        if e_idx < s_idx:
+            e_idx = s_idx
+
+        # --- Optional sentence-boundary expansion ------------------------- #
+        # Try to widen slightly if a sentence boundary is just outside.
+        sentence_end = _find_sentence_end_cue(cues, e_idx, scan_backward=False, max_scan=2)
+        if sentence_end is not None and sentence_end > e_idx:
+            expansion_cost = cues[sentence_end].end - cues[e_idx].end
+            if expansion_cost <= 2.0:
+                e_idx = sentence_end
+
+        sentence_start = _find_sentence_end_cue(cues, s_idx, scan_backward=True, max_scan=2)
+        if sentence_start is not None and sentence_start < s_idx:
+            expansion_cost = cues[s_idx].start - cues[sentence_start].start
+            if expansion_cost <= 2.0:
+                s_idx = sentence_start
+
+        # --- Derive final timestamps from snapped cues -------------------- #
+        t_start = cues[s_idx].start
+        t_end = cues[e_idx].end
+
+        # Snap t_end to inter-cue gap if one exists right after e_idx.
+        if e_idx + 1 < len(cues):
+            gap_start = cues[e_idx].end
+            gap_end = cues[e_idx + 1].start
+            if gap_end > gap_start:
+                snapped = (gap_start + gap_end) / 2.0
+                if abs(snapped - t_end) <= SNAP_TOLERANCE_SEC:
+                    t_end = snapped
+
+        if video_duration_sec and video_duration_sec > 0:
+            t_end = min(t_end, float(video_duration_sec))
+
+        duration = t_end - t_start
+        if duration < min_reel_sec or duration > abs_max_cap:
+            logger.debug(
+                "dropping out-of-range segment t=%.1f-%.1f duration=%.1fs label=%s",
+                t_start, t_end, duration, label,
+            )
+            continue
+
+        # Split segments that exceed the soft max.
+        if duration > max_reel_sec:
+            split = _split_long_range(
+                t_start, t_end, label, summary,
+                max_reel_sec=max_reel_sec, min_reel_sec=min_reel_sec,
+            )
+            if not split:
+                split = [(t_start, t_end, label, summary)]
+        else:
+            split = [(t_start, t_end, label, summary)]
+
+        for sub_start, sub_end, sub_label, sub_summary in split:
+            candidates.append(
+                TopicReel(
+                    video_id=video_id,
+                    t_start=round(sub_start, 2),
+                    t_end=round(sub_end, 2),
+                    label=sub_label,
+                    summary=sub_summary,
+                    cue_start_idx=s_idx,
+                    cue_end_idx=e_idx,
+                    relevance_score=relevance,
+                )
+            )
+
+    # Sort and trim overlaps.
+    candidates.sort(key=lambda r: r.t_start)
+    cleaned: list[TopicReel] = []
+    for reel in candidates:
+        if cleaned and reel.t_start < cleaned[-1].t_end:
+            new_start = cleaned[-1].t_end
+            if (reel.t_end - new_start) < MIN_TOPIC_REEL_SEC:
+                continue
+            reel.t_start = round(new_start, 2)
+        cleaned.append(reel)
+    return cleaned
+
+
+# --------------------------------------------------------------------------- #
 # Top-level entrypoint
 # --------------------------------------------------------------------------- #
 
@@ -1818,14 +2187,15 @@ def cut_video_into_topic_reels(
         )
         return classification, []
 
+    # ---- Transcript validation ----------------------------------------- #
+    transcript_validation: TranscriptValidation | None = None
+    if transcript:
+        effective_duration = duration_sec or classification.duration_sec or None
+        transcript_validation = _validate_transcript_coverage(
+            transcript, effective_duration,
+        )
+
     # ---- Path 1: YouTube chapters (free, no API, no inference). -------- #
-    # When the creator put chapter markers in the description, yt-dlp parses
-    # them into info_dict["chapters"]. These are the BEST signal we can get —
-    # the creator's own segmentation, not a guess. If we have any usable
-    # chapters we return immediately without ever touching the LLM or the
-    # heuristic. Transcript may still be empty here (e.g. captions disabled
-    # but description has chapter markers), and that's fine — chapters carry
-    # their own absolute timestamps.
     chapters = extract_chapters(info_dict)
     if chapters:
         chapter_segments = chapters_to_topic_segments(chapters)
@@ -1839,7 +2209,10 @@ def cut_video_into_topic_reels(
         )
         if chapter_reels:
             if query and chapter_reels:
-                chapter_reels = _filter_reels_by_query(chapter_reels, query, cues=transcript or [])
+                chapter_reels = _filter_reels_by_query(
+                    chapter_reels, query, cues=transcript or [],
+                    transcript_validation=transcript_validation,
+                )
             logger.info(
                 "video %s cut from %d YouTube chapters → %d reels (free path)",
                 video_id, len(chapters), len(chapter_reels),
@@ -1859,97 +2232,70 @@ def cut_video_into_topic_reels(
         )
         return classification, []
 
-    # ---- Path 2: LLM topic segmentation (free-tier first). ------------- #
-    # Fallback chain: Gemini Flash (free) → Groq/Llama 3 (free) → OpenAI (paid, optional)
-    raw_segments: list[tuple[int, int, str, str]] = []
+    # ---- Path 2: LLM topic segmentation (timestamp-based). ------------- #
+    # Fallback chain: Gemini Flash (free) → Groq/Llama 3 (free) → OpenAI (paid)
+    # LLM functions now return timestamp-based _SegmentTuples, not cue indices.
+    llm_segments: list[_SegmentTuple] = []
+    used_llm = False
+
     if use_llm and len(transcript) <= MAX_CUES_FOR_LLM:
         # 2a: Google Gemini Flash (free tier: 15 RPM, 1M tokens/day)
         gemini = _build_gemini_client()
         if gemini:
             try:
-                raw_segments = _llm_topic_segments_gemini(transcript, genai_module=gemini)
-                if raw_segments:
+                llm_segments = _llm_topic_segments_gemini(
+                    transcript, genai_module=gemini, query=query,
+                )
+                if llm_segments:
+                    used_llm = True
                     logger.info(
                         "video %s segmented via Gemini Flash → %d segments",
-                        video_id, len(raw_segments),
+                        video_id, len(llm_segments),
                     )
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "Gemini topic segmentation failed for video %s; trying Groq next",
                     video_id,
                 )
-                raw_segments = []
+                llm_segments = []
 
         # 2b: Groq / Llama 3 (free tier fallback)
-        if not raw_segments:
+        if not llm_segments:
             groq = _build_groq_client()
             if groq:
                 try:
-                    raw_segments = _llm_topic_segments_groq(transcript, groq_client=groq)
-                    if raw_segments:
+                    llm_segments = _llm_topic_segments_groq(
+                        transcript, groq_client=groq, query=query,
+                    )
+                    if llm_segments:
+                        used_llm = True
                         logger.info(
                             "video %s segmented via Groq/Llama 3 → %d segments",
-                            video_id, len(raw_segments),
+                            video_id, len(llm_segments),
                         )
                 except Exception:  # noqa: BLE001
                     logger.exception(
                         "Groq topic segmentation failed for video %s; trying OpenAI next",
                         video_id,
                     )
-                    raw_segments = []
+                    llm_segments = []
 
         # 2c: OpenAI (paid, optional last resort for LLM path)
-        if not raw_segments:
+        if not llm_segments:
             client = openai_client or _maybe_build_openai_client()
             if client:
                 try:
-                    raw_segments = _llm_topic_segments(transcript, openai_client=client, model=model)
+                    llm_segments = _llm_topic_segments(
+                        transcript, openai_client=client, model=model, query=query,
+                    )
+                    if llm_segments:
+                        used_llm = True
                 except Exception:  # noqa: BLE001
                     logger.exception(
                         "OpenAI topic segmentation failed for video %s; trying semantic path",
                         video_id,
                     )
-                    raw_segments = []
-
-        # Two-pass boundary refinement: refine LLM segment boundaries with
-        # a cheap second LLM call per segment boundary (tiny 10-cue windows).
-        if raw_segments and refine_boundaries:
-            def _make_llm_call(prompt: str) -> str:
-                """Route refinement call through the same free-tier chain."""
-                gemini_mod = _build_gemini_client()
-                if gemini_mod:
-                    try:
-                        m = gemini_mod.GenerativeModel(
-                            model_name="gemini-2.0-flash",
-                            generation_config=gemini_mod.GenerationConfig(
-                                response_mime_type="application/json",
-                                temperature=0.0,
-                            ),
-                        )
-                        return m.generate_content(prompt).text or "{}"
-                    except Exception:
-                        pass
-                groq_c = _build_groq_client()
-                if groq_c:
-                    try:
-                        resp = groq_c.chat.completions.create(
-                            model="llama-3.3-70b-versatile",
-                            temperature=0.0,
-                            response_format={"type": "json_object"},
-                            messages=[{"role": "user", "content": prompt}],
-                        )
-                        return resp.choices[0].message.content or "{}"
-                    except Exception:
-                        pass
-                return "{}"
-
-            try:
-                raw_segments = _refine_boundaries_llm(
-                    raw_segments, transcript, llm_call=_make_llm_call,
-                )
-                logger.info("refined boundaries for %d segments", len(raw_segments))
-            except Exception:
-                logger.debug("boundary refinement failed; keeping original segments")
+                    llm_segments = []
 
     elif use_llm and len(transcript) > MAX_CUES_FOR_LLM:
         logger.warning(
@@ -1958,26 +2304,40 @@ def cut_video_into_topic_reels(
             len(transcript), MAX_CUES_FOR_LLM,
         )
 
-    # ---- Path 3: Local sentence-transformer embeddings (free, near-LLM). #
-    # This is the "free LLM-equivalent": a small ~80 MB MiniLM model runs in
-    # this process and detects topic boundaries via cosine-similarity drops.
-    # Returns None if sentence-transformers isn't installed — that's fine, the
-    # Jaccard fallback below picks up the slack.
-    if not raw_segments:
-        semantic = _semantic_topic_segments(transcript)
-        if semantic:
-            logger.info(
-                "video %s segmented via local sentence-transformers → %d ranges",
-                video_id, len(semantic),
+    # If an LLM produced timestamp-based segments, snap them directionally.
+    if used_llm and llm_segments:
+        reels = _snap_timestamps_to_cues(
+            llm_segments,
+            transcript,
+            video_id=video_id,
+            video_duration_sec=classification.duration_sec or None,
+            min_reel_sec=min_reel_sec,
+            max_reel_sec=max_reel_sec,
+        )
+        if query and reels:
+            reels = _filter_reels_by_query(
+                reels, query, cues=transcript,
+                transcript_validation=transcript_validation,
             )
-            raw_segments = semantic
+        return classification, reels
+
+    # ---- Path 3: Local sentence-transformer embeddings (free, near-LLM). #
+    # These fallback paths still use the legacy index-based pipeline.
+    legacy_segments: list[tuple[int, int, str, str]] = []
+    semantic = _semantic_topic_segments(transcript)
+    if semantic:
+        logger.info(
+            "video %s segmented via local sentence-transformers → %d ranges",
+            video_id, len(semantic),
+        )
+        legacy_segments = semantic
 
     # ---- Path 4: Pure-Python Jaccard heuristic (always available). ----- #
-    if not raw_segments:
-        raw_segments = _heuristic_topic_segments(transcript)
+    if not legacy_segments:
+        legacy_segments = _heuristic_topic_segments(transcript)
 
     reels = _snap_segments_to_cues(
-        raw_segments,
+        legacy_segments,
         transcript,
         video_id=video_id,
         video_duration_sec=classification.duration_sec or None,
@@ -1985,7 +2345,10 @@ def cut_video_into_topic_reels(
         max_reel_sec=max_reel_sec,
     )
     if query and reels:
-        reels = _filter_reels_by_query(reels, query, cues=transcript)
+        reels = _filter_reels_by_query(
+            reels, query, cues=transcript,
+            transcript_validation=transcript_validation,
+        )
     return classification, reels
 
 

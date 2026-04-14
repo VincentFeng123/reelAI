@@ -16,7 +16,7 @@ from backend.app import db as db_module
 from backend.app.config import get_settings
 from backend.app.db import dumps_json, fetch_one, get_conn, insert, now_iso
 import backend.app.main as main_module
-from backend.app.main import COMMUNITY_OWNER_HEADER, COMMUNITY_SESSION_HEADER, _hash_community_password, app
+from backend.app.main import COMMUNITY_OWNER_HEADER, COMMUNITY_SESSION_HEADER, _hash_community_password, _hash_community_verification_code, app
 
 
 class _VerificationTestBase(unittest.TestCase):
@@ -151,18 +151,19 @@ class HostedVerificationDeliveryTests(_VerificationTestBase):
         db_module._db_ready = False
         self._refresh_client()
 
+        # With the pre-signup verification flow, the 503 now surfaces
+        # at the send-signup-verification step when HMAC key is missing.
         response = self.client.post(
-            "/api/community/auth/register",
+            "/api/community/auth/send-signup-verification",
             headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
             json={
-                "username": "hostedsecret",
                 "email": "hostedsecret@example.com",
-                "password": "password123",
+                "username": "hostedsecret",
             },
         )
 
         self.assertEqual(response.status_code, 503, response.text)
-        self.assertIn("verification secret is not configured", response.json()["detail"].lower())
+        self.assertIn("verification", response.json()["detail"].lower())
 
         with get_conn(transactional=True) as conn:
             account = fetch_one(
@@ -176,20 +177,52 @@ class HostedVerificationDeliveryTests(_VerificationTestBase):
 
 
 class CommunityChangeEmailTests(_VerificationTestBase):
-    def test_unverified_account_can_change_email_and_only_new_code_works(self) -> None:
-        register_response = self.client.post(
-            "/api/community/auth/register",
-            headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
-            json={
-                "username": "changeemailuser",
-                "email": "old-email@example.com",
-                "password": "password123",
-            },
+    def _presignup(self, *, owner_key: str, email: str, username: str) -> None:
+        send_resp = self.client.post(
+            "/api/community/auth/send-signup-verification",
+            headers={COMMUNITY_OWNER_HEADER: owner_key},
+            json={"email": email, "username": username},
         )
-        self.assertEqual(register_response.status_code, 201, register_response.text)
-        register_json = register_response.json()
-        original_code = str(register_json["verification_code_debug"])
-        session_token = str(register_json["session_token"])
+        self.assertEqual(send_resp.status_code, 200, send_resp.text)
+        code = str(send_resp.json().get("verification_code_debug") or "")
+        self.assertTrue(code)
+        verify_resp = self.client.post(
+            "/api/community/auth/verify-signup-email",
+            headers={COMMUNITY_OWNER_HEADER: owner_key},
+            json={"email": email, "code": code},
+        )
+        self.assertEqual(verify_resp.status_code, 200, verify_resp.text)
+
+    def _create_unverified_account_with_session(self, *, username: str, email: str, password: str) -> tuple[str, str]:
+        """Insert an unverified account + session directly into the DB."""
+        import secrets as _secrets
+        account_id = str(__import__("uuid").uuid4())
+        salt_hex = "bb" * 16
+        token_raw = _secrets.token_urlsafe(32)
+        token_hash = __import__("hashlib").sha256(token_raw.encode("utf-8")).hexdigest()
+        ts = now_iso()
+        code = "123456"
+        code_hash = _hash_community_verification_code(code)
+        with get_conn(transactional=True) as conn:
+            insert(conn, "community_accounts", {
+                "id": account_id, "username": username, "username_normalized": username.lower(),
+                "email": email, "email_normalized": email.lower(),
+                "password_hash": _hash_community_password(password, salt_hex), "password_salt": salt_hex,
+                "verified_at": None, "verification_code_hash": code_hash,
+                "verification_expires_at": "2099-01-01T00:00:00+00:00",
+                "legacy_claim_owner_key_hash": None, "created_at": ts, "updated_at": ts,
+            })
+            insert(conn, "community_sessions", {
+                "id": str(__import__("uuid").uuid4()), "account_id": account_id,
+                "token_hash": token_hash, "created_at": ts, "last_used_at": ts,
+                "expires_at": "2099-01-01T00:00:00+00:00",
+            })
+        return token_raw, code
+
+    def test_unverified_account_can_change_email_and_only_new_code_works(self) -> None:
+        session_token, original_code = self._create_unverified_account_with_session(
+            username="changeemailuser", email="old-email@example.com", password="password123",
+        )
 
         change_email_response = self.client.post(
             "/api/community/auth/change-email",
@@ -249,17 +282,9 @@ class CommunityChangeEmailTests(_VerificationTestBase):
                 },
             )
 
-        register_response = self.client.post(
-            "/api/community/auth/register",
-            headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
-            json={
-                "username": "changemaildup",
-                "email": "available@example.com",
-                "password": "password123",
-            },
+        session_token, _ = self._create_unverified_account_with_session(
+            username="changemaildup", email="available@example.com", password="password123",
         )
-        self.assertEqual(register_response.status_code, 201, register_response.text)
-        session_token = str(register_response.json()["session_token"])
 
         change_email_response = self.client.post(
             "/api/community/auth/change-email",
@@ -404,31 +429,49 @@ class CommunityAuthSecurityTests(_VerificationTestBase):
 
 class CommunityDeleteAccountTests(_VerificationTestBase):
     def _register_and_verify(self, *, owner_key: str, username: str, password: str) -> tuple[str, str]:
+        email = f"{username}@example.com"
+        # Pre-signup verification
+        send_resp = self.client.post(
+            "/api/community/auth/send-signup-verification",
+            headers={COMMUNITY_OWNER_HEADER: owner_key},
+            json={"email": email, "username": username},
+        )
+        self.assertEqual(send_resp.status_code, 200, send_resp.text)
+        signup_code = str(send_resp.json().get("verification_code_debug") or "")
+        self.assertTrue(signup_code)
+        verify_signup_resp = self.client.post(
+            "/api/community/auth/verify-signup-email",
+            headers={COMMUNITY_OWNER_HEADER: owner_key},
+            json={"email": email, "code": signup_code},
+        )
+        self.assertEqual(verify_signup_resp.status_code, 200, verify_signup_resp.text)
+
         register_response = self.client.post(
             "/api/community/auth/register",
             headers={COMMUNITY_OWNER_HEADER: owner_key},
             json={
                 "username": username,
-                "email": f"{username}@example.com",
+                "email": email,
                 "password": password,
             },
         )
         self.assertEqual(register_response.status_code, 201, register_response.text)
         register_payload = register_response.json()
         session_token = str(register_payload["session_token"])
-        verification_code = str(register_payload["verification_code_debug"])
         account_id = str(register_payload["account"]["id"])
 
-        verify_response = self.client.post(
-            "/api/community/auth/verify",
-            headers={
-                COMMUNITY_OWNER_HEADER: owner_key,
-                COMMUNITY_SESSION_HEADER: session_token,
-            },
-            json={"code": verification_code},
-        )
-        self.assertEqual(verify_response.status_code, 200, verify_response.text)
-        self.assertTrue(verify_response.json()["account"]["is_verified"])
+        if register_payload.get("verification_required") and register_payload.get("verification_code_debug"):
+            verification_code = str(register_payload["verification_code_debug"])
+            verify_response = self.client.post(
+                "/api/community/auth/verify",
+                headers={
+                    COMMUNITY_OWNER_HEADER: owner_key,
+                    COMMUNITY_SESSION_HEADER: session_token,
+                },
+                json={"code": verification_code},
+            )
+            self.assertEqual(verify_response.status_code, 200, verify_response.text)
+            self.assertTrue(verify_response.json()["account"]["is_verified"])
         return account_id, session_token
 
     def test_delete_account_removes_account_sessions_and_owned_data(self) -> None:

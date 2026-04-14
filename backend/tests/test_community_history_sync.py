@@ -49,26 +49,43 @@ class CommunityHistorySyncTests(unittest.TestCase):
         main_module.settings = get_settings()
 
     def _register_and_verify(self, *, client: TestClient, owner_key: str, username: str, password: str) -> str:
+        email = f"{username}@example.com"
+        send_resp = client.post(
+            "/api/community/auth/send-signup-verification",
+            headers={COMMUNITY_OWNER_HEADER: owner_key},
+            json={"email": email, "username": username},
+        )
+        self.assertEqual(send_resp.status_code, 200, send_resp.text)
+        signup_code = str(send_resp.json().get("verification_code_debug") or "")
+        self.assertTrue(signup_code)
+        verify_signup_resp = client.post(
+            "/api/community/auth/verify-signup-email",
+            headers={COMMUNITY_OWNER_HEADER: owner_key},
+            json={"email": email, "code": signup_code},
+        )
+        self.assertEqual(verify_signup_resp.status_code, 200, verify_signup_resp.text)
+
         register_response = client.post(
             "/api/community/auth/register",
             headers={COMMUNITY_OWNER_HEADER: owner_key},
-            json={"username": username, "email": f"{username}@example.com", "password": password},
+            json={"username": username, "email": email, "password": password},
         )
         self.assertEqual(register_response.status_code, 201, register_response.text)
         register_json = register_response.json()
-        verification_code = str(register_json["verification_code_debug"])
         session_token = str(register_json["session_token"])
+        verification_code = str(register_json.get("verification_code_debug") or "")
 
-        verify_response = client.post(
-            "/api/community/auth/verify",
-            headers={
-                COMMUNITY_OWNER_HEADER: owner_key,
-                COMMUNITY_SESSION_HEADER: session_token,
-            },
-            json={"code": verification_code},
-        )
-        self.assertEqual(verify_response.status_code, 200, verify_response.text)
-        self.assertTrue(verify_response.json()["account"]["is_verified"])
+        if verification_code:
+            verify_response = client.post(
+                "/api/community/auth/verify",
+                headers={
+                    COMMUNITY_OWNER_HEADER: owner_key,
+                    COMMUNITY_SESSION_HEADER: session_token,
+                },
+                json={"code": verification_code},
+            )
+            self.assertEqual(verify_response.status_code, 200, verify_response.text)
+            self.assertTrue(verify_response.json()["account"]["is_verified"])
         return session_token
 
     def test_history_syncs_across_devices_for_same_account(self) -> None:

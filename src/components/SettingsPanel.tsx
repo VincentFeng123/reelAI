@@ -759,6 +759,8 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     });
   }, [availabilityState, isAvailabilityModalMounted, isAvailabilityModalVisible, onAvailabilityModalStateChange]);
 
+  const noticeTimerRef = useRef<number | null>(null);
+
   useEffect(() => {
     return () => {
       if (typeof window === "undefined") {
@@ -773,15 +775,21 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
       if (availabilityHeuristicTimerRef.current !== null) {
         window.clearTimeout(availabilityHeuristicTimerRef.current);
       }
+      if (noticeTimerRef.current !== null) {
+        window.clearTimeout(noticeTimerRef.current);
+      }
     };
   }, []);
-
   const showNotice = useCallback((message: string) => {
     setNotice(message);
     if (typeof window === "undefined") {
       return;
     }
-    window.setTimeout(() => {
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
+    noticeTimerRef.current = window.setTimeout(() => {
+      noticeTimerRef.current = null;
       setNotice((current) => (current === message ? null : current));
     }, 2200);
   }, []);

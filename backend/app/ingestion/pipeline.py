@@ -623,7 +623,7 @@ class IngestionPipeline:
                         takeaways=takeaways,
                         captions=clip_captions,
                         score=1.0,
-                        relevance_score=None,
+                        relevance_score=getattr(tr, 'relevance_score', None),
                         discovery_score=None,
                         clipability_score=1.0,
                         query_strategy="topic_cut",

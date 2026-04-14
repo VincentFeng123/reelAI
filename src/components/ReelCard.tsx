@@ -137,6 +137,7 @@ export function ReelCard({
   const autoplayRetryCountRef = useRef(0);
   const autoplayEnabledRef = useRef(autoplayEnabled);
   const playbackRateRef = useRef(playbackRate);
+  const isActiveRef = useRef(isActive);
   const didHandleClipEndRef = useRef(false);
   const didUserInteractRef = useRef(false);
   const manualPauseRequestedRef = useRef(false);
@@ -157,6 +158,16 @@ export function ReelCard({
   const videoId = useMemo(() => extractVideoId(reel.video_url), [reel.video_url]);
   const videoProvider = useMemo(() => detectVideoProvider(reel.video_url), [reel.video_url]);
   const isYouTubeVideo = videoProvider === "youtube";
+  const safeExternalUrl = useMemo(() => {
+    if (isYouTubeVideo) return null;
+    try {
+      const parsed = new URL(reel.video_url);
+      if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+        return parsed.href;
+      }
+    } catch { /* invalid URL */ }
+    return null;
+  }, [reel.video_url, isYouTubeVideo]);
   const isCommunityImported = (reel.relevance_reason || "").trim() === "Opened from a community set.";
   // Upper bound from the server-reported video duration (when present). This
   // protects against malformed t_start / t_end (e.g. timestamps past the
@@ -218,6 +229,10 @@ export function ReelCard({
   useEffect(() => {
     autoplayEnabledRef.current = autoplayEnabled;
   }, [autoplayEnabled]);
+
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
 
   useEffect(() => {
     playbackRateRef.current = playbackRate;
@@ -936,17 +951,21 @@ export function ReelCard({
               ref={hostContainerRef}
               className="pointer-events-none absolute inset-0 h-full w-full"
             />
-          ) : (
+          ) : safeExternalUrl ? (
             <iframe
-              src={reel.video_url}
+              src={safeExternalUrl}
               title={reel.video_title || reel.concept_title || "Community reel"}
-            className="absolute inset-0 h-full w-full border-0"
-            loading="eager"
-            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-            sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox allow-presentation"
-            allowFullScreen
-          />
-        )}
+              className="absolute inset-0 h-full w-full border-0"
+              loading="eager"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+              sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-presentation"
+              allowFullScreen
+            />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center bg-black/70 text-xs uppercase tracking-[0.12em] text-white/55">
+              Invalid video URL
+            </div>
+          )}
         </div>
       ) : (
         <div className="flex h-full w-full items-center justify-center bg-black/70 text-xs uppercase tracking-[0.12em] text-white/55">

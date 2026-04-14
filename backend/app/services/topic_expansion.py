@@ -637,8 +637,8 @@ class TopicExpansionService:
             likely_language=likely_language,
         )
 
-        if opaque_topic:
-            self.request_timeout_sec = self.request_timeout_sec * 1.5
+        # Use a local timeout to avoid permanently inflating the instance value.
+        effective_timeout = self.request_timeout_sec * 1.5 if opaque_topic else self.request_timeout_sec
 
         aliases = self._collect_aliases(
             topic=clean_topic,

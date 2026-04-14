@@ -797,6 +797,7 @@ class ReelService:
         )
         self._strategy_history_cache: dict[str, float] = {}
         self._strategy_history_cache_lock = threading.Lock()
+        self._strategy_history_cache_max_size = 10_000
         allow_openai_serverless = os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1"
         can_use_openai = (
             bool(settings.openai_enabled)
@@ -4055,13 +4056,22 @@ class ReelService:
                         rationale=f"llm_intent: LLM selected '{vt}' for concept '{title}'",
                     )
                     with self._strategy_history_cache_lock:
+                        self._evict_strategy_cache_if_full()
                         self._strategy_history_cache[cache_key] = result
                     return result
         except Exception:
             pass
         with self._strategy_history_cache_lock:
+            self._evict_strategy_cache_if_full()
             self._strategy_history_cache[cache_key] = "_none_"
         return None
+
+    def _evict_strategy_cache_if_full(self) -> None:
+        """Evict oldest half of cache entries when max size is reached. Must be called under lock."""
+        if len(self._strategy_history_cache) >= self._strategy_history_cache_max_size:
+            keys = list(self._strategy_history_cache.keys())
+            for key in keys[: len(keys) // 2]:
+                del self._strategy_history_cache[key]
 
     def _build_literal_query(
         self,

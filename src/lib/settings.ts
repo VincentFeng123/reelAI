@@ -302,7 +302,7 @@ export function normalizeStudyReelsSettings(raw: StudyReelsSettingsInput): Study
     defaultInputMode: toInputMode(raw.defaultInputMode),
     minRelevanceThreshold: Number(minRelevanceThreshold.toFixed(2)),
     startMuted: raw.startMuted !== false && raw.startMuted !== "0" && raw.startMuted !== "false",
-    autoplayNextReel: raw.autoplayNextReel !== false && raw.autoplayNextReel !== "0" && raw.autoplayNextReel !== "false",
+    autoplayNextReel: raw.autoplayNextReel === true || raw.autoplayNextReel === "1" || raw.autoplayNextReel === "true",
     videoPoolMode: toVideoPoolMode(raw.videoPoolMode),
     preferredVideoDuration: toPreferredVideoDuration(raw.preferredVideoDuration),
     targetClipDurationSec: normalizedTarget,

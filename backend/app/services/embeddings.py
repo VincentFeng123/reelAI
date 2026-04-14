@@ -103,7 +103,7 @@ class EmbeddingService:
         if vec.ndim != 1:
             return None, True
         if vec.size == self.dim:
-            return self._normalize(vec), True
+            return self._normalize(vec), False
         # Dimension mismatch — always allow replacement so the cache stays usable.
         # When OpenAI is re-enabled, 256-dim entries will be replaced with 1536-dim ones.
         return None, True

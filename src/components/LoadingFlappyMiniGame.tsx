@@ -86,18 +86,26 @@ export function LoadingFlappyMiniGame() {
     state.spawnCooldown = 46;
   }, []);
 
+  const restartLoopRef = useRef<(() => void) | null>(null);
+
   const flap = useCallback(() => {
     const state = stateRef.current;
     if (!state.started) {
       resetRound(state, true);
       state.birdVY = FLAP_VELOCITY;
       syncUi(state);
+      if (frameRef.current === null && restartLoopRef.current) {
+        restartLoopRef.current();
+      }
       return;
     }
     if (!state.alive) {
       resetRound(state, true);
       state.birdVY = FLAP_VELOCITY;
       syncUi(state);
+      if (frameRef.current === null && restartLoopRef.current) {
+        restartLoopRef.current();
+      }
       return;
     }
     state.birdVY = FLAP_VELOCITY;
@@ -233,11 +241,23 @@ export function LoadingFlappyMiniGame() {
       }
 
       draw();
-      frameRef.current = window.requestAnimationFrame(tick);
+      // Only continue the animation loop when the game is active.
+      // When idle (not started or dead), draw once and stop to save CPU.
+      if (current.started && current.alive) {
+        frameRef.current = window.requestAnimationFrame(tick);
+      } else {
+        frameRef.current = null;
+      }
     };
 
     frameRef.current = window.requestAnimationFrame(tick);
+    restartLoopRef.current = () => {
+      if (frameRef.current === null) {
+        frameRef.current = window.requestAnimationFrame(tick);
+      }
+    };
     return () => {
+      restartLoopRef.current = null;
       if (frameRef.current !== null) {
         window.cancelAnimationFrame(frameRef.current);
         frameRef.current = null;

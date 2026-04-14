@@ -13,6 +13,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -129,7 +130,16 @@ from .ingestion.pipeline import IngestionPipeline
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
-app = FastAPI(title="StudyReels API", version="0.1.0")
+
+@asynccontextmanager
+async def lifespan(app_instance):
+    os.makedirs(settings.data_dir, exist_ok=True)
+    init_db()
+    _resume_pending_refinement_jobs()
+    _warn_if_hosted_auth_email_is_unconfigured()
+    yield
+
+app = FastAPI(title="StudyReels API", version="0.1.0", lifespan=lifespan)
 
 
 def _normalize_origin_candidate(raw_origin: str) -> str | None:
@@ -281,6 +291,7 @@ REFINEMENT_STAGE_ANCHORED_ADJACENT = 3
 REFINEMENT_STAGE_MULTI_CLIP_EXPANDED = 4
 REFINEMENT_STAGE_RECOVERY_GRAPH = 5
 MAX_REFINEMENT_RECOVERY_STAGE = REFINEMENT_STAGE_RECOVERY_GRAPH
+REFINEMENT_JOB_STALE_TIMEOUT_SEC = 300
 
 VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
@@ -2599,8 +2610,8 @@ def _upsert_generation_head(
         row["stage_exhausted_json"] = "{}"
     try:
         upsert(conn, "reel_generation_heads", row)
-    except sqlite3.OperationalError as exc:
-        if "no column named id" not in str(exc).lower():
+    except (sqlite3.OperationalError, Exception) as exc:
+        if "no column named id" not in str(exc).lower() and "column" not in str(exc).lower():
             raise
         execute_modify(
             conn,
@@ -2757,6 +2768,15 @@ def _fetch_refinement_job_for_generation(conn, source_generation_id: str | None)
     )
     if not job_row:
         return None
+    if str(job_row.get("status") or "").strip().lower() == "running" and _refinement_job_is_stale(job_row):
+        job_id = str(job_row.get("id") or "").strip()
+        logger.warning("Resetting stale refinement job %s to failed", job_id)
+        execute_modify(
+            conn,
+            "UPDATE reel_generation_jobs SET status = 'failed', error_text = 'stale (timed out)', completed_at = ? WHERE id = ?",
+            (now_iso(), job_id),
+        )
+        return None
     if str(job_row.get("status") or "").strip().lower() == "queued":
         resumed = _resume_queued_refinement_job(conn, job_row)
         if resumed is None:
@@ -2769,18 +2789,14 @@ def _submit_refinement_job(job_id: str) -> bool:
     clean_job_id = str(job_id or "").strip()
     if not clean_job_id or SERVERLESS_MODE:
         return False
+    if _refinement_job_executor is None:
+        return False
     with _refinement_jobs_lock:
         if clean_job_id in _scheduled_refinement_job_ids:
             return False
         _scheduled_refinement_job_ids.add(clean_job_id)
         try:
-            worker = threading.Thread(
-                target=_run_refinement_job_with_cleanup,
-                args=(clean_job_id,),
-                daemon=True,
-                name=f"reels-refine-{clean_job_id[:8]}",
-            )
-            worker.start()
+            _refinement_job_executor.submit(_run_refinement_job_with_cleanup, clean_job_id)
         except Exception:
             _scheduled_refinement_job_ids.discard(clean_job_id)
             raise
@@ -3259,7 +3275,9 @@ def _ranked_request_reels(
 ) -> list[dict[str, Any]]:
     try:
         material_row = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
-    except sqlite3.OperationalError:
+    except (sqlite3.OperationalError, Exception) as _schema_exc:
+        if "column" not in str(_schema_exc).lower() and "exist" not in str(_schema_exc).lower():
+            raise
         material_row = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
     subject_tag = str((material_row or {}).get("subject_tag") or "").strip() or None
     strict_topic_only = str((material_row or {}).get("source_type") or "").strip().lower() == "topic"
@@ -4803,14 +4821,6 @@ def _normalize_community_history_items(payload_items) -> list[dict[str, object]]
         if len(normalized) >= MAX_COMMUNITY_HISTORY_ITEMS:
             break
     return normalized
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-    os.makedirs(settings.data_dir, exist_ok=True)
-    init_db()
-    _resume_pending_refinement_jobs()
-    _warn_if_hosted_auth_email_is_unconfigured()
 
 
 @app.get("/")
@@ -6798,8 +6808,12 @@ def create_community_set(request: Request, payload: CommunitySetCreateRequest):
     thumbnail_url = payload.thumbnail_url.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Set name is required.")
+    if len(title) > 200:
+        raise HTTPException(status_code=400, detail="Set name must be 200 characters or fewer.")
     if len(description) < 18:
         raise HTTPException(status_code=400, detail="Description must be at least 18 characters.")
+    if len(description) > 5000:
+        raise HTTPException(status_code=400, detail="Description must be 5000 characters or fewer.")
     if not thumbnail_url:
         raise HTTPException(status_code=400, detail="Thumbnail is required.")
     thumbnail_url = _normalize_community_thumbnail_url(thumbnail_url)
@@ -6915,8 +6929,12 @@ def update_community_set(request: Request, set_id: str, payload: CommunitySetUpd
     thumbnail_url = payload.thumbnail_url.strip()
     if not title:
         raise HTTPException(status_code=400, detail="Set name is required.")
+    if len(title) > 200:
+        raise HTTPException(status_code=400, detail="Set name must be 200 characters or fewer.")
     if len(description) < 18:
         raise HTTPException(status_code=400, detail="Description must be at least 18 characters.")
+    if len(description) > 5000:
+        raise HTTPException(status_code=400, detail="Description must be 5000 characters or fewer.")
     if not thumbnail_url:
         raise HTTPException(status_code=400, detail="Thumbnail is required.")
     thumbnail_url = _normalize_community_thumbnail_url(thumbnail_url)

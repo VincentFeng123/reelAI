@@ -167,9 +167,11 @@ class IngestionTopicCutTests(unittest.TestCase):
 
     def test_long_form_llm_path_returns_multiple_reels(self) -> None:
         source_url = "https://www.youtube.com/watch?v=aircAruvnKk"
+        info_dict = dict(_fake_info_dict_youtube())
+        info_dict["duration"] = 600.0  # match transcript fixture span (20 cues x 30s)
         fake_adapter = _FakeAdapter(
             platform="yt",
-            info_dict=_fake_info_dict_youtube(),
+            info_dict=info_dict,
             source_url=source_url,
             source_id="aircAruvnKk",
         )
@@ -178,7 +180,7 @@ class IngestionTopicCutTests(unittest.TestCase):
 
         with contextlib.ExitStack() as stack:
             # The transcript fixture spans 600s, so probe_duration must agree.
-            for patch in _patch_ffmpeg_and_ffprobe(probe_duration_sec=720.0):
+            for patch in _patch_ffmpeg_and_ffprobe(probe_duration_sec=600.0):
                 stack.enter_context(patch)
             response = self.client.post(
                 "/api/ingest/topic-cut",
@@ -283,9 +285,11 @@ class IngestionTopicCutTests(unittest.TestCase):
 
     def test_heuristic_path_still_produces_reels(self) -> None:
         source_url = "https://www.youtube.com/watch?v=aircAruvnKk"
+        info_dict = dict(_fake_info_dict_youtube())
+        info_dict["duration"] = 600.0  # match transcript fixture span (20 cues x 30s)
         fake_adapter = _FakeAdapter(
             platform="yt",
-            info_dict=_fake_info_dict_youtube(),
+            info_dict=info_dict,
             source_url=source_url,
             source_id="aircAruvnKk",
         )
@@ -295,7 +299,7 @@ class IngestionTopicCutTests(unittest.TestCase):
         main_module.ingestion_pipeline._openai_client = client
 
         with contextlib.ExitStack() as stack:
-            for patch in _patch_ffmpeg_and_ffprobe(probe_duration_sec=720.0):
+            for patch in _patch_ffmpeg_and_ffprobe(probe_duration_sec=600.0):
                 stack.enter_context(patch)
             response = self.client.post(
                 "/api/ingest/topic-cut",
@@ -323,9 +327,11 @@ class IngestionTopicCutTests(unittest.TestCase):
 
     def test_re_ingest_is_idempotent(self) -> None:
         source_url = "https://www.youtube.com/watch?v=aircAruvnKk"
+        info_dict = dict(_fake_info_dict_youtube())
+        info_dict["duration"] = 600.0  # match transcript fixture span (20 cues x 30s)
         fake_adapter = _FakeAdapter(
             platform="yt",
-            info_dict=_fake_info_dict_youtube(),
+            info_dict=info_dict,
             source_url=source_url,
             source_id="aircAruvnKk",
         )
@@ -333,7 +339,7 @@ class IngestionTopicCutTests(unittest.TestCase):
         main_module.ingestion_pipeline._openai_client = _make_mock_openai_client()
 
         with contextlib.ExitStack() as stack:
-            for patch in _patch_ffmpeg_and_ffprobe(probe_duration_sec=720.0):
+            for patch in _patch_ffmpeg_and_ffprobe(probe_duration_sec=600.0):
                 stack.enter_context(patch)
             r1 = self.client.post("/api/ingest/topic-cut",
                                   json={"source_url": source_url})
@@ -375,6 +381,7 @@ class IngestionTopicCutTests(unittest.TestCase):
         # _FakeAdapter passes its info_dict straight through, so the pipeline
         # will see them in the same shape yt-dlp produces.
         info_dict = dict(_fake_info_dict_youtube())
+        info_dict["duration"] = 600.0  # match transcript fixture span (20 cues x 30s)
         info_dict["chapters"] = [
             {"start_time": 0.0, "end_time": 60.0, "title": "Intro"},  # fluff, dropped
             {"start_time": 60.0, "end_time": 200.0, "title": "Cooking spaghetti carbonara"},
@@ -394,7 +401,7 @@ class IngestionTopicCutTests(unittest.TestCase):
         main_module.ingestion_pipeline._openai_client = client
 
         with contextlib.ExitStack() as stack:
-            for patch in _patch_ffmpeg_and_ffprobe(probe_duration_sec=720.0):
+            for patch in _patch_ffmpeg_and_ffprobe(probe_duration_sec=600.0):
                 stack.enter_context(patch)
             response = self.client.post(
                 "/api/ingest/topic-cut",
