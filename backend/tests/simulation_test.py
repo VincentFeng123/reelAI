@@ -331,6 +331,67 @@ def assess_topic_relevance(clip_text: str, subject: str, keywords: list) -> tupl
     return is_relevant, notes
 
 
+def _innertube_fetch_transcript(video_id: str) -> list | None:
+    """Fetch transcript via YouTube's Innertube API (bypasses youtube_transcript_api).
+
+    Returns list of cues [{text, start, duration}, ...] or None on failure.
+    """
+    _INNERTUBE_PLAYER_URL = "https://www.youtube.com/youtubei/v1/player"
+    _CLIENTS = [
+        {"context": {"client": {"clientName": "WEB", "clientVersion": "2.20240726.00.00", "hl": "en", "gl": "US"}}},
+        {"context": {"client": {"clientName": "ANDROID", "clientVersion": "19.29.37", "hl": "en", "gl": "US", "androidSdkVersion": 34}}},
+    ]
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Content-Type": "application/json",
+        "Origin": "https://www.youtube.com",
+        "Referer": f"https://www.youtube.com/watch?v={video_id}",
+    })
+    for client_ctx in _CLIENTS:
+        try:
+            resp = session.post(_INNERTUBE_PLAYER_URL, json={**client_ctx, "videoId": video_id}, timeout=12)
+            if resp.status_code != 200:
+                continue
+            tracks = resp.json().get("captions", {}).get("playerCaptionsTracklistRenderer", {}).get("captionTracks", [])
+            if not tracks:
+                continue
+            best = None
+            for t in tracks:
+                if str(t.get("languageCode", "")).lower().startswith("en"):
+                    if best is None or t.get("kind") != "asr":
+                        best = t
+            if not best:
+                best = tracks[0]
+            base_url = best.get("baseUrl", "")
+            if not base_url:
+                continue
+            base_url = re.sub(r"[&?]fmt=[^&]*", "", base_url)
+            sep = "&" if "?" in base_url else "?"
+            cap_resp = session.get(f"{base_url}{sep}fmt=json3", timeout=12)
+            if cap_resp.status_code != 200:
+                continue
+            cues = []
+            for event in cap_resp.json().get("events", []):
+                segs = event.get("segs")
+                if not segs:
+                    continue
+                text = "".join(s.get("utf8", "") for s in segs).strip()
+                if not text or text == "\n":
+                    continue
+                cues.append({
+                    "text": text,
+                    "start": event.get("tStartMs", 0) / 1000.0,
+                    "duration": event.get("dDurationMs", 0) / 1000.0,
+                })
+            if cues:
+                print(f"      [innertube] Got {len(cues)} cues for {video_id}")
+                return cues
+        except Exception:
+            continue
+    return None
+
+
 def evaluate_clip(reel: dict, subject: str, keywords: list) -> ClipEvaluation:
     """Full evaluation of a single clip."""
     video_url = reel.get("video_url", "")
@@ -354,8 +415,8 @@ def evaluate_clip(reel: dict, subject: str, keywords: list) -> ClipEvaluation:
         ev.relevance_notes = "no video ID"
         return ev
 
-    # Try to fetch the transcript. If IP-blocked, fall back to backend-provided
-    # captions/snippet for boundary analysis.
+    # Try to fetch the transcript. If IP-blocked, try Innertube API, then
+    # fall back to backend-provided captions/snippet for boundary analysis.
     try:
         for attempt in range(2):
             try:
@@ -365,9 +426,13 @@ def evaluate_clip(reel: dict, subject: str, keywords: list) -> ClipEvaluation:
                 if "IpBlocked" in type(retry_err).__name__ and attempt < 1:
                     time.sleep(3)
                     continue
-                # Fall back to backend captions
+                # Fall back to Innertube API before backend captions
                 transcript = None
                 break
+
+        # Innertube fallback when youtube_transcript_api is IP-blocked
+        if transcript is None:
+            transcript = _innertube_fetch_transcript(video_id)
 
         if transcript:
             clip_cues = [c for c in transcript if c['start'] + c['duration'] > t_start and c['start'] < t_end]

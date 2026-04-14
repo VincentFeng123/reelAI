@@ -3409,8 +3409,17 @@ class YouTubeService:
                     time.sleep(0.5 * (attempt + 1))
                     continue
                 if attempt == max_attempts - 1:
-                    logger.warning("All transcript attempts failed for %s: %s", video_id, exc_name)
+                    logger.warning("All youtube_transcript_api attempts failed for %s: %s — trying Innertube", video_id, exc_name)
                 transcript = []
+
+        # Innertube fallback: if youtube_transcript_api returned nothing (IP-blocked
+        # or other failure), try YouTube's internal Innertube API which has much
+        # more relaxed rate-limiting and uses a different endpoint.
+        if not transcript:
+            try:
+                transcript = self._innertube_fetch_transcript(video_id)
+            except Exception as exc:
+                logger.debug("Innertube fallback failed for %s: %s", video_id, exc)
 
         # Compute coverage metadata for downstream consumers.
         coverage_ratio: float | None = None
@@ -3441,6 +3450,148 @@ class YouTubeService:
             return parsed
         except ValueError:
             return None
+
+    # ------------------------------------------------------------------
+    # Alternative transcript fetching — bypasses youtube_transcript_api
+    # via two strategies:
+    #   A) Innertube player API → caption track URLs → json3 content
+    #   B) Watch page scraping → extract captionTracks from HTML → json3
+    # Both are fallbacks when youtube_transcript_api is IP-blocked.
+    # ------------------------------------------------------------------
+    _INNERTUBE_PLAYER_URL = "https://www.youtube.com/youtubei/v1/player"
+    _INNERTUBE_CLIENTS: list[dict[str, Any]] = [
+        {"context": {"client": {"clientName": "WEB", "clientVersion": "2.20240726.00.00", "hl": "en", "gl": "US"}}},
+        {"context": {"client": {"clientName": "ANDROID", "clientVersion": "19.29.37", "hl": "en", "gl": "US", "androidSdkVersion": 34}}},
+    ]
+
+    def _innertube_fetch_transcript(self, video_id: str) -> list[dict[str, Any]]:
+        """Fetch transcript bypassing youtube_transcript_api.
+
+        Strategy A: Innertube player API (POST) → caption track URLs → json3.
+        Strategy B: Scrape watch page HTML → extract captionTracks → json3.
+
+        Returns transcript in [{text, start, duration}, ...] format.
+        """
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": _random_user_agent(),
+            "Accept-Language": "en-US,en;q=0.9",
+            **_STEALTH_HEADERS,
+        })
+        proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
+        if proxy:
+            session.proxies.update(proxy)
+
+        caption_tracks: list[dict[str, Any]] = []
+
+        # Strategy A: Innertube player API (works when not IP-blocked)
+        for client_ctx in self._INNERTUBE_CLIENTS:
+            try:
+                session.headers["Content-Type"] = "application/json"
+                session.headers["Origin"] = "https://www.youtube.com"
+                session.headers["Referer"] = f"https://www.youtube.com/watch?v={video_id}"
+                resp = session.post(
+                    self._INNERTUBE_PLAYER_URL,
+                    json={**client_ctx, "videoId": video_id},
+                    timeout=12,
+                )
+                if resp.status_code != 200:
+                    continue
+                player_data = resp.json()
+                tracks = (
+                    player_data
+                    .get("captions", {})
+                    .get("playerCaptionsTracklistRenderer", {})
+                    .get("captionTracks", [])
+                )
+                if tracks:
+                    caption_tracks = tracks
+                    logger.debug("Innertube player API found %d tracks for %s", len(tracks), video_id)
+                    break
+            except Exception as exc:
+                logger.debug("Innertube player %s failed for %s: %s",
+                             client_ctx["context"]["client"]["clientName"], video_id, exc)
+
+        # Strategy B: Scrape watch page HTML for embedded captionTracks
+        if not caption_tracks:
+            try:
+                session.headers.pop("Content-Type", None)
+                session.headers.pop("Origin", None)
+                watch_resp = session.get(
+                    f"https://www.youtube.com/watch?v={video_id}",
+                    timeout=15,
+                )
+                if watch_resp.status_code == 200:
+                    page = watch_resp.text
+                    idx = page.find('"captionTracks":')
+                    if idx >= 0:
+                        arr_start = page.index("[", idx)
+                        depth = 0
+                        arr_end = arr_start
+                        for i in range(min(50000, len(page) - arr_start)):
+                            ch = page[arr_start + i]
+                            if ch == "[":
+                                depth += 1
+                            elif ch == "]":
+                                depth -= 1
+                            if depth == 0:
+                                arr_end = arr_start + i + 1
+                                break
+                        caption_tracks = json.loads(page[arr_start:arr_end])
+                        logger.debug("Watch page scrape found %d tracks for %s", len(caption_tracks), video_id)
+            except Exception as exc:
+                logger.debug("Watch page scrape failed for %s: %s", video_id, exc)
+
+        if not caption_tracks:
+            return []
+
+        # Pick best English caption track (prefer manual over auto-generated)
+        best_track = None
+        for track in caption_tracks:
+            lang = str(track.get("languageCode", "")).lower()
+            if lang.startswith("en"):
+                if best_track is None or track.get("kind") != "asr":
+                    best_track = track
+        if not best_track:
+            best_track = caption_tracks[0]
+
+        base_url = best_track.get("baseUrl", "")
+        if not base_url:
+            return []
+
+        # Fetch caption content in json3 format
+        base_url = re.sub(r"[&?]fmt=[^&]*", "", base_url)
+        separator = "&" if "?" in base_url else "?"
+        json3_url = f"{base_url}{separator}fmt=json3"
+
+        try:
+            cap_resp = session.get(json3_url, timeout=12)
+            if cap_resp.status_code != 200:
+                logger.debug("Caption content fetch returned %d for %s", cap_resp.status_code, video_id)
+                return []
+            cap_data = cap_resp.json()
+        except Exception as exc:
+            logger.debug("Caption content fetch failed for %s: %s", video_id, exc)
+            return []
+
+        # Parse json3 into [{text, start, duration}, ...]
+        cues: list[dict[str, Any]] = []
+        for event in cap_data.get("events", []):
+            segs = event.get("segs")
+            if not segs:
+                continue
+            text = "".join(seg.get("utf8", "") for seg in segs).strip()
+            if not text or text == "\n":
+                continue
+            cues.append({
+                "text": text,
+                "start": event.get("tStartMs", 0) / 1000.0,
+                "duration": event.get("dDurationMs", 0) / 1000.0,
+            })
+
+        if cues:
+            logger.info("Alternative transcript fetch success for %s: %d cues", video_id, len(cues))
+        return cues
 
     def _fallback_any_transcript(self, video_id: str) -> list[dict[str, Any]]:
         try:
