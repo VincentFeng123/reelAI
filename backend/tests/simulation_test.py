@@ -131,8 +131,11 @@ def is_topic_intro(text: str, subject: str) -> bool:
     return any(p in lower for p in intro_patterns)
 
 
-def assess_educational_quality(title: str, description: str, text: str) -> tuple[bool, str]:
-    """Assess if the video is genuinely educational."""
+def assess_educational_quality(
+    title: str, description: str, text: str,
+    channel_name: str = "", video_duration_sec: int = 0, ai_summary: str = "",
+) -> tuple[bool, str]:
+    """Assess if the video is genuinely educational using all available metadata."""
     title_lower = title.lower()
     desc_lower = description.lower()
     combined = f"{title_lower} {desc_lower}"
@@ -148,38 +151,71 @@ def assess_educational_quality(title: str, description: str, text: str) -> tuple
     edu_signals = 0.0
     reasons = []
 
-    # Title keywords (broad set)
+    # Signal 1: Known educational channel (most authoritative signal)
+    # Matches the production KNOWN_EDUCATIONAL_CHANNELS set in reels.py
+    known_edu = [
+        '3blue1brown', 'amoeba sisters', 'bozeman science', 'brilliant',
+        'bright side of mathematics', 'cgp grey', 'computerphile', 'crash course',
+        'domain of science', 'dr. becky', 'dr. trefor bazett', 'engineerguy',
+        'fireship', 'freecodecamp', 'jbstatistics', 'khan academy', 'kurzgesagt',
+        'lumen learning', 'mark rober', 'mathologer', 'minutephysics',
+        'mit opencourseware', 'nancypi', 'national geographic', 'numberphile',
+        'organic chemistry tutor', 'patrickjmt', 'pbs space time', 'physics girl',
+        'professor dave explains', 'professor leonard', 'real engineering',
+        'science click', 'scishow', 'sixty symbols', 'smarter every day',
+        'stand-up maths', 'steve mould', 'ted-ed', 'the coding train',
+        'the engineer guy', 'the organic chemistry tutor', 'tibees', 'tom scott',
+        'two minute papers', 'veritasium', 'vsauce', 'zach star',
+        # Additional well-known educational channels
+        'mit', 'ted', 'simplilearn', 'freeschool', 'pbs', 'pbs eons',
+    ]
+    channel_lower = channel_name.lower().strip()
+    if channel_lower and any(ch in channel_lower for ch in known_edu):
+        edu_signals += 1.5
+        reasons.append(f"known educational channel: {channel_name}")
+    elif any(ch in combined for ch in known_edu):
+        edu_signals += 1.0
+        reasons.append("known educational channel (in metadata)")
+
+    # Signal 2: Title keywords
     title_edu_words = ['explained', 'tutorial', 'lecture', 'lesson', 'course', 'learn',
                        'introduction', 'intro', 'how', 'what is', 'guide', 'basics',
                        'chapter', 'part', 'fundamentals', 'overview', 'crash course',
                        'made simple', 'made easy', 'for beginners', '101', 'animated',
-                       'animation', 'documentary', 'science', 'history', 'math']
+                       'animation', 'documentary', 'science', 'history', 'math',
+                       'biology', 'chemistry', 'physics', 'calculus', 'algebra',
+                       'geometry', 'proof', 'theorem', 'derivation', 'equation']
     title_hits = sum(1 for w in title_edu_words if w in title_lower)
     if title_hits >= 1:
         edu_signals += 0.5 + 0.2 * min(3, title_hits)
         reasons.append(f"educational keywords in title ({title_hits})")
 
-    # Description keywords
+    # Signal 3: Description keywords
     desc_edu_words = ['learn', 'education', 'course', 'academy', 'university',
                       'professor', 'subscribe', 'khan', 'mit', 'ted', 'lecture',
-                      'patreon', 'support', 'free', 'practice']
+                      'patreon', 'support', 'free', 'practice', 'textbook',
+                      'curriculum', 'syllabus', 'exam', 'quiz', 'homework',
+                      'chapter', 'lesson', 'student', 'teaching']
     desc_hits = sum(1 for w in desc_edu_words if w in desc_lower)
     if desc_hits >= 1:
         edu_signals += 0.3 + 0.15 * min(3, desc_hits)
         reasons.append(f"educational keywords in description ({desc_hits})")
 
-    # Description structure signals
+    # Signal 4: Description structure
     if re.search(r'\d{1,2}:\d{2}', description):
         edu_signals += 0.5
         reasons.append("has timestamps in description")
-    if len(description) > 200:
+    if len(description) > 500:
+        edu_signals += 0.6
+        reasons.append("very detailed description")
+    elif len(description) > 200:
         edu_signals += 0.4
         reasons.append("detailed description")
     if 'http' in desc_lower:
         edu_signals += 0.2
         reasons.append("has links")
 
-    # Title structure patterns (numbered series, "Part N", etc.)
+    # Signal 5: Title structure patterns
     if re.search(r'\b(part|chapter|lecture|episode|module|unit)\s+\d', title_lower):
         edu_signals += 0.5
         reasons.append("series structure in title")
@@ -187,15 +223,20 @@ def assess_educational_quality(title: str, description: str, text: str) -> tuple
         edu_signals += 0.3
         reasons.append("numbered title")
 
-    # Known educational channels in title/description
-    known_edu = ['khan academy', 'crash course', 'ted', 'mit', 'national geographic',
-                 'simplilearn', 'freeschool', 'amoeba sisters', 'veritasium',
-                 '3blue1brown', 'brilliant', 'kurzgesagt', 'minutephysics']
-    if any(ch in combined for ch in known_edu):
-        edu_signals += 1.0
-        reasons.append("known educational channel")
+    # Signal 6: Duration band (educational videos tend to be 5-30 min)
+    if 300 <= video_duration_sec <= 1800:
+        edu_signals += 0.3
+        reasons.append(f"educational duration band ({video_duration_sec}s)")
+    elif 180 <= video_duration_sec <= 3600:
+        edu_signals += 0.15
+        reasons.append(f"acceptable duration ({video_duration_sec}s)")
 
-    # Transcript vocabulary (when full transcript available)
+    # Signal 7: AI summary (server already assessed educational value)
+    if ai_summary and len(ai_summary) > 40:
+        edu_signals += 0.3
+        reasons.append("has AI summary")
+
+    # Signal 8: Transcript vocabulary (when available)
     if text:
         words = text.split()
         if len(words) > 50:
@@ -313,6 +354,9 @@ def evaluate_clip(reel: dict, subject: str, keywords: list) -> ClipEvaluation:
                 reel.get("video_title", ""),
                 reel.get("video_description", ""),
                 ev.clip_text,
+                channel_name=reel.get("channel_name", ""),
+                video_duration_sec=reel.get("video_duration_sec", 0),
+                ai_summary=reel.get("ai_summary", ""),
             )
             ev.relevance_notes += f" | edu: {edu_notes}"
     except Exception as e:

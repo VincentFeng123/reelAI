@@ -96,6 +96,9 @@ from .models import (
     ReelsCanGenerateResponse,
     ReelsGenerateRequest,
     ReelsGenerateResponse,
+    AdminSimulationRequest,
+    SimulationResponse,
+    SimulationTopicResult,
 )
 from .services.email import send_welcome_email
 from .services.embeddings import EmbeddingService
@@ -348,6 +351,7 @@ INGEST_SEARCH_RATE_LIMIT_PER_WINDOW = 3
 # per video, so it's strictly cheaper than ingest_feed (which loops over many
 # items). 6/window matches /api/ingest/url's budget for one full video.
 INGEST_TOPIC_CUT_RATE_LIMIT_PER_WINDOW = 6
+ADMIN_SIMULATION_RATE_LIMIT_PER_WINDOW = 2
 MAX_COMMUNITY_HISTORY_ITEMS = 120
 _rate_limit_lock = threading.Lock()
 _rate_limit_hits: dict[str, deque[float]] = {}
@@ -7432,6 +7436,310 @@ def replace_community_material_groups(request: Request, payload: CommunityMateri
                 "updated_at": group.get("updated_at", ts) if isinstance(group, dict) else ts,
             })
     return {"groups": payload.groups}
+
+
+# ---------------------------------------------------------------------------
+# Admin: server-side simulation test
+# ---------------------------------------------------------------------------
+
+_SIMULATION_DEFAULT_TOPICS = [
+    {"subject": "Krebs Cycle", "text": "The Krebs cycle, also known as the citric acid cycle, is a series of chemical reactions in the mitochondrial matrix that oxidizes acetyl-CoA to CO2 and generates NADH, FADH2, and GTP.", "tier": "ultra-niche"},
+    {"subject": "Taylor Series Convergence", "text": "A Taylor series is an infinite sum of terms calculated from the values of a function's derivatives at a single point. The radius of convergence determines where the series converges.", "tier": "ultra-niche"},
+    {"subject": "CRISPR Gene Editing", "text": "CRISPR-Cas9 is a genome editing tool that uses a guide RNA to direct the Cas9 enzyme to a specific DNA sequence. It creates a double-strand break allowing for gene knockout, insertion, or correction.", "tier": "niche"},
+    {"subject": "Fourier Transform", "text": "The Fourier transform decomposes a function of time into the frequencies that make it up. It transforms a signal from the time domain to the frequency domain.", "tier": "niche"},
+    {"subject": "Mitosis", "text": "Mitosis is a type of cell division that produces two genetically identical daughter cells from a single parent cell. The stages are prophase, metaphase, anaphase, and telophase.", "tier": "moderate"},
+    {"subject": "Quantum Entanglement", "text": "Quantum entanglement is a phenomenon where two particles become correlated such that the quantum state of one instantly influences the other, regardless of distance.", "tier": "moderate"},
+    {"subject": "Game Theory", "text": "Game theory is the study of mathematical models of strategic interaction among rational agents. Key concepts include Nash equilibrium, dominant strategies, and the prisoner's dilemma.", "tier": "moderate"},
+    {"subject": "World War 2", "text": "World War 2 was a global conflict from 1939 to 1945 involving the Allied and Axis powers. Key events include the invasion of Poland, D-Day, and the atomic bombings.", "tier": "broad"},
+    {"subject": "Climate Change", "text": "Climate change refers to long-term shifts in global temperatures and weather patterns. Human activities, especially burning fossil fuels, have been the main driver since the industrial revolution.", "tier": "broad"},
+    {"subject": "Machine Learning", "text": "Machine learning is a subset of artificial intelligence where systems learn from data to improve performance on tasks without being explicitly programmed.", "tier": "broad"},
+    {"subject": "Biology", "text": "Biology is the scientific study of life and living organisms. It covers topics from molecular biology and genetics to ecology and evolution.", "tier": "ultra-broad"},
+    {"subject": "Mathematics", "text": "Mathematics is the abstract science of number, quantity, and space. Major branches include algebra, calculus, geometry, and statistics.", "tier": "ultra-broad"},
+]
+
+_SIMULATION_KNOWN_EDU_CHANNELS = {
+    '3blue1brown', 'amoeba sisters', 'bozeman science', 'brilliant',
+    'bright side of mathematics', 'cgp grey', 'computerphile', 'crash course',
+    'domain of science', 'dr. becky', 'dr. trefor bazett', 'engineerguy',
+    'fireship', 'freecodecamp', 'jbstatistics', 'khan academy', 'kurzgesagt',
+    'lumen learning', 'mark rober', 'mathologer', 'minutephysics',
+    'mit opencourseware', 'nancypi', 'national geographic', 'numberphile',
+    'organic chemistry tutor', 'patrickjmt', 'pbs space time', 'physics girl',
+    'professor dave explains', 'professor leonard', 'real engineering',
+    'science click', 'scishow', 'sixty symbols', 'smarter every day',
+    'stand-up maths', 'steve mould', 'ted-ed', 'the coding train',
+    'the engineer guy', 'the organic chemistry tutor', 'tibees', 'tom scott',
+    'two minute papers', 'veritasium', 'vsauce', 'zach star',
+    'mit', 'ted', 'simplilearn', 'freeschool', 'pbs', 'pbs eons',
+}
+
+_SIMULATION_RED_FLAGS = frozenset([
+    'reaction', 'vlog', 'unboxing', 'prank', 'challenge', 'asmr',
+    'gameplay', 'lets play', 'mukbang', 'haul', 'grwm', 'top 10',
+    'ranking every', 'tier list',
+])
+
+
+def _simulation_assess_educational(reel: dict[str, Any]) -> tuple[bool, str]:
+    """Server-side educational quality scorer for simulation endpoint."""
+    title = str(reel.get("video_title") or "")
+    description = str(reel.get("video_description") or "")
+    channel_name = str(reel.get("channel_name") or "")
+    ai_summary = str(reel.get("ai_summary") or "")
+    duration = int(reel.get("video_duration_sec") or 0)
+    title_lower = title.lower()
+    desc_lower = description.lower()
+    combined = f"{title_lower} {desc_lower}"
+
+    for flag in _SIMULATION_RED_FLAGS:
+        if flag in title_lower:
+            return False, f"Red flag: '{flag}' in title"
+
+    signals = 0.0
+    reasons: list[str] = []
+
+    # Channel name (most authoritative)
+    ch_lower = channel_name.lower().strip()
+    if ch_lower and any(ch in ch_lower for ch in _SIMULATION_KNOWN_EDU_CHANNELS):
+        signals += 1.5
+        reasons.append(f"known educational channel: {channel_name}")
+    elif any(ch in combined for ch in _SIMULATION_KNOWN_EDU_CHANNELS):
+        signals += 1.0
+        reasons.append("known educational channel (in metadata)")
+
+    # Title keywords
+    title_edu = ['explained', 'tutorial', 'lecture', 'lesson', 'course', 'learn',
+                 'introduction', 'intro', 'how', 'what is', 'guide', 'basics',
+                 'chapter', 'part', 'fundamentals', 'overview', 'crash course',
+                 'made simple', 'made easy', 'for beginners', '101', 'documentary',
+                 'science', 'history', 'math', 'biology', 'chemistry', 'physics',
+                 'calculus', 'algebra', 'proof', 'theorem', 'derivation']
+    hits = sum(1 for w in title_edu if w in title_lower)
+    if hits >= 1:
+        signals += 0.5 + 0.2 * min(3, hits)
+        reasons.append(f"title keywords ({hits})")
+
+    # Description keywords
+    desc_edu = ['learn', 'education', 'course', 'academy', 'university', 'professor',
+                'khan', 'mit', 'ted', 'lecture', 'patreon', 'practice', 'textbook',
+                'curriculum', 'syllabus', 'exam', 'student', 'teaching']
+    d_hits = sum(1 for w in desc_edu if w in desc_lower)
+    if d_hits >= 1:
+        signals += 0.3 + 0.15 * min(3, d_hits)
+        reasons.append(f"desc keywords ({d_hits})")
+
+    # Description structure
+    if re.search(r'\d{1,2}:\d{2}', description):
+        signals += 0.5
+        reasons.append("timestamps")
+    if len(description) > 500:
+        signals += 0.6
+        reasons.append("very detailed description")
+    elif len(description) > 200:
+        signals += 0.4
+        reasons.append("detailed description")
+    if 'http' in desc_lower:
+        signals += 0.2
+        reasons.append("links")
+
+    # Title structure
+    if re.search(r'\b(part|chapter|lecture|episode|module|unit)\s+\d', title_lower):
+        signals += 0.5
+        reasons.append("series structure")
+
+    # Duration band
+    if 300 <= duration <= 1800:
+        signals += 0.3
+        reasons.append(f"edu duration ({duration}s)")
+
+    # AI summary
+    if ai_summary and len(ai_summary) > 40:
+        signals += 0.3
+        reasons.append("has AI summary")
+
+    # Transcript vocabulary from captions
+    captions = reel.get("captions") or []
+    snippet = str(reel.get("transcript_snippet") or "")
+    text = " ".join(str(c.get("text", "")) for c in captions) if captions else snippet
+    if text:
+        words = text.split()
+        if len(words) > 50:
+            unique_ratio = len(set(w.lower() for w in words)) / max(1, len(words))
+            if unique_ratio > 0.35:
+                signals += 0.5
+                reasons.append(f"vocab diversity {unique_ratio:.2f}")
+            signals += 0.3
+            reasons.append(f"transcript ({len(words)} words)")
+
+    is_edu = signals >= 1.0
+    return is_edu, "; ".join(reasons) if reasons else "no educational signals"
+
+
+def _simulation_is_sentence_start(text: str) -> bool:
+    if not text.strip():
+        return False
+    return text.strip()[0].isupper() or text.strip()[0].isdigit() or text.strip()[0] in '"\'('
+
+
+def _simulation_is_sentence_end(text: str) -> bool:
+    stripped = text.rstrip()
+    return bool(stripped) and stripped[-1] in '.!?'
+
+
+@app.post("/api/admin/run-simulation", response_model=SimulationResponse)
+def admin_run_simulation(request: Request, payload: AdminSimulationRequest | None = None):
+    _require_community_client_identity(request)
+    _enforce_rate_limit(request, "admin-simulation", limit=ADMIN_SIMULATION_RATE_LIMIT_PER_WINDOW)
+
+    topics = (payload.topics if payload and payload.topics else None) or _SIMULATION_DEFAULT_TOPICS
+    num_reels = min(max(1, payload.num_reels if payload else 3), 5)
+
+    results: list[SimulationTopicResult] = []
+    total_clips = 0
+    total_edu = 0
+    total_on_topic = 0
+    total_clean_start = 0
+    total_clean_end = 0
+
+    for topic in topics:
+        subject = str(topic.get("subject", ""))
+        text = str(topic.get("text", ""))
+        tier = str(topic.get("tier", ""))
+        topic_result = SimulationTopicResult(subject=subject, tier=tier)
+
+        try:
+            with get_conn() as conn:
+                # Step 1: Create material
+                concept_limit = 6
+                concepts, objectives = material_intelligence_service.extract_concepts_and_objectives(
+                    conn, text, subject_tag=subject, max_concepts=concept_limit,
+                )
+                material_id = str(uuid.uuid4())
+                upsert(conn, "materials", {
+                    "id": material_id,
+                    "subject_tag": subject,
+                    "raw_text": text,
+                    "source_type": "text",
+                    "source_path": None,
+                    "created_at": now_iso(),
+                })
+                concept_id = ""
+                subject_lower = subject.lower()
+                if concepts:
+                    best = concepts[0]
+                    for c in concepts:
+                        if subject_lower in c.get("title", "").lower():
+                            best = c
+                            break
+                    concept_id = best.get("id", "")
+
+                    for concept in concepts:
+                        concept_text = f"{concept['title']}. Keywords: {' '.join(concept['keywords'])}. Summary: {concept['summary']}"
+                        emb = embedding_service.embed_texts(conn, [concept_text])[0]
+                        upsert(conn, "concepts", {
+                            "id": concept["id"],
+                            "material_id": material_id,
+                            "title": concept["title"],
+                            "keywords_json": dumps_json(concept["keywords"]),
+                            "summary": concept["summary"],
+                            "embedding_json": dumps_json(emb.tolist()),
+                            "created_at": now_iso(),
+                        })
+
+                if not concept_id:
+                    topic_result.error = "no concepts extracted"
+                    results.append(topic_result)
+                    continue
+
+                # Step 2: Generate reels
+                generation_result = _ensure_generation_for_request(
+                    conn,
+                    material_id=material_id,
+                    concept_id=concept_id,
+                    required_count=num_reels,
+                    sync_deep_fallback="if_empty",
+                    generation_mode="fast",
+                    target_clip_duration_sec=60,
+                    target_clip_duration_min_sec=15,
+                    target_clip_duration_max_sec=120,
+                    page_hint=1,
+                )
+
+            reels = list(generation_result.get("reels") or [])[:num_reels]
+            topic_result.reels_count = len(reels)
+
+            if not reels:
+                topic_result.error = "no reels generated"
+                results.append(topic_result)
+                continue
+
+            # Step 3: Evaluate each reel
+            keywords = text.lower().split()[:20]
+            for reel in reels:
+                total_clips += 1
+                clip_info: dict[str, Any] = {
+                    "video_title": reel.get("video_title", ""),
+                    "channel_name": reel.get("channel_name", ""),
+                    "t_start": reel.get("t_start", 0),
+                    "t_end": reel.get("t_end", 0),
+                    "video_duration_sec": reel.get("video_duration_sec", 0),
+                }
+
+                # Educational check
+                is_edu, edu_notes = _simulation_assess_educational(reel)
+                clip_info["educational"] = is_edu
+                clip_info["edu_notes"] = edu_notes
+                if is_edu:
+                    total_edu += 1
+                    topic_result.educational_count += 1
+
+                # On-topic check (from captions/snippet)
+                captions = reel.get("captions") or []
+                snippet = str(reel.get("transcript_snippet") or "")
+                clip_text = " ".join(str(c.get("text", "")) for c in captions) if captions else snippet
+                if clip_text:
+                    subject_words = subject.lower().split()
+                    subject_hits = sum(1 for w in subject_words if w in clip_text.lower())
+                    subject_cov = subject_hits / max(1, len(subject_words))
+                    kw_hits = sum(1 for kw in keywords if kw in clip_text.lower())
+                    kw_cov = kw_hits / max(1, len(keywords))
+                    is_on_topic = subject_cov >= 0.5 or kw_cov >= 0.3
+                else:
+                    is_on_topic = False
+                clip_info["on_topic"] = is_on_topic
+                if is_on_topic:
+                    total_on_topic += 1
+                    topic_result.on_topic_count += 1
+
+                # Boundary checks
+                starts_clean = _simulation_is_sentence_start(clip_text) if clip_text else False
+                ends_clean = _simulation_is_sentence_end(clip_text) if clip_text else False
+                clip_info["starts_clean"] = starts_clean
+                clip_info["ends_clean"] = ends_clean
+                if starts_clean:
+                    total_clean_start += 1
+                    topic_result.clean_start_count += 1
+                if ends_clean:
+                    total_clean_end += 1
+                    topic_result.clean_end_count += 1
+
+                topic_result.clips.append(clip_info)
+
+        except Exception as exc:
+            topic_result.error = str(exc)[:300]
+
+        results.append(topic_result)
+
+    n = max(1, total_clips)
+    return SimulationResponse(
+        topics_tested=len(results),
+        total_clips=total_clips,
+        educational_pct=round(100.0 * total_edu / n, 1),
+        on_topic_pct=round(100.0 * total_on_topic / n, 1),
+        clean_start_pct=round(100.0 * total_clean_start / n, 1),
+        clean_end_pct=round(100.0 * total_clean_end / n, 1),
+        per_topic=results,
+    )
 
 
 def _register_non_api_route_aliases() -> None:

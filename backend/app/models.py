@@ -76,6 +76,7 @@ class ReelOut(BaseModel):
     concept_title: str
     video_title: str = ""
     video_description: str = ""
+    channel_name: str = ""
     ai_summary: str = ""
     video_url: str
     t_start: float
@@ -104,6 +105,33 @@ class ReelsGenerateResponse(BaseModel):
     response_profile: str | None = None
     refinement_job_id: str | None = None
     refinement_status: str | None = None
+
+
+class AdminSimulationRequest(BaseModel):
+    topics: list[dict] | None = None
+    num_reels: int = 3
+
+
+class SimulationTopicResult(BaseModel):
+    subject: str = ""
+    tier: str = ""
+    reels_count: int = 0
+    educational_count: int = 0
+    on_topic_count: int = 0
+    clean_start_count: int = 0
+    clean_end_count: int = 0
+    error: str = ""
+    clips: list[dict] = Field(default_factory=list)
+
+
+class SimulationResponse(BaseModel):
+    topics_tested: int = 0
+    total_clips: int = 0
+    educational_pct: float = 0.0
+    on_topic_pct: float = 0.0
+    clean_start_pct: float = 0.0
+    clean_end_pct: float = 0.0
+    per_topic: list[SimulationTopicResult] = Field(default_factory=list)
 
 
 class ReelsCanGenerateResponse(BaseModel):
