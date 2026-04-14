@@ -9257,6 +9257,7 @@ class ReelService:
         MIN_CLUSTER_MENTIONS = 2
         LEAD_IN_CUES = 0
         TAIL_BUFFER_SEC = 1.0
+        SENTENCE_END_SEARCH_SEC = 8.0  # look up to 8s beyond last mention for a sentence end
         # When multiple clusters from the same video survive, the user wants
         # them to play back-to-back without temporal gaps. We bridge adjacent
         # clusters whose gap is ≤ MERGE_GAP_SEC by extending each window's
@@ -9344,10 +9345,39 @@ class ReelService:
             first_mention = cluster[0]
             last_mention = cluster[-1]
 
-            # Fixed 1-second lead-in before the first mention for a clean
-            # entry point, replacing the old variable LEAD_IN_CUES walk.
-            t_start = max(0.0, cue_starts[first_mention] - 1.0)
-            t_end = cue_ends[last_mention] + TAIL_BUFFER_SEC
+            # Snap t_start to the nearest sentence boundary before the
+            # first mention (look back up to 8s for a sentence end in the
+            # preceding cue — start right after it).
+            raw_start = cue_starts[first_mention]
+            t_start = max(0.0, raw_start - 1.0)  # default: 1s lead-in
+            for back in range(first_mention - 1, max(-1, first_mention - 10), -1):
+                if back < 0:
+                    t_start = 0.0  # start of video is a clean boundary
+                    break
+                if cue_starts[first_mention] - cue_ends[back] > 8.0:
+                    break
+                cue_text = cue_texts[back].strip()
+                if cue_text and re.search(r"[.!?…][\"'\)\]]*$", cue_text):
+                    t_start = cue_ends[back]  # start right after the sentence end
+                    break
+
+            # Snap t_end to the nearest sentence boundary after the last
+            # mention (look forward up to 8s for a sentence-ending cue).
+            raw_end = cue_ends[last_mention] + TAIL_BUFFER_SEC
+            t_end = raw_end
+            best_sent_end = None
+            best_sent_cost = float("inf")
+            for fwd in range(last_mention, min(len(cue_texts), last_mention + 12)):
+                if cue_starts[fwd] > raw_end + SENTENCE_END_SEARCH_SEC:
+                    break
+                cue_text = cue_texts[fwd].strip()
+                if cue_text and re.search(r"[.!?…][\"'\)\]]*$", cue_text):
+                    cost = abs(cue_ends[fwd] - raw_end)
+                    if cost < best_sent_cost:
+                        best_sent_cost = cost
+                        best_sent_end = cue_ends[fwd]
+            if best_sent_end is not None:
+                t_end = best_sent_end
 
             if video_duration_sec and video_duration_sec > 0:
                 t_end = min(t_end, float(video_duration_sec))
@@ -10169,13 +10199,30 @@ class ReelService:
                 start_idx = i
                 break
 
+        # Search up to 8s before desired_start for a sentence boundary.
+        # Pick the closest sentence-start to desired_start (minimize drift).
         refined_start_idx = start_idx
-        search_floor = max(0.0, desired_start - 6.0)
+        search_floor = max(0.0, desired_start - 8.0)
+        best_start_cost = float("inf")
         for i in range(start_idx, -1, -1):
             if float(entries[i]["start"]) < search_floor:
                 break
             if i == 0 or self._is_sentence_end(str(entries[i - 1]["text"])):
-                refined_start_idx = i
+                cost = abs(float(entries[i]["start"]) - desired_start)
+                if cost < best_start_cost:
+                    best_start_cost = cost
+                    refined_start_idx = i
+        # Also search a few seconds forward for a sentence start — the
+        # speaker may finish their previous sentence just after desired_start.
+        search_ceil = min(len(entries) - 1, start_idx + 4)
+        for i in range(start_idx + 1, search_ceil + 1):
+            if float(entries[i]["start"]) > desired_start + 4.0:
+                break
+            if i == 0 or self._is_sentence_end(str(entries[i - 1]["text"])):
+                cost = abs(float(entries[i]["start"]) - desired_start)
+                if cost < best_start_cost:
+                    best_start_cost = cost
+                    refined_start_idx = i
 
         refined_start = float(entries[refined_start_idx]["start"])
         min_end = refined_start + float(min_len)
@@ -10186,22 +10233,34 @@ class ReelService:
         best_any_end: float | None = None
         best_any_cost = float("inf")
 
+        # Allow sentence boundaries up to 8s past max_end — it's better to
+        # have a slightly longer clip that ends cleanly than a shorter one
+        # that cuts mid-sentence.  Non-sentence ends are still capped at
+        # max_end so we only exceed the target for a clean ending.
+        SENTENCE_SEARCH_BEYOND_SEC = 8.0
+
         for i in range(refined_start_idx, len(entries)):
             item_end = float(entries[i]["end"])
             if item_end < min_end:
                 continue
-            if item_end > max_end + 2.0:
+            if item_end > max_end + SENTENCE_SEARCH_BEYOND_SEC:
                 break
+            # Accept any cue end within the normal window for fallback.
             if item_end <= max_end:
                 any_cost = abs(item_end - desired_end)
                 if any_cost < best_any_cost:
                     best_any_cost = any_cost
                     best_any_end = item_end
-                if self._is_sentence_end(str(entries[i]["text"])):
-                    sent_cost = abs(item_end - desired_end)
-                    if sent_cost < best_sentence_cost:
-                        best_sentence_cost = sent_cost
-                        best_sentence_end = item_end
+            # Accept sentence ends in the extended window (up to +8s).
+            if self._is_sentence_end(str(entries[i]["text"])):
+                # Prefer sentence ends closer to desired_end, but penalize
+                # going past max_end so we don't pick a sentence 8s late when
+                # one exists at the target.
+                overshoot = max(0.0, item_end - max_end)
+                sent_cost = abs(item_end - desired_end) + 1.5 * overshoot
+                if sent_cost < best_sentence_cost:
+                    best_sentence_cost = sent_cost
+                    best_sentence_end = item_end
 
         refined_end = best_sentence_end if best_sentence_end is not None else best_any_end
         if refined_end is None:
