@@ -3421,6 +3421,16 @@ class YouTubeService:
             except Exception as exc:
                 logger.debug("Innertube fallback failed for %s: %s", video_id, exc)
 
+        # Whisper audio fallback: if all caption-based approaches failed,
+        # download the audio via yt-dlp and transcribe with faster-whisper
+        # or OpenAI Whisper API.  This bypasses YouTube's caption system
+        # entirely — it works regardless of IP blocks on the timedtext endpoint.
+        if not transcript:
+            try:
+                transcript = self._whisper_audio_fallback(video_id)
+            except Exception as exc:
+                logger.debug("Whisper audio fallback failed for %s: %s", video_id, exc)
+
         # Compute coverage metadata for downstream consumers.
         coverage_ratio: float | None = None
         cue_count = len(transcript)
@@ -3592,6 +3602,175 @@ class YouTubeService:
         if cues:
             logger.info("Alternative transcript fetch success for %s: %d cues", video_id, len(cues))
         return cues
+
+    # ------------------------------------------------------------------
+    # Whisper audio fallback — download audio, transcribe locally or via API
+    # ------------------------------------------------------------------
+
+    def _whisper_audio_fallback(self, video_id: str) -> list[dict[str, Any]]:
+        """Download audio via yt-dlp, transcribe with faster-whisper or OpenAI Whisper.
+
+        Completely bypasses YouTube's caption/timedtext system.
+        Returns transcript in [{text, start, duration}, ...] format.
+        """
+        import shutil
+        import subprocess
+        import tempfile
+
+        tmpdir = tempfile.mkdtemp(prefix="reelai_whisper_")
+        try:
+            # Step 1: Download audio with yt-dlp
+            audio_path = os.path.join(tmpdir, f"{video_id}.wav")
+            try:
+                import yt_dlp
+            except ImportError:
+                logger.debug("yt-dlp not installed, skipping Whisper audio fallback")
+                return []
+
+            ydl_opts = {
+                "format": "bestaudio/best",
+                "outtmpl": os.path.join(tmpdir, f"{video_id}.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "socket_timeout": 15,
+                "retries": 2,
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "wav",
+                }],
+                "postprocessor_args": ["-ac", "1", "-ar", "16000"],
+            }
+            proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
+            if proxy:
+                # yt-dlp expects a single proxy URL string
+                proxy_url = proxy.get("https") or proxy.get("http") or ""
+                if proxy_url:
+                    ydl_opts["proxy"] = proxy_url
+
+            logger.info("Whisper fallback: downloading audio for %s", video_id)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+
+            # Find the output WAV file
+            wav_files = [f for f in os.listdir(tmpdir) if f.endswith(".wav")]
+            if not wav_files:
+                logger.debug("No WAV file produced for %s", video_id)
+                return []
+            audio_path = os.path.join(tmpdir, wav_files[0])
+            audio_size = os.path.getsize(audio_path)
+            logger.info("Whisper fallback: audio downloaded for %s (%d bytes)", video_id, audio_size)
+
+            # Step 2: Try faster-whisper (free, local)
+            cues = self._transcribe_with_faster_whisper(audio_path, video_id)
+            if cues:
+                return cues
+
+            # Step 3: Try OpenAI Whisper API (paid, ~$0.006/min)
+            cues = self._transcribe_with_openai_whisper(audio_path, video_id)
+            if cues:
+                return cues
+
+            logger.debug("All Whisper strategies failed for %s", video_id)
+            return []
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _transcribe_with_faster_whisper(
+        self, audio_path: str, video_id: str,
+    ) -> list[dict[str, Any]]:
+        """Transcribe audio with faster-whisper (local CPU, free)."""
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            logger.debug("faster-whisper not installed, skipping local transcription")
+            return []
+
+        model_name = os.environ.get("FASTER_WHISPER_MODEL", "base.en")
+        device = os.environ.get("FASTER_WHISPER_DEVICE", "cpu")
+        compute_type = os.environ.get("FASTER_WHISPER_COMPUTE_TYPE", "int8")
+
+        try:
+            logger.info("Whisper fallback: transcribing %s with faster-whisper (%s)", video_id, model_name)
+            model = WhisperModel(model_name, device=device, compute_type=compute_type)
+            segments_iter, _info = model.transcribe(
+                audio_path,
+                language="en",
+                beam_size=1,
+                vad_filter=True,
+            )
+            cues: list[dict[str, Any]] = []
+            for seg in segments_iter:
+                text = seg.text.strip()
+                if text:
+                    cues.append({
+                        "text": text,
+                        "start": seg.start,
+                        "duration": seg.end - seg.start,
+                    })
+            if cues:
+                logger.info("faster-whisper success for %s: %d cues", video_id, len(cues))
+            return cues
+        except Exception as exc:
+            logger.warning("faster-whisper failed for %s: %s", video_id, exc)
+            return []
+
+    def _transcribe_with_openai_whisper(
+        self, audio_path: str, video_id: str,
+    ) -> list[dict[str, Any]]:
+        """Transcribe audio with OpenAI Whisper API (~$0.006/min)."""
+        api_key = os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            logger.debug("No OPENAI_API_KEY, skipping OpenAI Whisper fallback")
+            return []
+
+        # Whisper API limit is 25 MiB
+        max_size = 24 * 1024 * 1024
+        if os.path.getsize(audio_path) > max_size:
+            logger.debug("Audio too large for Whisper API (%d bytes), skipping", os.path.getsize(audio_path))
+            return []
+
+        try:
+            import openai
+            client = openai.OpenAI(api_key=api_key)
+            logger.info("Whisper fallback: transcribing %s with OpenAI Whisper API", video_id)
+            with open(audio_path, "rb") as f:
+                response = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=f,
+                    response_format="verbose_json",
+                    language="en",
+                    timestamp_granularities=["segment"],
+                )
+            # Parse response — may be dict or object
+            if hasattr(response, "segments"):
+                segments = response.segments or []
+            elif isinstance(response, dict):
+                segments = response.get("segments", [])
+            else:
+                segments = []
+
+            cues: list[dict[str, Any]] = []
+            for seg in segments:
+                if isinstance(seg, dict):
+                    text = seg.get("text", "").strip()
+                    start = float(seg.get("start", 0))
+                    end = float(seg.get("end", 0))
+                else:
+                    text = getattr(seg, "text", "").strip()
+                    start = float(getattr(seg, "start", 0))
+                    end = float(getattr(seg, "end", 0))
+                if text:
+                    cues.append({
+                        "text": text,
+                        "start": start,
+                        "duration": max(0.0, end - start),
+                    })
+            if cues:
+                logger.info("OpenAI Whisper success for %s: %d cues", video_id, len(cues))
+            return cues
+        except Exception as exc:
+            logger.warning("OpenAI Whisper failed for %s: %s", video_id, exc)
+            return []
 
     def _fallback_any_transcript(self, video_id: str) -> list[dict[str, Any]]:
         try:
