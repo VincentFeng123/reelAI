@@ -6705,6 +6705,7 @@ class ReelService:
         if any(p in title_lower for p in self.ENTERTAINMENT_TITLE_PATTERNS):
             return True
         if " provided to youtube " in lowered:
+            return True
         if normalized_subject == "calculus" and " lambda calculus " in lowered:
             return True
         if normalized_subject:
