@@ -119,6 +119,30 @@ YOUTUBE_VIDEO_ID_REGEX = re.compile(rf"^{YOUTUBE_VIDEO_ID_PATTERN}$")
 # not arbitrary 11-char tokens that happen to look like a YouTube ID.
 _VIDEO_ID_IN_JSON_REGEX = re.compile(rf'"videoId"\s*:\s*"({YOUTUBE_VIDEO_ID_PATTERN})"')
 
+# Flexible match for the ytInitialData assignment used by youtube.com search
+# and watch pages.  Accepts any of the observed forms:
+#   var ytInitialData = {...}
+#   window["ytInitialData"] = {...}
+#   window['ytInitialData'] = {...}
+#   window.ytInitialData = {...}
+#   ytInitialData = {...}
+#   ytInitialData={...}
+# The ``brace`` named group captures the position of the opening ``{`` so the
+# caller can kick off balanced-JSON extraction from there.
+_YT_INITIAL_DATA_ASSIGN_RE = re.compile(
+    r"(?:var\s+|window\s*(?:\[\s*[\"']|\.))?ytInitialData[\"']?\s*\]?\s*=\s*(?P<brace>\{)",
+)
+
+# Object-literal form: ``"ytInitialData": {...}``.  Used as a last-resort
+# fallback because it also matches inside string literals; callers must
+# validate by balanced-JSON + json.loads.
+_YT_INITIAL_DATA_KEY_RE = re.compile(r'"ytInitialData"\s*:\s*(?P<brace>\{)')
+
+# Page <title> extraction — used only for diagnostic logging when ytInitialData
+# extraction fails, so we can distinguish a consent wall from a bot challenge
+# from a real results page with a renamed variable.
+_HTML_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
 
 def _is_valid_youtube_video_id(value: Any) -> bool:
     """Return True iff *value* is a string matching the YouTube video ID format.
@@ -2697,63 +2721,62 @@ class YouTubeService:
         """Pull the ytInitialData JSON blob out of a YouTube HTML page.
 
         YouTube embeds its initial render state as a JavaScript variable in a
-        <script> tag. The blob has been given a few different names over the
-        years, so we try several known markers in order. Each marker is the
-        literal text that appears just before the opening "{" of the JSON
-        object. If one marker is missing, we fall through to the next — this
-        is the primary line of defence against YouTube renaming the variable.
-
-        Why scan for markers instead of using a proper HTML parser?
-        - The blob lives inside a <script> tag, so HTML parsers don't help us
-          get to the JSON any faster.
-        - ytInitialData is a top-level assignment and is always followed by
-          a balanced JSON object, so simple string scanning is reliable AND
-          dependency-free (educational bonus: you can see every step).
-        - If YouTube ever changes the format more drastically, you'll see a
-          loud warning in the logs pointing here.
+        <script> tag. The blob has been given a few different names and
+        spellings over the years, so we try several matching strategies in
+        order of specificity.  The most flexible path is a regex that allows
+        any whitespace between ``ytInitialData`` and the opening ``{`` — this
+        makes the extractor robust to minor formatting changes (e.g. YouTube
+        dropping the space after ``=``, or wrapping the assignment in new
+        layout-specific templates) without requiring a code change every time.
         """
         if not html:
             return None
 
-        # Ordered from most-common (as of current scraping) to fallbacks.
-        # Having more than one means a single server-side rename doesn't
-        # instantly break everything.
-        markers = (
-            "var ytInitialData = ",
-            "window[\"ytInitialData\"] = ",
-            "window['ytInitialData'] = ",
-            "ytInitialData = ",
-            # Some consent-wall / mobile layouts inline the data without a
-            # variable declaration at all. This last marker is the weakest
-            # (could match inside a string), but we only use it when every
-            # stronger marker has already failed.
-            "\"ytInitialData\":",
-        )
-
         tried_any = False
-        for marker in markers:
-            idx = html.find(marker)
-            if idx < 0:
-                continue
+
+        # 1) Flexible regex match.  Covers all historically observed forms
+        #    of the assignment:
+        #       var ytInitialData = {...}
+        #       window["ytInitialData"] = {...}
+        #       window['ytInitialData'] = {...}
+        #       ytInitialData = {...}
+        #       ytInitialData={...}             (no spaces)
+        #       window.ytInitialData = {...}    (dotted attribute form)
+        #    The regex anchors on ``ytInitialData`` followed by optional
+        #    whitespace, an ``=`` sign, optional whitespace, then the opening
+        #    brace — which matches the start of the JSON payload.  We then
+        #    balance-match the object so we still capture trailing nested
+        #    structures correctly.
+        for match in _YT_INITIAL_DATA_ASSIGN_RE.finditer(html):
             tried_any = True
-            start = html.find("{", idx + len(marker))
-            if start < 0:
-                continue
+            start = match.start("brace")
             payload = self._balanced_json_object(html, start)
             if not payload:
                 continue
             try:
                 loaded = json.loads(payload)
             except json.JSONDecodeError as exc:
-                # Don't give up yet — keep trying the remaining markers.
-                # A JSON decode failure on one marker usually means we
-                # matched inside a string literal (common for the weak
-                # "\"ytInitialData\":" marker).
                 logger.debug(
-                    "ytInitialData marker %r matched but JSON decode failed: %s",
-                    marker,
+                    "ytInitialData regex matched but JSON decode failed: %s",
                     exc,
                 )
+                continue
+            if isinstance(loaded, dict):
+                return loaded
+
+        # 2) Fallback: object-literal form ``"ytInitialData": {...}`` used
+        #    by some consent-wall / embedded-player layouts.  We already try
+        #    to ignore string-literal matches via JSON balance + decode; if
+        #    every stronger match above failed, this is our last resort.
+        for match in _YT_INITIAL_DATA_KEY_RE.finditer(html):
+            tried_any = True
+            start = match.start("brace")
+            payload = self._balanced_json_object(html, start)
+            if not payload:
+                continue
+            try:
+                loaded = json.loads(payload)
+            except json.JSONDecodeError:
                 continue
             if isinstance(loaded, dict):
                 return loaded
@@ -2761,16 +2784,37 @@ class YouTubeService:
         if tried_any:
             logger.warning(
                 "ytInitialData marker(s) found but no usable JSON object could be extracted "
-                "(html_bytes=%d). YouTube may have changed its embedding format.",
+                "(html_bytes=%d, title=%r). YouTube may have changed its embedding format.",
                 len(html),
+                self._html_title_snippet(html),
             )
         else:
             logger.warning(
-                "ytInitialData marker not found in HTML (html_bytes=%d). "
+                "ytInitialData marker not found in HTML (html_bytes=%d, title=%r). "
                 "YouTube may have renamed the variable or served a consent wall.",
                 len(html),
+                self._html_title_snippet(html),
             )
         return None
+
+    @staticmethod
+    def _html_title_snippet(html: str) -> str:
+        """Return a short <title> snippet from HTML for diagnostic logs.
+
+        When ytInitialData extraction fails we cannot tell whether we got a
+        consent wall, a bot challenge, an error page, or a valid-but-renamed
+        results page.  Logging the page <title> (truncated) gives that
+        signal without dumping the whole body into the log stream.
+        """
+        if not html:
+            return ""
+        match = _HTML_TITLE_RE.search(html)
+        if not match:
+            return ""
+        title = match.group(1).strip()
+        # Collapse whitespace so multi-line titles render on one log line.
+        title = re.sub(r"\s+", " ", title)
+        return title[:140]
 
     def _balanced_json_object(self, value: str, start_idx: int) -> str | None:
         depth = 0
