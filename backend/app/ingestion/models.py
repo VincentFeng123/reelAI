@@ -53,10 +53,42 @@ class IngestFeedRequest(BaseModel):
     language: str = Field(default="en", min_length=2, max_length=8)
 
 
+WordSourceLiteral = Literal["whisper", "openai", "proportional", "legacy"]
+
+
+class IngestTranscriptWord(BaseModel):
+    """
+    Word-level timestamp (Phase A.1).
+
+    Populated by the Whisper transcription paths when `word_timestamps=True` /
+    `timestamp_granularities=["word"]` are in use. For non-Whisper transcript
+    sources (youtube-transcript-api, yt-dlp VTT) the ingestion code fills this
+    by proportional-character fallback, and the containing cue's `word_source`
+    is marked `"proportional"` so the boundary engine can degrade accuracy
+    claims appropriately.
+    """
+
+    start: float = Field(ge=0.0)
+    end: float = Field(ge=0.0)
+    text: str
+    confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_time_order(self) -> "IngestTranscriptWord":
+        if self.end < self.start:
+            object.__setattr__(self, "end", self.start + 0.005)
+        return self
+
+
 class IngestTranscriptCue(BaseModel):
     start: float = Field(ge=0.0)
     end: float = Field(ge=0.0)
     text: str
+    # Additive fields for Phase A.1. Existing persisted rows deserialize with empty
+    # `words` and `word_source="legacy"`, letting the ClipBoundaryEngine fall back
+    # to cue-level sentence picks without error.
+    words: list[IngestTranscriptWord] = Field(default_factory=list)
+    word_source: WordSourceLiteral = "legacy"
 
     @model_validator(mode="after")
     def validate_time_order(self) -> "IngestTranscriptCue":
@@ -64,6 +96,19 @@ class IngestTranscriptCue(BaseModel):
             # Whisper occasionally emits a 0-duration cue; pad it by 10ms so downstream math doesn't divide by zero.
             object.__setattr__(self, "end", self.start + 0.01)
         return self
+
+    def word_window(self, t0: float, t1: float) -> list[IngestTranscriptWord]:
+        """Return words overlapping the [t0, t1] interval — linear scan, cues are short."""
+        if not self.words:
+            return []
+        out: list[IngestTranscriptWord] = []
+        for w in self.words:
+            if w.end < t0:
+                continue
+            if w.start > t1:
+                break
+            out.append(w)
+        return out
 
 
 class IngestSegment(BaseModel):
@@ -268,6 +313,8 @@ __all__ = [
     "IngestSearchRequest",
     "IngestTopicCutRequest",
     "IngestTranscriptCue",
+    "IngestTranscriptWord",
+    "WordSourceLiteral",
     "IngestSegment",
     "IngestMetadata",
     "ReelOutWithAttribution",

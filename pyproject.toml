@@ -19,4 +19,5 @@ dependencies = [
   "python-dateutil==2.9.0.post0",
   "psycopg[binary]==3.2.10",
   "resend==2.10.0",
+  "pysbd==0.3.4",
 ]

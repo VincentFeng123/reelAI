@@ -449,6 +449,19 @@ class IngestionPipeline:
             # propagated until now.
             info_dict_snapshot: dict[str, Any] = dict(adapter_result.info_dict or {})
 
+            # Phase A.4: silence ranges let ClipBoundaryEngine prefer sentence
+            # endings near silence (= clean breaks / speaker pauses).
+            silence_ranges_for_topic_cut: list[tuple[float, float]] = []
+            audio_path_for_silence = workspace / "audio_16k.wav"
+            try:
+                if audio_path_for_silence.exists():
+                    silence_ranges_for_topic_cut = silencedetect(audio_path_for_silence)
+            except SegmentationError:
+                logger.warning(
+                    "silencedetect failed in topic_cut path; continuing without silence tiebreakers"
+                )
+                silence_ranges_for_topic_cut = []
+
         # Outside the workspace ctx-manager: the temp dir + downloaded video are
         # gone, but cues + metadata are pure-Python and survive.
         topic_cues = cues_from_ingest_cues(cues)
@@ -460,6 +473,14 @@ class IngestionPipeline:
             use_llm=use_llm,
             transcript=topic_cues,
             info_dict=info_dict_snapshot,
+            # Phase A.4: precision inputs. `cues` carries word-level timestamps
+            # when Whisper was used (see transcribe.py A.1 changes).
+            ingest_cues_for_precision=cues,
+            silence_ranges=silence_ranges_for_topic_cut or None,
+            # The topic_cut endpoint has no notion of user clip-duration settings
+            # today; engine defaults (min=MIN_TOPIC_REEL_SEC, max=MAX_TOPIC_REEL_SEC)
+            # apply. /api/ingest/url and /api/feed callers that DO have user
+            # settings pass them through below.
         )
 
         persisted_reels: list[ReelOutWithAttribution] = []

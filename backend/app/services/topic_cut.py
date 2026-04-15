@@ -147,6 +147,9 @@ class TopicReel:
     cue_start_idx: int = -1
     cue_end_idx: int = -1
     relevance_score: float | None = None
+    # Phase A.4: tier set by the ClipBoundaryEngine when it refines t_start/t_end.
+    # Values: "legacy" (pre-engine), "chapter", "sentence", "precise", "degraded".
+    boundary_quality: str = "legacy"
 
     @property
     def duration_sec(self) -> float:
@@ -2054,6 +2057,116 @@ def _snap_timestamps_to_cues(
 
 
 # --------------------------------------------------------------------------- #
+# Phase A.4: ClipBoundaryEngine integration
+# --------------------------------------------------------------------------- #
+
+
+def _apply_boundary_engine(
+    reels: list[TopicReel],
+    *,
+    ingest_cues: Sequence[Any] | None,  # list[IngestTranscriptCue]
+    chapters: Sequence[Any] | None,
+    silence_ranges: Sequence[tuple[float, float]] | None,
+    llm_topic_segments_raw: Sequence[dict[str, Any]] | None,
+    query: str | None,
+    user_min_sec: float,
+    user_max_sec: float,
+    video_duration_sec: float | None,
+) -> list[TopicReel]:
+    """
+    Phase A.4: refine every TopicReel's (t_start, t_end) via `ClipBoundaryEngine`.
+
+    The LLM / chapter / novelty path above already identified WHICH topic each
+    reel represents. This pass tightens the boundaries to:
+      - start at the first substantive-introduction sentence (skipping boilerplate)
+      - end at either a natural topic-switch sentence boundary or, under
+        max-duration truncation, the latest terminal-punct sentence that fits.
+
+    Tagged `boundary_quality` per tier so downstream code can surface the
+    confidence level to clients.
+
+    `ingest_cues` carries word-level timestamps from the Whisper paths (Phase A.1);
+    when absent (older transcripts without word data) the engine falls back to
+    proportional word splits and tags quality `"sentence"` instead of `"precise"`.
+    """
+    if not reels or not ingest_cues:
+        # No word-level data available — leave reels as-is, but tag quality.
+        for r in reels:
+            if r.boundary_quality == "legacy":
+                r.boundary_quality = "chapter" if chapters else "sentence"
+        return reels
+
+    try:
+        from .clip_boundary import ClipBoundaryEngine
+        from .sentences import split_sentences
+    except Exception:
+        logger.exception("ClipBoundaryEngine unavailable; skipping boundary refinement")
+        return reels
+
+    try:
+        cue_list = list(ingest_cues)
+        sentences = split_sentences(cue_list)
+        if not sentences:
+            return reels
+    except Exception:
+        logger.exception("sentence splitting raised; skipping boundary refinement")
+        return reels
+
+    engine = ClipBoundaryEngine(llm_pick_start=None)
+
+    # Convert chapters to the dict shape the engine expects
+    chapter_dicts: list[dict[str, Any]] = []
+    if chapters:
+        for c in chapters:
+            try:
+                chapter_dicts.append(
+                    {
+                        "start_time": float(getattr(c, "start", getattr(c, "start_time", 0.0))),
+                        "end_time": float(getattr(c, "end", getattr(c, "end_time", 0.0))),
+                        "title": str(getattr(c, "title", "")),
+                    }
+                )
+            except (AttributeError, TypeError, ValueError):
+                continue
+
+    # LLM topic segments → shape the engine expects (dicts with t_end + label)
+    llm_hints: list[dict[str, Any]] = []
+    if llm_topic_segments_raw:
+        for seg in llm_topic_segments_raw:
+            if isinstance(seg, dict) and isinstance(seg.get("t_end"), (int, float)):
+                llm_hints.append(seg)
+
+    refined: list[TopicReel] = []
+    for r in reels:
+        try:
+            result = engine.refine(
+                raw_t_start=r.t_start,
+                raw_t_end=r.t_end,
+                cues=cue_list,
+                sentences=sentences,
+                query=query,
+                chapters=chapter_dicts or None,
+                llm_topic_segments=llm_hints or None,
+                silence_ranges=silence_ranges,
+                user_min_sec=user_min_sec,
+                user_max_sec=user_max_sec,
+                video_duration_sec=video_duration_sec,
+            )
+            # Only adopt refined bounds if they're saner than the raw ones.
+            if result.t_end > result.t_start:
+                r.t_start = round(float(result.t_start), 2)
+                r.t_end = round(float(result.t_end), 2)
+            r.boundary_quality = result.boundary_quality
+        except Exception:
+            logger.exception(
+                "boundary refinement failed for video %s raw=(%.2f, %.2f); keeping raw",
+                r.video_id, r.t_start, r.t_end,
+            )
+        refined.append(r)
+    return refined
+
+
+# --------------------------------------------------------------------------- #
 # Top-level entrypoint
 # --------------------------------------------------------------------------- #
 
@@ -2071,6 +2184,11 @@ def cut_video_into_topic_reels(
     info_dict: dict[str, Any] | None = None,
     min_reel_sec: float = MIN_TOPIC_REEL_SEC,
     max_reel_sec: float = MAX_TOPIC_REEL_SEC,
+    # Phase A.4: optional word-level precision inputs.
+    ingest_cues_for_precision: Sequence[Any] | None = None,
+    silence_ranges: Sequence[tuple[float, float]] | None = None,
+    user_min_sec: float | None = None,
+    user_max_sec: float | None = None,
 ) -> tuple[VideoClassification, list[TopicReel]]:
     """
     End-to-end: classify a YouTube video, fetch its transcript, and (if it's
@@ -2142,6 +2260,10 @@ def cut_video_into_topic_reels(
             transcript, effective_duration,
         )
 
+    # Resolve soft user-setting bounds — default to the hard min/max guardrails.
+    _user_min = float(user_min_sec) if user_min_sec is not None else float(min_reel_sec)
+    _user_max = float(user_max_sec) if user_max_sec is not None else float(max_reel_sec)
+
     # ---- Path 1: YouTube chapters (free, no API, no inference). -------- #
     chapters = extract_chapters(info_dict)
     if chapters:
@@ -2155,6 +2277,19 @@ def cut_video_into_topic_reels(
             max_reel_sec=max_reel_sec,
         )
         if chapter_reels:
+            # Phase A.4: tighten chapter bounds to skip intro/outro boilerplate and
+            # land on sentence endings, not hard chapter-boundary cuts mid-sentence.
+            chapter_reels = _apply_boundary_engine(
+                chapter_reels,
+                ingest_cues=ingest_cues_for_precision,
+                chapters=chapters,
+                silence_ranges=silence_ranges,
+                llm_topic_segments_raw=None,
+                query=query,
+                user_min_sec=_user_min,
+                user_max_sec=_user_max,
+                video_duration_sec=classification.duration_sec or None,
+            )
             if query and chapter_reels:
                 chapter_reels = _filter_reels_by_query(
                     chapter_reels, query, cues=transcript or [],
@@ -2261,6 +2396,24 @@ def cut_video_into_topic_reels(
             min_reel_sec=min_reel_sec,
             max_reel_sec=max_reel_sec,
         )
+        # Phase A.4: tighten LLM-picked topic windows to precise sentence ends.
+        # Also pass the raw LLM segments as topic_switch_hints so the engine can
+        # prefer natural closes over truncation.
+        llm_hints_for_engine = [
+            {"t_end": float(seg[1]), "label": str(seg[2]) if len(seg) > 2 else ""}
+            for seg in llm_segments
+        ]
+        reels = _apply_boundary_engine(
+            reels,
+            ingest_cues=ingest_cues_for_precision,
+            chapters=chapters or None,
+            silence_ranges=silence_ranges,
+            llm_topic_segments_raw=llm_hints_for_engine,
+            query=query,
+            user_min_sec=_user_min,
+            user_max_sec=_user_max,
+            video_duration_sec=classification.duration_sec or None,
+        )
         if query and reels:
             reels = _filter_reels_by_query(
                 reels, query, cues=transcript,
@@ -2290,6 +2443,18 @@ def cut_video_into_topic_reels(
         video_duration_sec=classification.duration_sec or None,
         min_reel_sec=min_reel_sec,
         max_reel_sec=max_reel_sec,
+    )
+    # Phase A.4: tighten heuristic/semantic bounds via ClipBoundaryEngine.
+    reels = _apply_boundary_engine(
+        reels,
+        ingest_cues=ingest_cues_for_precision,
+        chapters=chapters or None,
+        silence_ranges=silence_ranges,
+        llm_topic_segments_raw=None,
+        query=query,
+        user_min_sec=_user_min,
+        user_max_sec=_user_max,
+        video_duration_sec=classification.duration_sec or None,
     )
     if query and reels:
         reels = _filter_reels_by_query(

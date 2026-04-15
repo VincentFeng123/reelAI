@@ -108,10 +108,16 @@ from .services.embeddings import EmbeddingService
 from .services.material_intelligence import MaterialIntelligenceService
 from .services.parsers import ParseError, extract_text_from_file
 from .services.openai_client import build_openai_client
+from .services import progress_bus
 from .services.reels import GenerationCancelledError, ReelService
 from .services.storage import get_storage
 from .services.text_utils import chunk_text, normalize_whitespace
 from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8601_duration
+
+from .ingestion.logging_config import (
+    publish_progress as _publish_progress_event,
+    set_job_id as _set_progress_job_id,
+)
 
 from .ingestion.errors import (
     DownloadError as IngestDownloadError,
@@ -2811,11 +2817,47 @@ def _submit_refinement_job(job_id: str) -> bool:
 
 
 def _run_refinement_job_with_cleanup(job_id: str) -> None:
+    """
+    Instrumented wrapper around `_run_refinement_job` (Phase D.1 / D.2).
+
+    Binds the current thread's `job_id` contextvar so any `publish_progress(...)`
+    calls inside the worker auto-route onto the progress bus topic keyed on `job_id`.
+    Emits terminal `job_start` / `job_end` events and always calls
+    `progress_bus.terminate()` so attached NDJSON subscribers get a clean EOF.
+    """
+    clean_id = str(job_id or "").strip()
+    _set_progress_job_id(clean_id)
+    started_mono = time.monotonic()
+    _publish_progress_event("job_start", job_id=clean_id)
+    exc_class: str | None = None
     try:
         _run_refinement_job(job_id)
+    except BaseException as exc:
+        exc_class = type(exc).__name__
+        raise
     finally:
+        duration_ms = int((time.monotonic() - started_mono) * 1000)
+        outcome = "ok" if exc_class is None else "error"
+        _publish_progress_event(
+            "job_end",
+            job_id=clean_id,
+            duration_ms=duration_ms,
+            outcome=outcome,
+            error_class=exc_class,
+        )
+        progress_bus.terminate(
+            clean_id,
+            final_event={
+                "event": "job_terminal",
+                "job_id": clean_id,
+                "outcome": outcome,
+                "error_class": exc_class,
+                "duration_ms": duration_ms,
+            },
+        )
         with _refinement_jobs_lock:
-            _scheduled_refinement_job_ids.discard(str(job_id or "").strip())
+            _scheduled_refinement_job_ids.discard(clean_id)
+        _set_progress_job_id(None)
 
 
 def _resume_queued_refinement_job(conn, job_row: dict[str, Any]) -> dict[str, Any] | None:
@@ -4088,6 +4130,15 @@ def _run_refinement_job(job_id: str) -> None:
                 limit=safe_page_size_hint,
             )
             source_visible_keys = _visible_reel_clip_keys(source_visible_reels)
+            _publish_progress_event(
+                "stage_start",
+                stage=f"refinement_stage_{safe_recovery_stage}",
+                recovery_stage=safe_recovery_stage,
+                target_reel_count=target_reel_count,
+                generation_id=result_generation_id,
+                generation_mode=generation_mode,
+            )
+            stage_started_mono = time.monotonic()
             reel_service.generate_reels(
                 conn,
                 material_id=str(job_row.get("material_id") or ""),
@@ -4107,7 +4158,22 @@ def _run_refinement_job(job_id: str) -> None:
                 page_hint=safe_target_page,
                 recovery_stage=safe_recovery_stage,
             )
+            _publish_progress_event(
+                "stage_end",
+                stage=f"refinement_stage_{safe_recovery_stage}",
+                recovery_stage=safe_recovery_stage,
+                duration_ms=int((time.monotonic() - stage_started_mono) * 1000),
+                outcome="ok",
+            )
         except Exception as exc:
+            _publish_progress_event(
+                "stage_end",
+                stage=f"refinement_stage_{safe_recovery_stage}",
+                recovery_stage=safe_recovery_stage,
+                outcome="error",
+                error_class=type(exc).__name__,
+                detail=str(exc)[:240],
+            )
             _complete_generation(
                 conn,
                 generation_id=result_generation_id,
@@ -4243,6 +4309,14 @@ def _run_refinement_job(job_id: str) -> None:
             new_unique_videos=_count_generation_unique_videos(conn, result_generation_id),
             new_unique_clip_windows=result_count,
             new_unique_visible_reels=len(new_visible_reels),
+        )
+        _publish_progress_event(
+            "reels_completed",
+            result_generation_id=result_generation_id,
+            total_clip_windows=result_count,
+            new_visible_reels=len(new_visible_reels),
+            recovery_stage=safe_recovery_stage,
+            all_stages_exhausted=bool(next_state.get("all_stages_exhausted")),
         )
         # Keep refinement client-driven. A single queued job may finish after the
         # user leaves the page, but it should not recursively schedule more work
@@ -5978,6 +6052,58 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
             cancel_event.set()
 
     return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
+@app.get("/api/reels/refinement-stream/{job_id}")
+async def refinement_stream(request: Request, job_id: str, replay_from_ms: int = 0):
+    """
+    NDJSON progress stream for a refinement job (Phase D.1).
+
+    Emits one JSON line per progress event (stage_start, stage_end, reels_completed,
+    job_start, job_end, job_terminal, and any custom events published by the worker).
+    The response continues until the worker emits a `job_terminal` event (clean EOF)
+    or the subscriber's idle timeout elapses.
+
+    Late subscribers can pass `?replay_from_ms=` to skip events they already saw on
+    reconnect. When `replay_from_ms=0` (default) the client gets the full buffered
+    history (up to `progress_bus.BUFFER_SIZE` events).
+
+    Both iOS (APIClient.swift:589) and the webapp (api.ts:925) already handle
+    line-buffered NDJSON for /api/reels/generate-stream — this endpoint reuses that
+    client-side plumbing.
+    """
+    _require_community_client_identity(request)
+    _enforce_rate_limit(
+        request,
+        "reels-refinement-stream",
+        limit=REELS_REFINEMENT_STATUS_RATE_LIMIT_PER_WINDOW,
+    )
+
+    clean_job_id = str(job_id or "").strip()
+    if not clean_job_id:
+        raise HTTPException(status_code=400, detail="job_id required")
+
+    with get_conn() as conn:
+        job_row = fetch_one(
+            conn, "SELECT id FROM reel_generation_jobs WHERE id = ? LIMIT 1", (clean_job_id,)
+        )
+    if not job_row:
+        raise HTTPException(status_code=404, detail="job_id not found")
+
+    async def ndjson_events():
+        try:
+            async for event in progress_bus.subscribe(
+                clean_job_id,
+                replay_from_ms=int(replay_from_ms or 0),
+                idle_timeout_sec=90.0,
+            ):
+                if await request.is_disconnected():
+                    break
+                yield f"{json.dumps(event, default=str)}\n"
+        except Exception as exc:  # pragma: no cover - defensive
+            yield f"{json.dumps({'event': 'stream_error', 'detail': str(exc)})}\n"
+
+    return StreamingResponse(ndjson_events(), media_type="application/x-ndjson")
 
 
 @app.get("/api/reels/refinement-status/{job_id}", response_model=RefinementStatusResponse)
