@@ -304,6 +304,13 @@ REFINEMENT_STAGE_MULTI_CLIP_EXPANDED = 4
 REFINEMENT_STAGE_RECOVERY_GRAPH = 5
 MAX_REFINEMENT_RECOVERY_STAGE = REFINEMENT_STAGE_RECOVERY_GRAPH
 REFINEMENT_JOB_STALE_TIMEOUT_SEC = 300
+# Cumulative upper bound on reels stored per material across all feed pages.
+# The per-request generation cap in ReelService already bounds each individual
+# call, but without this ceiling a client that keeps paginating indefinitely
+# can drive total storage to unbounded growth (200 pages * 25 limit = 5,000
+# reels per material in the worst case). 300 comfortably covers typical study
+# sessions (3-50 reels) while guarding against runaway pagination.
+MAX_REELS_PER_MATERIAL = 300
 
 VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
@@ -6575,10 +6582,15 @@ def feed(
             raise HTTPException(status_code=404, detail="material_id not found")
 
         fast_mode = generation_mode == "fast"
+        client_requested_slow = generation_mode == "slow"
+        generation_mode_overridden = False
         if SERVERLESS_MODE:
             # Hosted/serverless: force fast retrieval profile to avoid request timeouts.
+            if client_requested_slow:
+                generation_mode_overridden = True
             fast_mode = True
             prefetch = min(prefetch, 6)
+        effective_generation_mode = "fast" if fast_mode else "slow"
         safe_min_relevance = _normalize_min_relevance(min_relevance)
         normalized_excluded_video_ids = _parse_excluded_video_ids_param(exclude_video_ids)
         safe_video_pool_mode = _normalize_video_pool_mode(video_pool_mode)
@@ -6638,26 +6650,48 @@ def feed(
                 "response_profile": response_profile,
                 "refinement_job_id": str((refinement_job or {}).get("id") or "") or None,
                 "refinement_status": str((refinement_job or {}).get("status") or "") or None,
+                "effective_generation_mode": effective_generation_mode,
+                "generation_mode_overridden": generation_mode_overridden,
             }
-        refinement_job = _queue_refinement_if_needed(
+        # Cumulative cap: if this material already has MAX_REELS_PER_MATERIAL
+        # reels on disk, don't queue another refinement. Stops unbounded
+        # background generation on clients that page indefinitely. Bypassed
+        # when the client isn't even asking for autofill (they're page-picking,
+        # not paginating) because those requests don't produce new generations.
+        material_reel_count_row = fetch_one(
             conn,
-            material_id=material_id,
-            concept_id=None,
-            request_key=request_key,
-            generation_id=active_generation_id,
-            current_reels=filtered_ranked,
-            required_count=target_total if autofill else page * limit,
-            generation_mode="fast" if fast_mode else "slow",
-            creative_commons_only=creative_commons_only,
-            preferred_video_duration=safe_video_duration_pref,
-            video_pool_mode=safe_video_pool_mode,
-            target_clip_duration_sec=safe_target_clip_duration_sec,
-            target_clip_duration_min_sec=safe_target_clip_min_sec,
-            target_clip_duration_max_sec=safe_target_clip_max_sec,
-            min_relevance=safe_min_relevance,
-            page_hint=page,
-            page_size_hint=limit,
+            "SELECT COUNT(*) AS reel_count FROM reels WHERE material_id = ?",
+            (material_id,),
         )
+        material_reel_count = int((material_reel_count_row or {}).get("reel_count") or 0)
+        if autofill and material_reel_count >= MAX_REELS_PER_MATERIAL:
+            logger.info(
+                "feed: per-material cap reached (material_id=%s count=%d cap=%d); skipping refinement queue",
+                material_id,
+                material_reel_count,
+                MAX_REELS_PER_MATERIAL,
+            )
+            refinement_job = None
+        else:
+            refinement_job = _queue_refinement_if_needed(
+                conn,
+                material_id=material_id,
+                concept_id=None,
+                request_key=request_key,
+                generation_id=active_generation_id,
+                current_reels=filtered_ranked,
+                required_count=target_total if autofill else page * limit,
+                generation_mode="fast" if fast_mode else "slow",
+                creative_commons_only=creative_commons_only,
+                preferred_video_duration=safe_video_duration_pref,
+                video_pool_mode=safe_video_pool_mode,
+                target_clip_duration_sec=safe_target_clip_duration_sec,
+                target_clip_duration_min_sec=safe_target_clip_min_sec,
+                target_clip_duration_max_sec=safe_target_clip_max_sec,
+                min_relevance=safe_min_relevance,
+                page_hint=page,
+                page_size_hint=limit,
+            )
     total = len(filtered_ranked)
     start = (page - 1) * limit
     end = start + limit
@@ -6672,6 +6706,8 @@ def feed(
         "response_profile": response_profile,
         "refinement_job_id": str((refinement_job or {}).get("id") or "") or None,
         "refinement_status": str((refinement_job or {}).get("status") or "") or None,
+        "effective_generation_mode": effective_generation_mode,
+        "generation_mode_overridden": generation_mode_overridden,
     }
 
 

@@ -211,6 +211,14 @@ class FeedResponse(BaseModel):
     response_profile: str | None = None
     refinement_job_id: str | None = None
     refinement_status: str | None = None
+    # The generation_mode the server actually used. When the client requested
+    # "slow" but the server was running in serverless mode (no long-running
+    # workers available), the server forces "fast" and reports it here so the
+    # UI can indicate the downgrade.
+    effective_generation_mode: str | None = None
+    # True when the server downgraded the client's requested mode. Clients
+    # can show an advisory; clients that don't care can ignore it.
+    generation_mode_overridden: bool = False
 
 
 class RefinementStatusResponse(BaseModel):

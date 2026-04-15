@@ -388,6 +388,32 @@ class ReelService:
         "top 5",
         "ranking every",
     )
+    # Title patterns that indicate film/TV/entertainment media clips rather than
+    # educational material. Critical for ambiguous queries like "calculus" where
+    # movie scenes (e.g. "Mean Girls — Calculus Scene") can otherwise sneak in.
+    # Matching is case-insensitive substring on `channel + " " + title`.
+    MOVIE_TITLE_PATTERNS = (
+        "movie clip",
+        "movie scene",
+        "film clip",
+        "film scene",
+        "official trailer",
+        "official clip",
+        "deleted scene",
+        "full scene",
+        "movie moment",
+        "cinemacon",
+        "- scene",
+        " scene -",
+        " scene (",
+        "blu-ray",
+        "behind the scenes",
+        " (hd)",
+        " (1080p)",
+        " (4k)",
+        "tv show",
+        "sitcom",
+    )
     AMBIGUOUS_CONCEPT_TOKENS = {
         "atom",
         "atoms",
@@ -592,6 +618,7 @@ class ReelService:
         "stock_footage": 0.08,
         "podcast": -0.03,
         "low_quality_compilation": -0.11,
+        "entertainment_media": -0.14,
     }
     # ----------------------------------------------------------------------- #
     # Scoring rubric — documents the weights used in _score_video_candidate.
@@ -2492,6 +2519,43 @@ class ReelService:
             else:
                 ranked_candidates = stage_candidates[: max(12, transcript_budget * 2)]
 
+            # Hard drop for ambiguous concepts. Runs in BOTH fast and non-fast
+            # modes. When the subject/concept contains a known homonym
+            # (e.g. "calculus", "cell", "python"), any candidate classified as
+            # entertainment_media or low_quality_compilation is almost
+            # certainly the wrong sense of the word and should be dropped
+            # outright rather than scored against a soft gate.
+            concept_ambig_tokens = normalize_terms([
+                str(subject_tag or ""),
+                str(concept.get("title") or ""),
+            ])
+            ambiguous_concept = bool(concept_ambig_tokens & self.AMBIGUOUS_CONCEPT_TOKENS)
+            if ambiguous_concept and ranked_candidates:
+                pre_count = len(ranked_candidates)
+                filtered: list[dict[str, Any]] = []
+                for cand in ranked_candidates:
+                    video_row = cand.get("video") or {}
+                    tier = self._infer_channel_tier(
+                        channel=str(video_row.get("channel_title") or "").lower(),
+                        title=str(video_row.get("title") or "").lower(),
+                    )
+                    if tier in {"entertainment_media", "low_quality_compilation"}:
+                        if self.retrieval_debug_logging:
+                            logger.info(
+                                "reels.loop drop_candidate concept=%s video=%s tier=%s reason=ambiguous_concept_entertainment",
+                                str(concept.get("id") or ""),
+                                str(cand.get("video_id") or ""),
+                                tier,
+                            )
+                        continue
+                    filtered.append(cand)
+                dropped = pre_count - len(filtered)
+                if dropped:
+                    retrieval_metrics["ambiguous_concept_dropped"] = int(
+                        retrieval_metrics.get("ambiguous_concept_dropped", 0)
+                    ) + dropped
+                ranked_candidates = filtered
+
             # LLM relevance pre-filter: drops clearly irrelevant candidates before
             # the expensive transcript-fetch step. Only runs in non-fast mode.
             if not fast_mode and self.openai_client and ranked_candidates:
@@ -2736,6 +2800,37 @@ class ReelService:
                 if not segment_candidates:
                     continue
 
+                # Chain-state for topic_cut sub-segments. There are TWO
+                # chaining regimes:
+                #
+                #   1. Sub-parts of a single oversized cluster share a
+                #      ``cluster_group_id`` (assigned by
+                #      `_topic_cut_segments_for_concept`). These must chain
+                #      exactly — no gap, no overlap.
+                #   2. Neighbouring clusters that were bridged at their gap
+                #      midpoint by `_topic_cut_segments_for_concept` have
+                #      DIFFERENT cluster_group_ids but their t_start/t_end
+                #      still line up. We detect this at the main-loop level
+                #      by tracking the last refined end per video, and when
+                #      the next segment's raw t_start is within a small
+                #      tolerance, we chain across the cluster boundary too.
+                cluster_chain_last_end: dict[str, float] = {}
+                topic_cut_last_refined_end: float | None = None
+                TOPIC_CUT_BRIDGE_TOLERANCE_SEC = 2.0
+
+                # Process segments in TEMPORAL order so consecutive clusters
+                # in the video are refined in the same order they appear.
+                # Sub-parts of the same cluster naturally sort in
+                # cluster_sub_index order because their t_start values are
+                # strictly increasing.
+                segment_candidates = sorted(
+                    segment_candidates,
+                    key=lambda item: (
+                        float(item[0].t_start),
+                        int(getattr(item[0], "cluster_sub_index", 0)),
+                    ),
+                )
+
                 for segment, segment_relevance in segment_candidates:
                     raise_if_cancelled()
                     # Compute one or more consecutive clip windows for this segment.
@@ -2743,21 +2838,105 @@ class ReelService:
                     # divides it into multiple sentence-aligned reels so that
                     # long-form topic content isn't dropped.
                     if use_full_short_clip:
-                        single_win = self._full_short_clip_window(video_duration)
+                        single_win = self._full_short_clip_window(
+                            video_duration,
+                            transcript=transcript if transcript else None,
+                        )
                         clip_windows: list[tuple[float, float]] = [single_win] if single_win else []
                     elif getattr(segment, "source", "legacy") == "topic_cut":
-                        # Topic-cut segments have already been precisely snapped to
-                        # sentence boundaries by topic_cut.py — skip the refinement
-                        # step which can shift boundaries by up to 6 seconds.
-                        single_win = self._normalize_clip_window(
-                            segment.t_start,
-                            segment.t_end,
-                            video_duration,
-                            min_len=clip_min_len,
-                            max_len=clip_max_len,
-                            allow_exceed_max=True,
-                        )
-                        clip_windows = [single_win] if single_win else []
+                        # Topic-cut segments were produced by topic_cut.py,
+                        # which already picks topic-aligned boundaries (LLM /
+                        # chapters / Jaccard) and snaps t_end to cue gaps.
+                        # However, cue boundaries are NOT sentence boundaries;
+                        # we still must guarantee the reel ends on a complete
+                        # sentence when possible. Two branches:
+                        #
+                        #   - seg_span > clip_max_len + 16 → split into
+                        #     consecutive sentence-aligned windows so the topic
+                        #     carries across multiple reels seamlessly and
+                        #     each honors the user's max_len.
+                        #   - seg_span ≤ clip_max_len + 16 → run the same
+                        #     transcript refiner with a generous max_len so the
+                        #     end lands on a sentence terminator WITHOUT
+                        #     truncating the topic below the user's max. Pass
+                        #     min_start=segment.t_start so refinement can only
+                        #     move the start FORWARD (never before the topic
+                        #     introduction).
+                        seg_span = max(0.0, float(segment.t_end) - float(segment.t_start))
+                        # Chaining: if this segment is a sub-part of an oversized
+                        # topic cluster, force continuity with the previous
+                        # sub-part's refined end so the reels play back as one
+                        # continuous topic discussion.
+                        chain_id = str(getattr(segment, "cluster_group_id", "") or "")
+                        chain_prev_end = cluster_chain_last_end.get(chain_id) if chain_id else None
+                        # When chained within the same cluster, the next
+                        # sub-part starts at exactly the previous sub-part's
+                        # refined end — no gap, no overlap.
+                        if chain_prev_end is not None:
+                            effective_start = float(chain_prev_end)
+                        elif (
+                            topic_cut_last_refined_end is not None
+                            and abs(float(segment.t_start) - topic_cut_last_refined_end)
+                            <= TOPIC_CUT_BRIDGE_TOLERANCE_SEC
+                        ):
+                            # Bridged adjacent clusters (different
+                            # cluster_group_id but touching timestamps). Chain
+                            # across the boundary so there's no overlap.
+                            effective_start = float(topic_cut_last_refined_end)
+                        else:
+                            effective_start = float(segment.t_start)
+                        if transcript and seg_span > float(clip_max_len) + 16.0:
+                            clip_windows = self._split_into_consecutive_windows(
+                                transcript=transcript,
+                                segment_start=effective_start,
+                                segment_end=segment.t_end,
+                                video_duration_sec=video_duration,
+                                min_len=clip_min_len,
+                                max_len=clip_max_len,
+                            )
+                        elif transcript:
+                            # Give the refiner enough headroom that it won't
+                            # truncate a legitimate topic span shorter than
+                            # the user's max_len; also ensure min_len doesn't
+                            # pull the start backward through the topic intro.
+                            refiner_max = int(max(seg_span + 16.0, float(clip_max_len)))
+                            refiner_min = max(1, min(int(clip_min_len), int(max(1.0, seg_span * 0.6))))
+                            single_win = self._refine_clip_window_from_transcript(
+                                transcript=transcript,
+                                proposed_start=effective_start,
+                                proposed_end=segment.t_end,
+                                video_duration_sec=video_duration,
+                                min_len=refiner_min,
+                                max_len=refiner_max,
+                                min_start=effective_start,
+                            )
+                            if not single_win:
+                                single_win = self._normalize_clip_window(
+                                    effective_start,
+                                    segment.t_end,
+                                    video_duration,
+                                    min_len=clip_min_len,
+                                    max_len=clip_max_len,
+                                    allow_exceed_max=True,
+                                )
+                            clip_windows = [single_win] if single_win else []
+                        else:
+                            single_win = self._normalize_clip_window(
+                                effective_start,
+                                segment.t_end,
+                                video_duration,
+                                min_len=clip_min_len,
+                                max_len=clip_max_len,
+                                allow_exceed_max=True,
+                            )
+                            clip_windows = [single_win] if single_win else []
+                        # Record the last refined end for this cluster chain so
+                        # subsequent sub-parts can snap to it. Also record the
+                        # video-wide last refined end for cross-cluster bridging.
+                        if clip_windows:
+                            if chain_id:
+                                cluster_chain_last_end[chain_id] = float(clip_windows[-1][1])
+                            topic_cut_last_refined_end = float(clip_windows[-1][1])
                     elif transcript:
                         # Preserve the old behavior for short/normal segments so
                         # working topics aren't perturbed. Only invoke the split
@@ -2797,7 +2976,10 @@ class ReelService:
                         if use_full_short_clip:
                             branch_dbg = "full_short"
                         elif getattr(segment, "source", "legacy") == "topic_cut":
-                            branch_dbg = "topic_cut"
+                            if transcript and seg_span_dbg > float(clip_max_len) + 16.0:
+                                branch_dbg = "topic_cut_split"
+                            else:
+                                branch_dbg = "topic_cut"
                         elif transcript and seg_span_dbg > float(clip_max_len) + 16.0:
                             branch_dbg = "split"
                         elif transcript:
@@ -7030,6 +7212,7 @@ class ReelService:
             "known_educational": 1.0, "education": 0.85, "tutorial": 0.7,
             "news": 0.6, "podcast": 0.4, "stock_footage": 0.3,
             "low_quality_compilation": 0.1,
+            "entertainment_media": 0.05,
         }
         score += 0.20 * tier_scores.get(tier, 0.5)
 
@@ -7725,28 +7908,46 @@ class ReelService:
         # Block known entertainment channels that use academic-sounding names.
         if channel.strip().lower() in self.KNOWN_ENTERTAINMENT_CHANNELS:
             return "low_quality_compilation"
-        hay = f"{channel} {title}"
-        # Low-quality must be checked before education to prevent false positives
-        # (e.g., "VEVO Academy" shouldn't classify as education).
-        if any(token in hay for token in ["vevo", "official audio", "lyrics", "karaoke", "remix"]):
+        hay_lower = f"{channel} {title}".lower()
+        title_lower = title.lower().strip()
+        # Film/TV entertainment patterns — must be checked before education so a
+        # title like "Calculus Scene - Mean Girls" doesn't classify as
+        # educational on the "scene"-adjacent text.
+        if any(token in hay_lower for token in self.MOVIE_TITLE_PATTERNS):
+            return "entertainment_media"
+        # Movie-clip titles commonly end in "Scene", "Scenes", "- HD", etc.
+        # Regex catches patterns that pure substring matching misses
+        # (e.g. "Mean Girls - Calculus Scene").
+        if re.search(
+            r"\b(scene|scenes)\s*(?:\([^\)]*\))?\s*[\-\|\[]*\s*(?:hd|4k|1080p|720p)?\s*$",
+            title_lower,
+        ):
+            return "entertainment_media"
+        # "(Movie) Scene", "(Film) Scene" — parenthetical or bracketed film tags.
+        if re.search(r"\(\s*(movie|film|tv|show)\b", title_lower):
+            return "entertainment_media"
+        # From here on, substring checks compare against a LOWERCASED haystack
+        # (hay_lower) so titles like "Calculus Basics Explained Simply" still
+        # match the "explained" token even when capitalised.
+        if any(token in hay_lower for token in ["vevo", "official audio", "lyrics", "karaoke", "remix"]):
             return "low_quality_compilation"
-        if any(token in hay for token in ["compilation", "best moments", "reaction", "clips", "tiktok", "meme"]):
+        if any(token in hay_lower for token in ["compilation", "best moments", "reaction", "clips", "tiktok", "meme"]):
             return "low_quality_compilation"
-        if any(token in hay for token in ["news", "times", "bbc", "cnn", "reuters", "al jazeera", "pbs"]):
+        if any(token in hay_lower for token in ["news", "times", "bbc", "cnn", "reuters", "al jazeera", "pbs"]):
             return "news"
         # Use word-boundary-aware matching for "academy" to avoid false positives
         # like "Academy Awards" or gaming channel names containing "academy".
-        if any(token in hay for token in ["course", "university", "opencourseware", "explained"]):
+        if any(token in hay_lower for token in ["course", "university", "opencourseware", "explained"]):
             return "education"
-        if re.search(r'\b(?:academy|education|science)\b', hay) and not any(
-            noise in hay for noise in ["gaming", "awards", "beauty", "sport", "fitness"]
+        if re.search(r'\b(?:academy|education|science)\b', hay_lower) and not any(
+            noise in hay_lower for noise in ["gaming", "awards", "beauty", "sport", "fitness"]
         ):
             return "education"
-        if any(token in hay for token in ["stock", "footage", "cinematic"]):
+        if any(token in hay_lower for token in ["stock", "footage", "cinematic"]):
             return "stock_footage"
-        if any(token in hay for token in ["tutorial", "how to", "walkthrough", "demo", "masterclass"]):
+        if any(token in hay_lower for token in ["tutorial", "how to", "walkthrough", "demo", "masterclass"]):
             return "tutorial"
-        if "podcast" in hay:
+        if "podcast" in hay_lower:
             return "podcast"
         return "tutorial"
 
@@ -7764,12 +7965,28 @@ class ReelService:
         Only runs when ``self.openai_client`` is available.  On any failure,
         all candidates pass through (graceful degradation).  Results are cached
         in ``llm_cache`` to avoid repeated API calls for the same candidate set.
+
+        For concepts in ``AMBIGUOUS_CONCEPT_TOKENS`` (e.g. "calculus", which
+        could refer to math or dental deposits or a movie title), the prompt
+        includes explicit disambiguation examples and the post-filter is
+        tightened — candidates omitted by the LLM are treated as rejections,
+        not passes, and the confidence floor is raised.
         """
         if not self.openai_client or not candidates:
             return candidates
 
+        # Ambiguity detection keys off both the subject_tag and the concept
+        # text — we want strictness to apply whenever ANY token in the concept
+        # is in the ambiguous set, not just the subject.
+        concept_tokens = normalize_terms([str(subject_tag or ""), concept_text])
+        ambiguous_query = bool(concept_tokens & self.AMBIGUOUS_CONCEPT_TOKENS)
+        ambiguous_tokens = sorted(concept_tokens & self.AMBIGUOUS_CONCEPT_TOKENS)
+
         BATCH_SIZE = 8
         results: list[dict[str, Any]] = []
+        # Cache-version bump ensures we don't reuse cached ratings produced by
+        # the older, looser prompt for ambiguous concepts.
+        prefilter_version = "v2"
 
         for batch_start in range(0, len(candidates), BATCH_SIZE):
             batch = candidates[batch_start : batch_start + BATCH_SIZE]
@@ -7780,21 +7997,40 @@ class ReelService:
                 for i, c in enumerate(batch)
             )
 
+            ambiguity_note = ""
+            if ambiguous_query:
+                ambiguity_note = (
+                    "\n\nCRITICAL DISAMBIGUATION: the subject terms "
+                    f"{ambiguous_tokens} are known homonyms. "
+                    "Reject any match that is NOT the educational sense of the term. "
+                    "Examples to reject: movie/TV scenes that merely mention the word, "
+                    "music videos, song lyrics with the word, sports teams / mascots, "
+                    "unrelated branding, dental-hygiene content when the query is math "
+                    "'calculus', biology 'cell' when the query is prison/storage cell, "
+                    "'python' the snake when the query is the language, etc. "
+                    "When in doubt about a generic-looking title, err toward REJECT "
+                    "(set relevant=false, confidence≥0.6). Only accept titles that "
+                    "clearly signal educational treatment of the concept."
+                )
+
             user_prompt = (
                 f"Target concept: {concept_text}\n"
                 f"Subject area: {subject_tag or 'General'}\n"
                 f"Context: {', '.join(context_terms[:10])}\n\n"
                 "Rate each video's educational relevance to the target concept.\n"
-                'Return JSON: {"ratings": [{"index": 1, "relevant": true, "confidence": 0.8, "reason": "brief"}]}\n\n'
+                'Return JSON: {"ratings": [{"index": 1, "relevant": true, "confidence": 0.8, "reason": "brief"}]}\n'
+                "You MUST return one rating per video, in the same order as listed.\n\n"
                 "Rules:\n"
                 "- relevant = the video likely contains substantive educational content about the concept\n"
                 "- Music, vlogs, reactions, compilations = not relevant\n"
+                "- Movie clips, film scenes, TV scenes, trailers = not relevant\n"
                 "- Tangential matches (e.g., dental calculus vs math calculus) = not relevant\n"
-                "- Videos that teach, explain, demonstrate the concept = relevant\n\n"
+                "- Videos that teach, explain, demonstrate the concept = relevant"
+                f"{ambiguity_note}\n\n"
                 f"Videos:\n{video_list}"
             )
 
-            cache_payload = f"llm_prefilter_v1|{self.chat_model}|{user_prompt}"
+            cache_payload = f"llm_prefilter_{prefilter_version}|{self.chat_model}|{user_prompt}"
             cache_key = f"llm_prefilter:{hashlib.sha256(cache_payload.encode('utf-8')).hexdigest()[:40]}"
 
             try:
@@ -7827,20 +8063,45 @@ class ReelService:
                         pk="cache_key",
                     )
 
+                # Initialize each candidate with a default; for ambiguous
+                # queries the default is REJECT (not pass) so that a partial
+                # LLM response can't accidentally whitelist unrated videos.
+                default_relevant = not ambiguous_query
+                default_confidence = 0.5 if not ambiguous_query else 0.0
+                for c in batch:
+                    c["llm_relevant"] = default_relevant
+                    c["llm_relevance"] = default_confidence
+                    c["llm_rated"] = False
+
                 for rating in ratings.get("ratings", []):
                     idx = int(rating.get("index", 0)) - 1
                     if 0 <= idx < len(batch):
                         batch[idx]["llm_relevance"] = float(rating.get("confidence", 0.5))
                         batch[idx]["llm_relevant"] = bool(rating.get("relevant", True))
+                        batch[idx]["llm_rated"] = True
                 results.extend(batch)
             except Exception:
                 logger.debug("LLM pre-filter failed for batch; passing all candidates through", exc_info=True)
                 for c in batch:
+                    # Fail-open only for non-ambiguous queries. Ambiguous ones
+                    # stay in the result so downstream transcript-relevance
+                    # scoring can still reject them, but we mark them as
+                    # unrated so downstream gates know to be stricter.
                     c["llm_relevance"] = 0.5
                     c["llm_relevant"] = True
+                    c["llm_rated"] = False
                 results.extend(batch)
 
-        # Only drop candidates the LLM is confident are NOT relevant.
+        if ambiguous_query:
+            # Strict path: only keep candidates the LLM explicitly marked
+            # relevant with confidence ≥ 0.6. Unrated / omitted candidates are
+            # dropped.
+            return [
+                c for c in results
+                if bool(c.get("llm_relevant"))
+                and float(c.get("llm_relevance") or 0.0) >= 0.6
+            ]
+        # Default path: only drop candidates the LLM is confident are NOT relevant.
         return [
             c for c in results
             if c.get("llm_relevant", True) or float(c.get("llm_relevance", 0.5)) > 0.7
@@ -9930,6 +10191,12 @@ class ReelService:
                     continue
 
             # Max-length guardrail: split too-long windows into equal parts.
+            # Each sub-part is tagged with a shared ``cluster_group`` id so the
+            # main candidate loop can refine them as a continuous chain
+            # (forcing each sub-part's refined t_start to the previous
+            # sub-part's refined t_end). Without this chaining, independent
+            # refinement of each sub-part can introduce gaps or overlaps at
+            # the sub-segment boundaries.
             sub_windows: list[tuple[float, float]] = []
             if duration > clip_max_len:
                 import math
@@ -9945,7 +10212,10 @@ class ReelService:
             else:
                 sub_windows = [(t_start, t_end)]
 
-            for a, b in sub_windows:
+            multi_part = len(sub_windows) > 1
+            cluster_group_id = f"tcut-{video_id}-{win_idx}" if multi_part else ""
+
+            for sub_idx, (a, b) in enumerate(sub_windows):
                 text_parts: list[str] = []
                 for i in range(len(cue_starts)):
                     if cue_starts[i] < a - 0.01:
@@ -9963,15 +10233,20 @@ class ReelService:
                 # — only the ordering within this video.
                 density_score = 0.4 + min(0.5, 0.05 * len(cluster))
 
-                segments.append(
-                    SegmentMatch(
-                        chunk_index=next_chunk_index,
-                        t_start=float(a),
-                        t_end=float(b),
-                        text=joined_text,
-                        score=density_score,
-                    )
+                match = SegmentMatch(
+                    chunk_index=next_chunk_index,
+                    t_start=float(a),
+                    t_end=float(b),
+                    text=joined_text,
+                    score=density_score,
                 )
+                # Chaining metadata — read by the main candidate loop so
+                # consecutive refined windows are contiguous.
+                if multi_part:
+                    match.cluster_group_id = cluster_group_id
+                    match.cluster_sub_index = sub_idx
+                    match.cluster_is_last = sub_idx == len(sub_windows) - 1
+                segments.append(match)
                 next_chunk_index += 1
 
         return segments
@@ -10616,9 +10891,65 @@ class ReelService:
         # Shorts are currently up to ~3 minutes; keep full playback for these.
         return video_duration_sec <= 185
 
-    def _full_short_clip_window(self, video_duration_sec: int) -> tuple[int, int] | None:
+    def _full_short_clip_window(
+        self,
+        video_duration_sec: int,
+        transcript: list[dict[str, Any]] | None = None,
+    ) -> tuple[int, int] | None:
+        """Return a window covering the full Short.
+
+        When a transcript is supplied, the start is snapped to the first
+        sentence beginning (or stays at 0 if the video opens on a sentence
+        start anyway). This prevents a Short whose first caption runs
+        "...and that's why calculus is useful!" from producing a reel that
+        begins mid-thought. Only the start is adjusted — the end stays at
+        the video duration so the full Short plays out.
+        """
+        t_start = 0.0
+        if transcript:
+            # Decide whether the transcript has real punctuation. If not,
+            # use a pause-based proxy for sentence boundaries.
+            use_pause_proxy = not self._transcript_has_terminal_punct(transcript)
+            # Look at the first few cues. If cue[0] already starts a sentence
+            # (or we have no sentence terminator before cue[1]), keep t_start
+            # at 0. Otherwise skip ahead to the first cue whose preceding
+            # cue ended on terminal punctuation.
+            parsed: list[tuple[float, float, str]] = []
+            for entry in transcript[:12]:
+                try:
+                    start = float(entry.get("start") or 0.0)
+                    dur = float(entry.get("duration") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                text = str(entry.get("text") or "").replace("\n", " ").strip()
+                if not text:
+                    continue
+                parsed.append((start, dur, text))
+            # Only shift forward if the earliest terminator is within the
+            # first ~4 seconds AND leaves at least 8s of content afterwards.
+            # This guards against Shorts with a single long monologue where
+            # snapping forward would clip out most of the video.
+            remaining_floor = max(8.0, float(video_duration_sec) * 0.4)
+            for i in range(1, len(parsed)):
+                prev_start, prev_dur, prev_text = parsed[i - 1]
+                cur_start, _, _ = parsed[i]
+                if cur_start > 4.0:
+                    break
+                # Boundary test:
+                #   - punctuated: prev cue ends with .!?…
+                #   - unpunctuated: gap between prev_end and cur_start ≥ 0.6s
+                prev_end = prev_start + prev_dur
+                is_boundary = (
+                    (cur_start - prev_end) >= 0.6
+                    if use_pause_proxy
+                    else self._is_sentence_end(prev_text)
+                )
+                if is_boundary:
+                    if float(video_duration_sec) - cur_start >= remaining_floor:
+                        t_start = cur_start
+                    break
         return self._normalize_clip_window(
-            t_start=0.0,
+            t_start=t_start,
             t_end=float(video_duration_sec),
             video_duration_sec=video_duration_sec,
             min_len=1,
@@ -10693,23 +11024,58 @@ class ReelService:
                 # extension to land on a sentence boundary even if it exceeds max_len.
                 proposed_end = seg_end
                 effective_max = int(max(remaining + 16, max_len))
+                # Final reel is lenient — prefer a sentence end but accept a
+                # clean cue boundary rather than dropping the remainder.
+                win = self._refine_clip_window_from_transcript(
+                    transcript=transcript,
+                    proposed_start=current_start,
+                    proposed_end=proposed_end,
+                    video_duration_sec=video_duration_sec,
+                    min_len=min_len,
+                    max_len=effective_max,
+                    min_start=current_start,
+                )
             else:
                 proposed_end = current_start + float(max_len)
                 effective_max = max_len
-
-            win = self._refine_clip_window_from_transcript(
-                transcript=transcript,
-                proposed_start=current_start,
-                proposed_end=proposed_end,
-                video_duration_sec=video_duration_sec,
-                min_len=min_len,
-                max_len=effective_max,
-            )
+                # Non-last split: REQUIRE the end to be a real sentence
+                # terminator so the continuation in the next window can pick
+                # up mid-thought without the prior reel having truncated
+                # mid-sentence. If strict mode can't land one (sparse
+                # transcript, no terminal punct in range), fall back to
+                # lenient mode rather than emitting zero reels.
+                win = self._refine_clip_window_from_transcript(
+                    transcript=transcript,
+                    proposed_start=current_start,
+                    proposed_end=proposed_end,
+                    video_duration_sec=video_duration_sec,
+                    min_len=min_len,
+                    max_len=effective_max,
+                    min_start=current_start,
+                    require_sentence_end=True,
+                )
+                if not win:
+                    win = self._refine_clip_window_from_transcript(
+                        transcript=transcript,
+                        proposed_start=current_start,
+                        proposed_end=proposed_end,
+                        video_duration_sec=video_duration_sec,
+                        min_len=min_len,
+                        max_len=effective_max,
+                        min_start=current_start,
+                    )
             if not win:
                 break
             s, e = win
-            # Guard against zero-progress (e.g. refiner snapped start backwards
-            # past current_start, or end <= start).
+            # Continuity invariant: the next window must start at or after
+            # `current_start` (= previous window's end). Passing `min_start`
+            # to the refiner usually enforces this, but re-clamp here as a
+            # final safety net — _normalize_clip_window may round the refined
+            # start, and zero-duration edge cases can still slip through.
+            if s < current_start:
+                s = current_start
+            # Guard against zero-progress (e.g. refiner snapped end back past
+            # current_start, or end <= start after the clamp).
             if e <= current_start + 1.0:
                 break
 
@@ -10755,7 +11121,21 @@ class ReelService:
         video_duration_sec: int,
         min_len: int = 15,
         max_len: int = 60,
+        min_start: float | None = None,
+        require_sentence_end: bool = False,
     ) -> tuple[int, int] | None:
+        """Snap ``(proposed_start, proposed_end)`` to sentence boundaries.
+
+        Parameters of interest:
+          * ``min_start`` — lower bound the refined start must NOT cross. When
+            set (e.g. by ``_split_into_consecutive_windows`` to the previous
+            window's end), the backward search is clamped so consecutive
+            reels never overlap. Defaults to None (no clamp).
+          * ``require_sentence_end`` — when True, refuse to return a window
+            whose end is mid-sentence. Used to hard-fail non-last splits so
+            the caller can pick a different boundary rather than silently
+            truncating.
+        """
         entries: list[dict[str, Any]] = []
         for entry in transcript:
             text = str(entry.get("text") or "").replace("\n", " ").strip()
@@ -10789,8 +11169,50 @@ class ReelService:
                 max_len=max_len,
             )
 
+        # Decide whether the transcript has real punctuation. If not (most
+        # YouTube auto-captions), fall back to a pause-based sentence proxy:
+        # treat cue-index ``i`` as a sentence boundary when the gap from
+        # cues[i-1] to cues[i] is ≥ 0.6s. This mirrors what speakers do — a
+        # brief inhale between thoughts — and empirically lines up with
+        # sentence breaks on unpunctuated captions.
+        use_pause_boundaries = not self._transcript_has_terminal_punct(entries)
+        pause_breaks = (
+            self._cue_pause_breaks(entries, min_pause_sec=0.6)
+            if use_pause_boundaries
+            else set()
+        )
+
+        def _is_boundary_before(idx: int) -> bool:
+            """Index `idx` starts a new sentence if the previous cue ended
+            one, or (for unpunctuated transcripts) if there's a pause before
+            it. Idx 0 is always a boundary (start of transcript)."""
+            if idx <= 0:
+                return True
+            if use_pause_boundaries:
+                return idx in pause_breaks
+            return self._is_sentence_end(str(entries[idx - 1]["text"]))
+
+        def _ends_sentence(idx: int) -> bool:
+            """Cue `idx` ends a sentence if its text has terminal punct, or
+            (for unpunctuated transcripts) if the NEXT cue starts after a
+            pause (i.e. idx+1 is a pause break).
+
+            Note: we deliberately do NOT treat the last cue as an automatic
+            sentence end — the video may legitimately cut mid-sentence, and
+            strict callers rely on this to reject bad endings.
+            """
+            if use_pause_boundaries:
+                return (idx + 1) in pause_breaks
+            return self._is_sentence_end(str(entries[idx]["text"]))
+
         desired_start = max(0.0, float(proposed_start))
         desired_end = max(desired_start + 1.0, float(proposed_end))
+        # Clamp the back-search floor so we never return a window that begins
+        # before a caller-supplied lower bound (e.g. the previous consecutive
+        # window's end).
+        back_search_floor = max(0.0, desired_start - 8.0)
+        if min_start is not None:
+            back_search_floor = max(back_search_floor, float(min_start))
 
         start_idx = 0
         for i, item in enumerate(entries):
@@ -10801,12 +11223,11 @@ class ReelService:
         # Search up to 8s before desired_start for a sentence boundary.
         # Pick the closest sentence-start to desired_start (minimize drift).
         refined_start_idx = start_idx
-        search_floor = max(0.0, desired_start - 8.0)
         best_start_cost = float("inf")
         for i in range(start_idx, -1, -1):
-            if float(entries[i]["start"]) < search_floor:
+            if float(entries[i]["start"]) < back_search_floor:
                 break
-            if i == 0 or self._is_sentence_end(str(entries[i - 1]["text"])):
+            if _is_boundary_before(i):
                 cost = abs(float(entries[i]["start"]) - desired_start)
                 if cost < best_start_cost:
                     best_start_cost = cost
@@ -10817,13 +11238,30 @@ class ReelService:
         for i in range(start_idx + 1, search_ceil + 1):
             if float(entries[i]["start"]) > desired_start + 4.0:
                 break
-            if i == 0 or self._is_sentence_end(str(entries[i - 1]["text"])):
+            if _is_boundary_before(i):
                 cost = abs(float(entries[i]["start"]) - desired_start)
                 if cost < best_start_cost:
                     best_start_cost = cost
                     refined_start_idx = i
 
         refined_start = float(entries[refined_start_idx]["start"])
+        # Enforce min_start after picking a candidate — if the closest sentence
+        # anchor landed before min_start (possible if min_start > desired_start
+        # or the floor calculation was overridden elsewhere), advance to the
+        # first cue whose start is at or after min_start so the refined start
+        # still aligns to a cue boundary (not to a mid-cue second).
+        if min_start is not None and refined_start < float(min_start):
+            advanced = False
+            for j in range(refined_start_idx, len(entries)):
+                if float(entries[j]["start"]) >= float(min_start) - 0.01:
+                    refined_start_idx = j
+                    refined_start = float(entries[j]["start"])
+                    advanced = True
+                    break
+            if not advanced:
+                # Fell off the end of the transcript — fall back to the bare
+                # min_start timestamp (better than a stale pre-clamp value).
+                refined_start = float(min_start)
         min_end = refined_start + float(min_len)
         max_end = refined_start + float(max_len)
 
@@ -10850,8 +11288,10 @@ class ReelService:
                 if any_cost < best_any_cost:
                     best_any_cost = any_cost
                     best_any_end = item_end
-            # Accept sentence ends in the extended window (up to +8s).
-            if self._is_sentence_end(str(entries[i]["text"])):
+            # Accept sentence ends in the extended window (up to +8s). For
+            # unpunctuated transcripts we use the pause-based proxy — a cue
+            # "ends a sentence" if the next cue starts after a pause.
+            if _ends_sentence(i):
                 # Prefer sentence ends closer to desired_end, but penalize
                 # going past max_end so we don't pick a sentence 8s late when
                 # one exists at the target.
@@ -10860,6 +11300,14 @@ class ReelService:
                 if sent_cost < best_sentence_cost:
                     best_sentence_cost = sent_cost
                     best_sentence_end = item_end
+
+        # When the caller requires a clean sentence ending (non-last split
+        # during consecutive-window generation), refuse to fall back to a
+        # mid-sentence cue end. Returning None tells the caller to stop
+        # splitting and either let the last-split branch handle the rest or
+        # fall through to single-window normalization.
+        if require_sentence_end and best_sentence_end is None:
+            return None
 
         refined_end = best_sentence_end if best_sentence_end is not None else best_any_end
         if refined_end is None:
@@ -10878,6 +11326,66 @@ class ReelService:
         if not cleaned:
             return False
         return bool(re.search(r"[.!?…][\"'\)\]]*$", cleaned))
+
+    def _transcript_has_terminal_punct(self, entries: list[dict[str, Any]]) -> bool:
+        """True when the transcript appears genuinely punctuated.
+
+        YouTube auto-generated captions typically ship without punctuation,
+        so ``_is_sentence_end`` never fires for them. Some generated-caption
+        videos include a handful of incidental periods (chapter timestamps,
+        URLs, decimals) — we guard against those producing a false positive
+        by requiring at least ~15% of the sampled cues to end with terminal
+        punctuation. Under that threshold we treat the transcript as
+        unpunctuated and fall back to cue-boundary alignment.
+        """
+        sample = entries[:120]
+        if not sample:
+            return False
+        n_punct = 0
+        for entry in sample:
+            if self._is_sentence_end(str(entry.get("text") or "")):
+                n_punct += 1
+        return (n_punct / len(sample)) >= 0.15
+
+    def _cue_pause_breaks(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        min_pause_sec: float = 0.6,
+    ) -> set[int]:
+        """Indices ``i`` such that cues[i-1] → cues[i] has a gap ≥ min_pause_sec.
+
+        Used as a sentence-boundary proxy for unpunctuated auto-captions.
+        A longer gap between captions almost always coincides with a
+        speaker's sentence break in practice; this is what YouTube's own
+        caption segmenter uses as a heuristic too.
+
+        Accepts both transcript formats: the raw ``{start, duration, text}``
+        shape from youtube-transcript-api AND the refiner's internal
+        ``{start, end, text}`` shape.
+        """
+        def _end(entry: dict[str, Any]) -> float:
+            # Prefer explicit `end` key when present; otherwise compute from
+            # start + duration. Falls back to start when neither is given.
+            try:
+                if "end" in entry and entry["end"] is not None:
+                    return float(entry["end"])
+                start = float(entry.get("start") or 0.0)
+                dur = float(entry.get("duration") or 0.0)
+                return start + dur
+            except (TypeError, ValueError):
+                return 0.0
+
+        breaks: set[int] = set()
+        for i in range(1, len(entries)):
+            try:
+                prev_end = _end(entries[i - 1])
+                cur_start = float(entries[i].get("start") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if cur_start - prev_end >= min_pause_sec:
+                breaks.add(i)
+        return breaks
 
     def _build_caption_cues(
         self,

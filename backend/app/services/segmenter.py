@@ -20,6 +20,17 @@ class SegmentMatch:
     text: str
     score: float
     source: str = "legacy"  # "legacy" or "topic_cut" — determines post-processing
+    # Chaining metadata for topic_cut segments that were split into
+    # consecutive sub-parts because a single topic cluster exceeded the
+    # user's max clip length. Segments sharing a ``cluster_group_id`` must
+    # be refined contiguously (each sub-part's refined t_start == previous
+    # sub-part's refined t_end) so the feed plays back seamlessly across
+    # the same topic. ``cluster_sub_index`` is the 0-based position of this
+    # sub-part inside the cluster; ``cluster_is_last`` marks the final
+    # sub-part so it gets the generous final-reel end-slack.
+    cluster_group_id: str = ""
+    cluster_sub_index: int = 0
+    cluster_is_last: bool = False
 
 
 def chunk_transcript(entries: list[dict], target_sec: int = 22, min_sec: int = 15, max_sec: int = 30) -> list[TranscriptChunk]:
