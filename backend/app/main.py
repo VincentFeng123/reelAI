@@ -7642,9 +7642,20 @@ def _simulation_is_sentence_start(text: str) -> bool:
     return text.strip()[0].isupper() or text.strip()[0].isdigit() or text.strip()[0] in '"\'('
 
 
+_SENTENCE_END_RE = re.compile(r"[.!?…][\"'\)\]]*\s*$")
+
+
 def _simulation_is_sentence_end(text: str) -> bool:
     stripped = text.rstrip()
-    return bool(stripped) and stripped[-1] in '.!?'
+    if not stripped:
+        return False
+    # Accept .!?… optionally followed by closing quotes/parens (matches what
+    # _refine_clip_window_from_transcript produces).  Also strip trailing
+    # caption markers like [Music], (laughter), etc. before checking.
+    cleaned = re.sub(r"\s*[\[\(][^\]\)]+[\]\)]\s*$", "", stripped).rstrip()
+    if not cleaned:
+        return False
+    return bool(_SENTENCE_END_RE.search(cleaned))
 
 
 @app.post("/api/admin/run-simulation", response_model=SimulationResponse)
@@ -7888,22 +7899,16 @@ def admin_diagnose_topic(request: Request, payload: AdminDiagnoseTopicRequest):
             response.final_reel_count = len(reels)
 
             # Step 3: Collect diagnostic data from DB
-            # Search queries used
-            search_rows = conn.execute(
-                "SELECT query FROM search_cache WHERE query LIKE ? ORDER BY created_at DESC LIMIT 20",
-                (f"%{subject_lower[:20]}%",),
-            ).fetchall() if hasattr(conn, "execute") else []
-            response.queries_generated = [str(r[0] if isinstance(r, tuple) else r.get("query", "")) for r in search_rows]
-
-            # Videos discovered for this material
-            video_rows = conn.execute(
-                "SELECT v.video_id, v.title, v.channel_title, v.duration_sec "
-                "FROM videos v "
-                "INNER JOIN reels r ON r.video_id = v.video_id "
-                "WHERE r.material_id = ? "
-                "ORDER BY r.created_at DESC LIMIT 20",
-                (material_id,),
-            ).fetchall() if hasattr(conn, "execute") else []
+            # Search queries used (search_cache may not exist on all schemas — fail open)
+            try:
+                search_rows = fetch_all(
+                    conn,
+                    "SELECT query FROM search_cache WHERE query LIKE ? ORDER BY created_at DESC LIMIT 20",
+                    (f"%{subject_lower[:20]}%",),
+                )
+                response.queries_generated = [str(r.get("query", "")) for r in search_rows]
+            except Exception:
+                response.queries_generated = []
 
             reel_stage = DiagnosticStageResult(
                 stage="reels_created",
