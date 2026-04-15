@@ -7944,6 +7944,56 @@ def admin_diagnose_topic(request: Request, payload: AdminDiagnoseTopicRequest):
             transcript_stage.candidate_count = sum(1 for d in transcript_stage.details if d.get("has_transcript"))
             response.stages.append(transcript_stage)
 
+            # Surface retrieval_metrics + per-segment branch counts from the
+            # most recent retrieval_runs entries for this material. These rows
+            # are written by `_persist_retrieval_debug_run` when
+            # retrieval_debug_logging is on (default true). Aggregating across
+            # all concept runs for this material gives visibility into WHERE
+            # in the segment loop candidates drop off.
+            try:
+                run_rows = fetch_all(
+                    conn,
+                    "SELECT id, concept_id, concept_title, selected_video_id, "
+                    "failure_reason, debug_json, created_at "
+                    "FROM retrieval_runs WHERE material_id = ? "
+                    "ORDER BY created_at DESC LIMIT 10",
+                    (material_id,),
+                )
+                aggregated: dict[str, Any] = {}
+                run_summaries: list[dict] = []
+                for row in run_rows:
+                    debug_json_raw = row.get("debug_json") or "{}"
+                    try:
+                        if isinstance(debug_json_raw, (bytes, bytearray)):
+                            debug_json_raw = debug_json_raw.decode("utf-8", errors="ignore")
+                        parsed = (
+                            debug_json_raw
+                            if isinstance(debug_json_raw, dict)
+                            else json.loads(str(debug_json_raw))
+                        )
+                    except Exception:
+                        parsed = {}
+                    metrics = parsed.get("metrics") or {}
+                    run_summaries.append({
+                        "run_id": str(row.get("id") or ""),
+                        "concept_id": str(row.get("concept_id") or ""),
+                        "concept_title": str(row.get("concept_title") or ""),
+                        "selected_video_id": str(row.get("selected_video_id") or ""),
+                        "failure_reason": str(row.get("failure_reason") or ""),
+                        "candidate_count": int(parsed.get("candidate_count") or 0),
+                        "query_count": int(parsed.get("query_count") or 0),
+                        "metrics": metrics,
+                    })
+                    for key, value in metrics.items():
+                        try:
+                            aggregated[key] = int(aggregated.get(key, 0)) + int(value or 0)
+                        except (TypeError, ValueError):
+                            aggregated[key] = value
+                response.retrieval_metrics = aggregated
+                response.retrieval_runs = run_summaries
+            except Exception:
+                logger.exception("diagnose-topic: failed to load retrieval_runs for %s", material_id)
+
             if not reels:
                 response.error = f"0 reels generated for '{subject}' — check stages for where candidates were lost"
 

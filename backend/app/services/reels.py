@@ -2792,16 +2792,58 @@ class ReelService:
                             max_len=clip_max_len,
                         )
                         clip_windows = [single_win] if single_win else []
+                    if self.retrieval_debug_logging:
+                        seg_span_dbg = max(0.0, float(segment.t_end) - float(segment.t_start))
+                        if use_full_short_clip:
+                            branch_dbg = "full_short"
+                        elif getattr(segment, "source", "legacy") == "topic_cut":
+                            branch_dbg = "topic_cut"
+                        elif transcript and seg_span_dbg > float(clip_max_len) + 16.0:
+                            branch_dbg = "split"
+                        elif transcript:
+                            branch_dbg = "refine_single"
+                        else:
+                            branch_dbg = "normalize_only"
+                        logger.info(
+                            "reels.loop seg concept=%s video=%s src=%s span=%.1f branch=%s windows=%d",
+                            str(concept.get("id") or ""),
+                            video_id,
+                            getattr(segment, "source", "legacy"),
+                            seg_span_dbg,
+                            branch_dbg,
+                            len(clip_windows),
+                        )
                     if not clip_windows:
+                        if self.retrieval_debug_logging:
+                            logger.info(
+                                "reels.loop drop_segment concept=%s video=%s reason=empty_clip_windows",
+                                str(concept.get("id") or ""),
+                                video_id,
+                            )
                         continue
 
                     hit_video_cap = False
+                    current_segment_contexts: list[dict[str, Any]] = []
                     for clip_window in clip_windows:
                         if not clip_window:
+                            if self.retrieval_debug_logging:
+                                logger.info(
+                                    "reels.loop drop concept=%s video=%s reason=window_none",
+                                    str(concept.get("id") or ""),
+                                    video_id,
+                                )
                             continue
                         start_sec, end_sec = clip_window
                         clip_key = self._clip_key(video_id, start_sec, end_sec)
                         if clip_key in existing_clip_keys or clip_key in generated_clip_keys:
+                            if self.retrieval_debug_logging:
+                                logger.info(
+                                    "reels.loop drop concept=%s video=%s win=(%.2f,%.2f) reason=clip_key_dup",
+                                    str(concept.get("id") or ""),
+                                    video_id,
+                                    float(start_sec),
+                                    float(end_sec),
+                                )
                             continue
 
                         relevance_context = self._merge_relevance_context(
@@ -2820,6 +2862,14 @@ class ReelService:
                         )
                         if not bool(relevance_context.get("passes", True)):
                             retrieval_metrics["low_relevance"] += 1
+                            if self.retrieval_debug_logging:
+                                logger.info(
+                                    "reels.loop drop concept=%s video=%s win=(%.2f,%.2f) reason=low_relevance_pre_guard",
+                                    str(concept.get("id") or ""),
+                                    video_id,
+                                    float(start_sec),
+                                    float(end_sec),
+                                )
                             continue
                         if not self._passes_selection_topic_guard(
                             video=video,
@@ -2833,17 +2883,46 @@ class ReelService:
                             root_topic_terms=root_topic_terms,
                         ):
                             retrieval_metrics["low_transcript_purity"] += 1
+                            if self.retrieval_debug_logging:
+                                logger.info(
+                                    "reels.loop drop concept=%s video=%s win=(%.2f,%.2f) reason=low_transcript_purity",
+                                    str(concept.get("id") or ""),
+                                    video_id,
+                                    float(start_sec),
+                                    float(end_sec),
+                                )
                             continue
 
+                        # Build clip_context from a per-window transcript slice so
+                        # novelty / self-containment scoring reflects what actually
+                        # plays in this window, not the full segment text. For
+                        # multi-window splits this also prevents window 2+ from
+                        # being rejected as near-duplicates of window 1 (same text).
+                        window_text = self._slice_transcript_text_in_window(
+                            transcript,
+                            float(start_sec),
+                            float(end_sec),
+                            fallback_text=segment.text,
+                        )
                         clip_context = self._build_clip_context(
-                            text=segment.text,
+                            text=window_text,
                             clip_duration_sec=float(max(0, end_sec - start_sec)),
                         )
+                        # Exclude this segment's already-accepted windows from the
+                        # novelty comparison — they intentionally cover consecutive
+                        # portions of the same topic, so near-duplicate text is
+                        # expected and should not block later windows.
+                        current_context_ids = {id(x) for x in current_segment_contexts}
+                        prior_contexts_for_novelty = [
+                            c
+                            for c in accepted_clip_contexts_by_video.get(video_id, [])
+                            if id(c) not in current_context_ids
+                        ]
                         quality_floor_passes, quality_floor_reason = self._passes_clip_quality_floor(
                             conn,
                             relevance_context=relevance_context,
                             clip_context=clip_context,
-                            prior_contexts=accepted_clip_contexts_by_video.get(video_id, []),
+                            prior_contexts=prior_contexts_for_novelty,
                             subject_tag=subject_tag,
                             retrieval_profile=safe_retrieval_profile,
                             fast_mode=fast_mode,
@@ -2852,6 +2931,15 @@ class ReelService:
                         )
                         if not quality_floor_passes:
                             retrieval_metrics[quality_floor_reason] = int(retrieval_metrics.get(quality_floor_reason) or 0) + 1
+                            if self.retrieval_debug_logging:
+                                logger.info(
+                                    "reels.loop drop concept=%s video=%s win=(%.2f,%.2f) reason=%s",
+                                    str(concept.get("id") or ""),
+                                    video_id,
+                                    float(start_sec),
+                                    float(end_sec),
+                                    quality_floor_reason,
+                                )
                             continue
 
                         accepted_count_for_video = existing_for_video + generated_video_counts.get(video_id, 0)
@@ -2863,6 +2951,14 @@ class ReelService:
                             relevance_context["score"] = max(0.0, float(relevance_context.get("score") or 0.0) - 0.03)
                         if float(relevance_context.get("score") or 0.0) < self._quality_floor_min_relevance(page_hint=safe_page_hint):
                             retrieval_metrics["low_relevance"] += 1
+                            if self.retrieval_debug_logging:
+                                logger.info(
+                                    "reels.loop drop concept=%s video=%s win=(%.2f,%.2f) reason=low_relevance_post_penalty",
+                                    str(concept.get("id") or ""),
+                                    video_id,
+                                    float(start_sec),
+                                    float(end_sec),
+                                )
                             continue
 
                         if dry_run:
@@ -2880,20 +2976,40 @@ class ReelService:
                                 except Exception:
                                     logger.exception("on_reel_created callback failed for dry-run reel")
                         else:
-                            reel = self._create_reel(
-                                conn,
-                                material_id=material_id,
-                                concept=concept,
-                                video=video,
-                                segment=segment,
-                                clip_window=clip_window,
-                                transcript=transcript,
-                                relevance_context=relevance_context,
-                                fast_mode=fast_mode,
-                                target_clip_duration_sec=safe_target_clip_duration,
-                                generation_id=generation_id,
-                            )
+                            try:
+                                reel = self._create_reel(
+                                    conn,
+                                    material_id=material_id,
+                                    concept=concept,
+                                    video=video,
+                                    segment=segment,
+                                    clip_window=clip_window,
+                                    transcript=transcript,
+                                    relevance_context=relevance_context,
+                                    fast_mode=fast_mode,
+                                    target_clip_duration_sec=safe_target_clip_duration,
+                                    generation_id=generation_id,
+                                )
+                            except Exception:
+                                # Surface previously-silent exceptions so a broken
+                                # persistence path doesn't look like an empty topic.
+                                logger.exception(
+                                    "reels.loop create_reel failed concept=%s video=%s win=(%.2f,%.2f)",
+                                    str(concept.get("id") or ""),
+                                    video_id,
+                                    float(start_sec),
+                                    float(end_sec),
+                                )
+                                continue
                             if not reel:
+                                if self.retrieval_debug_logging:
+                                    logger.info(
+                                        "reels.loop drop concept=%s video=%s win=(%.2f,%.2f) reason=create_reel_none",
+                                        str(concept.get("id") or ""),
+                                        video_id,
+                                        float(start_sec),
+                                        float(end_sec),
+                                    )
                                 continue
                             generated.append(reel)
                             if on_reel_created is not None:
@@ -2908,6 +3024,7 @@ class ReelService:
                         generated_clip_keys.add(clip_key)
                         generated_video_counts[video_id] = generated_video_counts.get(video_id, 0) + 1
                         accepted_clip_contexts_by_video.setdefault(video_id, []).append(clip_context)
+                        current_segment_contexts.append(clip_context)
                         mining_request_key = str(candidate.get("mining_request_key") or "").strip()
                         mining_video_id = str(candidate.get("mining_video_id") or "").strip()
                         if mining_request_key and mining_video_id:
@@ -7325,6 +7442,41 @@ class ReelService:
             "clip_duration_sec": float(max(0.0, clip_duration_sec)),
         }
 
+    def _slice_transcript_text_in_window(
+        self,
+        transcript: list[dict[str, Any]] | None,
+        clip_start: float,
+        clip_end: float,
+        fallback_text: str,
+    ) -> str:
+        """Concatenate transcript cue text whose midpoint falls inside [clip_start, clip_end].
+
+        Used to build a window-specific clip_context when a long topic segment
+        is split into multiple consecutive reels, so novelty/self-containment
+        scoring gets the text actually playing in this window rather than the
+        full segment. Falls back to ``fallback_text`` (usually ``segment.text``)
+        when no transcript is available or no cues land inside the window.
+        """
+        if not transcript:
+            return fallback_text
+        parts: list[str] = []
+        for entry in transcript:
+            try:
+                start = float(entry.get("start") or 0.0)
+                duration = float(entry.get("duration") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            mid = start + max(duration, 0.01) * 0.5
+            if mid < float(clip_start) - 0.5:
+                continue
+            if mid > float(clip_end) + 0.5:
+                break
+            text_piece = str(entry.get("text") or "").replace("\n", " ").strip()
+            if text_piece:
+                parts.append(text_piece)
+        joined = " ".join(parts).strip()
+        return joined or fallback_text
+
     def _clip_self_containment_score(
         self,
         *,
@@ -10574,6 +10726,20 @@ class ReelService:
                 proposed_start=segment_start,
                 proposed_end=segment_end,
                 video_duration_sec=video_duration_sec,
+                min_len=min_len,
+                max_len=max_len,
+            )
+            if win:
+                windows.append(win)
+        if not windows:
+            # Final safety net: transcript refinement failed in both the
+            # per-split loop and the single-window fallback. Produce a plain
+            # normalized window so long segments never silently drop to zero
+            # reels (mirrors the else-branch behavior in the main loop).
+            win = self._normalize_clip_window(
+                segment_start,
+                segment_end,
+                video_duration_sec,
                 min_len=min_len,
                 max_len=max_len,
             )

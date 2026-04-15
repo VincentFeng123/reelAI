@@ -151,6 +151,8 @@ class DiagnoseTopicResponse(BaseModel):
     stages: list[DiagnosticStageResult] = Field(default_factory=list)
     final_reel_count: int = 0
     error: str = ""
+    retrieval_metrics: dict = Field(default_factory=dict)
+    retrieval_runs: list[dict] = Field(default_factory=list)
 
 
 class ReelsCanGenerateResponse(BaseModel):
