@@ -4,6 +4,14 @@ python-multipart==0.0.20
 pydantic>=2.12.0
 pydantic-settings>=2.10.1
 requests==2.32.3
+# YouTube serves Brotli-compressed pages when the request advertises
+# Accept-Encoding: br (which our stealth headers do, to look like a real
+# browser). requests/urllib3 auto-decodes br ONLY if the ``brotli`` (or
+# ``brotlicffi``) package is installed; otherwise the raw compressed
+# bytes land in ``resp.text`` and every ytInitialData extraction fails
+# with "title=''" because <title> only appears in the decoded body.
+# Pinning this explicitly so Railway containers always have it.
+brotli==1.1.0
 youtube-transcript-api==1.2.4
 openai==2.26.0
 numpy==2.3.3
