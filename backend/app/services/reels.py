@@ -10631,11 +10631,29 @@ class ReelService:
                 break
 
         if not cues and fallback_text and fallback_text.strip():
+            # Truncate to 240 chars but snap to a sentence or word boundary
+            # so the cue text doesn't end mid-word.
+            raw = fallback_text.strip()
+            if len(raw) <= 240:
+                final_text = raw
+            else:
+                window = raw[:240]
+                # Prefer the last sentence end within the window.
+                sent_match = list(re.finditer(r"[.!?…][\"'\)\]]*", window))
+                if sent_match:
+                    final_text = window[: sent_match[-1].end()].rstrip()
+                else:
+                    # Fall back to last word boundary.
+                    space_idx = window.rfind(" ")
+                    final_text = (window[:space_idx] if space_idx > 100 else window).rstrip()
+                    # Append ellipsis to indicate truncation.
+                    if not final_text.endswith(("…", "...")):
+                        final_text = final_text.rstrip(",;:") + "…"
             cues.append(
                 {
                     "start": 0.0,
                     "end": round(clip_len, 2),
-                    "text": fallback_text.strip()[:240],
+                    "text": final_text,
                 }
             )
         return cues
