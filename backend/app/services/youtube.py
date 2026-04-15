@@ -424,6 +424,18 @@ class YouTubeService:
         self._session.mount("http://", adapter)
         self._session.headers.update(_STEALTH_HEADERS)
         self._session.headers["User-Agent"] = _random_user_agent()
+        # Pre-accept YouTube's cookie consent dialog so search/watch/channel
+        # pages return real `ytInitialData` HTML instead of a consent wall
+        # that lacks the marker entirely. Without this, requests from cloud
+        # IPs (Railway, AWS, GCP) frequently get redirected to consent.youtube.com
+        # and scraping silently returns zero rows for every query. These are
+        # the same values used by yt-dlp and youtube-dl to bypass the gate.
+        self._session.cookies.set("SOCS", "CAI", domain=".youtube.com")
+        self._session.cookies.set(
+            "CONSENT",
+            "YES+cb.20210328-17-p0.en+FX+000",
+            domain=".youtube.com",
+        )
 
     def _session_get(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
         # Rotate User-Agent and optionally proxy per request.
