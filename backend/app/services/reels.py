@@ -2738,13 +2738,18 @@ class ReelService:
 
                 for segment, segment_relevance in segment_candidates:
                     raise_if_cancelled()
+                    # Compute one or more consecutive clip windows for this segment.
+                    # If the segment exceeds max_len, _split_into_consecutive_windows
+                    # divides it into multiple sentence-aligned reels so that
+                    # long-form topic content isn't dropped.
                     if use_full_short_clip:
-                        clip_window = self._full_short_clip_window(video_duration)
+                        single_win = self._full_short_clip_window(video_duration)
+                        clip_windows: list[tuple[float, float]] = [single_win] if single_win else []
                     elif getattr(segment, "source", "legacy") == "topic_cut":
                         # Topic-cut segments have already been precisely snapped to
                         # sentence boundaries by topic_cut.py — skip the refinement
                         # step which can shift boundaries by up to 6 seconds.
-                        clip_window = self._normalize_clip_window(
+                        single_win = self._normalize_clip_window(
                             segment.t_start,
                             segment.t_end,
                             video_duration,
@@ -2752,211 +2757,222 @@ class ReelService:
                             max_len=clip_max_len,
                             allow_exceed_max=True,
                         )
+                        clip_windows = [single_win] if single_win else []
                     elif transcript:
-                        clip_window = self._refine_clip_window_from_transcript(
+                        clip_windows = self._split_into_consecutive_windows(
                             transcript=transcript,
-                            proposed_start=segment.t_start,
-                            proposed_end=segment.t_end,
+                            segment_start=segment.t_start,
+                            segment_end=segment.t_end,
                             video_duration_sec=video_duration,
                             min_len=clip_min_len,
                             max_len=clip_max_len,
                         )
                     else:
-                        clip_window = self._normalize_clip_window(
+                        single_win = self._normalize_clip_window(
                             segment.t_start,
                             segment.t_end,
                             video_duration,
                             min_len=clip_min_len,
                             max_len=clip_max_len,
                         )
-                    if not clip_window:
-                        continue
-                    start_sec, end_sec = clip_window
-                    clip_key = self._clip_key(video_id, start_sec, end_sec)
-                    if clip_key in existing_clip_keys or clip_key in generated_clip_keys:
+                        clip_windows = [single_win] if single_win else []
+                    if not clip_windows:
                         continue
 
-                    relevance_context = self._merge_relevance_context(
-                        candidate.get("video_relevance") or {},
-                        segment_relevance,
-                    )
-                    relevance_context["query_strategy"] = query_candidate.strategy
-                    relevance_context["retrieval_stage"] = str(candidate.get("stage") or "")
-                    relevance_context["discovery_score"] = float(ranking.get("discovery_score") or 0.0)
-                    relevance_context["clipability_score"] = float(ranking.get("clipability_score") or 0.0)
-                    relevance_context["source_surface"] = str(video.get("search_source") or "")
-                    relevance_context["score"] = (
-                        0.58 * float(relevance_context.get("score") or 0.0)
-                        + 0.28 * float(ranking.get("discovery_score") or 0.0)
-                        + 0.14 * float(ranking.get("clipability_score") or 0.0)
-                    )
-                    if not bool(relevance_context.get("passes", True)):
-                        retrieval_metrics["low_relevance"] += 1
-                        continue
-                    if not self._passes_selection_topic_guard(
-                        video=video,
-                        ranking=ranking,
-                        segment_relevance=segment_relevance,
-                        transcript_ranking=transcript_ranking,
-                        has_transcript=bool(transcript),
-                        fast_mode=fast_mode,
-                        strict_topic_only=strict_topic_only,
-                        subject_tag=subject_tag,
-                        root_topic_terms=root_topic_terms,
-                    ):
-                        retrieval_metrics["low_transcript_purity"] += 1
-                        continue
-
-                    clip_context = self._build_clip_context(
-                        text=segment.text,
-                        clip_duration_sec=float(max(0, end_sec - start_sec)),
-                    )
-                    quality_floor_passes, quality_floor_reason = self._passes_clip_quality_floor(
-                        conn,
-                        relevance_context=relevance_context,
-                        clip_context=clip_context,
-                        prior_contexts=accepted_clip_contexts_by_video.get(video_id, []),
-                        subject_tag=subject_tag,
-                        retrieval_profile=safe_retrieval_profile,
-                        fast_mode=fast_mode,
-                        page_hint=safe_page_hint,
-                        transcript_quality=transcript_quality,
-                    )
-                    if not quality_floor_passes:
-                        retrieval_metrics[quality_floor_reason] = int(retrieval_metrics.get(quality_floor_reason) or 0) + 1
-                        continue
-
-                    accepted_count_for_video = existing_for_video + generated_video_counts.get(video_id, 0)
-                    if accepted_count_for_video >= 9:
-                        relevance_context["score"] = max(0.0, float(relevance_context.get("score") or 0.0) - 0.10)
-                    elif accepted_count_for_video >= 6:
-                        relevance_context["score"] = max(0.0, float(relevance_context.get("score") or 0.0) - 0.06)
-                    elif accepted_count_for_video >= 3:
-                        relevance_context["score"] = max(0.0, float(relevance_context.get("score") or 0.0) - 0.03)
-                    if float(relevance_context.get("score") or 0.0) < self._quality_floor_min_relevance(page_hint=safe_page_hint):
-                        retrieval_metrics["low_relevance"] += 1
-                        continue
-
-                    if dry_run:
-                        preview = self._build_dry_run_reel_preview(
-                            concept=concept,
-                            video=video,
-                            segment=segment,
-                            clip_window=clip_window,
-                            relevance_context=relevance_context,
-                        )
-                        generated.append(preview)
-                        if on_reel_created is not None:
-                            try:
-                                on_reel_created(preview)
-                            except Exception:
-                                logger.exception("on_reel_created callback failed for dry-run reel")
-                    else:
-                        reel = self._create_reel(
-                            conn,
-                            material_id=material_id,
-                            concept=concept,
-                            video=video,
-                            segment=segment,
-                            clip_window=clip_window,
-                            transcript=transcript,
-                            relevance_context=relevance_context,
-                            fast_mode=fast_mode,
-                            target_clip_duration_sec=safe_target_clip_duration,
-                            generation_id=generation_id,
-                        )
-                        if not reel:
+                    hit_video_cap = False
+                    for clip_window in clip_windows:
+                        if not clip_window:
                             continue
-                        generated.append(reel)
-                        if on_reel_created is not None:
-                            try:
-                                on_reel_created(reel)
-                            except Exception:
-                                logger.exception(
-                                    "on_reel_created callback failed for reel_id=%s",
-                                    str(reel.get("reel_id") or ""),
-                                )
+                        start_sec, end_sec = clip_window
+                        clip_key = self._clip_key(video_id, start_sec, end_sec)
+                        if clip_key in existing_clip_keys or clip_key in generated_clip_keys:
+                            continue
 
-                    generated_clip_keys.add(clip_key)
-                    generated_video_counts[video_id] = generated_video_counts.get(video_id, 0) + 1
-                    accepted_clip_contexts_by_video.setdefault(video_id, []).append(clip_context)
-                    mining_request_key = str(candidate.get("mining_request_key") or "").strip()
-                    mining_video_id = str(candidate.get("mining_video_id") or "").strip()
-                    if mining_request_key and mining_video_id:
-                        updated_video_count = existing_for_video + generated_video_counts.get(video_id, 0)
-                        mining_cap = max(1, int(candidate.get("mining_segment_cap") or video_segment_cap))
-                        mining_exhausted = updated_video_count >= mining_cap
-                        next_mining_state = (
-                            self.MINING_STATE_EXHAUSTED
-                            if mining_exhausted
-                            else self.MINING_STATE_HIGH_YIELD
-                            if updated_video_count >= 3
-                            else self.MINING_STATE_PARTIALLY_MINED
+                        relevance_context = self._merge_relevance_context(
+                            candidate.get("video_relevance") or {},
+                            segment_relevance,
                         )
-                        self._upsert_request_video_mining_state(
-                            conn,
-                            material_id=material_id,
-                            request_key=mining_request_key,
-                            video_id=mining_video_id,
-                            mining_state=next_mining_state,
-                            accepted_clip_delta=1,
-                            exhausted=mining_exhausted,
+                        relevance_context["query_strategy"] = query_candidate.strategy
+                        relevance_context["retrieval_stage"] = str(candidate.get("stage") or "")
+                        relevance_context["discovery_score"] = float(ranking.get("discovery_score") or 0.0)
+                        relevance_context["clipability_score"] = float(ranking.get("clipability_score") or 0.0)
+                        relevance_context["source_surface"] = str(video.get("search_source") or "")
+                        relevance_context["score"] = (
+                            0.58 * float(relevance_context.get("score") or 0.0)
+                            + 0.28 * float(ranking.get("discovery_score") or 0.0)
+                            + 0.14 * float(ranking.get("clipability_score") or 0.0)
                         )
-                    family_key = str(query_candidate.family_key or "").strip()
-                    if family_key:
-                        accepted_reels_by_family[family_key] += 1
-                    selected_outcome = {
-                        "video_id": video_id,
-                        "reasons": [
-                            f"query_strategy:{query_candidate.strategy}",
-                            f"stage:{candidate.get('stage')}",
-                            f"discovery:{round(float(ranking.get('discovery_score') or 0.0), 3)}",
-                            f"clipability:{round(float(ranking.get('clipability_score') or 0.0), 3)}",
-                            f"function:{clip_context.get('function_label')}",
-                        ],
-                        "clip_window": {"t_start": start_sec, "t_end": end_sec},
-                    }
-                    retrieval_metrics["final_unique_reels"] = int(
-                        retrieval_metrics.get("final_unique_reels") or 0
-                    ) + 1
+                        if not bool(relevance_context.get("passes", True)):
+                            retrieval_metrics["low_relevance"] += 1
+                            continue
+                        if not self._passes_selection_topic_guard(
+                            video=video,
+                            ranking=ranking,
+                            segment_relevance=segment_relevance,
+                            transcript_ranking=transcript_ranking,
+                            has_transcript=bool(transcript),
+                            fast_mode=fast_mode,
+                            strict_topic_only=strict_topic_only,
+                            subject_tag=subject_tag,
+                            root_topic_terms=root_topic_terms,
+                        ):
+                            retrieval_metrics["low_transcript_purity"] += 1
+                            continue
 
-                    if self._should_finalize_generation(
-                        generated=generated,
-                        num_reels=num_reels,
-                        preferred_video_duration=safe_video_duration_pref,
-                        max_generation_target=max_generation_target,
-                        fast_mode=fast_mode,
-                    ):
-                        self._persist_retrieval_debug_run(
-                            conn,
-                            run=retrieval_run,
-                            query_reports=all_query_reports,
-                            candidate_rows=candidate_records,
-                            selected=selected_outcome,
-                            failure_reason="",
-                            dry_run=dry_run,
-                            metrics=retrieval_metrics,
+                        clip_context = self._build_clip_context(
+                            text=segment.text,
+                            clip_duration_sec=float(max(0, end_sec - start_sec)),
                         )
-                        if request_key:
-                            self._persist_request_frontier_reports(
+                        quality_floor_passes, quality_floor_reason = self._passes_clip_quality_floor(
+                            conn,
+                            relevance_context=relevance_context,
+                            clip_context=clip_context,
+                            prior_contexts=accepted_clip_contexts_by_video.get(video_id, []),
+                            subject_tag=subject_tag,
+                            retrieval_profile=safe_retrieval_profile,
+                            fast_mode=fast_mode,
+                            page_hint=safe_page_hint,
+                            transcript_quality=transcript_quality,
+                        )
+                        if not quality_floor_passes:
+                            retrieval_metrics[quality_floor_reason] = int(retrieval_metrics.get(quality_floor_reason) or 0) + 1
+                            continue
+
+                        accepted_count_for_video = existing_for_video + generated_video_counts.get(video_id, 0)
+                        if accepted_count_for_video >= 9:
+                            relevance_context["score"] = max(0.0, float(relevance_context.get("score") or 0.0) - 0.10)
+                        elif accepted_count_for_video >= 6:
+                            relevance_context["score"] = max(0.0, float(relevance_context.get("score") or 0.0) - 0.06)
+                        elif accepted_count_for_video >= 3:
+                            relevance_context["score"] = max(0.0, float(relevance_context.get("score") or 0.0) - 0.03)
+                        if float(relevance_context.get("score") or 0.0) < self._quality_floor_min_relevance(page_hint=safe_page_hint):
+                            retrieval_metrics["low_relevance"] += 1
+                            continue
+
+                        if dry_run:
+                            preview = self._build_dry_run_reel_preview(
+                                concept=concept,
+                                video=video,
+                                segment=segment,
+                                clip_window=clip_window,
+                                relevance_context=relevance_context,
+                            )
+                            generated.append(preview)
+                            if on_reel_created is not None:
+                                try:
+                                    on_reel_created(preview)
+                                except Exception:
+                                    logger.exception("on_reel_created callback failed for dry-run reel")
+                        else:
+                            reel = self._create_reel(
                                 conn,
                                 material_id=material_id,
-                                request_key=request_key,
-                                query_reports=all_query_reports,
-                                accepted_reels_by_family=accepted_reels_by_family,
+                                concept=concept,
+                                video=video,
+                                segment=segment,
+                                clip_window=clip_window,
+                                transcript=transcript,
+                                relevance_context=relevance_context,
+                                fast_mode=fast_mode,
+                                target_clip_duration_sec=safe_target_clip_duration,
+                                generation_id=generation_id,
                             )
-                        self._shutdown_transcript_prefetch_task(
-                            transcript_prefetch_task,
-                            wait=False,
-                            cancel_futures=True,
-                        )
-                        transcript_prefetch_task = None
-                        return self._finalize_generated_reels(
+                            if not reel:
+                                continue
+                            generated.append(reel)
+                            if on_reel_created is not None:
+                                try:
+                                    on_reel_created(reel)
+                                except Exception:
+                                    logger.exception(
+                                        "on_reel_created callback failed for reel_id=%s",
+                                        str(reel.get("reel_id") or ""),
+                                    )
+
+                        generated_clip_keys.add(clip_key)
+                        generated_video_counts[video_id] = generated_video_counts.get(video_id, 0) + 1
+                        accepted_clip_contexts_by_video.setdefault(video_id, []).append(clip_context)
+                        mining_request_key = str(candidate.get("mining_request_key") or "").strip()
+                        mining_video_id = str(candidate.get("mining_video_id") or "").strip()
+                        if mining_request_key and mining_video_id:
+                            updated_video_count = existing_for_video + generated_video_counts.get(video_id, 0)
+                            mining_cap = max(1, int(candidate.get("mining_segment_cap") or video_segment_cap))
+                            mining_exhausted = updated_video_count >= mining_cap
+                            next_mining_state = (
+                                self.MINING_STATE_EXHAUSTED
+                                if mining_exhausted
+                                else self.MINING_STATE_HIGH_YIELD
+                                if updated_video_count >= 3
+                                else self.MINING_STATE_PARTIALLY_MINED
+                            )
+                            self._upsert_request_video_mining_state(
+                                conn,
+                                material_id=material_id,
+                                request_key=mining_request_key,
+                                video_id=mining_video_id,
+                                mining_state=next_mining_state,
+                                accepted_clip_delta=1,
+                                exhausted=mining_exhausted,
+                            )
+                        family_key = str(query_candidate.family_key or "").strip()
+                        if family_key:
+                            accepted_reels_by_family[family_key] += 1
+                        selected_outcome = {
+                            "video_id": video_id,
+                            "reasons": [
+                                f"query_strategy:{query_candidate.strategy}",
+                                f"stage:{candidate.get('stage')}",
+                                f"discovery:{round(float(ranking.get('discovery_score') or 0.0), 3)}",
+                                f"clipability:{round(float(ranking.get('clipability_score') or 0.0), 3)}",
+                                f"function:{clip_context.get('function_label')}",
+                            ],
+                            "clip_window": {"t_start": start_sec, "t_end": end_sec},
+                        }
+                        retrieval_metrics["final_unique_reels"] = int(
+                            retrieval_metrics.get("final_unique_reels") or 0
+                        ) + 1
+
+                        if self._should_finalize_generation(
                             generated=generated,
                             num_reels=num_reels,
                             preferred_video_duration=safe_video_duration_pref,
-                        )
-                    if existing_for_video + generated_video_counts.get(video_id, 0) >= video_segment_cap:
+                            max_generation_target=max_generation_target,
+                            fast_mode=fast_mode,
+                        ):
+                            self._persist_retrieval_debug_run(
+                                conn,
+                                run=retrieval_run,
+                                query_reports=all_query_reports,
+                                candidate_rows=candidate_records,
+                                selected=selected_outcome,
+                                failure_reason="",
+                                dry_run=dry_run,
+                                metrics=retrieval_metrics,
+                            )
+                            if request_key:
+                                self._persist_request_frontier_reports(
+                                    conn,
+                                    material_id=material_id,
+                                    request_key=request_key,
+                                    query_reports=all_query_reports,
+                                    accepted_reels_by_family=accepted_reels_by_family,
+                                )
+                            self._shutdown_transcript_prefetch_task(
+                                transcript_prefetch_task,
+                                wait=False,
+                                cancel_futures=True,
+                            )
+                            transcript_prefetch_task = None
+                            return self._finalize_generated_reels(
+                                generated=generated,
+                                num_reels=num_reels,
+                                preferred_video_duration=safe_video_duration_pref,
+                            )
+                        if existing_for_video + generated_video_counts.get(video_id, 0) >= video_segment_cap:
+                            hit_video_cap = True
+                            break
+
+                    if hit_video_cap:
                         break
 
             self._persist_retrieval_debug_run(
@@ -10442,6 +10458,112 @@ class ReelService:
             allow_exceed_max=True,
             allow_below_min=True,
         )
+
+    def _split_into_consecutive_windows(
+        self,
+        transcript: list[dict[str, Any]] | None,
+        segment_start: float,
+        segment_end: float,
+        video_duration_sec: int,
+        min_len: int,
+        max_len: int,
+        *,
+        max_splits: int = 5,
+        skip_refinement: bool = False,
+    ) -> list[tuple[float, float]]:
+        """Split a long segment into consecutive sentence-aligned reels.
+
+        If the segment fits in one reel (duration <= max_len + small extension),
+        returns a single window.  Otherwise produces up to *max_splits*
+        consecutive windows that together cover the full segment.  The last
+        window may exceed *max_len* by more than the normal +8s allowance to
+        ensure the segment ends on a clean sentence boundary.
+
+        When *skip_refinement* is True (e.g. for topic_cut segments that are
+        already snapped), splits use plain normalization rather than transcript
+        refinement.
+        """
+        seg_dur = max(0.0, float(segment_end) - float(segment_start))
+        # Single window path: segment fits or no transcript to refine with.
+        single_threshold = float(max_len) + 8.0
+        if seg_dur <= single_threshold or not transcript or skip_refinement:
+            if skip_refinement or not transcript:
+                win = self._normalize_clip_window(
+                    segment_start, segment_end, video_duration_sec,
+                    min_len=min_len, max_len=max_len,
+                    allow_exceed_max=skip_refinement,
+                )
+            else:
+                win = self._refine_clip_window_from_transcript(
+                    transcript=transcript,
+                    proposed_start=segment_start,
+                    proposed_end=segment_end,
+                    video_duration_sec=video_duration_sec,
+                    min_len=min_len,
+                    max_len=max_len,
+                )
+            return [win] if win else []
+
+        # Multi-window path: segment exceeds max_len, split into consecutive reels.
+        windows: list[tuple[float, float]] = []
+        current_start = float(segment_start)
+        seg_end = float(segment_end)
+
+        for split_idx in range(max_splits):
+            remaining = seg_end - current_start
+            if remaining < float(min_len):
+                # Less than min_len left — extend the previous window to absorb it.
+                if windows:
+                    prev_s, prev_e = windows[-1]
+                    windows[-1] = (prev_s, min(seg_end, float(video_duration_sec) if video_duration_sec > 0 else seg_end))
+                break
+
+            is_last_split = (split_idx == max_splits - 1) or (remaining <= max_len + 16)
+
+            if is_last_split:
+                # Final reel: try to capture all remaining content; allow generous
+                # extension to land on a sentence boundary even if it exceeds max_len.
+                proposed_end = seg_end
+                effective_max = int(max(remaining + 16, max_len))
+            else:
+                proposed_end = current_start + float(max_len)
+                effective_max = max_len
+
+            win = self._refine_clip_window_from_transcript(
+                transcript=transcript,
+                proposed_start=current_start,
+                proposed_end=proposed_end,
+                video_duration_sec=video_duration_sec,
+                min_len=min_len,
+                max_len=effective_max,
+            )
+            if not win:
+                break
+            s, e = win
+            # Guard against zero-progress (e.g. refiner snapped start backwards
+            # past current_start, or end <= start).
+            if e <= current_start + 1.0:
+                break
+
+            windows.append((s, e))
+            current_start = float(e)
+
+            if e >= seg_end - 2.0:
+                break  # reached segment end
+
+        if not windows:
+            # Fallback: at least produce one window the normal way.
+            win = self._refine_clip_window_from_transcript(
+                transcript=transcript,
+                proposed_start=segment_start,
+                proposed_end=segment_end,
+                video_duration_sec=video_duration_sec,
+                min_len=min_len,
+                max_len=max_len,
+            )
+            if win:
+                windows.append(win)
+        return windows
 
     def _refine_clip_window_from_transcript(
         self,
