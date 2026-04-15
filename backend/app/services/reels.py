@@ -2759,14 +2759,30 @@ class ReelService:
                         )
                         clip_windows = [single_win] if single_win else []
                     elif transcript:
-                        clip_windows = self._split_into_consecutive_windows(
-                            transcript=transcript,
-                            segment_start=segment.t_start,
-                            segment_end=segment.t_end,
-                            video_duration_sec=video_duration,
-                            min_len=clip_min_len,
-                            max_len=clip_max_len,
-                        )
+                        # Preserve the old behavior for short/normal segments so
+                        # working topics aren't perturbed. Only invoke the split
+                        # path when the segment is long enough that a single
+                        # max_len reel would noticeably truncate it.
+                        seg_span = max(0.0, float(segment.t_end) - float(segment.t_start))
+                        if seg_span > float(clip_max_len) + 16.0:
+                            clip_windows = self._split_into_consecutive_windows(
+                                transcript=transcript,
+                                segment_start=segment.t_start,
+                                segment_end=segment.t_end,
+                                video_duration_sec=video_duration,
+                                min_len=clip_min_len,
+                                max_len=clip_max_len,
+                            )
+                        else:
+                            single_win = self._refine_clip_window_from_transcript(
+                                transcript=transcript,
+                                proposed_start=segment.t_start,
+                                proposed_end=segment.t_end,
+                                video_duration_sec=video_duration,
+                                min_len=clip_min_len,
+                                max_len=clip_max_len,
+                            )
+                            clip_windows = [single_win] if single_win else []
                     else:
                         single_win = self._normalize_clip_window(
                             segment.t_start,
