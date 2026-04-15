@@ -415,13 +415,6 @@ class YouTubeService:
             os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
         )
         self.retrieval_debug_logging = bool(settings.retrieval_debug_logging)
-        # Bounded per-instance budget for dumping failed-extraction HTML snippets
-        # to the logs. Each failed _extract_yt_initial_data call decrements this
-        # counter and emits a 500-char body preview so we can see what YouTube
-        # is actually serving (JS shell, consent wall, bot challenge, etc.)
-        # without flooding the log stream on every query variant.
-        self._html_snippet_log_budget = 10
-        self._html_snippet_log_lock = threading.Lock()
         self.search_time_budget_sec = 3.5 if self.serverless_mode else self.SEARCH_TIME_BUDGET_SEC
         self.request_timeout_sec = 2.5 if self.serverless_mode else self.REQUEST_TIMEOUT_SEC
 
@@ -2802,40 +2795,7 @@ class YouTubeService:
                 len(html),
                 self._html_title_snippet(html),
             )
-        # Dump the head of the failing HTML so we can tell *what* YouTube is
-        # actually serving — a consent wall, a JS-only shell, a bot challenge,
-        # or something else. This is rate-limited by a per-instance budget so
-        # a search run with many failed variants doesn't blow up the log stream.
-        if self.retrieval_debug_logging:
-            self._log_failed_html_snippet(html)
         return None
-
-    def _log_failed_html_snippet(self, html: str) -> None:
-        """Log the first ~500 chars of a YouTube HTML body when extraction fails.
-
-        Emits at most ``self._html_snippet_log_budget`` snippets per service
-        instance, so we can see concrete evidence of what the response looked
-        like (meta tags, script shim, redirect markup) without flooding logs.
-        Newlines and non-printable bytes are escaped so the preview fits on
-        one log line and is safe for downstream log aggregators.
-        """
-        if not html:
-            return
-        with self._html_snippet_log_lock:
-            if self._html_snippet_log_budget <= 0:
-                return
-            self._html_snippet_log_budget -= 1
-            remaining = self._html_snippet_log_budget
-        snippet = html[:500]
-        # Collapse whitespace and strip non-printable bytes so the snippet
-        # survives a single log line and doesn't confuse log parsers.
-        snippet = re.sub(r"\s+", " ", snippet).strip()
-        logger.warning(
-            "ytInitialData-fail HTML preview (html_bytes=%d, snippet_budget_remaining=%d): %r",
-            len(html),
-            remaining,
-            snippet,
-        )
 
     @staticmethod
     def _html_title_snippet(html: str) -> str:
