@@ -3455,6 +3455,75 @@ class YouTubeService:
                 ),
             )
 
+    _LOGGABLE_SENSITIVE_PARAMS = frozenset({
+        "key", "api_key", "apikey", "access_token", "token",
+        "client_secret", "password", "authkey",
+    })
+
+    @staticmethod
+    def _ytdlp_cookie_opts() -> dict[str, Any]:
+        """Return yt-dlp cookie options based on environment variables.
+
+        Railway / Vercel egress IPs get flagged by YouTube's bot filter and
+        all anonymous yt-dlp calls hit "Sign in to confirm you're not a bot".
+        Supplying authenticated cookies stops the challenge. Set ONE of:
+
+          YT_COOKIES_FILE=/path/to/cookies.txt
+              Netscape-format cookies file exported from a logged-in browser.
+              Preferred for production (mount as a Railway secret file).
+
+          YT_COOKIES_FROM_BROWSER=chrome   (or firefox, edge, safari, brave)
+              Read cookies directly from a browser profile. Only useful for
+              local development; containers don't have a browser.
+
+        Returns an empty dict when neither is set — yt-dlp then runs
+        anonymously (same as before).
+        """
+        opts: dict[str, Any] = {}
+        cookie_file = (os.environ.get("YT_COOKIES_FILE") or "").strip()
+        if cookie_file and os.path.exists(cookie_file):
+            opts["cookiefile"] = cookie_file
+            return opts
+        cookies_from_browser = (os.environ.get("YT_COOKIES_FROM_BROWSER") or "").strip()
+        if cookies_from_browser:
+            # yt-dlp accepts "browser" or "browser:profile" — passthrough as-is.
+            parts = tuple(cookies_from_browser.split(":", 1))
+            opts["cookiesfrombrowser"] = parts if len(parts) > 1 else (parts[0],)
+        return opts
+
+    @classmethod
+    def _redact_url_for_logs(cls, url: str) -> str:
+        """Drop query string entirely and return scheme://host/path.
+
+        Query strings on Google APIs contain the API key — never safe to log.
+        """
+        if not url:
+            return ""
+        try:
+            parsed = urlparse(url)
+            if parsed.scheme and parsed.netloc:
+                return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        except Exception:
+            pass
+        return url
+
+    @classmethod
+    def _redact_sensitive_text(cls, text: str) -> str:
+        """Remove sensitive query-string values from arbitrary text.
+
+        ``requests.HTTPError`` stringifies to ``"403 Client Error: Forbidden for
+        url: https://...?key=<SECRET>&..."`` — the URL is embedded in the
+        middle of a free-form message, so we match it with a regex and redact
+        any ``name=value`` pair whose name is in the sensitive set.
+        """
+        if not text:
+            return text
+        pattern = re.compile(
+            r"([?&](?:" + "|".join(cls._LOGGABLE_SENSITIVE_PARAMS) + r")=)[^&\s]+",
+            re.IGNORECASE,
+        )
+        return pattern.sub(r"\1<REDACTED>", text)
+
     def _note_request_failure(self, exc: requests.RequestException, *, scope: str) -> None:
         clean_scope = str(scope or "").strip()
         if not clean_scope:
@@ -3462,12 +3531,7 @@ class YouTubeService:
         response = getattr(exc, "response", None)
         request = getattr(exc, "request", None)
         request_url = str(getattr(response, "url", None) or getattr(request, "url", None) or "").strip()
-        parsed_url = urlparse(request_url)
-        url_target = (
-            f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path}"
-            if parsed_url.scheme and parsed_url.netloc
-            else request_url
-        )
+        url_target = self._redact_url_for_logs(request_url)
         status_code = int(response.status_code) if getattr(response, "status_code", None) else None
         is_transport_failure = response is None
         retry_after = _parse_retry_after(response)
@@ -3506,6 +3570,19 @@ class YouTubeService:
                     float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
                     time.monotonic() + backoff_sec,
                 )
+            elif status_code == 403:
+                # 403 from the YouTube Data API almost always means
+                # quota-exceeded or key-not-enabled. The server doesn't send
+                # Retry-After but quota resets at Pacific midnight, so we
+                # apply a long backoff (growing with repeated hits) and keep
+                # the streak so callers can skip the scope entirely.
+                streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0) + 1
+                self._network_failure_streak_by_scope[clean_scope] = streak
+                backoff_sec = _backoff_delay(streak, base_sec=60.0, cap_sec=900.0)
+                self._network_backoff_until_by_scope[clean_scope] = max(
+                    float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
+                    time.monotonic() + backoff_sec,
+                )
             else:
                 streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0)
             backoff_until = float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0)
@@ -3522,7 +3599,9 @@ class YouTubeService:
                     "failure_streak": streak,
                     "backoff_remaining_sec": round(backoff_remaining_sec, 2),
                     "error_type": type(exc).__name__,
-                    "error": str(exc),
+                    # Redact API keys / tokens that requests embeds in the
+                    # exception message ("... for url: https://...?key=<SECRET>").
+                    "error": self._redact_sensitive_text(str(exc)),
                 },
                 sort_keys=True,
             ),
@@ -4107,6 +4186,7 @@ class YouTubeService:
                 "quiet": True,
                 "no_warnings": True,
                 "socket_timeout": 10,
+                **self._ytdlp_cookie_opts(),
             }
             proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
             if proxy:
@@ -4193,6 +4273,7 @@ class YouTubeService:
                     "preferredcodec": "wav",
                 }],
                 "postprocessor_args": ["-ac", "1", "-ar", "16000"],
+                **self._ytdlp_cookie_opts(),
             }
             proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
             if proxy:

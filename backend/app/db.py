@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -9,6 +10,8 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 from .config import get_settings
+
+logger = logging.getLogger(__name__)
 
 try:
     import psycopg
@@ -22,6 +25,36 @@ except Exception:  # pragma: no cover - optional dependency at runtime
 
 class DatabaseIntegrityError(Exception):
     pass
+
+
+# When init_db() runs during container startup on Railway, the Postgres add-on
+# may still be in its own boot sequence — ``psycopg.connect`` then raises
+# ``OperationalError: the database system is starting up``. We retry with
+# exponential backoff rather than let the FastAPI lifespan crash.
+INIT_DB_MAX_RETRIES = 10
+INIT_DB_INITIAL_BACKOFF_SEC = 1.0
+INIT_DB_MAX_BACKOFF_SEC = 15.0
+
+
+def _is_transient_postgres_startup_error(exc: BaseException) -> bool:
+    """True when the error text indicates PG is still booting or unreachable.
+
+    Matches the wording of both ``FATAL: the database system is starting up``
+    and common ``Connection refused`` / ``could not translate host name``
+    transport errors that clear within a few seconds of container start.
+    """
+    text = str(exc).lower()
+    transient_markers = (
+        "the database system is starting up",
+        "the database system is shutting down",
+        "connection refused",
+        "could not translate host name",
+        "temporary failure in name resolution",
+        "no route to host",
+        "connection to server",
+        "connection timed out",
+    )
+    return any(marker in text for marker in transient_markers)
 
 
 SCHEMA = """
@@ -723,12 +756,41 @@ def _ensure_reels_generation_index_postgres(conn: Any) -> None:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_reels_generation_id ON reels(generation_id)")
 
 
+def _connect_postgres_with_retry():
+    """Connect to Postgres, retrying transient startup errors.
+
+    Returns an open psycopg connection (the caller is responsible for
+    closing / context-managing it). Raises the last exception if every
+    retry attempt fails.
+    """
+    assert psycopg is not None
+    last_exc: BaseException | None = None
+    backoff = INIT_DB_INITIAL_BACKOFF_SEC
+    for attempt in range(1, INIT_DB_MAX_RETRIES + 1):
+        try:
+            return psycopg.connect(_database_url(), connect_timeout=10)
+        except Exception as exc:
+            last_exc = exc
+            if not _is_transient_postgres_startup_error(exc) or attempt >= INIT_DB_MAX_RETRIES:
+                raise
+            logger.warning(
+                "init_db: Postgres not ready yet (attempt %d/%d): %s — retrying in %.1fs",
+                attempt, INIT_DB_MAX_RETRIES, str(exc).splitlines()[0][:180], backoff,
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 1.6, INIT_DB_MAX_BACKOFF_SEC)
+    # Should not reach here — loop either returns or raises — but keep mypy happy.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("init_db: exhausted retries without connecting")
+
+
 def init_db() -> None:
     global _db_ready
     if _is_postgres_configured():
         if psycopg is None:
             raise RuntimeError("DATABASE_URL is set to PostgreSQL, but psycopg is not installed.")
-        with psycopg.connect(_database_url(), connect_timeout=10) as conn:
+        with _connect_postgres_with_retry() as conn:
             with conn.cursor() as cur:
                 for statement in _postgres_schema_statements():
                     cur.execute(statement)
