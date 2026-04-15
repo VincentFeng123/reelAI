@@ -395,6 +395,13 @@ class YouTubeService:
         "shorts",
     )
 
+    # Two consecutive 403s from the YouTube Data API confirms the daily
+    # quota is exhausted (vs a single transient 403 which can happen
+    # with IP-restricted keys). Once set, _should_use_data_api() returns
+    # False for the rest of the process lifetime, falling through to
+    # HTML scraping everywhere.
+    API_QUOTA_EXHAUSTED_STREAK_THRESHOLD = 2
+
     def __init__(self) -> None:
         settings = get_settings()
         self.api_key = settings.youtube_api_key
@@ -403,6 +410,8 @@ class YouTubeService:
         self._network_backoff_lock = threading.Lock()
         self._network_backoff_until_by_scope: dict[str, float] = {}
         self._network_failure_streak_by_scope: dict[str, int] = {}
+        self._api_quota_exhausted: bool = False
+        self._api_quota_exhausted_at: float = 0.0
         # ---- circuit breaker state ----
         self._circuit_open_until: dict[str, float] = {}
         self._circuit_failure_count: dict[str, int] = {}
@@ -460,6 +469,21 @@ class YouTubeService:
             "YES+cb.20210328-17-p0.en+FX+000",
             domain=".youtube.com",
         )
+
+    def _should_use_data_api(self) -> bool:
+        """True when the YouTube Data API v3 is available AND not quota-blocked.
+
+        Central choke point so every call site behaves consistently:
+        - Key configured → check quota flag → check temporary backoff.
+        Falls through to HTML scraping when False.
+        """
+        if not self.api_key:
+            return False
+        if self._api_quota_exhausted:
+            return False
+        if self._network_backoff_active("youtube_api"):
+            return False
+        return True
 
     def _session_get(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
         # Rotate User-Agent and optionally proxy per request.
@@ -546,6 +570,7 @@ class YouTubeService:
             "allow_external_fallbacks": bool(allow_external_fallbacks),
             "graph_profile": graph_profile,
             "api_key_enabled": bool(self.api_key),
+            "api_quota_exhausted": self._api_quota_exhausted,
         }
         if rows:
             logger.info("YouTube search summary: %s", json.dumps(payload, sort_keys=True))
@@ -671,7 +696,7 @@ class YouTubeService:
         videos: list[dict[str, Any]] = []
         fast_non_api_enabled = not creative_commons_only
         if retrieval_profile == "bootstrap":
-            if creative_commons_only and self.api_key:
+            if creative_commons_only and self._should_use_data_api():
                 videos = self._search_via_data_api(
                     query=query,
                     max_results=max_results,
@@ -731,10 +756,11 @@ class YouTubeService:
             return videos
 
         futures: list[tuple[str, Any]] = []
-        max_workers = 1 + int(bool(self.api_key)) + int(fast_non_api_enabled)
+        api_available = self._should_use_data_api()
+        max_workers = 1 + int(api_available) + int(fast_non_api_enabled)
         max_workers = max(1, min(3, max_workers))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            if self.api_key:
+            if api_available:
                 futures.append(
                     (
                         "youtube_api",
@@ -1480,7 +1506,7 @@ class YouTubeService:
                 if str(video_id or "").strip()
             )
         )
-        details_by_id = self._video_details(all_video_ids, deadline=deadline) if all_video_ids and self.api_key else {}
+        details_by_id = self._video_details(all_video_ids, deadline=deadline) if all_video_ids and self._should_use_data_api() else {}
         ordered_external_rows: list[list[dict[str, Any]]] = [[] for _ in range(len(external_variants) * 2)]
         for order_idx, ids in enumerate(ordered_external_ids):
             if not ids:
@@ -2251,7 +2277,7 @@ class YouTubeService:
         deadline: float | None = None,
         details_by_id: dict[str, dict[str, Any]] | None = None,
     ) -> list[dict[str, Any]]:
-        details = details_by_id if details_by_id is not None else (self._video_details(video_ids, deadline=deadline) if self.api_key else {})
+        details = details_by_id if details_by_id is not None else (self._video_details(video_ids, deadline=deadline) if self._should_use_data_api() else {})
         rows: list[dict[str, Any]] = []
         for video_id in video_ids:
             row = self._fallback_video_row(video_id)
@@ -3328,7 +3354,7 @@ class YouTubeService:
         return self._extract_video_id_from_url(value)
 
     def _video_details(self, video_ids: list[str], deadline: float | None = None) -> dict[str, dict[str, Any]]:
-        if not self.api_key or not video_ids:
+        if not self._should_use_data_api() or not video_ids:
             return {}
         result: dict[str, dict[str, Any]] = {}
         unique_ids = list(dict.fromkeys(video_ids))
@@ -3583,6 +3609,23 @@ class YouTubeService:
                     float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
                     time.monotonic() + backoff_sec,
                 )
+                # Once we've seen enough consecutive 403s on the youtube_api
+                # scope, treat the daily quota as exhausted and permanently
+                # disable Data API calls for the life of this process.
+                # HTML scraping takes over automatically.
+                if (
+                    clean_scope == "youtube_api"
+                    and streak >= self.API_QUOTA_EXHAUSTED_STREAK_THRESHOLD
+                    and not self._api_quota_exhausted
+                ):
+                    self._api_quota_exhausted = True
+                    self._api_quota_exhausted_at = time.monotonic()
+                    logger.warning(
+                        "YouTube Data API quota exhausted (403 x%d) — "
+                        "disabling API calls, falling back to HTML scraping "
+                        "for the remainder of this process",
+                        streak,
+                    )
             else:
                 streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0)
             backoff_until = float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0)
