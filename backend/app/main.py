@@ -97,6 +97,9 @@ from .models import (
     ReelsGenerateRequest,
     ReelsGenerateResponse,
     AdminSimulationRequest,
+    AdminDiagnoseTopicRequest,
+    DiagnoseTopicResponse,
+    DiagnosticStageResult,
     SimulationResponse,
     SimulationTopicResult,
 )
@@ -7802,6 +7805,147 @@ def admin_run_simulation(request: Request, payload: AdminSimulationRequest | Non
         clean_end_pct=round(100.0 * total_clean_end / n, 1),
         per_topic=results,
     )
+
+
+@app.post("/api/admin/diagnose-topic", response_model=DiagnoseTopicResponse)
+def admin_diagnose_topic(request: Request, payload: AdminDiagnoseTopicRequest):
+    """Diagnose why a topic generates 0 reels.
+
+    Runs the full pipeline and returns a diagnostic report showing where
+    candidates are lost at each stage: search, duration filter, relevance
+    gate, transcript availability.
+    """
+    _require_community_client_identity(request)
+    _enforce_rate_limit(request, "admin-diagnose", limit=ADMIN_SIMULATION_RATE_LIMIT_PER_WINDOW)
+
+    subject = payload.subject.strip()
+    if not subject:
+        return DiagnoseTopicResponse(subject=subject, error="empty subject")
+
+    num_reels = min(max(1, payload.num_reels), 5)
+    response = DiagnoseTopicResponse(subject=subject)
+
+    try:
+        with get_conn() as conn:
+            # Step 1: Create material + extract concepts
+            text = subject
+            concepts, objectives = material_intelligence_service.extract_concepts_and_objectives(
+                conn, text, subject_tag=subject, max_concepts=6,
+            )
+            material_id = str(uuid.uuid4())
+            upsert(conn, "materials", {
+                "id": material_id,
+                "subject_tag": subject,
+                "raw_text": text,
+                "source_type": "text",
+                "source_path": None,
+                "created_at": now_iso(),
+            })
+
+            if not concepts:
+                response.error = "no concepts extracted"
+                return response
+
+            concept = concepts[0]
+            subject_lower = subject.lower()
+            for c in concepts:
+                if subject_lower in c.get("title", "").lower():
+                    concept = c
+                    break
+
+            concept_id = concept.get("id", "")
+            concept_text = f"{concept['title']}. Keywords: {' '.join(concept['keywords'])}. Summary: {concept['summary']}"
+            emb = embedding_service.embed_texts(conn, [concept_text])[0]
+            upsert(conn, "concepts", {
+                "id": concept_id,
+                "material_id": material_id,
+                "title": concept["title"],
+                "keywords_json": dumps_json(concept["keywords"]),
+                "summary": concept["summary"],
+                "embedding_json": dumps_json(emb.tolist()),
+                "created_at": now_iso(),
+            })
+
+            # Step 2: Generate reels with diagnostic tracking
+            generation_result = _ensure_generation_for_request(
+                conn,
+                material_id=material_id,
+                concept_id=concept_id,
+                required_count=num_reels,
+                sync_deep_fallback="if_empty",
+                creative_commons_only=False,
+                generation_mode="fast",
+                min_relevance=None,
+                video_pool_mode="balanced",
+                preferred_video_duration="any",
+                target_clip_duration_sec=60,
+                target_clip_duration_min_sec=15,
+                target_clip_duration_max_sec=120,
+                page_hint=1,
+            )
+
+            reels = list(generation_result.get("reels") or [])[:num_reels]
+            response.final_reel_count = len(reels)
+
+            # Step 3: Collect diagnostic data from DB
+            # Search queries used
+            search_rows = conn.execute(
+                "SELECT query FROM search_cache WHERE query LIKE ? ORDER BY created_at DESC LIMIT 20",
+                (f"%{subject_lower[:20]}%",),
+            ).fetchall() if hasattr(conn, "execute") else []
+            response.queries_generated = [str(r[0] if isinstance(r, tuple) else r.get("query", "")) for r in search_rows]
+
+            # Videos discovered for this material
+            video_rows = conn.execute(
+                "SELECT v.video_id, v.title, v.channel_title, v.duration_sec "
+                "FROM videos v "
+                "INNER JOIN reels r ON r.video_id = v.video_id "
+                "WHERE r.material_id = ? "
+                "ORDER BY r.created_at DESC LIMIT 20",
+                (material_id,),
+            ).fetchall() if hasattr(conn, "execute") else []
+
+            reel_stage = DiagnosticStageResult(
+                stage="reels_created",
+                candidate_count=len(reels),
+                details=[
+                    {
+                        "video_title": r.get("video_title", ""),
+                        "channel_name": r.get("channel_name", ""),
+                        "t_start": r.get("t_start", 0),
+                        "t_end": r.get("t_end", 0),
+                        "score": r.get("score", 0),
+                        "source_surface": r.get("source_surface", ""),
+                        "relevance_score": r.get("relevance_score", 0),
+                    }
+                    for r in reels
+                ],
+            )
+            response.stages.append(reel_stage)
+
+            # Transcript availability
+            transcript_stage = DiagnosticStageResult(stage="transcript_availability")
+            for reel in reels:
+                vid = reel.get("video_id", "")
+                if vid:
+                    tq = youtube_service.get_transcript_quality(conn, vid)
+                    transcript_stage.details.append({
+                        "video_id": vid,
+                        "has_transcript": tq is not None,
+                        "source_kind": tq.get("source_kind") if tq else None,
+                        "quality_score": tq.get("quality_score") if tq else None,
+                        "quality_status": tq.get("quality_status") if tq else None,
+                    })
+            transcript_stage.candidate_count = sum(1 for d in transcript_stage.details if d.get("has_transcript"))
+            response.stages.append(transcript_stage)
+
+            if not reels:
+                response.error = f"0 reels generated for '{subject}' — check stages for where candidates were lost"
+
+    except Exception as exc:
+        response.error = str(exc)[:500]
+
+    return response
 
 
 def _register_non_api_route_aliases() -> None:

@@ -92,7 +92,7 @@ class _ProxyRotator:
 
     def all(self) -> list[str]:
         return list(self._proxies)
-from .transcript_validation import validate_transcript
+from .transcript_validation import TranscriptQuality, validate_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,98 @@ GraphProfile = Literal["off", "light", "deep"]
 def _cache_key(*parts: str) -> str:
     value = "|".join(parts)
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Transcript source provenance
+# ---------------------------------------------------------------------------
+
+# Accurate names reflecting actual extraction method — "official_captions" is
+# reserved for the YouTube Data API OAuth path (captions.download), which
+# requires edit permission + quota.  The youtube_transcript_api library uses
+# an undocumented web-client endpoint, hence "web_caption_track".
+SOURCE_KIND_PRIORITY: dict[str, int] = {
+    "official_captions": 6,
+    "web_caption_track": 5,
+    "innertube_caption_track": 4,
+    "watch_page_caption_track": 3,
+    "yt_dlp_subtitle": 3,
+    "asr_local": 2,
+    "asr_api": 1,
+}
+
+# Status-specific cache TTLs (seconds).  Non-success states get short recheck
+# windows to avoid poisoning retrieval for videos whose captions appear later
+# or where an extractor had a transient bad response.
+CACHE_TTL_BY_STATUS: dict[str | None, int] = {
+    "success": 0,                  # indefinite — provenance upgrade after 24h
+    "failed_quality": 2 * 3600,    # 2 hours
+    "failed_access": 1 * 3600,     # 1 hour
+    "failed_rate_limit": 30 * 60,  # 30 minutes
+    "failed_no_captions": 6 * 3600,  # 6 hours
+    None: 0,                       # legacy entries — treat as success
+}
+
+# Granular version strings stored per transcript artifact.  Bump the relevant
+# constant when the corresponding logic changes to enable targeted cache
+# invalidation without discarding all cached transcripts.
+NORMALIZATION_VERSION = "norm_v1"
+
+
+def _vtt_timestamp_to_seconds(ts: str) -> float:
+    """Convert ``HH:MM:SS.mmm`` to seconds."""
+    parts = ts.split(":")
+    if len(parts) == 3:
+        h, m, s = parts
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    if len(parts) == 2:
+        m, s = parts
+        return int(m) * 60 + float(s)
+    return float(ts)
+
+
+def _backoff_delay(
+    attempt: int,
+    *,
+    base_sec: float = 1.0,
+    cap_sec: float = 60.0,
+    retry_after_sec: float | None = None,
+) -> float:
+    """Exponential backoff with full jitter (AWS style).
+
+    Returns ``random(0, min(cap, base * 2^attempt))``, with
+    *retry_after_sec* as a floor when a server-provided Retry-After
+    header was parsed.
+    """
+    exponential = min(cap_sec, base_sec * (2 ** attempt))
+    jittered = random.uniform(0, exponential)
+    if retry_after_sec is not None and retry_after_sec > 0:
+        return max(jittered, retry_after_sec)
+    return jittered
+
+
+def _parse_retry_after(response: "requests.Response | None") -> float | None:
+    """Parse HTTP ``Retry-After`` header (RFC 6585).
+
+    Handles both delta-seconds and HTTP-date formats.
+    Returns seconds to wait, or ``None`` if absent/unparseable.
+    """
+    if response is None:
+        return None
+    value = response.headers.get("Retry-After", "").strip()
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    from email.utils import parsedate_to_datetime
+    try:
+        target = parsedate_to_datetime(value)
+        delta = (target - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_iso8601_duration(value: str) -> int:
@@ -195,6 +287,16 @@ class YouTubeService:
     SEARCH_TIME_BUDGET_SEC = 8.0
     NETWORK_BACKOFF_SEC = 45.0
     NETWORK_BACKOFF_FAILURE_THRESHOLD = 3
+    # ---- transcript quality gates ----
+    TRANSCRIPT_MIN_CUE_COUNT = 3
+    TRANSCRIPT_MIN_TOTAL_CHARS = 50
+    TRANSCRIPT_MIN_COVERAGE = 0.40
+    TRANSCRIPT_MAX_EMPTY_RATIO = 0.30
+    # ---- circuit breaker ----
+    CIRCUIT_BREAKER_FAILURE_THRESHOLD = 5
+    CIRCUIT_BREAKER_COOLDOWN_SEC = 120.0
+    # ---- provenance upgrade ----
+    PROVENANCE_UPGRADE_AGE_SEC = 24 * 3600  # 24 hours
     # ---- connection pool ----
     # Must be at least as large as the maximum number of concurrent HTTP
     # requests we'll ever have in flight: search workers + transcript
@@ -277,6 +379,12 @@ class YouTubeService:
         self._network_backoff_lock = threading.Lock()
         self._network_backoff_until_by_scope: dict[str, float] = {}
         self._network_failure_streak_by_scope: dict[str, int] = {}
+        # ---- circuit breaker state ----
+        self._circuit_open_until: dict[str, float] = {}
+        self._circuit_failure_count: dict[str, int] = {}
+        # ---- single-flight transcript locking ----
+        self._transcript_flights: dict[str, threading.Event] = {}
+        self._transcript_flights_lock = threading.Lock()
         self._page_cache_lock = threading.Lock()
         self._page_cache: dict[str, tuple[float, str]] = {}
         self.serverless_mode = bool(
@@ -3306,17 +3414,42 @@ class YouTubeService:
         )
         status_code = int(response.status_code) if getattr(response, "status_code", None) else None
         is_transport_failure = response is None
+        retry_after = _parse_retry_after(response)
         streak = 0
         backoff_remaining_sec = 0.0
         with self._network_backoff_lock:
             if is_transport_failure:
+                # Silent throttle / connection drop — trip circuit breaker path.
                 streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0) + 1
                 self._network_failure_streak_by_scope[clean_scope] = streak
                 if streak >= self.NETWORK_BACKOFF_FAILURE_THRESHOLD:
+                    # Jittered backoff that scales with streak, capped at 180s.
+                    backoff_sec = _backoff_delay(
+                        streak - self.NETWORK_BACKOFF_FAILURE_THRESHOLD,
+                        base_sec=self.NETWORK_BACKOFF_SEC,
+                        cap_sec=self.NETWORK_BACKOFF_SEC * 4,
+                    )
                     self._network_backoff_until_by_scope[clean_scope] = max(
                         float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
-                        time.monotonic() + self.NETWORK_BACKOFF_SEC,
+                        time.monotonic() + backoff_sec,
                     )
+            elif status_code == 429 and retry_after is not None:
+                # Explicit 429 with Retry-After — respect the server's backoff.
+                self._network_backoff_until_by_scope[clean_scope] = max(
+                    float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
+                    time.monotonic() + retry_after,
+                )
+                streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0) + 1
+                self._network_failure_streak_by_scope[clean_scope] = streak
+            elif status_code == 429:
+                # 429 without Retry-After — exponential backoff with jitter.
+                streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0) + 1
+                self._network_failure_streak_by_scope[clean_scope] = streak
+                backoff_sec = _backoff_delay(streak, base_sec=2.0, cap_sec=30.0)
+                self._network_backoff_until_by_scope[clean_scope] = max(
+                    float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
+                    time.monotonic() + backoff_sec,
+                )
             else:
                 streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0)
             backoff_until = float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0)
@@ -3328,6 +3461,7 @@ class YouTubeService:
                     "scope": clean_scope,
                     "kind": "transport" if is_transport_failure else "http",
                     "status_code": status_code,
+                    "retry_after": retry_after,
                     "url": url_target,
                     "failure_streak": streak,
                     "backoff_remaining_sec": round(backoff_remaining_sec, 2),
@@ -3343,10 +3477,10 @@ class YouTubeService:
     ) -> list[dict[str, Any]]:
         if conn is None:
             with get_conn() as local_conn:
-                return self._get_transcript_with_conn(
+                return self._single_flight_transcript(
                     local_conn, video_id, video_duration_sec=video_duration_sec,
                 )
-        return self._get_transcript_with_conn(
+        return self._single_flight_transcript(
             conn, video_id, video_duration_sec=video_duration_sec,
         )
 
@@ -3354,94 +3488,232 @@ class YouTubeService:
         """Return cached coverage metadata for a transcript, or ``None``."""
         row = fetch_one(
             conn,
-            "SELECT coverage_ratio, cue_count FROM transcript_cache WHERE video_id = ?",
+            "SELECT coverage_ratio, cue_count, source_kind, quality_score, quality_status "
+            "FROM transcript_cache WHERE video_id = ?",
             (video_id,),
         )
         if row and row.get("coverage_ratio") is not None:
             return {
                 "coverage_ratio": float(row["coverage_ratio"]),
                 "cue_count": int(row.get("cue_count") or 0),
+                "source_kind": row.get("source_kind"),
+                "quality_score": float(row["quality_score"]) if row.get("quality_score") is not None else None,
+                "quality_status": row.get("quality_status"),
             }
         return None
 
     def _get_transcript_with_conn(
         self, conn, video_id: str, *, video_duration_sec: float | None = None,
     ) -> list[dict[str, Any]]:
-        cached = fetch_one(conn, "SELECT transcript_json, created_at FROM transcript_cache WHERE video_id = ?", (video_id,))
+        # ------------------------------------------------------------------
+        # Cache lookup with status-specific TTLs and provenance upgrades
+        # ------------------------------------------------------------------
+        cached = fetch_one(
+            conn,
+            "SELECT transcript_json, created_at, source_kind, quality_score, quality_status "
+            "FROM transcript_cache WHERE video_id = ?",
+            (video_id,),
+        )
         if cached:
             try:
                 cached_transcript = json.loads(cached["transcript_json"])
             except json.JSONDecodeError:
                 cached_transcript = []
-            if cached_transcript:
-                return cached_transcript
-            # Short-term cache misses to avoid hammering transcript fetch on videos with no transcript.
+
+            cached_status = str(cached.get("quality_status") or "").strip() or None
+            cached_source = str(cached.get("source_kind") or "").strip() or None
+            cached_priority = SOURCE_KIND_PRIORITY.get(cached_source or "", 0)
             created_at = self._parse_cache_time(str(cached.get("created_at") or ""))
-            if created_at:
-                age_sec = (datetime.now(timezone.utc) - created_at).total_seconds()
-                if age_sec < self.empty_transcript_ttl_sec:
+            age_sec = (datetime.now(timezone.utc) - created_at).total_seconds() if created_at else float("inf")
+
+            if cached_transcript:
+                # Provenance-aware upgrade: low-priority sources (ASR) get
+                # re-fetched after 24h to see if better captions are now available.
+                if cached_priority <= 2 and age_sec > self.PROVENANCE_UPGRADE_AGE_SEC:
+                    logger.info(
+                        "Provenance upgrade: re-fetching %s (source=%s, age=%.0fs)",
+                        video_id, cached_source, age_sec,
+                    )
+                    # Fall through to re-fetch; keep cached_transcript as fallback.
+                else:
+                    return cached_transcript
+            else:
+                # Empty transcript — check status-specific TTL.
+                ttl = CACHE_TTL_BY_STATUS.get(cached_status, CACHE_TTL_BY_STATUS.get(None, 0))
+                if ttl > 0 and age_sec < ttl:
                     return []
+                # Expired non-success entry — fall through to re-fetch.
 
-        transcript: list[dict[str, Any]] = []
-        # Retry with proxy rotation on IP blocks.
-        max_attempts = 3 if self._proxy_transcripts else 1
-        for attempt in range(max_attempts):
+        # Keep any existing cached transcript as fallback for provenance upgrade.
+        fallback_transcript: list[dict[str, Any]] = []
+        if cached:
             try:
-                api = self.transcript_api
-                # On retry, build a fresh API client with the next proxy.
-                if attempt > 0 and self._proxy_rotator.available:
-                    proxy = self._proxy_rotator.next()
-                    if proxy:
-                        api = YouTubeTranscriptApi(proxies=proxy)
-                        logger.info("Transcript retry %d/%d with proxy for video_id=%s", attempt + 1, max_attempts, video_id)
-                transcript = api.fetch(video_id, languages=["en"]).to_raw_data()
-                break  # success
-            except NoTranscriptFound:
-                transcript = self._fallback_any_transcript(video_id)
-                break
-            except (TranscriptsDisabled, VideoUnavailable):
-                transcript = []
-                break
-            except Exception as exc:
-                exc_name = type(exc).__name__
-                if "IpBlocked" in exc_name and attempt < max_attempts - 1:
-                    logger.warning("IP blocked fetching transcript for %s, rotating proxy (attempt %d)", video_id, attempt + 1)
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                if attempt == max_attempts - 1:
-                    logger.warning("All youtube_transcript_api attempts failed for %s: %s — trying Innertube", video_id, exc_name)
-                transcript = []
+                fallback_transcript = json.loads(cached.get("transcript_json") or "[]")
+            except json.JSONDecodeError:
+                pass
 
-        # Innertube fallback: if youtube_transcript_api returned nothing (IP-blocked
-        # or other failure), try YouTube's internal Innertube API which has much
-        # more relaxed rate-limiting and uses a different endpoint.
-        if not transcript:
+        # ------------------------------------------------------------------
+        # Fallback chain with quality gates at each stage
+        # ------------------------------------------------------------------
+        transcript: list[dict[str, Any]] = []
+        source_kind = ""
+        quality_obj: "TranscriptQuality | None" = None
+        rejection_reason: str | None = None
+        final_status = "failed_no_captions"  # default if all stages produce nothing
+        extractor_version = ""
+        model_version: str | None = None
+
+        # Stage 1: youtube_transcript_api (web_caption_track)
+        if not self._circuit_is_open("web_caption_track"):
+            max_attempts = 3 if self._proxy_transcripts else 1
+            stage1_failed = True
+            for attempt in range(max_attempts):
+                try:
+                    api = self.transcript_api
+                    if attempt > 0 and self._proxy_rotator.available:
+                        proxy = self._proxy_rotator.next()
+                        if proxy:
+                            api = YouTubeTranscriptApi(proxies=proxy)
+                            logger.info("Transcript retry %d/%d with proxy for video_id=%s", attempt + 1, max_attempts, video_id)
+                    transcript = api.fetch(video_id, languages=["en"]).to_raw_data()
+                    stage1_failed = False
+                    break
+                except NoTranscriptFound:
+                    transcript = self._fallback_any_transcript(video_id)
+                    stage1_failed = not bool(transcript)
+                    break
+                except (TranscriptsDisabled, VideoUnavailable):
+                    transcript = []
+                    break
+                except Exception as exc:
+                    exc_name = type(exc).__name__
+                    if "IpBlocked" in exc_name and attempt < max_attempts - 1:
+                        logger.warning("IP blocked fetching transcript for %s, rotating proxy (attempt %d)", video_id, attempt + 1)
+                        delay = _backoff_delay(attempt, base_sec=1.0, cap_sec=15.0)
+                        time.sleep(delay)
+                        continue
+                    if attempt == max_attempts - 1:
+                        logger.warning("All youtube_transcript_api attempts failed for %s: %s — trying Innertube", video_id, exc_name)
+                    transcript = []
+
+            if stage1_failed:
+                self._circuit_record_failure("web_caption_track")
+            elif transcript:
+                self._circuit_record_success("web_caption_track")
+
+            if transcript:
+                source_kind = "web_caption_track"
+                extractor_version = "web_caption_v1"
+                passes, quality_obj, rejection_reason = self._transcript_passes_quality_gate(
+                    transcript, video_duration_sec, source_kind,
+                )
+                if not passes:
+                    logger.warning("Quality gate failed for %s (source=%s): %s", video_id, source_kind, rejection_reason)
+                    transcript = []
+
+        # Stage 2: Innertube fallback
+        if not transcript and not self._circuit_is_open("innertube"):
             try:
                 transcript = self._innertube_fetch_transcript(video_id)
+                if transcript:
+                    self._circuit_record_success("innertube")
+                    source_kind = "innertube_caption_track"
+                    extractor_version = "innertube_v1"
+                    passes, quality_obj, rejection_reason = self._transcript_passes_quality_gate(
+                        transcript, video_duration_sec, source_kind,
+                    )
+                    if not passes:
+                        logger.warning("Quality gate failed for %s (source=%s): %s", video_id, source_kind, rejection_reason)
+                        transcript = []
             except Exception as exc:
                 logger.debug("Innertube fallback failed for %s: %s", video_id, exc)
+                self._circuit_record_failure("innertube")
 
-        # Whisper audio fallback: if all caption-based approaches failed,
-        # download the audio via yt-dlp and transcribe with faster-whisper
-        # or OpenAI Whisper API.  This bypasses YouTube's caption system
-        # entirely — it works regardless of IP blocks on the timedtext endpoint.
-        if not transcript:
+        # Stage 3: yt-dlp subtitle download (cheaper than audio ASR)
+        if not transcript and not self._circuit_is_open("yt_dlp_subtitle"):
             try:
-                transcript = self._whisper_audio_fallback(video_id)
+                transcript, sub_source = self._yt_dlp_subtitle_fetch(video_id)
+                if transcript:
+                    self._circuit_record_success("yt_dlp_subtitle")
+                    source_kind = "yt_dlp_subtitle"
+                    extractor_version = "yt_dlp_sub_v1"
+                    passes, quality_obj, rejection_reason = self._transcript_passes_quality_gate(
+                        transcript, video_duration_sec, source_kind,
+                    )
+                    if not passes:
+                        logger.warning("Quality gate failed for %s (source=%s): %s", video_id, source_kind, rejection_reason)
+                        transcript = []
+            except Exception as exc:
+                logger.debug("yt-dlp subtitle fallback failed for %s: %s", video_id, exc)
+                self._circuit_record_failure("yt_dlp_subtitle")
+
+        # Stage 4: Whisper audio fallback (ASR — most expensive)
+        if not transcript and not self._circuit_is_open("whisper"):
+            try:
+                transcript, whisper_source = self._whisper_audio_fallback(video_id)
+                if transcript:
+                    self._circuit_record_success("whisper")
+                    source_kind = whisper_source  # "asr_local" or "asr_api"
+                    extractor_version = "whisper_v1"
+                    model_version = (
+                        os.environ.get("FASTER_WHISPER_MODEL", "base.en")
+                        if whisper_source == "asr_local" else "whisper-1"
+                    )
+                    passes, quality_obj, rejection_reason = self._transcript_passes_quality_gate(
+                        transcript, video_duration_sec, source_kind,
+                    )
+                    if not passes:
+                        logger.warning("Quality gate failed for %s (source=%s): %s", video_id, source_kind, rejection_reason)
+                        transcript = []
             except Exception as exc:
                 logger.debug("Whisper audio fallback failed for %s: %s", video_id, exc)
+                self._circuit_record_failure("whisper")
+
+        # ------------------------------------------------------------------
+        # Determine final status and compute quality metadata
+        # ------------------------------------------------------------------
+        if transcript:
+            final_status = "success"
+        elif rejection_reason:
+            final_status = "failed_quality"
+        # else: final_status stays "failed_no_captions"
+
+        # Provenance-aware upgrade: never downgrade. If re-fetch produced a
+        # lower-priority or failed result, keep the existing cached transcript.
+        if not transcript and fallback_transcript:
+            cached_source_str = str(cached.get("source_kind") or "") if cached else ""
+            cached_priority_val = SOURCE_KIND_PRIORITY.get(cached_source_str, 0)
+            new_priority = SOURCE_KIND_PRIORITY.get(source_kind, 0)
+            if new_priority <= cached_priority_val:
+                logger.info("Provenance upgrade: keeping existing %s transcript for %s (new source %s not better)",
+                            cached_source_str, video_id, source_kind or "none")
+                return fallback_transcript
 
         # Compute coverage metadata for downstream consumers.
         coverage_ratio: float | None = None
         cue_count = len(transcript)
-        if transcript:
-            quality = validate_transcript(transcript, video_duration_sec)
-            coverage_ratio = quality.coverage_ratio
+        quality_score: float | None = None
+        if transcript and quality_obj is None:
+            quality_obj = validate_transcript(transcript, video_duration_sec)
+        if quality_obj:
+            coverage_ratio = quality_obj.coverage_ratio
+            quality_score = self._compute_quality_score(quality_obj, source_kind)
 
+        # ------------------------------------------------------------------
+        # Persist transcript artifact
+        # ------------------------------------------------------------------
         row_data: dict[str, Any] = {
             "video_id": video_id,
             "transcript_json": dumps_json(transcript),
             "created_at": now_iso(),
+            "source_kind": source_kind or None,
+            "quality_score": quality_score,
+            "language": "en",
+            "extractor_version": extractor_version or None,
+            "model_version": model_version,
+            "normalization_version": NORMALIZATION_VERSION,
+            "quality_status": final_status,
+            "quality_rejection_reason": rejection_reason if final_status != "success" else None,
         }
         if coverage_ratio is not None:
             row_data["coverage_ratio"] = coverage_ratio
@@ -3460,6 +3732,152 @@ class YouTubeService:
             return parsed
         except ValueError:
             return None
+
+    # ------------------------------------------------------------------
+    # Quality score computation
+    # ------------------------------------------------------------------
+
+    def _compute_quality_score(
+        self, quality: TranscriptQuality, source_kind: str,
+    ) -> float:
+        """Compute a 0.0-1.0 composite quality score from validation metrics."""
+        source_bonus = {
+            "official_captions": 1.0, "web_caption_track": 0.9,
+            "innertube_caption_track": 0.7, "watch_page_caption_track": 0.6,
+            "yt_dlp_subtitle": 0.6, "asr_local": 0.3, "asr_api": 0.2,
+        }.get(source_kind, 0.0)
+        gap_penalty = min(1.0, quality.largest_gap_sec / 60.0)
+        cue_saturation = min(1.0, quality.cue_count / 50.0)
+        return round(
+            0.40 * min(1.0, quality.coverage_ratio)
+            + 0.20 * (1.0 - quality.empty_cue_ratio)
+            + 0.15 * (1.0 - gap_penalty)
+            + 0.15 * cue_saturation
+            + 0.10 * source_bonus,
+            4,
+        )
+
+    # ------------------------------------------------------------------
+    # Transcript quality gate
+    # ------------------------------------------------------------------
+
+    def _transcript_passes_quality_gate(
+        self,
+        transcript: list[dict[str, Any]],
+        video_duration_sec: float | None,
+        source_kind: str,
+    ) -> tuple[bool, "TranscriptQuality | None", str | None]:
+        """Validate a transcript against lenient quality thresholds.
+
+        Returns ``(passes, quality, rejection_reason)``.
+        """
+        if not transcript:
+            return False, None, "empty transcript"
+
+        if len(transcript) < self.TRANSCRIPT_MIN_CUE_COUNT:
+            return False, None, f"too few cues ({len(transcript)} < {self.TRANSCRIPT_MIN_CUE_COUNT})"
+
+        total_chars = sum(len(str(c.get("text", ""))) for c in transcript)
+        if total_chars < self.TRANSCRIPT_MIN_TOTAL_CHARS:
+            return False, None, f"too little text ({total_chars} chars < {self.TRANSCRIPT_MIN_TOTAL_CHARS})"
+
+        # Timestamp sanity: no negative start or duration values
+        for cue in transcript:
+            start = float(cue.get("start", 0))
+            dur = float(cue.get("duration", 0))
+            if start < 0 or dur < 0:
+                return False, None, f"negative timestamp (start={start}, duration={dur})"
+
+        quality = validate_transcript(
+            transcript,
+            video_duration_sec,
+            min_coverage=self.TRANSCRIPT_MIN_COVERAGE,
+            max_gap_sec=120.0,
+            max_first_delay_sec=30.0,
+            max_empty_ratio=self.TRANSCRIPT_MAX_EMPTY_RATIO,
+        )
+
+        if video_duration_sec and video_duration_sec > 0 and quality.coverage_ratio < self.TRANSCRIPT_MIN_COVERAGE:
+            return False, quality, f"low coverage ({quality.coverage_ratio:.0%} < {self.TRANSCRIPT_MIN_COVERAGE:.0%})"
+
+        if quality.empty_cue_ratio > self.TRANSCRIPT_MAX_EMPTY_RATIO:
+            return False, quality, f"too many empty cues ({quality.empty_cue_ratio:.0%} > {self.TRANSCRIPT_MAX_EMPTY_RATIO:.0%})"
+
+        # Language plausibility: check ASCII-letter ratio for English
+        all_text = " ".join(str(c.get("text", "")) for c in transcript)
+        if all_text:
+            ascii_letters = sum(1 for ch in all_text if ch.isascii() and ch.isalpha())
+            total_alpha = sum(1 for ch in all_text if ch.isalpha())
+            if total_alpha > 20 and (ascii_letters / total_alpha) < 0.3:
+                return False, quality, f"language plausibility failed (ASCII ratio {ascii_letters / total_alpha:.0%})"
+
+        return True, quality, None
+
+    # ------------------------------------------------------------------
+    # Circuit breaker
+    # ------------------------------------------------------------------
+
+    def _circuit_is_open(self, scope: str) -> bool:
+        """Return True if the circuit breaker for *scope* is open."""
+        with self._network_backoff_lock:
+            return time.monotonic() < float(self._circuit_open_until.get(scope, 0.0))
+
+    def _circuit_record_failure(self, scope: str) -> None:
+        with self._network_backoff_lock:
+            count = int(self._circuit_failure_count.get(scope, 0)) + 1
+            self._circuit_failure_count[scope] = count
+            if count >= self.CIRCUIT_BREAKER_FAILURE_THRESHOLD:
+                self._circuit_open_until[scope] = time.monotonic() + self.CIRCUIT_BREAKER_COOLDOWN_SEC
+                logger.warning(
+                    "Circuit breaker opened for scope=%s after %d failures (cooldown %.0fs)",
+                    scope, count, self.CIRCUIT_BREAKER_COOLDOWN_SEC,
+                )
+
+    def _circuit_record_success(self, scope: str) -> None:
+        with self._network_backoff_lock:
+            self._circuit_failure_count.pop(scope, None)
+            self._circuit_open_until.pop(scope, None)
+
+    # ------------------------------------------------------------------
+    # Single-flight transcript locking
+    # ------------------------------------------------------------------
+
+    def _single_flight_transcript(
+        self, conn, video_id: str, *, video_duration_sec: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Acquire single-flight lock so concurrent requests for the same
+        video_id trigger exactly one transcript fetch."""
+        with self._transcript_flights_lock:
+            existing_event = self._transcript_flights.get(video_id)
+            if existing_event is not None:
+                # Another thread is already fetching — wait for it, then read cache.
+                pass  # fall through below
+            else:
+                event = threading.Event()
+                self._transcript_flights[video_id] = event
+
+        if existing_event is not None:
+            existing_event.wait(timeout=60)
+            # Read from cache — the fetching thread just populated it.
+            cached = fetch_one(
+                conn,
+                "SELECT transcript_json FROM transcript_cache WHERE video_id = ?",
+                (video_id,),
+            )
+            if cached:
+                try:
+                    return json.loads(cached["transcript_json"])
+                except json.JSONDecodeError:
+                    pass
+            # Cache miss after wait — fall through to fetch ourselves.
+            return self._get_transcript_with_conn(conn, video_id, video_duration_sec=video_duration_sec)
+
+        try:
+            return self._get_transcript_with_conn(conn, video_id, video_duration_sec=video_duration_sec)
+        finally:
+            with self._transcript_flights_lock:
+                self._transcript_flights.pop(video_id, None)
+            event.set()
 
     # ------------------------------------------------------------------
     # Alternative transcript fetching — bypasses youtube_transcript_api
@@ -3607,14 +4025,94 @@ class YouTubeService:
     # Whisper audio fallback — download audio, transcribe locally or via API
     # ------------------------------------------------------------------
 
-    def _whisper_audio_fallback(self, video_id: str) -> list[dict[str, Any]]:
+    def _yt_dlp_subtitle_fetch(self, video_id: str) -> tuple[list[dict[str, Any]], str]:
+        """Download subtitles via yt-dlp (no audio download — much cheaper than ASR).
+
+        Returns ``(transcript, "yt_dlp_subtitle")`` or ``([], "")``.
+        """
+        import shutil
+        import tempfile
+
+        try:
+            import yt_dlp
+        except ImportError:
+            logger.debug("yt-dlp not installed, skipping subtitle fetch")
+            return [], ""
+
+        tmpdir = tempfile.mkdtemp(prefix="reelai_ytdlp_sub_")
+        try:
+            ydl_opts = {
+                "writesubtitles": True,
+                "writeautomaticsub": True,
+                "subtitleslangs": ["en"],
+                "subtitlesformat": "vtt",
+                "skip_download": True,
+                "outtmpl": os.path.join(tmpdir, f"{video_id}.%(ext)s"),
+                "quiet": True,
+                "no_warnings": True,
+                "socket_timeout": 10,
+            }
+            proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
+            if proxy:
+                proxy_url = proxy.get("https") or proxy.get("http") or ""
+                if proxy_url:
+                    ydl_opts["proxy"] = proxy_url
+
+            logger.info("yt-dlp subtitle fetch for %s", video_id)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+
+            # Find downloaded .vtt files
+            vtt_files = [f for f in os.listdir(tmpdir) if f.endswith(".vtt")]
+            if not vtt_files:
+                logger.debug("No VTT subtitle file produced for %s", video_id)
+                return [], ""
+
+            vtt_path = os.path.join(tmpdir, vtt_files[0])
+            cues = self._parse_vtt_file(vtt_path)
+            if cues:
+                logger.info("yt-dlp subtitle fetch succeeded for %s (%d cues)", video_id, len(cues))
+                return cues, "yt_dlp_subtitle"
+            return [], ""
+        except Exception as exc:
+            logger.debug("yt-dlp subtitle fetch failed for %s: %s", video_id, exc)
+            return [], ""
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @staticmethod
+    def _parse_vtt_file(vtt_path: str) -> list[dict[str, Any]]:
+        """Parse a WebVTT file into [{text, start, duration}, ...] format."""
+        import re
+
+        cues: list[dict[str, Any]] = []
+        try:
+            with open(vtt_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except (OSError, UnicodeDecodeError):
+            return []
+
+        # Match VTT cue blocks:  HH:MM:SS.mmm --> HH:MM:SS.mmm\ntext
+        pattern = re.compile(
+            r"(\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}\.\d{3})\s*\n((?:.+\n?)+)",
+        )
+        for m in pattern.finditer(content):
+            start_str, end_str, text = m.group(1), m.group(2), m.group(3)
+            start = _vtt_timestamp_to_seconds(start_str)
+            end = _vtt_timestamp_to_seconds(end_str)
+            clean_text = re.sub(r"<[^>]+>", "", text).strip()
+            if clean_text and end > start:
+                cues.append({"text": clean_text, "start": start, "duration": round(end - start, 3)})
+        return cues
+
+    def _whisper_audio_fallback(self, video_id: str) -> tuple[list[dict[str, Any]], str]:
         """Download audio via yt-dlp, transcribe with faster-whisper or OpenAI Whisper.
 
         Completely bypasses YouTube's caption/timedtext system.
-        Returns transcript in [{text, start, duration}, ...] format.
+        Returns ``(transcript, source_kind)`` where source_kind is
+        ``"asr_local"`` or ``"asr_api"``, or ``([], "")`` on failure.
         """
         import shutil
-        import subprocess
         import tempfile
 
         tmpdir = tempfile.mkdtemp(prefix="reelai_whisper_")
@@ -3625,7 +4123,7 @@ class YouTubeService:
                 import yt_dlp
             except ImportError:
                 logger.debug("yt-dlp not installed, skipping Whisper audio fallback")
-                return []
+                return [], ""
 
             ydl_opts = {
                 "format": "bestaudio/best",
@@ -3642,7 +4140,6 @@ class YouTubeService:
             }
             proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
             if proxy:
-                # yt-dlp expects a single proxy URL string
                 proxy_url = proxy.get("https") or proxy.get("http") or ""
                 if proxy_url:
                     ydl_opts["proxy"] = proxy_url
@@ -3655,7 +4152,7 @@ class YouTubeService:
             wav_files = [f for f in os.listdir(tmpdir) if f.endswith(".wav")]
             if not wav_files:
                 logger.debug("No WAV file produced for %s", video_id)
-                return []
+                return [], ""
             audio_path = os.path.join(tmpdir, wav_files[0])
             audio_size = os.path.getsize(audio_path)
             logger.info("Whisper fallback: audio downloaded for %s (%d bytes)", video_id, audio_size)
@@ -3663,15 +4160,15 @@ class YouTubeService:
             # Step 2: Try faster-whisper (free, local)
             cues = self._transcribe_with_faster_whisper(audio_path, video_id)
             if cues:
-                return cues
+                return cues, "asr_local"
 
             # Step 3: Try OpenAI Whisper API (paid, ~$0.006/min)
             cues = self._transcribe_with_openai_whisper(audio_path, video_id)
             if cues:
-                return cues
+                return cues, "asr_api"
 
             logger.debug("All Whisper strategies failed for %s", video_id)
-            return []
+            return [], ""
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

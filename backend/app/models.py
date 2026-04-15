@@ -134,6 +134,25 @@ class SimulationResponse(BaseModel):
     per_topic: list[SimulationTopicResult] = Field(default_factory=list)
 
 
+class AdminDiagnoseTopicRequest(BaseModel):
+    subject: str
+    num_reels: int = 3
+
+
+class DiagnosticStageResult(BaseModel):
+    stage: str = ""
+    candidate_count: int = 0
+    details: list[dict] = Field(default_factory=list)
+
+
+class DiagnoseTopicResponse(BaseModel):
+    subject: str = ""
+    queries_generated: list[str] = Field(default_factory=list)
+    stages: list[DiagnosticStageResult] = Field(default_factory=list)
+    final_reel_count: int = 0
+    error: str = ""
+
+
 class ReelsCanGenerateResponse(BaseModel):
     can_generate: bool
     blocked_by_settings: bool = False

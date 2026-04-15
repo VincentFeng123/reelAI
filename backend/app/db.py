@@ -808,6 +808,14 @@ def init_db() -> None:
                 )
                 cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS coverage_ratio REAL")
                 cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS cue_count INTEGER")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS source_kind TEXT")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS quality_score REAL")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS language TEXT")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS extractor_version TEXT")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS model_version TEXT")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS normalization_version TEXT")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS quality_status TEXT")
+                cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS quality_rejection_reason TEXT")
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             conn.commit()
@@ -970,6 +978,20 @@ def init_db() -> None:
             conn.execute("ALTER TABLE transcript_cache ADD COLUMN cue_count INTEGER")
         except sqlite3.OperationalError:
             pass
+        for _col_sql in [
+            "ALTER TABLE transcript_cache ADD COLUMN source_kind TEXT",
+            "ALTER TABLE transcript_cache ADD COLUMN quality_score REAL",
+            "ALTER TABLE transcript_cache ADD COLUMN language TEXT",
+            "ALTER TABLE transcript_cache ADD COLUMN extractor_version TEXT",
+            "ALTER TABLE transcript_cache ADD COLUMN model_version TEXT",
+            "ALTER TABLE transcript_cache ADD COLUMN normalization_version TEXT",
+            "ALTER TABLE transcript_cache ADD COLUMN quality_status TEXT",
+            "ALTER TABLE transcript_cache ADD COLUMN quality_rejection_reason TEXT",
+        ]:
+            try:
+                conn.execute(_col_sql)
+            except sqlite3.OperationalError:
+                pass
         _migrate_reels_unique_clip_index_sqlite(conn)
         _migrate_reel_feedback_uniqueness_sqlite(conn)
         conn.commit()
