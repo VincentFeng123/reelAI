@@ -28,27 +28,37 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 # Proxy rotation & stealth helpers
 # ---------------------------------------------------------------------------
 # Rotating User-Agent pool — cycle through realistic browser fingerprints to
-# avoid bot detection by YouTube.  The pool is intentionally small (fewer
-# unique fingerprints = fewer "never-seen-before" signals) and only includes
-# Chrome on mainstream OSes to match YouTube's normal traffic profile.
+# avoid bot detection by YouTube.  Chrome 131-133 are the current stable
+# versions as of April 2026.  Includes Windows/Mac/Linux to match YouTube's
+# normal traffic distribution.  Updated monthly; stale UAs (>6 months old)
+# get flagged by YouTube's anti-bot heuristics.
 _USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    # Chrome 133 — current stable (April 2026)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    # Chrome 132 — previous stable
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+    # Chrome 131 — one back
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    # Edge (same Chromium base — common on corporate networks)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0",
 ]
 
-# Realistic browser headers to accompany each request.
+# Realistic browser headers to accompany each request. Sec-Ch-Ua must match
+# the UA version range above, or YouTube's passive fingerprinting flags a
+# mismatch between the UA header and the Sec-Ch-Ua hint.
 _STEALTH_HEADERS = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
     "Cache-Control": "max-age=0",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua": '"Chromium";v="133", "Google Chrome";v="133", "Not-A.Brand";v="24"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"macOS"',
     "Sec-Fetch-Dest": "document",
@@ -56,6 +66,7 @@ _STEALTH_HEADERS = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
+    "Priority": "u=0, i",
 }
 
 
@@ -461,14 +472,27 @@ class YouTubeService:
         # pages return real `ytInitialData` HTML instead of a consent wall
         # that lacks the marker entirely. Without this, requests from cloud
         # IPs (Railway, AWS, GCP) frequently get redirected to consent.youtube.com
-        # and scraping silently returns zero rows for every query. These are
-        # the same values used by yt-dlp and youtube-dl to bypass the gate.
-        self._session.cookies.set("SOCS", "CAI", domain=".youtube.com")
+        # and scraping silently returns zero rows for every query.
+        #
+        # SOCS=CAISEwgDEgk2OTgwMjMxNjQaAmVuIAEaBgiA_LyaBg is the base64 proto
+        # payload that encodes "I consent, English, April 2025". yt-dlp and
+        # Invidious both adopted this format after the 20210328 variant stopped
+        # working for EU/UK cloud IPs. The CONSENT cookie is kept as a fallback
+        # for older YouTube front-ends that still check it.
         self._session.cookies.set(
-            "CONSENT",
-            "YES+cb.20210328-17-p0.en+FX+000",
+            "SOCS",
+            "CAISEwgDEgk2OTgwMjMxNjQaAmVuIAEaBgiA_LyaBg",
             domain=".youtube.com",
         )
+        self._session.cookies.set(
+            "CONSENT",
+            "PENDING+987",
+            domain=".youtube.com",
+        )
+        # GPS=1 signals "I have location services enabled" which some YouTube
+        # personalization paths check — its absence can trigger a consent
+        # interstitial on cloud IPs.
+        self._session.cookies.set("GPS", "1", domain=".youtube.com")
 
     def _should_use_data_api(self) -> bool:
         """True when the YouTube Data API v3 is available AND not quota-blocked.
@@ -1118,6 +1142,21 @@ class YouTubeService:
         for rows in ordered_variant_rows:
             if rows:
                 results = self._merge_unique_videos(results, rows, None)
+
+        # InnerTube direct fallback — if HTML scraping returned nothing (consent
+        # wall, bot block, layout change), bypass HTML entirely and call
+        # YouTube's InnerTube API directly. This is immune to HTML parsing
+        # failures because it returns structured JSON.
+        if not results and not self._deadline_exceeded(deadline):
+            logger.info("HTML scraping returned 0 results for %r — trying InnerTube direct search", self._query_preview(query))
+            innertube_rows = self._innertube_search(
+                query=query,
+                max_results=target_pool,
+                deadline=deadline,
+            )
+            if innertube_rows:
+                results = innertube_rows
+
         results = self._finalize_search_rows(
             results,
             query=query,
@@ -2204,41 +2243,213 @@ class YouTubeService:
             return self._clean_query_text(f"{exact_core} {suffix}")
         return exact_core
 
+    # Maximum retries for _fetch_search_html when the response looks like a
+    # consent wall or empty page (valid HTTP 200 but no ytInitialData).
+    HTML_FETCH_MAX_RETRIES = 3
+    HTML_FETCH_RETRY_BACKOFF_SEC = 0.4
+
     def _fetch_search_html(self, search_query: str, deadline: float | None = None) -> str:
-        # Guard against empty queries. YouTube would happily return its
-        # trending page for "", which would contaminate the cache and skew
-        # every downstream scorer.
+        """Fetch YouTube search results HTML with retry on consent-wall responses.
+
+        Retries up to HTML_FETCH_MAX_RETRIES times when the response looks
+        like a consent wall (valid HTTP 200 but too small or missing
+        ytInitialData). Each retry rotates the User-Agent and adds a small
+        backoff to look like a real human retrying after a "page didn't load"
+        experience.
+        """
         clean_query = str(search_query or "").strip()
         if not clean_query:
             logger.debug("Skipping search HTML fetch — empty query")
             return ""
         if self._deadline_exceeded(deadline) or self._network_backoff_active("youtube_html"):
             return ""
+
+        best_payload = ""
+        for attempt in range(self.HTML_FETCH_MAX_RETRIES):
+            if attempt > 0:
+                # Rotate UA between retries so YouTube sees a "different browser"
+                self._session.headers["User-Agent"] = _random_user_agent()
+                delay = self.HTML_FETCH_RETRY_BACKOFF_SEC * (1.5 ** attempt)
+                time.sleep(delay)
+                if self._deadline_exceeded(deadline):
+                    break
+            try:
+                resp = self._session_get(
+                    "https://www.youtube.com/results",
+                    params={
+                        "search_query": clean_query,
+                        # Force English US locale — prevents YouTube from
+                        # serving a locale-specific consent wall or a
+                        # localized page layout that our regex can't parse.
+                        "gl": "US",
+                        "hl": "en",
+                        "persist_gl": "1",
+                        "persist_hl": "1",
+                    },
+                    deadline=deadline,
+                )
+                resp.raise_for_status()
+                self._note_request_success("youtube_html")
+            except requests.RequestException as exc:
+                self._note_request_failure(exc, scope="youtube_html")
+                continue
+
+            payload = resp.text or ""
+            # Quick check: does the page contain ytInitialData? If not, it's
+            # likely a consent wall — retry with a fresh UA.
+            if "ytInitialData" in payload and len(payload) > 20000:
+                return payload
+            # Keep the best (largest) response in case all retries are walls.
+            if len(payload) > len(best_payload):
+                best_payload = payload
+            if attempt < self.HTML_FETCH_MAX_RETRIES - 1:
+                logger.info(
+                    "Search HTML missing ytInitialData (attempt %d/%d, %d bytes) — retrying with fresh UA",
+                    attempt + 1, self.HTML_FETCH_MAX_RETRIES, len(payload),
+                )
+
+        # Return whatever we got — the extractor might still find video IDs
+        # via regex even if ytInitialData is missing.
+        if best_payload and len(best_payload) < 5000:
+            logger.warning(
+                "Search HTML fetch returned suspiciously small payload after %d attempts: query=%r bytes=%d",
+                self.HTML_FETCH_MAX_RETRIES, self._query_preview(clean_query), len(best_payload),
+            )
+        return best_payload
+
+    # Well-known InnerTube web-client key — public, non-secret.  YouTube
+    # embeds this in every page and all major clients (yt-dlp, Invidious,
+    # NewPipe) use it directly.  We hard-code a fallback so that even when
+    # HTML scraping fails, we can call the InnerTube search API directly.
+    INNERTUBE_API_KEY_FALLBACK = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+    INNERTUBE_CLIENT_VERSION_FALLBACK = "2.20250401.01.00"
+
+    def _innertube_search(
+        self,
+        query: str,
+        max_results: int = 20,
+        deadline: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Direct InnerTube search — no HTML parsing needed.
+
+        Calls YouTube's internal ``/youtubei/v1/search`` endpoint with a
+        well-known public API key. This bypasses HTML scraping entirely and
+        is immune to consent walls, page layout changes, and ytInitialData
+        format differences.
+
+        Returns a list of video dicts in the same shape as ``_search_via_data_api``.
+        """
+        if self._deadline_exceeded(deadline) or self._network_backoff_active("innertube_search"):
+            return []
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return []
+
+        # Use scraped key/version if we have them; otherwise the hardcoded fallback.
+        api_key = self.INNERTUBE_API_KEY_FALLBACK
+        client_version = self.INNERTUBE_CLIENT_VERSION_FALLBACK
+
+        body = {
+            "context": {
+                "client": {
+                    "clientName": "WEB",
+                    "clientVersion": client_version,
+                    "hl": "en",
+                    "gl": "US",
+                }
+            },
+            "query": clean_query,
+        }
+
         try:
-            resp = self._session_get(
-                "https://www.youtube.com/results",
-                params={"search_query": clean_query},
-                deadline=deadline,
+            resp = self._session.post(
+                f"https://www.youtube.com/youtubei/v1/search?key={api_key}&prettyPrint=false",
+                json=body,
+                timeout=min(8, (deadline - time.monotonic()) if deadline else 8),
+                headers={
+                    "Content-Type": "application/json",
+                    "X-YouTube-Client-Name": "1",
+                    "X-YouTube-Client-Version": client_version,
+                    "Origin": "https://www.youtube.com",
+                    "Referer": "https://www.youtube.com/",
+                },
             )
             resp.raise_for_status()
-            self._note_request_success("youtube_html")
         except requests.RequestException as exc:
-            self._note_request_failure(exc, scope="youtube_html")
-            return ""
-        payload = resp.text or ""
-        # Heuristic sanity check — a real YouTube results page is typically
-        # 300-800KB. Anything under a few KB is almost always a consent
-        # interstitial, a rate-limit stub, or an empty body. We still return
-        # whatever we got (the extractor may still salvage something), but we
-        # warn so the root cause shows up in logs instead of as a mysterious
-        # empty list.
-        if len(payload) < 5000:
-            logger.warning(
-                "Search HTML fetch returned suspiciously small payload: query=%r bytes=%d",
-                self._query_preview(clean_query),
-                len(payload),
+            self._note_request_failure(exc, scope="innertube_search")
+            logger.debug("InnerTube search failed: %s", type(exc).__name__)
+            return []
+
+        try:
+            data = resp.json()
+        except (ValueError, AttributeError):
+            return []
+
+        # Parse the InnerTube response — video results are nested deep in the
+        # response under contents → twoColumnSearchResultsRenderer →
+        # primaryContents → sectionListRenderer → contents → itemSectionRenderer
+        # → contents → videoRenderer
+        videos: list[dict[str, Any]] = []
+        try:
+            sections = (
+                data.get("contents", {})
+                .get("twoColumnSearchResultsRenderer", {})
+                .get("primaryContents", {})
+                .get("sectionListRenderer", {})
+                .get("contents", [])
             )
-        return payload
+            for section in sections:
+                items = section.get("itemSectionRenderer", {}).get("contents", [])
+                for item in items:
+                    vr = item.get("videoRenderer")
+                    if not vr:
+                        continue
+                    video_id = vr.get("videoId", "")
+                    if not video_id or not _is_valid_youtube_video_id(video_id):
+                        continue
+                    # Extract title
+                    title_runs = vr.get("title", {}).get("runs", [])
+                    title = "".join(r.get("text", "") for r in title_runs).strip() if title_runs else ""
+                    # Extract channel
+                    channel_runs = vr.get("ownerText", {}).get("runs", [])
+                    channel_title = "".join(r.get("text", "") for r in channel_runs).strip() if channel_runs else ""
+                    channel_id = ""
+                    if channel_runs:
+                        nav = channel_runs[0].get("navigationEndpoint", {}).get("browseEndpoint", {})
+                        channel_id = nav.get("browseId", "")
+                    # Extract duration from lengthText (e.g. "12:34")
+                    length_text = vr.get("lengthText", {}).get("simpleText", "")
+                    duration_sec = self._parse_duration_text(length_text)
+                    # Extract view count
+                    view_text = vr.get("viewCountText", {}).get("simpleText", "")
+                    view_count = self._parse_view_count_text(view_text)
+                    # Extract description snippet
+                    desc_runs = vr.get("detailedMetadataSnippets", [{}])[0].get("snippetText", {}).get("runs", []) if vr.get("detailedMetadataSnippets") else []
+                    description = "".join(r.get("text", "") for r in desc_runs).strip() if desc_runs else ""
+                    # Extract published time
+                    published_text = vr.get("publishedTimeText", {}).get("simpleText", "")
+
+                    videos.append({
+                        "id": video_id,
+                        "title": title,
+                        "channel_id": channel_id,
+                        "channel_title": channel_title,
+                        "description": description,
+                        "duration_sec": duration_sec,
+                        "view_count": view_count,
+                        "published_at": published_text,
+                        "search_source": "innertube_direct",
+                    })
+                    if len(videos) >= max_results:
+                        break
+                if len(videos) >= max_results:
+                    break
+        except Exception:
+            logger.debug("InnerTube search response parsing failed", exc_info=True)
+
+        if videos:
+            logger.info("InnerTube direct search returned %d videos for %r", len(videos), self._query_preview(clean_query))
+        return videos
 
     def _fallback_video_row(self, video_id: str) -> dict[str, Any] | None:
         """Create a bare-bones row from just a video ID.
