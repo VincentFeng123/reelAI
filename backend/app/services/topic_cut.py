@@ -2465,19 +2465,8 @@ def cut_video_into_topic_reels(
 
 
 def _maybe_build_openai_client() -> Any | None:
-    """Build an OpenAI client from `OPENAI_API_KEY` if possible, else None."""
-    api_key = os.environ.get("OPENAI_API_KEY") or ""
-    if not api_key:
-        return None
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return None
-    try:
-        return OpenAI(api_key=api_key, timeout=60.0)
-    except Exception:  # noqa: BLE001
-        logger.exception("could not build OpenAI client")
-        return None
+    """OpenAI integration is permanently disabled."""
+    return None
 
 
 # --------------------------------------------------------------------------- #
