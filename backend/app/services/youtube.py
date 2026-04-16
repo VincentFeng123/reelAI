@@ -3952,6 +3952,30 @@ class YouTubeService:
         extractor_version = ""
         model_version: str | None = None
 
+        # Short-circuit: if ALL transcript circuit breakers are already open,
+        # don't waste 30-60 seconds attempting doomed fetches. Return whatever
+        # we have cached (or empty). This is the #1 cause of "no reels
+        # available" on Railway — yt-dlp retries eat the entire request
+        # timeout budget.
+        all_circuits_open = (
+            self._circuit_is_open("web_caption_track")
+            and self._circuit_is_open("innertube")
+            and self._circuit_is_open("yt_dlp_subtitle")
+            and self._circuit_is_open("whisper")
+        )
+        if all_circuits_open and not fallback_transcript:
+            logger.info(
+                "All transcript circuit breakers open for %s — skipping fetch entirely",
+                video_id,
+            )
+            return []
+        if all_circuits_open and fallback_transcript:
+            logger.info(
+                "All transcript circuit breakers open for %s — using cached transcript (%d cues)",
+                video_id, len(fallback_transcript),
+            )
+            return fallback_transcript
+
         # Stage 1: youtube_transcript_api (web_caption_track)
         if not self._circuit_is_open("web_caption_track"):
             max_attempts = 3 if self._proxy_transcripts else 1
@@ -4605,11 +4629,8 @@ class YouTubeService:
     def _transcribe_with_openai_whisper(
         self, audio_path: str, video_id: str,
     ) -> list[dict[str, Any]]:
-        """Transcribe audio with OpenAI Whisper API (~$0.006/min)."""
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
-            logger.debug("No OPENAI_API_KEY, skipping OpenAI Whisper fallback")
-            return []
+        """OpenAI Whisper API is permanently disabled."""
+        return []
 
         # Whisper API limit is 25 MiB
         max_size = 24 * 1024 * 1024
