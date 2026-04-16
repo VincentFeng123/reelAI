@@ -828,10 +828,35 @@ def _llm_topic_segments(
 # --------------------------------------------------------------------------- #
 
 
-def _build_gemini_client() -> Any | None:
-    """Build a Google Gemini client from GEMINI_API_KEY if available."""
-    api_key = os.environ.get("GEMINI_API_KEY") or ""
-    if not api_key:
+def _collect_gemini_api_keys() -> list[str]:
+    """Collect all Gemini API keys from environment variables.
+
+    Reads GEMINI_API_KEY, GEMINI_API_KEY_2, GEMINI_API_KEY_3, ...
+    Returns a list of non-empty keys in order.
+    """
+    keys: list[str] = []
+    primary = os.environ.get("GEMINI_API_KEY") or ""
+    if primary:
+        keys.append(primary)
+    for i in range(2, 20):  # support up to 19 backup keys
+        k = os.environ.get(f"GEMINI_API_KEY_{i}") or ""
+        if k:
+            keys.append(k)
+    return keys
+
+
+# Track which key index to start with next (rotates on rate-limit).
+_gemini_key_offset: int = 0
+
+
+def _build_gemini_client(api_key: str | None = None) -> Any | None:
+    """Build a Google Gemini client.
+
+    If *api_key* is provided, uses that key directly. Otherwise reads
+    the primary GEMINI_API_KEY env var.
+    """
+    key = api_key or os.environ.get("GEMINI_API_KEY") or ""
+    if not key:
         return None
     try:
         import google.generativeai as genai
@@ -839,7 +864,7 @@ def _build_gemini_client() -> Any | None:
         logger.debug("google-generativeai is not installed; Gemini path disabled")
         return None
     try:
-        genai.configure(api_key=api_key)
+        genai.configure(api_key=key)
         return genai
     except Exception:
         logger.exception("could not configure Gemini client")
@@ -855,8 +880,12 @@ def _llm_topic_segments_gemini(
 ) -> list[_SegmentTuple]:
     """
     Identify topic boundaries using Google Gemini Flash (free tier).
-    Returns timestamp-based segment tuples with optional relevance scores.
+
+    Automatically rotates through all available GEMINI_API_KEY_* env vars
+    when a key hits its rate limit (HTTP 429).
     """
+    global _gemini_key_offset
+
     rendered = _render_transcript_for_llm(cues)
     system_prompt = _build_system_prompt(query=query)
     user_msg = (
@@ -865,17 +894,62 @@ def _llm_topic_segments_gemini(
         f"{rendered}"
     )
 
-    model_obj = genai_module.GenerativeModel(
-        model_name=model,
-        system_instruction=system_prompt,
-        generation_config=genai_module.GenerationConfig(
-            response_mime_type="application/json",
-            temperature=0.1,
-        ),
-    )
-    response = model_obj.generate_content(user_msg)
-    raw = response.text or "{}"
-    return _parse_llm_segments_json(raw)
+    all_keys = _collect_gemini_api_keys()
+    if not all_keys:
+        # No keys at all — use the already-configured genai_module as-is
+        all_keys = [""]
+
+    # Try each key starting from where we left off last time.
+    last_exc: Exception | None = None
+    for attempt in range(len(all_keys)):
+        idx = (_gemini_key_offset + attempt) % len(all_keys)
+        key = all_keys[idx]
+
+        # Reconfigure the module with this key (skip if empty = already configured)
+        if key:
+            try:
+                genai_module.configure(api_key=key)
+            except Exception:
+                continue
+
+        try:
+            model_obj = genai_module.GenerativeModel(
+                model_name=model,
+                system_instruction=system_prompt,
+                generation_config=genai_module.GenerationConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                ),
+            )
+            response = model_obj.generate_content(user_msg)
+            raw = response.text or "{}"
+            # Success — remember this key for next call
+            _gemini_key_offset = idx
+            return _parse_llm_segments_json(raw)
+        except Exception as exc:
+            last_exc = exc
+            exc_str = str(exc).lower()
+            is_rate_limit = (
+                "429" in exc_str
+                or "resource_exhausted" in exc_str
+                or "rate" in exc_str
+                or "quota" in exc_str
+            )
+            if is_rate_limit and len(all_keys) > 1:
+                logger.info(
+                    "Gemini key %d/%d rate-limited; rotating to next key",
+                    idx + 1, len(all_keys),
+                )
+                # Advance offset so next call starts with the next key
+                _gemini_key_offset = (idx + 1) % len(all_keys)
+                continue
+            # Non-rate-limit error — don't rotate, just raise
+            raise
+
+    # All keys exhausted
+    if last_exc is not None:
+        raise last_exc
+    return []
 
 
 # --------------------------------------------------------------------------- #
