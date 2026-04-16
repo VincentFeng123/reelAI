@@ -421,12 +421,33 @@ class ReelService:
         "calculus",
         "cell",
         "cells",
+        "current",
+        "derivatives",
+        "energy",
+        "evolution",
+        "field",
+        "force",
+        "function",
+        "gravity",
+        "group",
+        "integrals",
         "java",
         "javascript",
+        "limits",
         "loop",
         "loops",
+        "matrix",
+        "momentum",
+        "power",
         "python",
+        "relativity",
+        "resistance",
+        "revolution",
+        "ring",
+        "roots",
         "stress",
+        "vector",
+        "wave",
     }
     PROGRAMMING_TOKENS = {
         "algorithm",
@@ -2519,18 +2540,21 @@ class ReelService:
             else:
                 ranked_candidates = stage_candidates[: max(12, transcript_budget * 2)]
 
-            # Hard drop for ambiguous concepts. Runs in BOTH fast and non-fast
-            # modes. When the subject/concept contains a known homonym
-            # (e.g. "calculus", "cell", "python"), any candidate classified as
-            # entertainment_media or low_quality_compilation is almost
-            # certainly the wrong sense of the word and should be dropped
-            # outright rather than scored against a soft gate.
+            # Hard drop for entertainment/compilation content. Runs in BOTH
+            # fast and non-fast modes, for ALL concepts (not just ambiguous
+            # ones). Educational feed should never surface movie scenes,
+            # music videos, or compilation channels regardless of semantic
+            # similarity. For ambiguous concepts the drop is strict
+            # (entertainment_media + low_quality_compilation); for
+            # non-ambiguous concepts we still drop entertainment_media since
+            # movie/TV clips are never educational source material.
             concept_ambig_tokens = normalize_terms([
                 str(subject_tag or ""),
                 str(concept.get("title") or ""),
             ])
             ambiguous_concept = bool(concept_ambig_tokens & self.AMBIGUOUS_CONCEPT_TOKENS)
-            if ambiguous_concept and ranked_candidates:
+            drop_tiers = {"entertainment_media", "low_quality_compilation"} if ambiguous_concept else {"entertainment_media"}
+            if ranked_candidates:
                 pre_count = len(ranked_candidates)
                 filtered: list[dict[str, Any]] = []
                 for cand in ranked_candidates:
@@ -2539,10 +2563,10 @@ class ReelService:
                         channel=str(video_row.get("channel_title") or "").lower(),
                         title=str(video_row.get("title") or "").lower(),
                     )
-                    if tier in {"entertainment_media", "low_quality_compilation"}:
+                    if tier in drop_tiers:
                         if self.retrieval_debug_logging:
                             logger.info(
-                                "reels.loop drop_candidate concept=%s video=%s tier=%s reason=ambiguous_concept_entertainment",
+                                "reels.loop drop_candidate concept=%s video=%s tier=%s reason=entertainment_content_filter",
                                 str(concept.get("id") or ""),
                                 str(cand.get("video_id") or ""),
                                 tier,
@@ -2551,8 +2575,8 @@ class ReelService:
                     filtered.append(cand)
                 dropped = pre_count - len(filtered)
                 if dropped:
-                    retrieval_metrics["ambiguous_concept_dropped"] = int(
-                        retrieval_metrics.get("ambiguous_concept_dropped", 0)
+                    retrieval_metrics["entertainment_content_dropped"] = int(
+                        retrieval_metrics.get("entertainment_content_dropped", 0)
                     ) + dropped
                 ranked_candidates = filtered
 
@@ -11313,12 +11337,23 @@ class ReelService:
         if refined_end is None:
             refined_end = min(max_end, max(min_end, desired_end))
 
+        # When the refiner found a clean sentence boundary past max_end
+        # (within the +8s extension window), allow the normalizer to
+        # exceed max_len. This prevents _normalize_clip_window from
+        # clamping the end back to max_len and creating mid-sentence
+        # cuts that break continuation chaining.
+        sentence_extends_past_max = (
+            best_sentence_end is not None
+            and best_sentence_end > max_end
+            and refined_end == best_sentence_end
+        )
         return self._normalize_clip_window(
             refined_start,
             refined_end,
             video_duration_sec,
             min_len=min_len,
             max_len=max_len,
+            allow_exceed_max=sentence_extends_past_max,
         )
 
     def _is_sentence_end(self, text: str) -> bool:
