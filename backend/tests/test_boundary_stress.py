@@ -49,6 +49,47 @@ def _build_topic_transcript(
     return cues
 
 
+def _max_inter_cue_gap(transcript: list[dict[str, Any]]) -> float:
+    """Compute the maximum silence gap between consecutive cues in a transcript.
+
+    When consecutive windows are chained via _split_into_consecutive_windows,
+    the refiner snaps each boundary to a cue edge.  If cues have natural pauses
+    between them (real speech breathing, YouTube caption gaps), the resulting
+    window-to-window gap will be at most this value.  No content is dropped —
+    the gap is silence.
+    """
+    max_gap = 0.0
+    for i in range(len(transcript) - 1):
+        end_i = float(transcript[i]["start"]) + float(transcript[i].get("duration") or 0)
+        start_next = float(transcript[i + 1]["start"])
+        gap = start_next - end_i
+        if gap > max_gap:
+            max_gap = gap
+    return max_gap
+
+
+def _check_continuation_gaps(
+    windows: list[tuple[float, float]],
+    transcript: list[dict[str, Any]],
+    label: str,
+) -> list[str]:
+    """Verify continuation chaining: no overlap, no gap beyond inter-cue silence."""
+    failures: list[str] = []
+    max_cue_gap = _max_inter_cue_gap(transcript)
+    # Allow the natural inter-cue gap plus a small tolerance for float rounding
+    gap_tolerance = max_cue_gap + 0.05
+    for i in range(len(windows) - 1):
+        gap = windows[i + 1][0] - windows[i][1]
+        if gap < -0.01:
+            failures.append(f"{label}: overlap={abs(gap):.3f}s between win {i},{i+1}")
+        elif gap > gap_tolerance:
+            failures.append(
+                f"{label}: gap={gap:.3f}s between win {i},{i+1} "
+                f"(exceeds max inter-cue silence {max_cue_gap:.3f}s)"
+            )
+    return failures
+
+
 # 20 diverse topics with realistic educational sentences
 TOPIC_TRANSCRIPTS: dict[str, list[str]] = {
     "calculus_derivatives": [
@@ -350,6 +391,141 @@ EDGE_CASE_TRANSCRIPTS = {
         "and trailing off again",
         "One last proper sentence.",
         "the very end no period",
+    ],
+    # ---- NEW EDGE CASES ----
+    "commas_only": [
+        "first we consider the derivative, which measures change",
+        "then the integral reverses differentiation, giving us area",
+        "the chain rule handles compositions, as you know",
+        "substitution simplifies, and partial fractions help too",
+        "numerical methods approximate, when analytical fails",
+        "the mean value theorem states, for some c in the interval",
+        "L'Hopital's rule applies, when we have indeterminate forms",
+        "Taylor series expand, and converge under conditions",
+        "Fourier analysis decomposes, any periodic signal",
+        "that concludes our overview, of these techniques",
+    ],
+    "fast_speech_half_second": [
+        "Derivatives.",
+        "Rate of change.",
+        "Power rule.",
+        "Chain rule.",
+        "Product rule.",
+        "Quotient rule.",
+        "Implicit diff.",
+        "Higher order.",
+        "Applications.",
+        "Optimization.",
+        "Related rates.",
+        "Mean value.",
+        "Rolle's theorem.",
+        "L'Hopital.",
+        "Taylor series.",
+        "Convergence.",
+        "Radius.",
+        "Interval.",
+        "Summary.",
+        "Done.",
+    ],
+    "ellipses_and_questions_only": [
+        "What is a derivative...?",
+        "How does the chain rule work...?",
+        "Why do we need integrals...?",
+        "Can you explain substitution...?",
+        "What about partial fractions...?",
+        "Is there a shortcut...?",
+        "How do Taylor series converge...?",
+        "What happens at infinity...?",
+        "Why is e special...?",
+        "Does this always work...?",
+    ],
+    "long_lecture_50_sentences": [
+        "Welcome to today's lecture on differential equations.",
+        "These equations relate functions to their derivatives.",
+        "First order ODEs are the simplest case.",
+        "We can solve separable equations by dividing both sides.",
+        "The integrating factor method handles linear first order ODEs.",
+        "Exact equations require a potential function.",
+        "Existence and uniqueness theorems guarantee solutions.",
+        "Second order linear ODEs appear in many physical systems.",
+        "The characteristic equation gives us the general solution.",
+        "Complex roots lead to oscillating solutions.",
+        "Repeated roots require a special form with a t multiplier.",
+        "Variation of parameters works for nonhomogeneous equations.",
+        "Undetermined coefficients offer a faster approach sometimes.",
+        "Laplace transforms convert ODEs into algebraic equations.",
+        "The inverse transform recovers the time domain solution.",
+        "Convolution theorems simplify product transforms.",
+        "Systems of ODEs use matrix methods.",
+        "Eigenvalues determine the behavior of linear systems.",
+        "Phase portraits visualize two dimensional systems.",
+        "Stability analysis classifies equilibrium points.",
+        "Nonlinear systems require different techniques.",
+        "Linearization approximates near equilibria.",
+        "Lyapunov functions prove stability without solving.",
+        "Bifurcation theory studies parameter changes.",
+        "Limit cycles are isolated periodic orbits.",
+        "The Poincare Bendixson theorem restricts planar behavior.",
+        "Chaos arises in some nonlinear systems.",
+        "The Lorenz system is a famous chaotic example.",
+        "Sensitivity to initial conditions defines chaos.",
+        "Strange attractors have fractal dimension.",
+        "Numerical methods approximate solutions computationally.",
+        "Euler's method is the simplest numerical scheme.",
+        "Runge Kutta methods achieve higher accuracy.",
+        "Adaptive step sizing improves efficiency.",
+        "Stiff equations need implicit methods.",
+        "Boundary value problems differ from initial value problems.",
+        "Shooting methods convert BVPs to IVPs.",
+        "Finite difference methods discretize the domain.",
+        "Partial differential equations involve multiple variables.",
+        "The heat equation models diffusion.",
+        "The wave equation describes vibrations.",
+        "Laplace's equation appears in steady state problems.",
+        "Separation of variables is a key PDE technique.",
+        "Fourier series expand periodic functions.",
+        "Green's functions solve inhomogeneous problems.",
+        "Variational methods minimize functionals.",
+        "The finite element method handles complex geometries.",
+        "Numerical PDE methods are essential in engineering.",
+        "Applications range from fluid dynamics to quantum mechanics.",
+        "That concludes our comprehensive survey of differential equations.",
+    ],
+    "exact_cue_edge_boundaries": [
+        "This sentence ends exactly at the cue boundary.",
+        "And this one starts exactly at the next cue.",
+        "The transition is perfectly seamless.",
+        "No gap exists between these cues.",
+        "Each boundary is mathematically precise.",
+        "The timestamps align to floating point.",
+        "This tests the edge condition thoroughly.",
+        "Rounding errors could cause problems.",
+        "But the algorithm should handle it.",
+        "Final sentence at the exact edge.",
+    ],
+    "unicode_and_special_chars": [
+        "The Schrodinger equation describes quantum states.",
+        "Euler's identity says e to the i pi plus one equals zero!",
+        "The Navier-Stokes equations are millennium problems.",
+        "Godel's incompleteness theorems shook mathematics.",
+        "Riemann's zeta function connects primes to analysis.",
+        "Poincare's conjecture was proved by Perelman.",
+        "Noether's theorem links symmetry to conservation laws.",
+        "Cantor's diagonal argument proves uncountability.",
+        "Hilbert's problems guided twentieth century math.",
+        "Ramanujan's formulas still inspire research today.",
+    ],
+    "rapid_topic_switches": [
+        "Now let's talk about derivatives.",
+        "Actually let me switch to integrals instead!",
+        "Wait no let's cover linear algebra first.",
+        "On second thought probability is more important.",
+        "Or maybe we should start with set theory?",
+        "Okay let's just go back to derivatives.",
+        "The power rule says the derivative of x squared is two x.",
+        "Moving on to applications of derivatives.",
+        "Related rates problems use the chain rule.",
+        "And that wraps up our whirlwind tour.",
     ],
 }
 
@@ -826,6 +1002,656 @@ class BoundaryStressTests(unittest.TestCase):
             if result["window"] is not None:
                 self.stats["total_reels"] += 1  # already counted in helper
         self.assertTrue(True)  # no crash is the test
+
+    # =================== NEW EDGE CASES: commas-only, fast speech, etc. =================== #
+
+    def test_edge_commas_only_no_periods(self) -> None:
+        """Transcripts with ONLY commas (no terminal punctuation at all).
+        Should fall back to pause-based boundaries."""
+        transcript = _build_topic_transcript(
+            EDGE_CASE_TRANSCRIPTS["commas_only"],
+            cue_duration=3.0,
+            gap=0.7,  # pauses between cues for boundary detection
+        )
+        total_dur = int(len(EDGE_CASE_TRANSCRIPTS["commas_only"]) * 3.7)
+        # Single reel
+        win = self.rs._refine_clip_window_from_transcript(
+            transcript=transcript,
+            proposed_start=0.0,
+            proposed_end=20.0,
+            video_duration_sec=total_dur + 10,
+            min_len=15,
+            max_len=25,
+        )
+        self.assertIsNotNone(win, "Commas-only transcript must produce a window")
+        self.stats["total_reels"] += 1
+
+        # Split test — force multi-window
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=transcript,
+            segment_start=0.0,
+            segment_end=float(total_dur),
+            video_duration_sec=total_dur + 10,
+            min_len=8,
+            max_len=15,
+        )
+        self.assertGreater(len(windows), 0, "Commas-only must produce at least one window")
+        # Check continuation chaining (tolerance for inter-cue silence gaps)
+        failures = _check_continuation_gaps(windows, transcript, "commas_only")
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_edge_fast_speech_half_second_cues(self) -> None:
+        """Very fast speech with 0.5s cue durations (20 cues = 10s total)."""
+        transcript = _build_topic_transcript(
+            EDGE_CASE_TRANSCRIPTS["fast_speech_half_second"],
+            cue_duration=0.5,
+        )
+        total_dur = len(EDGE_CASE_TRANSCRIPTS["fast_speech_half_second"]) * 0.5  # 10s
+        failures = []
+
+        # Single reel with relaxed min
+        win = self.rs._refine_clip_window_from_transcript(
+            transcript=transcript,
+            proposed_start=0.0,
+            proposed_end=total_dur,
+            video_duration_sec=int(total_dur) + 10,
+            min_len=3,
+            max_len=12,
+        )
+        self.assertIsNotNone(win, "Fast speech must produce a window")
+        if win:
+            self.stats["total_reels"] += 1
+            end_type = self._check_end_boundary(transcript, win[1], "fast_speech")
+            if end_type == "mid":
+                failures.append(f"fast_speech single: end mid-sentence (t_end={win[1]})")
+
+        # Multi-reel split
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=transcript,
+            segment_start=0.0,
+            segment_end=total_dur,
+            video_duration_sec=int(total_dur) + 10,
+            min_len=2,
+            max_len=4,
+        )
+        failures.extend(_check_continuation_gaps(windows, transcript, "fast_speech split"))
+        for j, (ws, we) in enumerate(windows):
+            self.stats["total_reels"] += 1
+            start_ok = self._check_start_boundary(transcript, ws, "fast_speech")
+            if not start_ok:
+                failures.append(f"fast_speech win[{j}]: start NOT on sentence (t_start={ws})")
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_edge_ellipses_and_questions_only(self) -> None:
+        """Transcripts with only ellipses and question marks — all valid terminal punct."""
+        failures = []
+        transcript = _build_topic_transcript(
+            EDGE_CASE_TRANSCRIPTS["ellipses_and_questions_only"],
+            cue_duration=3.0,
+        )
+        total_dur = int(len(EDGE_CASE_TRANSCRIPTS["ellipses_and_questions_only"]) * 3)
+
+        # Multiple start positions
+        for start in [0.0, 3.0, 6.0, 9.0, 12.0]:
+            if start >= total_dur - 12:
+                continue
+            win = self.rs._refine_clip_window_from_transcript(
+                transcript=transcript,
+                proposed_start=start,
+                proposed_end=start + 18.0,
+                video_duration_sec=total_dur + 10,
+                min_len=12,
+                max_len=20,
+            )
+            if win is None:
+                continue
+            self.stats["total_reels"] += 1
+            end_type = self._check_end_boundary(transcript, win[1], "ellipses_questions")
+            if end_type == "mid":
+                failures.append(f"ellipses_questions@{start}: end mid-sentence (t_end={win[1]})")
+            start_ok = self._check_start_boundary(transcript, win[0], "ellipses_questions")
+            if not start_ok:
+                failures.append(f"ellipses_questions@{start}: start NOT on sentence (t_start={win[0]})")
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_edge_long_lecture_50_sentences(self) -> None:
+        """50+ sentence lecture — tests sustained splitting and continuation chaining."""
+        sentences = EDGE_CASE_TRANSCRIPTS["long_lecture_50_sentences"]
+        transcript = _build_topic_transcript(sentences, cue_duration=3.0)
+        total_dur = len(sentences) * 3  # 150s
+
+        failures = []
+
+        # Single reel extraction from middle
+        for start_offset in [0.0, 30.0, 60.0, 90.0, 120.0]:
+            if start_offset >= total_dur - 20:
+                continue
+            result = self._run_refine_and_check(
+                topic=f"long_lecture@{start_offset}",
+                transcript=transcript,
+                proposed_start=start_offset,
+                proposed_end=start_offset + 40.0,
+                video_duration=total_dur + 10,
+                min_len=20,
+                max_len=55,
+            )
+            if result["window"] is not None:
+                if not result["start_ok"]:
+                    failures.append(f"long_lecture@{start_offset}: start NOT on sentence")
+                if result["end_type"] == "mid":
+                    failures.append(f"long_lecture@{start_offset}: end mid-sentence")
+
+        # Force max splits: entire 150s with max_len=25 should produce 5+ windows
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=transcript,
+            segment_start=0.0,
+            segment_end=float(total_dur),
+            video_duration_sec=total_dur + 10,
+            min_len=15,
+            max_len=25,
+        )
+        self.assertGreaterEqual(len(windows), 3, f"Expected 3+ windows for 150s lecture, got {len(windows)}")
+
+        # Verify continuation chaining
+        for i in range(len(windows) - 1):
+            gap = windows[i + 1][0] - windows[i][1]
+            if gap > 0.01:
+                failures.append(f"long_lecture split: gap={gap:.3f}s between win {i} and {i+1}")
+                self.stats["continuation_has_gap"] += 1
+            elif gap < -0.01:
+                failures.append(f"long_lecture split: overlap={abs(gap):.3f}s between win {i} and {i+1}")
+                self.stats["continuation_has_overlap"] += 1
+            else:
+                self.stats["continuation_zero_gap"] += 1
+
+        # Verify boundary quality for each window
+        for j, (ws, we) in enumerate(windows):
+            self.stats["total_reels"] += 1
+            start_ok = self._check_start_boundary(transcript, ws, "long_lecture")
+            end_type = self._check_end_boundary(transcript, we, "long_lecture")
+            if start_ok:
+                self.stats["start_on_sentence"] += 1
+            else:
+                self.stats["start_not_on_sentence"] += 1
+                failures.append(f"long_lecture win[{j}]: start NOT on sentence (t_start={ws})")
+            if end_type == "sentence":
+                self.stats["end_on_sentence"] += 1
+            elif end_type == "fallback":
+                self.stats["end_on_fallback"] += 1
+            else:
+                self.stats["end_mid_sentence"] += 1
+                if j < len(windows) - 1:
+                    failures.append(f"long_lecture win[{j}]: end mid-sentence (t_end={we})")
+
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_edge_exact_cue_boundaries(self) -> None:
+        """Segment boundaries at exact cue edges — tests floating point alignment."""
+        transcript = _build_topic_transcript(
+            EDGE_CASE_TRANSCRIPTS["exact_cue_edge_boundaries"],
+            cue_duration=3.0,
+            gap=0.0,  # zero gap = exact edges
+        )
+        total_dur = len(EDGE_CASE_TRANSCRIPTS["exact_cue_edge_boundaries"]) * 3
+        failures = []
+
+        # Start at exact cue boundaries
+        for cue_idx in range(0, min(7, len(EDGE_CASE_TRANSCRIPTS["exact_cue_edge_boundaries"]))):
+            exact_start = float(cue_idx * 3)
+            if exact_start >= total_dur - 15:
+                continue
+            win = self.rs._refine_clip_window_from_transcript(
+                transcript=transcript,
+                proposed_start=exact_start,
+                proposed_end=exact_start + 18.0,
+                video_duration_sec=total_dur + 10,
+                min_len=12,
+                max_len=20,
+            )
+            if win is None:
+                continue
+            self.stats["total_reels"] += 1
+            start_ok = self._check_start_boundary(transcript, win[0], f"exact_edge@{cue_idx}")
+            end_type = self._check_end_boundary(transcript, win[1], f"exact_edge@{cue_idx}")
+            if not start_ok:
+                failures.append(f"exact_edge@cue{cue_idx}: start NOT on sentence (t_start={win[0]})")
+            if end_type == "mid":
+                failures.append(f"exact_edge@cue{cue_idx}: end mid-sentence (t_end={win[1]})")
+
+        # Test with proposed_end at exact cue end
+        for cue_idx in [3, 5, 7, 9]:
+            exact_end = float(cue_idx * 3)
+            if exact_end > total_dur or exact_end < 15:
+                continue
+            win = self.rs._refine_clip_window_from_transcript(
+                transcript=transcript,
+                proposed_start=0.0,
+                proposed_end=exact_end,
+                video_duration_sec=total_dur + 10,
+                min_len=12,
+                max_len=int(exact_end) + 5,
+            )
+            if win is not None:
+                self.stats["total_reels"] += 1
+                end_type = self._check_end_boundary(transcript, win[1], f"exact_edge_end@{cue_idx}")
+                if end_type == "mid":
+                    failures.append(f"exact_edge_end@cue{cue_idx}: end mid-sentence (t_end={win[1]})")
+
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_edge_unicode_special_chars(self) -> None:
+        """Transcripts with names containing special characters and apostrophes."""
+        failures = []
+        transcript = _build_topic_transcript(
+            EDGE_CASE_TRANSCRIPTS["unicode_and_special_chars"],
+            cue_duration=3.5,
+        )
+        total_dur = int(len(EDGE_CASE_TRANSCRIPTS["unicode_and_special_chars"]) * 3.5)
+        for start in [0.0, 7.0, 14.0]:
+            if start >= total_dur - 15:
+                continue
+            result = self._run_refine_and_check(
+                topic=f"unicode@{start}",
+                transcript=transcript,
+                proposed_start=start,
+                proposed_end=start + 20.0,
+                video_duration=total_dur + 10,
+                min_len=12,
+                max_len=25,
+            )
+            if result["window"] is not None:
+                if not result["start_ok"]:
+                    failures.append(f"unicode@{start}: start NOT on sentence")
+                if result["end_type"] == "mid":
+                    failures.append(f"unicode@{start}: end mid-sentence")
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_edge_rapid_topic_switches(self) -> None:
+        """Transcript with rapid topic changes — boundary quality should hold."""
+        failures = []
+        transcript = _build_topic_transcript(
+            EDGE_CASE_TRANSCRIPTS["rapid_topic_switches"],
+            cue_duration=3.0,
+        )
+        total_dur = int(len(EDGE_CASE_TRANSCRIPTS["rapid_topic_switches"]) * 3)
+        # Multiple window sizes
+        for max_len in [12, 18, 25]:
+            windows = self.rs._split_into_consecutive_windows(
+                transcript=transcript,
+                segment_start=0.0,
+                segment_end=float(total_dur),
+                video_duration_sec=total_dur + 10,
+                min_len=8,
+                max_len=max_len,
+            )
+            for i in range(len(windows) - 1):
+                gap = windows[i + 1][0] - windows[i][1]
+                if gap > 0.01:
+                    failures.append(f"rapid_switch max={max_len}: gap={gap:.3f}s between win {i},{i+1}")
+                elif gap < -0.01:
+                    failures.append(f"rapid_switch max={max_len}: overlap={abs(gap):.3f}s between win {i},{i+1}")
+            for j, (ws, we) in enumerate(windows):
+                self.stats["total_reels"] += 1
+                start_ok = self._check_start_boundary(transcript, ws, "rapid_switch")
+                end_type = self._check_end_boundary(transcript, we, "rapid_switch")
+                if not start_ok:
+                    failures.append(f"rapid_switch max={max_len} win[{j}]: start NOT on sentence")
+                if end_type == "mid" and j < len(windows) - 1:
+                    failures.append(f"rapid_switch max={max_len} win[{j}]: end mid-sentence")
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    # =================== Realistic YouTube transcript simulations =================== #
+
+    def test_realistic_khan_academy_style_transcript(self) -> None:
+        """Simulate a Khan Academy style narration — short clear sentences, steady pace."""
+        sentences = [
+            "Let's think about what it means to multiply two by three.",
+            "We can think of this as two groups of three.",
+            "Or we can think of it as three groups of two.",
+            "Either way we get six.",
+            "Now what about two times three point five?",
+            "Well that's two groups of three point five.",
+            "Three point five plus three point five equals seven.",
+            "So two times three point five is seven.",
+            "What if we multiplied by a fraction?",
+            "Say two times one half.",
+            "That gives us one whole.",
+            "Because half of two is one.",
+            "Fractions can be tricky but they follow the same rules.",
+            "Let's try a harder example.",
+            "What is three fourths times two thirds?",
+            "We multiply the numerators three times two is six.",
+            "We multiply the denominators four times three is twelve.",
+            "So we get six twelfths which simplifies to one half.",
+            "Always remember to simplify your fractions.",
+            "That's the key takeaway from today's lesson.",
+        ]
+        transcript = _build_topic_transcript(sentences, cue_duration=2.5, gap=0.3)
+        total_dur = int(len(sentences) * 2.8)
+        failures = []
+
+        # Full coverage split
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=transcript,
+            segment_start=0.0,
+            segment_end=float(total_dur),
+            video_duration_sec=total_dur + 10,
+            min_len=12,
+            max_len=20,
+        )
+        self.assertGreater(len(windows), 1, "Khan style should split into multiple reels")
+
+        failures.extend(_check_continuation_gaps(windows, transcript, "khan split"))
+
+        for j, (ws, we) in enumerate(windows):
+            self.stats["total_reels"] += 1
+            start_ok = self._check_start_boundary(transcript, ws, "khan")
+            end_type = self._check_end_boundary(transcript, we, "khan")
+            if not start_ok:
+                failures.append(f"khan win[{j}]: start NOT on sentence (t_start={ws})")
+            if end_type == "mid" and j < len(windows) - 1:
+                failures.append(f"khan win[{j}]: end mid-sentence (t_end={we})")
+            if start_ok:
+                self.stats["start_on_sentence"] += 1
+            else:
+                self.stats["start_not_on_sentence"] += 1
+            if end_type == "sentence":
+                self.stats["end_on_sentence"] += 1
+            elif end_type == "fallback":
+                self.stats["end_on_fallback"] += 1
+            else:
+                self.stats["end_mid_sentence"] += 1
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_realistic_veritasium_style_long_sentences(self) -> None:
+        """Simulate Veritasium style — longer, more complex sentences with varied pacing."""
+        sentences = [
+            "I want to show you something that will change how you think about magnets.",
+            "Most people think magnets work because of some mysterious force.",
+            "But the truth is much more interesting and much more fundamental.",
+            "It all comes down to the spin of electrons inside the material.",
+            "Now electrons are quantum particles and they have a property called spin.",
+            "Spin is not actually the electron spinning like a top.",
+            "It's a quantum mechanical property that has no classical analogue.",
+            "But it does give each electron a tiny magnetic moment.",
+            "In most materials these magnetic moments point in random directions and cancel out.",
+            "But in ferromagnetic materials something special happens.",
+            "The exchange interaction aligns neighboring spins in the same direction.",
+            "This creates domains where billions of atoms all point the same way.",
+            "When you magnetize a piece of iron you're aligning these domains.",
+            "That's why hitting a magnet can demagnetize it.",
+            "You're randomizing the domain structure through mechanical vibration.",
+            "Temperature also plays a role because thermal energy fights alignment.",
+            "Above the Curie temperature a ferromagnet becomes paramagnetic.",
+            "This is a phase transition just like ice melting into water.",
+            "The practical applications of magnetism are enormous.",
+            "From MRI machines to electric motors to computer hard drives.",
+            "Every time you use a credit card you're relying on magnetic storage.",
+            "And the fundamental physics behind all of it is quantum mechanics.",
+        ]
+        transcript = _build_topic_transcript(sentences, cue_duration=4.0, gap=0.5)
+        total_dur = int(len(sentences) * 4.5)
+        failures = []
+
+        # Force continuation splitting
+        for max_len in [20, 30, 40]:
+            windows = self.rs._split_into_consecutive_windows(
+                transcript=transcript,
+                segment_start=0.0,
+                segment_end=float(total_dur),
+                video_duration_sec=total_dur + 10,
+                min_len=15,
+                max_len=max_len,
+            )
+            failures.extend(_check_continuation_gaps(
+                windows, transcript, f"veritasium max={max_len}",
+            ))
+
+            for j, (ws, we) in enumerate(windows):
+                self.stats["total_reels"] += 1
+                start_ok = self._check_start_boundary(transcript, ws, "veritasium")
+                end_type = self._check_end_boundary(transcript, we, "veritasium")
+                if not start_ok:
+                    failures.append(f"veritasium max={max_len} win[{j}]: start NOT on sentence")
+                if end_type == "mid" and j < len(windows) - 1:
+                    failures.append(f"veritasium max={max_len} win[{j}]: end mid-sentence")
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_realistic_3b1b_style_unpunctuated_autocaptions(self) -> None:
+        """Simulate YouTube auto-captions (no punctuation, lowercase) like many 3B1B auto-gen."""
+        sentences = [
+            "so the question is what does the area of a circle have to do with calculus",
+            "well one way to think about it is to unroll all of those concentric rings",
+            "into thin rectangles and then line them up along an axis",
+            "the base of each rectangle corresponds to the circumference of the ring",
+            "which is two pi times the radius at that point",
+            "the height is just some small value dr",
+            "so the area of each thin rectangle is approximately two pi r times dr",
+            "and if we add up all of these rectangles from r equals zero to the full radius",
+            "we get the total area which should equal pi r squared",
+            "but notice what we just did we added up a bunch of thin rectangles",
+            "and that my friends is exactly what an integral does",
+            "the integral of two pi r from zero to big r equals pi r squared",
+            "so the formula for the area of a circle comes directly from calculus",
+            "now you might wonder why we bother with this formal machinery",
+            "the reason is that integrals let us handle much more complex shapes",
+            "this same idea of slicing and summing works for volumes and surfaces too",
+        ]
+        transcript = _build_topic_transcript(sentences, cue_duration=3.5, gap=0.8)
+        total_dur = int(len(sentences) * 4.3)
+        failures = []
+
+        # Should detect as unpunctuated and use pause-based boundaries
+        is_punct = self.rs._transcript_has_terminal_punct(
+            [{"start": c["start"], "end": c["start"] + c["duration"], "text": c["text"]}
+             for c in transcript]
+        )
+        self.assertFalse(is_punct, "Auto-caption transcript should be detected as unpunctuated")
+
+        # Single reel
+        win = self.rs._refine_clip_window_from_transcript(
+            transcript=transcript,
+            proposed_start=0.0,
+            proposed_end=25.0,
+            video_duration_sec=total_dur + 10,
+            min_len=15,
+            max_len=30,
+        )
+        self.assertIsNotNone(win, "Must produce a window for unpunctuated auto-captions")
+        if win:
+            self.stats["total_reels"] += 1
+
+        # Multi-reel split
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=transcript,
+            segment_start=0.0,
+            segment_end=float(total_dur),
+            video_duration_sec=total_dur + 10,
+            min_len=12,
+            max_len=20,
+        )
+        self.assertGreater(len(windows), 1, "Unpunctuated 68s transcript should split")
+
+        failures.extend(_check_continuation_gaps(windows, transcript, "3b1b_auto split"))
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_realistic_search_user_flow_calculus(self) -> None:
+        """Simulate a real user searching 'calculus' — test the full refine+split pipeline
+        across a realistic transcript that mimics actual YouTube content discovery."""
+        # This simulates what happens when a user searches "calculus" and we find
+        # a 300s educational video. The transcript has natural sentence structure
+        # with realistic timing and pacing.
+        intro = [
+            "Welcome back everyone.",
+            "Today we're going to explore one of the most beautiful ideas in all of mathematics.",
+            "The fundamental theorem of calculus connects two seemingly different concepts.",
+            "On one hand we have derivatives which measure instantaneous rates of change.",
+            "On the other hand we have integrals which compute accumulated quantities.",
+            "The theorem says these two operations are inverses of each other.",
+            "That's an incredibly powerful statement.",
+            "Let me show you what I mean with a concrete example.",
+        ]
+        body = [
+            "Consider a car driving along a highway.",
+            "We know its velocity at every moment in time.",
+            "The velocity function v of t tells us how fast the car is going.",
+            "If we want to know the total distance traveled we need to integrate.",
+            "The integral of velocity gives us displacement.",
+            "But here's the beautiful part.",
+            "If we take the derivative of displacement we get back the velocity!",
+            "That's the fundamental theorem in action.",
+            "Now let's be more precise about what the theorem actually says.",
+            "If F is an antiderivative of f then the definite integral from a to b equals F of b minus F of a.",
+            "This is sometimes called the evaluation theorem.",
+            "It transforms a potentially difficult limit of Riemann sums into a simple subtraction.",
+            "Let's work through an example step by step.",
+            "Suppose we want to compute the integral of x squared from zero to three.",
+            "An antiderivative of x squared is x cubed over three.",
+            "So we evaluate at the bounds and get twenty seven over three minus zero which is nine.",
+            "Compare that to computing the integral from the definition using Riemann sums.",
+            "You'd need to compute a limit of increasingly fine partitions.",
+            "The fundamental theorem saves us all that work.",
+            "This is why it's called fundamental.",
+        ]
+        outro = [
+            "So to summarize what we learned today.",
+            "The fundamental theorem of calculus has two parts.",
+            "Part one says the derivative of an integral recovers the original function.",
+            "Part two gives us a practical way to evaluate definite integrals.",
+            "Together they unify differential and integral calculus.",
+            "In the next video we'll see applications to physics and engineering.",
+            "Thanks for watching and I'll see you next time.",
+        ]
+        all_sentences = intro + body + outro
+        transcript = _build_topic_transcript(all_sentences, cue_duration=3.0, gap=0.2)
+        total_dur = int(len(all_sentences) * 3.2)
+        failures = []
+
+        # === Phase 1: Topic-aligned single reels from different segments ===
+        test_segments = [
+            (0.0, 24.0, 15, 30, "intro"),
+            (25.0, 60.0, 20, 45, "early_body"),
+            (60.0, 95.0, 20, 45, "mid_body"),
+            (95.0, 115.0, 15, 30, "outro"),
+        ]
+        for seg_start, seg_end, mn, mx, label in test_segments:
+            if seg_end > total_dur:
+                seg_end = float(total_dur)
+            result = self._run_refine_and_check(
+                topic=f"search_calc_{label}",
+                transcript=transcript,
+                proposed_start=seg_start,
+                proposed_end=seg_end,
+                video_duration=total_dur + 10,
+                min_len=mn,
+                max_len=mx,
+            )
+            if result["window"] is not None:
+                if not result["start_ok"]:
+                    failures.append(f"search_calc_{label}: start NOT on sentence")
+                if result["end_type"] == "mid":
+                    failures.append(f"search_calc_{label}: end mid-sentence (t_end={result['window'][1]})")
+
+        # === Phase 2: Full video split — simulate max coverage ===
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=transcript,
+            segment_start=0.0,
+            segment_end=float(total_dur),
+            video_duration_sec=total_dur + 10,
+            min_len=20,
+            max_len=40,
+        )
+        self.assertGreater(len(windows), 2, f"Expected 3+ reels for {total_dur}s video")
+
+        # Verify continuation invariants (allow inter-cue silence gaps)
+        max_cue_gap = _max_inter_cue_gap(transcript)
+        gap_tol = max_cue_gap + 0.05
+        for i in range(len(windows) - 1):
+            gap = windows[i + 1][0] - windows[i][1]
+            if gap < -0.01:
+                failures.append(f"search_calc full: overlap={abs(gap):.3f}s between win {i},{i+1}")
+                self.stats["continuation_has_overlap"] += 1
+            elif gap > gap_tol:
+                failures.append(f"search_calc full: gap={gap:.3f}s between win {i},{i+1} (exceeds cue gap)")
+                self.stats["continuation_has_gap"] += 1
+            else:
+                self.stats["continuation_zero_gap"] += 1
+
+        # Verify every window boundary
+        for j, (ws, we) in enumerate(windows):
+            self.stats["total_reels"] += 1
+            start_ok = self._check_start_boundary(transcript, ws, "search_calc_full")
+            end_type = self._check_end_boundary(transcript, we, "search_calc_full")
+            if start_ok:
+                self.stats["start_on_sentence"] += 1
+            else:
+                self.stats["start_not_on_sentence"] += 1
+                failures.append(f"search_calc_full win[{j}]: start NOT on sentence (t_start={ws})")
+            if end_type == "sentence":
+                self.stats["end_on_sentence"] += 1
+            elif end_type == "fallback":
+                self.stats["end_on_fallback"] += 1
+            else:
+                self.stats["end_mid_sentence"] += 1
+                if j < len(windows) - 1:
+                    failures.append(f"search_calc_full win[{j}]: end mid-sentence (t_end={we})")
+
+        # === Phase 3: Duration bounds check ===
+        for j, (ws, we) in enumerate(windows):
+            dur = we - ws
+            # Allow up to 8s past max_len for sentence extension
+            self.assertGreaterEqual(dur, 19.0, f"win[{j}] too short: {dur:.1f}s")
+            self.assertLessEqual(dur, 48.0, f"win[{j}] too long: {dur:.1f}s (max_len=40 + 8s extension)")
+
+        self.assertEqual(failures, [], "\n".join(failures))
+
+    def test_realistic_mixed_punctuation_density(self) -> None:
+        """Simulate a transcript where punctuation density varies within the same video.
+        Some sections well-punctuated, some sections auto-caption style."""
+        well_punctuated = [
+            "The periodic table organizes all known elements.",
+            "Each element has a unique atomic number.",
+            "Hydrogen is the simplest element with just one proton.",
+            "Helium is a noble gas that does not react easily.",
+            "Carbon forms the basis of organic chemistry.",
+            "The arrangement reveals patterns in chemical properties.",
+        ]
+        auto_caption = [
+            "so next we look at the transition metals",
+            "they include iron copper and zinc",
+            "these metals can form multiple oxidation states",
+            "which makes their chemistry really interesting",
+            "for example iron can be two plus or three plus",
+            "copper appears as one plus or two plus",
+        ]
+        back_to_punctuated = [
+            "To summarize, the periodic table is a powerful tool.",
+            "It predicts chemical behavior from atomic structure.",
+            "Understanding it is essential for all of chemistry.",
+            "That concludes our overview of the periodic table.",
+        ]
+        all_sentences = well_punctuated + auto_caption + back_to_punctuated
+        transcript = _build_topic_transcript(all_sentences, cue_duration=3.0, gap=0.6)
+        total_dur = int(len(all_sentences) * 3.6)
+        failures = []
+
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=transcript,
+            segment_start=0.0,
+            segment_end=float(total_dur),
+            video_duration_sec=total_dur + 10,
+            min_len=12,
+            max_len=22,
+        )
+
+        failures.extend(_check_continuation_gaps(windows, transcript, "mixed_density"))
+
+        for j, (ws, we) in enumerate(windows):
+            self.stats["total_reels"] += 1
+            start_ok = self._check_start_boundary(transcript, ws, "mixed_density")
+            if not start_ok:
+                failures.append(f"mixed_density win[{j}]: start NOT on sentence (t_start={ws})")
+        self.assertEqual(failures, [], "\n".join(failures))
 
     # =================== Report =================== #
 

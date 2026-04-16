@@ -160,14 +160,24 @@ class SentenceEndInvariantTests(unittest.TestCase):
         self.assertEqual(win[1], 12.0)  # cue 3 ends at 12.0 with "."
 
     def test_strict_mode_returns_none_when_no_sentence_end_in_range(self) -> None:
+        # For PUNCTUATED transcripts (>= 15% terminal punct), strict mode
+        # returns None when no sentence end exists in range. Build a
+        # transcript that IS detected as punctuated but has an unpunctuated
+        # window — only then should strict mode return None.
         cues = _sentence_cues([
-            (0.0, "No punct here"),
-            (3.0, "None here either"),
-            (6.0, "Still no punct"),
-            (9.0, "None"),
+            (0.0, "First sentence ends here."),
+            (3.0, "Second sentence also ends."),
+            # Punctuated prefix → detected as punctuated transcript
+            (6.0, "No punct here"),
+            (9.0, "None here either"),
+            (12.0, "Still no punct"),
+            (15.0, "None"),
         ])
+        # Restrict to the unpunctuated window [6, 18] — strict mode
+        # should fail because the transcript is punctuated overall but
+        # this sub-range has no terminal punct.
         result = self.rs._refine_clip_window_from_transcript(
-            transcript=cues, proposed_start=0.0, proposed_end=9.0,
+            transcript=cues, proposed_start=6.0, proposed_end=15.0,
             video_duration_sec=60, min_len=6, max_len=12, require_sentence_end=True,
         )
         self.assertIsNone(result)

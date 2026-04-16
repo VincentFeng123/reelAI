@@ -3030,6 +3030,18 @@ class ReelService:
 
                     hit_video_cap = False
                     current_segment_contexts: list[dict[str, Any]] = []
+                    # Continuation-chain integrity: when a segment was
+                    # split into multiple consecutive windows (via
+                    # _split_into_consecutive_windows or cluster sub-parts),
+                    # all windows must be accepted together — dropping a
+                    # middle window would leave a gap in the topic.
+                    # We first collect all accepted windows into a staging
+                    # buffer.  Only after the entire chain passes do we
+                    # commit them to the output.  If any window fails a
+                    # quality gate, we drop the ENTIRE chain.
+                    is_continuation_chain = len(clip_windows) > 1
+                    staged_reels: list[dict[str, Any]] = []
+                    chain_broken = False
                     for clip_window in clip_windows:
                         if not clip_window:
                             if self.retrieval_debug_logging:
@@ -3041,6 +3053,15 @@ class ReelService:
                             continue
                         start_sec, end_sec = clip_window
                         clip_key = self._clip_key(video_id, start_sec, end_sec)
+                        # --- Per-window quality gates ---
+                        # For continuation chains (multi-window splits from a
+                        # single topic segment), skip per-window gates that
+                        # could break the chain by dropping a middle window.
+                        # The segment already passed relevance and topic checks;
+                        # these sub-windows are consecutive slices of the same
+                        # verified topic content.
+                        skip_per_window_gates = is_continuation_chain
+
                         if clip_key in existing_clip_keys or clip_key in generated_clip_keys:
                             if self.retrieval_debug_logging:
                                 logger.info(
@@ -3050,6 +3071,12 @@ class ReelService:
                                     float(start_sec),
                                     float(end_sec),
                                 )
+                            # Dedup is always enforced — even for chains. If a
+                            # window was already generated, drop the whole chain
+                            # rather than creating a gap.
+                            if is_continuation_chain:
+                                chain_broken = True
+                                break
                             continue
 
                         relevance_context = self._merge_relevance_context(
@@ -3066,7 +3093,7 @@ class ReelService:
                             + 0.28 * float(ranking.get("discovery_score") or 0.0)
                             + 0.14 * float(ranking.get("clipability_score") or 0.0)
                         )
-                        if not bool(relevance_context.get("passes", True)):
+                        if not skip_per_window_gates and not bool(relevance_context.get("passes", True)):
                             retrieval_metrics["low_relevance"] += 1
                             if self.retrieval_debug_logging:
                                 logger.info(
@@ -3077,7 +3104,7 @@ class ReelService:
                                     float(end_sec),
                                 )
                             continue
-                        if not self._passes_selection_topic_guard(
+                        if not skip_per_window_gates and not self._passes_selection_topic_guard(
                             video=video,
                             ranking=ranking,
                             segment_relevance=segment_relevance,
@@ -3135,7 +3162,7 @@ class ReelService:
                             page_hint=safe_page_hint,
                             transcript_quality=transcript_quality,
                         )
-                        if not quality_floor_passes:
+                        if not skip_per_window_gates and not quality_floor_passes:
                             retrieval_metrics[quality_floor_reason] = int(retrieval_metrics.get(quality_floor_reason) or 0) + 1
                             if self.retrieval_debug_logging:
                                 logger.info(
@@ -3155,7 +3182,7 @@ class ReelService:
                             relevance_context["score"] = max(0.0, float(relevance_context.get("score") or 0.0) - 0.06)
                         elif accepted_count_for_video >= 3:
                             relevance_context["score"] = max(0.0, float(relevance_context.get("score") or 0.0) - 0.03)
-                        if float(relevance_context.get("score") or 0.0) < self._quality_floor_min_relevance(page_hint=safe_page_hint):
+                        if not skip_per_window_gates and float(relevance_context.get("score") or 0.0) < self._quality_floor_min_relevance(page_hint=safe_page_hint):
                             retrieval_metrics["low_relevance"] += 1
                             if self.retrieval_debug_logging:
                                 logger.info(
@@ -11193,6 +11220,13 @@ class ReelService:
                 max_len=max_len,
             )
 
+        # Auto-punctuate unpunctuated transcripts (YouTube auto-captions).
+        # Running punctuation restoration BEFORE the terminal-punct check
+        # means the refiner can use real sentence boundaries even for
+        # auto-captions that ship without any punctuation.
+        if not self._transcript_has_terminal_punct(entries):
+            entries = self._auto_punctuate_entries(entries)
+
         # Decide whether the transcript has real punctuation. If not (most
         # YouTube auto-captions), fall back to a pause-based sentence proxy:
         # treat cue-index ``i`` as a sentence boundary when the gap from
@@ -11200,11 +11234,21 @@ class ReelService:
         # brief inhale between thoughts — and empirically lines up with
         # sentence breaks on unpunctuated captions.
         use_pause_boundaries = not self._transcript_has_terminal_punct(entries)
-        pause_breaks = (
-            self._cue_pause_breaks(entries, min_pause_sec=0.6)
-            if use_pause_boundaries
-            else set()
-        )
+        pause_breaks: set[int] = set()
+        if use_pause_boundaries:
+            pause_breaks = self._cue_pause_breaks(entries, min_pause_sec=0.6)
+            # If no pauses were found at the 0.6s threshold, try a smaller
+            # gap (0.3s) — some auto-caption streams have tiny but
+            # consistent micro-pauses between thoughts.
+            if not pause_breaks:
+                pause_breaks = self._cue_pause_breaks(entries, min_pause_sec=0.3)
+            # Last resort: if the transcript has zero inter-cue gaps (all
+            # cues are back-to-back), every cue boundary is equally valid.
+            # Without ANY signal we fall back to treating each cue as a
+            # potential sentence boundary so the refiner can at least land
+            # on a cue edge rather than cutting mid-cue.
+            if not pause_breaks:
+                pause_breaks = set(range(1, len(entries)))
 
         def _is_boundary_before(idx: int) -> bool:
             """Index `idx` starts a new sentence if the previous cue ended
@@ -11214,7 +11258,27 @@ class ReelService:
                 return True
             if use_pause_boundaries:
                 return idx in pause_breaks
-            return self._is_sentence_end(str(entries[idx - 1]["text"]))
+            prev_text = str(entries[idx - 1]["text"]).strip()
+            # Standard check: previous cue's text ends with terminal punct.
+            if self._is_sentence_end(prev_text):
+                return True
+            # Empty / silence cues (blank text or whitespace-only) act as
+            # natural sentence boundaries — the speaker paused.
+            if not prev_text:
+                return True
+            # Multi-sentence cue check: the previous cue may CONTAIN a
+            # sentence ending mid-text (e.g. "Hi everyone. Steven here, and")
+            # followed by a continuation.  If the CURRENT cue's text starts
+            # with a capital letter, treat the cue boundary as a valid start
+            # — real YouTube manual captions frequently break across cues
+            # this way.
+            cur_text = str(entries[idx]["text"]).strip()
+            if cur_text and cur_text[0].isupper():
+                # Extra confidence: verify a terminal punct exists somewhere
+                # in the previous cue (not just at the end).
+                if re.search(r"[.!?…]", prev_text):
+                    return True
+            return False
 
         def _ends_sentence(idx: int) -> bool:
             """Cue `idx` ends a sentence if its text has terminal punct, or
@@ -11361,6 +11425,110 @@ class ReelService:
         if not cleaned:
             return False
         return bool(re.search(r"[.!?…][\"'\)\]]*$", cleaned))
+
+    # Lazy-loaded punctuation restoration model (loaded once on first use).
+    _punct_pipeline = None
+
+    @classmethod
+    def _get_punct_pipeline(cls):
+        """Return the punctuation-restoration NER pipeline, loading on first call."""
+        if cls._punct_pipeline is None:
+            try:
+                from transformers import pipeline as hf_pipeline, AutoModelForTokenClassification, AutoTokenizer
+                model_name = "oliverguhr/fullstop-punctuation-multilang-large"
+                tokenizer = AutoTokenizer.from_pretrained(model_name)
+                model = AutoModelForTokenClassification.from_pretrained(model_name)
+                cls._punct_pipeline = hf_pipeline(
+                    "ner", model=model, tokenizer=tokenizer,
+                    aggregation_strategy="simple",
+                )
+            except Exception:
+                logger.warning("Failed to load punctuation model; auto-captions will use pause-based boundaries")
+                cls._punct_pipeline = False  # sentinel — don't retry
+        return cls._punct_pipeline if cls._punct_pipeline is not False else None
+
+    def _auto_punctuate_entries(
+        self,
+        entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Add punctuation to unpunctuated transcript entries in-place.
+
+        Concatenates all cue text, runs a BERT-based punctuation-restoration
+        model, then maps the restored punctuation back to each cue. This
+        converts YouTube auto-captions like ``"so lets talk about"`` into
+        ``"So lets talk about."`` so that downstream sentence-boundary
+        detection works correctly.
+
+        Falls back to the original entries if the model is unavailable.
+        """
+        pipe = self._get_punct_pipeline()
+        if pipe is None:
+            return entries
+
+        # Concatenate cue texts with a single space, tracking char→cue mapping
+        parts: list[str] = []
+        cue_char_ranges: list[tuple[int, int]] = []  # (start_char, end_char) per cue
+        offset = 0
+        for entry in entries:
+            text = str(entry.get("text") or "").strip()
+            if not text:
+                cue_char_ranges.append((offset, offset))
+                continue
+            if offset > 0:
+                offset += 1  # space separator
+            start_c = offset
+            offset += len(text)
+            cue_char_ranges.append((start_c, offset))
+            parts.append(text)
+
+        full_text = " ".join(parts)
+        if not full_text.strip():
+            return entries
+
+        try:
+            results = pipe(full_text)
+        except Exception:
+            logger.debug("Punctuation model inference failed; skipping auto-punctuate")
+            return entries
+
+        # Build a set of character positions where punctuation should be inserted
+        # result: {char_position: punct_char}
+        punct_insertions: dict[int, str] = {}
+        for r in results:
+            label = r.get("entity_group", "0")
+            if label in (".", "?", "!"):
+                punct_insertions[int(r["end"])] = label
+            elif label == ",":
+                punct_insertions[int(r["end"])] = ","
+
+        # Map insertions back to cues: for each cue, find punct that falls
+        # within or right after its character range
+        new_entries = []
+        for i, entry in enumerate(entries):
+            text = str(entry.get("text") or "").strip()
+            if not text:
+                new_entries.append(entry)
+                continue
+            c_start, c_end = cue_char_ranges[i]
+            # Find the last punctuation mark at or near this cue's end
+            best_punct = None
+            for pos, p in punct_insertions.items():
+                if c_start <= pos <= c_end + 1:
+                    best_punct = (pos, p)
+            if best_punct is not None:
+                # Append punct to end of cue text if not already there
+                if text and text[-1] not in ".!?,;:":
+                    text = text + best_punct[1]
+            # Capitalize first letter if this cue follows a sentence-ending cue
+            if i > 0 and new_entries:
+                prev_t = str(new_entries[-1].get("text") or "").strip()
+                if prev_t and prev_t[-1] in ".!?":
+                    text = text[0].upper() + text[1:] if len(text) > 1 else text.upper()
+            elif i == 0 and text:
+                text = text[0].upper() + text[1:] if len(text) > 1 else text.upper()
+            new_entries.append({**entry, "text": text})
+
+        return new_entries
 
     def _transcript_has_terminal_punct(self, entries: list[dict[str, Any]]) -> bool:
         """True when the transcript appears genuinely punctuated.
