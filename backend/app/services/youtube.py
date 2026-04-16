@@ -56,7 +56,7 @@ _USER_AGENTS = [
 _STEALTH_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "max-age=0",
     "Sec-Ch-Ua": '"Chromium";v="133", "Google Chrome";v="133", "Not-A.Brand";v="24"',
     "Sec-Ch-Ua-Mobile": "?0",
@@ -72,6 +72,24 @@ _STEALTH_HEADERS = {
 
 def _random_user_agent() -> str:
     return random.choice(_USER_AGENTS)
+
+
+def _sec_ch_ua_for_user_agent(ua: str) -> str:
+    """Derive a Sec-Ch-Ua hint that matches the Chrome major version in *ua*.
+
+    YouTube's passive fingerprinting compares the User-Agent header against the
+    Sec-Ch-Ua client hint.  A mismatch (e.g. UA says Chrome/131 but Sec-Ch-Ua
+    says v="133") is a strong bot signal.  This helper keeps them in sync
+    whenever we rotate the User-Agent.
+    """
+    match = re.search(r"Chrome/(\d+)", ua)
+    if not match:
+        # Fallback for non-Chrome UAs (shouldn't happen with our pool)
+        return '"Chromium";v="133", "Google Chrome";v="133", "Not-A.Brand";v="24"'
+    ver = match.group(1)
+    if "Edg/" in ua:
+        return f'"Chromium";v="{ver}", "Microsoft Edge";v="{ver}", "Not-A.Brand";v="24"'
+    return f'"Chromium";v="{ver}", "Google Chrome";v="{ver}", "Not-A.Brand";v="24"'
 
 
 class _ProxyRotator:
@@ -510,8 +528,11 @@ class YouTubeService:
         return True
 
     def _session_get(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
-        # Rotate User-Agent and optionally proxy per request.
-        self._session.headers["User-Agent"] = _random_user_agent()
+        # Rotate User-Agent and keep Sec-Ch-Ua in sync so YouTube's passive
+        # fingerprinting doesn't flag a version mismatch as bot traffic.
+        ua = _random_user_agent()
+        self._session.headers["User-Agent"] = ua
+        self._session.headers["Sec-Ch-Ua"] = _sec_ch_ua_for_user_agent(ua)
         if self._proxy_search and "proxies" not in kwargs:
             proxy = self._proxy_rotator.next()
             if proxy:
@@ -523,7 +544,9 @@ class YouTubeService:
         )
 
     def _session_post(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
-        self._session.headers["User-Agent"] = _random_user_agent()
+        ua = _random_user_agent()
+        self._session.headers["User-Agent"] = ua
+        self._session.headers["Sec-Ch-Ua"] = _sec_ch_ua_for_user_agent(ua)
         if self._proxy_search and "proxies" not in kwargs:
             proxy = self._proxy_rotator.next()
             if proxy:
@@ -2268,7 +2291,9 @@ class YouTubeService:
         for attempt in range(self.HTML_FETCH_MAX_RETRIES):
             if attempt > 0:
                 # Rotate UA between retries so YouTube sees a "different browser"
-                self._session.headers["User-Agent"] = _random_user_agent()
+                ua = _random_user_agent()
+                self._session.headers["User-Agent"] = ua
+                self._session.headers["Sec-Ch-Ua"] = _sec_ch_ua_for_user_agent(ua)
                 delay = self.HTML_FETCH_RETRY_BACKOFF_SEC * (1.5 ** attempt)
                 time.sleep(delay)
                 if self._deadline_exceeded(deadline):
