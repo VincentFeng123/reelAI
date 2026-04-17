@@ -32,6 +32,20 @@ from .transcript_validation import TranscriptQuality, validate_transcript
 logger = logging.getLogger(__name__)
 
 
+# Playback padding applied to the ends of every refined reel window.
+# YouTube's iframe/embed player seeks to the nearest keyframe AFTER the
+# requested start timestamp (~100-300 ms jitter), which clips the first
+# audible word. Ending precisely on a cue boundary can also truncate the
+# trailing consonant. A small symmetric pre-roll/post-roll buffer
+# reliably eliminates both without bleeding in noticeable extra content.
+# Applied by ``_refine_clip_window_from_transcript`` for single-reel paths
+# and by ``_split_into_consecutive_windows`` to the first/last reel of a
+# chain only (middle reels chain exactly so consecutive-reel playback
+# doesn't double-play the padded region).
+REEL_PAD_START_SEC = 0.3
+REEL_PAD_END_SEC = 0.3
+
+
 class GenerationCancelledError(Exception):
     """Raised when the caller abandons reel generation mid-request."""
 
@@ -2941,6 +2955,11 @@ class ReelService:
                                 min_len=refiner_min,
                                 max_len=refiner_max,
                                 min_start=effective_start,
+                                # Single-reel topic segment: pad both ends so the
+                                # embed player has keyframe-jitter headroom at
+                                # start and the closing consonant isn't clipped.
+                                pad_start_sec=REEL_PAD_START_SEC,
+                                pad_end_sec=REEL_PAD_END_SEC,
                             )
                             if not single_win:
                                 single_win = self._normalize_clip_window(
@@ -2992,6 +3011,11 @@ class ReelService:
                                 video_duration_sec=video_duration,
                                 min_len=clip_min_len,
                                 max_len=clip_max_len,
+                                # Single-reel path: pad both ends so the embed
+                                # player's keyframe-jitter doesn't clip the
+                                # opening word and the final consonant plays.
+                                pad_start_sec=REEL_PAD_START_SEC,
+                                pad_end_sec=REEL_PAD_END_SEC,
                             )
                             clip_windows = [single_win] if single_win else []
                     else:
@@ -11087,6 +11111,9 @@ class ReelService:
                     video_duration_sec=video_duration_sec,
                     min_len=min_len,
                     max_len=max_len,
+                    # Single-window reel: pad both ends for clean playback.
+                    pad_start_sec=REEL_PAD_START_SEC,
+                    pad_end_sec=REEL_PAD_END_SEC,
                 )
             return [win] if win else []
 
@@ -11105,6 +11132,14 @@ class ReelService:
                 break
 
             is_last_split = (split_idx == max_splits - 1) or (remaining <= max_len + 16)
+            is_first_split = (split_idx == 0)
+            # Chain-position padding: pre-roll on the first reel of a chain
+            # (absorbs YouTube seek jitter on the segment's entry point),
+            # post-roll on the last reel (lets the closing consonant finish).
+            # Middle reels in a chain chain exactly — no padding so consecutive
+            # reels don't double-play the padded region when viewed in sequence.
+            pad_start_this = REEL_PAD_START_SEC if is_first_split else 0.0
+            pad_end_this = REEL_PAD_END_SEC if is_last_split else 0.0
 
             if is_last_split:
                 # Final reel: try to capture all remaining content; allow generous
@@ -11121,6 +11156,8 @@ class ReelService:
                     min_len=min_len,
                     max_len=effective_max,
                     min_start=current_start,
+                    pad_start_sec=pad_start_this,
+                    pad_end_sec=pad_end_this,
                 )
             else:
                 proposed_end = current_start + float(max_len)
@@ -11140,6 +11177,8 @@ class ReelService:
                     max_len=effective_max,
                     min_start=current_start,
                     require_sentence_end=True,
+                    pad_start_sec=pad_start_this,
+                    pad_end_sec=pad_end_this,
                 )
                 if not win:
                     win = self._refine_clip_window_from_transcript(
@@ -11150,6 +11189,8 @@ class ReelService:
                         min_len=min_len,
                         max_len=effective_max,
                         min_start=current_start,
+                        pad_start_sec=pad_start_this,
+                        pad_end_sec=pad_end_this,
                     )
             if not win:
                 break
@@ -11181,6 +11222,11 @@ class ReelService:
                 video_duration_sec=video_duration_sec,
                 min_len=min_len,
                 max_len=max_len,
+                # Single-window fallback: pad both ends like the primary
+                # single-window path so the refiner's output is consistent
+                # whether the segment fit immediately or needed the retry.
+                pad_start_sec=REEL_PAD_START_SEC,
+                pad_end_sec=REEL_PAD_END_SEC,
             )
             if win:
                 windows.append(win)
@@ -11210,6 +11256,8 @@ class ReelService:
         max_len: int = 60,
         min_start: float | None = None,
         require_sentence_end: bool = False,
+        pad_start_sec: float = 0.0,
+        pad_end_sec: float = 0.0,
     ) -> tuple[int, int] | None:
         """Snap ``(proposed_start, proposed_end)`` to sentence boundaries.
 
@@ -11222,6 +11270,19 @@ class ReelService:
             whose end is mid-sentence. Used to hard-fail non-last splits so
             the caller can pick a different boundary rather than silently
             truncating.
+          * ``pad_start_sec`` — after sentence-snapping the start, pull the
+            start timestamp back by this many seconds to absorb YouTube
+            embed-player seek jitter (the iframe often lands slightly AFTER
+            ``&start=N`` due to keyframe alignment, clipping the first
+            100-300 ms of audio). Clamped to ``max(0, refined_start -
+            pad_start_sec)`` and (when supplied) ``min_start`` so chained
+            windows never regress past the caller's floor. Defaults to 0
+            (off) for backward compatibility — production callers opt in.
+          * ``pad_end_sec`` — after sentence-snapping the end, extend the
+            end timestamp forward by this many seconds so the final
+            consonant / breath completes before playback cuts. Clamped to
+            ``min(video_duration_sec, refined_end + pad_end_sec)``.
+            Defaults to 0 (off).
         """
         entries: list[dict[str, Any]] = []
         for entry in transcript:
@@ -11447,7 +11508,7 @@ class ReelService:
             and best_sentence_end > max_end
             and refined_end == best_sentence_end
         )
-        return self._normalize_clip_window(
+        normalized = self._normalize_clip_window(
             refined_start,
             refined_end,
             video_duration_sec,
@@ -11455,6 +11516,40 @@ class ReelService:
             max_len=max_len,
             allow_exceed_max=sentence_extends_past_max,
         )
+        if normalized is None:
+            return None
+        # Apply pre-roll / post-roll padding AFTER normalization so the
+        # refiner's sentence-snapping logic is unaffected by the buffer, but
+        # the returned window carries the extra cushion. The padding absorbs
+        # YouTube embed-player seek jitter (typical ~100-300 ms keyframe
+        # snap) and lets the final consonant complete. Pre-roll respects
+        # ``min_start`` so mid-chain reels don't regress below the caller's
+        # floor; post-roll respects ``video_duration_sec`` so we never hand
+        # the player an end past the video.
+        try:
+            pad_pre = max(0.0, float(pad_start_sec))
+            pad_post = max(0.0, float(pad_end_sec))
+        except (TypeError, ValueError):
+            pad_pre = 0.0
+            pad_post = 0.0
+        if pad_pre == 0.0 and pad_post == 0.0:
+            return normalized
+        start_f, end_f = float(normalized[0]), float(normalized[1])
+        pre_floor = 0.0
+        if min_start is not None:
+            try:
+                pre_floor = max(pre_floor, float(min_start))
+            except (TypeError, ValueError):
+                pass
+        padded_start = max(pre_floor, start_f - pad_pre)
+        padded_end = end_f + pad_post
+        if video_duration_sec and video_duration_sec > 0:
+            padded_end = min(float(video_duration_sec), padded_end)
+        # Guard against zero-width or inverted windows if extreme padding
+        # values collided with a tiny segment.
+        if padded_end <= padded_start:
+            return normalized
+        return (round(padded_start, 2), round(padded_end, 2))
 
     def _is_sentence_end(self, text: str) -> bool:
         cleaned = text.strip()

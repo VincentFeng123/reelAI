@@ -401,5 +401,178 @@ class TopicCutSingleWindowRefinementTests(unittest.TestCase):
         self.assertIn(win[1], {16.0, 20.0})
 
 
+class BoundaryPaddingTests(unittest.TestCase):
+    """Pre-roll / post-roll padding absorbs YouTube embed seek jitter and
+    lets the closing consonant finish. Tests verify:
+
+      1. Default callers (pad_start_sec=0, pad_end_sec=0) get unchanged
+         behavior — important because many existing tests rely on that.
+      2. When padding is opted in, the returned window is exactly
+         pad_start_sec seconds earlier at the start and pad_end_sec
+         seconds later at the end (clamped by video_duration and
+         min_start).
+      3. Padding never crosses min_start (so chained reels can't regress
+         below the caller's floor).
+      4. Padding never extends past video_duration_sec.
+      5. _split_into_consecutive_windows applies pre-roll to the first
+         reel only, post-roll to the last reel only — middle reels chain
+         exactly so consecutive-reel playback doesn't double-play the
+         padded overlap.
+      6. Generator uses REEL_PAD_START_SEC / REEL_PAD_END_SEC constants
+         (currently 0.3s each) for production call sites.
+    """
+
+    def setUp(self) -> None:
+        self.rs = ReelService(embedding_service=EmbeddingService(), youtube_service=YouTubeService())
+
+    def _synthetic_cues(self, n: int = 60, cue_spacing: float = 4.0, cue_dur: float = 3.9) -> list[dict[str, Any]]:
+        """Build ``n`` cues, each ending with terminal punctuation so every
+        cue boundary is a legal sentence start/end."""
+        out: list[dict[str, Any]] = []
+        for i in range(n):
+            out.append({
+                "start": i * cue_spacing,
+                "duration": cue_dur,
+                "text": f"Synthetic sentence number {i}.",
+            })
+        return out
+
+    def test_default_params_produce_no_padding(self) -> None:
+        """Backward-compat: callers that don't opt in get the same
+        sentence-snapped boundaries as before."""
+        cues = self._synthetic_cues(40)
+        win = self.rs._refine_clip_window_from_transcript(
+            transcript=cues, proposed_start=12.0, proposed_end=40.0,
+            video_duration_sec=200, min_len=15, max_len=55,
+        )
+        self.assertIsNotNone(win)
+        # With default pad_*_sec = 0, the start should be exactly on a cue
+        # boundary (cue 3 starts at 12.0). The end should be on a cue end
+        # (cue 9 ends at 39.9).
+        self.assertEqual(win[0], 12.0)
+        self.assertEqual(win[1], 39.9)
+
+    def test_padding_shifts_boundaries_symmetrically(self) -> None:
+        """With pad_start=0.3 and pad_end=0.3, the returned window is
+        exactly 0.3s earlier at start and 0.3s later at end."""
+        cues = self._synthetic_cues(40)
+        baseline = self.rs._refine_clip_window_from_transcript(
+            transcript=cues, proposed_start=12.0, proposed_end=40.0,
+            video_duration_sec=200, min_len=15, max_len=55,
+        )
+        padded = self.rs._refine_clip_window_from_transcript(
+            transcript=cues, proposed_start=12.0, proposed_end=40.0,
+            video_duration_sec=200, min_len=15, max_len=55,
+            pad_start_sec=0.3, pad_end_sec=0.3,
+        )
+        self.assertIsNotNone(baseline)
+        self.assertIsNotNone(padded)
+        self.assertAlmostEqual(baseline[0] - padded[0], 0.3, places=5)
+        self.assertAlmostEqual(padded[1] - baseline[1], 0.3, places=5)
+
+    def test_pre_roll_clamped_by_min_start(self) -> None:
+        """Pre-roll must never pull the start below min_start — that would
+        overlap the previous reel in a chain continuation."""
+        cues = self._synthetic_cues(40)
+        padded = self.rs._refine_clip_window_from_transcript(
+            transcript=cues, proposed_start=12.0, proposed_end=40.0,
+            video_duration_sec=200, min_len=15, max_len=55,
+            min_start=12.0,  # Refiner will snap start to cue boundary at 12.0.
+            pad_start_sec=0.3, pad_end_sec=0.3,
+        )
+        self.assertIsNotNone(padded)
+        # Pre-roll squeezed to 0 because refined_start == min_start.
+        self.assertEqual(padded[0], 12.0)
+        # Post-roll still applies.
+        self.assertGreater(padded[1], 39.9)
+
+    def test_pre_roll_clamped_to_zero(self) -> None:
+        """Pre-roll never goes negative even when refined_start is small."""
+        cues = self._synthetic_cues(40)
+        padded = self.rs._refine_clip_window_from_transcript(
+            transcript=cues, proposed_start=0.0, proposed_end=20.0,
+            video_duration_sec=200, min_len=15, max_len=55,
+            pad_start_sec=0.3, pad_end_sec=0.3,
+        )
+        self.assertIsNotNone(padded)
+        self.assertGreaterEqual(padded[0], 0.0)
+
+    def test_post_roll_clamped_by_video_duration(self) -> None:
+        """Post-roll must never push the end past the video's duration."""
+        cues = self._synthetic_cues(30)
+        # Push end near the video duration; post-roll of 5s would overshoot.
+        padded = self.rs._refine_clip_window_from_transcript(
+            transcript=cues, proposed_start=80.0, proposed_end=119.0,
+            video_duration_sec=120, min_len=15, max_len=60,
+            pad_start_sec=0.3, pad_end_sec=5.0,
+        )
+        self.assertIsNotNone(padded)
+        self.assertLessEqual(padded[1], 120.0)
+
+    def test_split_chain_pre_roll_on_first_only(self) -> None:
+        """In a multi-window split, only the first reel's start is
+        pre-rolled; middle reels chain exactly against the previous end."""
+        cues = self._synthetic_cues(50)
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=cues, segment_start=12.0, segment_end=132.0,
+            video_duration_sec=200, min_len=20, max_len=55,
+        )
+        self.assertGreaterEqual(len(windows), 2)
+        # First reel start should sit below segment_start by up to 0.3s
+        # (the refiner lands on a cue at/near 12.0; pre-roll pulls back).
+        first_start, first_end = windows[0]
+        self.assertLessEqual(first_start, 12.0)
+        self.assertGreaterEqual(first_start, 12.0 - 0.35)
+        # Chain continuity: consecutive windows don't overlap.
+        for i in range(len(windows) - 1):
+            cur_end = windows[i][1]
+            next_start = windows[i + 1][0]
+            # Next reel must start at or after the current reel's end.
+            self.assertGreaterEqual(next_start, cur_end - 1e-6)
+
+    def test_split_chain_post_roll_on_last_only(self) -> None:
+        """Last reel's end is post-rolled; intermediate reel ends are not
+        (else ``current_start`` would advance past real content)."""
+        cues = self._synthetic_cues(50)
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=cues, segment_start=12.0, segment_end=132.0,
+            video_duration_sec=200, min_len=20, max_len=55,
+        )
+        self.assertGreaterEqual(len(windows), 2)
+        # Last reel's end should extend past the natural cue end by
+        # about REEL_PAD_END_SEC (0.3s) — we just check it's beyond what
+        # a non-padded cue end would produce.
+        last_s, last_e = windows[-1]
+        # Either the last reel stopped at video boundary or near segment_end
+        # + post-roll. We can at least assert it's >= the nearest cue end.
+        # Cue 32 ends at 32*4 + 3.9 = 131.9.
+        self.assertGreaterEqual(last_e, 131.9)
+
+    def test_split_single_window_pads_both_ends(self) -> None:
+        """When the segment fits in one reel, the single-window path pads
+        both ends symmetrically."""
+        cues = self._synthetic_cues(30)
+        # Segment from 12 to 56 — fits in max_len=55 + 8s tolerance.
+        windows = self.rs._split_into_consecutive_windows(
+            transcript=cues, segment_start=12.0, segment_end=56.0,
+            video_duration_sec=200, min_len=20, max_len=55,
+        )
+        self.assertEqual(len(windows), 1)
+        s, e = windows[0]
+        # Pre-roll: start should be ~0.3s below the nearest cue at/near 12.0.
+        self.assertLess(s, 12.0)
+        self.assertGreaterEqual(s, 11.0)
+        # Post-roll: end should extend ~0.3s past the nearest cue end.
+        # (Cue 13 ends at 13*4+3.9 = 55.9; padded ~56.2.)
+        self.assertGreater(e, 55.9)
+
+    def test_padding_constants_exported(self) -> None:
+        """Production callers import REEL_PAD_START_SEC / REEL_PAD_END_SEC.
+        Lock in the current values so drift triggers an explicit review."""
+        from app.services.reels import REEL_PAD_START_SEC, REEL_PAD_END_SEC
+        self.assertEqual(REEL_PAD_START_SEC, 0.3)
+        self.assertEqual(REEL_PAD_END_SEC, 0.3)
+
+
 if __name__ == "__main__":
     unittest.main()
