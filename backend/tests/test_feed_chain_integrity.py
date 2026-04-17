@@ -223,5 +223,107 @@ class FeedChainIntegrityTests(unittest.TestCase):
         self.assertEqual(ids, ["S1", "S2", "S3"], f"Expected chronological order, got {ids}")
 
 
+class MergeRequestReelListsChainIntegrityTests(unittest.TestCase):
+    """
+    Cross-generation merge integrity.
+
+    ``_merge_request_reel_lists`` is called by ``/api/feed`` when a
+    request's reels span multiple chained generations (deep + bootstrap,
+    pagination extensions, etc.). Without re-grouping after the merge,
+    a video that has reels in both generations gets its reels split
+    across the merged output, defeating the per-generation grouping.
+
+    iOS and the webapp both consume ``/api/feed``, so both clients see
+    the same merged output — which means the merge must preserve
+    same-video grouping as well.
+    """
+
+    @staticmethod
+    def _reel(reel_id: str, video_key: str, t_start: float, t_end: float, score: float) -> dict:
+        return {
+            "reel_id": reel_id,
+            "video_url": f"https://www.youtube.com/embed/{video_key}",
+            "t_start": t_start,
+            "t_end": t_end,
+            "score": score,
+            "created_at": "2026-04-16T00:00:00+00:00",
+        }
+
+    def test_merge_groups_same_video_reels_across_generations(self) -> None:
+        import backend.app.main as main_module
+
+        # Generation 1 returned A's reels then B's reels (both already
+        # grouped by ranked_feed). Generation 2 returned A again (a new
+        # part) and C.
+        gen1 = [
+            self._reel("A1", "vidA", 10.0, 40.0, score=1.0),
+            self._reel("A2", "vidA", 60.0, 90.0, score=0.8),
+            self._reel("B1", "vidB", 10.0, 40.0, score=0.9),
+            self._reel("B2", "vidB", 60.0, 90.0, score=0.7),
+        ]
+        gen2 = [
+            self._reel("A3", "vidA", 120.0, 150.0, score=0.6),
+            self._reel("C1", "vidC", 10.0, 40.0, score=0.5),
+        ]
+
+        merged = main_module._merge_request_reel_lists(gen1, gen2)
+        ids = [r["reel_id"] for r in merged]
+        # A's reels must be contiguous AND chronological (A1, A2, A3).
+        # A's best score 1.0 > B's 0.9 > C's 0.5 → groups order A, B, C.
+        self.assertEqual(ids, ["A1", "A2", "A3", "B1", "B2", "C1"],
+                         f"Expected cross-gen grouping, got {ids}")
+
+    def test_merge_dedupes_then_groups(self) -> None:
+        import backend.app.main as main_module
+
+        # Same reel appears in both batches (same clip_key). Dedup keeps
+        # first, then grouping sorts the remainder by video.
+        gen1 = [
+            self._reel("A1", "vidA", 10.0, 40.0, score=1.0),
+            self._reel("B1", "vidB", 10.0, 40.0, score=0.9),
+        ]
+        gen2 = [
+            self._reel("A1-dup", "vidA", 10.0, 40.0, score=0.99),  # same clip_key as A1
+            self._reel("A2", "vidA", 60.0, 90.0, score=0.8),
+        ]
+        merged = main_module._merge_request_reel_lists(gen1, gen2)
+        ids = [r["reel_id"] for r in merged]
+        # A1-dup is dropped; A1 and A2 grouped together; B1 follows.
+        self.assertEqual(ids, ["A1", "A2", "B1"], f"Expected dedup+group, got {ids}")
+
+    def test_merge_single_list_preserves_grouping(self) -> None:
+        import backend.app.main as main_module
+
+        # Within a single batch, same-video reels already contiguous.
+        # Merge must not scramble them.
+        gen1 = [
+            self._reel("A1", "vidA", 10.0, 40.0, score=1.0),
+            self._reel("A2", "vidA", 60.0, 90.0, score=0.8),
+            self._reel("B1", "vidB", 10.0, 40.0, score=0.9),
+        ]
+        merged = main_module._merge_request_reel_lists(gen1)
+        ids = [r["reel_id"] for r in merged]
+        self.assertEqual(ids, ["A1", "A2", "B1"], f"Expected single-batch passthrough, got {ids}")
+
+    def test_merge_handles_reels_missing_video_identity(self) -> None:
+        import backend.app.main as main_module
+
+        # Reels without a recognizable video identity still merge and
+        # come out at the tail rather than getting dropped.
+        good = self._reel("A1", "vidA", 10.0, 40.0, score=1.0)
+        bad = {
+            "reel_id": "orphan",
+            "video_url": "",
+            "t_start": 0.0,
+            "t_end": 5.0,
+            "score": 0.1,
+            "created_at": "2026-04-16T00:00:00+00:00",
+        }
+        merged = main_module._merge_request_reel_lists([good, bad])
+        ids = [r["reel_id"] for r in merged]
+        self.assertEqual(ids[0], "A1")
+        self.assertIn("orphan", ids)
+
+
 if __name__ == "__main__":
     unittest.main()

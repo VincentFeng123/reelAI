@@ -3131,7 +3131,68 @@ def _merge_request_reel_lists(*reel_lists: list[dict[str, Any]]) -> list[dict[st
                 seen_reel_ids.add(reel_id)
             seen_clip_keys.add(clip_key)
             merged.append(reel)
-    return merged
+
+    if not merged:
+        return merged
+
+    # Cross-generation regrouping: each batch is already video-grouped by
+    # ``ranked_feed``, but concatenating batches can split a video's reels
+    # across generation boundaries (gen1's A-reels, other videos, then
+    # gen2's A-reels later). Re-group by video so same-clip reels play
+    # contiguously in chronological order — exact same behavior as
+    # ``ranked_feed`` produces within a single generation. This keeps the
+    # iOS and web feeds aligned with the within-generation grouping.
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    group_first_rank: dict[str, int] = {}
+    group_best_score: dict[str, float] = {}
+    group_best_created_at: dict[str, str] = {}
+    unkeyed: list[dict[str, Any]] = []
+    for idx, reel in enumerate(merged):
+        _, clip_key = _reel_identity_key(reel)
+        group_key = clip_key.split(":", 1)[0] if clip_key else ""
+        if not group_key:
+            # Defensive: reels without an identifiable video identity stay
+            # in their merged-order position via a stable rank sentinel.
+            unkeyed.append(reel)
+            continue
+        if group_key not in grouped:
+            grouped[group_key] = []
+            group_first_rank[group_key] = idx
+        grouped[group_key].append(reel)
+        try:
+            score = float(reel.get("score") or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        if score > group_best_score.get(group_key, float("-inf")):
+            group_best_score[group_key] = score
+            group_best_created_at[group_key] = str(reel.get("created_at") or "")
+
+    # Order groups by best score (desc), then by first-merged-rank (asc)
+    # as a deterministic tiebreak — preserving the original cross-batch
+    # ordering when scores are tied or absent.
+    ordered_groups = sorted(
+        grouped.keys(),
+        key=lambda k: (
+            -group_best_score.get(k, 0.0),
+            group_first_rank.get(k, 0),
+        ),
+    )
+    regrouped: list[dict[str, Any]] = []
+    for group_key in ordered_groups:
+        # Within each group, play reels in chronological order so a
+        # multi-part clip's narrative (part 1 → 2 → 3) stays intact.
+        group_reels = sorted(
+            grouped[group_key],
+            key=lambda r: (
+                float(r.get("t_start") or 0.0),
+                float(r.get("t_end") or 0.0),
+            ),
+        )
+        regrouped.extend(group_reels)
+    # Append any reels we couldn't group (missing video identity) at the
+    # tail, preserving their merged order.
+    regrouped.extend(unkeyed)
+    return regrouped
 
 
 def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
