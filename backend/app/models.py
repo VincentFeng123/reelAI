@@ -256,6 +256,10 @@ class ChatRequest(BaseModel):
     topic: str | None = None
     text: str | None = None
     history: list[ChatMessageIn] = Field(default_factory=list)
+    reel_summary: str | None = None
+    video_title: str | None = None
+    video_description: str | None = None
+    transcript_snippet: str | None = None
 
 
 class ChatResponse(BaseModel):

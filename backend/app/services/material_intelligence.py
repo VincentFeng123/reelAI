@@ -391,6 +391,11 @@ class MaterialIntelligenceService:
         topic: str | None = None,
         text: str | None = None,
         history: list[dict[str, str]] | None = None,
+        reel_summary: str | None = None,
+        video_title: str | None = None,
+        video_description: str | None = None,
+        transcript_snippet: str | None = None,
+        gemini_api_key_override: str | None = None,
     ) -> str:
         question = normalize_whitespace(message or "").strip()
         if not question:
@@ -398,6 +403,10 @@ class MaterialIntelligenceService:
 
         topic_clean = normalize_whitespace(topic or "").strip()
         text_clean = normalize_whitespace(text or "").strip()
+        reel_summary_clean = normalize_whitespace(reel_summary or "").strip()
+        video_title_clean = normalize_whitespace(video_title or "").strip()
+        video_description_clean = normalize_whitespace(video_description or "").strip()
+        transcript_clean = normalize_whitespace(transcript_snippet or "").strip()
         context_excerpt = self._build_excerpt(text_clean, max_chars=7000) if text_clean else ""
 
         if not self.llm_available:
@@ -421,9 +430,21 @@ class MaterialIntelligenceService:
             speaker = "User" if role == "user" else "Assistant"
             history_lines.append(f"{speaker}: {content[:1800]}")
 
+        context_lines: list[str] = []
+        if video_title_clean:
+            context_lines.append(f"Video title: {video_title_clean[:300]}")
+        if video_description_clean:
+            context_lines.append(f"Video description: {video_description_clean[:1200]}")
+        if reel_summary_clean:
+            context_lines.append(f"Reel summary: {reel_summary_clean[:1500]}")
+        if transcript_clean:
+            context_lines.append(f"Transcript excerpt: {transcript_clean[:3000]}")
+        if context_excerpt:
+            context_lines.append(f"Source text:\n{context_excerpt}")
+
         user_prompt = (
             f"Topic: {topic_clean or 'not provided'}\n"
-            f"Source context:\n{context_excerpt or 'not provided'}\n"
+            f"Context:\n{chr(10).join(context_lines) if context_lines else 'not provided'}\n"
         )
         if history_lines:
             user_prompt += "\nConversation so far:\n" + "\n".join(history_lines) + "\n"
@@ -434,6 +455,7 @@ class MaterialIntelligenceService:
                 system=system_prompt,
                 user=user_prompt,
                 temperature=0.25,
+                gemini_api_key_override=gemini_api_key_override,
             )
             if answer:
                 return answer.strip()[:1200]

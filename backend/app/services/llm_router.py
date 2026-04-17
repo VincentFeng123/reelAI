@@ -144,14 +144,19 @@ def _gemini_chat(
     temperature: float,
     json_mode: bool,
     max_output_tokens: int | None,
+    api_key_override: str | None = None,
 ) -> str | None:
     global _gemini_key_offset
 
-    all_keys = _collect_gemini_api_keys() or [""]
+    if api_key_override:
+        # Dedicated key path: no rotation, no fallback to the main pool.
+        all_keys = [api_key_override]
+    else:
+        all_keys = _collect_gemini_api_keys() or [""]
     last_exc: Exception | None = None
 
     for attempt in range(len(all_keys)):
-        idx = (_gemini_key_offset + attempt) % len(all_keys)
+        idx = (_gemini_key_offset + attempt) % len(all_keys) if not api_key_override else 0
         key = all_keys[idx]
         if key:
             try:
@@ -233,6 +238,7 @@ def chat_completion(
     max_tokens: int | None = None,
     gemini_model: str = GEMINI_DEFAULT_MODEL,
     groq_model: str = GROQ_DEFAULT_MODEL,
+    gemini_api_key_override: str | None = None,
 ) -> str | None:
     """Run a chat completion: Gemini first, Groq fallback.
 
@@ -244,6 +250,10 @@ def chat_completion(
       * Else if ``cache_namespace`` is supplied along with a ``conn``, a cache
         key is derived from the namespace + model + prompt hash.
       * Caching is disabled if neither is supplied or if ``conn`` is None.
+
+    ``gemini_api_key_override`` forces a specific key for the Gemini call
+    (used by the chat endpoint so it runs on a dedicated backup key without
+    consuming the primary rotation pool's quota).
     """
     effective_cache_key: str | None = None
     if conn is not None:
@@ -258,7 +268,7 @@ def chat_completion(
             if cached is not None:
                 return cached
 
-    gemini = _build_gemini_module()
+    gemini = _build_gemini_module(api_key=gemini_api_key_override)
     if gemini is not None:
         try:
             out = _gemini_chat(
@@ -269,6 +279,7 @@ def chat_completion(
                 temperature=temperature,
                 json_mode=json_mode,
                 max_output_tokens=max_tokens,
+                api_key_override=gemini_api_key_override,
             )
             if out:
                 if conn is not None and effective_cache_key:

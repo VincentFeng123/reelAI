@@ -6783,11 +6783,19 @@ def feed(
 def chat(request: Request, payload: ChatRequest):
     _enforce_rate_limit(request, "chat", limit=CHAT_RATE_LIMIT_PER_WINDOW)
     history = [{"role": m.role, "content": m.content} for m in payload.history]
+    # Pin chat to the dedicated backup Gemini key so it never contends with
+    # reel-generation traffic on the primary rotation pool.
+    chat_gemini_key = (os.environ.get("GEMINI_API_KEY_2") or "").strip() or None
     answer = material_intelligence_service.chat_assistant(
         message=payload.message,
         topic=payload.topic,
         text=payload.text,
         history=history,
+        reel_summary=payload.reel_summary,
+        video_title=payload.video_title,
+        video_description=payload.video_description,
+        transcript_snippet=payload.transcript_snippet,
+        gemini_api_key_override=chat_gemini_key,
     )
     return {"answer": answer}
 
