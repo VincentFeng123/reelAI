@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -9,6 +10,8 @@ from . import llm_router
 from .concepts import extract_concepts, extract_learning_objectives
 from .text_utils import normalize_whitespace
 from .topic_expansion import TopicExpansionService
+
+logger = logging.getLogger(__name__)
 
 
 class MaterialIntelligenceService:
@@ -459,8 +462,25 @@ class MaterialIntelligenceService:
             )
             if answer:
                 return answer.strip()[:1200]
+            logger.warning(
+                "chat_assistant: primary chat_completion returned no answer (override=%s, llm_available=%s)",
+                bool(gemini_api_key_override), self.llm_available,
+            )
         except Exception:
-            pass
+            logger.exception("chat_assistant: primary chat_completion raised")
+
+        if gemini_api_key_override:
+            try:
+                answer = llm_router.chat_completion(
+                    system=system_prompt,
+                    user=user_prompt,
+                    temperature=0.25,
+                )
+                if answer:
+                    return answer.strip()[:1200]
+                logger.warning("chat_assistant: fallback chat_completion returned no answer")
+            except Exception:
+                logger.exception("chat_assistant: fallback chat_completion raised")
 
         if topic_clean:
             return f"I could not reach the model right now. For '{topic_clean}', start with one key definition and one example."
