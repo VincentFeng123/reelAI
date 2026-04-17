@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -3024,6 +3025,13 @@ class ReelService:
                         else:
                             effective_start = float(segment.t_start)
                         if transcript and seg_span > float(clip_max_len) + 16.0:
+                            # Size max_splits so every sub-window (except
+                            # possibly the last) lands near clip_max_len,
+                            # instead of letting the final split absorb an
+                            # oversized tail when the topic is much longer
+                            # than 5 × clip_max_len.
+                            span_for_splits = max(1.0, float(segment.t_end) - float(effective_start))
+                            dyn_max_splits = max(5, math.ceil(span_for_splits / max(float(clip_max_len), 1.0)) + 1)
                             clip_windows = self._split_into_consecutive_windows(
                                 transcript=transcript,
                                 segment_start=effective_start,
@@ -3031,6 +3039,7 @@ class ReelService:
                                 video_duration_sec=video_duration,
                                 min_len=clip_min_len,
                                 max_len=clip_max_len,
+                                max_splits=dyn_max_splits,
                             )
                         elif transcript:
                             # Give the refiner enough headroom that it won't
@@ -3081,12 +3090,15 @@ class ReelService:
                                 cluster_chain_last_end[chain_id] = float(clip_windows[-1][1])
                             topic_cut_last_refined_end = float(clip_windows[-1][1])
                     elif transcript:
-                        # Preserve the old behavior for short/normal segments so
-                        # working topics aren't perturbed. Only invoke the split
-                        # path when the segment is long enough that a single
-                        # max_len reel would noticeably truncate it.
+                        # Only invoke the split path when the segment is long
+                        # enough that a single max_len reel would noticeably
+                        # truncate it. For shorter segments, run the refiner
+                        # with a max_len sized to the full segment so
+                        # sentence-aligned boundaries stay inside the
+                        # AI-picked range without silent truncation.
                         seg_span = max(0.0, float(segment.t_end) - float(segment.t_start))
                         if seg_span > float(clip_max_len) + 16.0:
+                            dyn_max_splits = max(5, math.ceil(seg_span / max(float(clip_max_len), 1.0)) + 1)
                             clip_windows = self._split_into_consecutive_windows(
                                 transcript=transcript,
                                 segment_start=segment.t_start,
@@ -3094,15 +3106,17 @@ class ReelService:
                                 video_duration_sec=video_duration,
                                 min_len=clip_min_len,
                                 max_len=clip_max_len,
+                                max_splits=dyn_max_splits,
                             )
                         else:
+                            refiner_max = int(max(seg_span + 16.0, float(clip_max_len)))
                             single_win = self._refine_clip_window_from_transcript(
                                 transcript=transcript,
                                 proposed_start=segment.t_start,
                                 proposed_end=segment.t_end,
                                 video_duration_sec=video_duration,
                                 min_len=clip_min_len,
-                                max_len=clip_max_len,
+                                max_len=refiner_max,
                                 # Single-reel path: pad both ends so the embed
                                 # player's keyframe-jitter doesn't clip the
                                 # opening word and the final consonant plays.
@@ -10473,30 +10487,16 @@ class ReelService:
                     # too-short clip.
                     continue
 
-            # Max-length guardrail: split too-long windows into equal parts.
-            # Each sub-part is tagged with a shared ``cluster_group`` id so the
-            # main candidate loop can refine them as a continuous chain
-            # (forcing each sub-part's refined t_start to the previous
-            # sub-part's refined t_end). Without this chaining, independent
-            # refinement of each sub-part can introduce gaps or overlaps at
-            # the sub-segment boundaries.
-            sub_windows: list[tuple[float, float]] = []
-            if duration > clip_max_len:
-                import math
-                num_parts = int(math.ceil(duration / clip_max_len))
-                part_dur = duration / num_parts
-                if part_dur < clip_min_len:
-                    sub_windows = [(t_start, t_end)]
-                else:
-                    for i in range(num_parts):
-                        a = t_start + i * part_dur
-                        b = t_end if i == num_parts - 1 else (t_start + (i + 1) * part_dur)
-                        sub_windows.append((a, b))
-            else:
-                sub_windows = [(t_start, t_end)]
-
-            multi_part = len(sub_windows) > 1
-            cluster_group_id = f"tcut-{video_id}-{win_idx}" if multi_part else ""
+            # Keep the full window intact here. Sentence-aligned splitting
+            # happens downstream in the main candidate loop via
+            # `_split_into_consecutive_windows`, which honours punctuation
+            # boundaries when the segment needs to be cut into sub-reels to
+            # respect the user's max_clip_duration. Pre-splitting here would
+            # produce arbitrary numeric cuts that later refinement can only
+            # partially correct.
+            sub_windows: list[tuple[float, float]] = [(t_start, t_end)]
+            multi_part = False
+            cluster_group_id = ""
 
             for sub_idx, (a, b) in enumerate(sub_windows):
                 text_parts: list[str] = []

@@ -1568,18 +1568,11 @@ def _topic_reels_from_chapters(
             )
             continue
 
-        if duration > max_reel_sec:
-            sub_ranges = _split_long_range(
-                t_start, t_end, label, summary,
-                max_reel_sec=max_reel_sec,
-                min_reel_sec=min_reel_sec,
-            )
-            if not sub_ranges:
-                # Splitting would produce sub-parts shorter than the minimum.
-                # Keep the natural boundary instead.
-                sub_ranges = [(t_start, t_end, label, summary)]
-        else:
-            sub_ranges = [(t_start, t_end, label, summary)]
+        # Keep the full sentence-aligned range intact. Splitting into
+        # `max_reel_sec` chunks happens downstream in reels.py via
+        # `_split_into_consecutive_windows`, which enforces sentence
+        # boundaries on every sub-window.
+        sub_ranges = [(t_start, t_end, label, summary)]
 
         for sub_start, sub_end, sub_label, sub_summary in sub_ranges:
             s_idx = -1
@@ -1889,20 +1882,11 @@ def _snap_segments_to_cues(
             )
             continue
 
-        # If the segment exceeds the SOFT cap, split it into roughly-equal parts
-        # so the user's max_reel_sec preference is respected. Each part inherits
-        # the same label with a "(i/N)" suffix.
-        if duration > max_reel_sec:
-            split = _split_long_range(
-                t_start, t_end, label, summary,
-                max_reel_sec=max_reel_sec, min_reel_sec=min_reel_sec,
-            )
-            if not split:
-                # Splitting would yield sub-parts shorter than min_reel_sec,
-                # so keep the natural boundary instead.
-                split = [(t_start, t_end, label, summary)]
-        else:
-            split = [(t_start, t_end, label, summary)]
+        # Keep the full sentence-aligned range intact. Splitting into
+        # `max_reel_sec` chunks happens downstream in reels.py via
+        # `_split_into_consecutive_windows`, which enforces sentence
+        # boundaries on every sub-window.
+        split = [(t_start, t_end, label, summary)]
 
         for sub_start, sub_end, sub_label, sub_summary in split:
             candidates.append(
@@ -2059,16 +2043,11 @@ def _snap_timestamps_to_cues(
             )
             continue
 
-        # Split segments that exceed the soft max.
-        if duration > max_reel_sec:
-            split = _split_long_range(
-                t_start, t_end, label, summary,
-                max_reel_sec=max_reel_sec, min_reel_sec=min_reel_sec,
-            )
-            if not split:
-                split = [(t_start, t_end, label, summary)]
-        else:
-            split = [(t_start, t_end, label, summary)]
+        # Keep the full sentence-aligned range intact. Splitting into
+        # `max_reel_sec` chunks happens downstream in reels.py via
+        # `_split_into_consecutive_windows`, which enforces sentence
+        # boundaries on every sub-window.
+        split = [(t_start, t_end, label, summary)]
 
         for sub_start, sub_end, sub_label, sub_summary in split:
             candidates.append(
