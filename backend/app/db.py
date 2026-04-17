@@ -502,6 +502,13 @@ CREATE TABLE IF NOT EXISTS llm_cache (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS video_liveness_cache (
+    video_id TEXT PRIMARY KEY,
+    alive INTEGER NOT NULL,
+    checked_at TEXT NOT NULL,
+    ttl_seconds INTEGER NOT NULL DEFAULT 28800
+);
+
 CREATE TABLE IF NOT EXISTS community_starred_sets (
     account_id TEXT NOT NULL,
     set_id TEXT NOT NULL,

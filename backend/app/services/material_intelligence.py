@@ -1,13 +1,12 @@
 import hashlib
 import json
-import os
 import uuid
 from typing import Any
 
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, now_iso, upsert
+from . import llm_router
 from .concepts import extract_concepts, extract_learning_objectives
-from .openai_client import build_openai_client
 from .text_utils import normalize_whitespace
 from .topic_expansion import TopicExpansionService
 
@@ -118,19 +117,8 @@ class MaterialIntelligenceService:
 
     def __init__(self) -> None:
         settings = get_settings()
-        self.model = settings.openai_chat_model
-        serverless_mode = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
-        allow_openai_serverless = os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1"
-        can_use_openai = (
-            bool(settings.openai_enabled)
-            and bool(settings.openai_api_key)
-            and (not serverless_mode or allow_openai_serverless)
-        )
-        self.client = build_openai_client(
-            api_key=settings.openai_api_key,
-            timeout=8.0,
-            enabled=can_use_openai,
-        )
+        self.model = settings.gemini_model
+        self.llm_available = llm_router.gemini_or_groq_available()
         self.topic_expansion_service = TopicExpansionService()
 
     def extract_concepts_and_objectives(
@@ -177,7 +165,7 @@ class MaterialIntelligenceService:
         if prefer_topic_seed and opaque_topic_seed:
             return base_concepts, base_objectives
 
-        if not self.client:
+        if not self.llm_available:
             return base_concepts, base_objectives
 
         payload = self._cached_or_generate(conn, text, subject_tag, max_concepts=max_concepts)
@@ -412,7 +400,7 @@ class MaterialIntelligenceService:
         text_clean = normalize_whitespace(text or "").strip()
         context_excerpt = self._build_excerpt(text_clean, max_chars=7000) if text_clean else ""
 
-        if not self.client:
+        if not self.llm_available:
             if topic_clean:
                 return (
                     f"Based on '{topic_clean}', focus on core definitions first, then one worked example. "
@@ -424,32 +412,31 @@ class MaterialIntelligenceService:
             "You are a concise study coach. Answer directly, use plain language, and stay grounded in the provided context. "
             "If context is missing, state assumptions briefly. Keep responses under 120 words."
         )
-        context_block = (
-            f"Topic: {topic_clean or 'not provided'}\n"
-            f"Source context:\n{context_excerpt or 'not provided'}"
-        )
-
-        messages: list[dict[str, str]] = [
-            {"role": "system", "content": system_prompt},
-            {"role": "system", "content": context_block},
-        ]
+        history_lines: list[str] = []
         for item in (history or [])[-8:]:
             role = str(item.get("role") or "").strip().lower()
             content = normalize_whitespace(str(item.get("content") or "")).strip()
             if role not in {"user", "assistant"} or not content:
                 continue
-            messages.append({"role": role, "content": content[:1800]})
-        messages.append({"role": "user", "content": question[:2000]})
+            speaker = "User" if role == "user" else "Assistant"
+            history_lines.append(f"{speaker}: {content[:1800]}")
+
+        user_prompt = (
+            f"Topic: {topic_clean or 'not provided'}\n"
+            f"Source context:\n{context_excerpt or 'not provided'}\n"
+        )
+        if history_lines:
+            user_prompt += "\nConversation so far:\n" + "\n".join(history_lines) + "\n"
+        user_prompt += f"\nUser question: {question[:2000]}"
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
+            answer = llm_router.chat_completion(
+                system=system_prompt,
+                user=user_prompt,
                 temperature=0.25,
-                messages=messages,
             )
-            answer = (response.choices[0].message.content or "").strip()
             if answer:
-                return answer[:1200]
+                return answer.strip()[:1200]
         except Exception:
             pass
 
@@ -486,7 +473,7 @@ class MaterialIntelligenceService:
         return payload
 
     def _generate_payload(self, text: str, subject_tag: str | None, max_concepts: int) -> dict[str, Any]:
-        if not self.client:
+        if not self.llm_available:
             return {}
 
         cleaned = normalize_whitespace(text)
@@ -513,16 +500,14 @@ class MaterialIntelligenceService:
         )
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
+            content = llm_router.chat_completion(
+                system=system_prompt,
+                user=user_prompt,
                 temperature=0.2,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                json_mode=True,
             )
-            content = response.choices[0].message.content or "{}"
+            if not content:
+                return {}
             return json.loads(content)
         except Exception:
             return {}

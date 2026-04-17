@@ -18,6 +18,7 @@ import re
 from typing import Any
 
 from ..db import DatabaseIntegrityError, dumps_json, fetch_one, now_iso, upsert
+from ..services import llm_router
 from ..services.concepts import build_takeaways
 from .logging_config import get_ingest_logger
 from .models import IngestMetadata, PlatformLiteral
@@ -28,7 +29,6 @@ logger: logging.Logger = get_ingest_logger(__name__)
 _HASHTAG_RE = re.compile(r"#([A-Za-z0-9_\u00c0-\u024f][A-Za-z0-9_\u00c0-\u024f]{1,48})")
 _AI_SUMMARY_CACHE_PREFIX = "ingest_ai_summary:"
 _AI_SUMMARY_TTL_SEC = 7 * 24 * 3600  # 7 days
-_SUMMARY_MODEL = "gpt-4o-mini"
 _SUMMARY_MAX_TOKENS = 180
 
 
@@ -239,7 +239,6 @@ def fallback_ai_summary(
 def brief_ai_summary(
     conn: Any,
     *,
-    openai_client: Any,
     concept_title: str,
     video_title: str,
     video_description: str,
@@ -248,12 +247,10 @@ def brief_ai_summary(
     cache_key_suffix: str,
 ) -> str:
     """
-    LLM-backed summary. Uses the `llm_cache` table with key `ingest_ai_summary:{suffix}`
-    so identical inputs never pay the LLM cost twice. Falls back to `fallback_ai_summary`
+    LLM-backed summary via `services.llm_router` (Gemini primary, Groq fallback).
+    Uses the `llm_cache` table with key `ingest_ai_summary:{suffix}` so identical
+    inputs never pay the LLM cost twice. Falls back to `fallback_ai_summary`
     on any error — summary is cosmetic, we never want it to fail the ingest.
-
-    Does NOT touch `reels.py`. Does NOT instantiate a new OpenAI client — the caller
-    passes one that was built via `openai_client.build_openai_client(...)`.
     """
     fallback = fallback_ai_summary(
         concept_title=concept_title,
@@ -262,7 +259,7 @@ def brief_ai_summary(
         transcript_snippet=transcript_snippet,
         takeaways=takeaways,
     )
-    if openai_client is None:
+    if not llm_router.gemini_or_groq_available():
         return fallback
 
     cache_key = f"{_AI_SUMMARY_CACHE_PREFIX}{cache_key_suffix}"
@@ -283,31 +280,31 @@ def brief_ai_summary(
         logger.exception("brief_ai_summary: llm_cache read failed")
 
     try:
-        prompt = (
+        system_prompt = (
             "You write concise, factual one-paragraph summaries of short-form video content "
             "for an educational study app. Stick to what's in the transcript. Use 1-2 sentences, "
-            "<= 320 characters, plain declarative voice, no emojis, no hashtags.\n\n"
+            "<= 320 characters, plain declarative voice, no emojis, no hashtags. "
+            "Return only the summary paragraph, no preamble."
+        )
+        user_prompt = (
             f"Video title: {video_title or '(untitled)'}\n"
             f"Author-provided description: {video_description[:600] if video_description else '(none)'}\n"
             f"Transcript excerpt: {transcript_snippet[:1400] if transcript_snippet else '(none)'}"
         )
-        completion = openai_client.chat.completions.create(
-            model=_SUMMARY_MODEL,
-            messages=[
-                {"role": "system", "content": "Return only the summary paragraph, no preamble."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=_SUMMARY_MAX_TOKENS,
+        raw = llm_router.chat_completion(
+            system=system_prompt,
+            user=user_prompt,
             temperature=0.2,
+            max_tokens=_SUMMARY_MAX_TOKENS,
         )
-        raw = (completion.choices[0].message.content or "").strip() if completion.choices else ""
+        raw = (raw or "").strip()
         if not raw:
             return fallback
         summary = " ".join(raw.split())[:320]
         if summary and summary[-1] not in ".!?":
             summary = summary + "."
     except Exception:
-        logger.warning("brief_ai_summary: OpenAI call failed, falling back")
+        logger.warning("brief_ai_summary: LLM call failed, falling back")
         return fallback
 
     try:

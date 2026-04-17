@@ -147,7 +147,6 @@ class IngestionPipeline:
         *,
         youtube_service: Any,
         embedding_service: Any,
-        openai_client: Any,
         settings: Any = None,
         adapters: list[BaseAdapter] | None = None,
         rate_limiter: _PlatformRateLimiter | None = None,
@@ -156,7 +155,6 @@ class IngestionPipeline:
     ) -> None:
         self._youtube_service = youtube_service
         self._embedding_service = embedding_service
-        self._openai_client = openai_client
         self._settings = settings
         self._adapters: list[BaseAdapter] = adapters or [YtDlpAdapter()]
         self._rate_limiter = rate_limiter or _PlatformRateLimiter()
@@ -167,7 +165,6 @@ class IngestionPipeline:
                 or os.environ.get("K_SERVICE")
             )
         self._serverless_mode = serverless_mode
-        self._allow_openai_in_serverless = os.environ.get("ALLOW_OPENAI_IN_SERVERLESS") == "1"
         self._feed_executor = ThreadPoolExecutor(max_workers=max(1, int(feed_concurrency)))
 
     # --------------------------------------------------------------------- #
@@ -188,10 +185,6 @@ class IngestionPipeline:
     # --------------------------------------------------------------------- #
 
     def _preflight(self) -> None:
-        if self._serverless_mode and not self._allow_openai_in_serverless:
-            raise ServerlessUnavailable(
-                "Reel ingestion is disabled in serverless mode. Set ALLOW_OPENAI_IN_SERVERLESS=1 to override."
-            )
         if not check_ffmpeg_available():
             raise DownloadError(
                 "ffmpeg/ffprobe are not installed on this host. "
@@ -365,8 +358,8 @@ class IngestionPipeline:
           2. For long-form: asks the LLM to identify topic boundaries by cue
              index, snaps the boundaries to natural cue gaps, and drops any
              segment outside [30s, 12min].
-          3. Falls back to the lexical-novelty heuristic if no OpenAI client
-             is available or the LLM call fails.
+          3. Falls back to the lexical-novelty heuristic if no LLM provider
+             (Gemini/Groq) is available or the LLM call fails.
 
         Each TopicReel is then persisted via the same sentinel-material path
         used by `_persist_ingest`, producing a list of `ReelOutWithAttribution`
@@ -469,7 +462,6 @@ class IngestionPipeline:
             source_url,
             query=query,
             duration_sec=float(duration_sec or 0.0),
-            openai_client=self._openai_client,
             use_llm=use_llm,
             transcript=topic_cues,
             info_dict=info_dict_snapshot,
@@ -582,7 +574,6 @@ class IngestionPipeline:
                 # is fine — the topic_cut label is already a usable headline.
                 ai_summary = brief_ai_summary(
                     conn,
-                    openai_client=self._openai_client,
                     concept_title=tr.label or metadata.title or "",
                     video_title=metadata.title or "",
                     video_description=metadata.description,
@@ -827,7 +818,6 @@ class IngestionPipeline:
             source_url,
             query=query,
             duration_sec=float(duration_sec or 0.0),
-            openai_client=self._openai_client,
             use_llm=True,
             transcript=topic_cues,
             info_dict=info_dict_snapshot,
@@ -1238,10 +1228,8 @@ class IngestionPipeline:
                 video_path=video_path,
                 workspace=workspace,
                 youtube_service=self._youtube_service,
-                openai_client=self._openai_client,
                 language=language,
                 serverless_mode=self._serverless_mode,
-                allow_openai_in_serverless=self._allow_openai_in_serverless,
                 video_duration_sec=video_duration_sec,
             )
 
@@ -1288,7 +1276,6 @@ class IngestionPipeline:
 
             ai_summary = brief_ai_summary(
                 conn,
-                openai_client=self._openai_client,
                 concept_title=metadata.title or "",
                 video_title=metadata.title or "",
                 video_description=metadata.description,
@@ -1390,28 +1377,17 @@ def _cli_main(argv: list[str] | None = None) -> int:  # pragma: no cover
     from .. import db as db_module
     from ..config import get_settings
     from ..services.embeddings import EmbeddingService
-    from ..services.openai_client import build_openai_client
     from ..services.youtube import YouTubeService
 
     settings = get_settings()
     db_module.init_db()
 
-    openai_client = build_openai_client(
-        api_key=settings.openai_api_key,
-        timeout=float(getattr(settings, "openai_timeout_sec", 60.0)),
-        enabled=bool(getattr(settings, "openai_enabled", False) and settings.openai_api_key),
-    )
-    embedding_service = EmbeddingService(
-        client=openai_client,
-        model=getattr(settings, "openai_embedding_model", "text-embedding-3-small"),
-        enabled=bool(getattr(settings, "openai_enabled", False) and settings.openai_api_key),
-    )
+    embedding_service = EmbeddingService()
     youtube_service = YouTubeService(settings=settings)
 
     pipeline = IngestionPipeline(
         youtube_service=youtube_service,
         embedding_service=embedding_service,
-        openai_client=openai_client,
         settings=settings,
     )
 

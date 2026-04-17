@@ -1,36 +1,22 @@
 import hashlib
 import json
-import math
 import logging
-import os
 from typing import Iterable
 
 import numpy as np
 
-from ..config import get_settings
 from ..db import dumps_json, fetch_one, now_iso, upsert
-from .openai_client import build_openai_client
 
 logger = logging.getLogger(__name__)
 
 
 class EmbeddingService:
     def __init__(self) -> None:
-        settings = get_settings()
-        self.model = settings.openai_embed_model
-        serverless_mode = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
-        allow_openai_serverless = os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1"
-        can_use_openai = (
-            bool(settings.openai_enabled)
-            and bool(settings.openai_api_key)
-            and (not serverless_mode or allow_openai_serverless)
-        )
-        self.client = build_openai_client(
-            api_key=settings.openai_api_key,
-            timeout=8.0,
-            enabled=can_use_openai,
-        )
-        self.dim = 1536 if self.client else 256
+        # Hosted embedding providers have been removed; we use a pure-Python
+        # hashing embedding that is deterministic, free, and fast. The
+        # dimension is fixed at 256 so callers never need to re-hash on model
+        # changes.
+        self.dim = 256
 
     def embed_texts(self, conn, texts: Iterable[str]) -> np.ndarray:
         text_list = [t.strip() for t in texts]
@@ -58,15 +44,7 @@ class EmbeddingService:
 
         if missing_indices:
             missing_texts = [text_list[i] for i in missing_indices]
-            if self.client:
-                try:
-                    fetched = self._embed_openai(missing_texts)
-                except Exception as exc:
-                    # Keep API endpoints alive even when OpenAI quota/model calls fail.
-                    logger.warning("OpenAI embeddings failed; falling back to local embeddings: %s", exc)
-                    fetched = self._embed_local(missing_texts)
-            else:
-                fetched = self._embed_local(missing_texts)
+            fetched = self._embed_local(missing_texts)
 
             for local_i, global_i in enumerate(missing_indices):
                 vec = self._normalize(fetched[local_i])
@@ -104,17 +82,7 @@ class EmbeddingService:
             return None, True
         if vec.size == self.dim:
             return self._normalize(vec), False
-        # Dimension mismatch — always allow replacement so the cache stays usable.
-        # When OpenAI is re-enabled, 256-dim entries will be replaced with 1536-dim ones.
         return None, True
-
-    def _embed_openai(self, texts: list[str], batch_size: int = 64) -> np.ndarray:
-        vectors: list[list[float]] = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            response = self.client.embeddings.create(model=self.model, input=batch)
-            vectors.extend(item.embedding for item in response.data)
-        return np.array(vectors, dtype=np.float32)
 
     def _embed_local(self, texts: list[str]) -> np.ndarray:
         vectors = [self._hash_embed(t) for t in texts]

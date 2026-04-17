@@ -22,10 +22,6 @@ class Settings(BaseSettings):
     data_dir: str = Field(default_factory=_default_data_dir)
     database_url: str = ""
 
-    openai_enabled: bool = False
-    openai_api_key: str = ""
-    openai_embed_model: str = "text-embedding-3-small"
-    openai_chat_model: str = "gpt-4o-mini"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
     groq_api_key: str = ""

@@ -4095,7 +4095,7 @@ class YouTubeService:
                     extractor_version = "whisper_v1"
                     model_version = (
                         os.environ.get("FASTER_WHISPER_MODEL", "base.en")
-                        if whisper_source == "asr_local" else "whisper-1"
+                        if whisper_source == "asr_local" else "whisper-large-v3"
                     )
                     passes, quality_obj, rejection_reason = self._transcript_passes_quality_gate(
                         transcript, video_duration_sec, source_kind,
@@ -4545,7 +4545,7 @@ class YouTubeService:
         return cues
 
     def _whisper_audio_fallback(self, video_id: str) -> tuple[list[dict[str, Any]], str]:
-        """Download audio via yt-dlp, transcribe with faster-whisper or OpenAI Whisper.
+        """Download audio via yt-dlp, transcribe with faster-whisper or Groq Whisper.
 
         Completely bypasses YouTube's caption/timedtext system.
         Returns ``(transcript, source_kind)`` where source_kind is
@@ -4602,8 +4602,8 @@ class YouTubeService:
             if cues:
                 return cues, "asr_local"
 
-            # Step 3: Try OpenAI Whisper API (paid, ~$0.006/min)
-            cues = self._transcribe_with_openai_whisper(audio_path, video_id)
+            # Step 3: Try Groq Whisper API (via llm_router, whisper-large-v3)
+            cues = self._transcribe_with_groq_whisper(audio_path, video_id)
             if cues:
                 return cues, "asr_api"
 
@@ -4651,48 +4651,37 @@ class YouTubeService:
             logger.warning("faster-whisper failed for %s: %s", video_id, exc)
             return []
 
-    def _transcribe_with_openai_whisper(
+    def _transcribe_with_groq_whisper(
         self, audio_path: str, video_id: str,
     ) -> list[dict[str, Any]]:
-        """OpenAI Whisper API is permanently disabled."""
-        return []
-
-        # Whisper API limit is 25 MiB
+        """Transcribe audio via Groq Whisper (whisper-large-v3) through llm_router."""
+        # Groq's Whisper file limit is 25 MiB (same as OpenAI-compatible endpoint).
         max_size = 24 * 1024 * 1024
         if os.path.getsize(audio_path) > max_size:
             logger.debug("Audio too large for Whisper API (%d bytes), skipping", os.path.getsize(audio_path))
             return []
 
         try:
-            import openai
-            client = openai.OpenAI(api_key=api_key)
-            logger.info("Whisper fallback: transcribing %s with OpenAI Whisper API", video_id)
-            with open(audio_path, "rb") as f:
-                response = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=f,
-                    response_format="verbose_json",
-                    language="en",
-                    timestamp_granularities=["segment"],
-                )
-            # Parse response — may be dict or object
-            if hasattr(response, "segments"):
-                segments = response.segments or []
-            elif isinstance(response, dict):
-                segments = response.get("segments", [])
-            else:
-                segments = []
+            from . import llm_router
+        except ImportError:
+            return []
+
+        try:
+            logger.info("Whisper fallback: transcribing %s with Groq Whisper API", video_id)
+            payload = llm_router.transcribe_audio(audio_path, language="en")
+            if not payload:
+                return []
+            segments = payload.get("segments") if isinstance(payload, dict) else None
+            if not isinstance(segments, list):
+                return []
 
             cues: list[dict[str, Any]] = []
             for seg in segments:
-                if isinstance(seg, dict):
-                    text = seg.get("text", "").strip()
-                    start = float(seg.get("start", 0))
-                    end = float(seg.get("end", 0))
-                else:
-                    text = getattr(seg, "text", "").strip()
-                    start = float(getattr(seg, "start", 0))
-                    end = float(getattr(seg, "end", 0))
+                if not isinstance(seg, dict):
+                    continue
+                text = str(seg.get("text") or "").strip()
+                start = float(seg.get("start") or 0.0)
+                end = float(seg.get("end") or 0.0)
                 if text:
                     cues.append({
                         "text": text,
@@ -4700,10 +4689,10 @@ class YouTubeService:
                         "duration": max(0.0, end - start),
                     })
             if cues:
-                logger.info("OpenAI Whisper success for %s: %d cues", video_id, len(cues))
+                logger.info("Groq Whisper success for %s: %d cues", video_id, len(cues))
             return cues
         except Exception as exc:
-            logger.warning("OpenAI Whisper failed for %s: %s", video_id, exc)
+            logger.warning("Groq Whisper failed for %s: %s", video_id, exc)
             return []
 
     def _fallback_any_transcript(self, video_id: str) -> list[dict[str, Any]]:

@@ -16,8 +16,8 @@ import numpy as np
 
 from ..config import get_settings
 from ..db import DatabaseIntegrityError, dumps_json, fetch_all, fetch_one, now_iso, upsert
+from . import llm_router
 from .concepts import build_takeaways
-from .openai_client import build_openai_client
 from .segmenter import (
     SegmentMatch,
     TranscriptChunk,
@@ -146,6 +146,60 @@ class QueryPlanningResult:
 
 
 RetrievalProfile = Literal["bootstrap", "deep"]
+
+
+class _ChainBufferingEmitter:
+    """Buffer reels belonging to a continuation chain until the chain ends.
+
+    Continuation chains share a ``cluster_group_id``. Reels for an in-progress
+    chain are staged in arrival order; once a different chain (or a
+    chain-less reel) is observed, the previously-buffered chain flushes
+    atomically so the NDJSON stream never interleaves reels inside a chain.
+    ``drop_chain`` flushes the partial prefix when a chain is truncated
+    mid-way; ``flush_all`` is the final safety net.
+    """
+
+    def __init__(self, downstream) -> None:
+        self._downstream = downstream
+        self._buffers: dict[str, list[dict[str, Any]]] = {}
+
+    def emit(self, reel: dict[str, Any], *, chain_id: str) -> None:
+        if self._downstream is None:
+            return
+        if not chain_id:
+            self._flush_others(active_chain_id=None)
+            self._forward(reel)
+            return
+        self._flush_others(active_chain_id=chain_id)
+        self._buffers.setdefault(chain_id, []).append(reel)
+
+    def drop_chain(self, chain_id: str) -> None:
+        if not chain_id:
+            return
+        self._flush_chain(chain_id)
+
+    def flush_all(self) -> None:
+        for chain_id in list(self._buffers.keys()):
+            self._flush_chain(chain_id)
+
+    def _flush_others(self, *, active_chain_id: str | None) -> None:
+        for chain_id in list(self._buffers.keys()):
+            if chain_id != active_chain_id:
+                self._flush_chain(chain_id)
+
+    def _flush_chain(self, chain_id: str) -> None:
+        buffered = self._buffers.pop(chain_id, [])
+        for reel in buffered:
+            self._forward(reel)
+
+    def _forward(self, reel: dict[str, Any]) -> None:
+        try:
+            self._downstream(reel)
+        except Exception:
+            logger.exception(
+                "chain_buffering downstream failed for reel_id=%s",
+                str(reel.get("reel_id") or ""),
+            )
 
 
 class ReelService:
@@ -1185,7 +1239,7 @@ class ReelService:
         settings = get_settings()
         self.embedding_service = embedding_service
         self.youtube_service = youtube_service
-        self.chat_model = settings.openai_chat_model
+        self.chat_model = settings.gemini_model
         self.retrieval_engine_v2_enabled = bool(settings.retrieval_engine_v2_enabled)
         self.retrieval_tier2_enabled = bool(settings.retrieval_tier2_enabled)
         self.retrieval_debug_logging = bool(settings.retrieval_debug_logging)
@@ -1196,17 +1250,7 @@ class ReelService:
         self._strategy_history_cache: dict[str, float] = {}
         self._strategy_history_cache_lock = threading.Lock()
         self._strategy_history_cache_max_size = 10_000
-        allow_openai_serverless = os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1"
-        can_use_openai = (
-            bool(settings.openai_enabled)
-            and bool(settings.openai_api_key)
-            and (not self.serverless_mode or allow_openai_serverless)
-        )
-        self.openai_client = build_openai_client(
-            api_key=settings.openai_api_key,
-            timeout=8.0,
-            enabled=can_use_openai,
-        )
+        self.llm_available = llm_router.gemini_or_groq_available()
         self.topic_expansion_service = TopicExpansionService()
 
     def _reel_scope_where(
@@ -1304,7 +1348,7 @@ class ReelService:
             """,
             (material_id,),
         ) or {}
-        summary_mode = "fallback" if fast_mode or not self.openai_client else f"ai:{self.chat_model}"
+        summary_mode = "fallback" if fast_mode or not self.llm_available else f"ai:{self.chat_model}"
         payload = {
             "version": self.RANKED_FEED_CACHE_VERSION,
             "material_id": material_id,
@@ -1429,6 +1473,7 @@ class ReelService:
                 return
 
         raise_if_cancelled()
+        chain_emitter = _ChainBufferingEmitter(on_reel_created) if on_reel_created is not None else None
         self._min_relevance_threshold = max(0.0, min(1.0, float(min_relevance_threshold)))
         safe_page_hint = max(1, int(page_hint or 1))
         safe_recovery_stage = max(0, int(recovery_stage or 0))
@@ -1658,8 +1703,9 @@ class ReelService:
             allow_bootstrap_subtopic_expansion=not (
                 strict_topic_only
                 and safe_retrieval_profile == "bootstrap"
-                and self._topic_breadth_class(subject_tag) != "curated_broad"
+                and self._topic_breadth_class(subject_tag, conn=conn) != "curated_broad"
             ),
+            conn=conn,
         )
         selected_concept_ids = {plan.concept_id for plan in query_plan.selected_concepts}
         selected_concept_by_id = {
@@ -1761,6 +1807,44 @@ class ReelService:
                     )
                     for query in planned_queries
                 ]
+                # Port v1 ``_build_query_variants`` output into the v2 pool so v2
+                # is a strict superset of v1. Dedup by normalized query key so
+                # variants that already appear (typical case, since both paths
+                # share ``_plan_query_set_for_concepts``) don't inflate the pool.
+                try:
+                    variant_texts = self._build_query_variants(
+                        concept["title"],
+                        concept_keywords,
+                        subject_tag,
+                        context_terms=context_terms,
+                    )
+                except Exception:
+                    logger.exception("v2 variant port: _build_query_variants failed")
+                    variant_texts = []
+                existing_keys = {self._normalize_query_key(qc.text) for qc in query_candidates}
+                for vtext in variant_texts:
+                    key = self._normalize_query_key(vtext)
+                    if not key or key in existing_keys:
+                        continue
+                    query_candidates.append(
+                        QueryCandidate(
+                            text=vtext,
+                            strategy="literal_variant",
+                            confidence=0.55,
+                            source_terms=[concept["title"]],
+                            stage="broad",
+                            weight=0.6,
+                            source_surface="youtube_html",
+                            family_key=self._frontier_family_key(
+                                self.FRONTIER_ROOT_COMPANION, vtext
+                            ),
+                            source_family="other",
+                            anchor_mode="root_companion",
+                            seed_video_id="",
+                            seed_channel_id="",
+                        )
+                    )
+                    existing_keys.add(key)
             else:
                 query_candidates = [
                     QueryCandidate(
@@ -1802,6 +1886,7 @@ class ReelService:
                 subject_tag=subject_tag,
                 page_hint=safe_page_hint,
                 recovery_stage=safe_recovery_stage,
+                conn=conn,
             )
             retrieval_run = self._init_retrieval_debug_run(
                 material_id=material_id,
@@ -1970,11 +2055,12 @@ class ReelService:
                         recovery_stage=safe_recovery_stage,
                         allow_external_fallbacks=allow_adjacent_recovery and stage.name == "recovery",
                         variant_limit=(
-                            (4 if self._topic_breadth_class(subject_tag) == "opaque_niche" else 3)
+                            (4 if self._topic_breadth_class(subject_tag, conn=conn) == "opaque_niche" else 3)
                             if safe_retrieval_profile == "bootstrap"
                             else None
                         ),
                         subject_tag=subject_tag,
+                        conn=conn,
                     )
                     raise_if_cancelled()
 
@@ -2187,6 +2273,7 @@ class ReelService:
                             allow_external_fallbacks=False,
                             variant_limit=1,
                             subject_tag=subject_tag,
+                            conn=conn,
                         )
                         for query_idx, _duration_idx, query_candidate, _duration, videos in recovery_jobs:
                             if query_idx >= len(recovery_reports):
@@ -2350,6 +2437,7 @@ class ReelService:
                         allow_external_fallbacks=True,
                         variant_limit=1,
                         subject_tag=subject_tag,
+                        conn=conn,
                     )
                     for query_idx, _duration_idx, query_candidate, _duration, videos in fallback_jobs:
                         if query_idx >= len(fallback_reports):
@@ -2448,7 +2536,7 @@ class ReelService:
 
             bootstrap_local_recovery = (
                 safe_retrieval_profile == "bootstrap"
-                and self._topic_breadth_class(subject_tag) == "curated_broad"
+                and self._topic_breadth_class(subject_tag, conn=conn) == "curated_broad"
             )
             if not stage_candidates and (allow_adjacent_recovery or bootstrap_local_recovery):
                 local_candidates = self._recover_candidates_from_local_corpus(
@@ -2596,7 +2684,7 @@ class ReelService:
 
             # LLM relevance pre-filter: drops clearly irrelevant candidates before
             # the expensive transcript-fetch step. Only runs in non-fast mode.
-            if not fast_mode and self.openai_client and ranked_candidates:
+            if not fast_mode and self.llm_available and ranked_candidates:
                 pre_filter_count = len(ranked_candidates)
                 ranked_candidates = self._llm_relevance_prefilter(
                     conn,
@@ -2863,6 +2951,10 @@ class ReelService:
                 # skip those gates so a middle sub-part can't drop out and
                 # leave a gap in the chain.
                 active_chain_ids: set[str] = set()
+                # Chains that broke mid-way stay here so a later segment with
+                # the same cluster_group_id cannot re-activate them and leave a
+                # gap in the emitted reel sequence.
+                dead_chain_ids: set[str] = set()
 
                 # Process segments in TEMPORAL order so consecutive clusters
                 # in the video are refined in the same order they appear.
@@ -3082,7 +3174,9 @@ class ReelService:
                     #      and leave a gap in the user-visible reel chain.
                     seg_chain_id = str(getattr(segment, "cluster_group_id", "") or "")
                     is_cross_segment_continuation = (
-                        bool(seg_chain_id) and seg_chain_id in active_chain_ids
+                        bool(seg_chain_id)
+                        and seg_chain_id in active_chain_ids
+                        and seg_chain_id not in dead_chain_ids
                     )
                     is_continuation_chain = (
                         len(clip_windows) > 1 or is_cross_segment_continuation
@@ -3098,6 +3192,9 @@ class ReelService:
                                     str(concept.get("id") or ""),
                                     video_id,
                                 )
+                            if is_continuation_chain:
+                                chain_broken = True
+                                break
                             continue
                         start_sec, end_sec = clip_window
                         clip_key = self._clip_key(video_id, start_sec, end_sec)
@@ -3251,11 +3348,11 @@ class ReelService:
                                 relevance_context=relevance_context,
                             )
                             generated.append(preview)
-                            if on_reel_created is not None:
+                            if chain_emitter is not None:
                                 try:
-                                    on_reel_created(preview)
+                                    chain_emitter.emit(preview, chain_id=seg_chain_id or "")
                                 except Exception:
-                                    logger.exception("on_reel_created callback failed for dry-run reel")
+                                    logger.exception("chain_emitter.emit failed for dry-run reel")
                         else:
                             try:
                                 reel = self._create_reel(
@@ -3281,6 +3378,9 @@ class ReelService:
                                     float(start_sec),
                                     float(end_sec),
                                 )
+                                if is_continuation_chain:
+                                    chain_broken = True
+                                    break
                                 continue
                             if not reel:
                                 if self.retrieval_debug_logging:
@@ -3291,14 +3391,17 @@ class ReelService:
                                         float(start_sec),
                                         float(end_sec),
                                     )
+                                if is_continuation_chain:
+                                    chain_broken = True
+                                    break
                                 continue
                             generated.append(reel)
-                            if on_reel_created is not None:
+                            if chain_emitter is not None:
                                 try:
-                                    on_reel_created(reel)
+                                    chain_emitter.emit(reel, chain_id=seg_chain_id or "")
                                 except Exception:
                                     logger.exception(
-                                        "on_reel_created callback failed for reel_id=%s",
+                                        "chain_emitter.emit failed for reel_id=%s",
                                         str(reel.get("reel_id") or ""),
                                     )
 
@@ -3378,6 +3481,11 @@ class ReelService:
                                 cancel_futures=True,
                             )
                             transcript_prefetch_task = None
+                            if chain_emitter is not None:
+                                try:
+                                    chain_emitter.flush_all()
+                                except Exception:
+                                    logger.exception("chain_emitter.flush_all failed at early finalize")
                             return self._finalize_generated_reels(
                                 generated=generated,
                                 num_reels=num_reels,
@@ -3395,7 +3503,18 @@ class ReelService:
                     # — later sub-parts will run gates on their own merit
                     # (orphan sub-part reels are rare and usually still
                     # represent valid topic content).
-                    if seg_chain_id and segment_produced_accepted_reel:
+                    if seg_chain_id and chain_broken:
+                        dead_chain_ids.add(seg_chain_id)
+                        active_chain_ids.discard(seg_chain_id)
+                        if chain_emitter is not None:
+                            try:
+                                chain_emitter.drop_chain(seg_chain_id)
+                            except Exception:
+                                logger.exception(
+                                    "chain_emitter.drop_chain failed for chain_id=%s",
+                                    seg_chain_id,
+                                )
+                    elif seg_chain_id and segment_produced_accepted_reel:
                         active_chain_ids.add(seg_chain_id)
 
                     if hit_video_cap:
@@ -3428,6 +3547,11 @@ class ReelService:
                 cancel_futures=True,
             )
             material_seen_video_ids.update(seen_video_ids)
+        if chain_emitter is not None:
+            try:
+                chain_emitter.flush_all()
+            except Exception:
+                logger.exception("chain_emitter.flush_all failed at end of generate_reels")
         return self._finalize_generated_reels(
             generated=generated,
             num_reels=num_reels,
@@ -3628,7 +3752,7 @@ class ReelService:
             return 6 if fast_mode else 9
         return 8 if fast_mode else 12
 
-    def _topic_breadth_class(self, subject_tag: str | None) -> str:
+    def _topic_breadth_class(self, subject_tag: str | None, *, conn: Any = None) -> str:
         cleaned = self._clean_query_text(subject_tag or "")
         subject_key = self._normalize_query_key(cleaned)
         if not subject_key:
@@ -3640,25 +3764,81 @@ class ReelService:
                 *self.BROAD_TOPIC_SUBTOPICS.keys(),
             )
         }:
-            return "curated_broad"
-        likely_language = False
-        try:
-            likely_language = bool(self.topic_expansion_service._looks_like_language_topic(cleaned))
-        except Exception:
+            rules_class = "curated_broad"
+        else:
             likely_language = False
-        try:
-            opaque_topic = bool(
-                self.topic_expansion_service._is_opaque_single_token_topic(
-                    cleaned,
-                    canonical_topic=cleaned,
-                    likely_language=likely_language,
+            try:
+                likely_language = bool(self.topic_expansion_service._looks_like_language_topic(cleaned))
+            except Exception:
+                likely_language = False
+            try:
+                opaque_topic = bool(
+                    self.topic_expansion_service._is_opaque_single_token_topic(
+                        cleaned,
+                        canonical_topic=cleaned,
+                        likely_language=likely_language,
+                    )
                 )
+            except Exception:
+                opaque_topic = False
+            rules_class = "opaque_niche" if opaque_topic else "default"
+        return self._merge_breadth_class_with_llm(
+            cleaned,
+            subject_key=subject_key,
+            rules_class=rules_class,
+            conn=conn,
+        )
+
+    def _merge_breadth_class_with_llm(
+        self,
+        cleaned: str,
+        *,
+        subject_key: str,
+        rules_class: str,
+        conn: Any,
+    ) -> str:
+        if conn is None or not cleaned:
+            return rules_class
+        try:
+            raw = llm_router.chat_completion(
+                conn=conn,
+                cache_key=f"breadth_class:v1:{subject_key}",
+                system=(
+                    "Classify a search-topic's breadth for a video retrieval system. "
+                    "Return JSON {\"class\": \"curated_broad\"|\"opaque_niche\"|\"default\", "
+                    "\"confidence\": 0.0-1.0}. curated_broad = common broad topic (e.g. "
+                    "'machine learning', 'cooking'); opaque_niche = obscure/single-term niche "
+                    "topic (e.g. 'paleography', 'triboelectric'); default = neither."
+                ),
+                user=cleaned,
+                temperature=0.0,
+                json_mode=True,
             )
         except Exception:
-            opaque_topic = False
-        if opaque_topic:
+            logger.exception("breadth_class LLM call failed for %s", subject_key)
+            return rules_class
+        if not raw:
+            return rules_class
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            return rules_class
+        llm_class = str(payload.get("class") or "").strip().lower()
+        try:
+            confidence = float(payload.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if llm_class not in {"curated_broad", "opaque_niche", "default"}:
+            return rules_class
+        if rules_class == "curated_broad" and llm_class != "curated_broad" and confidence >= 0.75:
+            return "default"
+        if rules_class == "default" and llm_class == "curated_broad" and confidence >= 0.7:
+            return "curated_broad"
+        if rules_class == "default" and llm_class == "opaque_niche" and confidence >= 0.7:
             return "opaque_niche"
-        return "default"
+        if rules_class == "opaque_niche" and llm_class != "opaque_niche" and confidence >= 0.75:
+            return "default"
+        return rules_class
 
     def _topic_novelty_profile(
         self,
@@ -3666,8 +3846,9 @@ class ReelService:
         subject_tag: str | None,
         retrieval_profile: RetrievalProfile,
         fast_mode: bool,
+        conn: Any = None,
     ) -> dict[str, float]:
-        breadth_class = self._topic_breadth_class(subject_tag)
+        breadth_class = self._topic_breadth_class(subject_tag, conn=conn)
         technical_tokens = set(
             str(token or "").strip().lower()
             for token in (
@@ -4619,6 +4800,7 @@ class ReelService:
         fast_mode: bool,
         targeted_concept_id: str | None,
         subject_tag: str | None = None,
+        conn: Any = None,
     ) -> tuple[tuple[dict[str, Any], ...], tuple[ConceptSelectionDecision, ...], bool]:
         if not concepts:
             return (), (), False
@@ -4631,7 +4813,7 @@ class ReelService:
             budget_reason = "serverless concept budget"
         elif retrieval_profile == "bootstrap":
             bootstrap_cap = self.BOOTSTRAP_CONCEPT_LIMIT
-            if self._topic_breadth_class(subject_tag) == "curated_broad":
+            if self._topic_breadth_class(subject_tag, conn=conn) == "curated_broad":
                 bootstrap_cap = max(bootstrap_cap, 6)
             concept_limit = max(1, min(bootstrap_cap, request_need + (1 if request_need <= 2 else 0)))
             budget_reason = f"bootstrap concept budget {concept_limit} for request need {request_need}"
@@ -4832,13 +5014,9 @@ class ReelService:
             cached = self._strategy_history_cache.get(cache_key)
         if cached is not None:
             return cached if cached != "_none_" else None
-        settings = get_settings()
-        if not (settings.openai_enabled and settings.openai_api_key):
+        if not self.llm_available:
             return None
         try:
-            client = build_openai_client(api_key=settings.openai_api_key, timeout=8.0, enabled=True)
-            if client is None:
-                return None
             valid_types = ["tutorial", "explained", "lecture", "worked example", "animation", "documentary", "demo"]
             prompt = (
                 f"Given the study concept '{title}' (keywords: {', '.join(keywords[:5])}, "
@@ -4847,13 +5025,12 @@ class ReelService:
                 f"Choose exactly one: {', '.join(valid_types)}. "
                 f"Reply with just the type name."
             )
-            response = client.chat.completions.create(
-                model=settings.openai_chat_model or "gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
+            answer = (llm_router.chat_completion(
+                system="You pick the best YouTube content format for a study concept.",
+                user=prompt,
                 temperature=0.2,
                 max_tokens=20,
-            )
-            answer = (response.choices[0].message.content or "").strip().lower()
+            ) or "").strip().lower()
             for vt in valid_types:
                 if vt in answer:
                     result = ConceptIntentPlan(
@@ -5003,13 +5180,9 @@ class ReelService:
 
     def _expand_synonyms_via_llm(self, terms: list[str]) -> list[str] | None:
         """Fix K: Use LLM to generate richer query synonyms in slow mode."""
-        settings = get_settings()
-        if not (settings.openai_enabled and settings.openai_api_key):
+        if not self.llm_available:
             return None
         try:
-            client = build_openai_client(api_key=settings.openai_api_key, timeout=8.0, enabled=True)
-            if client is None:
-                return None
             cleaned_terms = [t.strip() for t in terms if t.strip()][:5]
             if not cleaned_terms:
                 return None
@@ -5018,13 +5191,12 @@ class ReelService:
                 f"Generate 4-6 alternative search phrases that would find educational YouTube videos "
                 f"teaching the same concepts. Return one phrase per line, no numbering."
             )
-            response = client.chat.completions.create(
-                model=settings.openai_chat_model or "gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
+            content = (llm_router.chat_completion(
+                system="You generate alternative educational search phrases.",
+                user=prompt,
                 temperature=0.4,
                 max_tokens=200,
-            )
-            content = (response.choices[0].message.content or "").strip()
+            ) or "").strip()
             synonyms = [line.strip() for line in content.split("\n") if line.strip() and len(line.strip()) > 2]
             return synonyms[:8] if synonyms else None
         except Exception:
@@ -5039,7 +5211,7 @@ class ReelService:
         subject_tag: str | None,
     ) -> list[str] | None:
         """Generate broader parent topics for niche/specific concepts that lack hardcoded expansions."""
-        if self.openai_client is None:
+        if not self.llm_available:
             return None
         try:
             subject_hint = f" within {subject_tag}" if subject_tag else ""
@@ -5053,13 +5225,14 @@ class ReelService:
                 f"Also include 2-3 closely related or prerequisite concepts.\n"
                 f"One topic per line, no numbering or explanation."
             )
-            response = self.openai_client.chat.completions.create(
-                model=self.chat_model,
-                messages=[{"role": "user", "content": prompt}],
+            content = llm_router.chat_completion(
+                system="You expand study concepts into real YouTube topics.",
+                user=prompt,
                 temperature=0.3,
                 max_tokens=250,
             )
-            content = (response.choices[0].message.content or "").strip()
+            if not content:
+                return None
             terms = [line.strip() for line in content.split("\n") if line.strip() and len(line.strip()) > 2]
             return terms[:8] if terms else None
         except Exception:
@@ -5584,6 +5757,7 @@ class ReelService:
         request_need: int,
         targeted_concept_id: str | None,
         allow_bootstrap_subtopic_expansion: bool = True,
+        conn: Any = None,
     ) -> QueryPlanningResult:
         # preferred_video_duration is now used below for pool-mode query hints.
         selected_concepts, selection_decisions, exhausted = self._select_concepts(
@@ -5593,6 +5767,7 @@ class ReelService:
             fast_mode=fast_mode,
             targeted_concept_id=targeted_concept_id,
             subject_tag=subject_tag,
+            conn=conn,
         )
         selected_ids = {str(concept.get("id") or "") for concept in selected_concepts}
         selected_plans: list[ConceptQueryPlan] = []
@@ -5804,6 +5979,7 @@ class ReelService:
         subject_tag: str | None = None,
         page_hint: int = 1,
         recovery_stage: int = 0,
+        conn: Any = None,
     ) -> list[RetrievalStagePlan]:
         stage_map: dict[str, list[QueryCandidate]] = {"high_precision": [], "broad": [], "recovery": []}
         allowed_families = self._allowed_frontier_families(
@@ -5857,7 +6033,7 @@ class ReelService:
             else:
                 high_precision_budget = 2 if fast_mode else 3
                 high_precision_min = 2 if fast_mode else 3
-            breadth_class = self._topic_breadth_class(subject_tag)
+            breadth_class = self._topic_breadth_class(subject_tag, conn=conn)
             if breadth_class == "opaque_niche":
                 slow_base_broad_budget = 2
                 slow_max_broad_budget = 4
@@ -5963,9 +6139,10 @@ class ReelService:
         page_hint: int,
         recovery_stage: int,
         subject_tag: str | None = None,
+        conn: Any = None,
     ) -> Literal["off", "light", "deep"]:
         if retrieval_profile == "bootstrap":
-            if subject_tag and self._topic_breadth_class(subject_tag) == "opaque_niche":
+            if subject_tag and self._topic_breadth_class(subject_tag, conn=conn) == "opaque_niche":
                 return "light"
             return "off"
         if not self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage):
@@ -5991,6 +6168,7 @@ class ReelService:
         allow_external_fallbacks: bool = True,
         variant_limit: int | None = None,
         subject_tag: str | None = None,
+        conn: Any = None,
     ) -> list[tuple[int, int, QueryCandidate, str | None, list[dict[str, Any]]]]:
         jobs: list[tuple[int, int, QueryCandidate, str | None]] = []
         has_any_duration = None in stage_duration_plan
@@ -6027,6 +6205,7 @@ class ReelService:
                         page_hint=page_hint,
                         recovery_stage=recovery_stage,
                         subject_tag=subject_tag,
+                        conn=conn,
                     ),
                     root_terms=list(query_candidate.source_terms),
                 )
@@ -6055,6 +6234,7 @@ class ReelService:
                         page_hint=page_hint,
                         recovery_stage=recovery_stage,
                         subject_tag=subject_tag,
+                        conn=conn,
                     ),
                     list(query_candidate.source_terms),
                 ): (query_idx, duration_idx, query_candidate, duration)
@@ -7818,6 +7998,7 @@ class ReelService:
             subject_tag=subject_tag,
             retrieval_profile=retrieval_profile,
             fast_mode=fast_mode,
+            conn=conn,
         )
         same_video_threshold = float(thresholds.get("same_video_similarity") or 0.88)
         current_text = str(clip_context.get("text") or "")
@@ -8073,9 +8254,10 @@ class ReelService:
     ) -> list[dict[str, Any]]:
         """Filter candidates using an LLM. Drops clearly irrelevant videos.
 
-        Only runs when ``self.openai_client`` is available.  On any failure,
-        all candidates pass through (graceful degradation).  Results are cached
-        in ``llm_cache`` to avoid repeated API calls for the same candidate set.
+        Only runs when an LLM backend (Gemini or Groq) is available.  On any
+        failure, all candidates pass through (graceful degradation).  Results
+        are cached in ``llm_cache`` to avoid repeated API calls for the same
+        candidate set.
 
         For concepts in ``AMBIGUOUS_CONCEPT_TOKENS`` (e.g. "calculus", which
         could refer to math or dental deposits or a movie title), the prompt
@@ -8083,7 +8265,7 @@ class ReelService:
         tightened — candidates omitted by the LLM are treated as rejections,
         not passes, and the confidence floor is raised.
         """
-        if not self.openai_client or not candidates:
+        if not self.llm_available or not candidates:
             return candidates
 
         # Ambiguity detection keys off both the subject_tag and the concept
@@ -8149,19 +8331,12 @@ class ReelService:
                 if cached and cached.get("response_json"):
                     ratings = json.loads(cached["response_json"])
                 else:
-                    response = self.openai_client.chat.completions.create(
-                        model=self.chat_model,
+                    raw = llm_router.chat_completion(
+                        system="You are an educational content classifier. Always respond with valid JSON.",
+                        user=user_prompt,
                         temperature=0.0,
-                        response_format={"type": "json_object"},
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": "You are an educational content classifier. Always respond with valid JSON.",
-                            },
-                            {"role": "user", "content": user_prompt},
-                        ],
-                    )
-                    raw = response.choices[0].message.content or "{}"
+                        json_mode=True,
+                    ) or "{}"
                     ratings = json.loads(raw)
                     upsert(
                         conn,
@@ -8849,7 +9024,7 @@ class ReelService:
         base_expansion: dict[str, Any],
         observed_examples: list[dict[str, str]],
     ) -> dict[str, Any]:
-        if self.openai_client is None:
+        if not self.llm_available:
             return {}
 
         observed_block = "\n".join(
@@ -8904,16 +9079,13 @@ class ReelService:
             "- no numbering, prose, or markdown"
         )
         try:
-            response = self.openai_client.chat.completions.create(
-                model=self.chat_model,
+            raw = llm_router.chat_completion(
+                system=system_prompt,
+                user=user_prompt,
                 temperature=0.2,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            payload = json.loads(response.choices[0].message.content or "{}")
+                json_mode=True,
+            ) or "{}"
+            payload = json.loads(raw)
             if not isinstance(payload, dict):
                 return {}
             sanitized = self._sanitize_topic_expansion_payload(payload, subject_tag=subject_tag)
@@ -10901,7 +11073,7 @@ class ReelService:
                 pass
 
         summary = fallback
-        if self.openai_client:
+        if self.llm_available:
             prompt = (
                 "Write a brief study summary of this video clip in 1-2 sentences.\n"
                 "Keep it concrete and under 220 characters.\n"
@@ -10913,18 +11085,12 @@ class ReelService:
                 f"Takeaways: {'; '.join(takeaways[:4]) or 'N/A'}"
             )
             try:
-                response = self.openai_client.chat.completions.create(
-                    model=self.chat_model,
+                generated = llm_router.chat_completion(
+                    system="You write concise educational summaries.",
+                    user=prompt,
                     temperature=0.2,
-                    messages=[
-                        {
-                            "role": "system",
-                            "content": "You write concise educational summaries.",
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                )
-                generated = (response.choices[0].message.content or "").strip()
+                ) or ""
+                generated = generated.strip()
                 if generated:
                     compact = " ".join(generated.split())
                     summary = compact[:320].strip() or fallback

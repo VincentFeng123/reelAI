@@ -53,7 +53,7 @@ class IngestFeedRequest(BaseModel):
     language: str = Field(default="en", min_length=2, max_length=8)
 
 
-WordSourceLiteral = Literal["whisper", "openai", "proportional", "legacy"]
+WordSourceLiteral = Literal["whisper", "openai", "groq", "proportional", "legacy"]
 
 
 class IngestTranscriptWord(BaseModel):

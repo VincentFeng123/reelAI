@@ -42,7 +42,7 @@ Pipeline:
         `YouTubeService.get_transcript`.
     4.  If Short: return [].
     5.  If long-form:
-          (a) Ask gpt-4o-mini to identify topic boundaries by CUE INDEX (we send
+          (a) Ask Gemini (Groq fallback) to identify topic boundaries by CUE INDEX (we send
               the transcript with explicit `[idx mm:ss]` prefixes so the model
               cannot hallucinate timestamps it didn't see). Parse the JSON
               response into (start_idx, end_idx, label) triples.
@@ -99,9 +99,10 @@ MAX_TOPIC_REEL_SEC = 12 * 60
 # mid-sentence.
 SNAP_TOLERANCE_SEC = 1.5
 
-# Default LLM model. Mirrors `Settings.openai_chat_model`. Cheap, fast, fits
-# any single-video transcript in one call.
-DEFAULT_MODEL = "gpt-4o-mini"
+# Default LLM model label (retained for logging). Actual inference runs on
+# Gemini Flash with Groq/Llama fallback — see `_build_gemini_client()` and
+# `_build_groq_client()` below.
+DEFAULT_MODEL = "gemini-2.0-flash"
 
 # Hard cap on transcript cues sent to the LLM. ~6000 cues ≈ 8 hours of speech;
 # beyond that we fall back to the heuristic (and warn) rather than risk a
@@ -787,40 +788,6 @@ def _parse_llm_segments_json(raw: str) -> list[_SegmentTuple]:
                 pass
         out.append((s, e, label, summary, relevance))
     return out
-
-
-def _llm_topic_segments(
-    cues: Sequence[TranscriptCue],
-    *,
-    openai_client: Any,
-    model: str = DEFAULT_MODEL,
-    query: str | None = None,
-) -> list[_SegmentTuple]:
-    """
-    Ask the LLM to identify topic boundaries by timestamp.
-
-    Returns a list of (start_time, end_time, label, summary, relevance).
-    May raise on API errors so the caller can fall back.
-    """
-    rendered = _render_transcript_for_llm(cues)
-    system_prompt = _build_system_prompt(query=query)
-    user_msg = (
-        "Here is the full transcript of a long-form YouTube video. "
-        "Identify topic segments per the rules in the system prompt.\n\n"
-        f"{rendered}"
-    )
-
-    response = openai_client.chat.completions.create(
-        model=model,
-        temperature=0.1,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ],
-    )
-    raw = response.choices[0].message.content or "{}"
-    return _parse_llm_segments_json(raw)
 
 
 # --------------------------------------------------------------------------- #
@@ -2250,7 +2217,6 @@ def cut_video_into_topic_reels(
     *,
     query: str | None = None,
     duration_sec: float | None = None,
-    openai_client: Any | None = None,
     model: str = DEFAULT_MODEL,
     use_llm: bool = True,
     refine_boundaries: bool = True,
@@ -2272,8 +2238,9 @@ def cut_video_into_topic_reels(
         1. **YouTube chapters** from `info_dict["chapters"]` — creator-authored,
            free, deterministic. When chapters exist we use them DIRECTLY and
            skip the LLM/heuristic entirely.
-        2. **LLM topic segmentation** via `openai_client.chat.completions` —
-           skipped when `use_llm=False` or no client is available.
+        2. **LLM topic segmentation** via Gemini Flash (primary) with Groq
+           Llama fallback — skipped when `use_llm=False` or neither provider
+           is configured.
         3. **Lexical-novelty heuristic** — pure-Python Jaccard sliding window,
            no API needed. Always available as the final fallback.
 
@@ -2282,11 +2249,10 @@ def cut_video_into_topic_reels(
         duration_sec: Optional duration in seconds — if you already have it
             from the HTML scraper (`_video_row_from_renderer["duration_sec"]`)
             pass it through; otherwise duration is inferred from the transcript.
-        openai_client: Optional pre-built OpenAI client. If None and `use_llm`
-            is True, this function tries to build one from `OPENAI_API_KEY`.
-        model: Chat model to use. Defaults to `gpt-4o-mini`.
+        model: Chat model label retained for logging only; Gemini and Groq
+            models are configured via their own env vars.
         use_llm: If False, skip the LLM call and use the heuristic fallback
-            even when an OpenAI client is available. Useful for offline runs.
+            even when an LLM provider is available. Useful for offline runs.
         transcript: Optional pre-fetched transcript cues. When provided, the
             function skips its internal `fetch_transcript` call. This is the
             integration point used by `IngestionPipeline.ingest_topic_cut`,
@@ -2389,8 +2355,8 @@ def cut_video_into_topic_reels(
         return classification, []
 
     # ---- Path 2: LLM topic segmentation (timestamp-based). ------------- #
-    # Fallback chain: Gemini Flash (free) → Groq/Llama 3 (free) → OpenAI (paid)
-    # LLM functions now return timestamp-based _SegmentTuples, not cue indices.
+    # Fallback chain: Gemini Flash (free) → Groq/Llama 3 (free)
+    # LLM functions return timestamp-based _SegmentTuples, not cue indices.
     llm_segments: list[_SegmentTuple] = []
     used_llm = False
 
@@ -2431,24 +2397,7 @@ def cut_video_into_topic_reels(
                         )
                 except Exception:  # noqa: BLE001
                     logger.exception(
-                        "Groq topic segmentation failed for video %s; trying OpenAI next",
-                        video_id,
-                    )
-                    llm_segments = []
-
-        # 2c: OpenAI (paid, optional last resort for LLM path)
-        if not llm_segments:
-            client = openai_client or _maybe_build_openai_client()
-            if client:
-                try:
-                    llm_segments = _llm_topic_segments(
-                        transcript, openai_client=client, model=model, query=query,
-                    )
-                    if llm_segments:
-                        used_llm = True
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "OpenAI topic segmentation failed for video %s; trying semantic path",
+                        "Groq topic segmentation failed for video %s; falling back to semantic path",
                         video_id,
                     )
                     llm_segments = []
@@ -2538,11 +2487,6 @@ def cut_video_into_topic_reels(
     return classification, reels
 
 
-def _maybe_build_openai_client() -> Any | None:
-    """OpenAI integration is permanently disabled."""
-    return None
-
-
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -2586,7 +2530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--model",
         default=DEFAULT_MODEL,
-        help=f"OpenAI chat model (default: {DEFAULT_MODEL})",
+        help=f"LLM label for logging (default: {DEFAULT_MODEL})",
     )
     parser.add_argument(
         "--no-llm",

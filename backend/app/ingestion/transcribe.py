@@ -8,12 +8,12 @@ Transcript extraction with a four-strategy fallback chain:
        most English YouTube videos land here.
     3. faster-whisper running LOCALLY on the extracted audio. Free; runs on
        CPU via CTranslate2; downloads a small model (~80 MB for `base.en`) on
-       first use to `~/.cache/huggingface/hub/`. Tried before the paid OpenAI
-       path so users without an OpenAI key still get usable transcripts.
+       first use to `~/.cache/huggingface/hub/`. Tried before the remote Groq
+       path so users without a Groq key still get usable transcripts.
        Skipped silently if `faster-whisper` is not installed.
-    4. Fallback: OpenAI Whisper API (`whisper-1`) on the extracted audio. Paid
-       (~$0.006/min) but works on anything that has speech. Used only when
-       both 1-3 fail OR an OpenAI client is explicitly preferred.
+    4. Fallback: Groq Whisper API (`whisper-large-v3`) on the extracted audio,
+       routed through `services.llm_router.transcribe_audio`. Used only when
+       strategies 1-3 fail.
 
 Results are cached in the existing `llm_cache` table under key
 `ingest_transcript:{platform}:{source_id}` so repeated ingests of the same URL skip
@@ -31,7 +31,7 @@ from typing import Any
 
 from ..db import DatabaseIntegrityError, dumps_json, fetch_one, loads_json, now_iso, upsert
 from ..services.transcript_validation import validate_transcript
-from .errors import ServerlessUnavailable, TranscriptionError
+from .errors import TranscriptionError
 from .ffmpeg_tools import extract_audio_wav
 from .logging_config import get_ingest_logger, log_event
 from .models import IngestTranscriptCue, IngestTranscriptWord, PlatformLiteral, WordSourceLiteral
@@ -39,7 +39,7 @@ from .models import IngestTranscriptCue, IngestTranscriptWord, PlatformLiteral, 
 logger: logging.Logger = get_ingest_logger(__name__)
 
 _TRANSCRIPT_CACHE_PREFIX = "ingest_transcript:"
-_WHISPER_MODEL = "whisper-1"
+_WHISPER_MODEL = "whisper-large-v3"
 _WHISPER_MAX_FILE_BYTES = 24 * 1024 * 1024  # 24 MiB (Whisper API caps at 25 MiB)
 
 # faster-whisper local model size. Override with FASTER_WHISPER_MODEL env var.
@@ -107,7 +107,7 @@ def _deserialize_cues(raw: Any) -> list[IngestTranscriptCue]:
             word_source_raw = str(item.get("word_source") or "legacy")
             word_source: WordSourceLiteral = (
                 word_source_raw  # type: ignore[assignment]
-                if word_source_raw in ("whisper", "openai", "proportional", "legacy")
+                if word_source_raw in ("whisper", "openai", "groq", "proportional", "legacy")
                 else "legacy"
             )
             cues.append(
@@ -358,7 +358,7 @@ def _load_faster_whisper_model() -> Any | None:
     """
     Lazy-load and cache the faster-whisper model. Returns None if the package
     isn't installed or model loading fails — every caller is expected to
-    handle None gracefully and fall through to the OpenAI Whisper API path.
+    handle None gracefully and fall through to the Groq Whisper API path.
 
     The first call downloads the model (~80 MB for base.en) to
     `~/.cache/huggingface/hub/`. Subsequent calls reuse the cached weights so
@@ -401,7 +401,7 @@ def _faster_whisper_transcribe(
     Returns:
       * `list[IngestTranscriptCue]` on success.
       * None if faster-whisper isn't installed or the model fails to load —
-        the caller falls through to the OpenAI Whisper API path.
+        the caller falls through to the Groq Whisper API path.
       * Raises TranscriptionError if the model loaded but the transcription
         itself failed (e.g. corrupt audio file). The caller treats this as
         a hard failure for this strategy and moves on.
@@ -481,24 +481,26 @@ def _faster_whisper_transcribe(
 
 
 # --------------------------------------------------------------------- #
-# Strategy 4: OpenAI Whisper API
+# Strategy 4: Groq Whisper API (via services.llm_router)
 # --------------------------------------------------------------------- #
 
 
 def _whisper_transcribe(
     audio_path: Path,
     *,
-    openai_client: Any,
     language: str,
 ) -> list[IngestTranscriptCue]:
     """
-    Upload the wav to OpenAI Whisper API and return timestamped cues. Kept as a module-level
-    function so tests can `patch.object(transcribe, "_whisper_transcribe", ...)` without
-    spinning up the full pipeline.
+    Upload the wav to Groq Whisper API (whisper-large-v3) and return timestamped
+    cues. Kept as a module-level function so tests can
+    `patch.object(transcribe, "_whisper_transcribe", ...)` without spinning up
+    the full pipeline.
     """
-    if openai_client is None:
+    from ..services import llm_router
+
+    if not llm_router.gemini_or_groq_available():
         raise TranscriptionError(
-            "Whisper fallback requested but no OpenAI client is configured",
+            "Whisper fallback requested but no Groq API key is configured",
         )
 
     try:
@@ -514,57 +516,36 @@ def _whisper_transcribe(
         )
 
     try:
-        with open(audio_path, "rb") as f:
-            # Phase A.1: request both segment- and word-level timestamps.
-            # OpenAI's whisper-1 returns a flat `words` array on the completion
-            # object when word granularity is requested; we distribute those
-            # words into segments by time containment below.
-            completion = openai_client.audio.transcriptions.create(
-                model=_WHISPER_MODEL,
-                file=f,
-                response_format="verbose_json",
-                language=language if language else None,
-                timestamp_granularities=["segment", "word"],
-            )
+        completion = llm_router.transcribe_audio(
+            str(audio_path),
+            language=language if language else None,
+        )
     except Exception as exc:
         raise TranscriptionError("Whisper API call failed", detail=str(exc)) from exc
 
-    segments = getattr(completion, "segments", None)
-    if segments is None and isinstance(completion, dict):
-        segments = completion.get("segments")
+    if not isinstance(completion, dict):
+        raise TranscriptionError("Whisper returned no usable response")
+
+    segments = completion.get("segments")
     if not segments:
-        raw_text = getattr(completion, "text", None) or (completion.get("text") if isinstance(completion, dict) else "")
+        raw_text = completion.get("text")
         if not raw_text:
             raise TranscriptionError("Whisper returned no segments and no text")
         cue = IngestTranscriptCue(
             start=0.0,
             end=max(1.0, float(audio_path.stat().st_size) / 32000.0),
             text=str(raw_text).strip(),
-            word_source="openai",
+            word_source="groq",
         )
         _fill_proportional_words(cue)
         return [cue]
 
-    # Extract the flat word list (available when timestamp_granularities includes "word").
-    words_payload = getattr(completion, "words", None)
-    if words_payload is None and isinstance(completion, dict):
-        words_payload = completion.get("words")
+    words_payload = completion.get("words")
     flat_words: list[dict[str, Any]] = []
     if isinstance(words_payload, list):
         for w in words_payload:
             if isinstance(w, dict):
                 flat_words.append(w)
-            else:
-                try:
-                    flat_words.append(
-                        {
-                            "start": float(getattr(w, "start", 0.0)),
-                            "end": float(getattr(w, "end", 0.0)),
-                            "word": getattr(w, "word", None) or getattr(w, "text", None) or "",
-                        }
-                    )
-                except Exception:
-                    continue
     flat_words.sort(key=lambda w: float(w.get("start") or 0.0))
 
     def _words_in(start_t: float, end_t: float) -> list[IngestTranscriptWord]:
@@ -588,7 +569,7 @@ def _whisper_transcribe(
                         start=ws,
                         end=max(we, ws + 0.01),
                         text=token,
-                        confidence=None,  # OpenAI whisper-1 doesn't return per-word confidence
+                        confidence=None,
                     )
                 )
             except Exception:
@@ -597,21 +578,18 @@ def _whisper_transcribe(
 
     cues: list[IngestTranscriptCue] = []
     for segment in segments:
-        if isinstance(segment, dict):
-            start = float(segment.get("start", 0.0))
-            end = float(segment.get("end", start))
-            text = str(segment.get("text", "")).strip()
-        else:
-            start = float(getattr(segment, "start", 0.0))
-            end = float(getattr(segment, "end", start))
-            text = str(getattr(segment, "text", "")).strip()
+        if not isinstance(segment, dict):
+            continue
+        start = float(segment.get("start", 0.0))
+        end = float(segment.get("end", start))
+        text = str(segment.get("text", "")).strip()
         if not text:
             continue
         cue = IngestTranscriptCue(
             start=start,
             end=max(end, start + 0.01),
             text=text,
-            word_source="openai",
+            word_source="groq",
         )
         cue.words = _words_in(start, max(end, start + 0.01))
         if not cue.words:
@@ -654,10 +632,8 @@ def transcribe(
     video_path: Path,
     workspace: Path,
     youtube_service: Any,
-    openai_client: Any,
     language: str = "en",
     serverless_mode: bool = False,
-    allow_openai_in_serverless: bool = False,
     video_duration_sec: float | None = None,
 ) -> list[IngestTranscriptCue]:
     """
@@ -668,7 +644,7 @@ def transcribe(
       (2) YouTube service (yt platform only) — reuses existing cache
       (3) yt-dlp scraped subtitles from the info_dict
       (4) faster-whisper running LOCALLY (free, no API)
-      (5) OpenAI Whisper API fallback (paid, refused in SERVERLESS_MODE unless overridden)
+      (5) Groq Whisper API fallback (whisper-large-v3 via llm_router)
 
     When `video_duration_sec` is provided, each strategy's output is checked for
     transcript coverage (last cue end / video duration). If coverage is below 85%,
@@ -677,6 +653,7 @@ def transcribe(
 
     Raises `TranscriptionError` if every strategy fails AND Whisper is unavailable.
     """
+    from ..services import llm_router
     MIN_COVERAGE = 0.85
     cache_key = _cache_key(platform, source_id, language)
 
@@ -733,9 +710,9 @@ def transcribe(
         return accepted
 
     # Strategy 4: faster-whisper running LOCALLY (free, no API).
-    # We try this BEFORE the paid OpenAI Whisper API so users without an
-    # OpenAI key still get usable transcripts. Skipped silently if the package
-    # isn't installed — the OpenAI path picks up the slack.
+    # We try this BEFORE the remote Groq Whisper API so users without a Groq
+    # key still get usable transcripts. Skipped silently if the package isn't
+    # installed — the Groq path picks up the slack.
     audio_path = workspace / "audio_16k.wav"
     audio_extracted = False
 
@@ -775,25 +752,12 @@ def transcribe(
                     return accepted
     except TranscriptionError:
         logger.exception(
-            "faster-whisper transcribe failed for %s:%s; falling back to OpenAI Whisper",
+            "faster-whisper transcribe failed for %s:%s; falling back to Groq Whisper",
             platform, source_id,
         )
 
-    # Strategy 5: OpenAI Whisper API fallback (paid)
-    if serverless_mode and not allow_openai_in_serverless:
-        # Before failing, check if we have a best-effort result from earlier strategies.
-        if best_cues:
-            logger.warning(
-                "Whisper unavailable in serverless mode; returning best-effort transcript "
-                "(%.0f%% coverage, %d cues)",
-                best_coverage * 100, len(best_cues),
-            )
-            _store_cache(conn, cache_key, best_cues)
-            return best_cues
-        raise ServerlessUnavailable(
-            "Whisper fallback is unavailable in serverless mode. Set ALLOW_OPENAI_IN_SERVERLESS=1 to override."
-        )
-    if openai_client is None:
+    # Strategy 5: Groq Whisper API fallback (whisper-large-v3)
+    if not llm_router.gemini_or_groq_available():
         # Return best-effort result if we have one, even if coverage is low.
         if best_cues:
             logger.warning(
@@ -804,11 +768,11 @@ def transcribe(
             _store_cache(conn, cache_key, best_cues)
             return best_cues
         raise TranscriptionError(
-            "No transcript available from platform sources and neither faster-whisper nor OpenAI Whisper is configured."
+            "No transcript available from platform sources and neither faster-whisper nor Groq Whisper is configured."
         )
 
     _ensure_audio_extracted()
-    cues = _whisper_transcribe(audio_path, openai_client=openai_client, language=language)
+    cues = _whisper_transcribe(audio_path, language=language)
     _store_cache(conn, cache_key, cues)
     log_event(
         logger,

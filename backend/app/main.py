@@ -105,9 +105,9 @@ from .models import (
 )
 from .services.email import send_welcome_email
 from .services.embeddings import EmbeddingService
+from .services.liveness import is_video_alive
 from .services.material_intelligence import MaterialIntelligenceService
 from .services.parsers import ParseError, extract_text_from_file
-from .services.openai_client import build_openai_client
 from .services import progress_bus
 from .services.reels import GenerationCancelledError, ReelService
 from .services.storage import get_storage
@@ -263,23 +263,9 @@ youtube_service = YouTubeService()
 reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service)
 SERVERLESS_MODE = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
 
-# Longer-timeout OpenAI client for the ingestion pipeline (Whisper uploads + AI summaries
-# need more than the 8s budget EmbeddingService uses). Gated behind the same SERVERLESS_MODE
-# check the rest of the codebase uses; the pipeline itself also refuses to run in serverless
-# unless ALLOW_OPENAI_IN_SERVERLESS=1 is set.
-_ingest_openai_client = build_openai_client(
-    api_key=settings.openai_api_key,
-    timeout=60.0,
-    enabled=bool(
-        settings.openai_enabled
-        and settings.openai_api_key
-        and (not SERVERLESS_MODE or os.getenv("ALLOW_OPENAI_IN_SERVERLESS") == "1")
-    ),
-)
 ingestion_pipeline = IngestionPipeline(
     youtube_service=youtube_service,
     embedding_service=embedding_service,
-    openai_client=_ingest_openai_client,
     settings=settings,
     serverless_mode=SERVERLESS_MODE,
 )
@@ -3434,6 +3420,27 @@ def _ranked_request_reels(
             reel for reel in ranked
             if str(reel.get("video_id") or "").strip() not in excluded_video_id_set
         ]
+
+    unique_vids = {
+        str(reel.get("video_id") or "").strip()
+        for reel in ranked
+        if str(reel.get("video_id") or "").strip()
+    }
+    if unique_vids:
+        alive_map: dict[str, bool] = {}
+        with ThreadPoolExecutor(max_workers=min(8, len(unique_vids))) as pool:
+            futures = {pool.submit(is_video_alive, vid, conn=conn): vid for vid in unique_vids}
+            for future in futures:
+                vid = futures[future]
+                try:
+                    alive_map[vid] = bool(future.result())
+                except Exception:
+                    alive_map[vid] = True  # fail open so a probe error never hides a reel
+        ranked = [
+            reel for reel in ranked
+            if alive_map.get(str(reel.get("video_id") or "").strip(), True)
+        ]
+
     if page <= 1:
         return _shape_request_page_reels(
             ranked,
@@ -6006,7 +6013,7 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
         emitted_reels: set[tuple[str, str]] = set()
         cancel_event = threading.Event()
         # Hard wall-clock deadline for the whole generation so a runaway LLM /
-        # YouTube call cannot bill OpenAI credits forever for a disconnected client.
+        # YouTube call cannot bill LLM credits forever for a disconnected client.
         STREAM_DEADLINE_SEC = 25.0 if SERVERLESS_MODE else 90.0
         deadline = time.monotonic() + STREAM_DEADLINE_SEC
 
