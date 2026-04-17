@@ -2841,6 +2841,14 @@ class ReelService:
                 cluster_chain_last_end: dict[str, float] = {}
                 topic_cut_last_refined_end: float | None = None
                 TOPIC_CUT_BRIDGE_TOLERANCE_SEC = 2.0
+                # Track multi-segment cluster chains: when a single oversized
+                # topic cluster is split into N sub-part segments (each with
+                # the same cluster_group_id but different cluster_sub_index),
+                # they must all be accepted together. Sub-part 0 passes the
+                # per-window gates normally; once activated, sub-parts 1..N-1
+                # skip those gates so a middle sub-part can't drop out and
+                # leave a gap in the chain.
+                active_chain_ids: set[str] = set()
 
                 # Process segments in TEMPORAL order so consecutive clusters
                 # in the video are refined in the same order they appear.
@@ -3039,9 +3047,25 @@ class ReelService:
                     # buffer.  Only after the entire chain passes do we
                     # commit them to the output.  If any window fails a
                     # quality gate, we drop the ENTIRE chain.
-                    is_continuation_chain = len(clip_windows) > 1
+                    #
+                    # Two chain regimes feed into ``is_continuation_chain``:
+                    #   1. Intra-segment: _split_into_consecutive_windows
+                    #      returned multiple windows for a single segment.
+                    #   2. Cross-segment: this segment is a sub-part of a
+                    #      cluster whose sub-part 0 was already accepted
+                    #      (tracked in ``active_chain_ids``). Without this,
+                    #      a middle sub-part could fail a per-window gate
+                    #      and leave a gap in the user-visible reel chain.
+                    seg_chain_id = str(getattr(segment, "cluster_group_id", "") or "")
+                    is_cross_segment_continuation = (
+                        bool(seg_chain_id) and seg_chain_id in active_chain_ids
+                    )
+                    is_continuation_chain = (
+                        len(clip_windows) > 1 or is_cross_segment_continuation
+                    )
                     staged_reels: list[dict[str, Any]] = []
                     chain_broken = False
+                    segment_produced_accepted_reel = False
                     for clip_window in clip_windows:
                         if not clip_window:
                             if self.retrieval_debug_logging:
@@ -3258,6 +3282,7 @@ class ReelService:
                         generated_video_counts[video_id] = generated_video_counts.get(video_id, 0) + 1
                         accepted_clip_contexts_by_video.setdefault(video_id, []).append(clip_context)
                         current_segment_contexts.append(clip_context)
+                        segment_produced_accepted_reel = True
                         mining_request_key = str(candidate.get("mining_request_key") or "").strip()
                         mining_video_id = str(candidate.get("mining_video_id") or "").strip()
                         if mining_request_key and mining_video_id:
@@ -3337,6 +3362,17 @@ class ReelService:
                         if existing_for_video + generated_video_counts.get(video_id, 0) >= video_segment_cap:
                             hit_video_cap = True
                             break
+
+                    # After processing all windows for this segment, if any
+                    # window was accepted, activate its chain so subsequent
+                    # sub-parts of the same cluster chain (shared
+                    # ``cluster_group_id``) skip per-window gates and stay
+                    # contiguous. If no window was accepted, don't activate
+                    # — later sub-parts will run gates on their own merit
+                    # (orphan sub-part reels are rare and usually still
+                    # represent valid topic content).
+                    if seg_chain_id and segment_produced_accepted_reel:
+                        active_chain_ids.add(seg_chain_id)
 
                     if hit_video_cap:
                         break
@@ -12027,6 +12063,53 @@ class ReelService:
                 seen_reel_ids.add(reel_id)
             seen_clip_keys.add(clip_key)
             deduped.append(dict(item))
+
+        # --- Same-video grouping ---
+        # Without this, score-based sorting can interleave reels from
+        # different YouTube videos, so a multi-reel arc from one clip gets
+        # interrupted by a reel from another video. Users experience this
+        # as "videos from the same clip are interrupted by other videos."
+        # Fix: after score-sort + dedup, group reels by ``video_id`` and
+        # emit each group consecutively. Within a group, sort by
+        # ``t_start`` so the clip's narrative plays in chronological order
+        # (part 1 → part 2 → part 3). Groups themselves are ordered by
+        # their best (max) reel score, preserving overall ranking.
+        if deduped:
+            grouped_by_video: dict[str, list[dict[str, Any]]] = {}
+            video_first_seen_order: list[str] = []
+            video_best_score: dict[str, float] = {}
+            video_best_created_at: dict[str, str] = {}
+            for item in deduped:
+                vid = str(item.get("video_id") or "")
+                if vid not in grouped_by_video:
+                    grouped_by_video[vid] = []
+                    video_first_seen_order.append(vid)
+                grouped_by_video[vid].append(item)
+                s = float(item.get("score") or 0.0)
+                if s > video_best_score.get(vid, float("-inf")):
+                    video_best_score[vid] = s
+                    video_best_created_at[vid] = str(item.get("created_at") or "")
+            # Sort video groups by their best reel's score (desc), then by
+            # that reel's created_at (desc) for tiebreaks — mirrors the
+            # original per-reel sort key so ordering remains deterministic.
+            video_first_seen_order.sort(
+                key=lambda v: (
+                    video_best_score.get(v, 0.0),
+                    video_best_created_at.get(v, ""),
+                ),
+                reverse=True,
+            )
+            regrouped: list[dict[str, Any]] = []
+            for vid in video_first_seen_order:
+                group = sorted(
+                    grouped_by_video[vid],
+                    key=lambda x: (
+                        float(x.get("t_start") or 0.0),
+                        float(x.get("t_end") or 0.0),
+                    ),
+                )
+                regrouped.extend(group)
+            deduped = regrouped
 
         deduped_video_ids = sorted({str(item.get("video_id") or "") for item in deduped if item.get("video_id")})
         transcript_by_video: dict[str, list[dict[str, Any]]] = {}
