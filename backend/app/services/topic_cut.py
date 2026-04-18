@@ -817,25 +817,22 @@ _gemini_key_offset: int = 0
 
 
 def _build_gemini_client(api_key: str | None = None) -> Any | None:
-    """Build a Google Gemini client.
+    """Return the ``google.genai`` module when a key is available.
 
-    If *api_key* is provided, uses that key directly. Otherwise reads
-    the primary GEMINI_API_KEY env var.
+    The new SDK builds a fresh ``Client`` per call (see
+    ``_llm_topic_segments_gemini``), so this helper only checks whether
+    the module is importable and a key is present — it does not
+    construct a client here.
     """
     key = api_key or os.environ.get("GEMINI_API_KEY") or ""
     if not key:
         return None
     try:
-        import google.generativeai as genai
+        from google import genai
     except ImportError:
-        logger.debug("google-generativeai is not installed; Gemini path disabled")
+        logger.debug("google-genai is not installed; Gemini path disabled")
         return None
-    try:
-        genai.configure(api_key=key)
-        return genai
-    except Exception:
-        logger.exception("could not configure Gemini client")
-        return None
+    return genai
 
 
 def _llm_topic_segments_gemini(
@@ -863,32 +860,32 @@ def _llm_topic_segments_gemini(
 
     all_keys = _collect_gemini_api_keys()
     if not all_keys:
-        # No keys at all — use the already-configured genai_module as-is
-        all_keys = [""]
+        return []
+
+    from google.genai import types as genai_types
 
     # Try each key starting from where we left off last time.
     last_exc: Exception | None = None
     for attempt in range(len(all_keys)):
         idx = (_gemini_key_offset + attempt) % len(all_keys)
         key = all_keys[idx]
-
-        # Reconfigure the module with this key (skip if empty = already configured)
-        if key:
-            try:
-                genai_module.configure(api_key=key)
-            except Exception:
-                continue
+        if not key:
+            continue
+        try:
+            client = genai_module.Client(api_key=key)
+        except Exception:
+            continue
 
         try:
-            model_obj = genai_module.GenerativeModel(
-                model_name=model,
-                system_instruction=system_prompt,
-                generation_config=genai_module.GenerationConfig(
+            response = client.models.generate_content(
+                model=model,
+                contents=user_msg,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=system_prompt,
                     response_mime_type="application/json",
                     temperature=0.1,
                 ),
             )
-            response = model_obj.generate_content(user_msg)
             raw = response.text or "{}"
             # Success — remember this key for next call
             _gemini_key_offset = idx

@@ -54,20 +54,21 @@ def _collect_gemini_api_keys() -> list[str]:
 
 
 def _build_gemini_module(api_key: str | None = None) -> Any | None:
+    """Return the ``google.genai`` module when a key is available.
+
+    The new SDK builds a fresh ``Client`` per call (see ``_gemini_chat``),
+    so this helper only checks whether the module is importable and a key
+    is present — it does not construct a client here.
+    """
     key = api_key or os.environ.get("GEMINI_API_KEY") or ""
     if not key:
         return None
     try:
-        import google.generativeai as genai
+        from google import genai
     except ImportError:
-        logger.debug("google-generativeai not installed; Gemini disabled")
+        logger.debug("google-genai not installed; Gemini disabled")
         return None
-    try:
-        genai.configure(api_key=key)
-        return genai
-    except Exception:
-        logger.exception("could not configure Gemini client")
-        return None
+    return genai
 
 
 def _build_groq_client() -> Any | None:
@@ -155,27 +156,33 @@ def _gemini_chat(
         all_keys = _collect_gemini_api_keys() or [""]
     last_exc: Exception | None = None
 
+    from google.genai import types as genai_types
+
     for attempt in range(len(all_keys)):
         idx = (_gemini_key_offset + attempt) % len(all_keys) if not api_key_override else 0
         key = all_keys[idx]
-        if key:
-            try:
-                genai_module.configure(api_key=key)
-            except Exception:
-                continue
+        if not key:
+            continue
+        try:
+            client = genai_module.Client(api_key=key)
+        except Exception:
+            continue
+
+        config_kwargs: dict[str, Any] = {
+            "system_instruction": system,
+            "temperature": float(temperature),
+        }
+        if json_mode:
+            config_kwargs["response_mime_type"] = "application/json"
+        if max_output_tokens is not None:
+            config_kwargs["max_output_tokens"] = int(max_output_tokens)
 
         try:
-            generation_config_kwargs: dict[str, Any] = {"temperature": float(temperature)}
-            if json_mode:
-                generation_config_kwargs["response_mime_type"] = "application/json"
-            if max_output_tokens is not None:
-                generation_config_kwargs["max_output_tokens"] = int(max_output_tokens)
-            model_obj = genai_module.GenerativeModel(
-                model_name=model,
-                system_instruction=system,
-                generation_config=genai_module.GenerationConfig(**generation_config_kwargs),
+            response = client.models.generate_content(
+                model=model,
+                contents=user,
+                config=genai_types.GenerateContentConfig(**config_kwargs),
             )
-            response = model_obj.generate_content(user)
             text = (response.text or "").strip()
             if not text:
                 return None
