@@ -2153,8 +2153,79 @@ def _apply_boundary_engine(
             if isinstance(seg, dict) and isinstance(seg.get("t_end"), (int, float)):
                 llm_hints.append(seg)
 
+    # LLM-direct clip picker: ask the LLM to pick the best (t_start, t_end)
+    # inside each topic window, then snap to a terminal-punct sentence
+    # boundary + nearest silence gap. This is the primary path when a query
+    # is available and LLM keys are configured. The heuristic ClipBoundaryEngine
+    # below runs as a fallback whenever the LLM path declines (no keys,
+    # malformed output, or snap rejects because no terminal-punct sentence
+    # fits).
+    try:
+        from .clip_llm import pick_clip_llm
+        from .clip_boundary import snap_llm_boundary
+    except Exception:
+        pick_clip_llm = None  # type: ignore[assignment]
+        snap_llm_boundary = None  # type: ignore[assignment]
+
+    def _try_llm_pick(r: TopicReel) -> bool:
+        """Return True when the LLM-direct path successfully set r.t_start
+        and r.t_end on terminal-punct sentence boundaries. False otherwise —
+        caller falls back to the heuristic engine."""
+        if not query or pick_clip_llm is None or snap_llm_boundary is None:
+            return False
+        # Send only the cues inside the topic window (plus tiny buffer so
+        # boundary cues aren't chopped off). This keeps each LLM call cheap
+        # and constrains the LLM to a relevant slice.
+        window_lo = max(0.0, r.t_start - 2.0)
+        window_hi = r.t_end + 2.0
+        window_cues = [
+            TranscriptCue(start=c.start, duration=getattr(c, "duration", 0.0) or 0.0, text=c.text)
+            for c in cue_list
+            if window_lo <= c.start <= window_hi and str(getattr(c, "text", "")).strip()
+        ]
+        if not window_cues:
+            return False
+        try:
+            pick = pick_clip_llm(
+                query,
+                window_cues,
+                min_sec=max(user_min_sec, 15.0),
+                max_sec=max(user_max_sec, 15.0),
+            )
+        except Exception:
+            logger.exception("clip_llm.pick_clip_llm raised for video %s", r.video_id)
+            return False
+        if pick is None:
+            return False
+        try:
+            snap = snap_llm_boundary(
+                raw_t_start=pick.t_start,
+                raw_t_end=pick.t_end,
+                sentences=sentences,
+                silence_ranges=silence_ranges,
+                min_sec=max(user_min_sec, 15.0),
+                max_sec=max(user_max_sec, 15.0),
+            )
+        except Exception:
+            logger.exception("snap_llm_boundary raised for video %s", r.video_id)
+            return False
+        if not snap.snapped:
+            logger.debug(
+                "clip_llm snap rejected for video %s raw=(%.2f,%.2f) reason=%s",
+                r.video_id, pick.t_start, pick.t_end, snap.reason,
+            )
+            return False
+        r.t_start = round(float(snap.t_start), 2)
+        r.t_end = round(float(snap.t_end), 2)
+        r.boundary_quality = "llm-snap"
+        return True
+
     refined: list[TopicReel] = []
     for r in reels:
+        if _try_llm_pick(r):
+            refined.append(r)
+            continue
+        # Heuristic fallback — the original ClipBoundaryEngine path.
         try:
             result = engine.refine(
                 raw_t_start=r.t_start,

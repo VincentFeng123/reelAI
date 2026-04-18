@@ -322,12 +322,17 @@ class ClipBoundaryEngine:
             video_duration_sec=video_duration_sec,
         )
         if end_sent is None:
-            # Degrade: last sentence ending before min(raw_t_end, start_t + user_max)
+            # Degrade (still require terminal punct). Widening the cap is the
+            # last attempt to find a sentence-ending period/exclamation/question
+            # inside a broader window. If THIS still returns None, the caller
+            # gets a "no_terminal_end" warning + degraded quality tier — we do
+            # NOT fall back to require_terminal=False because mid-sentence cuts
+            # are the exact audible failure this contract prevents.
             cap = min(raw_t_end, start_t + user_max_sec * SOFT_MAX_TOLERANCE)
-            end_sent = latest_sentence_ending_before(sentences, cap, require_terminal=False)
+            end_sent = latest_sentence_ending_before(sentences, cap, require_terminal=True)
             end_mode = "fallback"
         if end_sent is None:
-            warnings.append("no_end_sentence_found")
+            warnings.append("no_terminal_end_sentence_found")
             end_t = raw_t_end
         else:
             end_t = end_sent.t_end
@@ -495,8 +500,13 @@ class ClipBoundaryEngine:
             candidate = self._silence_tiebreak_end(candidate, sentences, silence_ranges)
             return candidate, "truncation"
 
-        # --- Final fallback: any sentence ending before soft_hi (even no terminal punct) ---
-        fallback = latest_sentence_ending_before(sentences, soft_hi, require_terminal=False)
+        # --- Final fallback: STILL require terminal punct. Widen the window
+        # one more time (to soft_hi) and require a real sentence end. If no
+        # terminal-punct sentence fits anywhere in [start_t, soft_hi], return
+        # None so the caller tags the clip "degraded" rather than silently
+        # cutting mid-sentence. This is the whole point of Phase 2.4 —
+        # begin/end on punctuation is a hard contract. ---
+        fallback = latest_sentence_ending_before(sentences, soft_hi, require_terminal=True)
         return fallback, "fallback"
 
     def _silence_tiebreak(
@@ -596,9 +606,206 @@ class ClipBoundaryEngine:
         return "chapter"
 
 
+# --------------------------------------------------------------------------- #
+# Snap-only boundary helper — for LLM-direct clip picking path
+# --------------------------------------------------------------------------- #
+# The ClipBoundaryEngine above does picking + snapping. The LLM-direct
+# picker (services/clip_llm.py) does its own picking and only needs the
+# snap half. `snap_llm_boundary` is that half — no lexical novelty, no
+# LLM round-trip, just: take raw (t_start, t_end) from the LLM and force
+# them onto terminal-punctuation sentence boundaries (and, when silence
+# ranges are available, onto inter-word pauses so the clip doesn't pop).
+
+
+# Max distance between the LLM's raw t_start/t_end and the chosen sentence
+# boundary. Snapping further than this means the LLM's pick landed far from
+# any sentence boundary (likely malformed) — reject rather than silently
+# include several seconds of unintended audio on either side.
+_SNAP_MAX_SHIFT_SEC = 5.0
+# Silence gap refinement window around a chosen sentence boundary. The
+# audible goal: enter/leave the clip during a natural pause, not mid-word.
+_SILENCE_REFINE_WINDOW_SEC = 0.4
+
+
+def _find_containing_or_next_sentence(
+    sentences: Sequence[SentenceSpan], t_sec: float
+) -> SentenceSpan | None:
+    """First sentence whose t_end >= t_sec — the one that contains t_sec
+    if one does, else the next sentence after t_sec. Returns None if t_sec
+    is past every sentence's end."""
+    for s in sentences:
+        if s.t_end >= t_sec:
+            return s
+    return None
+
+
+def _latest_terminal_ending_at_or_before(
+    sentences: Sequence[SentenceSpan], t_sec: float
+) -> SentenceSpan | None:
+    """Latest sentence ending on terminal punctuation whose t_end <= t_sec.
+    If t_sec falls mid-sentence, considers the containing sentence only if
+    its t_end <= t_sec (it won't, by definition — but included for clarity)."""
+    chosen: SentenceSpan | None = None
+    for s in sentences:
+        if s.t_end > t_sec:
+            break
+        if s.terminal_punct in {".", "!", "?", "…"}:
+            chosen = s
+    return chosen
+
+
+def _silence_midpoint_near(
+    t_sec: float,
+    silence_ranges: Sequence[tuple[float, float]] | None,
+    *,
+    window_sec: float,
+) -> float | None:
+    """If a silence range overlaps [t_sec - window, t_sec + window],
+    return the midpoint of the nearest overlapping range. Otherwise None.
+    """
+    if not silence_ranges:
+        return None
+    lo = t_sec - window_sec
+    hi = t_sec + window_sec
+    best_mid: float | None = None
+    best_dist = float("inf")
+    for sil_start, sil_end in silence_ranges:
+        if sil_end < lo or sil_start > hi:
+            continue
+        mid = 0.5 * (sil_start + sil_end)
+        dist = abs(mid - t_sec)
+        if dist < best_dist:
+            best_dist = dist
+            best_mid = mid
+    return best_mid
+
+
+@dataclass
+class SnapResult:
+    """Outcome of snap_llm_boundary.
+
+    When `snapped` is True the clip is good to serve: `t_start` / `t_end`
+    are on a sentence with terminal punctuation and, where data was
+    available, refined to sit inside a silence gap. When `snapped` is
+    False the reason is non-empty and the clip should be rejected — never
+    serve a clip that ends mid-sentence, that's the one thing this helper
+    exists to prevent.
+    """
+    snapped: bool
+    t_start: float
+    t_end: float
+    start_sentence: SentenceSpan | None
+    end_sentence: SentenceSpan | None
+    reason: str  # empty when snapped=True
+
+
+def snap_llm_boundary(
+    *,
+    raw_t_start: float,
+    raw_t_end: float,
+    sentences: Sequence[SentenceSpan],
+    silence_ranges: Sequence[tuple[float, float]] | None = None,
+    min_sec: float = 15.0,
+    max_sec: float = 60.0,
+) -> SnapResult:
+    """Snap LLM-picked raw timestamps onto terminal-punct sentence boundaries
+    (and silence gaps, when available). Contract:
+
+      * start: first sentence whose `t_start >= raw_t_start - _SNAP_SEARCH_FLOOR_SEC`.
+        Start sentences don't need terminal punct at their start — only to be
+        the BEGINNING of a sentence (which every SentenceSpan is by
+        construction).
+      * end: latest terminal-punct sentence with `t_end <= raw_t_end + _SNAP_SEARCH_CEIL_SEC`.
+        If none is found, the clip is REJECTED — this is what kills the old
+        silent mid-sentence fallback at clip_boundary.py:498-500.
+      * duration after snap must land in [min_sec, max_sec]; otherwise reject.
+      * silence refinement: when silence_ranges is provided, the final
+        t_start/t_end are nudged to the midpoint of a silence gap that
+        overlaps ±_SILENCE_REFINE_WINDOW_SEC of the chosen boundary. No
+        silence = just use the sentence boundary verbatim (safe default —
+        sentence boundaries are themselves natural breaks).
+
+    Rejects with an explanatory `reason` rather than silently degrading,
+    so reels.py can log/skip the clip instead of serving something
+    mid-word.
+    """
+    if not sentences:
+        return SnapResult(False, raw_t_start, raw_t_end, None, None, "no sentences")
+    if raw_t_end <= raw_t_start:
+        return SnapResult(False, raw_t_start, raw_t_end, None, None, "raw end <= start")
+
+    sent_list = list(sentences)
+
+    # Start: find the sentence containing raw_t_start (if any) or the next
+    # sentence after raw_t_start. This snaps the boundary to the start of
+    # the current thought — "begin on punctuation" = begin right after the
+    # period of the previous sentence, which is the chosen sentence's t_start.
+    start_sent = _find_containing_or_next_sentence(sent_list, raw_t_start)
+    if start_sent is None:
+        return SnapResult(
+            False, raw_t_start, raw_t_end, None, None,
+            "no sentence at/after raw_t_start",
+        )
+    if abs(start_sent.t_start - raw_t_start) > _SNAP_MAX_SHIFT_SEC:
+        return SnapResult(
+            False, raw_t_start, raw_t_end, start_sent, None,
+            f"start shift {start_sent.t_start - raw_t_start:+.1f}s exceeds ±{_SNAP_MAX_SHIFT_SEC:.0f}s",
+        )
+
+    # End: terminal-punct sentence with t_end closest to raw_t_end (either
+    # direction) within _SNAP_MAX_SHIFT_SEC. Consider both the latest one
+    # ending at-or-before and the earliest one ending after — LLMs sometimes
+    # round t_end down slightly, so the right answer can be a hair past
+    # raw_t_end. Hard requirement on terminal punctuation; if no candidate
+    # qualifies, reject rather than silently cut mid-sentence.
+    before = _latest_terminal_ending_at_or_before(sent_list, raw_t_end)
+    after: SentenceSpan | None = None
+    for s in sent_list:
+        if s.t_end > raw_t_end and s.terminal_punct in {".", "!", "?", "…"}:
+            after = s
+            break
+    candidates = [c for c in (before, after) if c is not None]
+    candidates = [c for c in candidates if abs(c.t_end - raw_t_end) <= _SNAP_MAX_SHIFT_SEC]
+    if not candidates:
+        return SnapResult(
+            False, raw_t_start, raw_t_end, start_sent, None,
+            f"no terminal-punct sentence within ±{_SNAP_MAX_SHIFT_SEC:.0f}s of raw_t_end",
+        )
+    end_sent = min(candidates, key=lambda c: abs(c.t_end - raw_t_end))
+    if end_sent.t_end <= start_sent.t_start:
+        return SnapResult(
+            False, raw_t_start, raw_t_end, start_sent, end_sent,
+            "end sentence precedes start sentence",
+        )
+
+    t_start = start_sent.t_start
+    t_end = end_sent.t_end
+    duration = t_end - t_start
+    if duration < min_sec or duration > max_sec:
+        return SnapResult(
+            False, t_start, t_end, start_sent, end_sent,
+            f"snapped duration {duration:.1f}s outside [{min_sec:.0f}, {max_sec:.0f}]",
+        )
+
+    # Silence refinement — nudge the boundary to a pause midpoint if one
+    # overlaps. Preserves the terminal-punct contract (we only move within
+    # _SILENCE_REFINE_WINDOW_SEC of the sentence boundary, which cannot
+    # cross into a neighboring sentence).
+    start_silence_mid = _silence_midpoint_near(t_start, silence_ranges, window_sec=_SILENCE_REFINE_WINDOW_SEC)
+    if start_silence_mid is not None:
+        t_start = start_silence_mid
+    end_silence_mid = _silence_midpoint_near(t_end, silence_ranges, window_sec=_SILENCE_REFINE_WINDOW_SEC)
+    if end_silence_mid is not None:
+        t_end = end_silence_mid
+
+    return SnapResult(True, t_start, t_end, start_sent, end_sent, "")
+
+
 __all__ = [
     "BOUNDARY_ENGINE_VERSION",
     "ClipBoundaryEngine",
     "BoundaryResult",
     "TopicSwitchHint",
+    "SnapResult",
+    "snap_llm_boundary",
 ]
