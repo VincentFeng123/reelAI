@@ -1,6 +1,8 @@
 import hashlib
 import json
 import logging
+import os
+import threading
 from typing import Iterable
 
 import numpy as np
@@ -10,13 +12,70 @@ from ..db import dumps_json, fetch_one, now_iso, upsert
 logger = logging.getLogger(__name__)
 
 
+# Sentence-transformers model id. all-MiniLM-L6-v2 is ~90MB, 384-dim, English-
+# biased, and near-SOTA for its size. Trade-off vs. hash embeddings: real
+# semantic similarity ("ML" ≈ "machine learning") at the cost of ~5s cold
+# start and pytorch-in-the-image. Switched on Railway; serverless (Vercel)
+# auto-degrades to the hash path because pytorch cold-starts are too slow
+# for function timeouts and the model isn't in that requirements.txt.
+_SEMANTIC_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
+_SEMANTIC_DIM = 384
+_HASH_DIM = 256
+
+
+def _serverless_mode() -> bool:
+    return bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
+
+
+# Singleton model handle — lazy-loaded on first use, None means "we already
+# tried and the model path is unavailable; never retry this process".
+_semantic_model_lock = threading.Lock()
+_semantic_model: object | None = None
+_semantic_model_tried = False
+
+
+def _get_semantic_model() -> object | None:
+    """Lazy-load sentence-transformers. Returns None when unavailable so
+    EmbeddingService degrades to hash embeddings without raising.
+    """
+    global _semantic_model, _semantic_model_tried
+    if _semantic_model_tried:
+        return _semantic_model
+    if _serverless_mode():
+        _semantic_model_tried = True
+        return None
+    with _semantic_model_lock:
+        if _semantic_model_tried:
+            return _semantic_model
+        _semantic_model_tried = True
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as exc:
+            logger.info("sentence-transformers not available, using hash embeddings: %s", exc)
+            return None
+        try:
+            model = SentenceTransformer(_SEMANTIC_MODEL_ID, device="cpu")
+        except Exception:
+            logger.exception("could not load %s, using hash embeddings", _SEMANTIC_MODEL_ID)
+            return None
+        _semantic_model = model
+        logger.info("loaded semantic embedding model %s (dim=%d)", _SEMANTIC_MODEL_ID, _SEMANTIC_DIM)
+        return _semantic_model
+
+
 class EmbeddingService:
     def __init__(self) -> None:
-        # Hosted embedding providers have been removed; we use a pure-Python
-        # hashing embedding that is deterministic, free, and fast. The
-        # dimension is fixed at 256 so callers never need to re-hash on model
-        # changes.
-        self.dim = 256
+        # Dimension is decided at init time, keyed on which backend we can
+        # actually load. The cache layer (_load_cached_embedding) compares
+        # stored vectors against self.dim and invalidates on mismatch — so
+        # rolling from hash (256) → semantic (384) simply expires old rows.
+        model = _get_semantic_model()
+        if model is None:
+            self._semantic_model = None
+            self.dim = _HASH_DIM
+        else:
+            self._semantic_model = model
+            self.dim = _SEMANTIC_DIM
 
     def embed_texts(self, conn, texts: Iterable[str]) -> np.ndarray:
         text_list = [t.strip() for t in texts]
@@ -85,10 +144,32 @@ class EmbeddingService:
         return None, True
 
     def _embed_local(self, texts: list[str]) -> np.ndarray:
+        if self._semantic_model is not None:
+            try:
+                # encode() returns np.ndarray; normalize for cosine-sim usage
+                # downstream. batch_size and convert_to_numpy defaults are fine.
+                vecs = self._semantic_model.encode(  # type: ignore[attr-defined]
+                    texts,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
+                if isinstance(vecs, np.ndarray) and vecs.ndim == 2 and vecs.shape[1] == self.dim:
+                    return vecs.astype(np.float32)
+                logger.warning(
+                    "semantic model returned unexpected shape %s; falling through to hash embed",
+                    getattr(vecs, "shape", None),
+                )
+            except Exception:
+                logger.exception("semantic embed raised; falling back to hash embed for this batch")
         vectors = [self._hash_embed(t) for t in texts]
         return np.array(vectors, dtype=np.float32)
 
     def _hash_embed(self, text: str) -> np.ndarray:
+        # Hash to self.dim so this works both as the primary embedder
+        # (self.dim == _HASH_DIM) and as a fallback when the semantic
+        # embed raises mid-batch (self.dim == _SEMANTIC_DIM, vector is
+        # mostly zeros but same shape — keeps vstack consistent).
         vec = np.zeros(self.dim, dtype=np.float32)
         tokens = text.lower().split()
         for token in tokens:
