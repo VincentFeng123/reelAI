@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     gemini_model: str = "gemini-2.0-flash"
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
+    cerebras_api_key: str = ""
+    cerebras_model: str = "llama-3.3-70b"
     youtube_api_key: str = ""
     retrieval_engine_v2_enabled: bool = True
     retrieval_tier2_enabled: bool = False

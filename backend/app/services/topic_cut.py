@@ -971,6 +971,66 @@ def _llm_topic_segments_groq(
 
 
 # --------------------------------------------------------------------------- #
+# Cerebras (Llama 3.3 70B, free tier, ~2000 tok/sec) — third-tier fallback
+# --------------------------------------------------------------------------- #
+
+
+def _build_cerebras_client() -> Any | None:
+    """Build a Cerebras client from CEREBRAS_API_KEY if available.
+
+    OpenAI-compatible chat-completion API; see cerebras-cloud-sdk. Returns
+    None when the key is missing or the SDK isn't installed, so the caller
+    degrades silently to whatever path is next (or gives up on LLM cuts).
+    """
+    api_key = os.environ.get("CEREBRAS_API_KEY") or ""
+    if not api_key:
+        return None
+    try:
+        from cerebras.cloud.sdk import Cerebras
+    except ImportError:
+        logger.debug("cerebras-cloud-sdk is not installed; Cerebras path disabled")
+        return None
+    try:
+        return Cerebras(api_key=api_key)
+    except Exception:
+        logger.exception("could not build Cerebras client")
+        return None
+
+
+def _llm_topic_segments_cerebras(
+    cues: Sequence[TranscriptCue],
+    *,
+    cerebras_client: Any,
+    model: str = "llama-3.3-70b",
+    query: str | None = None,
+) -> list[_SegmentTuple]:
+    """Identify topic boundaries using Cerebras Llama 3.3 70B.
+
+    Called after Gemini and Groq both fail/rate-limit. Same prompt, same
+    JSON parse. Llama 3.3 70B on Cerebras supports `response_format` JSON
+    mode as of SDK v1.35+.
+    """
+    rendered = _render_transcript_for_llm(cues)
+    system_prompt = _build_system_prompt(query=query)
+    user_msg = (
+        "Here is the full transcript of a long-form YouTube video. "
+        "Identify topic segments per the rules in the system prompt.\n\n"
+        f"{rendered}"
+    )
+    response = cerebras_client.chat.completions.create(
+        model=model,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ],
+    )
+    raw = response.choices[0].message.content or "{}"
+    return _parse_llm_segments_json(raw)
+
+
+# --------------------------------------------------------------------------- #
 # Two-pass boundary refinement
 # --------------------------------------------------------------------------- #
 
@@ -2402,7 +2462,9 @@ def cut_video_into_topic_reels(
         return classification, []
 
     # ---- Path 2: LLM topic segmentation (timestamp-based). ------------- #
-    # Fallback chain: Gemini Flash (free) → Groq/Llama 3 (free)
+    # Fallback chain: Gemini Flash → Groq/Llama 3 → Cerebras/Llama 3.3 70B
+    # All three are free-tier; the order is by daily-quota generosity on
+    # this project's typical load (Gemini widest, then Groq, then Cerebras).
     # LLM functions return timestamp-based _SegmentTuples, not cue indices.
     llm_segments: list[_SegmentTuple] = []
     used_llm = False
@@ -2444,7 +2506,28 @@ def cut_video_into_topic_reels(
                         )
                 except Exception:  # noqa: BLE001
                     logger.exception(
-                        "Groq topic segmentation failed for video %s; falling back to semantic path",
+                        "Groq topic segmentation failed for video %s; trying Cerebras next",
+                        video_id,
+                    )
+                    llm_segments = []
+
+        # 2c: Cerebras / Llama 3.3 70B (free tier fallback)
+        if not llm_segments:
+            cerebras = _build_cerebras_client()
+            if cerebras:
+                try:
+                    llm_segments = _llm_topic_segments_cerebras(
+                        transcript, cerebras_client=cerebras, query=query,
+                    )
+                    if llm_segments:
+                        used_llm = True
+                        logger.info(
+                            "video %s segmented via Cerebras/Llama 3.3 70B → %d segments",
+                            video_id, len(llm_segments),
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Cerebras topic segmentation failed for video %s; falling back to semantic path",
                         video_id,
                     )
                     llm_segments = []

@@ -49,6 +49,11 @@ faster-whisper==1.1.1
 sentence-transformers>=3.0.0
 google-genai>=1.0.0
 groq>=0.12.0
+# Third-tier LLM fallback (after Gemini → Groq). Cerebras serves Llama 3.3
+# 70B at ~2000 tok/sec on a generous free tier — useful when both Gemini
+# daily quota and Groq per-day caps are exhausted. OpenAI-compatible API
+# shape so it slots into the same call pattern as Groq.
+cerebras-cloud-sdk>=1.35.0
 # Sentence boundary detection for ClipBoundaryEngine (Phase A.2). ~50KB, pure
 # Python, no C deps — handles abbreviations (Dr./Mr./e.g./decimals) that the
 # regex fallback mis-splits on. If this import ever fails, services/sentences.py

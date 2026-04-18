@@ -36,6 +36,7 @@ from typing import Any, Sequence
 
 from .topic_cut import (
     TranscriptCue,
+    _build_cerebras_client,
     _build_gemini_client,
     _build_groq_client,
     _collect_gemini_api_keys,
@@ -267,6 +268,48 @@ def _pick_via_groq(
     return _validate_pick(pick, cues, min_sec=min_sec, max_sec=max_sec)
 
 
+def _pick_via_cerebras(
+    query: str,
+    cues: Sequence[TranscriptCue],
+    *,
+    min_sec: float,
+    max_sec: float,
+    model: str = "llama-3.3-70b",
+) -> ClipPick | None:
+    """Cerebras Llama 3.3 70B fallback when both Gemini and Groq fail.
+
+    Cerebras uses the same OpenAI-compatible chat-completion shape as
+    Groq, so the call is structurally identical.
+    """
+    client = _build_cerebras_client()
+    if client is None:
+        return None
+    system_prompt = _build_clip_system_prompt(query, min_sec, max_sec)
+    user_msg = (
+        "Here is the full transcript of a YouTube video. "
+        "Pick the one best clip per the rules in the system prompt.\n\n"
+        f"{_render_transcript_for_llm(cues)}"
+    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+        raw = response.choices[0].message.content or "{}"
+    except Exception as exc:
+        logger.debug("clip_llm: Cerebras call failed: %s", exc)
+        return None
+    pick = _parse_clip_pick_json(raw, cues)
+    if pick is None:
+        return None
+    return _validate_pick(pick, cues, min_sec=min_sec, max_sec=max_sec)
+
+
 def pick_clip_llm(
     query: str,
     cues: Sequence[TranscriptCue],
@@ -276,8 +319,9 @@ def pick_clip_llm(
 ) -> ClipPick | None:
     """Pick the single best clip for the query from the transcript via LLM.
 
-    Returns None on any failure mode; the caller then falls back to the
-    heuristic picker.
+    Fallback chain: Gemini → Groq → Cerebras. Returns None if all three
+    are unavailable or all fail validation; caller then falls back to the
+    heuristic picker in ClipBoundaryEngine.
     """
     query = (query or "").strip()
     if not query or not cues:
@@ -285,7 +329,10 @@ def pick_clip_llm(
     pick = _pick_via_gemini(query, cues, min_sec=min_sec, max_sec=max_sec)
     if pick is not None:
         return pick
-    return _pick_via_groq(query, cues, min_sec=min_sec, max_sec=max_sec)
+    pick = _pick_via_groq(query, cues, min_sec=min_sec, max_sec=max_sec)
+    if pick is not None:
+        return pick
+    return _pick_via_cerebras(query, cues, min_sec=min_sec, max_sec=max_sec)
 
 
 __all__ = [
