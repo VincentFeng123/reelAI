@@ -2855,6 +2855,7 @@ class ReelService:
                                 video_duration_sec=video_duration,
                                 clip_min_len=clip_min_len,
                                 clip_max_len=clip_max_len,
+                                clip_target_len=safe_target_clip_duration,
                                 max_segments=target_segment_budget,
                                 concept_terms=concept_terms,
                             )
@@ -10227,6 +10228,7 @@ class ReelService:
         video_duration_sec: int,
         clip_min_len: int,
         clip_max_len: int,
+        clip_target_len: int,
         max_segments: int,
         concept_terms: list[str] | None = None,
     ) -> list[SegmentMatch]:
@@ -10599,8 +10601,20 @@ class ReelService:
                 refine_boundaries=True,
                 transcript=tc_cues,
                 info_dict=info_dict,
+                # Topic-segmentation bounds — kept wider than user clip
+                # bounds so a topic can encompass multiple clip-sized
+                # passages the LLM then narrows. The actual clip-level
+                # bounds come from user settings below.
                 min_reel_sec=max(clip_min_len, 15),
                 max_reel_sec=max(clip_max_len, 60),
+                # Clip-level bounds from the user's settings.
+                # `cut_video_into_topic_reels` threads these into
+                # `_apply_boundary_engine` → `pick_clip_llm` so the LLM
+                # and snap pipeline respect the user's configured
+                # min/max/preferred durations exactly.
+                user_min_sec=float(clip_min_len),
+                user_max_sec=float(clip_max_len),
+                user_target_sec=float(clip_target_len),
             )
         except Exception:
             logger.exception(

@@ -2148,6 +2148,7 @@ def _apply_boundary_engine(
     query: str | None,
     user_min_sec: float,
     user_max_sec: float,
+    user_target_sec: float | None,
     video_duration_sec: float | None,
 ) -> list[TopicReel]:
     """
@@ -2249,8 +2250,9 @@ def _apply_boundary_engine(
             pick = pick_clip_llm(
                 query,
                 window_cues,
-                min_sec=max(user_min_sec, 15.0),
-                max_sec=max(user_max_sec, 15.0),
+                min_sec=user_min_sec,
+                max_sec=user_max_sec,
+                target_sec=user_target_sec,
             )
         except Exception:
             logger.exception("clip_llm.pick_clip_llm raised for video %s", r.video_id)
@@ -2263,8 +2265,8 @@ def _apply_boundary_engine(
                 raw_t_end=pick.t_end,
                 sentences=sentences,
                 silence_ranges=silence_ranges,
-                min_sec=max(user_min_sec, 15.0),
-                max_sec=max(user_max_sec, 15.0),
+                min_sec=user_min_sec,
+                max_sec=user_max_sec,
             )
         except Exception:
             logger.exception("snap_llm_boundary raised for video %s", r.video_id)
@@ -2336,6 +2338,7 @@ def cut_video_into_topic_reels(
     silence_ranges: Sequence[tuple[float, float]] | None = None,
     user_min_sec: float | None = None,
     user_max_sec: float | None = None,
+    user_target_sec: float | None = None,
 ) -> tuple[VideoClassification, list[TopicReel]]:
     """
     End-to-end: classify a YouTube video, fetch its transcript, and (if it's
@@ -2410,6 +2413,9 @@ def cut_video_into_topic_reels(
     # Resolve soft user-setting bounds — default to the hard min/max guardrails.
     _user_min = float(user_min_sec) if user_min_sec is not None else float(min_reel_sec)
     _user_max = float(user_max_sec) if user_max_sec is not None else float(max_reel_sec)
+    # Target defaults to the midpoint when the caller didn't resolve a
+    # specific preferred duration from the user's settings.
+    _user_target = float(user_target_sec) if user_target_sec is not None else 0.5 * (_user_min + _user_max)
 
     # ---- Path 1: YouTube chapters (free, no API, no inference). -------- #
     chapters = extract_chapters(info_dict)
@@ -2435,6 +2441,7 @@ def cut_video_into_topic_reels(
                 query=query,
                 user_min_sec=_user_min,
                 user_max_sec=_user_max,
+                user_target_sec=_user_target,
                 video_duration_sec=classification.duration_sec or None,
             )
             if query and chapter_reels:
@@ -2565,6 +2572,7 @@ def cut_video_into_topic_reels(
             query=query,
             user_min_sec=_user_min,
             user_max_sec=_user_max,
+            user_target_sec=_user_target,
             video_duration_sec=classification.duration_sec or None,
         )
         if query and reels:
@@ -2607,6 +2615,7 @@ def cut_video_into_topic_reels(
         query=query,
         user_min_sec=_user_min,
         user_max_sec=_user_max,
+        user_target_sec=_user_target,
         video_duration_sec=classification.duration_sec or None,
     )
     if query and reels:

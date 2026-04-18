@@ -205,6 +205,80 @@ def test_parse_clip_pick_negative_start_returns_none():
 
 
 # --------------------------------------------------------------------------- #
+# User-settings plumbing — min/max/target flow into snap + prompt
+# --------------------------------------------------------------------------- #
+
+
+def test_snap_respects_user_max_below_60s():
+    # User sets max=40s; a 50s pick must reject even though 50 < 60 (old floor).
+    sents = _sample_sentences()
+    r = snap_llm_boundary(
+        raw_t_start=3.5,
+        raw_t_end=37.0,  # snapped duration = 33.5s, within 15-40
+        sentences=sents,
+        min_sec=15.0,
+        max_sec=40.0,
+    )
+    assert r.snapped
+    r2 = snap_llm_boundary(
+        raw_t_start=0.0,
+        raw_t_end=50.0,  # would snap to 37.0; 37s < 40s so OK
+        sentences=sents,
+        min_sec=15.0,
+        max_sec=30.0,  # but max=30 → 37-0=37s exceeds max → must reject
+    )
+    assert not r2.snapped
+
+
+def test_snap_respects_user_min_above_15s():
+    # User sets min=30s; a 20s clip must reject even though 20 > 15 (old floor).
+    sents = _sample_sentences()
+    r = snap_llm_boundary(
+        raw_t_start=10.5,
+        raw_t_end=28.0,  # snapped duration = 17.5s
+        sentences=sents,
+        min_sec=30.0,
+        max_sec=60.0,
+    )
+    assert not r.snapped
+    assert "duration" in r.reason.lower()
+
+
+def test_pick_clip_llm_accepts_target_sec_kwarg():
+    # Without any LLM keys set this returns None fast; we just verify the
+    # signature accepts target_sec without blowing up.
+    from backend.app.services.clip_llm import pick_clip_llm
+
+    cues = [TranscriptCue(start=0.0, duration=5.0, text="hello world")]
+    result = pick_clip_llm(
+        "anything",
+        cues,
+        min_sec=20.0,
+        max_sec=45.0,
+        target_sec=30.0,
+    )
+    # No LLM → None; but kwargs were accepted, signature is correct.
+    assert result is None or hasattr(result, "t_start")
+
+
+def test_pick_clip_llm_target_outside_bounds_gets_clamped():
+    # If caller passes target=5s but min/max=[20,45], the clamp logic
+    # should pull target into range without raising.
+    from backend.app.services.clip_llm import pick_clip_llm
+
+    cues = [TranscriptCue(start=0.0, duration=5.0, text="x")]
+    result = pick_clip_llm(
+        "q",
+        cues,
+        min_sec=20.0,
+        max_sec=45.0,
+        target_sec=5.0,  # deliberately out-of-range
+    )
+    # Same: no LLM → None, but no exception from the clamp path.
+    assert result is None or hasattr(result, "t_start")
+
+
+# --------------------------------------------------------------------------- #
 # EmbeddingService (hash fallback path — forced by VERCEL=1 in module init)
 # --------------------------------------------------------------------------- #
 

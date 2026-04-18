@@ -68,12 +68,18 @@ class ClipPick:
         return max(0.0, self.t_end - self.t_start)
 
 
-def _build_clip_system_prompt(query: str, min_sec: float, max_sec: float) -> str:
+def _build_clip_system_prompt(
+    query: str,
+    min_sec: float,
+    max_sec: float,
+    target_sec: float,
+) -> str:
     """System prompt for the single-clip picker.
 
-    Emphasizes: (a) exactly one clip, (b) duration bounds, (c) starts and
-    ends on complete thoughts, (d) picks the passage that most
-    substantively addresses the query, not merely mentions it.
+    Emphasizes: (a) exactly one clip, (b) duration bounds from user settings,
+    (c) aim near target_sec (user's preferred clip length), (d) starts and
+    ends on complete thoughts, (e) picks the passage that most substantively
+    addresses the query, not merely mentions it.
     """
     return f"""You are a precise video editor cutting a single short clip from a long-form YouTube video.
 
@@ -84,7 +90,12 @@ Example: [45.2-48.7s] And that brings us to the concept of gradient descent.
 
 The user is searching for: "{query}"
 
-Your job: pick the ONE best {min_sec:.0f}-{max_sec:.0f} second clip from this video that most substantively addresses the user's query. Return exactly one clip — no alternatives, no runner-ups.
+The user's clip-length preferences (from their settings):
+  - Minimum duration: {min_sec:.0f} seconds
+  - Maximum duration: {max_sec:.0f} seconds
+  - Preferred duration: {target_sec:.0f} seconds (aim for this when the natural topic allows)
+
+Your job: pick the ONE best clip from this video that most substantively addresses the user's query. Return exactly one clip — no alternatives, no runner-ups. Aim near {target_sec:.0f} seconds when the topic permits; extend toward {max_sec:.0f}s only when a single natural thought genuinely needs the room, and trim toward {min_sec:.0f}s only when the substantive passage is brief.
 
 Rules for picking the clip:
 - Choose the passage where the creator most directly and substantively discusses the query topic, not merely mentions it. A passing reference ("as we discussed with X") is not a clip; a sustained explanation of X is.
@@ -98,7 +109,7 @@ Rules for t_start:
 Rules for t_end:
 - t_end must be the END timestamp of a cue where the creator is finishing a complete thought about the query topic.
 - Do not end mid-sentence. Prefer ending just before a transition ("now let's look at", "moving on") rather than cutting the transition in.
-- Duration = t_end - t_start MUST be between {min_sec:.0f} and {max_sec:.0f} seconds. Outside this range the clip is rejected entirely. Aim near {(min_sec + max_sec) / 2:.0f}s for a clean standalone watch.
+- Duration = t_end - t_start MUST be between {min_sec:.0f} and {max_sec:.0f} seconds. Outside this range the clip is rejected entirely.
 
 IMPORTANT: t_start and t_end MUST be exact timestamp values that appear in the transcript's [X.X-Y.Ys] ranges. Use the START value of some cue for t_start and the END value of some cue for t_end. Do not interpolate, average, or invent timestamps.
 
@@ -179,6 +190,7 @@ def _pick_via_gemini(
     *,
     min_sec: float,
     max_sec: float,
+    target_sec: float,
     model: str = "gemini-2.0-flash",
 ) -> ClipPick | None:
     """Try Gemini Flash first — cheapest + fastest. Rotates API keys on
@@ -193,7 +205,7 @@ def _pick_via_gemini(
 
     from google.genai import types as genai_types
 
-    system_prompt = _build_clip_system_prompt(query, min_sec, max_sec)
+    system_prompt = _build_clip_system_prompt(query, min_sec, max_sec, target_sec)
     user_msg = (
         "Here is the full transcript of a YouTube video. "
         "Pick the one best clip per the rules in the system prompt.\n\n"
@@ -236,13 +248,14 @@ def _pick_via_groq(
     *,
     min_sec: float,
     max_sec: float,
+    target_sec: float,
     model: str = "llama-3.3-70b-versatile",
 ) -> ClipPick | None:
     """Groq Llama fallback when Gemini is unavailable or exhausted."""
     groq_client = _build_groq_client()
     if groq_client is None:
         return None
-    system_prompt = _build_clip_system_prompt(query, min_sec, max_sec)
+    system_prompt = _build_clip_system_prompt(query, min_sec, max_sec, target_sec)
     user_msg = (
         "Here is the full transcript of a YouTube video. "
         "Pick the one best clip per the rules in the system prompt.\n\n"
@@ -274,6 +287,7 @@ def _pick_via_cerebras(
     *,
     min_sec: float,
     max_sec: float,
+    target_sec: float,
     model: str = "llama-3.3-70b",
 ) -> ClipPick | None:
     """Cerebras Llama 3.3 70B fallback when both Gemini and Groq fail.
@@ -284,7 +298,7 @@ def _pick_via_cerebras(
     client = _build_cerebras_client()
     if client is None:
         return None
-    system_prompt = _build_clip_system_prompt(query, min_sec, max_sec)
+    system_prompt = _build_clip_system_prompt(query, min_sec, max_sec, target_sec)
     user_msg = (
         "Here is the full transcript of a YouTube video. "
         "Pick the one best clip per the rules in the system prompt.\n\n"
@@ -316,8 +330,15 @@ def pick_clip_llm(
     *,
     min_sec: float = MIN_CLIP_SEC,
     max_sec: float = MAX_CLIP_SEC,
+    target_sec: float | None = None,
 ) -> ClipPick | None:
     """Pick the single best clip for the query from the transcript via LLM.
+
+    `min_sec`/`max_sec`/`target_sec` come from the user's clip-window
+    settings (`target_clip_duration_min_sec`, `_max_sec`, `_sec`). The
+    LLM is told the preferred length and aims for it when the natural
+    topic allows; it can stretch or contract within [min, max]. When
+    `target_sec` is omitted it defaults to the midpoint of [min, max].
 
     Fallback chain: Gemini → Groq → Cerebras. Returns None if all three
     are unavailable or all fail validation; caller then falls back to the
@@ -326,13 +347,23 @@ def pick_clip_llm(
     query = (query or "").strip()
     if not query or not cues:
         return None
-    pick = _pick_via_gemini(query, cues, min_sec=min_sec, max_sec=max_sec)
+    if target_sec is None:
+        target_sec = 0.5 * (min_sec + max_sec)
+    # Keep target inside [min, max]; callers occasionally pass loose values.
+    target_sec = max(min_sec, min(max_sec, float(target_sec)))
+    pick = _pick_via_gemini(
+        query, cues, min_sec=min_sec, max_sec=max_sec, target_sec=target_sec,
+    )
     if pick is not None:
         return pick
-    pick = _pick_via_groq(query, cues, min_sec=min_sec, max_sec=max_sec)
+    pick = _pick_via_groq(
+        query, cues, min_sec=min_sec, max_sec=max_sec, target_sec=target_sec,
+    )
     if pick is not None:
         return pick
-    return _pick_via_cerebras(query, cues, min_sec=min_sec, max_sec=max_sec)
+    return _pick_via_cerebras(
+        query, cues, min_sec=min_sec, max_sec=max_sec, target_sec=target_sec,
+    )
 
 
 __all__ = [
