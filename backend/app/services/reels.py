@@ -10828,7 +10828,7 @@ class ReelService:
         concept: dict[str, Any],
         video: dict[str, Any],
         segment: SegmentMatch,
-        clip_window: tuple[float, float],
+        clip_window: tuple[int, int],
         relevance_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         start_sec, end_sec = clip_window
@@ -10873,7 +10873,7 @@ class ReelService:
         concept: dict[str, Any],
         video: dict[str, Any],
         segment: SegmentMatch,
-        clip_window: tuple[float, float] | None = None,
+        clip_window: tuple[int, int] | None = None,
         transcript: list[dict[str, Any]] | None = None,
         relevance_context: dict[str, Any] | None = None,
         fast_mode: bool = False,
@@ -10888,29 +10888,22 @@ class ReelService:
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
         )
-        video_duration_sec = int(video.get("duration_sec") or 0)
-        normalized_clip_window: tuple[float, float] | None
+        normalized_clip_window: tuple[int, int] | None
         if clip_window is None:
             normalized_clip_window = self._normalize_clip_window(
                 segment.t_start,
                 segment.t_end,
-                video_duration_sec,
+                int(video.get("duration_sec") or 0),
                 min_len=clip_min_len,
                 max_len=clip_max_len,
             )
         else:
-            # Upstream legacy clipping has already sentence-snapped and chained
-            # this window. Re-applying max/min clipping here truncates the reel
-            # back to the user's max length, which cuts endings mid-sentence
-            # and creates gaps before the next chained part.
             normalized_clip_window = self._normalize_clip_window(
                 clip_window[0],
                 clip_window[1],
-                video_duration_sec,
+                int(video.get("duration_sec") or 0),
                 min_len=clip_min_len,
                 max_len=clip_max_len,
-                allow_exceed_max=True,
-                allow_below_min=True,
             )
         if not normalized_clip_window:
             return None
@@ -10995,7 +10988,7 @@ class ReelService:
             "source_surface": str((relevance_context or {}).get("source_surface") or ""),
             "matched_terms": matched_terms,
             "relevance_reason": relevance_reason,
-            "video_duration_sec": video_duration_sec,
+            "video_duration_sec": int(video.get("duration_sec") or 0),
             "clip_duration_sec": float(max(0.0, end_sec - start_sec)),
         }
 
