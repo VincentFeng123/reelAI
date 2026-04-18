@@ -15,11 +15,14 @@ don't depend on YouTube / LLM availability.
 
 from __future__ import annotations
 
+import sqlite3
 import unittest
 from typing import Any
 
+from app.db import SCHEMA
 from app.services.embeddings import EmbeddingService
 from app.services.reels import ReelService
+from app.services.segmenter import SegmentMatch
 from app.services.youtube import YouTubeService
 
 
@@ -253,6 +256,145 @@ class ContinuationInvariantTests(unittest.TestCase):
         # Overlap invariant still holds.
         for i in range(len(windows) - 1):
             self.assertLessEqual(windows[i][1], windows[i + 1][0] + 0.01)
+
+
+class PersistedClipWindowInvariantTests(unittest.TestCase):
+    """Persisted legacy reels keep the refined window the cutter produced."""
+
+    MATERIAL_ID = "material-persisted-window"
+    CONCEPT_ID = "concept-persisted-window"
+    VIDEO_ID = "video-persisted-window"
+
+    def setUp(self) -> None:
+        self.rs = ReelService(embedding_service=None, youtube_service=None)
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript(SCHEMA)
+        self.conn.execute(
+            "INSERT INTO materials (id, subject_tag, raw_text, source_type, source_path, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                self.MATERIAL_ID,
+                "math",
+                "Chain rule notes",
+                "text",
+                None,
+                "2026-04-17T00:00:00+00:00",
+            ),
+        )
+        self.conn.execute(
+            "INSERT INTO concepts (id, material_id, title, keywords_json, summary, embedding_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                self.CONCEPT_ID,
+                self.MATERIAL_ID,
+                "Chain rule",
+                '["chain rule", "derivative"]',
+                "How composite derivatives work.",
+                None,
+                "2026-04-17T00:01:00+00:00",
+            ),
+        )
+        self.conn.execute(
+            "INSERT INTO videos (id, title, channel_title, description, duration_sec, view_count, is_creative_commons, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                self.VIDEO_ID,
+                "Chain rule walkthrough",
+                "Test Channel",
+                "A clean calculus lecture.",
+                600,
+                1000,
+                0,
+                "2026-04-17T00:02:00+00:00",
+            ),
+        )
+
+    def tearDown(self) -> None:
+        self.conn.close()
+
+    def _concept(self) -> dict[str, Any]:
+        return {
+            "id": self.CONCEPT_ID,
+            "title": "Chain rule",
+            "keywords": ["chain rule", "derivative"],
+        }
+
+    def _video(self) -> dict[str, Any]:
+        return {
+            "id": self.VIDEO_ID,
+            "title": "Chain rule walkthrough",
+            "channel_title": "Test Channel",
+            "description": "A clean calculus lecture.",
+            "duration_sec": 600,
+        }
+
+    def _segment(self, *, score: float = 0.9) -> SegmentMatch:
+        return SegmentMatch(
+            chunk_index=0,
+            t_start=18.0,
+            t_end=48.0,
+            text="The chain rule states that the derivative of a composite function is the derivative of the outer function times the derivative of the inner function.",
+            score=score,
+        )
+
+    def test_create_reel_preserves_refined_window_past_max_len(self) -> None:
+        refined_window = (18.0, 50.3)  # 32.3s > default max_len(30) for target=20
+        reel = self.rs._create_reel(
+            self.conn,
+            material_id=self.MATERIAL_ID,
+            concept=self._concept(),
+            video=self._video(),
+            segment=self._segment(),
+            clip_window=refined_window,
+            transcript=[],
+            fast_mode=True,
+            target_clip_duration_sec=20,
+        )
+        self.assertIsNotNone(reel)
+        self.assertAlmostEqual(float(reel["t_start"]), refined_window[0])
+        self.assertAlmostEqual(float(reel["t_end"]), refined_window[1])
+
+        row = self.conn.execute(
+            "SELECT t_start, t_end FROM reels WHERE id = ?",
+            (reel["reel_id"],),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertAlmostEqual(float(row["t_start"]), refined_window[0])
+        self.assertAlmostEqual(float(row["t_end"]), refined_window[1])
+
+    def test_create_reel_keeps_chained_windows_contiguous(self) -> None:
+        first_window = (20.0, 52.3)
+        second_window = (52.3, 84.0)
+
+        first = self.rs._create_reel(
+            self.conn,
+            material_id=self.MATERIAL_ID,
+            concept=self._concept(),
+            video=self._video(),
+            segment=self._segment(score=0.92),
+            clip_window=first_window,
+            transcript=[],
+            fast_mode=True,
+            target_clip_duration_sec=20,
+        )
+        second = self.rs._create_reel(
+            self.conn,
+            material_id=self.MATERIAL_ID,
+            concept=self._concept(),
+            video=self._video(),
+            segment=self._segment(score=0.88),
+            clip_window=second_window,
+            transcript=[],
+            fast_mode=True,
+            target_clip_duration_sec=20,
+        )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertAlmostEqual(float(first["t_end"]), first_window[1])
+        self.assertAlmostEqual(float(second["t_start"]), second_window[0])
+        self.assertAlmostEqual(float(first["t_end"]), float(second["t_start"]))
 
 
 class TopicStartInvariantTests(unittest.TestCase):
