@@ -60,6 +60,17 @@ class Settings(BaseSettings):
     # Enable proxy for YouTube search HTML scraping
     proxy_search: bool = True
 
+    # PO Token provider for yt-dlp. YouTube enforces PO Tokens on flagged
+    # (cloud) IPs for video playback and some caption fetches. The plugin
+    # `bgutil-ytdlp-pot-provider` (already in requirements.txt) talks to an
+    # HTTP bgutil provider service to generate tokens. Leave blank to skip
+    # the feature (yt-dlp falls back to non-PO-token flows, which may fail
+    # on cloud IPs). To enable: deploy `brainicism/bgutil-ytdlp-pot-provider`
+    # as a Railway sidecar on port 4416 and set this to the sidecar URL
+    # (e.g. "http://bgutil-provider.railway.internal:4416"). yt_dlp_adapter
+    # reads this and wires it into extractor_args automatically.
+    ytdlp_pot_provider_url: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

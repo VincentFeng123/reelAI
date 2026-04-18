@@ -4,6 +4,13 @@ python-multipart==0.0.20
 pydantic>=2.12.0
 pydantic-settings>=2.10.1
 requests==2.32.3
+# curl_cffi: browser-fingerprint-impersonating HTTP client built on
+# libcurl-impersonate. Replaces plain `requests` for YouTube scraping
+# paths (services/youtube.py) so ClientHello, JA3/JA4, HTTP/2 frame
+# order, and ALPN sequence match Chrome instead of Python-urllib3's
+# bot-shaped fingerprint. Non-scraping call sites (Resend API, LLM
+# routers, topic_expansion) keep plain `requests`.
+curl_cffi>=0.15.0
 # YouTube serves Brotli-compressed pages when the request advertises
 # Accept-Encoding: br (which our stealth headers do, to look like a real
 # browser). requests/urllib3 auto-decodes br ONLY if the ``brotli`` (or
@@ -11,6 +18,8 @@ requests==2.32.3
 # bytes land in ``resp.text`` and every ytInitialData extraction fails
 # with "title=''" because <title> only appears in the decoded body.
 # Pinning this explicitly so Railway containers always have it.
+# (curl_cffi decompresses brotli internally via libcurl, but `requests`
+# is still used for non-YouTube paths so this stays required.)
 brotli==1.1.0
 youtube-transcript-api==1.2.4
 openai==2.26.0
@@ -23,7 +32,21 @@ python-dateutil==2.9.0.post0
 psycopg[binary]==3.2.10
 resend==2.10.0
 yt-dlp==2026.3.17
+# Optional yt-dlp plugin that supplies PO Tokens via a bgutil HTTP provider.
+# Safe to install even when no provider is deployed — yt-dlp skips the plugin
+# if extractor_args don't point to a reachable URL. Activate by deploying
+# `brainicism/bgutil-ytdlp-pot-provider` as a sidecar and setting
+# YTDLP_POT_PROVIDER_URL (see config.py).
+bgutil-ytdlp-pot-provider>=0.7.0
 faster-whisper==1.1.1
+# Semantic text embeddings for clip-relevance scoring. Loaded lazily on
+# first use; the module auto-falls-back to the hash embedder if the model
+# can't load (missing pytorch, Vercel serverless, no internet on first
+# call, etc). The Vercel top-level requirements.txt intentionally does
+# NOT include this — the function size limit plus cold-start latency
+# make MiniLM impractical in serverless, and the hash fallback keeps
+# Vercel paths functional.
+sentence-transformers>=3.0.0
 google-genai>=1.0.0
 groq>=0.12.0
 # Sentence boundary detection for ClipBoundaryEngine (Phase A.2). ~50KB, pure

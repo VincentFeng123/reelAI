@@ -11,8 +11,20 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import parse_qs, unquote, urlparse
 
-import requests
-from requests.adapters import HTTPAdapter
+# curl_cffi is used in place of vanilla `requests` on every YouTube scrape
+# path so the TLS ClientHello, JA3/JA4, HTTP/2 frame order, and ALPN sequence
+# match a real Chrome build instead of Python's urllib3 fingerprint (which
+# YouTube's edge flags as a bot regardless of User-Agent). The module exposes
+# a requests-compatible API, so `requests.Session`, `requests.get/post`,
+# `requests.Response`, and `requests.exceptions.*` continue to work; only the
+# urllib3-specific `HTTPAdapter.mount()` path is gone (curl_cffi uses libcurl
+# pools internally).
+from curl_cffi import requests
+from curl_cffi.requests.exceptions import (
+    HTTPError,
+    RequestException,
+    Timeout,
+)
 from youtube_transcript_api import YouTubeTranscriptApi
 from youtube_transcript_api._errors import (
     NoTranscriptFound,
@@ -27,40 +39,36 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 # ---------------------------------------------------------------------------
 # Proxy rotation & stealth helpers
 # ---------------------------------------------------------------------------
-# Rotating User-Agent pool — cycle through realistic browser fingerprints to
-# avoid bot detection by YouTube.  Chrome 131-133 are the current stable
-# versions as of April 2026.  Includes Windows/Mac/Linux to match YouTube's
-# normal traffic distribution.  Updated monthly; stale UAs (>6 months old)
-# get flagged by YouTube's anti-bot heuristics.
-_USER_AGENTS = [
-    # Chrome 133 — current stable (April 2026)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
-    # Chrome 132 — previous stable
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-    # Chrome 131 — one back
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    # Edge (same Chromium base — common on corporate networks)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0",
+# curl_cffi impersonation targets. Each target locks in a full browser
+# fingerprint — TLS ClientHello + JA3/JA4 + HTTP/2 SETTINGS frame order +
+# ALPN + the matching User-Agent, Sec-Ch-Ua, Sec-Ch-Ua-Mobile,
+# Sec-Ch-Ua-Platform, and Accept-Encoding. Rotating the target rotates all
+# of those in lockstep; rotating just the UA string (as the old code did)
+# is a known bot tell because TLS and UA get out of sync. One target is
+# picked once per Session lifetime — real browsers don't change their TLS
+# fingerprint mid-session. For diversity across fetches, the Innertube
+# helper builds a fresh Session per video with its own target pick.
+_IMPERSONATE_TARGETS = [
+    "chrome131",
+    "chrome133",
+    "chrome140",
+    "chrome146",  # most recent free-tier target in curl_cffi 0.15
 ]
 
-# Realistic browser headers to accompany each request. Sec-Ch-Ua must match
-# the UA version range above, or YouTube's passive fingerprinting flags a
-# mismatch between the UA header and the Sec-Ch-Ua hint.
+
+def _random_impersonate() -> str:
+    return random.choice(_IMPERSONATE_TARGETS)
+
+
+# Headers curl_cffi's impersonation does NOT set for us and that we still
+# need for YouTube specifically. Sec-Ch-Ua* and Accept-Encoding are now
+# owned by curl_cffi (removing them from here avoids overriding the
+# impersonation-matched values). Sec-Fetch-* are not part of the TLS
+# fingerprint and must be supplied explicitly.
 _STEALTH_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "max-age=0",
-    "Sec-Ch-Ua": '"Chromium";v="133", "Google Chrome";v="133", "Not-A.Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"macOS"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
@@ -68,28 +76,6 @@ _STEALTH_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
     "Priority": "u=0, i",
 }
-
-
-def _random_user_agent() -> str:
-    return random.choice(_USER_AGENTS)
-
-
-def _sec_ch_ua_for_user_agent(ua: str) -> str:
-    """Derive a Sec-Ch-Ua hint that matches the Chrome major version in *ua*.
-
-    YouTube's passive fingerprinting compares the User-Agent header against the
-    Sec-Ch-Ua client hint.  A mismatch (e.g. UA says Chrome/131 but Sec-Ch-Ua
-    says v="133") is a strong bot signal.  This helper keeps them in sync
-    whenever we rotate the User-Agent.
-    """
-    match = re.search(r"Chrome/(\d+)", ua)
-    if not match:
-        # Fallback for non-Chrome UAs (shouldn't happen with our pool)
-        return '"Chromium";v="133", "Google Chrome";v="133", "Not-A.Brand";v="24"'
-    ver = match.group(1)
-    if "Edg/" in ua:
-        return f'"Chromium";v="{ver}", "Microsoft Edge";v="{ver}", "Not-A.Brand";v="24"'
-    return f'"Chromium";v="{ver}", "Google Chrome";v="{ver}", "Not-A.Brand";v="24"'
 
 
 class _ProxyRotator:
@@ -475,17 +461,21 @@ class YouTubeService:
         else:
             self.transcript_api = YouTubeTranscriptApi()
 
-        # ---- HTTP session with stealth headers + optional proxy ------------
-        self._session = requests.Session()
-        adapter = HTTPAdapter(
-            pool_connections=self.SESSION_POOL_SIZE,
-            pool_maxsize=self.SESSION_POOL_SIZE,
-            max_retries=0,
-        )
-        self._session.mount("https://", adapter)
-        self._session.mount("http://", adapter)
+        # ---- HTTP session with Chrome impersonation + stealth headers ------
+        # `impersonate=` locks in the TLS + HTTP/2 + header-set fingerprint of
+        # a specific Chrome build for the lifetime of this session. Picked once
+        # here (stable per process) because a TLS fingerprint that changes
+        # between requests to the same host is itself a bot signal. Connection
+        # pooling is handled by libcurl internally, so there's no HTTPAdapter
+        # to mount; SESSION_POOL_SIZE is kept as documentation for the ceiling
+        # the ThreadPoolExecutor should stay under.
+        self._impersonate_target = _random_impersonate()
+        self._session = requests.Session(impersonate=self._impersonate_target)
+        # Supplementary headers curl_cffi doesn't set as part of impersonation
+        # (Sec-Fetch-*, Cache-Control, Priority). Sec-Ch-Ua*, User-Agent, and
+        # Accept-Encoding are intentionally NOT in _STEALTH_HEADERS — the
+        # impersonation sets them and overriding creates a mismatch.
         self._session.headers.update(_STEALTH_HEADERS)
-        self._session.headers["User-Agent"] = _random_user_agent()
         # Pre-accept YouTube's cookie consent dialog so search/watch/channel
         # pages return real `ytInitialData` HTML instead of a consent wall
         # that lacks the marker entirely. Without this, requests from cloud
@@ -528,11 +518,9 @@ class YouTubeService:
         return True
 
     def _session_get(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
-        # Rotate User-Agent and keep Sec-Ch-Ua in sync so YouTube's passive
-        # fingerprinting doesn't flag a version mismatch as bot traffic.
-        ua = _random_user_agent()
-        self._session.headers["User-Agent"] = ua
-        self._session.headers["Sec-Ch-Ua"] = _sec_ch_ua_for_user_agent(ua)
+        # User-Agent and Sec-Ch-Ua are set by curl_cffi's impersonation so
+        # they always match the TLS fingerprint — manual rotation here would
+        # only create a UA/TLS mismatch (the exact signal we're avoiding).
         if self._proxy_search and "proxies" not in kwargs:
             proxy = self._proxy_rotator.next()
             if proxy:
@@ -544,9 +532,6 @@ class YouTubeService:
         )
 
     def _session_post(self, url: str, *, deadline: float | None = None, **kwargs: Any) -> requests.Response:
-        ua = _random_user_agent()
-        self._session.headers["User-Agent"] = ua
-        self._session.headers["Sec-Ch-Ua"] = _sec_ch_ua_for_user_agent(ua)
         if self._proxy_search and "proxies" not in kwargs:
             proxy = self._proxy_rotator.next()
             if proxy:
@@ -1017,7 +1002,7 @@ class YouTubeService:
                 resp.raise_for_status()
                 data = resp.json()
                 self._note_request_success("youtube_api")
-            except requests.RequestException as exc:
+            except RequestException as exc:
                 self._note_request_failure(exc, scope="youtube_api")
                 if page_idx == 0:
                     status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -1987,7 +1972,7 @@ class YouTubeService:
             resp.raise_for_status()
             payload = resp.text
             self._note_request_success("youtube_html")
-        except requests.RequestException as exc:
+        except RequestException as exc:
             self._note_request_failure(exc, scope="youtube_html")
             return ""
         # A successful response can still be useless if YouTube served us a
@@ -2023,7 +2008,7 @@ class YouTubeService:
             resp.raise_for_status()
             payload = resp.text
             self._note_request_success("youtube_html")
-        except requests.RequestException as exc:
+        except RequestException as exc:
             self._note_request_failure(exc, scope="youtube_html")
             return ""
         if not payload or len(payload) < 5000:
@@ -2289,11 +2274,12 @@ class YouTubeService:
 
         best_payload = ""
         for attempt in range(self.HTML_FETCH_MAX_RETRIES):
+            request_kwargs: dict[str, Any] = {}
             if attempt > 0:
-                # Rotate UA between retries so YouTube sees a "different browser"
-                ua = _random_user_agent()
-                self._session.headers["User-Agent"] = ua
-                self._session.headers["Sec-Ch-Ua"] = _sec_ch_ua_for_user_agent(ua)
+                # On retry, swap to a fresh impersonation target so YouTube
+                # sees a different full-stack browser fingerprint (TLS + UA +
+                # Sec-Ch-Ua together), not just a UA-header change.
+                request_kwargs["impersonate"] = _random_impersonate()
                 delay = self.HTML_FETCH_RETRY_BACKOFF_SEC * (1.5 ** attempt)
                 time.sleep(delay)
                 if self._deadline_exceeded(deadline):
@@ -2312,10 +2298,11 @@ class YouTubeService:
                         "persist_hl": "1",
                     },
                     deadline=deadline,
+                    **request_kwargs,
                 )
                 resp.raise_for_status()
                 self._note_request_success("youtube_html")
-            except requests.RequestException as exc:
+            except RequestException as exc:
                 self._note_request_failure(exc, scope="youtube_html")
                 continue
 
@@ -2400,7 +2387,7 @@ class YouTubeService:
                 },
             )
             resp.raise_for_status()
-        except requests.RequestException as exc:
+        except RequestException as exc:
             self._note_request_failure(exc, scope="innertube_search")
             logger.debug("InnerTube search failed: %s", type(exc).__name__)
             return []
@@ -2970,7 +2957,7 @@ class YouTubeService:
             resp.raise_for_status()
             data = resp.json()
             self._note_request_success("youtube_html")
-        except requests.RequestException as exc:
+        except RequestException as exc:
             self._note_request_failure(exc, scope="youtube_html")
             return None
         except ValueError:
@@ -3513,7 +3500,7 @@ class YouTubeService:
                 )
                 resp.raise_for_status()
                 self._note_request_success(scope)
-            except requests.RequestException as exc:
+            except RequestException as exc:
                 self._note_request_failure(exc, scope=scope)
                 continue
 
@@ -3638,7 +3625,7 @@ class YouTubeService:
             resp.raise_for_status()
             data = resp.json()
             self._note_request_success("youtube_api")
-        except requests.RequestException as exc:
+        except RequestException as exc:
             self._note_request_failure(exc, scope="youtube_api")
             return {}
         payload: dict[str, dict[str, Any]] = {}
@@ -3786,7 +3773,7 @@ class YouTubeService:
         )
         return pattern.sub(r"\1<REDACTED>", text)
 
-    def _note_request_failure(self, exc: requests.RequestException, *, scope: str) -> None:
+    def _note_request_failure(self, exc: RequestException, *, scope: str) -> None:
         clean_scope = str(scope or "").strip()
         if not clean_scope:
             return
@@ -3832,6 +3819,21 @@ class YouTubeService:
                     float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
                     time.monotonic() + backoff_sec,
                 )
+            elif (
+                status_code is not None
+                and 500 <= status_code < 600
+                and retry_after is not None
+            ):
+                # 5xx with Retry-After: the origin is overloaded or in a
+                # maintenance window and told us when to come back. Honor the
+                # hint — retrying earlier burns proxy budget during a known
+                # degraded period and is itself a bot signal.
+                self._network_backoff_until_by_scope[clean_scope] = max(
+                    float(self._network_backoff_until_by_scope.get(clean_scope, 0.0) or 0.0),
+                    time.monotonic() + retry_after,
+                )
+                streak = int(self._network_failure_streak_by_scope.get(clean_scope, 0) or 0) + 1
+                self._network_failure_streak_by_scope[clean_scope] = streak
             elif status_code == 403:
                 # 403 from the YouTube Data API almost always means
                 # quota-exceeded or key-not-enabled. The server doesn't send
@@ -4338,12 +4340,12 @@ class YouTubeService:
 
         Returns transcript in [{text, start, duration}, ...] format.
         """
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": _random_user_agent(),
-            "Accept-Language": "en-US,en;q=0.9",
-            **_STEALTH_HEADERS,
-        })
+        # Fresh impersonation per video — each Innertube fetch looks like a
+        # different user opening a different video (different TLS, different
+        # UA, different Sec-Ch-Ua, all matched). curl_cffi's per-Session
+        # impersonation handles the User-Agent and Sec-Ch-Ua* automatically.
+        session = requests.Session(impersonate=_random_impersonate())
+        session.headers.update(_STEALTH_HEADERS)
         proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
         if proxy:
             session.proxies.update(proxy)
@@ -4463,6 +4465,16 @@ class YouTubeService:
     # Whisper audio fallback — download audio, transcribe locally or via API
     # ------------------------------------------------------------------
 
+    def _ytdlp_pot_extractor_args(self) -> dict[str, dict[str, list[str]]]:
+        """Build extractor_args that activate the bgutil PO Token provider
+        when a sidecar URL is configured, otherwise empty. See config.py for
+        the provider-deployment contract.
+        """
+        provider_url = get_settings().ytdlp_pot_provider_url.strip()
+        if not provider_url:
+            return {}
+        return {"youtubepot-bgutilhttp": {"base_url": [provider_url]}}
+
     def _yt_dlp_subtitle_fetch(self, video_id: str) -> tuple[list[dict[str, Any]], str]:
         """Download subtitles via yt-dlp (no audio download — much cheaper than ASR).
 
@@ -4479,7 +4491,7 @@ class YouTubeService:
 
         tmpdir = tempfile.mkdtemp(prefix="reelai_ytdlp_sub_")
         try:
-            ydl_opts = {
+            ydl_opts: dict[str, Any] = {
                 "writesubtitles": True,
                 "writeautomaticsub": True,
                 "subtitleslangs": ["en"],
@@ -4491,6 +4503,9 @@ class YouTubeService:
                 "socket_timeout": 10,
                 **self._ytdlp_cookie_opts(),
             }
+            pot_args = self._ytdlp_pot_extractor_args()
+            if pot_args:
+                ydl_opts["extractor_args"] = pot_args
             proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
             if proxy:
                 proxy_url = proxy.get("https") or proxy.get("http") or ""
@@ -4564,7 +4579,7 @@ class YouTubeService:
                 logger.debug("yt-dlp not installed, skipping Whisper audio fallback")
                 return [], ""
 
-            ydl_opts = {
+            ydl_opts: dict[str, Any] = {
                 "format": "bestaudio/best",
                 "outtmpl": os.path.join(tmpdir, f"{video_id}.%(ext)s"),
                 "quiet": True,
@@ -4578,6 +4593,9 @@ class YouTubeService:
                 "postprocessor_args": ["-ac", "1", "-ar", "16000"],
                 **self._ytdlp_cookie_opts(),
             }
+            pot_args = self._ytdlp_pot_extractor_args()
+            if pot_args:
+                ydl_opts["extractor_args"] = pot_args
             proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
             if proxy:
                 proxy_url = proxy.get("https") or proxy.get("http") or ""

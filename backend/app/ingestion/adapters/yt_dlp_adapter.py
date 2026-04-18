@@ -30,6 +30,7 @@ import urllib.robotparser
 from pathlib import Path
 from typing import Any
 
+from ... import config as _config
 from .. import USER_AGENT
 from ..errors import DownloadError, UnsupportedSourceError
 from ..logging_config import get_ingest_logger, log_event
@@ -384,11 +385,27 @@ class YtDlpAdapter(BaseAdapter):
     # the common case without needing a proxy or cookies. yt-dlp must be
     # reasonably recent for these client names to exist — see
     # backend/requirements.txt for the pinned version.
-    _YOUTUBE_EXTRACTOR_ARGS: dict[str, dict[str, list[str]]] = {
+    _YOUTUBE_EXTRACTOR_ARGS_BASE: dict[str, dict[str, list[str]]] = {
         "youtube": {
             "player_client": ["default", "web_embedded", "mweb"],
         },
     }
+
+    def _youtube_extractor_args(self) -> dict[str, dict[str, list[str]]]:
+        # Copy the base and layer in the bgutil PO token provider when
+        # YTDLP_POT_PROVIDER_URL is set. On flagged IPs (cloud datacenters),
+        # YouTube increasingly requires PO Tokens for GVS/caption requests;
+        # the bgutil plugin fetches them from a sidecar HTTP provider. When
+        # the provider URL is empty, yt-dlp behaves exactly as before (plugin
+        # is installed but not configured, so it's a no-op).
+        args: dict[str, dict[str, list[str]]] = {
+            k: {kk: list(vv) for kk, vv in v.items()}
+            for k, v in self._YOUTUBE_EXTRACTOR_ARGS_BASE.items()
+        }
+        provider_url = _config.get_settings().ytdlp_pot_provider_url.strip()
+        if provider_url:
+            args["youtubepot-bgutilhttp"] = {"base_url": [provider_url]}
+        return args
 
     def _ydl_opts_for_resolve(self, workspace: Path) -> dict[str, Any]:
         return {
@@ -407,7 +424,7 @@ class YtDlpAdapter(BaseAdapter):
             "writeautomaticsub": True,
             "subtitleslangs": ["en", "en-US", "en-GB"],
             "subtitlesformat": "vtt",
-            "extractor_args": self._YOUTUBE_EXTRACTOR_ARGS,
+            "extractor_args": self._youtube_extractor_args(),
             "http_headers": {
                 "User-Agent": USER_AGENT,
             },
@@ -425,7 +442,7 @@ class YtDlpAdapter(BaseAdapter):
             "nocheckcertificate": False,
             "socket_timeout": self._socket_timeout,
             "retries": self._retries,
-            "extractor_args": self._YOUTUBE_EXTRACTOR_ARGS,
+            "extractor_args": self._youtube_extractor_args(),
             "http_headers": {
                 "User-Agent": USER_AGENT,
             },
