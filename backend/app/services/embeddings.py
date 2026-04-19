@@ -143,6 +143,16 @@ class EmbeddingService:
             return self._normalize(vec), False
         return None, True
 
+    def embed_local(self, texts: Iterable[str]) -> np.ndarray:
+        """Uncached embedding generation — used by scoring paths that don't
+        need DB caching (e.g., the heuristic clip picker scoring hundreds of
+        candidate windows per call where caching each would churn the table).
+        """
+        text_list = [str(t).strip() for t in texts]
+        if not text_list:
+            return np.empty((0, self.dim), dtype=np.float32)
+        return self._embed_local(text_list)
+
     def _embed_local(self, texts: list[str]) -> np.ndarray:
         if self._semantic_model is not None:
             try:

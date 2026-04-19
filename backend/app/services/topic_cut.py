@@ -2216,17 +2216,33 @@ def _apply_boundary_engine(
 
     # LLM-direct clip picker: ask the LLM to pick the best (t_start, t_end)
     # inside each topic window, then snap to a terminal-punct sentence
-    # boundary + nearest silence gap. This is the primary path when a query
-    # is available and LLM keys are configured. The heuristic ClipBoundaryEngine
-    # below runs as a fallback whenever the LLM path declines (no keys,
-    # malformed output, or snap rejects because no terminal-punct sentence
-    # fits).
+    # boundary + nearest silence gap + word-level trim. When all three LLM
+    # providers (Gemini → Groq → Cerebras) fail or rate-limit, the strong
+    # heuristic picker runs as a second-tier fallback — it scores every
+    # terminal-punct-bounded window using sentence-transformer embeddings
+    # (when available) + TF-IDF + filler/silence/intro signals. Only if
+    # BOTH LLM and heuristic pickers fail does the legacy ClipBoundaryEngine
+    # heuristic run.
     try:
         from .clip_llm import pick_clip_llm
-        from .clip_boundary import snap_llm_boundary
+        from .clip_boundary import pick_clip_heuristic, snap_llm_boundary
     except Exception:
         pick_clip_llm = None  # type: ignore[assignment]
+        pick_clip_heuristic = None  # type: ignore[assignment]
         snap_llm_boundary = None  # type: ignore[assignment]
+
+    # Build an embed_func for the heuristic picker's semantic scoring. We
+    # lazy-load EmbeddingService once per video (not per reel) so we pay
+    # the model-lookup cost at most N=1 times even when a video has 5+
+    # topic reels. On Vercel (serverless) this returns a hash-embed
+    # function automatically; heuristic scoring still runs, just weaker.
+    _embed_func: Any | None = None
+    try:
+        from .embeddings import EmbeddingService
+        _svc = EmbeddingService()
+        _embed_func = _svc.embed_local
+    except Exception:
+        _embed_func = None
 
     def _try_llm_pick(r: TopicReel) -> bool:
         """Return True when the LLM-direct path successfully set r.t_start
@@ -2267,6 +2283,7 @@ def _apply_boundary_engine(
                 silence_ranges=silence_ranges,
                 min_sec=user_min_sec,
                 max_sec=user_max_sec,
+                ingest_cues=cue_list,  # enables word-level + filler trimming
             )
         except Exception:
             logger.exception("snap_llm_boundary raised for video %s", r.video_id)
@@ -2282,12 +2299,62 @@ def _apply_boundary_engine(
         r.boundary_quality = "llm-snap"
         return True
 
+    def _try_heuristic_pick(r: TopicReel) -> bool:
+        """Strong-heuristic fallback. Runs when the LLM path declines —
+        scores every terminal-punct-bounded window inside the topic reel
+        using semantic embeddings + TF-IDF + filler/silence/intro signals
+        and picks the top scorer. Word-level trimming is applied inside
+        `pick_clip_heuristic`, so no separate snap step is needed."""
+        if not query or pick_clip_heuristic is None:
+            return False
+        window_lo = max(0.0, r.t_start - 2.0)
+        window_hi = r.t_end + 2.0
+        window_sentences = [
+            s for s in sentences
+            if window_lo <= s.t_start and s.t_end <= window_hi
+        ]
+        if not window_sentences:
+            return False
+        # Narrow ingest_cues to the same window so the word-level refiner
+        # doesn't walk the whole video's cue list per reel.
+        window_cues = [
+            c for c in cue_list
+            if window_lo <= float(getattr(c, "start", 0.0)) <= window_hi
+        ]
+        try:
+            result = pick_clip_heuristic(
+                query=query,
+                cues=window_cues or None,
+                sentences=window_sentences,
+                silence_ranges=silence_ranges,
+                user_min_sec=user_min_sec,
+                user_max_sec=user_max_sec,
+                user_target_sec=user_target_sec or 0.5 * (user_min_sec + user_max_sec),
+                video_duration_sec=video_duration_sec,
+                embed_func=_embed_func,
+            )
+        except Exception:
+            logger.exception("pick_clip_heuristic raised for video %s", r.video_id)
+            return False
+        if result is None:
+            return False
+        r.t_start = round(float(result.t_start), 2)
+        r.t_end = round(float(result.t_end), 2)
+        r.boundary_quality = "heuristic-strong"
+        return True
+
     refined: list[TopicReel] = []
     for r in reels:
         if _try_llm_pick(r):
             refined.append(r)
             continue
-        # Heuristic fallback — the original ClipBoundaryEngine path.
+        if _try_heuristic_pick(r):
+            refined.append(r)
+            continue
+        # Last-resort fallback — the original ClipBoundaryEngine heuristic.
+        # Only reached when both the LLM path AND the strong heuristic
+        # picker decline (e.g., no terminal-punct windows fit the user's
+        # clip-length bounds inside the topic).
         try:
             result = engine.refine(
                 raw_t_start=r.t_start,

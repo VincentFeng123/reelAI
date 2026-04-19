@@ -324,3 +324,258 @@ def test_embedding_service_hash_embed_different_text_different_vec():
     import numpy as np
 
     assert not np.array_equal(a, b)
+
+
+# --------------------------------------------------------------------------- #
+# Word-level refinement + filler trimming
+# --------------------------------------------------------------------------- #
+
+
+class _FakeWord:
+    """Lightweight stand-in for IngestTranscriptWord."""
+    def __init__(self, text: str, start: float, end: float):
+        self.text = text
+        self.start = start
+        self.end = end
+
+
+class _FakeCue:
+    """Lightweight stand-in for IngestTranscriptCue (just the attrs
+    refine_boundaries_word_level actually duck-types against)."""
+    def __init__(self, start: float, end: float, words: list[_FakeWord]):
+        self.start = start
+        self.end = end
+        self.words = words
+
+
+def test_word_level_trims_leading_filler():
+    from backend.app.services.clip_boundary import refine_boundaries_word_level
+
+    # Sentence: "Um, so gradient descent is an optimization algorithm."
+    # 0.0  "um"       0.30  0.40
+    # 0.4  "so"       0.50  0.60
+    # 0.6  "gradient" 1.00
+    # 1.0  "descent"  1.40
+    # 1.4  "is"       1.55
+    # 1.55 "an"       1.70
+    # 1.7  "optimization" 2.40
+    # 2.4  "algorithm"    2.90
+    words = [
+        _FakeWord("Um,", 0.30, 0.40),
+        _FakeWord("so", 0.50, 0.60),
+        _FakeWord("gradient", 0.60, 1.00),
+        _FakeWord("descent", 1.00, 1.40),
+        _FakeWord("is", 1.40, 1.55),
+        _FakeWord("an", 1.55, 1.70),
+        _FakeWord("optimization", 1.70, 2.40),
+        _FakeWord("algorithm.", 2.40, 2.90),
+    ]
+    cues = [_FakeCue(0.3, 2.9, words)]
+    # Raw sentence start=0.3, end=2.9 — should trim "Um, so" and start at "gradient".
+    new_start, new_end, start_reason, _ = refine_boundaries_word_level(
+        0.3, 2.9, cues, silence_ranges=None,
+    )
+    assert new_start >= 0.55  # at or past "so" end → "gradient" start
+    assert "filler-trim" in start_reason
+    assert new_end >= 2.85  # end unchanged or nudged minimally
+
+
+def test_word_level_trims_trailing_filler():
+    from backend.app.services.clip_boundary import refine_boundaries_word_level
+
+    # "...convergence rate, you know."
+    words = [
+        _FakeWord("The", 0.0, 0.15),
+        _FakeWord("convergence", 0.15, 0.75),
+        _FakeWord("rate", 0.75, 1.05),
+        _FakeWord("you", 1.15, 1.25),
+        _FakeWord("know.", 1.25, 1.45),
+    ]
+    cues = [_FakeCue(0.0, 1.45, words)]
+    new_start, new_end, _, end_reason = refine_boundaries_word_level(
+        0.0, 1.45, cues, silence_ranges=None,
+    )
+    # Should trim "you know" bigram → end at "rate" (1.05)
+    assert new_end <= 1.15
+    assert "filler-trim" in end_reason
+
+
+def test_word_level_no_timing_passes_through():
+    from backend.app.services.clip_boundary import refine_boundaries_word_level
+
+    # Cue with no words attached → sentinel path, timestamps unchanged.
+    cue = _FakeCue(10.0, 20.0, words=[])
+    new_start, new_end, sr, er = refine_boundaries_word_level(
+        10.0, 20.0, [cue], silence_ranges=None,
+    )
+    assert new_start == 10.0
+    assert new_end == 20.0
+    assert sr == "no-word-timing" or sr == "no-cues"
+
+
+def test_word_level_snaps_to_inter_word_silence_midpoint():
+    from backend.app.services.clip_boundary import refine_boundaries_word_level
+
+    # Gap of 400ms between "one." and "Two" — should nudge t_end into the gap.
+    words = [
+        _FakeWord("The", 0.0, 0.1),
+        _FakeWord("answer", 0.1, 0.5),
+        _FakeWord("is", 0.5, 0.7),
+        _FakeWord("one.", 0.7, 1.0),
+        # gap 1.0 → 1.4
+        _FakeWord("Two", 1.4, 1.6),
+    ]
+    cues = [_FakeCue(0.0, 1.6, words)]
+    new_start, new_end, _, _ = refine_boundaries_word_level(
+        0.0, 1.0, cues, silence_ranges=None,
+    )
+    # Expected: nudged into the middle of the 400ms gap ≈ 1.2s
+    assert 1.0 < new_end <= 1.25
+
+
+# --------------------------------------------------------------------------- #
+# Strong heuristic picker
+# --------------------------------------------------------------------------- #
+
+
+def test_heuristic_picker_returns_top_scoring_window():
+    from backend.app.services.clip_boundary import pick_clip_heuristic
+
+    # 8 sentences, one clearly matches the query "gradient descent".
+    sents = [
+        _sent("Welcome back to the channel everyone.", 0.0, 3.0),
+        _sent("Today we discuss calculus foundations.", 3.5, 7.0),
+        _sent("Gradient descent is an optimization algorithm.", 7.5, 12.0),
+        _sent("It iteratively steps toward the minimum of a loss function.", 12.5, 19.0),
+        _sent("The learning rate controls the step size.", 19.5, 24.0),
+        _sent("Too large and you overshoot the minimum.", 24.5, 29.0),
+        _sent("Too small and convergence is slow.", 29.5, 33.0),
+        _sent("In the next video we will cover momentum.", 33.5, 37.0),
+    ]
+    result = pick_clip_heuristic(
+        query="gradient descent",
+        cues=None,  # no word timing available
+        sentences=sents,
+        silence_ranges=None,
+        user_min_sec=15.0,
+        user_max_sec=30.0,
+        user_target_sec=20.0,
+        video_duration_sec=40.0,
+        embed_func=None,  # TF-IDF only path
+    )
+    assert result is not None
+    # Window must include the query-matching sentence (idx 2 or 3).
+    assert result.t_start <= 12.5 and result.t_end >= 12.0
+
+
+def test_heuristic_picker_prefers_non_intro():
+    from backend.app.services.clip_boundary import pick_clip_heuristic
+
+    # Intro (sentences 0-1, times 0-7s) also mentions "gradient". Later
+    # block covers it properly. Heuristic should prefer the later block
+    # because of intro/outro dampening at t<10s.
+    sents = [
+        _sent("Hey everyone, today we'll cover gradient descent.", 0.0, 4.0),
+        _sent("Let's get started.", 4.5, 6.0),
+        _sent("Many viewers ask what algorithm optimizes gradients best.", 6.5, 10.0),
+        # Beyond intro window:
+        _sent("Gradient descent minimizes a loss function by stepping along the gradient.", 15.0, 22.0),
+        _sent("Each step is scaled by the learning rate.", 22.5, 26.0),
+        _sent("With a careful learning rate the process converges quickly.", 26.5, 31.0),
+        _sent("Too large and it diverges.", 31.5, 34.0),
+    ]
+    result = pick_clip_heuristic(
+        query="gradient descent",
+        cues=None,
+        sentences=sents,
+        silence_ranges=None,
+        user_min_sec=15.0,
+        user_max_sec=30.0,
+        user_target_sec=20.0,
+        video_duration_sec=40.0,
+        embed_func=None,
+    )
+    assert result is not None
+    # Chosen start should be at or past 15s (the real topic), not the intro (0-7s).
+    assert result.t_start >= 15.0
+
+
+def test_heuristic_picker_respects_user_max_tight_bound():
+    from backend.app.services.clip_boundary import pick_clip_heuristic
+
+    sents = _sample_sentences()  # 6 sentences, spans 0-40.5s
+    # Tight max=20s must keep the chosen window under 20s.
+    result = pick_clip_heuristic(
+        query="gradient descent",
+        cues=None,
+        sentences=sents,
+        silence_ranges=None,
+        user_min_sec=15.0,
+        user_max_sec=20.0,
+        user_target_sec=17.0,
+        video_duration_sec=45.0,
+        embed_func=None,
+    )
+    if result is not None:
+        assert (result.t_end - result.t_start) <= 20.5  # +0.5 slack for word-level nudge
+
+
+def test_heuristic_picker_returns_none_when_no_windows_fit():
+    from backend.app.services.clip_boundary import pick_clip_heuristic
+
+    # All sentences too close together — no 30s+ terminal-to-terminal window exists.
+    sents = [
+        _sent("Short.", 0.0, 1.0),
+        _sent("Also short.", 1.5, 2.5),
+        _sent("Another.", 3.0, 4.0),
+    ]
+    result = pick_clip_heuristic(
+        query="anything",
+        cues=None,
+        sentences=sents,
+        silence_ranges=None,
+        user_min_sec=30.0,
+        user_max_sec=60.0,
+        user_target_sec=45.0,
+        video_duration_sec=5.0,
+        embed_func=None,
+    )
+    assert result is None
+
+
+def test_snap_llm_boundary_with_ingest_cues_does_word_level_refinement():
+    """Integration: snap_llm_boundary accepts ingest_cues and applies
+    word-level trimming without crashing. Detailed trim behavior is
+    tested unit-level in test_word_level_trims_leading_filler."""
+    from backend.app.services.clip_boundary import snap_llm_boundary
+
+    sents = _sample_sentences()
+    # Provide word timings covering the full chosen clip range (3.5-37s)
+    # so word-level refinement doesn't trip the duration-fallback guard.
+    all_words: list[_FakeWord] = []
+    for idx, s in enumerate(sents):
+        # Simple 3-word-per-sentence split with a filler at the start of
+        # the first picked sentence (idx=1 in _sample_sentences).
+        words_txt = s.text.split()
+        n = len(words_txt)
+        if n == 0:
+            continue
+        dt = (s.t_end - s.t_start) / max(1, n)
+        for i, w in enumerate(words_txt):
+            ws = s.t_start + i * dt
+            we = s.t_start + (i + 1) * dt - 0.02
+            all_words.append(_FakeWord(w, ws, we))
+    cues = [_FakeCue(0.0, 40.5, all_words)]
+    r = snap_llm_boundary(
+        raw_t_start=3.5,
+        raw_t_end=37.0,
+        sentences=sents,
+        silence_ranges=None,
+        min_sec=15.0,
+        max_sec=60.0,
+        ingest_cues=cues,
+    )
+    assert r.snapped
+    # Duration must stay inside [min, max] — refinement fell back if it
+    # would have broken the contract, which is the defensive behavior.
+    assert 15.0 <= (r.t_end - r.t_start) <= 60.0

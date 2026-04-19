@@ -707,6 +707,7 @@ def snap_llm_boundary(
     silence_ranges: Sequence[tuple[float, float]] | None = None,
     min_sec: float = 15.0,
     max_sec: float = 60.0,
+    ingest_cues: Sequence[Any] | None = None,
 ) -> SnapResult:
     """Snap LLM-picked raw timestamps onto terminal-punct sentence boundaries
     (and silence gaps, when available). Contract:
@@ -798,7 +799,542 @@ def snap_llm_boundary(
     if end_silence_mid is not None:
         t_end = end_silence_mid
 
+    # Word-level + filler refinement when ingest_cues available. This takes
+    # the sentence-level (t_start, t_end) and narrows to the exact acoustic
+    # onset/offset of the first/last substantive (non-filler) word.
+    if ingest_cues:
+        t_start, t_end, _s_reason, _e_reason = refine_boundaries_word_level(
+            t_start, t_end, ingest_cues, silence_ranges,
+        )
+        # If word-level refinement accidentally pushed duration outside
+        # bounds (extremely rare — only happens when filler trim removes
+        # most of a short clip), fall back to sentence-level bounds.
+        if (t_end - t_start) < min_sec or (t_end - t_start) > max_sec:
+            t_start = start_sent.t_start
+            t_end = end_sent.t_end
+
     return SnapResult(True, t_start, t_end, start_sent, end_sent, "")
+
+
+# --------------------------------------------------------------------------- #
+# Word-level boundary refinement + filler trimming
+# --------------------------------------------------------------------------- #
+# Everything below this line exists to cut at the individual-word level
+# instead of the sentence level. Two concrete use cases:
+#
+#   (a) The LLM (or the heuristic picker) returns a (t_start, t_end) that
+#       lands on a sentence boundary but the first word of that sentence is
+#       a filler ("so", "um", "well, okay") — we want the user to hear the
+#       substantive first word, not the throat-clearing.
+#   (b) The sentence's t_start is a cue-level timestamp that may include a
+#       small chunk of the preceding pause; we'd rather the clip begin at
+#       the actual acoustic onset of the first substantive word.
+#
+# Filler list composed from the working sets used by Descript, OpusClip,
+# CapCut, Cleanvoice, and Riverside as of 2026. Conservative — phrases
+# that are sometimes substantive (e.g., "right?") are excluded.
+_FILLER_TOKENS: frozenset[str] = frozenset({
+    "um", "uh", "umm", "uhh", "uhm", "er", "err", "eh", "ah", "hm", "hmm", "mm",
+    "okay", "ok", "alright", "so", "well", "now", "like", "basically",
+    "literally", "actually", "honestly", "obviously", "anyway", "anyways",
+    "right", "yeah", "yep", "yup", "nope", "nah",
+})
+_FILLER_BIGRAMS: frozenset[tuple[str, str]] = frozenset({
+    ("you", "know"), ("i", "mean"), ("sort", "of"), ("kind", "of"),
+    ("you", "see"), ("like", "i"), ("like", "so"), ("so", "like"),
+    ("okay", "so"), ("alright", "so"), ("ok", "so"), ("so", "um"),
+    ("so", "yeah"), ("um", "so"), ("right", "so"), ("well", "um"),
+})
+
+# How much inter-word time separates a "real pause" from natural between-
+# word ms-scale gaps. 150ms is a common empirical breakpoint from speech
+# research — shorter and it's just coarticulation/breath, longer and it's
+# a perceptible pause a listener notices.
+_INTER_WORD_PAUSE_SEC = 0.15
+# Filler trimming is bounded — we won't walk more than this many words in
+# from either edge looking for the first non-filler. Prevents pathological
+# cases (all-filler clip, or a transcript pun about "um") from chewing the
+# whole clip.
+_MAX_FILLER_TRIM_WORDS = 4
+
+
+def _cue_has_word_timings(cue: Any) -> bool:
+    """Duck-type: cue has a non-empty `words` list with .start/.end."""
+    words = getattr(cue, "words", None)
+    if not words:
+        return False
+    first = words[0]
+    return hasattr(first, "start") and hasattr(first, "end") and hasattr(first, "text")
+
+
+def _collect_word_timings_in_range(
+    cues: Sequence[Any],
+    t_lo: float,
+    t_hi: float,
+) -> list[tuple[str, float, float]]:
+    """Flatten cue.words into a list of (text, t_start, t_end) triples whose
+    timestamps land inside [t_lo - 0.3s, t_hi + 2.0s]. The upper slop is
+    generous because the end-boundary refiner needs the next-word-after-
+    end to compute the silence-gap midpoint, and a gap can be >1s on a
+    clean speaker pause. Returns [] when no cue has word-level timing.
+    """
+    out: list[tuple[str, float, float]] = []
+    for cue in cues:
+        if not _cue_has_word_timings(cue):
+            continue
+        for w in cue.words:
+            try:
+                ws = float(w.start)
+                we = float(w.end)
+            except (TypeError, ValueError):
+                continue
+            if we < t_lo - 0.3 or ws > t_hi + 2.0:
+                continue
+            txt = str(w.text or "").strip()
+            if not txt:
+                continue
+            out.append((txt, ws, we))
+    out.sort(key=lambda tup: tup[1])
+    return out
+
+
+def _word_is_filler(word_text: str) -> bool:
+    """True when a single-word token is in the filler set. Strips trailing
+    punctuation since Whisper sometimes attaches a comma to filler words."""
+    w = word_text.lower().strip(",.?!;:\"'()[]{}…")
+    return w in _FILLER_TOKENS
+
+
+def _bigram_is_filler(a: str, b: str) -> bool:
+    aa = a.lower().strip(",.?!;:\"'()[]{}…")
+    bb = b.lower().strip(",.?!;:\"'()[]{}…")
+    return (aa, bb) in _FILLER_BIGRAMS
+
+
+def _refine_start_to_word_boundary(
+    words_in_range: list[tuple[str, float, float]],
+    sentence_t_start: float,
+    silence_ranges: Sequence[tuple[float, float]] | None,
+) -> tuple[float, str]:
+    """Given the word list and a chosen sentence-start timestamp, return the
+    refined start timestamp + a human reason string. Strategy:
+
+        1. Find the first word whose start >= sentence_t_start - 0.2s.
+        2. Walk forward past filler tokens / filler bigrams (bounded).
+        3. If a real inter-word pause exists immediately before the chosen
+           word, snap to the pause midpoint so the clip enters on silence.
+    """
+    if not words_in_range:
+        return sentence_t_start, "no-word-timing"
+    # Step 1: locate the first word at-or-after the sentence start.
+    start_idx = 0
+    for i, (_, ws, _we) in enumerate(words_in_range):
+        if ws >= sentence_t_start - 0.2:
+            start_idx = i
+            break
+    else:
+        start_idx = len(words_in_range) - 1
+
+    # Step 2: trim leading fillers (bounded).
+    idx = start_idx
+    stop = min(len(words_in_range) - 1, start_idx + _MAX_FILLER_TRIM_WORDS)
+    while idx < stop:
+        cur = words_in_range[idx][0]
+        nxt = words_in_range[idx + 1][0] if idx + 1 < len(words_in_range) else ""
+        if _bigram_is_filler(cur, nxt):
+            idx += 2
+            continue
+        if _word_is_filler(cur):
+            idx += 1
+            continue
+        break
+    if idx >= len(words_in_range):
+        return sentence_t_start, "all-filler"
+    chosen = words_in_range[idx]
+    # Step 3: if the gap between the previous word's end and this word's
+    # start exceeds _INTER_WORD_PAUSE_SEC, snap to the pause midpoint —
+    # cleaner onset than cutting exactly on the first phoneme.
+    refined_t_start = chosen[1]
+    if idx > 0:
+        prev_end = words_in_range[idx - 1][2]
+        gap = chosen[1] - prev_end
+        if gap >= _INTER_WORD_PAUSE_SEC:
+            refined_t_start = prev_end + 0.5 * gap
+    # Cross-check against silencedetect ranges when available — prefer the
+    # silence midpoint over our word-gap heuristic since silencedetect has
+    # the actual audio.
+    silence_mid = _silence_midpoint_near(
+        chosen[1], silence_ranges, window_sec=_SILENCE_REFINE_WINDOW_SEC,
+    )
+    if silence_mid is not None:
+        refined_t_start = silence_mid
+    reason = "word-snap" if idx == start_idx else f"filler-trim+{idx - start_idx}"
+    return refined_t_start, reason
+
+
+def _refine_end_to_word_boundary(
+    words_in_range: list[tuple[str, float, float]],
+    sentence_t_end: float,
+    silence_ranges: Sequence[tuple[float, float]] | None,
+) -> tuple[float, str]:
+    """Mirror of _refine_start_to_word_boundary for the end boundary. Walks
+    backward past filler tokens and snaps to a trailing pause midpoint."""
+    if not words_in_range:
+        return sentence_t_end, "no-word-timing"
+    # Step 1: locate the last word at-or-before the sentence end.
+    end_idx = len(words_in_range) - 1
+    for i in range(len(words_in_range) - 1, -1, -1):
+        if words_in_range[i][2] <= sentence_t_end + 0.2:
+            end_idx = i
+            break
+    # Step 2: trim trailing fillers (bounded).
+    idx = end_idx
+    stop = max(0, end_idx - _MAX_FILLER_TRIM_WORDS)
+    while idx > stop:
+        cur = words_in_range[idx][0]
+        prev = words_in_range[idx - 1][0] if idx - 1 >= 0 else ""
+        # Check the bigram (prev, cur) as a filler pair; if yes, drop both.
+        if _bigram_is_filler(prev, cur):
+            idx -= 2
+            continue
+        if _word_is_filler(cur):
+            idx -= 1
+            continue
+        break
+    if idx < 0:
+        return sentence_t_end, "all-filler"
+    chosen = words_in_range[idx]
+    # Step 3: snap to trailing pause midpoint when a gap exists.
+    refined_t_end = chosen[2]
+    if idx + 1 < len(words_in_range):
+        next_start = words_in_range[idx + 1][1]
+        gap = next_start - chosen[2]
+        if gap >= _INTER_WORD_PAUSE_SEC:
+            refined_t_end = chosen[2] + 0.5 * gap
+    silence_mid = _silence_midpoint_near(
+        chosen[2], silence_ranges, window_sec=_SILENCE_REFINE_WINDOW_SEC,
+    )
+    if silence_mid is not None:
+        refined_t_end = silence_mid
+    reason = "word-snap" if idx == end_idx else f"filler-trim-{end_idx - idx}"
+    return refined_t_end, reason
+
+
+def refine_boundaries_word_level(
+    t_start: float,
+    t_end: float,
+    ingest_cues: Sequence[Any] | None,
+    silence_ranges: Sequence[tuple[float, float]] | None,
+) -> tuple[float, float, str, str]:
+    """Adjust sentence-level (t_start, t_end) to word-level boundaries,
+    trimming filler words and snapping to inter-word silence midpoints.
+
+    Returns ``(refined_t_start, refined_t_end, start_reason, end_reason)``.
+    When no word-level data is available the input timestamps pass through
+    unchanged with reason ``"no-word-timing"``. Never returns boundaries
+    that would invert the clip (``refined_t_end > refined_t_start``
+    guaranteed); when filler trimming would cross, returns the originals.
+    """
+    if not ingest_cues or t_end <= t_start:
+        return t_start, t_end, "no-cues", "no-cues"
+    words_in = _collect_word_timings_in_range(ingest_cues, t_start, t_end)
+    if not words_in:
+        return t_start, t_end, "no-word-timing", "no-word-timing"
+    new_start, start_reason = _refine_start_to_word_boundary(words_in, t_start, silence_ranges)
+    new_end, end_reason = _refine_end_to_word_boundary(words_in, t_end, silence_ranges)
+    if new_end <= new_start:
+        return t_start, t_end, "trim-inverted", "trim-inverted"
+    return new_start, new_end, start_reason, end_reason
+
+
+# --------------------------------------------------------------------------- #
+# Strong heuristic clip picker — "as robust as an AI"
+# --------------------------------------------------------------------------- #
+# Replaces the old Jaccard-novelty + lexical-keyword picker. Scoring
+# combines:
+#   1. Semantic similarity to the query via sentence-transformer embeddings
+#      (when available on Railway) — the single strongest signal.
+#   2. TF-IDF-weighted keyword coverage so content terms dominate over
+#      function words.
+#   3. Filler-density penalty (see _FILLER_TOKENS) so um/uh-heavy passages
+#      lose to clean ones.
+#   4. Silence-start bonus when the window opens right after a >1s pause
+#      (strong cue that a new thought is starting).
+#   5. Intro/outro dampening (first 10s and last 15s of the video almost
+#      never contain the "most important" passage).
+# The window is enumerated at sentence granularity: every terminal-punct-
+# to-terminal-punct run whose duration falls inside [user_min, user_max].
+# This cheaply guarantees the chosen window starts and ends on punctuation
+# before the word-level refiner runs — matching the contract that no clip
+# ever ends mid-sentence.
+
+
+_CONTENT_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9'\-]+")
+# TF-IDF over sliding windows — used when embeddings aren't available. Each
+# "document" is a window, IDF lowers the weight of words appearing in many
+# windows (common function words, topic preamble, etc).
+_HEURISTIC_INTRO_PENALTY_SEC = 10.0
+_HEURISTIC_OUTRO_PENALTY_SEC = 15.0
+_HEURISTIC_SILENCE_BONUS_WINDOW_SEC = 1.0
+_HEURISTIC_SILENCE_BONUS_MIN_GAP_SEC = 1.0
+
+
+def _extract_content_words(text: str) -> list[str]:
+    toks = [m.group(0).lower() for m in _CONTENT_WORD_RE.finditer(text or "")]
+    return [t for t in toks if t not in _FILLER_TOKENS and t not in _STOPWORDS and len(t) > 1]
+
+
+def _cosine_similarity(a: "Any", b: "Any") -> float:
+    """Cosine similarity between two 1-D numpy vectors. Imports numpy
+    locally to keep clip_boundary importable on machines without it — the
+    fallback scorer still works."""
+    try:
+        import numpy as np
+    except ImportError:
+        return 0.0
+    a_arr = np.asarray(a, dtype="float32")
+    b_arr = np.asarray(b, dtype="float32")
+    an = float((a_arr * a_arr).sum()) ** 0.5
+    bn = float((b_arr * b_arr).sum()) ** 0.5
+    if an == 0.0 or bn == 0.0:
+        return 0.0
+    return float((a_arr * b_arr).sum()) / (an * bn)
+
+
+def _enumerate_candidate_windows(
+    sentences: Sequence[SentenceSpan],
+    min_sec: float,
+    max_sec: float,
+) -> list[tuple[int, int]]:
+    """Return every (start_idx, end_idx) pair over the sentence list where:
+      * both sentences have terminal punctuation (so the window begins and
+        ends on a complete thought);
+      * total duration falls inside [min_sec, max_sec].
+    Each pair indexes the sentences slice [start_idx : end_idx + 1]."""
+    windows: list[tuple[int, int]] = []
+    n = len(sentences)
+    for i in range(n):
+        s_i = sentences[i]
+        if s_i.terminal_punct in {".", "!", "?", "…"}:
+            # Even the opening sentence should end on punctuation — keeps
+            # the downstream contract uniform.
+            pass  # no constraint on start-sentence punctuation itself
+        for j in range(i, n):
+            s_j = sentences[j]
+            if s_j.terminal_punct not in {".", "!", "?", "…"}:
+                continue
+            dur = s_j.t_end - s_i.t_start
+            if dur < min_sec:
+                continue
+            if dur > max_sec:
+                break  # durations only grow as j increases
+            windows.append((i, j))
+    return windows
+
+
+def _score_window(
+    *,
+    sentences_slice: list[SentenceSpan],
+    query_words: list[str],
+    global_df: dict[str, int],
+    num_windows: int,
+    query_embedding: "Any",
+    embed_func: Any | None,
+    video_duration_sec: float | None,
+    silence_ranges: Sequence[tuple[float, float]] | None,
+    user_target_sec: float,
+) -> float:
+    """Score one candidate window. Returns a float in roughly [-1, 2]."""
+    text = " ".join(s.text for s in sentences_slice)
+    window_words = _extract_content_words(text)
+    word_count = max(1, len(window_words))
+
+    # --- 1. Semantic similarity (strongest signal when available). ---
+    semantic = 0.0
+    if embed_func is not None and query_embedding is not None:
+        try:
+            window_emb = embed_func([text])
+            if window_emb is not None and len(window_emb) > 0:
+                semantic = _cosine_similarity(query_embedding, window_emb[0])
+        except Exception:
+            semantic = 0.0
+
+    # --- 2. TF-IDF weighted keyword coverage. ---
+    tf_idf = 0.0
+    if query_words:
+        # Term frequency within window (normalized).
+        from collections import Counter
+        tf = Counter(window_words)
+        denom = sum(tf.values()) or 1
+        query_terms = set(query_words)
+        for qt in query_terms:
+            term_tf = tf.get(qt, 0) / denom
+            if term_tf == 0.0:
+                continue
+            # IDF: log((N+1)/(df+1)) + 1 (smoothed).
+            df = global_df.get(qt, 0)
+            idf = 1.0
+            if num_windows > 0:
+                import math
+                idf = math.log((num_windows + 1) / (df + 1)) + 1.0
+            tf_idf += term_tf * idf
+        # Normalize so tf_idf is roughly [0, 1] for typical queries.
+        tf_idf = min(1.0, tf_idf)
+
+    # --- 3. Filler density penalty. ---
+    filler_count = sum(
+        1 for m in _CONTENT_WORD_RE.finditer(text)
+        if m.group(0).lower() in _FILLER_TOKENS
+    )
+    filler_ratio = filler_count / word_count
+    filler_penalty = min(0.35, filler_ratio * 0.6)
+
+    # --- 4. Silence-start bonus. ---
+    t_start = sentences_slice[0].t_start
+    silence_bonus = 0.0
+    if silence_ranges:
+        for sil_start, sil_end in silence_ranges:
+            gap = sil_end - sil_start
+            if (
+                gap >= _HEURISTIC_SILENCE_BONUS_MIN_GAP_SEC
+                and abs(sil_end - t_start) <= _HEURISTIC_SILENCE_BONUS_WINDOW_SEC
+            ):
+                silence_bonus = 0.12
+                break
+
+    # --- 5. Intro/outro dampening. ---
+    intro_outro_penalty = 0.0
+    if t_start < _HEURISTIC_INTRO_PENALTY_SEC:
+        intro_outro_penalty = 0.18
+    elif (
+        video_duration_sec is not None
+        and (video_duration_sec - sentences_slice[-1].t_end) < _HEURISTIC_OUTRO_PENALTY_SEC
+    ):
+        intro_outro_penalty = 0.12
+
+    # --- 6. Prefer windows near the user's target duration. ---
+    duration = sentences_slice[-1].t_end - t_start
+    # Penalty scales with how far duration strays from user_target_sec,
+    # normalized by user_target_sec so the scale is comparable to other terms.
+    target_delta = abs(duration - user_target_sec) / max(1.0, user_target_sec)
+    target_penalty = min(0.2, target_delta * 0.25)
+
+    # Weighted sum — semantic dominates when present, lexical carries more
+    # weight when semantic is unavailable (emb_func=None).
+    if embed_func is not None:
+        score = 0.55 * semantic + 0.25 * tf_idf
+    else:
+        score = 0.6 * tf_idf  # no embeddings → tf-idf is the primary signal
+    score += silence_bonus
+    score -= filler_penalty
+    score -= intro_outro_penalty
+    score -= target_penalty
+    return score
+
+
+@dataclass
+class HeuristicPickResult:
+    t_start: float
+    t_end: float
+    start_sentence: SentenceSpan
+    end_sentence: SentenceSpan
+    score: float
+    signal_summary: str  # e.g. "semantic=0.72 tf-idf=0.15 fillers=0.04"
+
+
+def pick_clip_heuristic(
+    *,
+    query: str,
+    cues: Sequence[Any] | None,  # list[IngestTranscriptCue] when available
+    sentences: Sequence[SentenceSpan],
+    silence_ranges: Sequence[tuple[float, float]] | None,
+    user_min_sec: float,
+    user_max_sec: float,
+    user_target_sec: float,
+    video_duration_sec: float | None,
+    embed_func: Any | None = None,
+) -> HeuristicPickResult | None:
+    """Picker that runs without any LLM call. Scores every
+    terminal-punct-to-terminal-punct window that fits [user_min, user_max]
+    on semantic similarity + TF-IDF + filler/silence/intro signals, then
+    returns the top-scoring window. Returns None when no qualifying window
+    exists (e.g., transcript too short, no terminal-punct sentences).
+
+    ``embed_func`` is an optional ``Callable[[list[str]], np.ndarray]`` —
+    pass ``EmbeddingService().embed_local`` to activate semantic scoring.
+    Omit to fall back to lexical-only (still stronger than the old Jaccard
+    picker because it's TF-IDF-weighted).
+    """
+    sent_list = [s for s in sentences if s is not None]
+    if not sent_list:
+        return None
+    windows = _enumerate_candidate_windows(sent_list, user_min_sec, user_max_sec)
+    if not windows:
+        return None
+
+    query_words = _extract_content_words(query)
+    # Precompute a query embedding once, not once per window.
+    query_embedding = None
+    if embed_func is not None and query:
+        try:
+            qemb = embed_func([query])
+            if qemb is not None and len(qemb) > 0:
+                query_embedding = qemb[0]
+        except Exception:
+            query_embedding = None
+
+    # Build global document frequency for TF-IDF weighting. "Documents"
+    # are the candidate windows themselves — gives us topic-specific IDF
+    # without needing a corpus.
+    global_df: dict[str, int] = {}
+    window_word_caches: list[list[str]] = []
+    for (i, j) in windows:
+        text = " ".join(s.text for s in sent_list[i : j + 1])
+        words = set(_extract_content_words(text))
+        window_word_caches.append(list(words))
+        for w in words:
+            global_df[w] = global_df.get(w, 0) + 1
+
+    best: HeuristicPickResult | None = None
+    for (i, j) in windows:
+        sentences_slice = list(sent_list[i : j + 1])
+        score = _score_window(
+            sentences_slice=sentences_slice,
+            query_words=query_words,
+            global_df=global_df,
+            num_windows=len(windows),
+            query_embedding=query_embedding,
+            embed_func=embed_func,
+            video_duration_sec=video_duration_sec,
+            silence_ranges=silence_ranges,
+            user_target_sec=user_target_sec,
+        )
+        if best is None or score > best.score:
+            summary = (
+                f"semantic={'y' if embed_func else 'n'} tfidf_terms={len(query_words)} "
+                f"duration={sentences_slice[-1].t_end - sentences_slice[0].t_start:.1f}s"
+            )
+            best = HeuristicPickResult(
+                t_start=sentences_slice[0].t_start,
+                t_end=sentences_slice[-1].t_end,
+                start_sentence=sentences_slice[0],
+                end_sentence=sentences_slice[-1],
+                score=score,
+                signal_summary=summary,
+            )
+
+    if best is None:
+        return None
+
+    # Apply word-level + filler trimming to the chosen sentence-level
+    # window. Only narrows t_start / t_end; the underlying sentence choice
+    # (which guarantees terminal punctuation) is preserved.
+    refined_start, refined_end, _, _ = refine_boundaries_word_level(
+        best.t_start, best.t_end, cues, silence_ranges,
+    )
+    best.t_start = refined_start
+    best.t_end = refined_end
+    return best
 
 
 __all__ = [
@@ -808,4 +1344,7 @@ __all__ = [
     "TopicSwitchHint",
     "SnapResult",
     "snap_llm_boundary",
+    "refine_boundaries_word_level",
+    "HeuristicPickResult",
+    "pick_clip_heuristic",
 ]
