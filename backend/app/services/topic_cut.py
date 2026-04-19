@@ -2133,6 +2133,55 @@ def _snap_timestamps_to_cues(
     return cleaned
 
 
+def _proportional_ingest_cues_from_transcript(
+    transcript: Sequence[TranscriptCue],
+) -> list[Any]:
+    """Build a list of IngestTranscriptCue from cue-level TranscriptCue by
+    synthesizing per-word timestamps proportionally across each cue's
+    duration. Used when the caller doesn't have real Whisper word-level
+    data (search path via youtube-transcript-api). Precision is bounded
+    by cue granularity, but it's enough to let the sentence splitter
+    and word-gap silence-midpoint code path execute without crashing.
+    """
+    try:
+        from ..ingestion.models import IngestTranscriptCue, IngestTranscriptWord
+    except Exception:
+        return []
+    out: list[Any] = []
+    for entry in transcript:
+        try:
+            start = float(entry.start)
+            duration = float(entry.duration or 0.01)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        end = start + max(duration, 0.01)
+        text = str(entry.text or "").replace("\n", " ").strip()
+        if not text:
+            continue
+        words_txt = text.split()
+        n = max(1, len(words_txt))
+        dt = duration / n
+        words = []
+        for i, w in enumerate(words_txt):
+            ws = start + i * dt
+            we = start + (i + 1) * dt - max(0.005, dt * 0.05)
+            try:
+                words.append(IngestTranscriptWord(start=ws, end=we, text=w))
+            except Exception:
+                continue
+        try:
+            out.append(IngestTranscriptCue(
+                start=start,
+                end=end,
+                text=text,
+                words=words,
+                word_source="proportional",
+            ))
+        except Exception:
+            continue
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Phase A.4: ClipBoundaryEngine integration
 # --------------------------------------------------------------------------- #
@@ -2343,12 +2392,53 @@ def _apply_boundary_engine(
         r.boundary_quality = "heuristic-strong"
         return True
 
+    # Optional final-step: Groq Whisper word-level refinement for ≤50ms
+    # boundary precision (gated on env var WHISPER_CLIP_REFINE_ENABLED).
+    # Runs after the sentence-level picker chose (t_start, t_end); if it
+    # returns refined bounds, we use them; if it fails or is disabled the
+    # sentence-level boundaries stand.
+    try:
+        from .clip_whisper_refine import (
+            refine_clip_with_whisper,
+            whisper_clip_refine_enabled,
+        )
+    except Exception:
+        refine_clip_with_whisper = None  # type: ignore[assignment]
+        whisper_clip_refine_enabled = lambda: False  # type: ignore[assignment]
+
+    def _try_whisper_refine(r: TopicReel) -> None:
+        if not whisper_clip_refine_enabled() or refine_clip_with_whisper is None:
+            return
+        if not r.video_id:
+            return
+        try:
+            result = refine_clip_with_whisper(
+                video_id=str(r.video_id),
+                t_start=float(r.t_start),
+                t_end=float(r.t_end),
+                conn=None,  # _apply_boundary_engine has no conn; cache is a noop here
+            )
+        except Exception:
+            logger.exception("whisper refinement raised for video %s", r.video_id)
+            return
+        if result is None:
+            return
+        # Refinement only wins when it keeps the clip inside user bounds.
+        new_dur = result.t_end - result.t_start
+        if new_dur < user_min_sec or new_dur > user_max_sec:
+            return
+        r.t_start = round(float(result.t_start), 3)
+        r.t_end = round(float(result.t_end), 3)
+        r.boundary_quality = "whisper-word"
+
     refined: list[TopicReel] = []
     for r in reels:
         if _try_llm_pick(r):
+            _try_whisper_refine(r)
             refined.append(r)
             continue
         if _try_heuristic_pick(r):
+            _try_whisper_refine(r)
             refined.append(r)
             continue
         # Last-resort fallback — the original ClipBoundaryEngine heuristic.
@@ -2483,6 +2573,17 @@ def cut_video_into_topic_reels(
     # Target defaults to the midpoint when the caller didn't resolve a
     # specific preferred duration from the user's settings.
     _user_target = float(user_target_sec) if user_target_sec is not None else 0.5 * (_user_min + _user_max)
+
+    # If the caller didn't supply word-level ingest cues (the usual case
+    # for user searches — youtube-transcript-api only returns cue-level
+    # timings), synthesize proportional word timestamps from the cue-level
+    # transcript so the LLM-pick / heuristic-pick / word-level snap paths
+    # downstream actually run. Precision is limited to cue granularity
+    # (~500ms-2s per cue) without real Whisper data. For <50ms precision,
+    # the clip_whisper_refine step below takes the chosen clip boundaries
+    # and re-transcribes just that window with real word-level Whisper.
+    if not ingest_cues_for_precision and transcript:
+        ingest_cues_for_precision = _proportional_ingest_cues_from_transcript(transcript)
 
     # ---- Path 1: YouTube chapters (free, no API, no inference). -------- #
     chapters = extract_chapters(info_dict)

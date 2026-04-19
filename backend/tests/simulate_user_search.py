@@ -342,6 +342,14 @@ def main() -> int:
     print("   then strong heuristic if all 3 unavailable)")
     print()
 
+    # NOTE: intentionally pass ingest_cues_for_precision=None to mirror
+    # exactly what the production search path does. reels.py does NOT
+    # provide real Whisper word timings when generating clips from search
+    # — those only come from the ingestion pipeline. The Phase A fix
+    # inside cut_video_into_topic_reels synthesizes proportional ingest
+    # cues from the transcript automatically, so the inner pickers still
+    # run. We keep the locally-built `ingest_cues` only for the post-hoc
+    # precision audit below (reconstruct clip text from word timings).
     classification, topic_reels = cut_video_into_topic_reels(
         video_id,
         query=query,
@@ -350,7 +358,7 @@ def main() -> int:
         refine_boundaries=True,
         transcript=tc_cues,
         info_dict=None,  # no chapters available
-        ingest_cues_for_precision=ingest_cues,
+        ingest_cues_for_precision=None,
         silence_ranges=None,
         user_min_sec=USER_MIN_SEC,
         user_max_sec=USER_MAX_SEC,

@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     # reads this and wires it into extractor_args automatically.
     ytdlp_pot_provider_url: str = ""
 
+    # Per-clip Whisper refinement for ≤50ms boundary precision. When set
+    # to truthy, clip_whisper_refine downloads the clip's audio window
+    # via yt-dlp and re-transcribes it with Groq Whisper large-v3 +
+    # word-level timestamp granularity. Results are cached in
+    # `llm_cache` keyed by (video_id, t_start, t_end). Off by default
+    # because each refinement costs a ~3-10s yt-dlp download + a Groq
+    # API call, so activation is a quality/latency trade-off.
+    whisper_clip_refine_enabled: bool = False
+
 
 @lru_cache
 def get_settings() -> Settings:
