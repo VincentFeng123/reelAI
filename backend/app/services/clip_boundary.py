@@ -1107,28 +1107,63 @@ def _enumerate_candidate_windows(
     max_sec: float,
 ) -> list[tuple[int, int]]:
     """Return every (start_idx, end_idx) pair over the sentence list where:
-      * both sentences have terminal punctuation (so the window begins and
-        ends on a complete thought);
+      * the END sentence has terminal punctuation (so the window ends on
+        a complete thought);
       * total duration falls inside [min_sec, max_sec].
     Each pair indexes the sentences slice [start_idx : end_idx + 1]."""
     windows: list[tuple[int, int]] = []
     n = len(sentences)
     for i in range(n):
-        s_i = sentences[i]
-        if s_i.terminal_punct in {".", "!", "?", "…"}:
-            # Even the opening sentence should end on punctuation — keeps
-            # the downstream contract uniform.
-            pass  # no constraint on start-sentence punctuation itself
         for j in range(i, n):
             s_j = sentences[j]
             if s_j.terminal_punct not in {".", "!", "?", "…"}:
                 continue
-            dur = s_j.t_end - s_i.t_start
+            dur = s_j.t_end - sentences[i].t_start
             if dur < min_sec:
                 continue
             if dur > max_sec:
                 break  # durations only grow as j increases
             windows.append((i, j))
+    return windows
+
+
+def _enumerate_cue_fallback_windows(
+    cues: Sequence[Any],
+    min_sec: float,
+    max_sec: float,
+) -> list[tuple[int, int, float, float]]:
+    """Fallback enumerator for transcripts without terminal punctuation
+    (YouTube auto-captions, comma-spliced text, run-on transcripts). Uses
+    cue boundaries as synthetic "soft-sentence" markers: each (t_start,
+    t_end) pair is a span of cues whose duration lands in [min, max].
+
+    Returns ``(i, j, t_start, t_end)`` tuples — i/j index the cue list;
+    t_start/t_end are the actual timestamps the clip will use. Unlike
+    `_enumerate_candidate_windows`, this does NOT guarantee terminal
+    punctuation — it guarantees only that the boundary aligns with a cue
+    edge (i.e., the speaker's utterance gap), which is the closest thing
+    to a "sentence end" we have when pysbd can't find one.
+    """
+    windows: list[tuple[int, int, float, float]] = []
+    n = len(cues)
+    if n == 0:
+        return windows
+    for i in range(n):
+        try:
+            t_start = float(cues[i].start)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        for j in range(i, n):
+            try:
+                t_end = float(cues[j].end)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            dur = t_end - t_start
+            if dur < min_sec:
+                continue
+            if dur > max_sec:
+                break
+            windows.append((i, j, t_start, t_end))
     return windows
 
 
@@ -1266,11 +1301,20 @@ def pick_clip_heuristic(
     picker because it's TF-IDF-weighted).
     """
     sent_list = [s for s in sentences if s is not None]
-    if not sent_list:
-        return None
     windows = _enumerate_candidate_windows(sent_list, user_min_sec, user_max_sec)
+    using_cue_fallback = False
+    cue_windows: list[tuple[int, int, float, float]] = []
     if not windows:
-        return None
+        # No sentence windows ended on terminal punctuation — common for
+        # YouTube auto-captions and comma-spliced transcripts. Fall back
+        # to cue-boundary windows so we still produce SOMETHING. The
+        # word-level refiner at the tail of this function still trims
+        # leading/trailing fillers for acoustically clean edges.
+        if cues:
+            cue_windows = _enumerate_cue_fallback_windows(cues, user_min_sec, user_max_sec)
+        if not cue_windows:
+            return None
+        using_cue_fallback = True
 
     query_words = _extract_content_words(query)
     # Precompute a query embedding once, not once per window.
@@ -1283,45 +1327,90 @@ def pick_clip_heuristic(
         except Exception:
             query_embedding = None
 
+    # Build candidate-window metadata. Sentence-window path uses
+    # sent_list[i:j+1] text; cue-fallback path uses cues[i:j+1] text.
+    # Both feed the same scoring function — only the "slice" representation
+    # changes, plus the chosen boundary sentences for SnapResult.
+    def _window_text(widx: int) -> str:
+        if using_cue_fallback:
+            i, j, _, _ = cue_windows[widx]
+            return " ".join(str(getattr(cues[k], "text", "") or "") for k in range(i, j + 1))
+        i, j = windows[widx]
+        return " ".join(s.text for s in sent_list[i : j + 1])
+
+    def _window_bounds(widx: int) -> tuple[float, float]:
+        if using_cue_fallback:
+            _, _, t0, t1 = cue_windows[widx]
+            return t0, t1
+        i, j = windows[widx]
+        return sent_list[i].t_start, sent_list[j].t_end
+
+    num_windows = len(cue_windows) if using_cue_fallback else len(windows)
+
     # Build global document frequency for TF-IDF weighting. "Documents"
     # are the candidate windows themselves — gives us topic-specific IDF
     # without needing a corpus.
     global_df: dict[str, int] = {}
-    window_word_caches: list[list[str]] = []
-    for (i, j) in windows:
-        text = " ".join(s.text for s in sent_list[i : j + 1])
-        words = set(_extract_content_words(text))
-        window_word_caches.append(list(words))
+    for widx in range(num_windows):
+        words = set(_extract_content_words(_window_text(widx)))
         for w in words:
             global_df[w] = global_df.get(w, 0) + 1
 
     best: HeuristicPickResult | None = None
-    for (i, j) in windows:
-        sentences_slice = list(sent_list[i : j + 1])
+    best_bounds: tuple[float, float] | None = None
+    best_idx: int = -1
+    for widx in range(num_windows):
+        text = _window_text(widx)
+        t_start, t_end = _window_bounds(widx)
+        # Build a synthetic single-sentence slice for the cue-fallback
+        # path so _score_window's sentence-typed interface stays uniform.
+        if using_cue_fallback:
+            synthetic = SentenceSpan(
+                text=text,
+                t_start=t_start,
+                t_end=t_end,
+                cue_start_idx=cue_windows[widx][0],
+                cue_end_idx=cue_windows[widx][1],
+                word_start_idx=0,
+                word_end_idx=0,
+                terminal_punct="",  # cue-fallback path has no terminal punct
+                confidence=0.4,
+            )
+            sentences_slice = [synthetic]
+        else:
+            i, j = windows[widx]
+            sentences_slice = list(sent_list[i : j + 1])
         score = _score_window(
             sentences_slice=sentences_slice,
             query_words=query_words,
             global_df=global_df,
-            num_windows=len(windows),
+            num_windows=num_windows,
             query_embedding=query_embedding,
             embed_func=embed_func,
             video_duration_sec=video_duration_sec,
             silence_ranges=silence_ranges,
             user_target_sec=user_target_sec,
         )
+        # Cue-fallback windows pay a small quality penalty — real sentence
+        # windows are objectively better when both are candidates.
+        if using_cue_fallback:
+            score -= 0.05
         if best is None or score > best.score:
             summary = (
-                f"semantic={'y' if embed_func else 'n'} tfidf_terms={len(query_words)} "
-                f"duration={sentences_slice[-1].t_end - sentences_slice[0].t_start:.1f}s"
+                f"semantic={'y' if embed_func else 'n'} "
+                f"mode={'cue-fallback' if using_cue_fallback else 'sentence'} "
+                f"tfidf_terms={len(query_words)} duration={t_end - t_start:.1f}s"
             )
             best = HeuristicPickResult(
-                t_start=sentences_slice[0].t_start,
-                t_end=sentences_slice[-1].t_end,
+                t_start=t_start,
+                t_end=t_end,
                 start_sentence=sentences_slice[0],
                 end_sentence=sentences_slice[-1],
                 score=score,
                 signal_summary=summary,
             )
+            best_bounds = (t_start, t_end)
+            best_idx = widx
 
     if best is None:
         return None
