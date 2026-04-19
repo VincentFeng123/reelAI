@@ -1096,6 +1096,126 @@ def _is_back_reference_opener(first_sentence_text: str) -> bool:
     return False
 
 
+# --------------------------------------------------------------------- #
+# Phase 2 — hook-pattern bonus (Opus-style opener classification)
+# --------------------------------------------------------------------- #
+# Seven regex groups applied to the FIRST sentence of a candidate window.
+# Patterns lifted from Opus Clip's publicly documented hook taxonomy.
+# Bonuses are deliberately modest (0.08–0.14) so semantic+tf-idf remain
+# the dominant ranking signals — hooks are a tie-breaker, not the engine.
+
+_HOOK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("contradiction", re.compile(
+        r"^\s*(but|however|actually)\b|everyone\s+thinks\b.*\b(but|yet)\b|\bthe\s+(real|truth|reason)\b",
+        re.IGNORECASE,
+    )),
+    ("counterintuitive_howto", re.compile(
+        r"\bhow\s+to\b.*\bwithout\b|\bthe\s+(wrong|worst)\s+way\s+to\b|\bstop\s+(doing|using|making)\b",
+        re.IGNORECASE,
+    )),
+    ("warning", re.compile(
+        r"^\s*(warning|never|don'?t|avoid|stop)\b|\bbiggest\s+mistake\b|\bred\s+flag\b",
+        re.IGNORECASE,
+    )),
+    ("before_after", re.compile(
+        r"\b(went|changed|grew|dropped|jumped)\s+from\b.*\bto\b|\bi\s+was\b.*\bnow\s+i'?m\b|\bfrom\s+\w+\s+to\s+\w+",
+        re.IGNORECASE,
+    )),
+    ("number_promise", re.compile(
+        r"^\s*\d+\s+(ways|reasons|steps|mistakes|tips|things|rules|secrets|signs|habits)\b",
+        re.IGNORECASE,
+    )),
+    ("question", re.compile(
+        r"^\s*(why|how|what|when|where|who)\b[^.!?]*\?|\bhave\s+you\s+ever\b|\bdo\s+you\s+know\b",
+        re.IGNORECASE,
+    )),
+    ("confession", re.compile(
+        r"^\s*(i\s+)?(used\s+to|never\s+told|nobody\s+knows|secret)\b|\bi\s+was\s+(wrong|scared|broke|lost)\b",
+        re.IGNORECASE,
+    )),
+)
+
+_HOOK_BONUS: dict[str, float] = {
+    "contradiction": 0.14,
+    "counterintuitive_howto": 0.12,
+    "warning": 0.10,
+    "before_after": 0.10,
+    "number_promise": 0.09,
+    "question": 0.08,
+    "confession": 0.08,
+}
+
+
+def _classify_hook_pattern(first_sentence_text: str) -> str | None:
+    """Return the first matching hook pattern name, or None. Scan length
+    is capped at 200 chars so a long opener doesn't waste regex time.
+    Pattern order is bonus-ranked — the first match is the strongest hook."""
+    if not first_sentence_text:
+        return None
+    text = first_sentence_text[:200]
+    for name, pat in _HOOK_PATTERNS:
+        if pat.search(text):
+            return name
+    return None
+
+
+# --------------------------------------------------------------------- #
+# Phase 2 — extended self-containment penalties
+# --------------------------------------------------------------------- #
+# Backref opener (_is_back_reference_opener) already catches connectors
+# like "so," "but," "therefore." These two additional checks catch the
+# cases a backref opener misses.
+
+# Third-person pronouns and bare demonstratives that, when they open a
+# clip, require an antecedent the viewer never heard.
+_AMBIGUOUS_OPEN_PRONOUNS: frozenset[str] = frozenset({
+    "he", "she", "they", "it", "him", "her", "them",
+    "his", "hers", "theirs", "its",
+    "this", "that", "these", "those",
+})
+
+# "Yes, we did" — a clip that opens with an assertion answer is almost
+# always responding to a question the viewer didn't hear.
+_ANSWER_OPENER_RE = re.compile(
+    r"^\s*(yes|no|right|exactly|correct|absolutely|definitely|maybe|probably|sure)\s*[,.]",
+    re.IGNORECASE,
+)
+
+
+def _pronoun_ambiguity_open(first_sentence_text: str) -> bool:
+    """True when the first content word is an ambiguous pronoun/
+    demonstrative. "He told me...", "This is why...", "That's when..."
+    all fail. "The reason I moved...", "I think that..." pass."""
+    tokens = [m.group(0).lower() for m in _CONTENT_WORD_RE.finditer(first_sentence_text or "")]
+    if not tokens:
+        return False
+    return tokens[0] in _AMBIGUOUS_OPEN_PRONOUNS
+
+
+def _is_answer_without_question(first_sentence_text: str) -> bool:
+    """True when the opener looks like an answer to an unseen question."""
+    return bool(_ANSWER_OPENER_RE.match(first_sentence_text or ""))
+
+
+# --------------------------------------------------------------------- #
+# Phase 2 — payoff bonus (closing sentence delivers resolution)
+# --------------------------------------------------------------------- #
+
+_PAYOFF_CUES_RE = re.compile(
+    r"\b(so|therefore|that'?s\s+why|the\s+point\s+is|here'?s\s+the\s+thing|which\s+means|\bin\s+short\b|\bthe\s+bottom\s+line\b)\b",
+    re.IGNORECASE,
+)
+
+
+def _payoff_bonus_score(last_sentence_text: str) -> float:
+    """Small bonus when the closing sentence contains a resolution cue."""
+    if not last_sentence_text:
+        return 0.0
+    if _PAYOFF_CUES_RE.search(last_sentence_text):
+        return 0.08
+    return 0.0
+
+
 def _extract_content_words(text: str) -> list[str]:
     toks = [m.group(0).lower() for m in _CONTENT_WORD_RE.finditer(text or "")]
     return [t for t in toks if t not in _FILLER_TOKENS and t not in _STOPWORDS and len(t) > 1]
@@ -1195,8 +1315,16 @@ def _score_window(
     video_duration_sec: float | None,
     silence_ranges: Sequence[tuple[float, float]] | None,
     user_target_sec: float,
+    breakdown: dict[str, Any] | None = None,
 ) -> float:
-    """Score one candidate window. Returns a float in roughly [-1, 2]."""
+    """Score one candidate window. Returns a float in roughly [-1, 2].
+
+    When ``breakdown`` is a dict, sub-score components are written to it
+    (semantic, tf_idf, hook_pattern, hook_bonus, payoff_bonus, filler_penalty,
+    silence_bonus, coverage_bonus, backref_penalty, self_containment_penalty,
+    intro_outro_penalty, target_penalty, boundary_confidence). Phase 3's
+    `generate_clip_candidates` uses this to build ClipCandidate objects
+    without re-running the scoring logic."""
     text = " ".join(s.text for s in sentences_slice)
     window_words = _extract_content_words(text)
     word_count = max(1, len(window_words))
@@ -1282,9 +1410,26 @@ def _score_window(
     # viewer doesn't have. A strong penalty pushes windows that open
     # cleanly (e.g., "Gradient descent is an optimization algorithm.")
     # above ones that open with connectors.
+    first_sentence_text = sentences_slice[0].text
+    last_sentence_text = sentences_slice[-1].text
     backref_penalty = 0.0
-    if _is_back_reference_opener(sentences_slice[0].text):
+    if _is_back_reference_opener(first_sentence_text):
         backref_penalty = 0.25
+
+    # Phase 2 — extended self-containment: pronoun/answer openers.
+    extra_self_containment_penalty = 0.0
+    if _pronoun_ambiguity_open(first_sentence_text):
+        extra_self_containment_penalty += 0.15
+    if _is_answer_without_question(first_sentence_text):
+        extra_self_containment_penalty += 0.10
+
+    # Phase 2 — hook-pattern bonus (first sentence only; keeps virality
+    # signals from rewarding mid-clip clickbait).
+    hook_pattern = _classify_hook_pattern(first_sentence_text)
+    hook_bonus = _HOOK_BONUS.get(hook_pattern or "", 0.0)
+
+    # Phase 2 — payoff bonus on the closing sentence.
+    payoff_bonus = _payoff_bonus_score(last_sentence_text)
 
     # --- 8. Query-coverage: reward windows where multiple sentences
     # mention query terms; hard-reject when ZERO sentences mention them
@@ -1325,11 +1470,160 @@ def _score_window(
         score = 0.6 * tf_idf  # no embeddings → tf-idf is the primary signal
     score += silence_bonus
     score += coverage_bonus
+    score += hook_bonus
+    score += payoff_bonus
     score -= filler_penalty
     score -= intro_outro_penalty
     score -= target_penalty
     score -= backref_penalty
+    score -= extra_self_containment_penalty
+
+    if breakdown is not None:
+        breakdown["semantic"] = semantic
+        breakdown["tf_idf"] = tf_idf
+        breakdown["hook_pattern"] = hook_pattern
+        breakdown["hook_bonus"] = hook_bonus
+        breakdown["payoff_bonus"] = payoff_bonus
+        breakdown["filler_penalty"] = filler_penalty
+        breakdown["silence_bonus"] = silence_bonus
+        breakdown["coverage_bonus"] = coverage_bonus
+        breakdown["coverage"] = coverage
+        breakdown["backref_penalty"] = backref_penalty
+        breakdown["self_containment_extra_penalty"] = extra_self_containment_penalty
+        breakdown["intro_outro_penalty"] = intro_outro_penalty
+        breakdown["target_penalty"] = target_penalty
+        breakdown["boundary_confidence"] = float(sentences_slice[0].confidence)
     return score
+
+
+@dataclass
+class ClipCandidate:
+    """Structural candidate for the cross-video LLM reranker (Phase 3).
+
+    Carries decomposed sub-scores so the reranker can reason about WHY a
+    candidate is strong (hook? payoff? semantic match?) instead of seeing
+    one opaque number. Debugging and tuning both benefit from the split.
+    """
+    t_start: float
+    t_end: float
+    opener_text: str            # first sentence (truncated)
+    closer_text: str            # last sentence (truncated)
+    relevance_score: float      # semantic + tf-idf + coverage
+    engagement_score: float     # hook + payoff
+    completeness_score: float   # 1 - self-containment penalties (clamped to [0,1])
+    boundary_confidence: float  # first sentence's confidence (0..1)
+    combined_score: float       # _score_window's scalar
+    hook_pattern: str | None
+    start_sentence_idx: int     # into sentences[] passed to generator
+    end_sentence_idx: int
+
+
+def _clip_candidate_from_breakdown(
+    *,
+    t_start: float,
+    t_end: float,
+    sentences_slice: list[SentenceSpan],
+    start_idx: int,
+    end_idx: int,
+    breakdown: dict[str, Any],
+    combined: float,
+) -> "ClipCandidate":
+    relevance = float(breakdown.get("semantic", 0.0)) + float(breakdown.get("tf_idf", 0.0)) + float(breakdown.get("coverage_bonus", 0.0))
+    engagement = float(breakdown.get("hook_bonus", 0.0)) + float(breakdown.get("payoff_bonus", 0.0))
+    self_contain = float(breakdown.get("backref_penalty", 0.0)) + float(breakdown.get("self_containment_extra_penalty", 0.0))
+    # Completeness is the inverse of self-containment penalty, normalized to [0, 1].
+    # Max possible penalty = 0.25 (backref) + 0.25 (pronoun + answer) = 0.50.
+    completeness = max(0.0, 1.0 - (self_contain / 0.5))
+    return ClipCandidate(
+        t_start=t_start,
+        t_end=t_end,
+        opener_text=(sentences_slice[0].text or "")[:240].strip(),
+        closer_text=(sentences_slice[-1].text or "")[:240].strip(),
+        relevance_score=max(0.0, min(1.5, relevance)),
+        engagement_score=max(0.0, min(1.0, engagement)),
+        completeness_score=completeness,
+        boundary_confidence=float(breakdown.get("boundary_confidence", 0.5)),
+        combined_score=combined,
+        hook_pattern=(breakdown.get("hook_pattern") if isinstance(breakdown.get("hook_pattern"), str) else None),
+        start_sentence_idx=start_idx,
+        end_sentence_idx=end_idx,
+    )
+
+
+def generate_clip_candidates(
+    *,
+    query: str,
+    sentences: Sequence[SentenceSpan],
+    cues: Sequence[Any] | None,
+    silence_ranges: Sequence[tuple[float, float]] | None,
+    user_min_sec: float,
+    user_max_sec: float,
+    user_target_sec: float,
+    video_duration_sec: float | None,
+    embed_func: Any | None = None,
+    target_count: int = 10,
+) -> list[ClipCandidate]:
+    """Enumerate every terminal-punct window across the full transcript
+    (not per-topic), score each, and return the top ``target_count * 3``
+    candidates (capped at 60) sorted by combined score desc.
+
+    Returns [] when no terminal-punct windows fit the duration bounds —
+    caller stays on the per-topic heuristic path."""
+    sent_list = [s for s in sentences if s is not None]
+    windows = _enumerate_candidate_windows(sent_list, user_min_sec, user_max_sec)
+    if not windows:
+        return []
+
+    query_words = _extract_content_words(query or "")
+    query_embedding = None
+    if embed_func is not None and query:
+        try:
+            qemb = embed_func([query])
+            if qemb is not None and len(qemb) > 0:
+                query_embedding = qemb[0]
+        except Exception:
+            query_embedding = None
+
+    num_windows = len(windows)
+    global_df: dict[str, int] = {}
+    for (i, j) in windows:
+        words = set(_extract_content_words(" ".join(s.text for s in sent_list[i : j + 1])))
+        for w in words:
+            global_df[w] = global_df.get(w, 0) + 1
+
+    out: list[ClipCandidate] = []
+    for (i, j) in windows:
+        sentences_slice = list(sent_list[i : j + 1])
+        breakdown: dict[str, Any] = {}
+        combined = _score_window(
+            sentences_slice=sentences_slice,
+            query_words=query_words,
+            global_df=global_df,
+            num_windows=num_windows,
+            query_embedding=query_embedding,
+            embed_func=embed_func,
+            video_duration_sec=video_duration_sec,
+            silence_ranges=silence_ranges,
+            user_target_sec=user_target_sec,
+            breakdown=breakdown,
+        )
+        if combined == float("-inf"):
+            continue
+        candidate = _clip_candidate_from_breakdown(
+            t_start=sentences_slice[0].t_start,
+            t_end=sentences_slice[-1].t_end,
+            sentences_slice=sentences_slice,
+            start_idx=i,
+            end_idx=j,
+            breakdown=breakdown,
+            combined=combined,
+        )
+        out.append(candidate)
+
+    out.sort(key=lambda c: c.combined_score, reverse=True)
+    # Return top K*3, capped at 60 to keep the LLM reranker prompt small.
+    keep_n = min(60, max(target_count * 3, target_count))
+    return out[:keep_n]
 
 
 @dataclass
@@ -1505,4 +1799,7 @@ __all__ = [
     "refine_boundaries_word_level",
     "HeuristicPickResult",
     "pick_clip_heuristic",
+    "ClipCandidate",
+    "generate_clip_candidates",
+    "_classify_hook_pattern",
 ]

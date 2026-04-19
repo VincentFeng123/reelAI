@@ -319,8 +319,12 @@ def split_sentences(
         t_end = max(last_word.end, t_start + 0.05)
         # Confidence: higher when underlying cues have non-legacy word_source.
         cue_sources = {cues[flat_words[i].cue_idx].word_source for i in range(w_start_idx, w_end_idx + 1)}
-        if "whisper" in cue_sources or "openai" in cue_sources:
+        if "whisperx" in cue_sources:
+            confidence = 0.95 if terminal else 0.85
+        elif "whisper" in cue_sources or "openai" in cue_sources:
             confidence = 0.9 if terminal else 0.75
+        elif "whisper_aligned" in cue_sources:
+            confidence = 0.88 if terminal else 0.78
         elif "proportional" in cue_sources:
             confidence = 0.6 if terminal else 0.45
         else:  # legacy only

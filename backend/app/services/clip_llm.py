@@ -366,9 +366,245 @@ def pick_clip_llm(
     )
 
 
+# --------------------------------------------------------------------- #
+# Phase 3 — cross-video LLM reranker
+# --------------------------------------------------------------------- #
+
+
+@dataclass
+class RankedClipPick:
+    """Output of the global reranker. One per selected candidate, ordered
+    by virality desc. `candidate_idx` indexes back into the list that was
+    passed in — the caller reads the actual boundaries from there."""
+    candidate_idx: int
+    virality_score: float       # 0..1 from LLM
+    hook_pattern: str | None    # copied from candidate; may differ if LLM re-classifies
+    reason: str                 # one short sentence
+
+
+def _build_rerank_system_prompt(query: str | None, target_count: int) -> str:
+    query_line = f'The user is searching for: "{query}"\n\n' if query else ""
+    return (
+        "You are a viral-clip ranker. You receive a NUMBERED list of candidate "
+        "clips extracted from a single long-form video. Each candidate shows "
+        "opener text, closer text, duration, structural sub-scores (relevance, "
+        "engagement, completeness), and a hook pattern if one was detected.\n\n"
+        f"{query_line}"
+        f"Your job: pick the top {target_count} candidates most likely to "
+        "perform as standalone short-form clips. Weight the decision by:\n"
+        "  1. How strongly the clip stands alone — no unresolved references, "
+        "opens on a complete thought, closes on a complete thought.\n"
+        "  2. Hook strength — does the opener earn attention in the first "
+        "second? Opus Clip's viral hook taxonomy (contradiction, number "
+        "promise, confession, question, before/after, counterintuitive how-to, "
+        "warning) is a useful prior but not required.\n"
+        "  3. Payoff — does the clip deliver on what its opener promises?\n"
+        "  4. Relevance to query when one was provided.\n\n"
+        "Return JSON only:\n"
+        '{"picks": [{"candidate_idx": <int>, "virality_score": <0..1>, '
+        '"hook_pattern": "<name or null>", "reason": "<one short sentence>"}]}\n'
+        "Return at most the requested count. Fewer is fine if most candidates "
+        "are weak. Do NOT invent new candidates — only reference "
+        "candidate_idx values from the list."
+    )
+
+
+def _render_candidates_for_rerank(candidates: Sequence[Any]) -> str:
+    """Compact numbered rendering of candidates — metadata only, no transcript text."""
+    lines: list[str] = []
+    for i, c in enumerate(candidates):
+        duration = max(0.0, float(getattr(c, "t_end", 0.0)) - float(getattr(c, "t_start", 0.0)))
+        lines.append(
+            f"[{i}] start={float(getattr(c, 't_start', 0.0)):.1f}s "
+            f"end={float(getattr(c, 't_end', 0.0)):.1f}s "
+            f"dur={duration:.1f}s "
+            f"hook={getattr(c, 'hook_pattern', None) or '-'} "
+            f"rel={float(getattr(c, 'relevance_score', 0.0)):.2f} "
+            f"eng={float(getattr(c, 'engagement_score', 0.0)):.2f} "
+            f"cmp={float(getattr(c, 'completeness_score', 0.0)):.2f}\n"
+            f"    opener: {getattr(c, 'opener_text', '')!r}\n"
+            f"    closer: {getattr(c, 'closer_text', '')!r}"
+        )
+    return "\n".join(lines)
+
+
+def _parse_rerank_response(
+    raw: str, *, num_candidates: int, target_count: int,
+) -> list[RankedClipPick]:
+    try:
+        payload = json.loads(_strip_code_fences(raw))
+    except (json.JSONDecodeError, ValueError):
+        logger.debug("rerank: invalid JSON from LLM: %s", raw[:200])
+        return []
+    if not isinstance(payload, dict):
+        return []
+    picks_raw = payload.get("picks")
+    if not isinstance(picks_raw, list):
+        return []
+    out: list[RankedClipPick] = []
+    seen_idx: set[int] = set()
+    for entry in picks_raw:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            idx = int(entry.get("candidate_idx"))
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= num_candidates or idx in seen_idx:
+            continue
+        seen_idx.add(idx)
+        try:
+            virality = float(entry.get("virality_score") or 0.0)
+        except (TypeError, ValueError):
+            virality = 0.0
+        virality = max(0.0, min(1.0, virality))
+        hook = entry.get("hook_pattern")
+        hook_str = str(hook) if isinstance(hook, str) and hook else None
+        reason = str(entry.get("reason") or "").strip()[:300]
+        out.append(RankedClipPick(
+            candidate_idx=idx,
+            virality_score=virality,
+            hook_pattern=hook_str,
+            reason=reason,
+        ))
+    return out[:target_count]
+
+
+def _heuristic_rerank_fallback(
+    candidates: Sequence[Any],
+    *,
+    target_count: int,
+) -> list[RankedClipPick]:
+    """Deterministic ranking when the LLM chain returns nothing usable.
+    Combined weighting documented in the design: 0.45·relevance +
+    0.25·engagement + 0.20·completeness + 0.10·boundary_confidence."""
+    scored: list[tuple[int, float, Any]] = []
+    for i, c in enumerate(candidates):
+        rel = float(getattr(c, "relevance_score", 0.0))
+        eng = float(getattr(c, "engagement_score", 0.0))
+        cmp_ = float(getattr(c, "completeness_score", 0.0))
+        bc = float(getattr(c, "boundary_confidence", 0.0))
+        combined = 0.45 * rel + 0.25 * eng + 0.20 * cmp_ + 0.10 * bc
+        scored.append((i, combined, c))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    out: list[RankedClipPick] = []
+    for idx, combined, c in scored[:target_count]:
+        out.append(RankedClipPick(
+            candidate_idx=idx,
+            virality_score=max(0.0, min(1.0, combined)),
+            hook_pattern=getattr(c, "hook_pattern", None),
+            reason="heuristic fallback (no LLM)",
+        ))
+    return out
+
+
+def rerank_clip_candidates_llm(
+    candidates: Sequence[Any],
+    *,
+    query: str | None = None,
+    target_count: int = 5,
+) -> list[RankedClipPick]:
+    """Rank candidates globally across the video. Sends metadata (not
+    transcript text) so the prompt stays small even at 60 candidates.
+
+    Returns a heuristic-sorted fallback if every LLM provider fails — the
+    caller can always rely on a non-empty return when candidates is non-empty.
+    """
+    if not candidates:
+        return []
+    target_count = max(1, int(target_count))
+    system_prompt = _build_rerank_system_prompt(query, target_count)
+    user_msg = (
+        f"Candidates (total={len(candidates)}):\n"
+        f"{_render_candidates_for_rerank(candidates)}"
+    )
+    num = len(candidates)
+
+    genai = _build_gemini_client()
+    if genai is not None:
+        keys = _collect_gemini_api_keys()
+        if keys:
+            from google.genai import types as genai_types
+            for key in keys:
+                try:
+                    client = genai.Client(api_key=key)
+                except Exception:
+                    continue
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.0-flash",
+                        contents=user_msg,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            response_mime_type="application/json",
+                            temperature=0.1,
+                        ),
+                    )
+                    picks = _parse_rerank_response(
+                        response.text or "{}",
+                        num_candidates=num, target_count=target_count,
+                    )
+                    if picks:
+                        return picks
+                    break
+                except Exception as exc:
+                    exc_str = str(exc).lower()
+                    if any(s in exc_str for s in ("429", "resource_exhausted", "rate", "quota")):
+                        continue
+                    logger.debug("rerank: Gemini failed: %s", exc)
+                    break
+
+    groq_client = _build_groq_client()
+    if groq_client is not None:
+        try:
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            picks = _parse_rerank_response(
+                response.choices[0].message.content or "{}",
+                num_candidates=num, target_count=target_count,
+            )
+            if picks:
+                return picks
+        except Exception as exc:
+            logger.debug("rerank: Groq failed: %s", exc)
+
+    cerebras_client = _build_cerebras_client()
+    if cerebras_client is not None:
+        try:
+            response = cerebras_client.chat.completions.create(
+                model="llama3.1-8b",
+                temperature=0.1,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+            )
+            picks = _parse_rerank_response(
+                response.choices[0].message.content or "{}",
+                num_candidates=num, target_count=target_count,
+            )
+            if picks:
+                return picks
+        except Exception as exc:
+            logger.debug("rerank: Cerebras failed: %s", exc)
+
+    logger.info("rerank: all LLM providers failed; using heuristic fallback")
+    return _heuristic_rerank_fallback(candidates, target_count=target_count)
+
+
 __all__ = [
     "ClipPick",
     "MIN_CLIP_SEC",
     "MAX_CLIP_SEC",
     "pick_clip_llm",
+    "RankedClipPick",
+    "rerank_clip_candidates_llm",
 ]

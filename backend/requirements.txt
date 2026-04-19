@@ -59,3 +59,12 @@ cerebras-cloud-sdk>=1.35.0
 # regex fallback mis-splits on. If this import ever fails, services/sentences.py
 # degrades to the regex splitter automatically.
 pysbd==0.3.4
+# WhisperX — Phase 4 selective wav2vec2 forced alignment. Used ONLY when:
+#   (a) Phase-1 faster-whisper alignment falls below match-rate threshold, OR
+#   (b) top-k clip refinement wants ≤50ms boundary precision.
+# Never runs on the default ingest path. Version pinned because whisperx
+# alignment quality regressed across 3.2.x and 3.3.x releases; the kill-switch
+# is `WHISPERX_ENABLED=false`. Lazy-imported from
+# `app/ingestion/whisperx_transcribe.py` so Vercel/test environments without
+# the wheel still run.
+whisperx==3.1.1

@@ -1454,5 +1454,145 @@ class GenerateReelsWiringTest(unittest.TestCase):
         )
 
 
+# --------------------------------------------------------------------------- #
+# Phase 3 — distribute_ranked_to_topic_reels + TopicReel sub-score serialization
+# --------------------------------------------------------------------------- #
+
+
+class DistributeRankedToTopicReelsTests(unittest.TestCase):
+    """Focused tests for `topic_cut.distribute_ranked_to_topic_reels`.
+
+    The helper is the glue between the global LLM reranker output
+    (`RankedClipPick`) and the `TopicReel` list. The tests cover the three
+    interesting behaviours:
+
+      1. High-overlap pick transplants boundaries + sub-scores onto the
+         matching reel and marks it covered.
+      2. Low-overlap pick synthesizes an orphan TopicReel (covered too).
+      3. `TopicReel.to_dict()` serializes every new Phase-3 sub-score field.
+    """
+
+    def _mk_candidate(self, *, t_start, t_end, idx_start=0, idx_end=0, hook=None,
+                      relevance=0.5, engagement=0.4, completeness=0.6,
+                      boundary_conf=0.7):
+        from backend.app.services.clip_boundary import ClipCandidate
+        return ClipCandidate(
+            t_start=t_start, t_end=t_end,
+            opener_text="opener", closer_text="closer",
+            relevance_score=relevance, engagement_score=engagement,
+            completeness_score=completeness, boundary_confidence=boundary_conf,
+            combined_score=0.0, hook_pattern=hook,
+            start_sentence_idx=idx_start, end_sentence_idx=idx_end,
+        )
+
+    def _mk_pick(self, *, candidate_idx, virality=0.8, hook=None, reason="r"):
+        from backend.app.services.clip_llm import RankedClipPick
+        return RankedClipPick(
+            candidate_idx=candidate_idx,
+            virality_score=virality,
+            hook_pattern=hook,
+            reason=reason,
+        )
+
+    def test_pick_transplants_boundaries_and_subscores_on_match(self):
+        reels = [
+            TopicReel(video_id="VID", t_start=10.0, t_end=60.0, label="Topic A"),
+            TopicReel(video_id="VID", t_start=100.0, t_end=160.0, label="Topic B"),
+        ]
+        # Candidate fully inside Topic A (100% overlap).
+        cand_a = self._mk_candidate(
+            t_start=18.0, t_end=48.0,
+            relevance=0.9, engagement=0.5, completeness=0.8, boundary_conf=0.85,
+            hook="contradiction",
+        )
+        pick = self._mk_pick(candidate_idx=0, virality=0.92, hook="contradiction")
+        updated, covered = topic_cut.distribute_ranked_to_topic_reels(
+            ranked=[pick],
+            candidates=[cand_a],
+            reels=reels,
+            video_id="VID",
+        )
+        self.assertEqual(len(updated), 2)  # no orphan
+        topic_a = next(r for r in updated if r.label == "Topic A")
+        self.assertEqual(topic_a.t_start, 18.0)
+        self.assertEqual(topic_a.t_end, 48.0)
+        self.assertEqual(topic_a.boundary_quality, "llm-rerank")
+        self.assertAlmostEqual(topic_a.final_rank_score, 0.92)
+        self.assertAlmostEqual(topic_a.engagement_score, 0.5)
+        self.assertAlmostEqual(topic_a.completeness_score, 0.8)
+        self.assertAlmostEqual(topic_a.boundary_confidence, 0.85)
+        self.assertEqual(topic_a.hook_pattern, "contradiction")
+        self.assertIn(id(topic_a), covered)
+
+    def test_orphan_synthesis_when_no_reel_overlaps(self):
+        reels = [
+            TopicReel(video_id="VID", t_start=10.0, t_end=60.0, label="Topic A"),
+        ]
+        # Candidate entirely outside any reel.
+        cand = self._mk_candidate(t_start=200.0, t_end=240.0, hook="warning")
+        pick = self._mk_pick(candidate_idx=0, virality=0.77, hook="warning")
+        updated, covered = topic_cut.distribute_ranked_to_topic_reels(
+            ranked=[pick],
+            candidates=[cand],
+            reels=reels,
+            video_id="VID",
+        )
+        self.assertEqual(len(updated), 2)  # original + 1 orphan
+        orphan = updated[-1]
+        self.assertEqual(orphan.t_start, 200.0)
+        self.assertEqual(orphan.t_end, 240.0)
+        self.assertEqual(orphan.label, "")
+        self.assertEqual(orphan.boundary_quality, "llm-rerank")
+        self.assertAlmostEqual(orphan.final_rank_score, 0.77)
+        self.assertEqual(orphan.hook_pattern, "warning")
+        self.assertIn(id(orphan), covered)
+        # Existing reel should remain untouched.
+        self.assertEqual(updated[0].final_rank_score, 0.0)
+
+    def test_each_reel_claimed_at_most_once(self):
+        reels = [
+            TopicReel(video_id="VID", t_start=10.0, t_end=60.0, label="Topic A"),
+        ]
+        # Two picks both overlap Topic A — second should become orphan.
+        cand_a = self._mk_candidate(t_start=20.0, t_end=50.0)
+        cand_b = self._mk_candidate(t_start=15.0, t_end=55.0)
+        picks = [
+            self._mk_pick(candidate_idx=0, virality=0.9),
+            self._mk_pick(candidate_idx=1, virality=0.6),
+        ]
+        updated, covered = topic_cut.distribute_ranked_to_topic_reels(
+            ranked=picks,
+            candidates=[cand_a, cand_b],
+            reels=reels,
+            video_id="VID",
+        )
+        # Topic A claimed once + one orphan = 2 total.
+        self.assertEqual(len(updated), 2)
+        self.assertEqual(len(covered), 2)
+
+    def test_topic_reel_to_dict_includes_phase3_fields(self):
+        r = TopicReel(
+            video_id="VID",
+            t_start=10.0, t_end=40.0,
+            label="Topic X",
+            relevance_score=0.42,
+            boundary_quality="llm-rerank",
+            engagement_score=0.55,
+            completeness_score=0.7,
+            boundary_confidence=0.85,
+            final_rank_score=0.9,
+            hook_pattern="question",
+        )
+        d = r.to_dict()
+        self.assertEqual(d["final_rank_score"], 0.9)
+        self.assertEqual(d["engagement_score"], 0.55)
+        self.assertEqual(d["completeness_score"], 0.7)
+        self.assertEqual(d["boundary_confidence"], 0.85)
+        self.assertEqual(d["hook_pattern"], "question")
+        # Existing keys still present.
+        self.assertEqual(d["label"], "Topic X")
+        self.assertEqual(d["boundary_quality"], "llm-rerank")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -216,10 +216,43 @@ def _download_clip_audio(
 
 
 def _call_whisper(audio_path: Path, dl_start_sec: float) -> list[WhisperWord]:
-    """Run the clip audio through Groq Whisper and convert word
-    timestamps (relative to the extracted audio's own t=0) into absolute
-    video seconds by adding the download offset.
+    """Run the clip audio through WhisperX (preferred) or Groq Whisper
+    (legacy fallback) and convert word timestamps (relative to the
+    extracted audio's own t=0) into absolute video seconds by adding the
+    download offset.
+
+    Phase 4(b): when `WHISPERX_ENABLED=true` (default) and the package is
+    installed, WhisperX wav2vec2 alignment runs locally for ±30 ms word
+    precision. When WhisperX is disabled or unavailable, the legacy Groq
+    hosted Whisper large-v3 path still runs at ±80 ms precision.
     """
+    try:
+        from ..ingestion.whisperx_transcribe import (
+            whisperx_enabled,
+            whisperx_words_for_audio,
+        )
+    except Exception:
+        whisperx_enabled = lambda: False  # type: ignore[assignment]
+        whisperx_words_for_audio = None  # type: ignore[assignment]
+
+    if whisperx_enabled() and whisperx_words_for_audio is not None:
+        try:
+            wx_words = whisperx_words_for_audio(audio_path, language="en")
+        except Exception:
+            logger.exception("whisperx_words_for_audio raised during clip refinement")
+            wx_words = []
+        if wx_words:
+            return [
+                WhisperWord(
+                    text=w.text,
+                    start=w.start + dl_start_sec,
+                    end=w.end + dl_start_sec,
+                )
+                for w in wx_words
+            ]
+        # Fall through to Groq only when WhisperX returned nothing — lets
+        # the legacy path act as emergency backup rather than be retired.
+
     try:
         payload = transcribe_audio(audio_path, language="en", timeout=_WHISPER_TIMEOUT_SEC)
     except Exception:

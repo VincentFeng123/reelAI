@@ -110,6 +110,29 @@ DEFAULT_MODEL = "gemini-2.0-flash"
 # handle large contexts well.
 MAX_CUES_FOR_LLM = 6000
 
+# Phase 3 — cross-video LLM reranker toggle. Defaults on; set false to restore
+# the pre-Phase-3 per-topic LLM pick path (useful for A/B comparison on a
+# specific video without redeploying).
+_GLOBAL_LLM_RERANK_ENABLED = os.getenv("GLOBAL_LLM_RERANK_ENABLED", "true").lower() == "true"
+# Minimum fraction of a candidate's duration that must lie inside a TopicReel
+# for the candidate to REFINE that reel (vs. be emitted as a new "orphan" reel).
+_RANK_OVERLAP_RATIO = 0.40
+
+# Default final_rank_score values by boundary tier — applied to reels the
+# global rerank didn't claim, so the desc sort still produces a sensible
+# order (ranked > llm-snap > whisper-word > heuristic > chapter > legacy).
+_FALLBACK_RANK_BY_TIER = {
+    "llm-rerank": None,        # already set by distribute_ranked_to_topic_reels
+    "whisper-word": 0.55,
+    "llm-snap": 0.50,
+    "chapter": 0.40,
+    "heuristic-strong": 0.35,
+    "precise": 0.30,
+    "sentence": 0.25,
+    "degraded": 0.15,
+    "legacy": 0.10,
+}
+
 
 # --------------------------------------------------------------------------- #
 # Public dataclasses
@@ -151,6 +174,13 @@ class TopicReel:
     # Phase A.4: tier set by the ClipBoundaryEngine when it refines t_start/t_end.
     # Values: "legacy" (pre-engine), "chapter", "sentence", "precise", "degraded".
     boundary_quality: str = "legacy"
+    # Phase 3 — decomposed sub-scores from the cross-video reranker. Zero-default
+    # so older code paths (chapter-only, heuristic-only) keep serializing cleanly.
+    engagement_score: float = 0.0
+    completeness_score: float = 0.0
+    boundary_confidence: float = 0.0
+    final_rank_score: float = 0.0
+    hook_pattern: str | None = None
 
     @property
     def duration_sec(self) -> float:
@@ -163,6 +193,10 @@ class TopicReel:
         d["t_end"] = round(self.t_end, 2)
         if self.relevance_score is not None:
             d["relevance_score"] = round(self.relevance_score, 3)
+        d["engagement_score"] = round(self.engagement_score, 3)
+        d["completeness_score"] = round(self.completeness_score, 3)
+        d["boundary_confidence"] = round(self.boundary_confidence, 3)
+        d["final_rank_score"] = round(self.final_rank_score, 3)
         return d
 
 
@@ -2187,6 +2221,98 @@ def _proportional_ingest_cues_from_transcript(
 # --------------------------------------------------------------------------- #
 
 
+def distribute_ranked_to_topic_reels(
+    *,
+    ranked: Sequence[Any],        # Sequence[RankedClipPick]
+    candidates: Sequence[Any],    # Sequence[ClipCandidate]
+    reels: list[TopicReel],
+    video_id: str,
+) -> tuple[list[TopicReel], set[int]]:
+    """
+    Fold global-rerank picks into the existing per-topic reel list.
+
+    Each ranked pick resolves to a ClipCandidate (via `candidate_idx`). We try
+    to pair the candidate with the TopicReel whose overlap with the candidate
+    covers at least `_RANK_OVERLAP_RATIO` of the candidate's duration; when a
+    match is found we transplant the candidate's boundaries and sub-scores onto
+    that reel. When no reel overlaps enough, the candidate becomes a new
+    "orphan" TopicReel with an empty label (the caller can choose to backfill).
+
+    Returns the updated reel list (possibly longer than the input) and a set of
+    `id(reel)` values for reels that the rerank claimed; the caller skips those
+    in the per-topic fallback loop.
+    """
+    updated: list[TopicReel] = list(reels)
+    covered_ids: set[int] = set()
+    used_reel_ids: set[int] = set()
+
+    for pick in ranked:
+        try:
+            cand_idx = int(getattr(pick, "candidate_idx", -1))
+        except (TypeError, ValueError):
+            continue
+        if cand_idx < 0 or cand_idx >= len(candidates):
+            continue
+        cand = candidates[cand_idx]
+        try:
+            cand_start = float(cand.t_start)
+            cand_end = float(cand.t_end)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        cand_dur = max(0.01, cand_end - cand_start)
+
+        best_reel: TopicReel | None = None
+        best_overlap_frac = 0.0
+        for r in updated:
+            if id(r) in used_reel_ids:
+                continue
+            overlap_start = max(cand_start, r.t_start)
+            overlap_end = min(cand_end, r.t_end)
+            overlap = max(0.0, overlap_end - overlap_start)
+            if overlap <= 0.0:
+                continue
+            frac = overlap / cand_dur
+            if frac > best_overlap_frac:
+                best_overlap_frac = frac
+                best_reel = r
+
+        virality = float(getattr(pick, "virality_score", 0.0))
+        hook_from_pick = getattr(pick, "hook_pattern", None)
+        hook_from_cand = getattr(cand, "hook_pattern", None)
+
+        if best_reel is not None and best_overlap_frac >= _RANK_OVERLAP_RATIO:
+            best_reel.t_start = round(cand_start, 2)
+            best_reel.t_end = round(cand_end, 2)
+            best_reel.boundary_quality = "llm-rerank"
+            best_reel.relevance_score = float(getattr(cand, "relevance_score", 0.0))
+            best_reel.engagement_score = float(getattr(cand, "engagement_score", 0.0))
+            best_reel.completeness_score = float(getattr(cand, "completeness_score", 0.0))
+            best_reel.boundary_confidence = float(getattr(cand, "boundary_confidence", 0.0))
+            best_reel.final_rank_score = max(0.0, min(1.0, virality))
+            best_reel.hook_pattern = hook_from_pick or hook_from_cand
+            used_reel_ids.add(id(best_reel))
+            covered_ids.add(id(best_reel))
+        else:
+            orphan = TopicReel(
+                video_id=video_id,
+                t_start=round(cand_start, 2),
+                t_end=round(cand_end, 2),
+                label="",
+                summary="",
+                relevance_score=float(getattr(cand, "relevance_score", 0.0)),
+                boundary_quality="llm-rerank",
+                engagement_score=float(getattr(cand, "engagement_score", 0.0)),
+                completeness_score=float(getattr(cand, "completeness_score", 0.0)),
+                boundary_confidence=float(getattr(cand, "boundary_confidence", 0.0)),
+                final_rank_score=max(0.0, min(1.0, virality)),
+                hook_pattern=hook_from_pick or hook_from_cand,
+            )
+            updated.append(orphan)
+            covered_ids.add(id(orphan))
+
+    return updated, covered_ids
+
+
 def _apply_boundary_engine(
     reels: list[TopicReel],
     *,
@@ -2431,8 +2557,72 @@ def _apply_boundary_engine(
         r.t_end = round(float(result.t_end), 3)
         r.boundary_quality = "whisper-word"
 
+    # Phase 3 — global candidate generation + LLM rerank. When enabled and a
+    # query is present, run it BEFORE the per-topic loop: candidates span the
+    # whole transcript, the LLM reranker picks the top N metadata-only, and
+    # `distribute_ranked_to_topic_reels` transplants refined boundaries onto
+    # each TopicReel that overlaps a pick (orphans synthesize new reels).
+    ranked_covered: set[int] = set()
+    if _GLOBAL_LLM_RERANK_ENABLED and query and reels:
+        try:
+            from .clip_boundary import generate_clip_candidates
+            from .clip_llm import rerank_clip_candidates_llm as _rerank_llm
+        except Exception:
+            logger.exception("phase3 rerank imports failed; using per-topic fallback")
+            generate_clip_candidates = None  # type: ignore[assignment]
+            _rerank_llm = None  # type: ignore[assignment]
+
+        if generate_clip_candidates is not None and _rerank_llm is not None:
+            target_count = max(len(reels), 3)
+            try:
+                cand_list = generate_clip_candidates(
+                    query=query,
+                    sentences=sentences,
+                    cues=cue_list,
+                    silence_ranges=silence_ranges,
+                    user_min_sec=user_min_sec,
+                    user_max_sec=user_max_sec,
+                    user_target_sec=user_target_sec or 0.5 * (user_min_sec + user_max_sec),
+                    video_duration_sec=video_duration_sec,
+                    embed_func=_embed_func,
+                    target_count=target_count,
+                )
+            except Exception:
+                logger.exception("generate_clip_candidates raised; using per-topic fallback")
+                cand_list = []
+
+            if cand_list:
+                try:
+                    ranked = _rerank_llm(
+                        cand_list,
+                        query=query,
+                        target_count=target_count,
+                    )
+                except Exception:
+                    logger.exception("rerank_clip_candidates_llm raised; using per-topic fallback")
+                    ranked = []
+
+                if ranked:
+                    video_id_for_orphans = reels[0].video_id if reels else ""
+                    reels, ranked_covered = distribute_ranked_to_topic_reels(
+                        ranked=ranked,
+                        candidates=cand_list,
+                        reels=reels,
+                        video_id=video_id_for_orphans,
+                    )
+                    logger.info(
+                        "phase3 rerank: %d picks, %d reels covered, %d total after orphans",
+                        len(ranked), len(ranked_covered), len(reels),
+                    )
+
     refined: list[TopicReel] = []
     for r in reels:
+        if id(r) in ranked_covered:
+            # Global rerank already set precise boundaries + sub-scores;
+            # still allow word-level whisper refinement on top.
+            _try_whisper_refine(r)
+            refined.append(r)
+            continue
         if _try_llm_pick(r):
             _try_whisper_refine(r)
             refined.append(r)
@@ -2470,6 +2660,21 @@ def _apply_boundary_engine(
                 r.video_id, r.t_start, r.t_end,
             )
         refined.append(r)
+
+    # Phase 3 — populate default sub-scores for reels that didn't go through
+    # the global rerank pipeline, so the final sort-by-final_rank_score
+    # produces a sensible order (ranked picks first, fallbacks after).
+    for r in refined:
+        if r.boundary_quality == "llm-rerank":
+            continue  # already populated
+        if r.final_rank_score == 0.0:
+            r.final_rank_score = _FALLBACK_RANK_BY_TIER.get(r.boundary_quality, 0.15)
+        if r.completeness_score == 0.0:
+            r.completeness_score = 0.5
+        if r.boundary_confidence == 0.0:
+            r.boundary_confidence = 0.65
+
+    refined.sort(key=lambda rr: rr.final_rank_score, reverse=True)
     return refined
 
 
