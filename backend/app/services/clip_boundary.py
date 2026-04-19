@@ -916,60 +916,46 @@ def _refine_start_to_word_boundary(
     sentence_t_start: float,
     silence_ranges: Sequence[tuple[float, float]] | None,
 ) -> tuple[float, str]:
-    """Given the word list and a chosen sentence-start timestamp, return the
-    refined start timestamp + a human reason string. Strategy:
+    """Refine a sentence-level start timestamp to word-level precision.
+    Strategy:
 
-        1. Find the first word whose start >= sentence_t_start - 0.2s.
-        2. Walk forward past filler tokens / filler bigrams (bounded).
-        3. If a real inter-word pause exists immediately before the chosen
-           word, snap to the pause midpoint so the clip enters on silence.
+        1. Find the first word at or after `sentence_t_start` — this is
+           the actual acoustic onset of the first word of the sentence,
+           which can differ from `sentence_t_start` by up to a few
+           hundred ms when the cue boundary includes a pause.
+        2. If an inter-word silence (>= _INTER_WORD_PAUSE_SEC) exists
+           right before the chosen word, snap to the silence midpoint —
+           cleaner listener experience than cutting exactly on the first
+           phoneme.
+
+    Filler trimming across the sentence boundary is intentionally NOT
+    done: it would shift the clip start off the terminal-punct contract
+    ("the word before the clip must end with .!?…"). Fillers inside the
+    sentence still get scored against by `_score_window`'s filler-density
+    penalty, so filler-heavy windows lose at selection time.
     """
     if not words_in_range:
         return sentence_t_start, "no-word-timing"
-    # Step 1: locate the first word at-or-after the sentence start.
-    start_idx = 0
+    chosen_idx: int | None = None
     for i, (_, ws, _we) in enumerate(words_in_range):
-        if ws >= sentence_t_start - 0.2:
-            start_idx = i
+        if ws >= sentence_t_start - 0.1:
+            chosen_idx = i
             break
-    else:
-        start_idx = len(words_in_range) - 1
-
-    # Step 2: trim leading fillers (bounded).
-    idx = start_idx
-    stop = min(len(words_in_range) - 1, start_idx + _MAX_FILLER_TRIM_WORDS)
-    while idx < stop:
-        cur = words_in_range[idx][0]
-        nxt = words_in_range[idx + 1][0] if idx + 1 < len(words_in_range) else ""
-        if _bigram_is_filler(cur, nxt):
-            idx += 2
-            continue
-        if _word_is_filler(cur):
-            idx += 1
-            continue
-        break
-    if idx >= len(words_in_range):
-        return sentence_t_start, "all-filler"
-    chosen = words_in_range[idx]
-    # Step 3: if the gap between the previous word's end and this word's
-    # start exceeds _INTER_WORD_PAUSE_SEC, snap to the pause midpoint —
-    # cleaner onset than cutting exactly on the first phoneme.
+    if chosen_idx is None:
+        return sentence_t_start, "no-word-at-start"
+    chosen = words_in_range[chosen_idx]
     refined_t_start = chosen[1]
-    if idx > 0:
-        prev_end = words_in_range[idx - 1][2]
+    if chosen_idx > 0:
+        prev_end = words_in_range[chosen_idx - 1][2]
         gap = chosen[1] - prev_end
         if gap >= _INTER_WORD_PAUSE_SEC:
             refined_t_start = prev_end + 0.5 * gap
-    # Cross-check against silencedetect ranges when available — prefer the
-    # silence midpoint over our word-gap heuristic since silencedetect has
-    # the actual audio.
     silence_mid = _silence_midpoint_near(
         chosen[1], silence_ranges, window_sec=_SILENCE_REFINE_WINDOW_SEC,
     )
     if silence_mid is not None:
         refined_t_start = silence_mid
-    reason = "word-snap" if idx == start_idx else f"filler-trim+{idx - start_idx}"
-    return refined_t_start, reason
+    return refined_t_start, "word-snap"
 
 
 def _refine_end_to_word_boundary(
@@ -977,37 +963,26 @@ def _refine_end_to_word_boundary(
     sentence_t_end: float,
     silence_ranges: Sequence[tuple[float, float]] | None,
 ) -> tuple[float, str]:
-    """Mirror of _refine_start_to_word_boundary for the end boundary. Walks
-    backward past filler tokens and snaps to a trailing pause midpoint."""
+    """Mirror of `_refine_start_to_word_boundary` for the end boundary.
+    Finds the last word that ends at or before `sentence_t_end` and snaps
+    to a trailing inter-word silence midpoint when one exists.
+
+    As with the start, filler trimming is NOT applied — that would move
+    the end off the terminal-punct contract.
+    """
     if not words_in_range:
         return sentence_t_end, "no-word-timing"
-    # Step 1: locate the last word at-or-before the sentence end.
-    end_idx = len(words_in_range) - 1
+    chosen_idx: int | None = None
     for i in range(len(words_in_range) - 1, -1, -1):
-        if words_in_range[i][2] <= sentence_t_end + 0.2:
-            end_idx = i
+        if words_in_range[i][2] <= sentence_t_end + 0.1:
+            chosen_idx = i
             break
-    # Step 2: trim trailing fillers (bounded).
-    idx = end_idx
-    stop = max(0, end_idx - _MAX_FILLER_TRIM_WORDS)
-    while idx > stop:
-        cur = words_in_range[idx][0]
-        prev = words_in_range[idx - 1][0] if idx - 1 >= 0 else ""
-        # Check the bigram (prev, cur) as a filler pair; if yes, drop both.
-        if _bigram_is_filler(prev, cur):
-            idx -= 2
-            continue
-        if _word_is_filler(cur):
-            idx -= 1
-            continue
-        break
-    if idx < 0:
-        return sentence_t_end, "all-filler"
-    chosen = words_in_range[idx]
-    # Step 3: snap to trailing pause midpoint when a gap exists.
+    if chosen_idx is None:
+        return sentence_t_end, "no-word-at-end"
+    chosen = words_in_range[chosen_idx]
     refined_t_end = chosen[2]
-    if idx + 1 < len(words_in_range):
-        next_start = words_in_range[idx + 1][1]
+    if chosen_idx + 1 < len(words_in_range):
+        next_start = words_in_range[chosen_idx + 1][1]
         gap = next_start - chosen[2]
         if gap >= _INTER_WORD_PAUSE_SEC:
             refined_t_end = chosen[2] + 0.5 * gap
@@ -1016,8 +991,7 @@ def _refine_end_to_word_boundary(
     )
     if silence_mid is not None:
         refined_t_end = silence_mid
-    reason = "word-snap" if idx == end_idx else f"filler-trim-{end_idx - idx}"
-    return refined_t_end, reason
+    return refined_t_end, "word-snap"
 
 
 def refine_boundaries_word_level(

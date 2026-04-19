@@ -348,18 +348,13 @@ class _FakeCue:
         self.words = words
 
 
-def test_word_level_trims_leading_filler():
+def test_word_level_preserves_sentence_start_even_with_leading_filler():
+    """Boundary-level filler trimming was removed to preserve the strict
+    begin/end-on-punctuation contract. Sentence-level start must stay
+    intact; filler density is penalized at scoring time instead, not at
+    the boundary."""
     from backend.app.services.clip_boundary import refine_boundaries_word_level
 
-    # Sentence: "Um, so gradient descent is an optimization algorithm."
-    # 0.0  "um"       0.30  0.40
-    # 0.4  "so"       0.50  0.60
-    # 0.6  "gradient" 1.00
-    # 1.0  "descent"  1.40
-    # 1.4  "is"       1.55
-    # 1.55 "an"       1.70
-    # 1.7  "optimization" 2.40
-    # 2.4  "algorithm"    2.90
     words = [
         _FakeWord("Um,", 0.30, 0.40),
         _FakeWord("so", 0.50, 0.60),
@@ -371,19 +366,20 @@ def test_word_level_trims_leading_filler():
         _FakeWord("algorithm.", 2.40, 2.90),
     ]
     cues = [_FakeCue(0.3, 2.9, words)]
-    # Raw sentence start=0.3, end=2.9 — should trim "Um, so" and start at "gradient".
     new_start, new_end, start_reason, _ = refine_boundaries_word_level(
         0.3, 2.9, cues, silence_ranges=None,
     )
-    assert new_start >= 0.55  # at or past "so" end → "gradient" start
-    assert "filler-trim" in start_reason
-    assert new_end >= 2.85  # end unchanged or nudged minimally
+    # Start should snap to first word's onset (0.3), not skip past fillers.
+    assert new_start <= 0.35
+    assert start_reason == "word-snap"
 
 
-def test_word_level_trims_trailing_filler():
+def test_word_level_preserves_sentence_end_even_with_trailing_filler():
+    """Trailing fillers are NOT trimmed at the boundary — the clip must
+    still end on terminal punctuation, not on an arbitrary word that
+    happens to precede a filler."""
     from backend.app.services.clip_boundary import refine_boundaries_word_level
 
-    # "...convergence rate, you know."
     words = [
         _FakeWord("The", 0.0, 0.15),
         _FakeWord("convergence", 0.15, 0.75),
@@ -395,9 +391,9 @@ def test_word_level_trims_trailing_filler():
     new_start, new_end, _, end_reason = refine_boundaries_word_level(
         0.0, 1.45, cues, silence_ranges=None,
     )
-    # Should trim "you know" bigram → end at "rate" (1.05)
-    assert new_end <= 1.15
-    assert "filler-trim" in end_reason
+    # End should snap to last word's offset (1.45), NOT trim "you know".
+    assert new_end >= 1.40
+    assert end_reason == "word-snap"
 
 
 def test_word_level_no_timing_passes_through():
