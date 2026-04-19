@@ -1001,7 +1001,7 @@ def _llm_topic_segments_cerebras(
     cues: Sequence[TranscriptCue],
     *,
     cerebras_client: Any,
-    model: str = "llama-3.3-70b",
+    model: str = "llama3.1-8b",
     query: str | None = None,
 ) -> list[_SegmentTuple]:
     """Identify topic boundaries using Cerebras Llama 3.3 70B.

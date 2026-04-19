@@ -32,7 +32,11 @@ logger = logging.getLogger(__name__)
 
 GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
 GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
-CEREBRAS_DEFAULT_MODEL = "llama-3.3-70b"
+# llama3.1-8b is the default Cerebras free-tier model available to every
+# account (the other universally-available one is gpt-oss-120b). The
+# earlier default `llama-3.3-70b` returned 404 for accounts that weren't
+# explicitly provisioned for it. Override via CEREBRAS_MODEL env var.
+CEREBRAS_DEFAULT_MODEL = os.environ.get("CEREBRAS_MODEL", "llama3.1-8b").strip() or "llama3.1-8b"
 GROQ_WHISPER_MODEL = "whisper-large-v3"
 GROQ_AUDIO_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 # Groq currently caps audio uploads at 25 MB.

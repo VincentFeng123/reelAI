@@ -288,7 +288,7 @@ def _pick_via_cerebras(
     min_sec: float,
     max_sec: float,
     target_sec: float,
-    model: str = "llama-3.3-70b",
+    model: str = "llama3.1-8b",
 ) -> ClipPick | None:
     """Cerebras Llama 3.3 70B fallback when both Gemini and Groq fail.
 

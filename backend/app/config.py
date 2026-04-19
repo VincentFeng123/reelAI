@@ -27,7 +27,10 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     cerebras_api_key: str = ""
-    cerebras_model: str = "llama-3.3-70b"
+    # llama3.1-8b is the universally-available Cerebras free-tier model.
+    # llama-3.3-70b requires explicit account provisioning and 404s on
+    # most accounts; switch to gpt-oss-120b if you want a larger model.
+    cerebras_model: str = "llama3.1-8b"
     youtube_api_key: str = ""
     retrieval_engine_v2_enabled: bool = True
     retrieval_tier2_enabled: bool = False
