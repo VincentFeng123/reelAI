@@ -51,4 +51,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 8000
 
-CMD ["sh", "-c", "uvicorn backend.app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Use shell form (not JSON exec form) so ${PORT} is expanded by /bin/sh at
+# container start. Railway injects $PORT at runtime; exec form with sh -c
+# has historically been mangled by Railway's runner, causing uvicorn to see
+# the literal string "$PORT" and fail with "not a valid integer".
+CMD uvicorn backend.app.main:app --host 0.0.0.0 --port ${PORT:-8000}
