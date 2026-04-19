@@ -1,4 +1,4 @@
-"""Central LLM router: Gemini primary, Groq fallback.
+"""Central LLM router: Gemini primary, Groq fallback, Cerebras final fallback.
 
 Replaces the previous OpenAI-based clients across the backend. Two public
 surfaces:
@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
 GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
+CEREBRAS_DEFAULT_MODEL = "llama-3.3-70b"
 GROQ_WHISPER_MODEL = "whisper-large-v3"
 GROQ_AUDIO_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 # Groq currently caps audio uploads at 25 MB.
@@ -87,8 +88,28 @@ def _build_groq_client() -> Any | None:
         return None
 
 
+def _build_cerebras_client() -> Any | None:
+    api_key = os.environ.get("CEREBRAS_API_KEY") or ""
+    if not api_key:
+        return None
+    try:
+        from cerebras.cloud.sdk import Cerebras
+    except ImportError:
+        logger.debug("cerebras-cloud-sdk not installed; Cerebras disabled")
+        return None
+    try:
+        return Cerebras(api_key=api_key)
+    except Exception:
+        logger.exception("could not build Cerebras client")
+        return None
+
+
 def gemini_or_groq_available() -> bool:
-    return bool(_collect_gemini_api_keys()) or bool(os.environ.get("GROQ_API_KEY") or "")
+    return (
+        bool(_collect_gemini_api_keys())
+        or bool(os.environ.get("GROQ_API_KEY") or "")
+        or bool(os.environ.get("CEREBRAS_API_KEY") or "")
+    )
 
 
 def _looks_rate_limited(exc: Exception) -> bool:
@@ -233,6 +254,37 @@ def _groq_chat(
     return content.strip() or None
 
 
+def _cerebras_chat(
+    *,
+    cerebras_client: Any,
+    model: str,
+    system: str,
+    user: str,
+    temperature: float,
+    json_mode: bool,
+    max_tokens: int | None,
+) -> str | None:
+    """Cerebras Llama 3.3 70B call — OpenAI-compatible, same shape as Groq."""
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "temperature": float(temperature),
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    if max_tokens is not None:
+        kwargs["max_completion_tokens"] = int(max_tokens)
+    response = cerebras_client.chat.completions.create(**kwargs)
+    choices = getattr(response, "choices", None) or []
+    if not choices:
+        return None
+    content = getattr(choices[0].message, "content", None) or ""
+    return content.strip() or None
+
+
 def chat_completion(
     *,
     conn: Any | None = None,
@@ -245,6 +297,7 @@ def chat_completion(
     max_tokens: int | None = None,
     gemini_model: str = GEMINI_DEFAULT_MODEL,
     groq_model: str = GROQ_DEFAULT_MODEL,
+    cerebras_model: str = CEREBRAS_DEFAULT_MODEL,
     gemini_api_key_override: str | None = None,
 ) -> str | None:
     """Run a chat completion: Gemini first, Groq fallback.
@@ -312,7 +365,29 @@ def chat_completion(
                     _write_cache(conn, effective_cache_key, out)
                 return out
         except Exception:
-            logger.warning("llm_router.chat_completion: Groq failed", exc_info=True)
+            logger.warning(
+                "llm_router.chat_completion: Groq failed, falling back to Cerebras",
+                exc_info=True,
+            )
+
+    cerebras = _build_cerebras_client()
+    if cerebras is not None:
+        try:
+            out = _cerebras_chat(
+                cerebras_client=cerebras,
+                model=cerebras_model,
+                system=system,
+                user=user,
+                temperature=temperature,
+                json_mode=json_mode,
+                max_tokens=max_tokens,
+            )
+            if out:
+                if conn is not None and effective_cache_key:
+                    _write_cache(conn, effective_cache_key, out)
+                return out
+        except Exception:
+            logger.warning("llm_router.chat_completion: Cerebras failed", exc_info=True)
 
     return None
 
