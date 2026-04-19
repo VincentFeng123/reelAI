@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # Railway deploy image for the FastAPI backend.
 #
 # We use an explicit Dockerfile rather than Railpack because the reel ingestion
@@ -7,6 +8,11 @@
 # someone has tried to "fix" this with railpack.toml / railpack.json, the
 # result has been a silent no-op and ingest_search started bouncing with a
 # DownloadError. Do not revert this to Railpack without a working test.
+#
+# The `# syntax=docker/dockerfile:1` header tells BuildKit to use the latest
+# stable Dockerfile frontend (features like heredoc, RUN --mount=, etc).
+# It's also a strong signal to Railway's builder auto-detection that this
+# is a "real" Dockerfile and should not be bypassed for Railpack.
 FROM python:3.12-slim
 
 # System deps:

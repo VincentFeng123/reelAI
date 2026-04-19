@@ -1,0 +1,70 @@
+# Build context hygiene — only ship what the Dockerfile actually COPYs.
+# Also keeps Railway's auto-detection from scanning these and misidentifying
+# the project type (e.g., mistaking the Next.js frontend or the iOS sibling
+# for the deploy target and kicking off Railpack instead of honoring our
+# Dockerfile).
+
+# Git + CI noise
+.git
+.gitignore
+.github
+.railway
+.vercel
+
+# Python bytecode, venvs, caches
+__pycache__
+*.py[cod]
+*$py.class
+.venv
+backend/.venv
+backend/.pytest_cache
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Next.js / webapp — built separately on Vercel, not part of the
+# backend Docker image.
+node_modules
+.next
+out
+public
+src
+frontend
+api
+*.ts
+*.tsx
+*.js
+*.jsx
+package*.json
+tsconfig*.json
+next.config.*
+postcss.config.*
+tailwind.config.*
+vercel.json
+
+# iOS sibling directory lives one up from this repo root; still belt-and-
+# suspenders in case someone ever adds a symlink.
+*.xcodeproj
+*.xcworkspace
+reelaiApp.swift
+
+# Local dev state
+.env
+.env.local
+.env.*.local
+.logs
+.pids
+
+# Large data + artifacts that shouldn't ship
+data
+graphify-out
+*.mp4
+*.wav
+*.mp3
+*.png
+*.jpg
+*.jpeg
+
+# Test scaffolding that the runtime doesn't need
+backend/tests
+Tests/
