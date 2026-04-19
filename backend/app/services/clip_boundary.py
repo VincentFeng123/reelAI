@@ -873,10 +873,12 @@ def _collect_word_timings_in_range(
     t_hi: float,
 ) -> list[tuple[str, float, float]]:
     """Flatten cue.words into a list of (text, t_start, t_end) triples whose
-    timestamps land inside [t_lo - 0.3s, t_hi + 2.0s]. The upper slop is
-    generous because the end-boundary refiner needs the next-word-after-
-    end to compute the silence-gap midpoint, and a gap can be >1s on a
-    clean speaker pause. Returns [] when no cue has word-level timing.
+    timestamps land inside [t_lo - 2.0s, t_hi + 2.0s]. Symmetric slop is
+    critical: the START-boundary refiner needs the LAST word of the
+    preceding sentence to compute the inter-word silence-midpoint nudge,
+    and that word may sit up to ~1s before t_lo on a clean sentence-end
+    pause. The END-boundary refiner needs the FIRST word of the next
+    sentence for the same reason. A 2.0s slop on each side covers both.
     """
     out: list[tuple[str, float, float]] = []
     for cue in cues:
@@ -888,7 +890,7 @@ def _collect_word_timings_in_range(
                 we = float(w.end)
             except (TypeError, ValueError):
                 continue
-            if we < t_lo - 0.3 or ws > t_hi + 2.0:
+            if we < t_lo - 2.0 or ws > t_hi + 2.0:
                 continue
             txt = str(w.text or "").strip()
             if not txt:
@@ -1053,6 +1055,47 @@ _HEURISTIC_SILENCE_BONUS_WINDOW_SEC = 1.0
 _HEURISTIC_SILENCE_BONUS_MIN_GAP_SEC = 1.0
 
 
+# Words / bigrams that open a sentence referring backward to prior context
+# ("naturally enough...", "to take a simpler example...", "but better than
+# that..."). Windows whose FIRST sentence starts with one of these are
+# structurally un-self-contained — a viewer watching the clip cold doesn't
+# know what it's referring back to. Penalized in _score_window so the
+# heuristic prefers windows that begin a new thread.
+_BACKREF_OPENERS: frozenset[str] = frozenset({
+    "basically", "naturally", "therefore", "thus", "however", "also",
+    "moreover", "additionally", "furthermore", "then", "next",
+    "but", "and", "or", "yet", "still", "anyway", "anyways",
+    "meanwhile", "likewise", "similarly", "conversely", "alternatively",
+    "otherwise", "instead", "rather", "whereas",
+})
+_BACKREF_BIGRAMS: frozenset[tuple[str, str]] = frozenset({
+    ("to", "take"),       # "To take a simpler example..."
+    ("for", "example"), ("for", "instance"),
+    ("in", "other"),       # "In other words..."
+    ("that", "is"), ("that's", "why"), ("thats", "why"),
+    ("but", "better"),
+    ("in", "contrast"), ("in", "summary"), ("to", "summarize"),
+    ("which", "is"), ("which", "means"),
+    ("so", "that"),
+})
+
+
+def _is_back_reference_opener(first_sentence_text: str) -> bool:
+    """True when the sentence opens with a back-reference connector that
+    assumes prior context the viewer didn't hear."""
+    words = [
+        m.group(0).lower()
+        for m in _CONTENT_WORD_RE.finditer(first_sentence_text or "")
+    ]
+    if len(words) < 2:
+        return False
+    if (words[0], words[1]) in _BACKREF_BIGRAMS:
+        return True
+    if words[0] in _BACKREF_OPENERS:
+        return True
+    return False
+
+
 def _extract_content_words(text: str) -> list[str]:
     toks = [m.group(0).lower() for m in _CONTENT_WORD_RE.finditer(text or "")]
     return [t for t in toks if t not in _FILLER_TOKENS and t not in _STOPWORDS and len(t) > 1]
@@ -1212,14 +1255,19 @@ def _score_window(
                 break
 
     # --- 5. Intro/outro dampening. ---
+    # Penalties sized so they beat the maximum coverage bonus (+0.20) —
+    # otherwise an intro that happens to mention the query word in its
+    # "today we'll cover X" announcement wins over a real explanation
+    # farther in. The real explanation may have lower keyword density
+    # because it elaborates instead of announcing.
     intro_outro_penalty = 0.0
     if t_start < _HEURISTIC_INTRO_PENALTY_SEC:
-        intro_outro_penalty = 0.18
+        intro_outro_penalty = 0.30
     elif (
         video_duration_sec is not None
         and (video_duration_sec - sentences_slice[-1].t_end) < _HEURISTIC_OUTRO_PENALTY_SEC
     ):
-        intro_outro_penalty = 0.12
+        intro_outro_penalty = 0.20
 
     # --- 6. Prefer windows near the user's target duration. ---
     duration = sentences_slice[-1].t_end - t_start
@@ -1228,16 +1276,59 @@ def _score_window(
     target_delta = abs(duration - user_target_sec) / max(1.0, user_target_sec)
     target_penalty = min(0.2, target_delta * 0.25)
 
+    # --- 7. Self-contained penalty: back-reference opener on first sentence. ---
+    # "Naturally enough...", "To take a simpler example...", "But better
+    # than that...", "Basically, ..." — these require prior context the
+    # viewer doesn't have. A strong penalty pushes windows that open
+    # cleanly (e.g., "Gradient descent is an optimization algorithm.")
+    # above ones that open with connectors.
+    backref_penalty = 0.0
+    if _is_back_reference_opener(sentences_slice[0].text):
+        backref_penalty = 0.25
+
+    # --- 8. Query-coverage: reward windows where multiple sentences
+    # mention query terms; hard-reject when ZERO sentences mention them
+    # AND semantic similarity can't vouch for topical relevance. This
+    # stops the "Michael Nielsen book recommendation" case — ML-adjacent
+    # text that semantically looks close to the query via embeddings but
+    # never actually says "gradient descent."
+    coverage_bonus = 0.0
+    coverage = 0.0
+    if query_words:
+        query_term_set = set(query_words)
+        hits = 0
+        for s in sentences_slice:
+            s_words = set(_extract_content_words(s.text))
+            if query_term_set & s_words:
+                hits += 1
+        coverage = hits / max(1, len(sentences_slice))
+        # 0 → -0.25, 0.25 → -0.05, 0.5 → +0.10, 1.0 → +0.35 (clamped to 0.25).
+        coverage_bonus = (coverage - 0.25) * 0.5
+        coverage_bonus = max(-0.25, min(0.25, coverage_bonus))
+
+    # Hard reject: if the query is non-trivial, zero sentences mention
+    # any query term, AND semantic similarity isn't high enough to
+    # vouch for relevance, disqualify the window. Returning -inf pushes
+    # it below every other candidate in the max() loop.
+    if (
+        query_words
+        and coverage == 0.0
+        and (embed_func is None or semantic < 0.45)
+    ):
+        return float("-inf")
+
     # Weighted sum — semantic dominates when present, lexical carries more
     # weight when semantic is unavailable (emb_func=None).
     if embed_func is not None:
-        score = 0.55 * semantic + 0.25 * tf_idf
+        score = 0.45 * semantic + 0.25 * tf_idf
     else:
         score = 0.6 * tf_idf  # no embeddings → tf-idf is the primary signal
     score += silence_bonus
+    score += coverage_bonus
     score -= filler_penalty
     score -= intro_outro_penalty
     score -= target_penalty
+    score -= backref_penalty
     return score
 
 
@@ -1386,11 +1477,15 @@ def pick_clip_heuristic(
             best_bounds = (t_start, t_end)
             best_idx = widx
 
-    if best is None:
+    if best is None or best.score == float("-inf"):
+        # Every candidate was hard-rejected (e.g., zero query-term mentions
+        # everywhere in the topic reel and embeddings couldn't vouch for
+        # any window). Return None so `_apply_boundary_engine` falls
+        # through to the legacy ClipBoundaryEngine heuristic.
         return None
 
-    # Apply word-level + filler trimming to the chosen sentence-level
-    # window. Only narrows t_start / t_end; the underlying sentence choice
+    # Apply word-level snapping to the chosen sentence-level window.
+    # Only narrows t_start / t_end; the underlying sentence choice
     # (which guarantees terminal punctuation) is preserved.
     refined_start, refined_end, _, _ = refine_boundaries_word_level(
         best.t_start, best.t_end, cues, silence_ranges,

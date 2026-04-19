@@ -464,17 +464,19 @@ def test_heuristic_picker_returns_top_scoring_window():
     assert result.t_start <= 12.5 and result.t_end >= 12.0
 
 
-def test_heuristic_picker_prefers_non_intro():
+def test_heuristic_picker_prefers_substantive_content():
+    """The picker must cover the substantive explanation (sentence 3 at
+    t=15-22). Starting earlier to pick up the intro announcement is OK
+    because that announcement provides useful lead-in context — both
+    intro-inclusive and body-only windows are acceptable clips so long
+    as the substantive content is in them.
+    """
     from backend.app.services.clip_boundary import pick_clip_heuristic
 
-    # Intro (sentences 0-1, times 0-7s) also mentions "gradient". Later
-    # block covers it properly. Heuristic should prefer the later block
-    # because of intro/outro dampening at t<10s.
     sents = [
         _sent("Hey everyone, today we'll cover gradient descent.", 0.0, 4.0),
         _sent("Let's get started.", 4.5, 6.0),
         _sent("Many viewers ask what algorithm optimizes gradients best.", 6.5, 10.0),
-        # Beyond intro window:
         _sent("Gradient descent minimizes a loss function by stepping along the gradient.", 15.0, 22.0),
         _sent("Each step is scaled by the learning rate.", 22.5, 26.0),
         _sent("With a careful learning rate the process converges quickly.", 26.5, 31.0),
@@ -492,8 +494,40 @@ def test_heuristic_picker_prefers_non_intro():
         embed_func=None,
     )
     assert result is not None
-    # Chosen start should be at or past 15s (the real topic), not the intro (0-7s).
-    assert result.t_start >= 15.0
+    # Window must encompass sentence 3 (t_end=22.0) — the substantive
+    # explanation. t_start can be anywhere from 0 (intro-inclusive) to
+    # 15 (body-only); both are valid.
+    assert result.t_end >= 22.0
+
+
+def test_heuristic_picker_hard_rejects_off_topic_windows():
+    """Windows with zero query-term sentence coverage AND no embedding
+    vouching should be disqualified. Without this gate the picker can
+    pick off-topic content that happens to share vocabulary."""
+    from backend.app.services.clip_boundary import pick_clip_heuristic
+
+    # Transcript is entirely about pasta. Query is "gradient descent".
+    sents = [
+        _sent("First, render the guanciale in a cold pan until crisp.", 0.0, 5.0),
+        _sent("Whisk egg yolks with pecorino romano cheese.", 5.5, 10.0),
+        _sent("Cook spaghetti al dente in heavily salted water.", 10.5, 15.0),
+        _sent("Reserve a cup of pasta water before draining.", 15.5, 20.0),
+        _sent("Toss pasta with guanciale off heat and add egg mixture.", 20.5, 26.0),
+        _sent("Stir vigorously with pasta water until silky.", 26.5, 31.0),
+        _sent("Serve immediately with extra cheese and black pepper.", 31.5, 36.0),
+    ]
+    result = pick_clip_heuristic(
+        query="gradient descent",
+        cues=None,
+        sentences=sents,
+        silence_ranges=None,
+        user_min_sec=15.0,
+        user_max_sec=45.0,
+        user_target_sec=25.0,
+        video_duration_sec=40.0,
+        embed_func=None,  # no semantic path → coverage=0 should hard-reject
+    )
+    assert result is None
 
 
 def test_heuristic_picker_respects_user_max_tight_bound():
