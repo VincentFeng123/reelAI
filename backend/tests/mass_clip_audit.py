@@ -42,6 +42,7 @@ Stat-sig note (copy into the summary):
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import logging
@@ -113,6 +114,8 @@ from app.services.clip_whisper_refine import (  # noqa: E402
     WhisperWord,
     _call_whisper,
     _download_clip_audio,
+    _ensure_full_video_audio,
+    _slice_audio_for_clip,
 )
 from app.services.topic_cut import (  # noqa: E402
     TranscriptCue,
@@ -246,7 +249,16 @@ def measure_clip_with_whisper(
     dl_end = float(t_end) + 1.0
     tmpdir = Path(tempfile.mkdtemp(prefix="mass_audit_"))
     try:
-        audio = _download_clip_audio(video_id, dl_start, dl_end, tmpdir)
+        # Tier 1: slice from cached full-video audio (one yt-dlp per video,
+        # not per clip). _ensure_full_video_audio is process-memoised and
+        # serialises concurrent first-time downloads via an internal lock.
+        full_audio = _ensure_full_video_audio(video_id)
+        audio: Path | None = None
+        if full_audio is not None:
+            slice_path = tmpdir / f"{video_id}_{int(dl_start * 1000)}_{int(dl_end * 1000)}.wav"
+            audio = _slice_audio_for_clip(full_audio, dl_start, dl_end, slice_path)
+        if audio is None:
+            audio = _download_clip_audio(video_id, dl_start, dl_end, tmpdir)
         if audio is None:
             return {"error": "download_failed"}
         words = _call_whisper(audio, dl_start)
@@ -340,9 +352,9 @@ def run_entry(entry: CorpusEntry, *, use_llm: bool = True) -> list[ClipMetrics]:
         logger.info("%s produced zero clips", entry.video_id)
         return []
 
-    rows: list[ClipMetrics] = []
+    metrics_by_idx: dict[int, ClipMetrics] = {}
     for idx, r in enumerate(topic_reels, 1):
-        m = ClipMetrics(
+        metrics_by_idx[idx] = ClipMetrics(
             video_id=entry.video_id,
             content_type=entry.content_type,
             target_query=entry.target_query,
@@ -354,21 +366,42 @@ def run_entry(entry: CorpusEntry, *, use_llm: bool = True) -> list[ClipMetrics]:
             label=str(getattr(r, "label", "") or ""),
             boundary_quality=str(getattr(r, "boundary_quality", "") or ""),
         )
-        probe = measure_clip_with_whisper(entry.video_id, r.t_start, r.t_end)
-        if "error" in probe:
-            m.error = str(probe["error"])
-            rows.append(m)
-            continue
-        m.whisper_first_word = str(probe["first_word"])
-        m.whisper_last_word = str(probe["last_word"])
-        m.start_precision_ms = float(probe["start_precision_ms"])
-        m.end_precision_ms = float(probe["end_precision_ms"])
-        m.starts_mid_word = bool(probe["starts_mid_word"])
-        m.ends_mid_sentence = bool(probe["ends_mid_sentence"])
-        m.starts_on_filler = bool(probe["starts_on_filler"])
-        m.is_usable = bool(probe["is_usable"])
-        rows.append(m)
-    return rows
+
+    # Parallel per-clip whisper probe. faster-whisper releases the GIL in
+    # native code, so threads give a real speedup. The full-video audio is
+    # downloaded once via the lock inside _ensure_full_video_audio; ffmpeg
+    # slicing + whisper inference then run concurrently per clip.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(
+                measure_clip_with_whisper,
+                entry.video_id,
+                float(r.t_start),
+                float(r.t_end),
+            ): idx
+            for idx, r in enumerate(topic_reels, 1)
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            idx = futures[fut]
+            m = metrics_by_idx[idx]
+            try:
+                probe = fut.result()
+            except Exception as exc:
+                m.error = f"probe_exception:{type(exc).__name__}"
+                continue
+            if "error" in probe:
+                m.error = str(probe["error"])
+                continue
+            m.whisper_first_word = str(probe["first_word"])
+            m.whisper_last_word = str(probe["last_word"])
+            m.start_precision_ms = float(probe["start_precision_ms"])
+            m.end_precision_ms = float(probe["end_precision_ms"])
+            m.starts_mid_word = bool(probe["starts_mid_word"])
+            m.ends_mid_sentence = bool(probe["ends_mid_sentence"])
+            m.starts_on_filler = bool(probe["starts_on_filler"])
+            m.is_usable = bool(probe["is_usable"])
+
+    return [metrics_by_idx[i] for i in sorted(metrics_by_idx)]
 
 
 # --------------------------------------------------------------------------- #
