@@ -1,0 +1,149 @@
+# Pinned corpus for mass_clip_audit.py.
+#
+# Each entry fixes a (video_id, target_query) pair so week-over-week runs
+# measure exactly the same boundary cases. Deleted or re-uploaded videos
+# would silently break the delta chain, so we pin IDs rather than resolve
+# them via search.
+#
+# When adding / replacing entries:
+#   1. Verify the video is publicly available AND has EN captions.
+#   2. Prefer creators who ship many videos at a stable cadence (their
+#      back catalog tends to stay up).
+#   3. Pick a target_query that matches content genuinely discussed in
+#      the video — not a topic that merely appears in the title. The
+#      audit is measuring BOUNDARY quality, not retrieval quality, so
+#      the picker needs real material to cut around.
+#   4. content_type is used to bucket deltas. Keep the 6 existing types.
+#
+# Entries marked TODO-VERIFY are starter picks that must be spot-checked
+# before committing the first baseline. Open the YouTube URL and confirm
+# (a) the video loads and (b) EN captions exist in any form.
+
+- video_id: "WUvTyaaNkzM"
+  content_type: "lecture"
+  target_query: "essence of calculus"
+  note: "3B1B Essence of Calculus Ch.1 — manual captions, dense math"
+
+- video_id: "aircAruvnKk"
+  content_type: "lecture"
+  target_query: "neural network"
+  note: "3B1B NN ch.1 What is a neural network — manual captions"
+
+- video_id: "IHZwWFHWa-w"
+  content_type: "lecture"
+  target_query: "gradient descent"
+  note: "3B1B NN ch.2 Gradient descent — manual captions"
+
+- video_id: "d4EgbgTm0Bg"
+  content_type: "lecture"
+  target_query: "quaternions"
+  note: "3B1B quaternions — manual captions"
+
+- video_id: "b7FxPsqfkOY"
+  content_type: "lecture"
+  target_query: "complex numbers"
+  note: "3B1B Winding numbers and domain coloring - manual captions"
+
+- video_id: "UF8uR6Z6KLc"
+  content_type: "speech"
+  target_query: "stay hungry stay foolish"
+  note: "Steve Jobs 2005 Stanford commencement — very stable, manual captions"
+
+- video_id: "iG9CE55wbtY"
+  content_type: "speech"
+  target_query: "creativity in schools"
+  note: "Sir Ken Robinson 'Do schools kill creativity?' TED - manual captions"
+
+- video_id: "iCvmsMzlF7o"
+  content_type: "speech"
+  target_query: "vulnerability shame"
+  note: "Brené Brown 'The power of vulnerability' TED - manual captions"
+
+- video_id: "8KkKuTCFvzI"
+  content_type: "speech"
+  target_query: "good life relationships"
+  note: "Robert Waldinger 'What Makes a Good Life? Lessons from the Longest Study on Happiness' TED - manual captions"
+
+- video_id: "rfscVS0vtbw"
+  content_type: "auto_caption_only"
+  target_query: "python functions"
+  note: "freeCodeCamp Python full course — auto-generated captions, long-form"
+
+- video_id: "PkZNo7MFNFg"
+  content_type: "auto_caption_only"
+  target_query: "javascript basics"
+  note: "freeCodeCamp JS tutorial — manual captions and auto captions"
+
+- video_id: "SqcY0GlETPk"
+  content_type: "auto_caption_only"
+  target_query: "machine learning"
+  note: "Full JS Course - manual captions"
+
+- video_id: "TD7BayhLxDg"
+  content_type: "auto_caption_only"
+  target_query: "react hooks"
+  note: "React course - auto captions"
+
+# -- Interviews, podcasts, comedy require manual selection. --
+# Commit these 12 entries as TODO-VERIFY so we can reach 25. Replace
+# each video_id with a real one before running the first baseline.
+
+- video_id: "EV7WhVT270Q"
+  content_type: "interview"
+  target_query: "artificial intelligence future"
+  note: "Longer than 60min - manual and auto captions"
+
+- video_id: "h2aWYjSA1Jc"
+  content_type: "interview"
+  target_query: "sleep and performance"
+  note: "'Sleep Toolkit: Tools for Optimizing Sleep & Sleep-Wake Timing' - manual captions"
+
+- video_id: "qOUnBaeTUOY"
+  content_type: "interview"
+  target_query: "productivity habits"
+  note: "Tim Ferriss show interview - auto captions"
+
+- video_id: "IZDJ3jcO5UY"
+  content_type: "interview"
+  target_query: "startup founder story"
+  note: "Ben Horowitz on AI Anxiety, Big Tech Transitions & The Future of Startups | a16z - auto captions"
+
+- video_id: "5YABcdrv3e0"
+  content_type: "interview"
+  target_query: "journalism"
+  note: "SVWC Podcast Endangered Species - Tad Friend and the Art of Long Form Journalism - auto captions"
+
+- video_id: "d6EMk6dyrOU"
+  content_type: "podcast"
+  target_query: "business strategy"
+  note: "10 Years of Acquired (with Michael Lewis) - auto captions"
+
+- video_id: "4Bu-X8Ty8BI"
+  content_type: "podcast"
+  target_query: "conspiracy theory"
+  note: "Joe Rogan youtube short - auto captions"
+
+- video_id: "RpfGzVSNdnU"
+  content_type: "podcast"
+  target_query: "historical events"
+  note: "Dan Carlin's Hardcore History 71 - Mania for Subjugation - auto captions"
+
+- video_id: "vpq8USrhCzs"
+  content_type: "comedy"
+  target_query: "stand up comedy"
+  note: "The Best Hard Core Comedy | Stand-Up Comedy Compilation - auto captions"
+
+- video_id: "KFSJA8gGYcA"
+  content_type: "comedy"
+  target_query: "travel comedy"
+  note: "Across The Pond | Zoltan Kaszas | Stand-Up Comedy - auto captions"
+
+- video_id: "sD1PkP6SxfI"
+  content_type: "comedy"
+  target_query: "college humor"
+  note: "Raising My Gen Z Roommate | Alec Flynn | Stand Up Comedy - auto captions"
+
+- video_id: "FV1zm2Ysz2U"
+  content_type: "comedy"
+  target_query: "animal comedy"
+  note: "Dolphins aren't Even Hot | Jackie Pirico | Stand Up Comedy - auto captions"

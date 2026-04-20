@@ -21,3 +21,9 @@ backend/.env
 # Runtime artifacts
 .logs/
 .pids/
+
+# Mass-audit ephemera (isolated sqlite workdir + per-run logs/smoke CSVs)
+audit_work/
+audit_*.log
+audit_smoke*.csv
+audit_smoke*.md
