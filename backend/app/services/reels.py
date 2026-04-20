@@ -2855,30 +2855,41 @@ class ReelService:
                     # creator introduces a topic and ends when they transition away.
                     # Falls back to mention-clustering if topic_cut returns nothing.
                     if not use_full_short_clip:
-                        segments = self._topic_boundary_segments_for_concept(
-                            transcript=transcript,
-                            video_id=video_id,
-                            video_duration_sec=video_duration,
-                            clip_min_len=clip_min_len,
-                            clip_max_len=clip_max_len,
-                            max_segments=target_segment_budget,
-                            concept_terms=concept_terms,
-                            concept_title=str(concept.get("title") or ""),
-                            info_dict=video.get("info_dict"),
-                        )
-                        # Fallback to keyword-mention clustering when topic-boundary
-                        # detection returns nothing (Short, no transcript, etc.)
-                        if not segments:
-                            segments = self._topic_cut_segments_for_concept(
+                        _video_timeout_sec = self._topic_cut_video_timeout_sec()
+                        segments = self._run_with_video_timeout(
+                            lambda: self._topic_boundary_segments_for_concept(
                                 transcript=transcript,
                                 video_id=video_id,
                                 video_duration_sec=video_duration,
                                 clip_min_len=clip_min_len,
                                 clip_max_len=clip_max_len,
-                                clip_target_len=safe_target_clip_duration,
                                 max_segments=target_segment_budget,
                                 concept_terms=concept_terms,
-                            )
+                                concept_title=str(concept.get("title") or ""),
+                                info_dict=video.get("info_dict"),
+                            ),
+                            timeout_sec=_video_timeout_sec,
+                            video_id=video_id,
+                            stage="topic_boundary",
+                        ) or []
+                        # Fallback to keyword-mention clustering when topic-boundary
+                        # detection returns nothing (Short, no transcript, etc.)
+                        if not segments:
+                            segments = self._run_with_video_timeout(
+                                lambda: self._topic_cut_segments_for_concept(
+                                    transcript=transcript,
+                                    video_id=video_id,
+                                    video_duration_sec=video_duration,
+                                    clip_min_len=clip_min_len,
+                                    clip_max_len=clip_max_len,
+                                    clip_target_len=safe_target_clip_duration,
+                                    max_segments=target_segment_budget,
+                                    concept_terms=concept_terms,
+                                ),
+                                timeout_sec=_video_timeout_sec,
+                                video_id=video_id,
+                                stage="topic_cut",
+                            ) or []
 
                     # Legacy embedding-based path: runs when topic_cut returned
                     # nothing (transcript too short, classification mismatch) AND
@@ -3987,6 +3998,44 @@ class ReelService:
             return float(score)
         return 0.0
 
+    def _topic_cut_video_timeout_sec(self) -> float:
+        raw = os.environ.get("TOPIC_CUT_VIDEO_TIMEOUT_SEC")
+        if raw is None or not raw.strip():
+            return 45.0
+        try:
+            return max(5.0, float(raw))
+        except (TypeError, ValueError):
+            return 45.0
+
+    def _run_with_video_timeout(
+        self,
+        fn: Any,
+        *,
+        timeout_sec: float,
+        video_id: str,
+        stage: str,
+    ) -> Any:
+        """Run ``fn()`` in a worker thread; return its result or ``None`` on
+        timeout so a pathological video (e.g. a 5-hour auto-captioned upload
+        whose audio download stalls) cannot block the outer per-candidate
+        loop. Python threads cannot be pre-empted — the abandoned worker
+        finishes in the background; `cancel_futures=True` prevents it from
+        blocking shutdown."""
+        pool = ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = pool.submit(fn)
+            try:
+                return fut.result(timeout=timeout_sec)
+            except FutureTimeoutError:
+                logger.warning(
+                    "topic_cut %s timed out after %.1fs for video %s; skipping",
+                    stage, timeout_sec, video_id,
+                )
+                fut.cancel()
+                return None
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     def _has_short_and_long_mix(self, generated: list[dict[str, Any]]) -> bool:
         has_short = False
         has_long = False
@@ -4112,7 +4161,7 @@ class ReelService:
         if not generated or num_reels <= 0:
             return []
         if preferred_video_duration != "any" or num_reels <= 1:
-            return generated[:num_reels]
+            return self._group_by_video(generated[:num_reels])
 
         ranked = sorted(generated, key=self._generation_result_score, reverse=True)
         short_candidates = [reel for reel in ranked if self._video_duration_bucket(reel.get("video_duration_sec")) == "short"]
@@ -4142,8 +4191,38 @@ class ReelService:
                 seen_ids.add(reel_id)
 
         selected = selected[:num_reels]
-        selected.sort(key=self._generation_result_score, reverse=True)
-        return selected
+        return self._group_by_video(selected)
+
+    def _group_by_video(self, reels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Reorder a flat list so all clips from the same video appear
+        contiguously. Video order follows the best clip in each group
+        (highest generation score first); within a video the clips play
+        in chronological order (ascending t_start). Preserves the input
+        list's membership — only the order changes."""
+        if len(reels) <= 1:
+            return list(reels)
+        groups: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        for reel in reels:
+            video_id = str(reel.get("video_id") or "").strip()
+            if video_id not in groups:
+                groups[video_id] = []
+                order.append(video_id)
+            groups[video_id].append(reel)
+
+        def _group_best_score(video_id: str) -> float:
+            return max(
+                (self._generation_result_score(r) for r in groups[video_id]),
+                default=0.0,
+            )
+
+        order.sort(key=_group_best_score, reverse=True)
+        result: list[dict[str, Any]] = []
+        for video_id in order:
+            group = groups[video_id]
+            group.sort(key=lambda r: float(r.get("t_start") or 0.0))
+            result.extend(group)
+        return result
 
     def _parse_keywords_json(self, value: Any) -> list[str]:
         raw = str(value or "[]")

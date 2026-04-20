@@ -64,6 +64,7 @@ import logging
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qs, urlparse
@@ -2619,6 +2620,18 @@ def _apply_boundary_engine(
         except (TypeError, ValueError):
             return 5.0
 
+    def _whisper_refine_max_workers() -> int:
+        # Parallel Whisper refinement cap. faster-whisper int8 inference
+        # saturates ~1.5 cores per worker; 3 workers ≈ 4-5 cores on Railway
+        # (8 vCPU), leaving headroom for ffmpeg slicing and the request loop.
+        raw = os.environ.get("WHISPER_REFINE_MAX_WORKERS")
+        if raw is None or not raw.strip():
+            return 3
+        try:
+            return max(1, min(8, int(raw)))
+        except (TypeError, ValueError):
+            return 3
+
     def _enforce_sentence_edges(r: TopicReel) -> bool:
         """Hard gate: snap t_start to a sentence start and t_end to a
         terminal-punctuation sentence end; keep the pair whose start sits
@@ -2754,36 +2767,36 @@ def _apply_boundary_engine(
                         len(ranked), len(ranked_covered), len(reels),
                     )
 
-    refined: list[TopicReel] = []
-    dropped_no_sentence_edge = 0
+    # Refinement in three phases so Whisper can run in parallel.
+    #
+    # Phase 1 (sequential): pick boundaries per reel via ranked_covered /
+    #                       LLM / heuristic / engine. Each picker may read
+    #                       shared caches; keeping them serial avoids race
+    #                       conditions and preserves deterministic order.
+    # Phase 2 (parallel):   run `_try_whisper_refine` across reels that want
+    #                       Whisper refinement. faster-whisper releases the
+    #                       GIL during CTranslate2 inference, so threads do
+    #                       deliver real speedup. `_lock_for_video` in
+    #                       clip_whisper_refine.py serializes the one-shot
+    #                       full-video audio download per video_id.
+    # Phase 3 (sequential): enforce sentence-edge gate, collect in original
+    #                       order so chain linkage (see reels.py) still works.
+    reels_for_whisper: list[TopicReel] = []
+    reels_for_engine: list[TopicReel] = []
     for r in reels:
         if id(r) in ranked_covered:
-            # Global rerank already set precise boundaries + sub-scores;
-            # still allow word-level whisper refinement on top.
-            _try_whisper_refine(r)
-            if not _enforce_sentence_edges(r):
-                dropped_no_sentence_edge += 1
-                continue
-            refined.append(r)
+            reels_for_whisper.append(r)
             continue
         if _try_llm_pick(r):
-            _try_whisper_refine(r)
-            if not _enforce_sentence_edges(r):
-                dropped_no_sentence_edge += 1
-                continue
-            refined.append(r)
+            reels_for_whisper.append(r)
             continue
         if _try_heuristic_pick(r):
-            _try_whisper_refine(r)
-            if not _enforce_sentence_edges(r):
-                dropped_no_sentence_edge += 1
-                continue
-            refined.append(r)
+            reels_for_whisper.append(r)
             continue
-        # Last-resort fallback — the original ClipBoundaryEngine heuristic.
-        # Only reached when both the LLM path AND the strong heuristic
-        # picker decline (e.g., no terminal-punct windows fit the user's
-        # clip-length bounds inside the topic).
+        reels_for_engine.append(r)
+
+    # Last-resort engine refinement is pure-Python and mutates `r`; keep serial.
+    for r in reels_for_engine:
         try:
             result = engine.refine(
                 raw_t_start=r.t_start,
@@ -2798,7 +2811,6 @@ def _apply_boundary_engine(
                 user_max_sec=user_max_sec,
                 video_duration_sec=video_duration_sec,
             )
-            # Only adopt refined bounds if they're saner than the raw ones.
             if result.t_end > result.t_start:
                 r.t_start = round(float(result.t_start), 2)
                 r.t_end = round(float(result.t_end), 2)
@@ -2808,6 +2820,21 @@ def _apply_boundary_engine(
                 "boundary refinement failed for video %s raw=(%.2f, %.2f); keeping raw",
                 r.video_id, r.t_start, r.t_end,
             )
+
+    # Parallel Whisper refinement. Cap workers at _WHISPER_REFINE_MAX_WORKERS
+    # — Railway has ~8 vCPU and each CT2 inference saturates ~1.5 cores.
+    if reels_for_whisper:
+        worker_count = max(1, min(_whisper_refine_max_workers(), len(reels_for_whisper)))
+        if worker_count == 1 or len(reels_for_whisper) == 1:
+            for r in reels_for_whisper:
+                _try_whisper_refine(r)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                list(pool.map(_try_whisper_refine, reels_for_whisper))
+
+    refined: list[TopicReel] = []
+    dropped_no_sentence_edge = 0
+    for r in reels:
         if not _enforce_sentence_edges(r):
             dropped_no_sentence_edge += 1
             continue

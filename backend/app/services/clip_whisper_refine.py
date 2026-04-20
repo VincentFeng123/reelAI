@@ -43,6 +43,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -308,6 +309,22 @@ def _download_clip_audio(
 _FULL_VIDEO_AUDIO_CACHE: dict[str, Path] = {}
 _CLIP_AUDIO_CACHE_DIR: Path | None = None
 
+# Per-video locks ensure that when N Whisper-refine workers fire in parallel
+# for the same video_id, only the first actually runs yt-dlp; the rest wait
+# for the cache entry to be populated instead of racing into duplicate
+# downloads. The outer dict lock just guards creation of the per-video lock.
+_FULL_VIDEO_AUDIO_LOCKS: dict[str, threading.Lock] = {}
+_FULL_VIDEO_AUDIO_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for_video(video_id: str) -> threading.Lock:
+    with _FULL_VIDEO_AUDIO_LOCKS_GUARD:
+        lock = _FULL_VIDEO_AUDIO_LOCKS.get(video_id)
+        if lock is None:
+            lock = threading.Lock()
+            _FULL_VIDEO_AUDIO_LOCKS[video_id] = lock
+        return lock
+
 # Full-video yt-dlp downloads can be large — bump the timeout well above the
 # per-clip case. 6 min handles a 2-hour video at 320kbps on a slow connection.
 _FULL_VIDEO_YT_DLP_TIMEOUT_SEC = 360
@@ -337,56 +354,62 @@ def _ensure_full_video_audio(video_id: str) -> Path | None:
     if cached is not None and cached.exists() and cached.stat().st_size > 0:
         return cached
 
-    try:
-        import yt_dlp  # noqa: F401
-    except ImportError:
-        return None
+    # Serialize concurrent first-time downloads for the same video_id.
+    # When within-video Whisper refinement is parallelized, N threads race
+    # here; the lock ensures only one runs yt-dlp and the rest re-check the
+    # cache after it exits.
+    with _lock_for_video(video_id):
+        cached = _FULL_VIDEO_AUDIO_CACHE.get(video_id)
+        if cached is not None and cached.exists() and cached.stat().st_size > 0:
+            return cached
 
-    cache_dir = _ensure_clip_audio_cache_dir()
-    out_path = cache_dir / f"{video_id}.wav"
-    out_tpl = str(cache_dir / f"{video_id}.%(ext)s")
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    cmd = [
-        "yt-dlp",
-        "-f", "bestaudio/best",
-        "--extract-audio",
-        "--audio-format", "wav",
-        "--postprocessor-args", "-ac 1 -ar 16000",
-        "-q",
-        "--no-warnings",
-        "-o", out_tpl,
-        url,
-    ]
-    try:
-        subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            timeout=_FULL_VIDEO_YT_DLP_TIMEOUT_SEC,
-        )
-    except FileNotFoundError:
-        return None
-    except subprocess.TimeoutExpired:
-        logger.warning("yt-dlp full-video download timed out for %s", video_id)
-        return None
-    except subprocess.CalledProcessError as exc:
-        logger.warning(
-            "yt-dlp full-video download failed for %s: %s",
-            video_id, (exc.stderr or b"")[:500].decode(errors="ignore"),
-        )
-        return None
-
-    if not out_path.exists() or out_path.stat().st_size == 0:
-        # yt-dlp may have named the output differently (e.g. .m4a before
-        # the postprocessor ran). Pick any .wav in the cache dir named after
-        # the video id.
-        candidates = [p for p in cache_dir.glob(f"{video_id}.*") if p.suffix.lower() == ".wav"]
-        if not candidates:
+        try:
+            import yt_dlp  # noqa: F401
+        except ImportError:
             return None
-        out_path = candidates[0]
 
-    _FULL_VIDEO_AUDIO_CACHE[video_id] = out_path
-    return out_path
+        cache_dir = _ensure_clip_audio_cache_dir()
+        out_path = cache_dir / f"{video_id}.wav"
+        out_tpl = str(cache_dir / f"{video_id}.%(ext)s")
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        cmd = [
+            "yt-dlp",
+            "-f", "bestaudio/best",
+            "--extract-audio",
+            "--audio-format", "wav",
+            "--postprocessor-args", "-ac 1 -ar 16000",
+            "-q",
+            "--no-warnings",
+            "-o", out_tpl,
+            url,
+        ]
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                capture_output=True,
+                timeout=_FULL_VIDEO_YT_DLP_TIMEOUT_SEC,
+            )
+        except FileNotFoundError:
+            return None
+        except subprocess.TimeoutExpired:
+            logger.warning("yt-dlp full-video download timed out for %s", video_id)
+            return None
+        except subprocess.CalledProcessError as exc:
+            logger.warning(
+                "yt-dlp full-video download failed for %s: %s",
+                video_id, (exc.stderr or b"")[:500].decode(errors="ignore"),
+            )
+            return None
+
+        if not out_path.exists() or out_path.stat().st_size == 0:
+            candidates = [p for p in cache_dir.glob(f"{video_id}.*") if p.suffix.lower() == ".wav"]
+            if not candidates:
+                return None
+            out_path = candidates[0]
+
+        _FULL_VIDEO_AUDIO_CACHE[video_id] = out_path
+        return out_path
 
 
 def _slice_audio_for_clip(
