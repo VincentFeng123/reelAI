@@ -118,7 +118,10 @@ def _build_cerebras_client() -> Any | None:
         logger.debug("cerebras-cloud-sdk not installed; Cerebras disabled")
         return None
     try:
-        return Cerebras(api_key=api_key)
+        # timeout=10s + max_retries=0 fast-fails instead of hanging for
+        # minutes when the API is overloaded or the key is bad — lets the
+        # chain fall through to the heuristic picker quickly.
+        return Cerebras(api_key=api_key, timeout=10.0, max_retries=0)
     except Exception:
         logger.exception("could not build Cerebras client")
         return None
