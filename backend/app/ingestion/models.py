@@ -57,6 +57,7 @@ WordSourceLiteral = Literal[
     "whisper",          # faster-whisper native (local)
     "whisper_aligned",  # caption text + faster-whisper word timings (Phase 1)
     "whisperx",         # WhisperX forced alignment (Phase 4, selective)
+    "youtube_vtt",      # YouTube auto-caption VTT <c>-tag word timings (captions-first path)
     "openai",
     "groq",
     "proportional",

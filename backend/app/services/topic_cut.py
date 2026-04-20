@@ -2862,6 +2862,79 @@ def _apply_boundary_engine(
     return refined
 
 
+def _try_yt_dlp_vtt_precision(
+    video_id: str,
+    language: str = "en",
+    timeout_sec: int = 20,
+) -> list[Any] | None:
+    """
+    Captions-first fast path for `cut_video_into_topic_reels`.
+
+    Downloads YouTube's auto-caption VTT via yt-dlp (`--write-auto-sub
+    --skip-download`) and parses the inline `<c>`-tag word timestamps into
+    `IngestTranscriptCue` objects with `word_source="youtube_vtt"`. The
+    returned cues close the A1 refine gate in `should_use_clip_audio_refine`,
+    so the per-clip Whisper refinement step is skipped on captioned videos —
+    the main speed unlock for long-form audits.
+
+    Returns `None` (caller falls through to `fetch_transcript`) when:
+      * `yt_dlp` or the ingestion `_parse_vtt` import fails;
+      * yt-dlp produces no `.vtt` file (no captions, live stream, age-gated, …);
+      * the VTT has no `<c>` tags (manually-authored captions: cue-level only).
+    """
+    try:
+        import tempfile
+        import shutil
+        import yt_dlp  # type: ignore[import-untyped]
+        from ..ingestion.transcribe import _parse_vtt
+    except Exception:
+        return None
+
+    tmpdir = tempfile.mkdtemp(prefix="reelai_vttp_")
+    try:
+        ydl_opts: dict[str, Any] = {
+            # `writesubtitles=False`: skip the manually-authored track. When
+            # a video has BOTH manual and auto, yt-dlp prefers manual — but
+            # manual VTT has no <c>-tag word timings, so the A1 gate would
+            # still fire. We explicitly want the auto track for its inline
+            # word timestamps; videos without auto captions fall through.
+            "writesubtitles": False,
+            "writeautomaticsub": True,
+            "subtitleslangs": [language],
+            "subtitlesformat": "vtt",
+            "skip_download": True,
+            "outtmpl": os.path.join(tmpdir, f"{video_id}.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": timeout_sec,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        vtt_files = [f for f in os.listdir(tmpdir) if f.endswith(".vtt")]
+        if not vtt_files:
+            return None
+        with open(os.path.join(tmpdir, vtt_files[0]), "r", encoding="utf-8") as f:
+            body = f.read()
+        cues = _parse_vtt(body)
+        if not cues:
+            return None
+        # Require at least one cue with real word-level data. Manually-authored
+        # captions (no <c> tags) fall through to `fetch_transcript` so we don't
+        # regress precision on videos where the existing API path already works.
+        if not any(getattr(c, "word_source", "") == "youtube_vtt" for c in cues):
+            return None
+        return cues
+    except Exception:
+        logger.debug("yt-dlp VTT precision fetch failed for %s", video_id, exc_info=True)
+        return None
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 # --------------------------------------------------------------------------- #
 # Top-level entrypoint
 # --------------------------------------------------------------------------- #
@@ -2931,7 +3004,20 @@ def cut_video_into_topic_reels(
     # duration_sec is missing) and for the actual segmentation. Skip the
     # network call if the caller already has cues in hand.
     if transcript is None:
-        transcript = fetch_transcript(video_id)
+        # Captions-first fast path: when the caller hasn't supplied either a
+        # transcript or word-level precision cues, try YouTube auto-caption
+        # VTT with <c>-tag word timings. One network call gives us both the
+        # cue-level transcript AND the word-level `ingest_cues_for_precision`
+        # the A1 refine gate needs — so per-clip Whisper refinement is skipped
+        # on captioned videos. Falls through to `fetch_transcript` silently
+        # when VTT is unavailable or has no <c> tags.
+        if ingest_cues_for_precision is None:
+            precision_cues = _try_yt_dlp_vtt_precision(video_id)
+            if precision_cues:
+                transcript = cues_from_ingest_cues(precision_cues)
+                ingest_cues_for_precision = precision_cues
+        if transcript is None:
+            transcript = fetch_transcript(video_id)
     else:
         transcript = list(transcript)
 
