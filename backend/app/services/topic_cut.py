@@ -858,6 +858,8 @@ def _build_gemini_client(api_key: str | None = None) -> Any | None:
     the module is importable and a key is present — it does not
     construct a client here.
     """
+    # PR 4: API blackout — Gemini disabled; heuristic path handles segmentation.
+    return None
     key = api_key or os.environ.get("GEMINI_API_KEY") or ""
     if not key:
         return None
@@ -957,6 +959,8 @@ def _llm_topic_segments_gemini(
 
 def _build_groq_client() -> Any | None:
     """Build a Groq client from GROQ_API_KEY if available."""
+    # PR 4: API blackout — Groq disabled; heuristic path handles segmentation.
+    return None
     api_key = os.environ.get("GROQ_API_KEY") or ""
     if not api_key:
         return None
@@ -1016,6 +1020,8 @@ def _build_cerebras_client() -> Any | None:
     None when the key is missing or the SDK isn't installed, so the caller
     degrades silently to whatever path is next (or gives up on LLM cuts).
     """
+    # PR 4: API blackout — Cerebras disabled; heuristic path handles segmentation.
+    return None
     api_key = os.environ.get("CEREBRAS_API_KEY") or ""
     if not api_key:
         return None

@@ -67,6 +67,8 @@ def _build_gemini_module(api_key: str | None = None) -> Any | None:
     so this helper only checks whether the module is importable and a key
     is present — it does not construct a client here.
     """
+    # PR 4: API blackout — Gemini disabled; router falls back to Ollama/heuristic.
+    return None
     key = api_key or os.environ.get("GEMINI_API_KEY") or ""
     if not key:
         return None
@@ -93,6 +95,8 @@ def _build_ollama_client() -> dict[str, Any] | None:
 
 
 def _build_groq_client() -> Any | None:
+    # PR 4: API blackout — Groq disabled; router falls back to Ollama/heuristic.
+    return None
     api_key = os.environ.get("GROQ_API_KEY") or ""
     if not api_key:
         return None
@@ -109,6 +113,8 @@ def _build_groq_client() -> Any | None:
 
 
 def _build_cerebras_client() -> Any | None:
+    # PR 4: API blackout — Cerebras disabled; router falls back to Ollama/heuristic.
+    return None
     api_key = os.environ.get("CEREBRAS_API_KEY") or ""
     if not api_key:
         return None
@@ -490,6 +496,9 @@ def transcribe_audio(
     Raises ``RuntimeError`` on HTTP/transport failures so the caller can
     wrap with its domain-specific error (e.g. ``TranscriptionError``).
     """
+    # PR 4: API blackout — Groq Whisper disabled; caller must use local
+    # faster-whisper / WhisperX path (ingestion.whisperx_transcribe).
+    return None
     api_key = os.environ.get("GROQ_API_KEY") or ""
     if not api_key:
         return None
