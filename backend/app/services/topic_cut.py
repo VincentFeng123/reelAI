@@ -1065,6 +1065,61 @@ def _llm_topic_segments_cerebras(
 
 
 # --------------------------------------------------------------------------- #
+# Ollama (local, free, unlimited) — top-priority fallback when configured
+# --------------------------------------------------------------------------- #
+
+
+def _build_ollama_client() -> dict[str, Any] | None:
+    """Return an Ollama config dict when ``OLLAMA_BASE_URL`` is set.
+
+    Ollama runs locally with an OpenAI-compatible endpoint, so the "client"
+    is just ``{base_url, model}``. Explicit env-var gating keeps production
+    (no local server) from accidentally enabling this path.
+    """
+    base_url = (os.environ.get("OLLAMA_BASE_URL") or "").strip()
+    if not base_url:
+        return None
+    model = (os.environ.get("OLLAMA_MODEL") or "qwen2.5:7b-instruct").strip() or "qwen2.5:7b-instruct"
+    return {"base_url": base_url.rstrip("/"), "model": model}
+
+
+def _llm_topic_segments_ollama(
+    cues: Sequence[TranscriptCue],
+    *,
+    ollama_client: dict[str, Any],
+    query: str | None = None,
+) -> list[_SegmentTuple]:
+    """Identify topic boundaries via a local Ollama server (OpenAI-compatible)."""
+    import httpx
+
+    rendered = _render_transcript_for_llm(cues)
+    system_prompt = _build_system_prompt(query=query)
+    user_msg = (
+        "Here is the full transcript of a long-form YouTube video. "
+        "Identify topic segments per the rules in the system prompt.\n\n"
+        f"{rendered}"
+    )
+    timeout = float(os.environ.get("OLLAMA_TIMEOUT", "180") or "180")
+    payload = {
+        "model": ollama_client["model"],
+        "temperature": 0.1,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_msg},
+        ],
+    }
+    url = f"{ollama_client['base_url']}/v1/chat/completions"
+    with httpx.Client(timeout=timeout) as client:
+        resp = client.post(url, json=payload)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Ollama returned {resp.status_code}: {resp.text[:400]}")
+    data = resp.json()
+    raw = (((data.get("choices") or [{}])[0].get("message") or {}).get("content")) or "{}"
+    return _parse_llm_segments_json(raw)
+
+
+# --------------------------------------------------------------------------- #
 # Two-pass boundary refinement
 # --------------------------------------------------------------------------- #
 
@@ -2842,33 +2897,56 @@ def cut_video_into_topic_reels(
         return classification, []
 
     # ---- Path 2: LLM topic segmentation (timestamp-based). ------------- #
-    # Fallback chain: Gemini Flash → Groq/Llama 3 → Cerebras/Llama 3.3 70B
-    # All three are free-tier; the order is by daily-quota generosity on
-    # this project's typical load (Gemini widest, then Groq, then Cerebras).
+    # Fallback chain: Ollama (local, if OLLAMA_BASE_URL set) → Gemini Flash →
+    # Groq/Llama 3 → Cerebras/Llama 3.3 70B. All free-tier; Ollama goes first
+    # because it's unlimited — saves paid/quota credits for when the local
+    # server isn't running. The three hosted tiers are ordered by daily-quota
+    # generosity on this project's typical load.
     # LLM functions return timestamp-based _SegmentTuples, not cue indices.
     llm_segments: list[_SegmentTuple] = []
     used_llm = False
 
     if use_llm and len(transcript) <= MAX_CUES_FOR_LLM:
-        # 2a: Google Gemini Flash (free tier: 15 RPM, 1M tokens/day)
-        gemini = _build_gemini_client()
-        if gemini:
+        # 2.pre: Local Ollama server (only when OLLAMA_BASE_URL is set)
+        ollama = _build_ollama_client()
+        if ollama:
             try:
-                llm_segments = _llm_topic_segments_gemini(
-                    transcript, genai_module=gemini, query=query,
+                llm_segments = _llm_topic_segments_ollama(
+                    transcript, ollama_client=ollama, query=query,
                 )
                 if llm_segments:
                     used_llm = True
                     logger.info(
-                        "video %s segmented via Gemini Flash → %d segments",
-                        video_id, len(llm_segments),
+                        "video %s segmented via Ollama (%s) → %d segments",
+                        video_id, ollama["model"], len(llm_segments),
                     )
             except Exception:  # noqa: BLE001
                 logger.exception(
-                    "Gemini topic segmentation failed for video %s; trying Groq next",
+                    "Ollama topic segmentation failed for video %s; trying Gemini next",
                     video_id,
                 )
                 llm_segments = []
+
+        # 2a: Google Gemini Flash (free tier: 15 RPM, 1M tokens/day)
+        if not llm_segments:
+            gemini = _build_gemini_client()
+            if gemini:
+                try:
+                    llm_segments = _llm_topic_segments_gemini(
+                        transcript, genai_module=gemini, query=query,
+                    )
+                    if llm_segments:
+                        used_llm = True
+                        logger.info(
+                            "video %s segmented via Gemini Flash → %d segments",
+                            video_id, len(llm_segments),
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Gemini topic segmentation failed for video %s; trying Groq next",
+                        video_id,
+                    )
+                    llm_segments = []
 
         # 2b: Groq / Llama 3 (free tier fallback)
         if not llm_segments:

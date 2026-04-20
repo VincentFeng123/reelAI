@@ -37,6 +37,8 @@ GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
 # earlier default `llama-3.3-70b` returned 404 for accounts that weren't
 # explicitly provisioned for it. Override via CEREBRAS_MODEL env var.
 CEREBRAS_DEFAULT_MODEL = os.environ.get("CEREBRAS_MODEL", "llama3.1-8b").strip() or "llama3.1-8b"
+OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b-instruct").strip() or "qwen2.5:7b-instruct"
+OLLAMA_DEFAULT_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "180") or "180")
 GROQ_WHISPER_MODEL = "whisper-large-v3"
 GROQ_AUDIO_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 # Groq currently caps audio uploads at 25 MB.
@@ -76,6 +78,20 @@ def _build_gemini_module(api_key: str | None = None) -> Any | None:
     return genai
 
 
+def _build_ollama_client() -> dict[str, Any] | None:
+    """Return an Ollama config dict when ``OLLAMA_BASE_URL`` is set.
+
+    Ollama exposes an OpenAI-compatible ``/v1/chat/completions`` endpoint,
+    so the "client" is just a base URL + model name; we call it with httpx.
+    Gating on an explicit env var means production (where localhost:11434
+    is not running) never accidentally enables this path.
+    """
+    base_url = (os.environ.get("OLLAMA_BASE_URL") or "").strip()
+    if not base_url:
+        return None
+    return {"base_url": base_url.rstrip("/"), "model": OLLAMA_DEFAULT_MODEL}
+
+
 def _build_groq_client() -> Any | None:
     api_key = os.environ.get("GROQ_API_KEY") or ""
     if not api_key:
@@ -113,6 +129,7 @@ def gemini_or_groq_available() -> bool:
         bool(_collect_gemini_api_keys())
         or bool(os.environ.get("GROQ_API_KEY") or "")
         or bool(os.environ.get("CEREBRAS_API_KEY") or "")
+        or bool((os.environ.get("OLLAMA_BASE_URL") or "").strip())
     )
 
 
@@ -159,6 +176,43 @@ def _build_cache_key(namespace: str, model: str, system: str, user: str, *, json
     payload = f"{namespace}|{model}|{int(json_mode)}|{system}|{user}"
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:40]
     return f"{namespace}:{digest}"
+
+
+def _ollama_chat(
+    *,
+    ollama_client: dict[str, Any],
+    model: str,
+    system: str,
+    user: str,
+    temperature: float,
+    json_mode: bool,
+    max_tokens: int | None,
+) -> str | None:
+    """Call an Ollama server via its OpenAI-compatible chat endpoint."""
+    payload: dict[str, Any] = {
+        "model": model,
+        "temperature": float(temperature),
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    if max_tokens is not None:
+        payload["max_tokens"] = int(max_tokens)
+
+    url = f"{ollama_client['base_url']}/v1/chat/completions"
+    with httpx.Client(timeout=OLLAMA_DEFAULT_TIMEOUT) as client:
+        resp = client.post(url, json=payload)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Ollama returned {resp.status_code}: {resp.text[:400]}")
+    data = resp.json()
+    choices = data.get("choices") or []
+    if not choices:
+        return None
+    content = (choices[0].get("message") or {}).get("content") or ""
+    return content.strip() or None
 
 
 def _gemini_chat(
@@ -332,6 +386,28 @@ def chat_completion(
             if cached is not None:
                 return cached
 
+    ollama = _build_ollama_client()
+    if ollama is not None:
+        try:
+            out = _ollama_chat(
+                ollama_client=ollama,
+                model=ollama["model"],
+                system=system,
+                user=user,
+                temperature=temperature,
+                json_mode=json_mode,
+                max_tokens=max_tokens,
+            )
+            if out:
+                if conn is not None and effective_cache_key:
+                    _write_cache(conn, effective_cache_key, out)
+                return out
+        except Exception:
+            logger.warning(
+                "llm_router.chat_completion: Ollama failed, falling back to Gemini",
+                exc_info=True,
+            )
+
     gemini = _build_gemini_module(api_key=gemini_api_key_override)
     if gemini is not None:
         try:
@@ -426,24 +502,17 @@ def transcribe_audio(
             f"audio file too large for Groq Whisper (size={size}, max={GROQ_WHISPER_MAX_BYTES})"
         )
 
-    data: dict[str, str] = {
+    # Groq accepts repeated "timestamp_granularities[]" form fields. With
+    # files= (multipart/form-data), current httpx versions choke on a
+    # list-of-tuples `data=` — the fix is dict values, using a list for the
+    # duplicate key, which httpx emits as two multipart parts.
+    data: dict[str, Any] = {
         "model": GROQ_WHISPER_MODEL,
         "response_format": "verbose_json",
-        "timestamp_granularities[]": "segment",
+        "timestamp_granularities[]": ["segment", "word"],
     }
     if language:
         data["language"] = language
-
-    # Groq accepts repeated "timestamp_granularities[]" form fields.
-    # httpx handles repeats via a list of tuples in the data payload.
-    form_items = [
-        ("model", GROQ_WHISPER_MODEL),
-        ("response_format", "verbose_json"),
-        ("timestamp_granularities[]", "segment"),
-        ("timestamp_granularities[]", "word"),
-    ]
-    if language:
-        form_items.append(("language", language))
 
     headers = {"Authorization": f"Bearer {api_key}"}
     try:
@@ -453,7 +522,7 @@ def transcribe_audio(
                 resp = client.post(
                     GROQ_AUDIO_ENDPOINT,
                     headers=headers,
-                    data=form_items,
+                    data=data,
                     files=files,
                 )
     except httpx.HTTPError as exc:

@@ -215,16 +215,55 @@ def _download_clip_audio(
     return wavs[0] if wavs else None
 
 
+def _faster_whisper_words(audio_path: Path) -> list[WhisperWord]:
+    """Transcribe a short clip with locally-installed faster-whisper and
+    return word timings relative to the audio's own t=0. Returns [] if the
+    package is missing, the model fails to load, or transcription fails —
+    the caller then falls through to the Groq hosted endpoint.
+
+    Used as the middle tier between WhisperX and Groq so local runs without
+    the heavy `whisperx` wheel still get free, offline word timings.
+    """
+    try:
+        from ..ingestion.transcribe import (
+            _faster_whisper_transcribe,
+            _load_faster_whisper_model,
+            TranscriptionError,
+        )
+    except Exception:
+        return []
+    if _load_faster_whisper_model() is None:
+        return []
+    try:
+        cues = _faster_whisper_transcribe(audio_path, language="en")
+    except TranscriptionError:
+        return []
+    except Exception:
+        logger.exception("faster-whisper raised during clip refinement")
+        return []
+    if not cues:
+        return []
+    out: list[WhisperWord] = []
+    for cue in cues:
+        for w in cue.words:
+            text = (w.text or "").strip()
+            if not text or w.end <= w.start:
+                continue
+            out.append(WhisperWord(text=text, start=float(w.start), end=float(w.end)))
+    return out
+
+
 def _call_whisper(audio_path: Path, dl_start_sec: float) -> list[WhisperWord]:
-    """Run the clip audio through WhisperX (preferred) or Groq Whisper
-    (legacy fallback) and convert word timestamps (relative to the
-    extracted audio's own t=0) into absolute video seconds by adding the
-    download offset.
+    """Run the clip audio through WhisperX (preferred), then local
+    faster-whisper, then Groq hosted Whisper as the last-resort fallback.
+    Word timestamps (relative to the extracted audio's own t=0) are
+    converted to absolute video seconds by adding the download offset.
 
     Phase 4(b): when `WHISPERX_ENABLED=true` (default) and the package is
     installed, WhisperX wav2vec2 alignment runs locally for ±30 ms word
-    precision. When WhisperX is disabled or unavailable, the legacy Groq
-    hosted Whisper large-v3 path still runs at ±80 ms precision.
+    precision. When WhisperX is unavailable, faster-whisper (also local)
+    runs at ±80-120 ms precision. Groq is only reached when both local
+    paths return nothing.
     """
     try:
         from ..ingestion.whisperx_transcribe import (
@@ -250,8 +289,17 @@ def _call_whisper(audio_path: Path, dl_start_sec: float) -> list[WhisperWord]:
                 )
                 for w in wx_words
             ]
-        # Fall through to Groq only when WhisperX returned nothing — lets
-        # the legacy path act as emergency backup rather than be retired.
+
+    fw_words = _faster_whisper_words(audio_path)
+    if fw_words:
+        return [
+            WhisperWord(
+                text=w.text,
+                start=w.start + dl_start_sec,
+                end=w.end + dl_start_sec,
+            )
+            for w in fw_words
+        ]
 
     try:
         payload = transcribe_audio(audio_path, language="en", timeout=_WHISPER_TIMEOUT_SEC)
