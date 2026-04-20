@@ -139,6 +139,10 @@ from .ingestion.models import (
     IngestTopicCutResult,
 )
 from .ingestion.pipeline import IngestionPipeline
+from .ingestion.whisperx_transcribe import (
+    _get_whisperx_module as _probe_whisperx_module,
+    whisperx_enabled,
+)
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -149,6 +153,14 @@ async def lifespan(app_instance):
     init_db()
     _resume_pending_refinement_jobs()
     _warn_if_hosted_auth_email_is_unconfigured()
+    # A2: eagerly warm the punctuation-restoration pipeline so the first
+    # user-facing search doesn't pay the 3-5s model-load cost. Failure is
+    # non-fatal — the sentinel in ReelService flips to False and subsequent
+    # ingests fall back to pause-boundary segmentation.
+    try:
+        ReelService.warm_punct_pipeline()
+    except Exception:
+        logger.exception("punct pipeline warmup raised; continuing without it")
     yield
 
 app = FastAPI(title="StudyReels API", version="0.1.0", lifespan=lifespan)
@@ -4987,6 +4999,30 @@ def root() -> dict:
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True}
+
+
+@app.get("/api/admin/health")
+def admin_health() -> dict:
+    punct_loaded = False
+    try:
+        punct_loaded = ReelService.punct_pipeline_loaded()
+    except Exception:
+        logger.exception("admin_health: punct_pipeline_loaded probe raised")
+    whisperx_available = False
+    try:
+        whisperx_available = whisperx_enabled() and _probe_whisperx_module() is not None
+    except Exception:
+        logger.exception("admin_health: whisperx probe raised")
+    ok = punct_loaded and whisperx_available
+    if not punct_loaded:
+        logger.warning("admin_health: punct pipeline not loaded")
+    if not whisperx_available:
+        logger.warning("admin_health: whisperx not available")
+    return {
+        "ok": ok,
+        "punct_pipeline_loaded": punct_loaded,
+        "whisperx_available": whisperx_available,
+    }
 
 
 @app.post("/api/community/auth/send-signup-verification", response_model=CommunitySendSignupVerificationResponse)

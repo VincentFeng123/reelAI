@@ -2591,6 +2591,67 @@ def _apply_boundary_engine(
         clip_audio_refine_conditional = lambda: True  # type: ignore[assignment]
         should_use_clip_audio_refine = lambda _cues: True  # type: ignore[assignment]
 
+    def _sentence_edge_enforce_enabled() -> bool:
+        # Default OFF — audit_after_A3_partial showed a 3x regression in
+        # starts_mid_word when the hard gate snapped to SentenceSpan.t_start,
+        # which is cue-level (not word-acoustic) for auto-caption paths and
+        # threw away A1's word-level refinement (+60-300ms shift per clip).
+        # Re-enable per-deploy with CLIP_SENTENCE_EDGE_ENFORCE=1 once the gate
+        # is rewritten to use word-level timestamps for the first word of the
+        # target sentence rather than SentenceSpan.t_start directly.
+        raw = os.environ.get("CLIP_SENTENCE_EDGE_ENFORCE")
+        if raw is None or not raw.strip():
+            return False
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+    def _sentence_edge_search_sec() -> float:
+        raw = os.environ.get("CLIP_SENTENCE_EDGE_SEARCH_SEC")
+        if raw is None or not raw.strip():
+            return 5.0
+        try:
+            return max(0.5, float(raw))
+        except (TypeError, ValueError):
+            return 5.0
+
+    def _enforce_sentence_edges(r: TopicReel) -> bool:
+        """Hard gate: snap t_start to a sentence start and t_end to a
+        terminal-punctuation sentence end; keep the pair whose start sits
+        closest to the original t_start and whose end keeps duration inside
+        [user_min_sec, user_max_sec]. Returns False when no such pair exists
+        within the search window — caller drops the clip. Toggle off with
+        CLIP_SENTENCE_EDGE_ENFORCE=0.
+        """
+        if not sentences:
+            return True
+        if not _sentence_edge_enforce_enabled():
+            return True
+        search_radius = _sentence_edge_search_sec()
+        starts = [
+            s for s in sentences
+            if abs(float(s.t_start) - float(r.t_start)) <= search_radius
+        ]
+        if not starts:
+            return False
+        terminal_ends = [s for s in sentences if bool(getattr(s, "terminal_punct", ""))]
+        if not terminal_ends:
+            return False
+        best_start = min(starts, key=lambda s: abs(float(s.t_start) - float(r.t_start)))
+        new_start = float(best_start.t_start)
+        candidate_ends = [
+            s for s in terminal_ends
+            if user_min_sec <= (float(s.t_end) - new_start) <= user_max_sec
+            and float(s.t_end) > new_start
+        ]
+        if not candidate_ends:
+            return False
+        best_end = min(
+            candidate_ends,
+            key=lambda s: abs(float(s.t_end) - float(r.t_end)),
+        )
+        r.t_start = round(new_start, 3)
+        r.t_end = round(float(best_end.t_end), 3)
+        return True
+
     def _try_whisper_refine(r: TopicReel) -> None:
         if not whisper_clip_refine_enabled() or refine_clip_with_whisper is None:
             return
@@ -2688,19 +2749,29 @@ def _apply_boundary_engine(
                     )
 
     refined: list[TopicReel] = []
+    dropped_no_sentence_edge = 0
     for r in reels:
         if id(r) in ranked_covered:
             # Global rerank already set precise boundaries + sub-scores;
             # still allow word-level whisper refinement on top.
             _try_whisper_refine(r)
+            if not _enforce_sentence_edges(r):
+                dropped_no_sentence_edge += 1
+                continue
             refined.append(r)
             continue
         if _try_llm_pick(r):
             _try_whisper_refine(r)
+            if not _enforce_sentence_edges(r):
+                dropped_no_sentence_edge += 1
+                continue
             refined.append(r)
             continue
         if _try_heuristic_pick(r):
             _try_whisper_refine(r)
+            if not _enforce_sentence_edges(r):
+                dropped_no_sentence_edge += 1
+                continue
             refined.append(r)
             continue
         # Last-resort fallback — the original ClipBoundaryEngine heuristic.
@@ -2731,7 +2802,15 @@ def _apply_boundary_engine(
                 "boundary refinement failed for video %s raw=(%.2f, %.2f); keeping raw",
                 r.video_id, r.t_start, r.t_end,
             )
+        if not _enforce_sentence_edges(r):
+            dropped_no_sentence_edge += 1
+            continue
         refined.append(r)
+    if dropped_no_sentence_edge:
+        logger.info(
+            "sentence-edge enforcement dropped %d clip(s) with no fitting sentence pair",
+            dropped_no_sentence_edge,
+        )
 
     # Phase 3 — populate default sub-scores for reels that didn't go through
     # the global rerank pipeline, so the final sort-by-final_rank_score

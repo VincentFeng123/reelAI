@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -52,6 +53,48 @@ logger = logging.getLogger(__name__)
 # below 15s clips lack context, above 60s users scroll away.
 MIN_CLIP_SEC = 15.0
 MAX_CLIP_SEC = 60.0
+
+# A3: snap-to-cue tolerance. Drift beyond this triggers a snap-to-nearest-cue
+# correction that catches LLM timestamp hallucinations. 0.15s is tighter than
+# typical cue granularity (~1-3s) so the check is oracle-robust.
+_SNAP_DRIFT_TOLERANCE_SEC = 0.15
+
+
+def _llm_timestamp_strict_validation() -> bool:
+    """A3 feature flag. Default ON; set LLM_TIMESTAMP_STRICT_VALIDATION=0 to
+    revert to edge-only validation (the pre-A3 behavior).
+    """
+    raw = os.environ.get("LLM_TIMESTAMP_STRICT_VALIDATION")
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+# Per-process telemetry for A3. Readers: the mass-audit harness and the
+# /api/admin/health endpoint. Resets at process start; treat as advisory,
+# not persistent.
+_snap_telemetry: dict[str, float | int] = {
+    "snap_count": 0,
+    "snap_adjustment_ms_total": 0.0,
+    "validate_calls": 0,
+    "validate_rejects": 0,
+}
+
+
+def snap_telemetry_snapshot() -> dict[str, float | int]:
+    """Return a copy of the snap-telemetry counters for audit/health readers."""
+    calls = int(_snap_telemetry["validate_calls"])
+    rejects = int(_snap_telemetry["validate_rejects"])
+    snaps = int(_snap_telemetry["snap_count"])
+    total_ms = float(_snap_telemetry["snap_adjustment_ms_total"])
+    avg_ms = (total_ms / snaps) if snaps > 0 else 0.0
+    return {
+        "validate_calls": calls,
+        "validate_rejects": rejects,
+        "snap_count": snaps,
+        "snap_adjustment_ms_avg": avg_ms,
+        "llm_heuristic_fallback_rate": (rejects / calls) if calls > 0 else 0.0,
+    }
 
 
 @dataclass
@@ -160,15 +203,20 @@ def _validate_pick(
     max_sec: float,
 ) -> ClipPick | None:
     """Reject picks outside duration bounds or referencing timestamps the
-    LLM invented. This catches hallucinated timestamps that would cause a
-    seek past the end of the source video.
+    LLM invented. When LLM_TIMESTAMP_STRICT_VALIDATION is enabled (default),
+    also snap t_start/t_end to the nearest cue boundary when drift exceeds
+    _SNAP_DRIFT_TOLERANCE_SEC — catches off-by-decimal hallucinations for
+    free; rejects picks that remain invalid after snap so the caller falls
+    back to the heuristic picker.
     """
+    _snap_telemetry["validate_calls"] = int(_snap_telemetry["validate_calls"]) + 1
     duration = pick.t_end - pick.t_start
     if duration < min_sec or duration > max_sec:
         logger.debug(
             "clip_llm: rejecting pick with duration %.1fs (bounds %.0f-%.0f)",
             duration, min_sec, max_sec,
         )
+        _snap_telemetry["validate_rejects"] = int(_snap_telemetry["validate_rejects"]) + 1
         return None
     if not cues:
         return pick
@@ -180,7 +228,46 @@ def _validate_pick(
             "clip_llm: pick %.1f-%.1fs outside transcript range %.1f-%.1fs",
             pick.t_start, pick.t_end, video_start, video_end,
         )
+        _snap_telemetry["validate_rejects"] = int(_snap_telemetry["validate_rejects"]) + 1
         return None
+
+    if not _llm_timestamp_strict_validation():
+        return pick
+
+    nearest_start_cue = min(cues, key=lambda c: abs(c.start - pick.t_start))
+    nearest_end_cue = min(cues, key=lambda c: abs(c.end - pick.t_end))
+    start_drift = abs(nearest_start_cue.start - pick.t_start)
+    end_drift = abs(nearest_end_cue.end - pick.t_end)
+
+    # Snap only the side that actually drifted. Avoids shifting a precise
+    # endpoint to a nearest-cue value just because the OTHER side was off —
+    # that wrecked 20+ clips worth of word-level precision in after_A3 partial.
+    orig_start, orig_end = pick.t_start, pick.t_end
+    snapped = False
+    if start_drift > _SNAP_DRIFT_TOLERANCE_SEC:
+        pick.t_start = float(nearest_start_cue.start)
+        snapped = True
+    if end_drift > _SNAP_DRIFT_TOLERANCE_SEC:
+        pick.t_end = float(nearest_end_cue.end)
+        snapped = True
+    if snapped:
+        snap_ms = (abs(pick.t_start - orig_start) + abs(pick.t_end - orig_end)) * 1000.0
+        _snap_telemetry["snap_count"] = int(_snap_telemetry["snap_count"]) + 1
+        _snap_telemetry["snap_adjustment_ms_total"] = (
+            float(_snap_telemetry["snap_adjustment_ms_total"]) + snap_ms
+        )
+        logger.debug(
+            "clip_llm: snapped pick %.2f-%.2fs → %.2f-%.2fs (drift start=%.2fs end=%.2fs)",
+            orig_start, orig_end, pick.t_start, pick.t_end, start_drift, end_drift,
+        )
+        snapped_duration = pick.t_end - pick.t_start
+        if snapped_duration < min_sec or snapped_duration > max_sec:
+            logger.debug(
+                "clip_llm: snapped pick duration %.1fs violates bounds (%.0f-%.0f); rejecting",
+                snapped_duration, min_sec, max_sec,
+            )
+            _snap_telemetry["validate_rejects"] = int(_snap_telemetry["validate_rejects"]) + 1
+            return None
     return pick
 
 

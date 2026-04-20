@@ -47,6 +47,26 @@ REEL_PAD_START_SEC = 0.3
 REEL_PAD_END_SEC = 0.3
 
 
+# A2: ratio-based auto-punctuation gate. Restoration fires on transcripts
+# whose cue-terminal-punct ratio falls below this threshold. Set to `0.0`
+# to disable restoration entirely, `1.0` to force it on every transcript.
+# Default 0.25 catches both fully-bare auto-captions AND semi-punctuated
+# transcripts that still have enough unpunctuated cues to trip the picker
+# into ending mid-sentence.
+def _read_punct_restore_threshold() -> float:
+    raw = os.environ.get("PUNCT_RESTORE_THRESHOLD")
+    if raw is None or not raw.strip():
+        return 0.25
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.25
+    return max(0.0, min(1.0, v))
+
+
+_PUNCT_RESTORE_THRESHOLD = _read_punct_restore_threshold()
+
+
 class GenerationCancelledError(Exception):
     """Raised when the caller abandons reel generation mid-request."""
 
@@ -11501,7 +11521,13 @@ class ReelService:
         # Running punctuation restoration BEFORE the terminal-punct check
         # means the refiner can use real sentence boundaries even for
         # auto-captions that ship without any punctuation.
-        if not self._transcript_has_terminal_punct(entries):
+        # A2: ratio-based gate (PUNCT_RESTORE_THRESHOLD, default 0.25).
+        # Restoration now fires on semi-punctuated transcripts too — not
+        # only fully-bare ones — which cleans up "ends_mid_sentence" cases
+        # where a transcript has 15-25% punctuation and the picker lands
+        # on one of the unpunctuated cues. Env=0.0 disables; env=1.0 forces.
+        punct_ratio = self._terminal_punct_ratio(entries)
+        if punct_ratio < _PUNCT_RESTORE_THRESHOLD:
             entries = self._auto_punctuate_entries(entries)
 
         # Decide whether the transcript has real punctuation. If not (most
@@ -11738,6 +11764,8 @@ class ReelService:
         return bool(re.search(r"[.!?…][\"'\)\]]*$", cleaned))
 
     # Lazy-loaded punctuation restoration model (loaded once on first use).
+    # Warmed eagerly at app startup via `warm_punct_pipeline` so the first
+    # user-facing search doesn't pay the 3-5s model-load cost.
     _punct_pipeline = None
 
     @classmethod
@@ -11757,6 +11785,20 @@ class ReelService:
                 logger.warning("Failed to load punctuation model; auto-captions will use pause-based boundaries")
                 cls._punct_pipeline = False  # sentinel — don't retry
         return cls._punct_pipeline if cls._punct_pipeline is not False else None
+
+    @classmethod
+    def warm_punct_pipeline(cls) -> bool:
+        """Eagerly load the punctuation-restoration model at app startup so
+        the first user request doesn't pay the model-load cost. Returns True
+        on success, False on load failure (a single failure flips the
+        sentinel so subsequent ingests skip quietly)."""
+        pipe = cls._get_punct_pipeline()
+        return pipe is not None
+
+    @classmethod
+    def punct_pipeline_loaded(cls) -> bool:
+        """True iff the punctuation pipeline is live (loaded and non-sentinel)."""
+        return cls._punct_pipeline not in (None, False)
 
     def _auto_punctuate_entries(
         self,
@@ -11841,6 +11883,20 @@ class ReelService:
 
         return new_entries
 
+    def _terminal_punct_ratio(self, entries: list[dict[str, Any]]) -> float:
+        """Fraction of the first 120 cues that end with terminal punctuation.
+        Used by both the pause-boundary decision (via
+        ``_transcript_has_terminal_punct``) and the A2 auto-restoration
+        gate at ``_PUNCT_RESTORE_THRESHOLD``."""
+        sample = entries[:120]
+        if not sample:
+            return 0.0
+        n_punct = 0
+        for entry in sample:
+            if self._is_sentence_end(str(entry.get("text") or "")):
+                n_punct += 1
+        return n_punct / len(sample)
+
     def _transcript_has_terminal_punct(self, entries: list[dict[str, Any]]) -> bool:
         """True when the transcript appears genuinely punctuated.
 
@@ -11852,14 +11908,7 @@ class ReelService:
         punctuation. Under that threshold we treat the transcript as
         unpunctuated and fall back to cue-boundary alignment.
         """
-        sample = entries[:120]
-        if not sample:
-            return False
-        n_punct = 0
-        for entry in sample:
-            if self._is_sentence_end(str(entry.get("text") or "")):
-                n_punct += 1
-        return (n_punct / len(sample)) >= 0.15
+        return self._terminal_punct_ratio(entries) >= 0.15
 
     def _cue_pause_breaks(
         self,
