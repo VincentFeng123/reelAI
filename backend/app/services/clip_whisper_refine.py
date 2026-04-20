@@ -79,6 +79,86 @@ def whisper_clip_refine_enabled() -> bool:
     }
 
 
+def clip_audio_refine_conditional() -> bool:
+    """Phase 1 A1 gate. When True (default), refinement only fires on clips
+    whose existing cue timings are untrustworthy (proportional/legacy source,
+    or sparse sub-60-word windows with >500ms inter-word gaps). When False,
+    falls back to the pre-A1 behaviour of refining every clip whenever
+    `WHISPER_CLIP_REFINE_ENABLED` is on.
+    """
+    raw = os.environ.get("CLIP_AUDIO_REFINE_CONDITIONAL")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Thresholds for `should_use_clip_audio_refine`. The inter-word-gap trigger
+# guards against cue windows where Whisper reported timings but they're
+# suspiciously stretched — only meaningful when the clip is genuinely sparse
+# (<60 words across the whole window), because a slow TED-style speaker can
+# have 500ms pauses with perfectly valid word timings.
+_REFINE_INTER_WORD_GAP_SEC = 0.5
+_REFINE_SPARSE_WORD_COUNT = 60
+
+
+def should_use_clip_audio_refine(cues_in_clip: Sequence[Any]) -> bool:
+    """Return True iff the clip's cue window has untrustworthy word timings
+    and therefore benefits from acoustic Whisper refinement.
+
+    Inputs are duck-typed against `IngestTranscriptCue` (any object with
+    `word_source` and iterable `words` containing `start`/`end` floats).
+
+    Trigger conditions (either):
+      - ANY cue in the window has `word_source` in {"proportional", "legacy"}
+        (YouTube manual captions / pre-Phase-A.1 persisted cues — no acoustic
+        word timings, only character-proportional interpolation).
+      - AVG inter-word gap in the window exceeds 500 ms AND the total word
+        count is under 60. The word-count guard prevents false positives on
+        slow speakers / speeches where 500 ms pauses are expected with valid
+        timings.
+    """
+    if not cues_in_clip:
+        # No cues → nothing to refine against. Caller keeps sentence-level bounds.
+        return False
+
+    untrusted_sources = {"proportional", "legacy"}
+    for cue in cues_in_clip:
+        src = getattr(cue, "word_source", None)
+        if src in untrusted_sources:
+            return True
+
+    word_starts_ends: list[tuple[float, float]] = []
+    for cue in cues_in_clip:
+        words = getattr(cue, "words", None) or []
+        for w in words:
+            try:
+                ws = float(getattr(w, "start", 0.0))
+                we = float(getattr(w, "end", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if we > ws:
+                word_starts_ends.append((ws, we))
+
+    word_count = len(word_starts_ends)
+    if word_count < 2:
+        # Too few words to compute a meaningful gap — if we got here the cues
+        # claimed a non-untrusted source, so trust them and skip refinement.
+        return False
+    if word_count >= _REFINE_SPARSE_WORD_COUNT:
+        return False
+
+    word_starts_ends.sort(key=lambda we: we[0])
+    gaps: list[float] = []
+    for i in range(1, len(word_starts_ends)):
+        gap = word_starts_ends[i][0] - word_starts_ends[i - 1][1]
+        if gap > 0:
+            gaps.append(gap)
+    if not gaps:
+        return False
+    avg_gap = sum(gaps) / len(gaps)
+    return avg_gap > _REFINE_INTER_WORD_GAP_SEC
+
+
 @dataclass
 class WhisperWord:
     text: str
@@ -170,6 +250,11 @@ def _download_clip_audio(
 ) -> Path | None:
     """Download a specific seconds range of a YouTube video's audio as
     16kHz mono WAV via yt-dlp. Returns the path or None on failure.
+
+    Used as the fallback when the video-level audio cache is disabled or
+    the full-video download failed. The primary path is
+    `_ensure_full_video_audio` + `_slice_audio_for_clip` which amortises the
+    yt-dlp cost across all clips from the same video.
     """
     try:
         import yt_dlp  # noqa: F401 — we use the CLI, but the import probes availability
@@ -213,6 +298,137 @@ def _download_clip_audio(
     # yt-dlp may pick any extension depending on the source; find the WAV.
     wavs = [p for p in out_dir.iterdir() if p.suffix.lower() == ".wav"]
     return wavs[0] if wavs else None
+
+
+# Process-local cache of full-video audio paths. Keyed by video_id so every
+# clip from the same video reuses the single yt-dlp download. The directory
+# is created lazily (`_ensure_clip_audio_cache_dir`) under the system tempdir
+# with the `reelai-ingest-` prefix so the existing orphan sweeper in
+# `app/ingestion/download.py` cleans up any leaks on the next worker boot.
+_FULL_VIDEO_AUDIO_CACHE: dict[str, Path] = {}
+_CLIP_AUDIO_CACHE_DIR: Path | None = None
+
+# Full-video yt-dlp downloads can be large — bump the timeout well above the
+# per-clip case. 6 min handles a 2-hour video at 320kbps on a slow connection.
+_FULL_VIDEO_YT_DLP_TIMEOUT_SEC = 360
+
+
+def _ensure_clip_audio_cache_dir() -> Path:
+    """Lazily create (and memoise) the per-process directory that holds full
+    video audio downloads. Uses `mkdtemp` with the `reelai-ingest-` prefix so
+    `sweep_orphans` in `app/ingestion/download.py` reaps it after an hour."""
+    global _CLIP_AUDIO_CACHE_DIR
+    if _CLIP_AUDIO_CACHE_DIR is not None and _CLIP_AUDIO_CACHE_DIR.exists():
+        return _CLIP_AUDIO_CACHE_DIR
+    _CLIP_AUDIO_CACHE_DIR = Path(tempfile.mkdtemp(prefix="reelai-ingest-clip-audio-"))
+    return _CLIP_AUDIO_CACHE_DIR
+
+
+def _ensure_full_video_audio(video_id: str) -> Path | None:
+    """Return a path to the full video's 16kHz mono WAV, downloading once
+    on first call per video. Returns None if yt-dlp is unavailable or the
+    download fails — the caller falls back to per-clip windowed download.
+
+    The download includes the *entire* video because slicing locally with
+    ffmpeg on a cached WAV is two orders of magnitude faster than re-issuing
+    yt-dlp per clip (N clips × ~5-10 s network + decode vs one ~10-30 s
+    download + N × ~0.5 s ffmpeg slices)."""
+    cached = _FULL_VIDEO_AUDIO_CACHE.get(video_id)
+    if cached is not None and cached.exists() and cached.stat().st_size > 0:
+        return cached
+
+    try:
+        import yt_dlp  # noqa: F401
+    except ImportError:
+        return None
+
+    cache_dir = _ensure_clip_audio_cache_dir()
+    out_path = cache_dir / f"{video_id}.wav"
+    out_tpl = str(cache_dir / f"{video_id}.%(ext)s")
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    cmd = [
+        "yt-dlp",
+        "-f", "bestaudio/best",
+        "--extract-audio",
+        "--audio-format", "wav",
+        "--postprocessor-args", "-ac 1 -ar 16000",
+        "-q",
+        "--no-warnings",
+        "-o", out_tpl,
+        url,
+    ]
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            timeout=_FULL_VIDEO_YT_DLP_TIMEOUT_SEC,
+        )
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("yt-dlp full-video download timed out for %s", video_id)
+        return None
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "yt-dlp full-video download failed for %s: %s",
+            video_id, (exc.stderr or b"")[:500].decode(errors="ignore"),
+        )
+        return None
+
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        # yt-dlp may have named the output differently (e.g. .m4a before
+        # the postprocessor ran). Pick any .wav in the cache dir named after
+        # the video id.
+        candidates = [p for p in cache_dir.glob(f"{video_id}.*") if p.suffix.lower() == ".wav"]
+        if not candidates:
+            return None
+        out_path = candidates[0]
+
+    _FULL_VIDEO_AUDIO_CACHE[video_id] = out_path
+    return out_path
+
+
+def _slice_audio_for_clip(
+    full_audio: Path,
+    dl_start_sec: float,
+    dl_end_sec: float,
+    out_path: Path,
+) -> Path | None:
+    """Extract `[dl_start_sec, dl_end_sec]` from the cached full-video WAV
+    into `out_path` using ffmpeg's pcm_s16le re-encode (fast, sample-accurate
+    on a mono 16kHz file). Returns the output path or None on failure."""
+    duration = max(0.05, dl_end_sec - dl_start_sec)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-ss", f"{max(0.0, dl_start_sec):.3f}",
+        "-i", str(full_audio),
+        "-t", f"{duration:.3f}",
+        "-ac", "1",
+        "-ar", "16000",
+        "-acodec", "pcm_s16le",
+        str(out_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, timeout=_YT_DLP_TIMEOUT_SEC)
+    except FileNotFoundError:
+        logger.debug("ffmpeg binary not on PATH; cannot slice cached audio")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg slice timed out for %s", full_audio.name)
+        return None
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            "ffmpeg slice failed for %s: %s",
+            full_audio.name, (exc.stderr or b"")[:500].decode(errors="ignore"),
+        )
+        return None
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return None
+    return out_path
 
 
 def _faster_whisper_words(audio_path: Path) -> list[WhisperWord]:
@@ -355,7 +571,16 @@ def refine_clip_with_whisper(
         dl_end = float(t_end) + _DOWNLOAD_PAD_SEC
         tmpdir = Path(tempfile.mkdtemp(prefix="whisper_refine_"))
         try:
-            audio_path = _download_clip_audio(video_id, dl_start, dl_end, tmpdir)
+            # Primary path: reuse the full-video audio cached on first refine
+            # for this video_id, slice locally with ffmpeg. Falls back to the
+            # per-clip windowed yt-dlp download only when the cache is unusable.
+            audio_path: Path | None = None
+            full = _ensure_full_video_audio(video_id)
+            if full is not None:
+                slice_out = tmpdir / f"{video_id}_{round(float(t_start), 1)}_{round(float(t_end), 1)}.wav"
+                audio_path = _slice_audio_for_clip(full, dl_start, dl_end, slice_out)
+            if audio_path is None:
+                audio_path = _download_clip_audio(video_id, dl_start, dl_end, tmpdir)
             if audio_path is None:
                 return None
             words = _call_whisper(audio_path, dl_start)
@@ -394,4 +619,6 @@ __all__ = [
     "WhisperRefinement",
     "refine_clip_with_whisper",
     "whisper_clip_refine_enabled",
+    "clip_audio_refine_conditional",
+    "should_use_clip_audio_refine",
 ]

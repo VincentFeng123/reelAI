@@ -2580,18 +2580,35 @@ def _apply_boundary_engine(
     # sentence-level boundaries stand.
     try:
         from .clip_whisper_refine import (
+            clip_audio_refine_conditional,
             refine_clip_with_whisper,
+            should_use_clip_audio_refine,
             whisper_clip_refine_enabled,
         )
     except Exception:
         refine_clip_with_whisper = None  # type: ignore[assignment]
         whisper_clip_refine_enabled = lambda: False  # type: ignore[assignment]
+        clip_audio_refine_conditional = lambda: True  # type: ignore[assignment]
+        should_use_clip_audio_refine = lambda _cues: True  # type: ignore[assignment]
 
     def _try_whisper_refine(r: TopicReel) -> None:
         if not whisper_clip_refine_enabled() or refine_clip_with_whisper is None:
             return
         if not r.video_id:
             return
+        # A1 gate: skip refinement when existing cues have trustworthy word
+        # timings (word_source in {"whisper", "whisperx", "whisper_aligned",
+        # "openai", "groq"} and dense gaps). Only fires when cues are
+        # proportional/legacy or the window looks sparse + stretched. Toggle
+        # off via CLIP_AUDIO_REFINE_CONDITIONAL=0 to restore blanket refinement.
+        if clip_audio_refine_conditional():
+            window_cues = [
+                c for c in cue_list
+                if float(getattr(c, "start", 0.0)) <= r.t_end
+                and float(getattr(c, "end", 0.0)) >= r.t_start
+            ]
+            if not should_use_clip_audio_refine(window_cues):
+                return
         try:
             result = refine_clip_with_whisper(
                 video_id=str(r.video_id),
