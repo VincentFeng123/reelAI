@@ -3398,17 +3398,6 @@ def _apply_boundary_engine(
                 r.video_id, r.t_start, r.t_end,
             )
 
-    # Parallel Whisper refinement. Cap workers at _WHISPER_REFINE_MAX_WORKERS
-    # — Railway has ~8 vCPU and each CT2 inference saturates ~1.5 cores.
-    if reels_for_whisper:
-        worker_count = max(1, min(_whisper_refine_max_workers(), len(reels_for_whisper)))
-        if worker_count == 1 or len(reels_for_whisper) == 1:
-            for r in reels_for_whisper:
-                _try_whisper_refine(r)
-        else:
-            with ThreadPoolExecutor(max_workers=worker_count) as pool:
-                list(pool.map(_try_whisper_refine, reels_for_whisper))
-
     # Phase 2.5 — soft punctuation snap. Runs when CLIP_PUNCT_SNAP_ENABLED=1
     # (default off for first audit cycle). Snaps picked boundaries to the
     # nearest SentenceSpan that fits [user_min, user_max]; no-op on failure.
