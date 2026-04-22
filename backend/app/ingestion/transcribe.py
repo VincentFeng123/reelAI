@@ -282,13 +282,87 @@ _VTT_TIMESTAMP_RE = re.compile(
     r"(\d{1,2}):(\d{2}):(\d{2})[.,](\d{3})\s+-->\s+(\d{1,2}):(\d{2}):(\d{2})[.,](\d{3})"
 )
 
+# Inline word-timestamp marker in YouTube auto-caption VTT, e.g. `<00:00:19.039>`.
+# Each marker is the START time of the word that follows in `<c>...</c>`.
+_VTT_CTAG_TIMESTAMP_RE = re.compile(r"<(\d{1,2}:\d{2}:\d{2}\.\d{3})>")
+
 
 def _vtt_time_to_seconds(h: str, m: str, s: str, ms: str) -> float:
     return int(h) * 3600 + int(m) * 60 + int(s) + int(ms) / 1000.0
 
 
+def _extract_ctag_words(cue_body: str, cue_end: float) -> list[IngestTranscriptWord]:
+    """
+    Parse YouTube auto-caption <c>-tag word timings from a VTT cue body.
+
+    Format (YouTube auto-captions only):
+
+        prefix_text<00:00:22.800><c> You</c><00:00:23.039><c> know</c>...
+
+    Each `<HH:MM:SS.mmm>` marker is the start time of the following `<c>`-tagged
+    word. The leading `prefix_text` is the rolling-caption duplicate of the
+    previous cue's content — we skip it (no trustworthy timestamp) and only
+    emit words that follow an explicit marker.
+
+    Returns `[]` when the cue body has no markers (SRT / manually authored
+    captions), letting the caller fall back to proportional word synthesis.
+    """
+    parts = _VTT_CTAG_TIMESTAMP_RE.split(cue_body)
+    # parts[0] = text before the first marker (no timestamp)
+    # parts[1::2] = timestamp strings HH:MM:SS.mmm
+    # parts[2::2] = text following each marker
+    if len(parts) < 3:
+        return []
+
+    items: list[tuple[float, str]] = []
+    for idx in range(1, len(parts), 2):
+        ts_str = parts[idx]
+        text_after = parts[idx + 1] if (idx + 1) < len(parts) else ""
+        cleaned = re.sub(r"<[^>]+>", "", text_after).replace("&nbsp;", " ").strip()
+        if not cleaned:
+            continue
+        try:
+            h, m, s_ms = ts_str.split(":")
+            sec_whole, sec_frac = s_ms.split(".")
+            t_sec = int(h) * 3600 + int(m) * 60 + int(sec_whole) + int(sec_frac) / 1000.0
+        except (ValueError, AttributeError):
+            continue
+        # A single marker occasionally precedes multiple whitespace-split tokens;
+        # share the start time across them rather than dropping the extras.
+        for tok in cleaned.split():
+            items.append((t_sec, tok))
+
+    if not items:
+        return []
+
+    words: list[IngestTranscriptWord] = []
+    for i, (start, tok) in enumerate(items):
+        end = items[i + 1][0] if (i + 1 < len(items)) else cue_end
+        if end <= start:
+            end = start + 0.05
+        try:
+            words.append(IngestTranscriptWord(start=start, end=end, text=tok))
+        except Exception:
+            continue
+    return words
+
+
 def _parse_vtt(text: str) -> list[IngestTranscriptCue]:
-    """Parse a WEBVTT or SRT payload into cues. Tolerant of minor format variants."""
+    """Parse a WEBVTT or SRT payload into cues. Tolerant of minor format variants.
+
+    Two paths, chosen by a cheap substring probe for `<c>` tags:
+
+    1. YouTube auto-caption VTT (contains `<c>` tags): each "new content" cue is
+       emitted once with clean text rebuilt from its `<c>`-tagged words and
+       `word_source="youtube_vtt"`. The rolling-caption duplicate cues (plain-
+       text repeats of the previous cue's content) are dropped — keeping them
+       would double-count text AND fire the A1 refine gate via their
+       `word_source="proportional"`.
+    2. SRT / manually-authored VTT (no `<c>` tags): unchanged pre-A behavior —
+       `_fill_proportional_words` synthesizes character-proportional timings
+       and `word_source="proportional"`, so the A1 refine gate still fires.
+    """
+    is_youtube_auto = "<c>" in text
     cues: list[IngestTranscriptCue] = []
     lines = text.splitlines()
     i = 0
@@ -302,17 +376,39 @@ def _parse_vtt(text: str) -> list[IngestTranscriptCue]:
         start = _vtt_time_to_seconds(*match.groups()[:4])
         end = _vtt_time_to_seconds(*match.groups()[4:])
         i += 1
-        buffer: list[str] = []
+        raw_lines: list[str] = []
+        cleaned_buffer: list[str] = []
         while i < n and lines[i].strip():
+            raw_lines.append(lines[i])
             clean = re.sub(r"<[^>]+>", "", lines[i])
             clean = clean.replace("&nbsp;", " ").strip()
             if clean:
-                buffer.append(clean)
+                cleaned_buffer.append(clean)
             i += 1
-        text_joined = " ".join(buffer).strip()
-        if text_joined:
-            cue = IngestTranscriptCue(start=start, end=max(end, start + 0.01), text=text_joined)
-            # VTT/SRT is segment-level; no native word timing. Fill proportional.
+        cue_end = max(end, start + 0.01)
+
+        if is_youtube_auto:
+            ctag_words = _extract_ctag_words("\n".join(raw_lines), cue_end=cue_end)
+            if not ctag_words:
+                # Rolling-caption duplicate — the next <c>-tagged cue carries this content.
+                continue
+            cue_text = " ".join(w.text.strip() for w in ctag_words).strip()
+            if not cue_text:
+                continue
+            cues.append(
+                IngestTranscriptCue(
+                    start=start,
+                    end=cue_end,
+                    text=cue_text,
+                    words=ctag_words,
+                    word_source="youtube_vtt",
+                )
+            )
+        else:
+            text_joined = " ".join(cleaned_buffer).strip()
+            if not text_joined:
+                continue
+            cue = IngestTranscriptCue(start=start, end=cue_end, text=text_joined)
             _fill_proportional_words(cue)
             cues.append(cue)
     return cues

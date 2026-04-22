@@ -125,6 +125,12 @@ MAX_CUES_FOR_LLM = 6000
 # the pre-Phase-3 per-topic LLM pick path (useful for A/B comparison on a
 # specific video without redeploying).
 _GLOBAL_LLM_RERANK_ENABLED = os.getenv("GLOBAL_LLM_RERANK_ENABLED", "true").lower() == "true"
+
+# Module-level cache of Silero VAD speech segments, keyed by video_id.
+# Each entry is a list of {"start": float_sec, "end": float_sec}. One
+# VAD pass per video (bundled with faster-whisper; ~2s for a 30-min video)
+# so Phase 2.6 can binary-search silence gaps for every reel in O(log N).
+_VAD_SPEECH_SEGMENTS_CACHE: dict[str, list[dict[str, float]]] = {}
 # Minimum fraction of a candidate's duration that must lie inside a TopicReel
 # for the candidate to REFINE that reel (vs. be emitted as a new "orphan" reel).
 _RANK_OVERLAP_RATIO = 0.40
@@ -2781,15 +2787,351 @@ def _apply_boundary_engine(
         # Parallel Whisper refinement cap. faster-whisper int8 inference
         # saturates ~1.5 cores per worker; 3 workers ≈ 4-5 cores on Railway
         # (8 vCPU), leaving headroom for ffmpeg slicing and the request loop.
+        # Audit-mode can go higher (Phase 2.6 narrow-snap dispatches 2N tasks
+        # and benefits from aggressive oversubscription); cap raised to 32.
         raw = os.environ.get("WHISPER_REFINE_MAX_WORKERS")
         if raw is None or not raw.strip():
             return 3
         try:
-            return max(1, min(8, int(raw)))
+            return max(1, min(32, int(raw)))
         except (TypeError, ValueError):
             return 3
 
     query_focus_tokens = _tokenize_for_relevance(query or "")
+
+    def _punct_snap_enabled() -> bool:
+        # Soft sibling of CLIP_SENTENCE_EDGE_ENFORCE. When on, the picked
+        # (t_start, t_end) is snapped to the nearest sentence-span boundaries
+        # that keep duration inside [user_min, user_max]; on failure the
+        # clip is left unchanged (no drop). Gated on trustworthy word_source
+        # — clips whose overlapping cues are `proportional`/`legacy` are
+        # skipped so we don't introduce inaccuracy from cue-derived starts.
+        # Default OFF for the first audit cycle; flip ON after it proves out.
+        raw = os.environ.get("CLIP_PUNCT_SNAP_ENABLED")
+        if raw is None or not raw.strip():
+            return False
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+    def _punct_snap_search_sec() -> float:
+        raw = os.environ.get("CLIP_PUNCT_SNAP_SEARCH_SEC")
+        if raw is None or not raw.strip():
+            return 3.0
+        try:
+            return max(0.5, float(raw))
+        except (TypeError, ValueError):
+            return 3.0
+
+    _TRUSTWORTHY_WORD_SOURCES = frozenset({
+        "youtube_vtt",
+        "whisper",
+        "whisperx",
+        "whisper_aligned",
+        "openai",
+        "groq",
+    })
+
+    def _snap_boundaries_to_punctuation_soft(r: TopicReel) -> None:
+        """Soft snap to sentence-span boundaries — no drop on failure.
+
+        Runs post-pick (after LLM / heuristic / engine + optional Whisper
+        refinement) when CLIP_PUNCT_SNAP_ENABLED=1. Only acts when every
+        cue overlapping the clip has a trustworthy `word_source` (YouTube
+        VTT <c>-tag, Whisper family, or paid-API outputs) — proportional
+        /legacy cues have cue-level start/end times and snapping to them
+        re-introduces the mid-word regression that blocked the hard gate.
+
+        On success: r.t_start / r.t_end land on a SentenceSpan start / end
+        whose duration fits user_min_sec..user_max_sec.
+        On failure: r is untouched.
+        """
+        if not _punct_snap_enabled():
+            return
+        if not sentences:
+            return
+
+        window_cues = [
+            c for c in cue_list
+            if float(getattr(c, "start", 0.0)) <= r.t_end
+            and float(getattr(c, "end", 0.0)) >= r.t_start
+        ]
+        if not window_cues:
+            return
+        for c in window_cues:
+            src = getattr(c, "word_source", "legacy")
+            if src not in _TRUSTWORTHY_WORD_SOURCES:
+                return
+
+        search_radius = _punct_snap_search_sec()
+        starts = [
+            s for s in sentences
+            if abs(float(s.t_start) - float(r.t_start)) <= search_radius
+        ]
+        if not starts:
+            return
+        terminal_ends = [
+            s for s in sentences if getattr(s, "terminal_punct", "") in {".", "!", "?", "…"}
+        ]
+        if not terminal_ends:
+            return
+
+        best_start = min(starts, key=lambda s: abs(float(s.t_start) - float(r.t_start)))
+        new_start = float(best_start.t_start)
+        candidate_ends = [
+            s for s in terminal_ends
+            if user_min_sec <= (float(s.t_end) - new_start) <= user_max_sec
+            and float(s.t_end) > new_start
+        ]
+        if not candidate_ends:
+            return
+        best_end = min(
+            candidate_ends,
+            key=lambda s: abs(float(s.t_end) - float(r.t_end)),
+        )
+        r.t_start = round(new_start, 3)
+        r.t_end = round(float(best_end.t_end), 3)
+
+    def _whisper_snap_enabled() -> bool:
+        # Narrow-Whisper boundary snap. When on, each picked reel's
+        # t_start / t_end is refined by running faster-whisper on ±radius
+        # seconds of audio around each boundary and snapping to the
+        # nearest word that begins a sentence (for t_start) or ends in
+        # terminal punctuation (for t_end). Independent of
+        # CLIP_PUNCT_SNAP_ENABLED — the soft-punct snap works from
+        # cue-level sentence spans (no Whisper), the narrow-Whisper snap
+        # works from acoustic ASR (costs one short Whisper call per
+        # boundary). Default OFF.
+        raw = os.environ.get("CLIP_WHISPER_SNAP_ENABLED")
+        if raw is None or not raw.strip():
+            return False
+        return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+    def _whisper_snap_radius_sec() -> float:
+        raw = os.environ.get("CLIP_WHISPER_SNAP_RADIUS_SEC")
+        if raw is None or not raw.strip():
+            return 10.0
+        try:
+            return max(1.0, min(30.0, float(raw)))
+        except (TypeError, ValueError):
+            return 10.0
+
+    def _get_vad_speech_segments(video_id: str) -> list[dict[str, float]]:
+        """Compute (and cache per video_id) Silero VAD speech segments in
+        absolute seconds. Returns [] on any failure (cache miss, decode
+        error, VAD import failure, etc.).
+
+        Silero VAD is bundled with faster-whisper — no extra dependency.
+        One pass per video (~2s for a 30-min video); subsequent snap queries
+        hit the cached list in O(N) — binary search possible if N grows big.
+        """
+        cached = _VAD_SPEECH_SEGMENTS_CACHE.get(video_id)
+        if cached is not None:
+            return cached
+        try:
+            from .clip_whisper_refine import _ensure_full_video_audio
+            from faster_whisper.audio import decode_audio
+            from faster_whisper.vad import get_speech_timestamps, VadOptions
+        except Exception:
+            _VAD_SPEECH_SEGMENTS_CACHE[video_id] = []
+            return []
+        full = _ensure_full_video_audio(video_id)
+        if full is None:
+            _VAD_SPEECH_SEGMENTS_CACHE[video_id] = []
+            return []
+        try:
+            audio = decode_audio(str(full), sampling_rate=16000)
+            # Treat silences >= 300ms as segment boundaries. Natural sentence
+            # pauses are typically 400-800ms; shorter gaps are within-sentence
+            # breaths. 300ms catches most sentence boundaries without merging
+            # comma-level pauses into long monologues.
+            opts = VadOptions(
+                threshold=0.5,
+                min_silence_duration_ms=300,
+                min_speech_duration_ms=250,
+                speech_pad_ms=0,
+            )
+            raw_segs = get_speech_timestamps(audio, vad_options=opts, sampling_rate=16000)
+            segs = [
+                {"start": float(s["start"]) / 16000.0, "end": float(s["end"]) / 16000.0}
+                for s in raw_segs
+            ]
+        except Exception:
+            logger.debug("silero VAD failed for %s", video_id, exc_info=True)
+            segs = []
+        _VAD_SPEECH_SEGMENTS_CACHE[video_id] = segs
+        return segs
+
+    def _vad_snap_start(video_id: str, cur_start: float, radius: float, min_gap_ms: float = 400.0) -> float | None:
+        """Snap t_start to the nearest Silero VAD speech-segment boundary
+        within ±radius seconds, restricted to boundaries that follow a silence
+        gap of at least `min_gap_ms` (a proxy for sentence-ending pause).
+
+        Returns None when no qualifying boundary is found — caller falls
+        through to narrow-Whisper or keeps the original t_start.
+        """
+        segs = _get_vad_speech_segments(video_id)
+        if not segs:
+            return None
+        best: float | None = None
+        best_delta = radius + 1.0
+        min_gap_s = min_gap_ms / 1000.0
+        for i, seg in enumerate(segs):
+            start = float(seg["start"])
+            # Gap before this segment = silence between prev.end and start.
+            # The very first segment has no preceding gap (start of video).
+            if i == 0:
+                gap = float("inf") if start > 0.1 else 0.0
+            else:
+                gap = start - float(segs[i - 1]["end"])
+            if gap < min_gap_s:
+                continue
+            delta = abs(start - cur_start)
+            if delta <= radius and delta < best_delta:
+                best_delta = delta
+                best = start
+        return best
+
+    def _vad_snap_end(video_id: str, cur_end: float, radius: float, min_gap_ms: float = 400.0) -> float | None:
+        """Snap t_end to the nearest VAD speech-segment end within ±radius,
+        restricted to boundaries followed by a silence gap ≥ min_gap_ms.
+        """
+        segs = _get_vad_speech_segments(video_id)
+        if not segs:
+            return None
+        best: float | None = None
+        best_delta = radius + 1.0
+        min_gap_s = min_gap_ms / 1000.0
+        for i, seg in enumerate(segs):
+            end = float(seg["end"])
+            # Gap after this segment = silence between end and next.start.
+            if i == len(segs) - 1:
+                gap = float("inf")  # end of video = implicit large gap
+            else:
+                gap = float(segs[i + 1]["start"]) - end
+            if gap < min_gap_s:
+                continue
+            delta = abs(end - cur_end)
+            if delta <= radius and delta < best_delta:
+                best_delta = delta
+                best = end
+        return best
+
+    def _refine_vad_pos_to_word_edge(video_id: str, vad_pos: float, kind: str) -> float:
+        """Run a ~3 s narrow Whisper pass around the VAD-determined sentence-
+        boundary position, then lock onto the exact word edge. Returns the
+        refined timestamp, or the original VAD position on any failure.
+
+        VAD's segment.end includes trailing silence/breath (caused ~300 ms
+        end_precision_ms regression in PR7h); VAD's segment.start is cleaner
+        but still ~80 ms off the Whisper word start. This refinement gives us
+        VAD's correct REGION (silence gap = sentence boundary) with Whisper's
+        WORD-EDGE precision — the combination the WhisperX paper prescribes.
+        """
+        words = _narrow_whisper_words(video_id, vad_pos, 1.5)
+        if not words:
+            return vad_pos
+        best: float | None = None
+        best_delta = 1.6
+        for w in words:
+            edge = float(w.start) if kind == "start" else float(w.end)
+            delta = abs(edge - vad_pos)
+            if delta < best_delta:
+                best_delta = delta
+                best = edge
+        return best if best is not None else vad_pos
+
+    def _narrow_whisper_words(video_id: str, center_sec: float, radius_sec: float) -> list[Any]:
+        """Transcribe a ±radius-second slice of the cached full-video audio
+        with faster-whisper and return absolute-time WhisperWord objects.
+
+        Returns [] on any failure (yt-dlp cache miss + fresh-download
+        failure, ffmpeg slice failure, Whisper import or load failure,
+        empty VAD output). Caller treats [] as "no snap possible, keep
+        original boundary".
+        """
+        try:
+            import tempfile
+            import shutil
+            from pathlib import Path
+            from .clip_whisper_refine import (
+                _ensure_full_video_audio,
+                _slice_audio_for_clip,
+                _faster_whisper_words,
+                WhisperWord,
+            )
+        except Exception:
+            return []
+        full = _ensure_full_video_audio(video_id)
+        if full is None:
+            return []
+        dl_start = max(0.0, center_sec - radius_sec)
+        dl_end = center_sec + radius_sec
+        tmpdir = Path(tempfile.mkdtemp(prefix="reelai_whsnap_"))
+        try:
+            slice_out = tmpdir / f"{video_id}_{int(dl_start*1000)}_{int(dl_end*1000)}.wav"
+            clip = _slice_audio_for_clip(full, dl_start, dl_end, slice_out)
+            if clip is None:
+                return []
+            rel_words = _faster_whisper_words(clip)
+            return [
+                WhisperWord(text=w.text, start=w.start + dl_start, end=w.end + dl_start)
+                for w in rel_words
+            ]
+        except Exception:
+            logger.debug("narrow-whisper slice failed for %s @ %.2f", video_id, center_sec, exc_info=True)
+            return []
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _narrow_snap_start_candidate(r: TopicReel, radius: float) -> float | None:
+        """Pure function: compute a snapped t_start via narrow Whisper at the
+        given radius, or return None if no real sentence-start predecessor is
+        visible in the window. Does not mutate `r`.
+
+        Scans for the nearest word whose predecessor ends in terminal punct
+        — a real sentence boundary. No `i == 0` fallback (blindly accepting
+        the first word regressed `starts_mid_word` in the PR7c audit). When
+        None is returned, the caller's progressive retry widens the radius.
+        """
+        if not r.video_id:
+            return None
+        cur_start = float(r.t_start)
+        words = _narrow_whisper_words(str(r.video_id), cur_start, radius)
+        if not words:
+            return None
+        best_delta = radius + 1.0
+        new_start: float | None = None
+        for i in range(1, len(words)):
+            prev_text = (words[i - 1].text or "").strip()
+            if not prev_text.endswith((".", "!", "?", "…")):
+                continue
+            delta = abs(float(words[i].start) - cur_start)
+            if delta < best_delta:
+                best_delta = delta
+                new_start = float(words[i].start)
+        return new_start
+
+    def _narrow_snap_end_candidate(r: TopicReel, radius: float) -> float | None:
+        """Pure function: compute a snapped t_end via narrow Whisper at the
+        given radius, or return None if no terminal-punct word sits in the
+        window. Does not mutate `r`.
+        """
+        if not r.video_id:
+            return None
+        cur_end = float(r.t_end)
+        words = _narrow_whisper_words(str(r.video_id), cur_end, radius)
+        if not words:
+            return None
+        best_delta = radius + 1.0
+        new_end: float | None = None
+        for w in words:
+            text_strip = (w.text or "").strip()
+            if not text_strip or not text_strip.endswith((".", "!", "?", "…")):
+                continue
+            delta = abs(float(w.end) - cur_end)
+            if delta < best_delta:
+                best_delta = delta
+                new_end = float(w.end)
+        return new_end
 
     def _enforce_sentence_edges(r: TopicReel) -> bool:
         """Hard gate: re-snap the clip to the nearest valid sentence pair
@@ -3056,6 +3398,166 @@ def _apply_boundary_engine(
                 r.video_id, r.t_start, r.t_end,
             )
 
+    # Parallel Whisper refinement. Cap workers at _WHISPER_REFINE_MAX_WORKERS
+    # — Railway has ~8 vCPU and each CT2 inference saturates ~1.5 cores.
+    if reels_for_whisper:
+        worker_count = max(1, min(_whisper_refine_max_workers(), len(reels_for_whisper)))
+        if worker_count == 1 or len(reels_for_whisper) == 1:
+            for r in reels_for_whisper:
+                _try_whisper_refine(r)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                list(pool.map(_try_whisper_refine, reels_for_whisper))
+
+    # Phase 2.5 — soft punctuation snap. Runs when CLIP_PUNCT_SNAP_ENABLED=1
+    # (default off for first audit cycle). Snaps picked boundaries to the
+    # nearest SentenceSpan that fits [user_min, user_max]; no-op on failure.
+    # Only fires for clips whose overlapping cues are all trustworthy word
+    # sources — avoids the cue-derived starts that caused the 3× regression
+    # in the hard CLIP_SENTENCE_EDGE_ENFORCE gate.
+    for r in reels:
+        _snap_boundaries_to_punctuation_soft(r)
+
+    # Phase 2.6 — millisecond-precision acoustic snap. Two-tier strategy:
+    #
+    #   Tier 1 (VAD): Silero Voice Activity Detector (bundled with
+    #     faster-whisper) runs ONCE per video on the cached full-video
+    #     audio, finding speech segments separated by silence gaps. For
+    #     each reel boundary, snap to the nearest segment edge that follows
+    #     (for start) or precedes (for end) a silence gap ≥ 400 ms — a
+    #     reliable proxy for a sentence-ending pause in lectures/speeches.
+    #     VAD is ~1 ms per 30 ms audio chunk: a 30-min video processes in
+    #     ~2 s total. Binary-searchable and trivially parallel.
+    #
+    #   Tier 2 (Whisper fallback): when VAD finds no qualifying silence gap
+    #     within ±15 s (rare — happens for dense speech), fall back to the
+    #     narrow-Whisper progressive scan (3 s → 8 s → 15 s) which looks
+    #     for terminal-punct predecessors. Much slower but catches cases
+    #     VAD misses.
+    #
+    # Runs when CLIP_WHISPER_SNAP_ENABLED=1. The silence-gap-first approach
+    # is ~100× faster than running Whisper on every boundary (no 6-30 s
+    # transcription slices for 95%+ of boundaries) and lands on actual
+    # acoustic silence — the most natural place to cut for clip editing.
+    if _whisper_snap_enabled() and reels:
+        vad_radius = 15.0
+        vad_min_gap_ms = 400.0
+
+        start_results: dict[int, float | None] = {}
+        end_results: dict[int, float | None] = {}
+        pending_start: list[int] = []
+        pending_end: list[int] = []
+
+        # Tier 1a: VAD locates the nearest sentence-boundary silence gap.
+        # Tier 1b: narrow-Whisper refines the VAD position to the exact
+        # word edge (VAD alone overshoots word end by ~300 ms — see PR7h).
+        # Collect refinement tasks upfront so Tier 1b runs in parallel.
+        refine_tasks: list[tuple[str, int, str, float]] = []  # (kind, idx, video_id, vad_pos)
+        for idx, r in enumerate(reels):
+            if not r.video_id:
+                pending_start.append(idx)
+                pending_end.append(idx)
+                continue
+            vid = str(r.video_id)
+            s = _vad_snap_start(vid, float(r.t_start), vad_radius, vad_min_gap_ms)
+            e = _vad_snap_end(vid, float(r.t_end), vad_radius, vad_min_gap_ms)
+            if s is not None:
+                refine_tasks.append(("start", idx, vid, s))
+            else:
+                pending_start.append(idx)
+            if e is not None:
+                refine_tasks.append(("end", idx, vid, e))
+            else:
+                pending_end.append(idx)
+
+        # Tier 1b: parallel Whisper refinement on ~3 s windows around each
+        # VAD-picked position. Small slices = cheap; parallel dispatch keeps
+        # wall-clock flat as reel count grows.
+        if refine_tasks:
+            cap_1b = _whisper_refine_max_workers()
+            worker_count_1b = max(1, min(cap_1b, 16, len(refine_tasks)))
+
+            def _run_refine(task: tuple[str, int, str, float]) -> tuple[str, int, float]:
+                kind, i, vid, vad_pos = task
+                return (kind, i, _refine_vad_pos_to_word_edge(vid, vad_pos, kind))
+
+            if worker_count_1b == 1 or len(refine_tasks) == 1:
+                refine_results = [_run_refine(t) for t in refine_tasks]
+            else:
+                with ThreadPoolExecutor(max_workers=worker_count_1b) as pool:
+                    refine_results = list(pool.map(_run_refine, refine_tasks))
+            for kind, i, val in refine_results:
+                if kind == "start":
+                    start_results[i] = val
+                else:
+                    end_results[i] = val
+
+        # Tier 2: Whisper fallback for boundaries VAD couldn't snap. Only
+        # runs on the residual set, so wall-clock stays small.
+        if pending_start or pending_end:
+            progressive_radii = [3.0, 8.0, 15.0]
+            worker_ramp = [8, 16, 24]
+            cap = _whisper_refine_max_workers()
+
+            for pass_idx, radius in enumerate(progressive_radii):
+                if not pending_start and not pending_end:
+                    break
+                tasks: list[tuple[str, int]] = (
+                    [("start", i) for i in pending_start]
+                    + [("end", i) for i in pending_end]
+                )
+                if not tasks:
+                    break
+
+                def _run(task: tuple[str, int], _radius: float = radius) -> tuple[str, int, float | None]:
+                    kind, i = task
+                    reel = reels[i]
+                    if kind == "start":
+                        return (kind, i, _narrow_snap_start_candidate(reel, _radius))
+                    return (kind, i, _narrow_snap_end_candidate(reel, _radius))
+
+                worker_count = max(1, min(cap, worker_ramp[pass_idx], len(tasks)))
+                if worker_count == 1 or len(tasks) == 1:
+                    pass_results = [_run(t) for t in tasks]
+                else:
+                    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                        pass_results = list(pool.map(_run, tasks))
+
+                next_pending_start: list[int] = []
+                next_pending_end: list[int] = []
+                for kind, i, val in pass_results:
+                    if val is not None:
+                        if kind == "start":
+                            start_results[i] = val
+                        else:
+                            end_results[i] = val
+                    else:
+                        if kind == "start":
+                            next_pending_start.append(i)
+                        else:
+                            next_pending_end.append(i)
+                pending_start = next_pending_start
+                pending_end = next_pending_end
+
+        for idx, r in enumerate(reels):
+            cur_start = float(r.t_start)
+            cur_end = float(r.t_end)
+            candidate_start = start_results.get(idx)
+            candidate_end = end_results.get(idx)
+            final_start = candidate_start if candidate_start is not None else cur_start
+            final_end = candidate_end if candidate_end is not None else cur_end
+            if final_start == cur_start and final_end == cur_end:
+                continue
+            new_dur = final_end - final_start
+            if new_dur < user_min_sec or new_dur > user_max_sec:
+                continue
+            if final_end <= final_start:
+                continue
+            r.t_start = round(final_start, 3)
+            r.t_end = round(final_end, 3)
+            if r.boundary_quality != "whisper-word":
+                r.boundary_quality = "whisper-word"
+
     refined: list[TopicReel] = []
     dropped_no_sentence_edge = 0
     for r in reels:
@@ -3099,6 +3601,79 @@ def _apply_boundary_engine(
 
     refined.sort(key=lambda rr: rr.final_rank_score, reverse=True)
     return refined
+
+
+def _try_yt_dlp_vtt_precision(
+    video_id: str,
+    language: str = "en",
+    timeout_sec: int = 20,
+) -> list[Any] | None:
+    """
+    Captions-first fast path for `cut_video_into_topic_reels`.
+
+    Downloads YouTube's auto-caption VTT via yt-dlp (`--write-auto-sub
+    --skip-download`) and parses the inline `<c>`-tag word timestamps into
+    `IngestTranscriptCue` objects with `word_source="youtube_vtt"`. The
+    returned cues close the A1 refine gate in `should_use_clip_audio_refine`,
+    so the per-clip Whisper refinement step is skipped on captioned videos —
+    the main speed unlock for long-form audits.
+
+    Returns `None` (caller falls through to `fetch_transcript`) when:
+      * `yt_dlp` or the ingestion `_parse_vtt` import fails;
+      * yt-dlp produces no `.vtt` file (no captions, live stream, age-gated, …);
+      * the VTT has no `<c>` tags (manually-authored captions: cue-level only).
+    """
+    try:
+        import tempfile
+        import shutil
+        import yt_dlp  # type: ignore[import-untyped]
+        from ..ingestion.transcribe import _parse_vtt
+    except Exception:
+        return None
+
+    tmpdir = tempfile.mkdtemp(prefix="reelai_vttp_")
+    try:
+        ydl_opts: dict[str, Any] = {
+            # `writesubtitles=False`: skip the manually-authored track. When
+            # a video has BOTH manual and auto, yt-dlp prefers manual — but
+            # manual VTT has no <c>-tag word timings, so the A1 gate would
+            # still fire. We explicitly want the auto track for its inline
+            # word timestamps; videos without auto captions fall through.
+            "writesubtitles": False,
+            "writeautomaticsub": True,
+            "subtitleslangs": [language],
+            "subtitlesformat": "vtt",
+            "skip_download": True,
+            "outtmpl": os.path.join(tmpdir, f"{video_id}.%(ext)s"),
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": timeout_sec,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
+        vtt_files = [f for f in os.listdir(tmpdir) if f.endswith(".vtt")]
+        if not vtt_files:
+            return None
+        with open(os.path.join(tmpdir, vtt_files[0]), "r", encoding="utf-8") as f:
+            body = f.read()
+        cues = _parse_vtt(body)
+        if not cues:
+            return None
+        # Require at least one cue with real word-level data. Manually-authored
+        # captions (no <c> tags) fall through to `fetch_transcript` so we don't
+        # regress precision on videos where the existing API path already works.
+        if not any(getattr(c, "word_source", "") == "youtube_vtt" for c in cues):
+            return None
+        return cues
+    except Exception:
+        logger.debug("yt-dlp VTT precision fetch failed for %s", video_id, exc_info=True)
+        return None
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
@@ -3170,7 +3745,20 @@ def cut_video_into_topic_reels(
     # duration_sec is missing) and for the actual segmentation. Skip the
     # network call if the caller already has cues in hand.
     if transcript is None:
-        transcript = fetch_transcript(video_id)
+        # Captions-first fast path: when the caller hasn't supplied either a
+        # transcript or word-level precision cues, try YouTube auto-caption
+        # VTT with <c>-tag word timings. One network call gives us both the
+        # cue-level transcript AND the word-level `ingest_cues_for_precision`
+        # the A1 refine gate needs — so per-clip Whisper refinement is skipped
+        # on captioned videos. Falls through to `fetch_transcript` silently
+        # when VTT is unavailable or has no <c> tags.
+        if ingest_cues_for_precision is None:
+            precision_cues = _try_yt_dlp_vtt_precision(video_id)
+            if precision_cues:
+                transcript = cues_from_ingest_cues(precision_cues)
+                ingest_cues_for_precision = precision_cues
+        if transcript is None:
+            transcript = fetch_transcript(video_id)
     else:
         transcript = list(transcript)
 
