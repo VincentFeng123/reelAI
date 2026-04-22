@@ -26,6 +26,7 @@ from curl_cffi.requests.exceptions import (
     Timeout,
 )
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import GenericProxyConfig
 from youtube_transcript_api._errors import (
     NoTranscriptFound,
     TranscriptsDisabled,
@@ -455,9 +456,16 @@ class YouTubeService:
             )
 
         # ---- Transcript API with optional proxy ----------------------------
+        # youtube-transcript-api 1.x replaced the legacy `proxies={...}`
+        # constructor kwarg with a typed `proxy_config=` accepting a
+        # GenericProxyConfig (or WebshareProxyConfig). The previous dict
+        # form raises TypeError on import-time __init__, so booting with
+        # PROXY_URLS set crashes the whole service.
         if self._proxy_transcripts and self._proxy_rotator.available:
             first_proxy = self._proxy_rotator.all()[0]
-            self.transcript_api = YouTubeTranscriptApi(proxies={"https": first_proxy, "http": first_proxy})
+            self.transcript_api = YouTubeTranscriptApi(
+                proxy_config=GenericProxyConfig(http_url=first_proxy, https_url=first_proxy)
+            )
         else:
             self.transcript_api = YouTubeTranscriptApi()
 
