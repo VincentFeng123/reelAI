@@ -29,8 +29,20 @@ from .segmenter import (
 )
 from .topic_expansion import TopicExpansionService
 from .transcript_validation import TranscriptQuality, validate_transcript
+from .query_intent import QueryIntent, classify_query
+from .segment_features import VideoFeatureBundle, extract_features
+from .importance_ranker import RankedSegment, rank_segments, select_clips
 
 logger = logging.getLogger(__name__)
+
+
+def _importance_ranker_enabled() -> bool:
+    """Read ``REELS_IMPORTANCE_RANKER_ENABLED`` env flag (default off)."""
+    raw = os.environ.get("REELS_IMPORTANCE_RANKER_ENABLED", "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_IMPORTANCE_TARGET_N = {"narrow": 2, "broad": 5, "medium": 3, "none": 3}
 
 
 # Playback padding applied to the ends of every refined reel window.
@@ -2955,6 +2967,8 @@ class ReelService:
                     subject_tag=subject_tag,
                     require_context=bool(context_terms) and vague_topic,
                     fast_mode=fast_mode,
+                    query_text=query_candidate.text or concept_plan.literal_query.text,
+                    video_duration_sec=float(video_duration) if video_duration else None,
                 )
                 if not segment_candidates:
                     continue
@@ -9995,7 +10009,34 @@ class ReelService:
         subject_tag: str | None,
         require_context: bool,
         fast_mode: bool,
+        *,
+        query_text: str | None = None,
+        video_duration_sec: float | None = None,
     ) -> list[tuple[SegmentMatch, dict[str, Any]]]:
+        flag_on = _importance_ranker_enabled()
+        intent: QueryIntent | None = None
+        bundle: VideoFeatureBundle | None = None
+        ranked_by_chunk: dict[int, RankedSegment] = {}
+        if flag_on and segments and query_text is not None:
+            try:
+                intent = classify_query(query_text)
+                bundle = extract_features(
+                    segments,
+                    self.embedding_service,
+                    nlp=None,
+                    video_duration=float(video_duration_sec or 0.0),
+                    conn=conn,
+                )
+                ranked_list = rank_segments(
+                    segments, bundle, intent,
+                    embedder=self.embedding_service, conn=conn,
+                )
+                ranked_by_chunk = {r.match.chunk_index: r for r in ranked_list}
+            except Exception:
+                logger.exception("importance ranker failed; falling back to legacy fusion")
+                ranked_by_chunk = {}
+                intent = None
+
         ranked: list[tuple[SegmentMatch, dict[str, Any]]] = []
         for segment in segments:
             relevance = self._score_text_relevance(
@@ -10015,7 +10056,26 @@ class ReelService:
             if not passes:
                 continue
 
-            combined_score = 0.65 * float(segment.score) + 0.35 * float(relevance["score"])
+            ranked_seg = ranked_by_chunk.get(segment.chunk_index)
+            if ranked_seg is not None and intent is not None:
+                if intent.type == "none":
+                    combined_score = (
+                        0.50 * float(segment.score)
+                        + 0.50 * float(ranked_seg.importance)
+                    )
+                else:
+                    combined_score = (
+                        0.30 * float(segment.score)
+                        + 0.20 * float(relevance["score"])
+                        + 0.50 * float(ranked_seg.importance)
+                    )
+                relevance["importance"] = float(ranked_seg.importance)
+                relevance["importance_components"] = dict(ranked_seg.components)
+                relevance["intent"] = intent.type
+                relevance["cluster_id"] = ranked_seg.cluster_id
+            else:
+                combined_score = 0.65 * float(segment.score) + 0.35 * float(relevance["score"])
+
             ranked.append(
                 (
                     SegmentMatch(
@@ -10024,10 +10084,27 @@ class ReelService:
                         t_end=segment.t_end,
                         text=segment.text,
                         score=combined_score,
+                        source=getattr(segment, "source", "legacy"),
+                        cluster_group_id=getattr(segment, "cluster_group_id", ""),
+                        cluster_sub_index=getattr(segment, "cluster_sub_index", 0),
+                        cluster_is_last=getattr(segment, "cluster_is_last", False),
                     ),
                     relevance,
                 )
             )
+
+        if ranked_by_chunk and intent is not None:
+            allowed_ids = {
+                r.match.chunk_index
+                for r in select_clips(
+                    list(ranked_by_chunk.values()), intent,
+                    target_n=_IMPORTANCE_TARGET_N.get(intent.type, 3),
+                )
+            }
+            if allowed_ids:
+                filtered = [row for row in ranked if row[0].chunk_index in allowed_ids]
+                if filtered:
+                    ranked = filtered
 
         ranked.sort(key=lambda row: row[0].score, reverse=True)
         return ranked

@@ -1,0 +1,36 @@
+video_id,content_type,target_query,transcript_kind,clip_index,t_start,t_end,duration_sec,label,boundary_quality,whisper_first_word,whisper_last_word,start_precision_ms,end_precision_ms,starts_mid_word,ends_mid_sentence,starts_on_filler,is_usable,error,opens_on_topic,topic_concentration,has_definition,structural_label,discourse_marker_density,usable_clip
+WUvTyaaNkzM,lecture,essence of calculus,manual,1,14.98,42.202,27.221999999999998,Might Lead Maybe,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,True,intro,4.25531914893617,True
+WUvTyaaNkzM,lecture,essence of calculus,manual,2,14.98,57.352,42.372,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,True,intro,2.857142857142857,True
+WUvTyaaNkzM,lecture,essence of calculus,manual,3,14.98,36.564,21.584,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,True,intro,5.194805194805195,True
+aircAruvnKk,lecture,neural network,manual,1,66.652,106.023,39.370999999999995,Neural Network,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,True,substantive,1.3986013986013985,True
+aircAruvnKk,lecture,neural network,manual,2,66.652,100.604,33.952,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,True,substantive,1.6,True
+aircAruvnKk,lecture,neural network,manual,3,272.674,303.515,30.841000000000008,Loop Top Subcomponents,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,2.1739130434782608,True
+aircAruvnKk,lecture,neural network,manual,4,974.886,1008.214,33.32800000000009,Function Relu Vector,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,3.6036036036036037,True
+IHZwWFHWa-w,lecture,gradient descent,manual,1,442.063,474.182,32.11900000000003,Should Step Slope,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,False,substantive,0.0,True
+IHZwWFHWa-w,lecture,gradient descent,manual,2,442.063,480.595,38.53200000000004,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,False,substantive,0.0,True
+IHZwWFHWa-w,lecture,gradient descent,manual,3,678.752,722.551,43.79900000000009,Network Doing,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,True,substantive,1.5151515151515151,True
+IHZwWFHWa-w,lecture,gradient descent,manual,4,750.331,793.643,43.31200000000001,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,True,substantive,0.0,True
+d4EgbgTm0Bg,lecture,quaternions,manual,1,168.993,192.219,23.226,Quantum Mechanics Discovery,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.0,True
+d4EgbgTm0Bg,lecture,quaternions,manual,2,168.993,205.613,36.620000000000005,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.9009009009009009,True
+d4EgbgTm0Bg,lecture,quaternions,manual,3,1269.41,1312.766,43.355999999999995,Real Part,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.847457627118644,True
+d4EgbgTm0Bg,lecture,quaternions,manual,4,1269.41,1306.542,37.131999999999834,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.0,True
+d4EgbgTm0Bg,lecture,quaternions,manual,5,1291.76,1345.944,54.18399999999997,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.6993006993006993,True
+b7FxPsqfkOY,lecture,complex numbers,manual,1,1194.773,1228.492,33.71900000000005,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,False,substantive,2.2222222222222223,True
+b7FxPsqfkOY,lecture,complex numbers,manual,2,1213.283,1234.873,21.590000000000146,Winding Numbers,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,recap,1.639344262295082,True
+b7FxPsqfkOY,lecture,complex numbers,manual,3,1284.923,1327.141,42.218000000000075,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.0,True
+b7FxPsqfkOY,lecture,complex numbers,manual,4,1291.283,1327.141,35.858000000000175,Theorem Algebra Term,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.0,True
+UF8uR6Z6KLc,speech,stay hungry stay foolish,manual,1,837.909,871.651,33.74199999999996,Stay Hungry,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,False,substantive,0.0,True
+UF8uR6Z6KLc,speech,stay hungry stay foolish,manual,2,837.909,859.373,21.464000000000055,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,False,substantive,0.0,True
+UF8uR6Z6KLc,speech,stay hungry stay foolish,manual,3,837.909,870.107,32.19799999999998,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,False,substantive,0.0,True
+iG9CE55wbtY,speech,creativity in schools,manual,1,37.269,67.223,29.954,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,True,substantive,1.1363636363636365,True
+iG9CE55wbtY,speech,creativity in schools,manual,2,43.096,67.223,24.127000000000002,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,True,substantive,1.2048192771084338,True
+iG9CE55wbtY,speech,creativity in schools,manual,3,171.845,216.59,44.745000000000005,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,True,substantive,0.8547008547008548,True
+iG9CE55wbtY,speech,creativity in schools,manual,4,182.041,203.788,21.747000000000014,Work Education,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,True,substantive,0.0,True
+iCvmsMzlF7o,speech,vulnerability shame,manual,1,308.278,354.11,45.831999999999994,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.0,True
+iCvmsMzlF7o,speech,vulnerability shame,manual,2,308.278,356.897,48.61899999999997,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.0,True
+iCvmsMzlF7o,speech,vulnerability shame,manual,3,321.174,354.11,32.936000000000035,When Ask Enough,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,False,1.0,False,substantive,0.0,True
+iCvmsMzlF7o,speech,vulnerability shame,manual,4,851.125,871.378,20.253000000000043,Said Therapist Breakdown,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,5.084745762711865,True
+8KkKuTCFvzI,speech,good life relationships,manual,1,12.756,50.328,37.572,,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.0,True
+8KkKuTCFvzI,speech,good life relationships,manual,2,26.602,50.328,23.726000000000003,We've Tracked Asking Through,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.0,True
+8KkKuTCFvzI,speech,good life relationships,manual,3,369.912,393.433,23.521000000000015,These Teenagers Lonely,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,2.380952380952381,True
+8KkKuTCFvzI,speech,good life relationships,manual,4,507.048,553.976,46.928,Count Other Relationships,llm-rerank,,,-1.0,-1.0,False,False,False,False,download_failed,True,1.0,False,substantive,0.8264462809917356,True

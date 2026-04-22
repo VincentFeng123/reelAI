@@ -70,8 +70,18 @@ from typing import Any, Iterable, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from .transcript_validation import TranscriptQuality, validate_transcript
+from .structural_classifier import classify_passage, label_penalty
+
+
+def _topic_cut_importance_flag() -> bool:
+    """Mirror of ``reels._importance_ranker_enabled`` — kept local to avoid
+    importing reels.py (heavy dependency tree) just for one env read.
+    """
+    raw = os.environ.get("REELS_IMPORTANCE_RANKER_ENABLED", "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 logger = logging.getLogger(__name__)
+_STRUCTURAL_SKIP_LABELS = {"sponsor", "outro", "intro", "recap"}
 
 
 # --------------------------------------------------------------------------- #
@@ -441,6 +451,27 @@ def fetch_transcript(
     pipeline caches at the DB level via `transcript_cache`; this CLI is meant
     to run standalone, so it doesn't touch the DB).
     """
+    # Production fallback chain: youtube_transcript_api → Innertube →
+    # yt-dlp subtitles → local Whisper. Reuse it here so `topic_cut` behaves
+    # like the main backend instead of hard-failing on an IP block.
+    try:
+        from ..db import get_conn
+        from .youtube import YouTubeService
+    except Exception:
+        get_conn = None  # type: ignore[assignment]
+        YouTubeService = None  # type: ignore[assignment]
+
+    if get_conn is not None and YouTubeService is not None:
+        try:
+            service = YouTubeService()
+            with get_conn() as conn:
+                raw = list(service.get_transcript(conn, video_id) or [])
+            cues = _coerce_to_cues(raw)
+            if cues:
+                return cues
+        except Exception:  # noqa: BLE001
+            logger.exception("transcript service fetch failed for video_id=%s", video_id)
+
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
         from youtube_transcript_api._errors import (
@@ -1880,19 +1911,32 @@ def _filter_reels_by_query(
     has_specific_query = len(query_tokens) >= 3
     llm_weight = 0.70 if (has_strong_transcript and has_specific_query) else 0.30
 
-    # Build transcript text for each reel.
-    reel_transcripts: list[str] = []
-    for reel in reels:
-        transcript_text = ""
+    def _reel_text(reel: TopicReel) -> str:
+        pieces: list[str] = []
+        for cue in cues:
+            mid = 0.5 * (cue.start + cue.end)
+            if mid < reel.t_start:
+                continue
+            if mid > reel.t_end:
+                break
+            if cue.text:
+                pieces.append(cue.text)
+        if pieces:
+            return " ".join(pieces)
         if reel.cue_start_idx >= 0 and reel.cue_end_idx >= 0:
-            transcript_text = " ".join(
+            return " ".join(
                 cues[i].text
                 for i in range(
                     max(0, reel.cue_start_idx),
                     min(len(cues), reel.cue_end_idx + 1),
                 )
             )
-        reel_transcripts.append(transcript_text)
+        return ""
+
+    # Build transcript text for each reel.
+    reel_transcripts: list[str] = []
+    for reel in reels:
+        reel_transcripts.append(_reel_text(reel))
 
     # Try semantic scoring (free, local sentence-transformer)
     semantic_scores = _compute_semantic_scores(query, reel_transcripts)
@@ -1921,6 +1965,22 @@ def _filter_reels_by_query(
         scored.append((combined, reel))
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    # Importance-ranker enrichment: hard-skip structural boilerplate when the
+    # flag is on. Structural classifier runs on the reel's transcript text
+    # (not the LLM-assigned label) so a "Patreon thanks" passage labeled
+    # "review" by the LLM still gets caught.
+    if _topic_cut_importance_flag() and reel_transcripts:
+        transcript_by_reel = {id(reel): reel_transcripts[i] for i, reel in enumerate(reels)}
+        survivors: list[tuple[float, TopicReel]] = []
+        for score, reel in scored:
+            text = transcript_by_reel.get(id(reel), "") or ""
+            label = classify_passage(text)
+            if label.name in _STRUCTURAL_SKIP_LABELS:
+                continue
+            survivors.append((score, reel))
+        if survivors:
+            scored = survivors
 
     # Keep reels above the relevance threshold.
     kept = [reel for score, reel in scored if score >= _MIN_QUERY_RELEVANCE]
@@ -1963,6 +2023,11 @@ def _find_sentence_end_cue(
             if i > 0 and _SENTENCE_END_RE.search(cues[i - 1].text.strip()):
                 return i
     return None
+
+
+def _ends_with_terminal_punct(text: str) -> bool:
+    stripped = (text or "").strip().rstrip("\"')]}")
+    return bool(stripped) and stripped[-1] in ".?!"
 
 
 def _snap_segments_to_cues(
@@ -2375,6 +2440,98 @@ def distribute_ranked_to_topic_reels(
     return updated, covered_ids
 
 
+def _rerank_phase3_candidates_by_importance(
+    candidates: Sequence[Any],
+    *,
+    query: str | None,
+    sentences: Sequence[Any],
+    video_duration_sec: float | None,
+    embedder: Any | None,
+    target_count: int,
+) -> list[Any]:
+    """Pre-rank phase-3 candidates using the local importance ranker.
+
+    This narrows the LLM rerank pool to transcript windows that are both
+    salient and structurally substantive. The LLM still makes the final pick;
+    this step just stops obvious intro/recap fluff and low-importance windows
+    from crowding the prompt.
+    """
+    if not _topic_cut_importance_flag() or not query or not candidates:
+        return list(candidates)
+    try:
+        from .importance_ranker import rank_segments
+        from .query_intent import classify_query
+        from .segment_features import extract_features
+        from .segmenter import SegmentMatch
+    except Exception:
+        logger.exception("phase3 importance imports failed; keeping raw candidate order")
+        return list(candidates)
+
+    segs: list[Any] = []
+    cand_by_chunk: dict[int, Any] = {}
+    for idx, cand in enumerate(candidates):
+        try:
+            start_idx = int(getattr(cand, "start_sentence_idx"))
+            end_idx = int(getattr(cand, "end_sentence_idx"))
+            t_start = float(getattr(cand, "t_start"))
+            t_end = float(getattr(cand, "t_end"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        sent_slice = list(sentences[max(0, start_idx) : end_idx + 1])
+        text = " ".join(str(getattr(s, "text", "") or "").strip() for s in sent_slice).strip()
+        if not text:
+            continue
+        segs.append(SegmentMatch(
+            chunk_index=idx,
+            t_start=t_start,
+            t_end=t_end,
+            text=text,
+            score=float(getattr(cand, "combined_score", 0.0) or 0.0),
+            source="topic_cut",
+        ))
+        cand_by_chunk[idx] = cand
+
+    if not segs:
+        return list(candidates)
+
+    try:
+        intent = classify_query(query)
+        bundle = extract_features(
+            segs,
+            embedder,
+            nlp=None,
+            video_duration=float(video_duration_sec or 0.0),
+            conn=None,
+        )
+        ranked = rank_segments(segs, bundle, intent, embedder=embedder, conn=None)
+    except Exception:
+        logger.exception("phase3 importance ranking failed; keeping raw candidate order")
+        return list(candidates)
+
+    survivors: list[Any] = []
+    seen_chunks: set[int] = set()
+    keep_n = min(len(candidates), max(target_count * 3, target_count))
+    for ranked_seg in ranked:
+        chunk_idx = int(ranked_seg.match.chunk_index)
+        cand = cand_by_chunk.get(chunk_idx)
+        if cand is None or chunk_idx in seen_chunks:
+            continue
+        if ranked_seg.features.structural_label in _STRUCTURAL_SKIP_LABELS:
+            continue
+        # Feed the LLM reranker a stronger relevance prior that mixes the
+        # existing heuristic signal with the query-aware importance score.
+        raw_rel = float(getattr(cand, "relevance_score", 0.0) or 0.0)
+        cand.relevance_score = max(raw_rel, float(ranked_seg.importance))
+        survivors.append(cand)
+        seen_chunks.add(chunk_idx)
+        if len(survivors) >= keep_n:
+            break
+
+    if survivors:
+        return survivors
+    return list(candidates[:keep_n])
+
+
 def _apply_boundary_engine(
     reels: list[TopicReel],
     *,
@@ -2474,12 +2631,14 @@ def _apply_boundary_engine(
     # topic reels. On Vercel (serverless) this returns a hash-embed
     # function automatically; heuristic scoring still runs, just weaker.
     _embed_func: Any | None = None
+    _embedder: Any | None = None
     try:
         from .embeddings import EmbeddingService
-        _svc = EmbeddingService()
-        _embed_func = _svc.embed_local
+        _embedder = EmbeddingService()
+        _embed_func = _embedder.embed_local
     except Exception:
         _embed_func = None
+        _embedder = None
 
     def _try_llm_pick(r: TopicReel) -> bool:
         """Return True when the LLM-direct path successfully set r.t_start
@@ -2599,13 +2758,11 @@ def _apply_boundary_engine(
         should_use_clip_audio_refine = lambda _cues: True  # type: ignore[assignment]
 
     def _sentence_edge_enforce_enabled() -> bool:
-        # Default OFF — audit_after_A3_partial showed a 3x regression in
-        # starts_mid_word when the hard gate snapped to SentenceSpan.t_start,
-        # which is cue-level (not word-acoustic) for auto-caption paths and
-        # threw away A1's word-level refinement (+60-300ms shift per clip).
-        # Re-enable per-deploy with CLIP_SENTENCE_EDGE_ENFORCE=1 once the gate
-        # is rewritten to use word-level timestamps for the first word of the
-        # target sentence rather than SentenceSpan.t_start directly.
+        # Default OFF — this is an accuracy-first gate that can drop clips
+        # whose nearest clean sentence pair sits too far from the picker
+        # output. When enabled, it now reuses `snap_llm_boundary(...)` so the
+        # enforced pair keeps the same word-level trim logic as the LLM path
+        # instead of reverting to raw sentence timestamps.
         raw = os.environ.get("CLIP_SENTENCE_EDGE_ENFORCE")
         if raw is None or not raw.strip():
             return False
@@ -2632,50 +2789,50 @@ def _apply_boundary_engine(
         except (TypeError, ValueError):
             return 3
 
+    query_focus_tokens = _tokenize_for_relevance(query or "")
+
     def _enforce_sentence_edges(r: TopicReel) -> bool:
-        """Hard gate: snap t_start to a sentence start and t_end to a
-        terminal-punctuation sentence end; keep the pair whose start sits
-        closest to the original t_start and whose end keeps duration inside
-        [user_min_sec, user_max_sec]. Returns False when no such pair exists
-        within the search window — caller drops the clip. Toggle off with
+        """Hard gate: re-snap the clip to the nearest valid sentence pair
+        using the same word-level-aware snap helper as the LLM path.
+
+        This keeps the terminal-punctuation contract without regressing a
+        previously refined clip back to a raw SentenceSpan boundary.
+        Returns False when no fitting sentence pair exists inside the search
+        radius — caller drops the clip. Toggle off with
         CLIP_SENTENCE_EDGE_ENFORCE=0.
         """
         if not sentences:
             return True
         if not _sentence_edge_enforce_enabled():
             return True
+        if snap_llm_boundary is None:
+            return True
         search_radius = _sentence_edge_search_sec()
-        starts = [
-            s for s in sentences
-            if abs(float(s.t_start) - float(r.t_start)) <= search_radius
-        ]
-        if not starts:
+        try:
+            snap = snap_llm_boundary(
+                raw_t_start=float(r.t_start),
+                raw_t_end=float(r.t_end),
+                sentences=sentences,
+                silence_ranges=silence_ranges,
+                min_sec=user_min_sec,
+                max_sec=user_max_sec,
+                ingest_cues=cue_list,
+                max_shift_sec=search_radius,
+            )
+        except Exception:
+            logger.exception("sentence-edge snap raised for video %s", r.video_id)
             return False
-        terminal_ends = [s for s in sentences if bool(getattr(s, "terminal_punct", ""))]
-        if not terminal_ends:
+        if not snap.snapped:
             return False
-        best_start = min(starts, key=lambda s: abs(float(s.t_start) - float(r.t_start)))
-        new_start = float(best_start.t_start)
-        candidate_ends = [
-            s for s in terminal_ends
-            if user_min_sec <= (float(s.t_end) - new_start) <= user_max_sec
-            and float(s.t_end) > new_start
-        ]
-        if not candidate_ends:
-            return False
-        best_end = min(
-            candidate_ends,
-            key=lambda s: abs(float(s.t_end) - float(r.t_end)),
-        )
-        r.t_start = round(new_start, 3)
-        r.t_end = round(float(best_end.t_end), 3)
+        r.t_start = round(float(snap.t_start), 3)
+        r.t_end = round(float(snap.t_end), 3)
         return True
 
-    def _try_whisper_refine(r: TopicReel) -> None:
+    def _try_whisper_refine(r: TopicReel) -> bool:
         if not whisper_clip_refine_enabled() or refine_clip_with_whisper is None:
-            return
+            return True
         if not r.video_id:
-            return
+            return True
         # A1 gate: skip refinement when existing cues have trustworthy word
         # timings (word_source in {"whisper", "whisperx", "whisper_aligned",
         # "openai", "groq"} and dense gaps). Only fires when cues are
@@ -2688,7 +2845,7 @@ def _apply_boundary_engine(
                 and float(getattr(c, "end", 0.0)) >= r.t_start
             ]
             if not should_use_clip_audio_refine(window_cues):
-                return
+                return True
         try:
             result = refine_clip_with_whisper(
                 video_id=str(r.video_id),
@@ -2698,16 +2855,86 @@ def _apply_boundary_engine(
             )
         except Exception:
             logger.exception("whisper refinement raised for video %s", r.video_id)
-            return
+            return True
         if result is None:
-            return
-        # Refinement only wins when it keeps the clip inside user bounds.
-        new_dur = result.t_end - result.t_start
+            return True
+        # Accuracy-first contract: only keep the clip when the acoustic pass
+        # can close it on a word that Whisper itself marks as sentence-final.
+        if not _ends_with_terminal_punct(getattr(result, "last_word", "")):
+            logger.info(
+                "dropping clip without acoustically terminal close video=%s t=%.2f-%.2f",
+                r.video_id,
+                r.t_start,
+                r.t_end,
+            )
+            return False
+        new_t_start = float(result.t_start)
+        new_t_end = float(result.t_end)
+        acoustic_words = list(getattr(result, "words", []) or [])
+        if acoustic_words:
+            def _words_in_final_window(start: float, end: float) -> list[Any]:
+                return [
+                    w for w in acoustic_words
+                    if (float(getattr(w, "start", 0.0)) >= (start - 0.1))
+                    and (float(getattr(w, "end", 0.0)) <= (end + 0.1))
+                ]
+
+            window_words = _words_in_final_window(new_t_start, new_t_end)
+            if not window_words:
+                return False
+
+            # Match the audit contract: the visible clip should open no more than
+            # 50 ms before the first word the final window actually contains.
+            first_window_word = window_words[0]
+            new_t_start = max(
+                0.0,
+                float(getattr(first_window_word, "start", new_t_start)) - 0.05,
+            )
+
+            window_words = _words_in_final_window(new_t_start, new_t_end)
+            if not window_words:
+                return False
+            if query_focus_tokens:
+                matched_query_word = next(
+                    (
+                        w for w in window_words
+                        if _tokenize_for_relevance(str(getattr(w, "text", "") or "")) & query_focus_tokens
+                    ),
+                    None,
+                )
+                if matched_query_word is not None:
+                    match_start = float(getattr(matched_query_word, "start", new_t_start))
+                    if match_start > (new_t_start + 0.25):
+                        new_t_start = max(0.0, match_start - 0.05)
+                        window_words = _words_in_final_window(new_t_start, new_t_end)
+                        if not window_words:
+                            return False
+            last_terminal_word = next(
+                (w for w in reversed(window_words) if _ends_with_terminal_punct(getattr(w, "text", ""))),
+                None,
+            )
+            if last_terminal_word is None:
+                return False
+            new_t_end = float(getattr(last_terminal_word, "end", new_t_end)) + 0.05
+
+            window_words = _words_in_final_window(new_t_start, new_t_end)
+            if not window_words or not _ends_with_terminal_punct(getattr(window_words[-1], "text", "")):
+                return False
+        new_dur = new_t_end - new_t_start
         if new_dur < user_min_sec or new_dur > user_max_sec:
-            return
-        r.t_start = round(float(result.t_start), 3)
-        r.t_end = round(float(result.t_end), 3)
+            logger.info(
+                "dropping clip with invalid acoustic duration video=%s raw=%.2f-%.2f refined=%.2f-%.2f",
+                r.video_id,
+                r.t_start,
+                r.t_end,
+                new_t_start,
+                new_t_end,
+            )
+            return False
+        r.t_start = round(new_t_start, 3)
+        r.t_end = round(new_t_end, 3)
         r.boundary_quality = "whisper-word"
+        return True
 
     # Phase 3 — global candidate generation + LLM rerank. When enabled and a
     # query is present, run it BEFORE the per-topic loop: candidates span the
@@ -2744,6 +2971,14 @@ def _apply_boundary_engine(
                 cand_list = []
 
             if cand_list:
+                cand_list = _rerank_phase3_candidates_by_importance(
+                    cand_list,
+                    query=query,
+                    sentences=sentences,
+                    video_duration_sec=video_duration_sec,
+                    embedder=_embedder,
+                    target_count=target_count,
+                )
                 try:
                     ranked = _rerank_llm(
                         cand_list,
@@ -2767,31 +3002,31 @@ def _apply_boundary_engine(
                         len(ranked), len(ranked_covered), len(reels),
                     )
 
-    # Refinement in three phases so Whisper can run in parallel.
+    # Refinement in four phases so the sentence-edge gate can enforce the
+    # punctuation contract before the optional local Whisper pass performs the
+    # final acoustic snap.
     #
     # Phase 1 (sequential): pick boundaries per reel via ranked_covered /
     #                       LLM / heuristic / engine. Each picker may read
     #                       shared caches; keeping them serial avoids race
     #                       conditions and preserves deterministic order.
-    # Phase 2 (parallel):   run `_try_whisper_refine` across reels that want
-    #                       Whisper refinement. faster-whisper releases the
-    #                       GIL during CTranslate2 inference, so threads do
-    #                       deliver real speedup. `_lock_for_video` in
+    # Phase 2 (sequential): enforce the sentence-edge gate on every reel,
+    #                       using the word-level-aware snap helper.
+    # Phase 3 (parallel):   run `_try_whisper_refine` across every surviving
+    #                       reel. faster-whisper releases the GIL during
+    #                       CTranslate2 inference, so threads do deliver real
+    #                       speedup. `_lock_for_video` in
     #                       clip_whisper_refine.py serializes the one-shot
     #                       full-video audio download per video_id.
-    # Phase 3 (sequential): enforce sentence-edge gate, collect in original
+    # Phase 4 (sequential): populate default rerank sub-scores in original
     #                       order so chain linkage (see reels.py) still works.
-    reels_for_whisper: list[TopicReel] = []
     reels_for_engine: list[TopicReel] = []
     for r in reels:
         if id(r) in ranked_covered:
-            reels_for_whisper.append(r)
             continue
         if _try_llm_pick(r):
-            reels_for_whisper.append(r)
             continue
         if _try_heuristic_pick(r):
-            reels_for_whisper.append(r)
             continue
         reels_for_engine.append(r)
 
@@ -2821,17 +3056,6 @@ def _apply_boundary_engine(
                 r.video_id, r.t_start, r.t_end,
             )
 
-    # Parallel Whisper refinement. Cap workers at _WHISPER_REFINE_MAX_WORKERS
-    # — Railway has ~8 vCPU and each CT2 inference saturates ~1.5 cores.
-    if reels_for_whisper:
-        worker_count = max(1, min(_whisper_refine_max_workers(), len(reels_for_whisper)))
-        if worker_count == 1 or len(reels_for_whisper) == 1:
-            for r in reels_for_whisper:
-                _try_whisper_refine(r)
-        else:
-            with ThreadPoolExecutor(max_workers=worker_count) as pool:
-                list(pool.map(_try_whisper_refine, reels_for_whisper))
-
     refined: list[TopicReel] = []
     dropped_no_sentence_edge = 0
     for r in reels:
@@ -2845,7 +3069,22 @@ def _apply_boundary_engine(
             dropped_no_sentence_edge,
         )
 
-    # Phase 3 — populate default sub-scores for reels that didn't go through
+    # Parallel Whisper refinement. Cap workers at _WHISPER_REFINE_MAX_WORKERS
+    # — Railway has ~8 vCPU and each CT2 inference saturates ~1.5 cores.
+    if refined:
+        worker_count = max(1, min(_whisper_refine_max_workers(), len(refined)))
+        if worker_count == 1 or len(refined) == 1:
+            whisper_refined: list[TopicReel] = []
+            for r in refined:
+                if _try_whisper_refine(r):
+                    whisper_refined.append(r)
+            refined = whisper_refined
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as pool:
+                keep_flags = list(pool.map(_try_whisper_refine, refined))
+            refined = [r for r, keep in zip(refined, keep_flags) if keep]
+
+    # Phase 4 — populate default sub-scores for reels that didn't go through
     # the global rerank pipeline, so the final sort-by-final_rank_score
     # produces a sensible order (ranked picks first, fallbacks after).
     for r in refined:

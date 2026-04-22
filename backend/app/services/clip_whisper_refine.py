@@ -57,8 +57,13 @@ logger = logging.getLogger(__name__)
 # Post-Whisper padding. Small enough to stay inside the contract ("start
 # exactly before the word"), big enough to ensure the word's initial
 # phoneme and terminal punctuation sound are both fully captured.
-_PRE_ROLL_SEC = 0.03
+_PRE_ROLL_SEC = 0.15
 _POST_ROLL_SEC = 0.05
+
+# Boundary-word grace. When the incoming clip already starts slightly inside a
+# spoken word, include that overlapping word in the refine window so Whisper
+# can pull the start back to the real onset instead of preserving the cut.
+_BOUNDARY_WORD_GRACE_SEC = 0.05
 
 # Download padding. Whisper needs context around the clip to segment
 # correctly — running it on a hard-cut audio clip makes the first and
@@ -174,6 +179,11 @@ class WhisperRefinement:
     words: list[WhisperWord]
     first_word: str
     last_word: str
+
+
+def _ends_with_terminal_punct(text: str) -> bool:
+    stripped = (text or "").strip().rstrip("\"')]}")
+    return bool(stripped) and stripped[-1] in ".?!"
 
 
 def _cache_key(video_id: str, t_start: float, t_end: float) -> str:
@@ -613,17 +623,33 @@ def refine_clip_with_whisper(
             return None
         _write_cached_words(conn, cache_key, words)
 
-    # Filter to words that land inside [t_start, t_end] with a small grace
-    # window — Whisper's word-level alignment drifts <100ms in both
-    # directions on clean speech.
+    # Keep every word that overlaps the requested clip window with a small
+    # grace on both sides. The left-edge overlap is important: if the incoming
+    # `t_start` already cuts into a word, the refiner must see that straddling
+    # word to pull the boundary back to the acoustic onset.
     in_window = [
         w for w in words
-        if (t_start - 0.1) <= w.start and w.end <= (t_end + 0.1)
+        if w.end >= (t_start - _BOUNDARY_WORD_GRACE_SEC)
+        and w.start <= (t_end + _BOUNDARY_WORD_GRACE_SEC)
     ]
     if not in_window:
         return None
-    first_word = in_window[0]
-    last_word = in_window[-1]
+    start_words = [w for w in in_window if w.end >= (t_start - _BOUNDARY_WORD_GRACE_SEC)]
+    end_words = [w for w in in_window if w.start <= (t_end + _BOUNDARY_WORD_GRACE_SEC)]
+    if not start_words or not end_words:
+        return None
+    try:
+        from .clip_boundary import _word_is_filler
+    except Exception:
+        _word_is_filler = lambda _text: False  # type: ignore[assignment]
+    first_word = next(
+        (w for w in start_words if not _word_is_filler(w.text or "")),
+        start_words[0],
+    )
+    last_word = next(
+        (w for w in reversed(end_words) if _ends_with_terminal_punct(w.text or "")),
+        end_words[-1],
+    )
     refined_t_start = max(0.0, first_word.start - _PRE_ROLL_SEC)
     refined_t_end = last_word.end + _POST_ROLL_SEC
     if refined_t_end <= refined_t_start:

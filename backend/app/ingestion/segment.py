@@ -18,6 +18,7 @@ Two exported functions:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -32,6 +33,13 @@ from .logging_config import get_ingest_logger
 from .models import IngestSegment, IngestTranscriptCue
 
 logger: logging.Logger = get_ingest_logger(__name__)
+
+_FOCUS_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9'-]{1,}")
+_FOCUS_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how",
+    "in", "is", "it", "of", "on", "or", "that", "the", "their", "this",
+    "to", "was", "what", "when", "which", "with", "why", "you", "your",
+}
 
 
 # --------------------------------------------------------------------- #
@@ -349,9 +357,10 @@ def snippet_for_window(
     t_end: float,
     *,
     max_chars: int = 700,
+    focus_query: str | None = None,
 ) -> str:
-    """Join all cue text whose midpoint falls inside [t_start, t_end] and cap at max_chars."""
-    pieces: list[str] = []
+    """Join cue text inside [t_start, t_end], optionally centering the snippet on the query."""
+    window_cues: list[IngestTranscriptCue] = []
     for cue in cues:
         mid = 0.5 * (cue.start + cue.end)
         if mid < t_start:
@@ -359,7 +368,50 @@ def snippet_for_window(
         if mid > t_end:
             break
         if cue.text:
-            pieces.append(cue.text)
+            window_cues.append(cue)
+    if not window_cues:
+        return ""
+
+    if focus_query:
+        query_tokens = {
+            tok for tok in _FOCUS_TOKEN_RE.findall(focus_query.lower())
+            if tok not in _FOCUS_STOPWORDS
+        }
+        normalized_query = " ".join(_FOCUS_TOKEN_RE.findall(focus_query.lower())).strip()
+        if query_tokens:
+            best_text = ""
+            best_score = -1.0
+            for start_idx in range(len(window_cues)):
+                pieces: list[str] = []
+                char_count = 0
+                for end_idx in range(start_idx, len(window_cues)):
+                    text = str(window_cues[end_idx].text or "").strip()
+                    if not text:
+                        continue
+                    next_chars = char_count + len(text) + (1 if pieces else 0)
+                    if next_chars > max_chars and pieces:
+                        break
+                    pieces.append(text)
+                    char_count = next_chars
+                    candidate = " ".join(pieces).strip()
+                    if not candidate:
+                        continue
+                    candidate_tokens = set(_FOCUS_TOKEN_RE.findall(candidate.lower()))
+                    overlap = len(candidate_tokens & query_tokens)
+                    if overlap <= 0:
+                        continue
+                    density = overlap / max(len(candidate_tokens), 1)
+                    exact_phrase = 1.0 if normalized_query and normalized_query in candidate.lower() else 0.0
+                    leading_tokens = set(_FOCUS_TOKEN_RE.findall(" ".join(pieces[:2]).lower()))
+                    leading_overlap = len(leading_tokens & query_tokens) / max(len(query_tokens), 1)
+                    score = 3.0 * exact_phrase + 2.0 * (overlap / len(query_tokens)) + leading_overlap + density
+                    if score > best_score:
+                        best_score = score
+                        best_text = candidate
+            if best_text:
+                return best_text
+
+    pieces = [str(cue.text or "").strip() for cue in window_cues if cue.text]
     snippet = " ".join(pieces).strip()
     if len(snippet) > max_chars:
         snippet = snippet[:max_chars].rstrip() + "…"

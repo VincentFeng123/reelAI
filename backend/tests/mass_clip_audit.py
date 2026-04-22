@@ -54,7 +54,7 @@ import tempfile
 import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 _backend_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_backend_root))
@@ -107,7 +107,7 @@ if _env_path.exists():
             continue
         os.environ.setdefault(k, v)
 
-from app.db import init_db  # noqa: E402
+from app.db import get_conn, init_db  # noqa: E402
 from app.ingestion.models import IngestTranscriptCue, IngestTranscriptWord  # noqa: E402
 from app.services.clip_boundary import _FILLER_TOKENS, _word_is_filler  # noqa: E402
 from app.services.clip_whisper_refine import (  # noqa: E402
@@ -126,6 +126,10 @@ logger = logging.getLogger("mass_clip_audit")
 
 _TERMINAL_PUNCT = {".", "!", "?", "…"}
 _USABLE_PRECISION_CEILING_MS = 500.0
+_YOUTUBE_SERVICE: Any | None = None
+
+if TYPE_CHECKING:
+    from app.services.youtube import YouTubeService
 
 
 # --------------------------------------------------------------------------- #
@@ -162,38 +166,55 @@ def load_corpus(path: Path) -> list[CorpusEntry]:
 
 
 # --------------------------------------------------------------------------- #
-# Transcript fetch — mirror real_search_simulation.py preference order
+# Transcript fetch — reuse the production fallback chain
 # --------------------------------------------------------------------------- #
 
 
-def fetch_transcript(video_id: str) -> tuple[list[dict], str]:
-    try:
-        from youtube_transcript_api import YouTubeTranscriptApi
-    except ImportError:
-        return [], ""
-    try:
-        api = YouTubeTranscriptApi()
-        tlist = api.list(video_id)
+def _get_youtube_service() -> "YouTubeService":
+    global _YOUTUBE_SERVICE
+    if _YOUTUBE_SERVICE is None:
+        from app.services.youtube import YouTubeService
+        _YOUTUBE_SERVICE = YouTubeService()
+    return _YOUTUBE_SERVICE
+
+
+def _normalize_transcript_rows(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
         try:
-            tr = tlist.find_manually_created_transcript(["en"])
-            kind = "manual"
+            text = str(entry.get("text") or "").replace("\n", " ").strip()
+            if not text:
+                continue
+            start = float(entry.get("start", 0.0))
+            duration_raw = entry.get("duration")
+            if isinstance(duration_raw, (int, float)):
+                duration = float(duration_raw)
+            else:
+                end_raw = entry.get("end")
+                duration = float(end_raw) - start if isinstance(end_raw, (int, float)) else 0.0
+            normalized.append({
+                "text": text,
+                "start": start,
+                "duration": max(duration, 0.01),
+            })
         except Exception:
-            try:
-                tr = tlist.find_generated_transcript(["en"])
-                kind = "generated"
-            except Exception:
-                tr = next(iter(tlist), None)
-                kind = "other"
-        if tr is None:
-            return [], ""
-        fetched = tr.fetch()
-        return (
-            [
-                {"text": s.text, "start": float(s.start), "duration": float(s.duration)}
-                for s in fetched.snippets
-            ],
-            kind,
-        )
+            continue
+    return normalized
+
+
+def fetch_transcript(
+    video_id: str,
+    *,
+    youtube_service: "YouTubeService | None" = None,
+) -> tuple[list[dict], str]:
+    service = youtube_service or _get_youtube_service()
+    try:
+        with get_conn() as conn:
+            raw = list(service.get_transcript(conn, video_id) or [])
+            quality = service.get_transcript_quality(conn, video_id) or {}
+        return _normalize_transcript_rows(raw), str(quality.get("source_kind") or "")
     except Exception as exc:
         logger.warning("transcript fetch failed for %s: %s", video_id, exc)
         return [], ""
@@ -240,6 +261,13 @@ class ClipMetrics:
     starts_on_filler: bool = False
     is_usable: bool = False
     error: str = ""
+    # Saliency / importance metrics (PR-6 ranker audit).
+    opens_on_topic: bool = False
+    topic_concentration: float = 0.0
+    has_definition: bool = False
+    structural_label: str = "substantive"
+    discourse_marker_density: float = 0.0
+    usable_clip: bool = False
 
 
 def measure_clip_with_whisper(
@@ -313,6 +341,67 @@ def measure_clip_with_whisper(
 # --------------------------------------------------------------------------- #
 
 
+def _clip_text_from_cues(cues: list, reel: Any) -> str:
+    """Concatenate cue texts whose timing falls inside the reel window."""
+    if not cues:
+        return ""
+    t0 = float(reel.t_start) - 0.05
+    t1 = float(reel.t_end) + 0.05
+    parts: list[str] = []
+    for c in cues:
+        c_start = float(getattr(c, "start", 0.0))
+        c_end = c_start + float(getattr(c, "duration", 0.0))
+        if c_end < t0 or c_start > t1:
+            continue
+        text = (getattr(c, "text", "") or "").strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts)
+
+
+def _compute_saliency(text: str, query: str) -> dict[str, Any]:
+    """Cheap per-clip saliency computation using the new ranker primitives."""
+    from app.services.query_intent import classify_query
+    from app.services.segment_features import (
+        _discourse_marker_count,
+        _hearst_hits,
+        _word_count,
+        match_anchors_in_text,
+    )
+    from app.services.structural_classifier import classify_passage
+
+    if not text:
+        return {
+            "opens_on_topic": False,
+            "topic_concentration": 0.0,
+            "has_definition": False,
+            "structural_label": "substantive",
+            "discourse_marker_density": 0.0,
+        }
+    intent = classify_query(query)
+    label = classify_passage(text)
+    marker_count = _discourse_marker_count(text)
+    word_ct = _word_count(text)
+    density = (marker_count / max(word_ct, 1)) * 100.0
+
+    first_sentence = text.split(".", 1)[0]
+    anchor_hits_first = match_anchors_in_text(first_sentence, intent.anchors, None)
+    hearst_first = _hearst_hits(first_sentence)
+    opens = bool(anchor_hits_first) or bool(hearst_first)
+
+    full_anchor_hits = match_anchors_in_text(text, intent.anchors, None)
+    coverage = sum(full_anchor_hits.values()) / max(word_ct / 100.0, 1.0)
+    coverage = min(1.0, coverage)
+
+    return {
+        "opens_on_topic": opens,
+        "topic_concentration": coverage,
+        "has_definition": bool(_hearst_hits(text)),
+        "structural_label": label.name,
+        "discourse_marker_density": density,
+    }
+
+
 def run_entry(entry: CorpusEntry, *, use_llm: bool = True) -> list[ClipMetrics]:
     if entry.video_id.startswith("TODO-"):
         logger.info("skipping unresolved TODO entry: %s", entry.video_id)
@@ -354,6 +443,8 @@ def run_entry(entry: CorpusEntry, *, use_llm: bool = True) -> list[ClipMetrics]:
 
     metrics_by_idx: dict[int, ClipMetrics] = {}
     for idx, r in enumerate(topic_reels, 1):
+        clip_text = _clip_text_from_cues(tc_cues, r)
+        sal = _compute_saliency(clip_text, entry.target_query)
         metrics_by_idx[idx] = ClipMetrics(
             video_id=entry.video_id,
             content_type=entry.content_type,
@@ -365,6 +456,11 @@ def run_entry(entry: CorpusEntry, *, use_llm: bool = True) -> list[ClipMetrics]:
             duration_sec=float(r.duration_sec),
             label=str(getattr(r, "label", "") or ""),
             boundary_quality=str(getattr(r, "boundary_quality", "") or ""),
+            opens_on_topic=sal["opens_on_topic"],
+            topic_concentration=sal["topic_concentration"],
+            has_definition=sal["has_definition"],
+            structural_label=sal["structural_label"],
+            discourse_marker_density=sal["discourse_marker_density"],
         )
 
     # Parallel per-clip whisper probe. faster-whisper releases the GIL in
@@ -401,6 +497,15 @@ def run_entry(entry: CorpusEntry, *, use_llm: bool = True) -> list[ClipMetrics]:
             m.starts_on_filler = bool(probe["starts_on_filler"])
             m.is_usable = bool(probe["is_usable"])
 
+    for m in metrics_by_idx.values():
+        boundary_ok = (
+            not m.starts_mid_word
+            and not m.ends_mid_sentence
+            and m.structural_label not in {"sponsor", "outro"}
+        )
+        saliency_ok = m.opens_on_topic or m.topic_concentration >= 0.4
+        m.usable_clip = boundary_ok and saliency_ok
+
     return [metrics_by_idx[i] for i in sorted(metrics_by_idx)]
 
 
@@ -417,6 +522,8 @@ _CSV_FIELDS = [
     "start_precision_ms", "end_precision_ms",
     "starts_mid_word", "ends_mid_sentence", "starts_on_filler",
     "is_usable", "error",
+    "opens_on_topic", "topic_concentration", "has_definition",
+    "structural_label", "discourse_marker_density", "usable_clip",
 ]
 
 
@@ -537,7 +644,15 @@ def main() -> int:
                         help="skip LLM segmentation; use heuristic/semantic path only")
     parser.add_argument("--skip-ids", default="",
                         help="comma-separated video_ids to skip (e.g. stuck long videos)")
+    parser.add_argument("--ranker", choices=["legacy", "importance"], default="legacy",
+                        help="legacy = current scorer; importance = sets "
+                             "REELS_IMPORTANCE_RANKER_ENABLED=1 before pipeline imports")
     args = parser.parse_args()
+
+    if args.ranker == "importance":
+        os.environ["REELS_IMPORTANCE_RANKER_ENABLED"] = "1"
+    else:
+        os.environ.pop("REELS_IMPORTANCE_RANKER_ENABLED", None)
 
     logging.basicConfig(
         level=logging.INFO,

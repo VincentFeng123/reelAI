@@ -484,6 +484,7 @@ class IngestionPipeline:
                 metadata=metadata,
                 material_id=material_id,
                 concept_id=concept_id,
+                query=query,
             )
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -521,6 +522,7 @@ class IngestionPipeline:
         metadata: IngestMetadata,
         material_id: str | None,
         concept_id: str | None,
+        query: str | None,
     ) -> list[ReelOutWithAttribution]:
         """
         Insert each TopicReel as a `reels` row and return the client-facing
@@ -561,7 +563,13 @@ class IngestionPipeline:
                 else:
                     video_url = adapter_result.playback_url
 
-                snippet = snippet_for_window(cues, clip_start, clip_end, max_chars=700)
+                snippet = snippet_for_window(
+                    cues,
+                    clip_start,
+                    clip_end,
+                    max_chars=700,
+                    focus_query=query,
+                )
                 takeaways = build_takeaways_for_ingest(
                     concept_title=tr.label or metadata.title or "",
                     transcript_snippet=snippet,
@@ -831,6 +839,7 @@ class IngestionPipeline:
                 metadata=metadata,
                 material_id=material_id,
                 concept_id=concept_id,
+                query=query,
             )
             if persisted:
                 return persisted

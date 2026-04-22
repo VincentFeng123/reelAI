@@ -1,0 +1,8 @@
+video_id,content_type,target_query,transcript_kind,clip_index,t_start,t_end,duration_sec,label,boundary_quality,whisper_first_word,whisper_last_word,start_precision_ms,end_precision_ms,starts_mid_word,ends_mid_sentence,starts_on_filler,is_usable,error
+WUvTyaaNkzM,lecture,essence of calculus,manual,1,14.98,57.06,42.08,Might Lead Maybe Radius,llm-rerank,Hey,yourself.,60.0000000000005,359.99999999999943,True,False,False,False,
+WUvTyaaNkzM,lecture,essence of calculus,manual,2,24.3,57.06,32.760000000000005,,llm-rerank,goal,yourself.,0.0,359.99999999999943,False,False,False,True,
+WUvTyaaNkzM,lecture,essence of calculus,manual,3,36.94,57.06,20.120000000000005,,llm-rerank,has,yourself.,320.0000000000003,300.00000000000426,True,False,False,False,
+WUvTyaaNkzM,lecture,essence of calculus,manual,4,375.63,399.01,23.379999999999995,These Rectangles,llm-snap,And,squared.,240.0000000000091,659.9999999999682,False,False,False,False,
+WUvTyaaNkzM,lecture,essence of calculus,manual,5,419.68,444.05,24.370000000000005,Original Problem Underneath,heuristic-strong,take,3.,60.000000000002274,199.99999999998863,True,False,False,False,
+WUvTyaaNkzM,lecture,essence of calculus,manual,6,640.03,689.7,49.67000000000007,Mystery Function Change,heuristic-strong,Calculus,wall.,200.00000000004547,530.0000000000864,False,False,False,False,
+WUvTyaaNkzM,lecture,essence of calculus,manual,7,944.8,970.24,25.440000000000055,Slight Nudge Derivatives Derivative,llm-rerank,of,explorations.,360.00000000001364,260.0000000001046,True,False,False,False,

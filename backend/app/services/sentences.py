@@ -325,6 +325,8 @@ def split_sentences(
             confidence = 0.9 if terminal else 0.75
         elif "whisper_aligned" in cue_sources:
             confidence = 0.88 if terminal else 0.78
+        elif "youtube_vtt" in cue_sources:
+            confidence = 0.85 if terminal else 0.7
         elif "proportional" in cue_sources:
             confidence = 0.6 if terminal else 0.45
         else:  # legacy only

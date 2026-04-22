@@ -708,6 +708,7 @@ def snap_llm_boundary(
     min_sec: float = 15.0,
     max_sec: float = 60.0,
     ingest_cues: Sequence[Any] | None = None,
+    max_shift_sec: float | None = None,
 ) -> SnapResult:
     """Snap LLM-picked raw timestamps onto terminal-punct sentence boundaries
     (and silence gaps, when available). Contract:
@@ -730,6 +731,8 @@ def snap_llm_boundary(
     so reels.py can log/skip the clip instead of serving something
     mid-word.
     """
+    shift_limit = _SNAP_MAX_SHIFT_SEC if max_shift_sec is None else max(0.0, float(max_shift_sec))
+
     if not sentences:
         return SnapResult(False, raw_t_start, raw_t_end, None, None, "no sentences")
     if raw_t_end <= raw_t_start:
@@ -747,10 +750,10 @@ def snap_llm_boundary(
             False, raw_t_start, raw_t_end, None, None,
             "no sentence at/after raw_t_start",
         )
-    if abs(start_sent.t_start - raw_t_start) > _SNAP_MAX_SHIFT_SEC:
+    if abs(start_sent.t_start - raw_t_start) > shift_limit:
         return SnapResult(
             False, raw_t_start, raw_t_end, start_sent, None,
-            f"start shift {start_sent.t_start - raw_t_start:+.1f}s exceeds ±{_SNAP_MAX_SHIFT_SEC:.0f}s",
+            f"start shift {start_sent.t_start - raw_t_start:+.1f}s exceeds ±{shift_limit:.0f}s",
         )
 
     # End: terminal-punct sentence with t_end closest to raw_t_end (either
@@ -766,11 +769,11 @@ def snap_llm_boundary(
             after = s
             break
     candidates = [c for c in (before, after) if c is not None]
-    candidates = [c for c in candidates if abs(c.t_end - raw_t_end) <= _SNAP_MAX_SHIFT_SEC]
+    candidates = [c for c in candidates if abs(c.t_end - raw_t_end) <= shift_limit]
     if not candidates:
         return SnapResult(
             False, raw_t_start, raw_t_end, start_sent, None,
-            f"no terminal-punct sentence within ±{_SNAP_MAX_SHIFT_SEC:.0f}s of raw_t_end",
+            f"no terminal-punct sentence within ±{shift_limit:.0f}s of raw_t_end",
         )
     end_sent = min(candidates, key=lambda c: abs(c.t_end - raw_t_end))
     if end_sent.t_end <= start_sent.t_start:
