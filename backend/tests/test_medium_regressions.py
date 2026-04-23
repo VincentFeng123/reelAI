@@ -5572,6 +5572,101 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual(data_api_calls, ["binary search trees"])
         self.assertEqual(html_calls, [])
 
+    def test_youtube_service_bootstrap_non_cc_falls_back_to_data_api_when_html_underfills(self) -> None:
+        service = YouTubeService()
+        service.api_key = "test-key"
+
+        html_calls: list[str] = []
+        data_api_calls: list[str] = []
+        external_calls: list[str] = []
+
+        def fake_search_via_data_api(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            query = str(kwargs.get("query") or args[0])
+            data_api_calls.append(query)
+            return [{"id": "api123xyz00", "title": "API video"}]
+
+        def fake_search_without_data_api(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            query = str(kwargs.get("query") or args[0])
+            html_calls.append(query)
+            return [{"id": "html123xyz0", "title": "HTML video"}]
+
+        def fake_search_external_fallbacks(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            query = str(kwargs.get("query") or args[0])
+            external_calls.append(query)
+            return [{"id": "ext123xyz00", "title": "External video"}]
+
+        service._search_via_data_api = fake_search_via_data_api  # type: ignore[method-assign]
+        service._search_without_data_api = fake_search_without_data_api  # type: ignore[method-assign]
+        service._search_external_fallbacks = fake_search_external_fallbacks  # type: ignore[method-assign]
+
+        with sqlite3.connect(":memory:") as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                "CREATE TABLE search_cache (cache_key TEXT PRIMARY KEY, response_json TEXT, created_at TEXT)"
+            )
+            rows = service._search_videos_with_conn(
+                conn,
+                query="binary search trees",
+                max_results=4,
+                creative_commons_only=False,
+                video_duration=None,
+                retrieval_strategy="literal",
+                retrieval_stage="high_precision",
+                source_surface="youtube_html",
+                retrieval_profile="bootstrap",
+                allow_external_fallbacks=False,
+                variant_limit=1,
+            )
+
+        self.assertEqual([row["id"] for row in rows], ["html123xyz0", "api123xyz00"])
+        self.assertEqual(html_calls, ["binary search trees"])
+        self.assertEqual(data_api_calls, ["binary search trees"])
+        self.assertEqual(external_calls, [])
+
+    def test_youtube_service_deep_recovery_uses_data_api_when_non_api_returns_nothing(self) -> None:
+        service = YouTubeService()
+        service.api_key = "test-key"
+
+        html_calls: list[str] = []
+        data_api_calls: list[str] = []
+
+        def fake_search_via_data_api(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            query = str(kwargs.get("query") or args[0])
+            data_api_calls.append(query)
+            return [{"id": "api123xyz00", "title": "API recovery video"}]
+
+        def fake_search_without_data_api(*args: object, **kwargs: object) -> list[dict[str, object]]:
+            query = str(kwargs.get("query") or args[0])
+            html_calls.append(query)
+            return []
+
+        service._search_via_data_api = fake_search_via_data_api  # type: ignore[method-assign]
+        service._search_without_data_api = fake_search_without_data_api  # type: ignore[method-assign]
+        service._should_use_data_api = mock.Mock(side_effect=[False, True])  # type: ignore[method-assign]
+
+        with sqlite3.connect(":memory:") as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute(
+                "CREATE TABLE search_cache (cache_key TEXT PRIMARY KEY, response_json TEXT, created_at TEXT)"
+            )
+            rows = service._search_videos_with_conn(
+                conn,
+                query="binary search trees",
+                max_results=4,
+                creative_commons_only=False,
+                video_duration=None,
+                retrieval_strategy="literal",
+                retrieval_stage="recovery",
+                source_surface="youtube_html",
+                retrieval_profile="deep",
+                allow_external_fallbacks=False,
+                variant_limit=1,
+            )
+
+        self.assertEqual([row["id"] for row in rows], ["api123xyz00"])
+        self.assertEqual(len(html_calls), 2)
+        self.assertEqual(data_api_calls, ["binary search trees"])
+
     def test_ranked_feed_cache_reuses_results_and_invalidates_on_feedback_and_transcript_updates(self) -> None:
         conn = self._build_ranked_feed_test_conn()
         service = ReelService(embedding_service=None, youtube_service=None)

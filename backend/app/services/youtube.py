@@ -757,13 +757,39 @@ class YouTubeService:
                     retrieval_stage=retrieval_stage,
                     source_surface="youtube_html",
                     deadline=deadline,
-                    include_external_fallbacks=allow_external_fallbacks,
+                    include_external_fallbacks=False,
                     variant_limit=variant_limit or 1,
                     skip_primary_variants=False,
                     retrieval_profile=retrieval_profile,
                     graph_profile=graph_profile,
                     root_terms=normalized_root_terms,
                 )
+                if self._should_use_data_api() and len(videos) < max_results:
+                    api_rows = self._search_via_data_api(
+                        query=query,
+                        max_results=max_results,
+                        creative_commons_only=False,
+                        video_duration=video_duration,
+                        retrieval_strategy=retrieval_strategy,
+                        retrieval_stage=retrieval_stage,
+                        source_surface="youtube_api",
+                        deadline=deadline,
+                        root_terms=normalized_root_terms,
+                    )
+                    videos = self._merge_unique_videos(videos, api_rows, None)
+                if allow_external_fallbacks and len(videos) < max_results:
+                    external_rows = self._search_external_fallbacks(
+                        query=query,
+                        max_results=max_results,
+                        video_duration=video_duration,
+                        retrieval_strategy=retrieval_strategy,
+                        retrieval_stage=retrieval_stage,
+                        source_surface=source_surface,
+                        retrieval_profile=retrieval_profile,
+                        deadline=deadline,
+                        variant_limit=variant_limit,
+                    )
+                    videos = self._merge_unique_videos(videos, external_rows, None)
             videos = self._finalize_search_rows(
                 videos,
                 query=query,
@@ -915,20 +941,18 @@ class YouTubeService:
             )
             videos = self._merge_unique_videos(videos, external, None)
 
-        if not videos and self.api_key and not creative_commons_only:
-            # Secondary recovery in case primary pass got blocked by transient API errors.
-            videos = self._search_without_data_api(
+        if not videos and not creative_commons_only and self._should_use_data_api():
+            # Secondary recovery in case the HTML/InnerTube path got blocked but
+            # the official Data API is still healthy.
+            videos = self._search_via_data_api(
                 query=query,
                 max_results=max_results,
                 creative_commons_only=False,
                 video_duration=video_duration,
                 retrieval_strategy=retrieval_strategy,
                 retrieval_stage=retrieval_stage,
-                source_surface=source_surface,
+                source_surface="youtube_api",
                 deadline=deadline,
-                include_external_fallbacks=True,
-                retrieval_profile=retrieval_profile,
-                graph_profile=graph_profile,
                 root_terms=normalized_root_terms,
             )
         videos = self._finalize_search_rows(
