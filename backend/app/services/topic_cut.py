@@ -1885,6 +1885,7 @@ def _filter_reels_by_query(
     *,
     cues: Sequence[TranscriptCue],
     transcript_validation: TranscriptValidation | None = None,
+    video_duration_sec: float | None = None,
 ) -> list[TopicReel]:
     """
     Score each TopicReel against the user's search *query* and keep only
@@ -1972,28 +1973,129 @@ def _filter_reels_by_query(
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
 
-    # Importance-ranker enrichment: hard-skip structural boilerplate when the
-    # flag is on. Structural classifier runs on the reel's transcript text
-    # (not the LLM-assigned label) so a "Patreon thanks" passage labeled
-    # "review" by the LLM still gets caught.
+    ranker_picked_ids: set[int] | None = None
+    importance_by_id: dict[int, float] = {}
     if _topic_cut_importance_flag() and reel_transcripts:
-        transcript_by_reel = {id(reel): reel_transcripts[i] for i, reel in enumerate(reels)}
-        survivors: list[tuple[float, TopicReel]] = []
-        for score, reel in scored:
-            text = transcript_by_reel.get(id(reel), "") or ""
-            label = classify_passage(text)
-            if label.name in _STRUCTURAL_SKIP_LABELS:
+        try:
+            from .importance_ranker import rank_segments, select_clips
+            from .query_intent import classify_query
+            from .segment_features import extract_features
+            from .segmenter import SegmentMatch
+
+            intent = classify_query(query)
+            segs: list[SegmentMatch] = []
+            seg_to_reel: dict[int, TopicReel] = {}
+            for i, reel in enumerate(reels):
+                text = reel_transcripts[i] or ""
+                if not text.strip():
+                    continue
+                segs.append(
+                    SegmentMatch(
+                        chunk_index=i,
+                        t_start=float(reel.t_start),
+                        t_end=float(reel.t_end),
+                        text=text,
+                        score=0.0,
+                        source="topic_cut",
+                    )
+                )
+                seg_to_reel[i] = reel
+
+            ranker_picked_ids = set()
+            if segs:
+                resolved_video_duration = float(video_duration_sec or 0.0)
+                if resolved_video_duration <= 0.0 and cues:
+                    resolved_video_duration = float(cues[-1].end)
+
+                def _ranked_segment_survives_contract(ranked_segment: Any) -> bool:
+                    reel = seg_to_reel.get(ranked_segment.match.chunk_index)
+                    if reel is None:
+                        return False
+                    label = str(ranked_segment.features.structural_label or "")
+                    penalty = float(ranked_segment.components.get("structural_penalty", 0.0) or 0.0)
+                    if label in {"sponsor", "outro"}:
+                        return False
+                    if label in _STRUCTURAL_SKIP_LABELS or penalty > 0.4:
+                        return _trim_structural_edges_from_reel(
+                            reel,
+                            cues=cues,
+                            video_duration_sec=(
+                                resolved_video_duration if resolved_video_duration > 0.0 else None
+                            ),
+                        ) is not None
+                    return True
+
+                bundle = extract_features(
+                    segs,
+                    embedder=None,
+                    nlp=None,
+                    video_duration=resolved_video_duration,
+                    conn=None,
+                )
+                ranked = rank_segments(
+                    segs,
+                    bundle,
+                    intent,
+                    embedder=None,
+                    conn=None,
+                )
+                ranked = [r for r in ranked if _ranked_segment_survives_contract(r)]
+                importance_by_id = {
+                    id(seg_to_reel[r.match.chunk_index]): float(r.importance)
+                    for r in ranked
+                    if r.match.chunk_index in seg_to_reel
+                }
+                target_n = {"narrow": 2, "broad": 5, "medium": 3, "none": 3}.get(
+                    intent.type, 3,
+                )
+                picks = select_clips(ranked, intent, target_n=target_n)
+                picks = [p for p in picks if _ranked_segment_survives_contract(p)]
+                ranker_picked_ids = {
+                    id(seg_to_reel[p.match.chunk_index])
+                    for p in picks
+                    if p.match.chunk_index in seg_to_reel
+                }
+        except Exception:
+            logger.exception(
+                "importance ranker failed inside _filter_reels_by_query; "
+                "falling back to cosine-only scoring",
+            )
+            ranker_picked_ids = None
+            importance_by_id = {}
+
+    if ranker_picked_ids is not None:
+        rescored: list[tuple[float, TopicReel]] = []
+        for combined, reel in scored:
+            if id(reel) not in ranker_picked_ids:
                 continue
-            survivors.append((score, reel))
-        if survivors:
-            scored = survivors
+            importance = importance_by_id.get(id(reel))
+            if importance is not None:
+                combined = 0.5 * float(combined) + 0.5 * float(importance)
+            rescored.append((combined, reel))
+        scored = rescored
+        scored.sort(key=lambda pair: pair[0], reverse=True)
 
     # Keep reels above the relevance threshold.
     kept = [reel for score, reel in scored if score >= _MIN_QUERY_RELEVANCE]
 
     # Fallback: never return empty — keep the best match.
-    if not kept and scored:
+    if not kept and scored and ranker_picked_ids is None:
         kept = [scored[0][1]]
+
+    if ranker_picked_ids is not None and kept:
+        resolved_video_duration = float(video_duration_sec or 0.0)
+        if resolved_video_duration <= 0.0 and cues:
+            resolved_video_duration = float(cues[-1].end)
+        trimmed: list[TopicReel] = []
+        for reel in kept:
+            cleaned = _trim_structural_edges_from_reel(
+                reel,
+                cues=cues,
+                video_duration_sec=resolved_video_duration if resolved_video_duration > 0.0 else None,
+            )
+            if cleaned is not None:
+                trimmed.append(cleaned)
+        kept = trimmed
 
     # Restore chronological order.
     kept.sort(key=lambda r: r.t_start)
@@ -2034,6 +2136,104 @@ def _find_sentence_end_cue(
 def _ends_with_terminal_punct(text: str) -> bool:
     stripped = (text or "").strip().rstrip("\"')]}")
     return bool(stripped) and stripped[-1] in ".?!"
+
+
+_STRUCTURAL_TRIM_LABELS = _STRUCTURAL_SKIP_LABELS | {"transition"}
+
+
+def _sentence_spans_for_reel(
+    reel: TopicReel,
+    *,
+    cues: Sequence[TranscriptCue],
+) -> list[tuple[int, int, str]]:
+    spans: list[tuple[int, int, str]] = []
+    sentence_start_idx: int | None = None
+    sentence_end_idx: int | None = None
+    pieces: list[str] = []
+
+    for idx, cue in enumerate(cues):
+        if cue.end <= reel.t_start + 0.01:
+            continue
+        if cue.start >= reel.t_end - 0.01:
+            break
+        text = str(cue.text or "").strip()
+        if not text:
+            continue
+        if sentence_start_idx is None:
+            sentence_start_idx = idx
+        sentence_end_idx = idx
+        pieces.append(text)
+        if _ends_with_terminal_punct(text):
+            spans.append((sentence_start_idx, idx, " ".join(pieces).strip()))
+            sentence_start_idx = None
+            sentence_end_idx = None
+            pieces = []
+
+    if sentence_start_idx is not None and sentence_end_idx is not None and pieces:
+        spans.append((sentence_start_idx, sentence_end_idx, " ".join(pieces).strip()))
+    return spans
+
+
+def _trim_structural_edges_from_reel(
+    reel: TopicReel,
+    *,
+    cues: Sequence[TranscriptCue],
+    video_duration_sec: float | None,
+) -> TopicReel | None:
+    spans = _sentence_spans_for_reel(reel, cues=cues)
+    if not spans:
+        return reel
+
+    video_duration = float(video_duration_sec) if video_duration_sec and video_duration_sec > 0.0 else None
+    start_idx = 0
+    end_idx = len(spans) - 1
+
+    while start_idx <= end_idx:
+        sent_start_idx, _, sent_text = spans[start_idx]
+        label = classify_passage(
+            sent_text,
+            t_start=float(cues[sent_start_idx].start),
+            video_duration=video_duration,
+        )
+        if label.name not in _STRUCTURAL_TRIM_LABELS:
+            break
+        start_idx += 1
+
+    while end_idx >= start_idx:
+        sent_start_idx, _, sent_text = spans[end_idx]
+        label = classify_passage(
+            sent_text,
+            t_start=float(cues[sent_start_idx].start),
+            video_duration=video_duration,
+        )
+        if label.name not in _STRUCTURAL_TRIM_LABELS:
+            break
+        end_idx -= 1
+
+    if start_idx > end_idx:
+        return None
+
+    new_start_idx = spans[start_idx][0]
+    new_end_idx = spans[end_idx][1]
+    start_trimmed = start_idx > 0
+    end_trimmed = end_idx < (len(spans) - 1)
+    new_start = float(reel.t_start)
+    new_end = float(reel.t_end)
+    if start_trimmed:
+        new_start = float(cues[new_start_idx].start)
+    if end_trimmed:
+        new_end = float(cues[new_end_idx].end)
+    if video_duration is not None:
+        new_end = min(new_end, video_duration)
+    if (new_end - new_start) < MIN_TOPIC_REEL_SEC:
+        return None
+    return dataclasses.replace(
+        reel,
+        t_start=round(new_start, 2),
+        t_end=round(new_end, 2),
+        cue_start_idx=new_start_idx if start_trimmed else reel.cue_start_idx,
+        cue_end_idx=new_end_idx if end_trimmed else reel.cue_end_idx,
+    )
 
 
 def _snap_segments_to_cues(
@@ -3821,6 +4021,7 @@ def cut_video_into_topic_reels(
                 chapter_reels = _filter_reels_by_query(
                     chapter_reels, query, cues=transcript or [],
                     transcript_validation=transcript_validation,
+                    video_duration_sec=classification.duration_sec or None,
                 )
             logger.info(
                 "video %s cut from %d YouTube chapters → %d reels (free path)",
@@ -3975,6 +4176,7 @@ def cut_video_into_topic_reels(
             reels = _filter_reels_by_query(
                 reels, query, cues=transcript,
                 transcript_validation=transcript_validation,
+                video_duration_sec=classification.duration_sec or None,
             )
         return classification, reels
 
@@ -4018,6 +4220,7 @@ def cut_video_into_topic_reels(
         reels = _filter_reels_by_query(
             reels, query, cues=transcript,
             transcript_validation=transcript_validation,
+            video_duration_sec=classification.duration_sec or None,
         )
     return classification, reels
 

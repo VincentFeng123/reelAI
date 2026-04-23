@@ -32,6 +32,7 @@ from .transcript_validation import TranscriptQuality, validate_transcript
 from .query_intent import QueryIntent, classify_query
 from .segment_features import VideoFeatureBundle, extract_features
 from .importance_ranker import RankedSegment, rank_segments, select_clips
+from .structural_classifier import classify_passage
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,8 @@ def _importance_ranker_enabled() -> bool:
 
 
 _IMPORTANCE_TARGET_N = {"narrow": 2, "broad": 5, "medium": 3, "none": 3}
+_STRUCTURAL_HARD_SKIP_LABELS = {"intro", "recap", "sponsor", "outro"}
+_STRUCTURAL_EDGE_TRIM_LABELS = _STRUCTURAL_HARD_SKIP_LABELS | {"transition"}
 
 
 # Playback padding applied to the ends of every refined reel window.
@@ -3294,6 +3297,9 @@ class ReelService:
                         relevance_context["discovery_score"] = float(ranking.get("discovery_score") or 0.0)
                         relevance_context["clipability_score"] = float(ranking.get("clipability_score") or 0.0)
                         relevance_context["source_surface"] = str(video.get("search_source") or "")
+                        relevance_context["query_text"] = str(
+                            query_candidate.text or concept_plan.literal_query.text or ""
+                        ).strip()
                         relevance_context["score"] = (
                             0.58 * float(relevance_context.get("score") or 0.0)
                             + 0.28 * float(ranking.get("discovery_score") or 0.0)
@@ -10016,11 +10022,61 @@ class ReelService:
     ) -> list[tuple[SegmentMatch, dict[str, Any]]]:
         flag_on = _importance_ranker_enabled()
         intent: QueryIntent | None = None
-        bundle: VideoFeatureBundle | None = None
         ranked_by_chunk: dict[int, RankedSegment] = {}
+        ranker_applied = False
         if flag_on and segments and query_text is not None:
             try:
                 intent = classify_query(query_text)
+
+                def _ranked_segment_survives_contract(ranked_segment: RankedSegment) -> bool:
+                    label = str(ranked_segment.features.structural_label or "")
+                    penalty = float(ranked_segment.components.get("structural_penalty", 0.0) or 0.0)
+                    if label in {"sponsor", "outro"}:
+                        return False
+                    if label not in _STRUCTURAL_HARD_SKIP_LABELS and penalty <= 0.4:
+                        return True
+                    text = str(ranked_segment.match.text or "").strip()
+                    if not text:
+                        return False
+                    sentences = [
+                        sentence.strip()
+                        for sentence in re.split(r"(?<=[.!?])\s+", text)
+                        if sentence.strip()
+                    ]
+                    if not sentences:
+                        return False
+                    start_idx = 0
+                    end_idx = len(sentences) - 1
+                    span = max(
+                        0.001,
+                        float(ranked_segment.match.t_end) - float(ranked_segment.match.t_start),
+                    )
+                    step = span / float(len(sentences))
+                    resolved_video_duration = (
+                        float(video_duration_sec) if video_duration_sec and video_duration_sec > 0 else None
+                    )
+                    while start_idx <= end_idx:
+                        sent_start = float(ranked_segment.match.t_start) + step * float(start_idx)
+                        sent_label = classify_passage(
+                            sentences[start_idx],
+                            t_start=sent_start,
+                            video_duration=resolved_video_duration,
+                        )
+                        if sent_label.name not in _STRUCTURAL_EDGE_TRIM_LABELS:
+                            break
+                        start_idx += 1
+                    while end_idx >= start_idx:
+                        sent_start = float(ranked_segment.match.t_start) + step * float(end_idx)
+                        sent_label = classify_passage(
+                            sentences[end_idx],
+                            t_start=sent_start,
+                            video_duration=resolved_video_duration,
+                        )
+                        if sent_label.name not in _STRUCTURAL_EDGE_TRIM_LABELS:
+                            break
+                        end_idx -= 1
+                    return start_idx <= end_idx
+
                 bundle = extract_features(
                     segments,
                     self.embedding_service,
@@ -10032,14 +10088,19 @@ class ReelService:
                     segments, bundle, intent,
                     embedder=self.embedding_service, conn=conn,
                 )
+                ranked_list = [r for r in ranked_list if _ranked_segment_survives_contract(r)]
                 ranked_by_chunk = {r.match.chunk_index: r for r in ranked_list}
+                ranker_applied = True
             except Exception:
                 logger.exception("importance ranker failed; falling back to legacy fusion")
                 ranked_by_chunk = {}
                 intent = None
+                ranker_applied = False
 
         ranked: list[tuple[SegmentMatch, dict[str, Any]]] = []
         for segment in segments:
+            if ranker_applied and segment.chunk_index not in ranked_by_chunk:
+                continue
             relevance = self._score_text_relevance(
                 conn,
                 text=segment.text,
@@ -10094,14 +10155,19 @@ class ReelService:
                 )
             )
 
-        if ranked_by_chunk and intent is not None:
-            allowed_ids = {
-                r.match.chunk_index
+        if ranker_applied and intent is not None:
+            selected_ranked = [
+                r
                 for r in select_clips(
-                    list(ranked_by_chunk.values()), intent,
+                    list(ranked_by_chunk.values()),
+                    intent,
                     target_n=_IMPORTANCE_TARGET_N.get(intent.type, 3),
                 )
-            }
+                if _ranked_segment_survives_contract(r)
+            ]
+            allowed_ids = {r.match.chunk_index for r in selected_ranked}
+            if not allowed_ids:
+                return []
             if allowed_ids:
                 filtered = [row for row in ranked if row[0].chunk_index in allowed_ids]
                 if filtered:
@@ -11015,6 +11081,213 @@ class ReelService:
             score=0.04 + 0.08 * lexical,
         )
 
+    def _build_query_focused_transcript_snippet(
+        self,
+        transcript: list[dict[str, Any]] | None,
+        *,
+        clip_start: float,
+        clip_end: float,
+        query_text: str | None = None,
+        fallback_text: str | None = None,
+        max_chars: int = 700,
+    ) -> str:
+        if transcript:
+            try:
+                from ..ingestion.models import IngestTranscriptCue
+                from ..ingestion.segment import snippet_for_window
+            except Exception:
+                snippet_for_window = None  # type: ignore[assignment]
+                IngestTranscriptCue = None  # type: ignore[assignment]
+            if snippet_for_window is not None and IngestTranscriptCue is not None:
+                cues: list[Any] = []
+                for entry in transcript:
+                    text = str(entry.get("text") or "").replace("\n", " ").strip()
+                    if not text:
+                        continue
+                    try:
+                        start = float(entry.get("start") or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    duration_value = entry.get("duration")
+                    try:
+                        duration = float(duration_value) if duration_value is not None else 0.0
+                    except (TypeError, ValueError):
+                        duration = 0.0
+                    if duration <= 0:
+                        duration = 1.5
+                    cues.append(
+                        IngestTranscriptCue(
+                            start=start,
+                            end=start + duration,
+                            text=text,
+                            words=[],
+                            word_source="legacy",
+                        )
+                    )
+                if cues:
+                    try:
+                        snippet = snippet_for_window(
+                            cues,
+                            float(clip_start),
+                            float(clip_end),
+                            max_chars=max_chars,
+                            focus_query=query_text,
+                        )
+                    except Exception:
+                        snippet = ""
+                    if snippet:
+                        return snippet
+
+        fallback = str(fallback_text or "").strip()
+        if len(fallback) > max_chars:
+            fallback = fallback[:max_chars].rstrip() + "…"
+        return fallback
+
+    def _sentence_spans_in_clip(
+        self,
+        transcript: list[dict[str, Any]],
+        *,
+        clip_start: float,
+        clip_end: float,
+    ) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for entry in transcript:
+            text = str(entry.get("text") or "").replace("\n", " ").strip()
+            if not text:
+                continue
+            try:
+                start = float(entry.get("start") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            duration_value = entry.get("duration")
+            try:
+                duration = float(duration_value) if duration_value is not None else 0.0
+            except (TypeError, ValueError):
+                duration = 0.0
+            if duration <= 0:
+                duration = 1.5
+            end = start + duration
+            if end <= clip_start or start >= clip_end:
+                continue
+            entries.append({"start": start, "end": end, "text": text})
+
+        if not entries:
+            return []
+
+        punct_ratio = self._terminal_punct_ratio(entries)
+        if punct_ratio < _PUNCT_RESTORE_THRESHOLD:
+            entries = self._auto_punctuate_entries(entries)
+
+        use_pause_boundaries = not self._transcript_has_terminal_punct(entries)
+        pause_breaks: set[int] = set()
+        if use_pause_boundaries:
+            pause_breaks = self._cue_pause_breaks(entries, min_pause_sec=0.6)
+            if not pause_breaks:
+                pause_breaks = self._cue_pause_breaks(entries, min_pause_sec=0.3)
+            if not pause_breaks:
+                pause_breaks = set(range(1, len(entries)))
+
+        spans: list[dict[str, Any]] = []
+        sentence_start: float | None = None
+        sentence_end: float | None = None
+        pieces: list[str] = []
+        for idx, entry in enumerate(entries):
+            start = max(float(clip_start), float(entry["start"]))
+            end = min(float(clip_end), float(entry["end"]))
+            if end <= start:
+                continue
+            text = str(entry["text"]).strip()
+            if not text:
+                continue
+            if sentence_start is None:
+                sentence_start = start
+            sentence_end = end
+            pieces.append(text)
+            ends_sentence = (
+                ((idx + 1) in pause_breaks)
+                if use_pause_boundaries
+                else self._is_sentence_end(text)
+            )
+            if ends_sentence:
+                spans.append(
+                    {
+                        "t_start": sentence_start,
+                        "t_end": sentence_end,
+                        "text": " ".join(pieces).strip(),
+                    }
+                )
+                sentence_start = None
+                sentence_end = None
+                pieces = []
+
+        if sentence_start is not None and sentence_end is not None and pieces:
+            spans.append(
+                {
+                    "t_start": sentence_start,
+                    "t_end": sentence_end,
+                    "text": " ".join(pieces).strip(),
+                }
+            )
+        return spans
+
+    def _trim_structural_edges_from_clip(
+        self,
+        transcript: list[dict[str, Any]],
+        *,
+        clip_start: float,
+        clip_end: float,
+        video_duration_sec: int,
+        min_len: int,
+    ) -> tuple[float, float] | None:
+        spans = self._sentence_spans_in_clip(
+            transcript,
+            clip_start=float(clip_start),
+            clip_end=float(clip_end),
+        )
+        if not spans:
+            return (float(clip_start), float(clip_end))
+
+        video_duration = float(video_duration_sec) if video_duration_sec > 0 else None
+        start_idx = 0
+        end_idx = len(spans) - 1
+
+        while start_idx <= end_idx:
+            label = classify_passage(
+                str(spans[start_idx]["text"] or ""),
+                t_start=float(spans[start_idx]["t_start"] or 0.0),
+                video_duration=video_duration,
+            )
+            if label.name not in _STRUCTURAL_EDGE_TRIM_LABELS:
+                break
+            start_idx += 1
+
+        while end_idx >= start_idx:
+            label = classify_passage(
+                str(spans[end_idx]["text"] or ""),
+                t_start=float(spans[end_idx]["t_start"] or 0.0),
+                video_duration=video_duration,
+            )
+            if label.name not in _STRUCTURAL_EDGE_TRIM_LABELS:
+                break
+            end_idx -= 1
+
+        if start_idx > end_idx:
+            return None
+
+        start_trimmed = start_idx > 0
+        end_trimmed = end_idx < (len(spans) - 1)
+        new_start = max(0.0, float(clip_start))
+        new_end = float(clip_end)
+        if start_trimmed:
+            new_start = max(0.0, float(spans[start_idx]["t_start"] or clip_start))
+        if end_trimmed:
+            new_end = float(spans[end_idx]["t_end"] or clip_end)
+        if video_duration_sec > 0:
+            new_end = min(new_end, float(video_duration_sec))
+        if new_end - new_start < float(min_len):
+            return None
+        return (round(new_start, 2), round(new_end, 2))
+
     def _build_dry_run_reel_preview(
         self,
         concept: dict[str, Any],
@@ -11080,7 +11353,7 @@ class ReelService:
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
         )
-        normalized_clip_window: tuple[int, int] | None
+        normalized_clip_window: tuple[float, float] | None
         if clip_window is None:
             normalized_clip_window = self._normalize_clip_window(
                 segment.t_start,
@@ -11100,18 +11373,38 @@ class ReelService:
         if not normalized_clip_window:
             return None
         start_sec, end_sec = normalized_clip_window
+        video_duration_sec = int(video.get("duration_sec") or 0)
+        if _importance_ranker_enabled() and transcript:
+            trimmed_window = self._trim_structural_edges_from_clip(
+                transcript,
+                clip_start=float(start_sec),
+                clip_end=float(end_sec),
+                video_duration_sec=video_duration_sec,
+                min_len=clip_min_len,
+            )
+            if trimmed_window is None:
+                return None
+            start_sec, end_sec = trimmed_window
+        query_text = str((relevance_context or {}).get("query_text") or "").strip()
+        transcript_snippet = self._build_query_focused_transcript_snippet(
+            transcript,
+            clip_start=float(start_sec),
+            clip_end=float(end_sec),
+            query_text=query_text or None,
+            fallback_text=segment.text,
+        )
         video_id = video["id"]
         url = (
             f"https://www.youtube.com/embed/{video_id}?start={start_sec}&end={end_sec}"
             f"&playlist={video_id}&autoplay=1&mute=1&playsinline=1"
             "&loop=1&controls=1&modestbranding=1&iv_load_policy=3&rel=0"
         )
-        takeaways = build_takeaways(concept, segment.text)
+        takeaways = build_takeaways(concept, transcript_snippet or segment.text)
         captions = self._build_caption_cues(
             transcript=transcript or [],
             clip_start=float(start_sec),
             clip_end=float(end_sec),
-            fallback_text=segment.text,
+            fallback_text=transcript_snippet or segment.text,
         )
         video_title = str(video.get("title") or "").strip()
         video_description = self._clean_video_description(str(video.get("description") or ""))
@@ -11121,7 +11414,7 @@ class ReelService:
             concept_title=str(concept.get("title") or ""),
             video_title=video_title,
             video_description=video_description,
-            transcript_snippet=segment.text[:700],
+            transcript_snippet=transcript_snippet,
             takeaways=takeaways,
             fast_mode=fast_mode,
         )
@@ -11146,7 +11439,7 @@ class ReelService:
                     "video_url": url,
                     "t_start": float(start_sec),
                     "t_end": float(end_sec),
-                    "transcript_snippet": segment.text[:700],
+                    "transcript_snippet": transcript_snippet,
                     "takeaways_json": dumps_json(takeaways),
                     "base_score": float(segment.score),
                     "created_at": now_iso(),
@@ -11168,7 +11461,7 @@ class ReelService:
             "video_url": url,
             "t_start": float(start_sec),
             "t_end": float(end_sec),
-            "transcript_snippet": segment.text[:700],
+            "transcript_snippet": transcript_snippet,
             "takeaways": takeaways,
             "captions": captions,
             "score": float(segment.score),
@@ -11180,7 +11473,7 @@ class ReelService:
             "source_surface": str((relevance_context or {}).get("source_surface") or ""),
             "matched_terms": matched_terms,
             "relevance_reason": relevance_reason,
-            "video_duration_sec": int(video.get("duration_sec") or 0),
+            "video_duration_sec": video_duration_sec,
             "clip_duration_sec": float(max(0.0, end_sec - start_sec)),
         }
 
