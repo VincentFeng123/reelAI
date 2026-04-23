@@ -35,6 +35,7 @@ from youtube_transcript_api._errors import (
 
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
+from .provider_registry import ProviderCandidate, ProviderRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +469,11 @@ class YouTubeService:
             )
         else:
             self.transcript_api = YouTubeTranscriptApi()
+
+        # ---- Multi-platform fallback providers -----------------------------
+        # Dormant when `provider_registry_enabled` is False; consulted inside
+        # `_search_external_fallbacks` alongside DuckDuckGo / Bing scraping.
+        self._provider_registry = ProviderRegistry()
 
         # ---- HTTP session with Chrome impersonation + stealth headers ------
         # `impersonate=` locks in the TLS + HTTP/2 + header-set fingerprint of
@@ -1611,6 +1617,27 @@ class YouTubeService:
         for rows in ordered_external_rows:
             if rows:
                 results = self._merge_unique_videos(results, rows, None)
+        # Multi-platform provider fallback: ask the registry for candidates
+        # from Vimeo / Dailymotion / Bilibili / TikTok / Twitch. Dormant when
+        # `provider_registry_enabled` is False, so zero overhead by default.
+        if self._provider_registry.enabled:
+            try:
+                provider_candidates = self._provider_registry.search_all(
+                    query,
+                    per_variant_budget,
+                )
+            except Exception:
+                provider_candidates = []
+            if provider_candidates:
+                provider_rows = [self._candidate_to_row(c) for c in provider_candidates]
+                self._annotate_search_rows(
+                    provider_rows,
+                    search_source="provider_registry",
+                    retrieval_strategy=retrieval_strategy,
+                    retrieval_stage=retrieval_stage,
+                    search_query=query,
+                )
+                results = self._merge_unique_videos(results, provider_rows, None)
         return self._finalize_search_rows(
             results,
             query=query,
@@ -2517,6 +2544,7 @@ class YouTubeService:
             "published_at": "",
             "is_creative_commons": False,
             "search_source": "youtube_html",
+            "provider": "youtube",
             "query_strategy": "",
             "query_stage": "",
             "search_query": "",
@@ -2524,6 +2552,29 @@ class YouTubeService:
             "seed_video_id": "",
             "seed_channel_id": "",
             "crawl_depth": 0,
+        }
+
+    @staticmethod
+    def _candidate_to_row(candidate: ProviderCandidate) -> dict[str, Any]:
+        """Map a ProviderCandidate (non-YouTube) onto the row dict shape
+        that flows through ranking + persistence. The `provider` field
+        is what `reels._get_transcript` later dispatches on.
+        """
+        return {
+            "id": candidate.video_id,
+            "title": candidate.title or f"{candidate.provider.title()} Video {candidate.video_id}",
+            "channel_id": "",
+            "channel_title": candidate.channel,
+            "description": candidate.description,
+            "duration_sec": int(candidate.duration_sec or 0),
+            "view_count": int(candidate.view_count or 0),
+            "published_at": candidate.published_at or "",
+            "is_creative_commons": False,
+            "search_source": f"{candidate.provider}_api",
+            "provider": candidate.provider,
+            "playback_url": candidate.playback_url,
+            "thumbnail_url": candidate.thumbnail_url,
+            "video_url": candidate.video_url,
         }
 
     def _build_fallback_rows(
@@ -2578,7 +2629,7 @@ class YouTubeService:
 
     def _normalize_video_row(self, row: dict[str, Any]) -> dict[str, Any]:
         video_id = str(row.get("id") or "").strip()
-        return {
+        normalized = {
             "id": video_id,
             "title": str(row.get("title") or "Untitled"),
             "channel_id": str(row.get("channel_id") or ""),
@@ -2596,7 +2647,15 @@ class YouTubeService:
             "seed_video_id": str(row.get("seed_video_id") or ""),
             "seed_channel_id": str(row.get("seed_channel_id") or row.get("channel_id") or ""),
             "crawl_depth": max(0, int(row.get("crawl_depth") or 0)),
+            "provider": (str(row.get("provider") or "youtube").strip().lower() or "youtube"),
         }
+        # Non-YouTube rows carry their embed URL through so downstream clients
+        # (Swift WKWebView / webapp <iframe>) can render them without needing
+        # provider-specific URL construction.
+        playback_url = str(row.get("playback_url") or "").strip()
+        if playback_url:
+            normalized["playback_url"] = playback_url
+        return normalized
 
     def _merge_video_rows(self, existing: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
         winner = candidate if self._video_row_rank(candidate) > self._video_row_rank(existing) else existing

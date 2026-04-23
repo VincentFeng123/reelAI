@@ -1,6 +1,6 @@
 "use client";
 
-import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import type { Reel } from "@/lib/types";
 import { loadYouTubeIframeApi } from "@/lib/youtubeIframeApi";
@@ -150,6 +150,11 @@ export function ReelCard({
   const [isResumeMaskVisible, setIsResumeMaskVisible] = useState(false);
   const [currentSec, setCurrentSec] = useState(0);
   const [detectedDurationSec, setDetectedDurationSec] = useState<number | null>(null);
+  // When duration detection via YT API never fires (stuck onReady, network
+  // stall), we fall back to a sensible clip end rather than leaving
+  // community-imported reels stuck at clipStart+1. Flips 5s after the
+  // player becomes ready if detection hasn't succeeded.
+  const [durationDetectionTimedOut, setDurationDetectionTimedOut] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isTouchLikeDevice, setIsTouchLikeDevice] = useState(false);
   const [isMobilePhoneDevice, setIsMobilePhoneDevice] = useState(false);
@@ -212,7 +217,13 @@ export function ReelCard({
     configuredClipEnd >= detectedClipEnd * 0.93;
   const clipEnd =
     detectedClipEnd === null
-      ? configuredClipEnd
+      ? shouldUseDetectedDurationAsMax
+        && durationDetectionTimedOut
+        && configuredClipEnd - clipStart < 15
+        // Detection timed out and the configured window is the 1s default —
+        // extend to a reasonable 30s so the reel is actually watchable.
+        ? clipStart + 30
+        : configuredClipEnd
       : shouldUseDetectedDurationAsMax || shouldAutoExtendNearFullClip
       ? detectedClipEnd
       : Math.max(clipStart + 1, Math.min(configuredClipEnd, detectedClipEnd));
@@ -234,14 +245,32 @@ export function ReelCard({
     isActiveRef.current = isActive;
   }, [isActive]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    // Sync before paint so async player/state-change callbacks see the
+    // updated rate on the same tick the prop changed. Plain useEffect
+    // runs after paint and leaves handlers one tick stale.
     playbackRateRef.current = playbackRate;
   }, [playbackRate]);
 
   useEffect(() => {
     didHandleClipEndRef.current = false;
     setDetectedDurationSec(null);
+    setDurationDetectionTimedOut(false);
   }, [reel.reel_id]);
+
+  useEffect(() => {
+    if (
+      !isYouTubeVideo
+      || !shouldUseDetectedDurationAsMax
+      || detectedDurationSec !== null
+    ) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      setDurationDetectionTimedOut(true);
+    }, 5000);
+    return () => clearTimeout(timer);
+  }, [isYouTubeVideo, shouldUseDetectedDurationAsMax, detectedDurationSec, reel.reel_id]);
 
   useEffect(() => {
     setCurrentSec((prev) => clamp(prev, 0, clipDuration));

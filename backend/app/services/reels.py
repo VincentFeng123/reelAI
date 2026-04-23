@@ -19,6 +19,8 @@ from ..config import get_settings
 from ..db import DatabaseIntegrityError, dumps_json, fetch_all, fetch_one, now_iso, upsert
 from . import llm_router
 from .concepts import build_takeaways
+from ..ingestion.segment import normalize_clip_window as _normalize_clip_window_fn
+from .provider_registry import ProviderRegistry
 from .segmenter import (
     SegmentMatch,
     TranscriptChunk,
@@ -1288,6 +1290,13 @@ class ReelService:
         self._strategy_history_cache_max_size = 10_000
         self.llm_available = llm_router.gemini_or_groq_available()
         self.topic_expansion_service = TopicExpansionService()
+        self._provider_registry = ProviderRegistry()
+        # Cache of video_id → provider so bare-id transcript fetches route
+        # correctly once a non-YouTube row has been seen. Populated by
+        # `_register_video_provider` (called from search wiring in
+        # youtube.py:_search_external_fallbacks) and consulted by
+        # `_get_transcript` when the caller only has a video_id string.
+        self._provider_by_video_id: dict[str, str] = {}
 
     def _reel_scope_where(
         self,
@@ -6386,6 +6395,64 @@ class ReelService:
         output.sort(key=lambda row: (row[0], row[1]))
         return output
 
+    def _register_video_provider(self, video_id: str, provider: str) -> None:
+        """Remember the provider for a video_id so later bare-id transcript
+        fetches (prefetch, parallel scan) route through the correct backend.
+        """
+        vid = str(video_id or "").strip()
+        if not vid:
+            return
+        name = str(provider or "youtube").strip().lower() or "youtube"
+        if name == "youtube":
+            # YouTube is the default — don't bloat the cache with it.
+            return
+        self._provider_by_video_id[vid] = name
+
+    def _get_transcript(self, video: Any) -> list[dict[str, Any]]:
+        """Route transcript fetch by provider. Returns a list of
+        `{"start": float, "duration": float, "text": str}` cues in
+        YouTube-compatible format (empty list on any failure).
+
+        Accepts:
+          * a dict video_row (reads `provider` + `video_id`/`id`)
+          * a `(video_id, provider)` tuple
+          * a bare video_id string (provider inferred from
+            `_provider_by_video_id`, else 'youtube')
+        """
+        provider_name = "youtube"
+        video_id = ""
+        if isinstance(video, dict):
+            video_id = str(video.get("video_id") or video.get("id") or "").strip()
+            provider_name = str(video.get("provider") or "youtube").strip().lower() or "youtube"
+        elif isinstance(video, tuple) and len(video) == 2:
+            raw_id, raw_provider = video
+            video_id = str(raw_id or "").strip()
+            provider_name = str(raw_provider or "youtube").strip().lower() or "youtube"
+        else:
+            video_id = str(video or "").strip()
+            provider_name = self._provider_by_video_id.get(video_id, "youtube")
+        if not video_id:
+            return []
+        if provider_name == "youtube":
+            try:
+                return list(self.youtube_service.get_transcript(None, video_id) or [])
+            except Exception:
+                return []
+        try:
+            transcript = self._provider_registry.fetch_transcript(provider_name, video_id)
+        except Exception:
+            return []
+        if transcript is None:
+            return []
+        return [
+            {
+                "start": float(cue.start),
+                "duration": max(0.0, float(cue.end) - float(cue.start)),
+                "text": str(cue.text or ""),
+            }
+            for cue in transcript.cues
+        ]
+
     def _prefetch_transcripts_parallel(
         self,
         video_ids: list[str],
@@ -6401,12 +6468,12 @@ class ReelService:
             workers_limit = min(workers_limit, 2)
         workers = max(1, min(workers_limit, len(unique_ids)))
         if workers == 1:
-            return {video_id: self.youtube_service.get_transcript(None, video_id) for video_id in unique_ids}
+            return {video_id: self._get_transcript(video_id) for video_id in unique_ids}
 
         transcripts: dict[str, list[dict[str, Any]]] = {}
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
-                executor.submit(self.youtube_service.get_transcript, None, video_id): video_id for video_id in unique_ids
+                executor.submit(self._get_transcript, video_id): video_id for video_id in unique_ids
             }
             for future in as_completed(future_map):
                 video_id = future_map[future]
@@ -6444,7 +6511,7 @@ class ReelService:
             )
         )
         future_by_video_id = {
-            video_id: executor.submit(self.youtube_service.get_transcript, None, video_id)
+            video_id: executor.submit(self._get_transcript, video_id)
             for video_id in ordered_ids
         }
         return TranscriptPrefetchTask(
@@ -6484,8 +6551,7 @@ class ReelService:
             )
         for video_id in pending_ids:
             prefetch_task.future_by_video_id[video_id] = prefetch_task.executor.submit(
-                self.youtube_service.get_transcript,
-                None,
+                self._get_transcript,
                 video_id,
             )
         prefetch_task.video_ids = tuple(
@@ -6537,7 +6603,7 @@ class ReelService:
             if future is not None:
                 transcript = list(future.result(timeout=timeout) or [])
             else:
-                transcript = list(self.youtube_service.get_transcript(None, clean_video_id) or [])
+                transcript = list(self._get_transcript(clean_video_id) or [])
         except FutureTimeoutError:
             logger.warning(
                 "Transcript prefetch timed out after %.1fs for video=%s",
@@ -6545,7 +6611,7 @@ class ReelService:
                 clean_video_id,
             )
             try:
-                transcript = list(self.youtube_service.get_transcript(None, clean_video_id) or [])
+                transcript = list(self._get_transcript(clean_video_id) or [])
             except Exception:
                 transcript = []
         except Exception:
@@ -6696,7 +6762,7 @@ class ReelService:
             )
         else:
             try:
-                transcript = list(self.youtube_service.get_transcript(None, clean_video_id) or [])
+                transcript = list(self._get_transcript(clean_video_id) or [])
             except Exception:
                 transcript = []
         transcript_cache[clean_video_id] = transcript
@@ -7025,7 +7091,7 @@ class ReelService:
                 continue
 
             try:
-                transcript = list(self.youtube_service.get_transcript(None, video_id) or [])
+                transcript = list(self._get_transcript(video_id) or [])
             except Exception:
                 transcript = []
             if not transcript:
@@ -10333,6 +10399,10 @@ class ReelService:
         return 0.25 * helpful - 0.35 * confusing + 0.15 * (avg_rating - 3.0)
 
     def _upsert_video(self, conn, video: dict[str, Any]) -> None:
+        provider = str(video.get("provider") or "youtube").strip().lower() or "youtube"
+        if provider != "youtube":
+            # Remember for later bare-id transcript fetches.
+            self._register_video_provider(str(video.get("id") or ""), provider)
         upsert(
             conn,
             "videos",
@@ -10344,6 +10414,7 @@ class ReelService:
                 "duration_sec": int(video.get("duration_sec") or 0),
                 "view_count": int(video.get("view_count") or 0),
                 "is_creative_commons": 1 if video.get("is_creative_commons") else 0,
+                "provider": provider,
                 "created_at": now_iso(),
             },
         )
@@ -11272,6 +11343,12 @@ class ReelService:
             end_idx -= 1
 
         if start_idx > end_idx:
+            logger.info(
+                "structural_trim dropped clip [%.2f, %.2f]: all %d sentence spans matched trim labels",
+                float(clip_start),
+                float(clip_end),
+                len(spans),
+            )
             return None
 
         start_trimmed = start_idx > 0
@@ -11285,6 +11362,14 @@ class ReelService:
         if video_duration_sec > 0:
             new_end = min(new_end, float(video_duration_sec))
         if new_end - new_start < float(min_len):
+            logger.info(
+                "structural_trim dropped clip [%.2f, %.2f]: post-trim window %.2f-%.2f shorter than min_len=%d",
+                float(clip_start),
+                float(clip_end),
+                new_start,
+                new_end,
+                int(min_len),
+            )
             return None
         return (round(new_start, 2), round(new_end, 2))
 
@@ -11604,36 +11689,15 @@ class ReelService:
         allow_exceed_max: bool = False,
         allow_below_min: bool = False,
     ) -> tuple[float, float] | None:
-        if min_len < 1:
-            min_len = 1
-
-        start_sec = max(0.0, round(float(t_start), 2))
-        end_sec = max(start_sec + 1.0, round(float(t_end), 2))
-
-        if max_len > 0 and not allow_exceed_max and end_sec - start_sec > max_len:
-            end_sec = start_sec + max_len
-        if not allow_below_min and end_sec - start_sec < min_len:
-            end_sec = start_sec + min_len
-
-        if video_duration_sec > 0:
-            if not allow_below_min and video_duration_sec < min_len:
-                return None
-            if end_sec > video_duration_sec:
-                end_sec = video_duration_sec
-            if not allow_below_min and end_sec - start_sec < min_len:
-                start_sec = max(0, end_sec - min_len)
-            if max_len > 0 and not allow_exceed_max and end_sec - start_sec > max_len:
-                end_sec = start_sec + max_len
-            if end_sec > video_duration_sec:
-                end_sec = video_duration_sec
-
-        if end_sec <= start_sec:
-            return None
-        if not allow_below_min and end_sec - start_sec < min_len:
-            return None
-        if max_len > 0 and not allow_exceed_max and end_sec - start_sec > max_len:
-            return None
-        return (start_sec, end_sec)
+        return _normalize_clip_window_fn(
+            t_start,
+            t_end,
+            video_duration_sec,
+            min_len=min_len,
+            max_len=max_len,
+            allow_exceed_max=allow_exceed_max,
+            allow_below_min=allow_below_min,
+        )
 
     def _should_use_full_short_clip(
         self,

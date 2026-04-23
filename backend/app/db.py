@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS videos (
     duration_sec INTEGER,
     view_count INTEGER DEFAULT 0,
     is_creative_commons INTEGER DEFAULT 0,
+    provider TEXT DEFAULT 'youtube',
     created_at TEXT NOT NULL
 );
 
@@ -885,6 +886,7 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS normalization_version TEXT")
                 cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS quality_status TEXT")
                 cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS quality_rejection_reason TEXT")
+                cur.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'youtube'")
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             conn.commit()
@@ -897,6 +899,10 @@ def init_db() -> None:
         # Lightweight schema migration for existing local databases.
         try:
             conn.execute("ALTER TABLE videos ADD COLUMN view_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE videos ADD COLUMN provider TEXT DEFAULT 'youtube'")
         except sqlite3.OperationalError:
             pass
         try:

@@ -2524,20 +2524,41 @@ def _fetch_generation_row(conn, generation_id: str | None) -> dict[str, Any] | N
     return fetch_one(conn, "SELECT * FROM reel_generations WHERE id = ?", (generation_id,))
 
 
-def _normalize_provider_stage(value: object) -> Literal["youtube", "youtube_graph", "youtube_external", "dailymotion", "wikimedia", "stock"]:
+def _normalize_provider_stage(value: object) -> Literal["youtube", "youtube_graph", "youtube_external", "vimeo", "dailymotion", "bilibili", "tiktok", "twitch", "wikimedia", "stock"]:
     clean = str(value or "").strip().lower()
-    if clean in {"youtube", "youtube_graph", "youtube_external", "dailymotion", "wikimedia", "stock"}:
+    if clean in {
+        "youtube",
+        "youtube_graph",
+        "youtube_external",
+        "vimeo",
+        "dailymotion",
+        "bilibili",
+        "tiktok",
+        "twitch",
+        "wikimedia",
+        "stock",
+    }:
         return clean  # type: ignore[return-value]
     if clean in {"wikimedia_commons", "internet_archive", "pexels_video", "pixabay_video"}:
         return "stock" if clean != "wikimedia_commons" else "wikimedia"
     return "youtube"
 
 
-def _next_provider_stage(current_stage: object) -> Literal["dailymotion", "wikimedia", "stock"] | None:
+def _next_provider_stage(current_stage: object) -> Literal["vimeo", "dailymotion", "bilibili", "tiktok", "twitch", "wikimedia", "stock"] | None:
     current = _normalize_provider_stage(current_stage)
+    # User-specified ladder: YouTube → Vimeo → Dailymotion → Bilibili → TikTok
+    # → Twitch, then the pre-existing Wikimedia + generic stock fallbacks.
     if current in {"youtube", "youtube_graph", "youtube_external"}:
+        return "vimeo"
+    if current == "vimeo":
         return "dailymotion"
     if current == "dailymotion":
+        return "bilibili"
+    if current == "bilibili":
+        return "tiktok"
+    if current == "tiktok":
+        return "twitch"
+    if current == "twitch":
         return "wikimedia"
     if current == "wikimedia":
         return "stock"
@@ -2548,7 +2569,7 @@ def _search_status_provider_stage(
     provider_stage: object,
     *,
     recovery_stage: int | None = None,
-) -> Literal["youtube", "youtube_graph", "youtube_external", "dailymotion", "wikimedia", "stock"]:
+) -> Literal["youtube", "youtube_graph", "youtube_external", "vimeo", "dailymotion", "bilibili", "tiktok", "twitch", "wikimedia", "stock"]:
     normalized = _normalize_provider_stage(provider_stage)
     if normalized != "youtube":
         return normalized

@@ -127,7 +127,6 @@ def _deserialize_cues(raw: Any) -> list[IngestTranscriptCue]:
                     "whisper",
                     "whisper_aligned",
                     "whisperx",
-                    "openai",
                     "groq",
                     "proportional",
                     "legacy",

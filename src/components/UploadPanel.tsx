@@ -404,14 +404,33 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
       });
       let materialIds: string[] = [];
       if (inputMode === "topic" && topicList.length > 1) {
-        const uploads = await Promise.all(
-          topicList.map(async (topic) =>
-            uploadMaterial({
-              subjectTag: topic,
-            }),
-          ),
+        // Multi-topic: accept partial success. A failed upload for one topic
+        // must not orphan successfully-created materials for the others —
+        // Promise.all rejects the whole batch and would do exactly that.
+        const settled = await Promise.allSettled(
+          topicList.map((topic) => uploadMaterial({ subjectTag: topic })),
         );
-        materialIds = uploads.map((row) => row.material_id).filter(Boolean);
+        const succeededIds = settled
+          .map((result) =>
+            result.status === "fulfilled" ? result.value.material_id : "",
+          )
+          .filter((id): id is string => Boolean(id));
+        const failedCount = settled.filter((r) => r.status === "rejected").length;
+        if (succeededIds.length === 0) {
+          throw new Error(
+            failedCount > 0
+              ? `All ${failedCount} topic upload${failedCount > 1 ? "s" : ""} failed.`
+              : "No materials were created.",
+          );
+        }
+        if (failedCount > 0) {
+          // Log-only: the user proceeds into the feed with the subset that
+          // worked rather than losing every successful upload.
+          console.warn(
+            `${failedCount} of ${topicList.length} topic uploads failed; continuing with ${succeededIds.length}.`,
+          );
+        }
+        materialIds = succeededIds;
       } else {
         const material = await uploadMaterial({
           text: textValue || undefined,

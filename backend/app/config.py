@@ -85,6 +85,22 @@ class Settings(BaseSettings):
     # API call, so activation is a quality/latency trade-off.
     whisper_clip_refine_enabled: bool = False
 
+    # Multi-platform provider registry (Vimeo / Dailymotion / Bilibili /
+    # TikTok / Twitch). When false the registry is dormant and callers
+    # (youtube._search_external_fallbacks, reels._get_transcript) bypass it.
+    # Enable per-provider via their own keys below.
+    provider_registry_enabled: bool = False
+    # Vimeo personal access token (https://developer.vimeo.com/). Keyless
+    # oEmbed covers public metadata, but the API is required for search
+    # and captions.
+    vimeo_access_token: str = ""
+    # Twitch app-access (Helix) credentials. Both required to hit
+    # /helix/clips. Token is fetched at runtime via client-credentials.
+    twitch_client_id: str = ""
+    twitch_client_secret: str = ""
+    # Dailymotion + Bilibili + TikTok are keyless in the current scaffolding
+    # (public APIs / yt-dlp). If those APIs later require keys, add them here.
+
 
 @lru_cache
 def get_settings() -> Settings:

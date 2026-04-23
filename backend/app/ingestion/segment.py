@@ -3,9 +3,8 @@ Clip segmentation — pick a 15-60s window that starts and ends on a natural bou
 
 Two exported functions:
 
-  * `normalize_clip_window(...)`: pure int-clamping logic, copied verbatim from
-    `app/services/reels.py:9286-9325` with `self` removed. This keeps the legacy and
-    the new pipeline bit-compatible on window math so tests comparing outputs stay valid.
+  * `normalize_clip_window(...)`: pure int-clamping logic. Canonical source;
+    `reels.py:_normalize_clip_window` delegates here.
 
   * `pick_segments(...)`: the smart picker. Uses transcript cue gaps + optional
     ffmpeg silencedetect ranges to find a window that does NOT start or end mid-word.
@@ -42,11 +41,6 @@ _FOCUS_STOPWORDS = {
 }
 
 
-# --------------------------------------------------------------------- #
-# Verbatim copy of `reels.py:9286-9325` (self-less)
-# --------------------------------------------------------------------- #
-
-
 def normalize_clip_window(
     t_start: float,
     t_end: float,
@@ -57,9 +51,8 @@ def normalize_clip_window(
     allow_below_min: bool = False,
 ) -> tuple[float, float] | None:
     """
-    Copied verbatim from `reels.py:_normalize_clip_window` with `self` removed.
-    Do NOT edit without keeping the original in sync, or rip the original out
-    once the refactor merges. Uses float precision to preserve sub-second timestamps.
+    Canonical clip-window clamper. `reels.py:_normalize_clip_window` delegates here.
+    Uses float precision to preserve sub-second timestamps.
     """
     if min_len < 1:
         min_len = 1
