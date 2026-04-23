@@ -1044,13 +1044,22 @@ class YouTubeService:
                 self._note_request_failure(exc, scope="youtube_api")
                 if page_idx == 0:
                     status = getattr(getattr(exc, "response", None), "status_code", None)
-                    if status == 403:
-                        raise YouTubeApiRequestError(
-                            "YouTube Data API request was rejected (403). Check YOUTUBE_API_KEY, API restrictions, and quota."
-                        ) from exc
-                    raise YouTubeApiRequestError(
-                        f"YouTube Data API request failed{f' ({status})' if status else ''}."
-                    ) from exc
+                    # Previously raised YouTubeApiRequestError here, which
+                    # escaped all the way up to the FastAPI endpoint and
+                    # returned a 502 — bypassing the HTML scrape, DDG/Bing
+                    # external fallbacks, and the cross-platform provider
+                    # registry. Now we mark the API exhausted (so sibling
+                    # calls in the same request skip it via
+                    # `_should_use_data_api`) and return whatever items we
+                    # collected so far (empty on first-page failure). The
+                    # orchestrator in `search_videos` then falls through to
+                    # the non-API paths, which the registry merges into.
+                    logger.warning(
+                        "YouTube Data API request failed (%s) — falling back to HTML/external/provider-registry paths",
+                        status or "no-status",
+                    )
+                    self._api_quota_exhausted = True
+                    self._api_quota_exhausted_at = time.monotonic()
                 break
 
             page_items = data.get("items", [])
