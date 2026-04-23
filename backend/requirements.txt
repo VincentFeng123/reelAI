@@ -59,6 +59,18 @@ cerebras-cloud-sdk>=1.35.0
 # regex fallback mis-splits on. If this import ever fails, services/sentences.py
 # degrades to the regex splitter automatically.
 pysbd==0.3.4
+# pyannote.audio pinned explicitly because whisperx 3.1.1 officially
+# pairs with pyannote.audio 3.1.1, but whisperx's own install_requires
+# isn't strict enough — on fresh Railway builds pip sometimes resolves
+# pyannote.audio 2.x instead. pyannote 2.x calls
+# `torchaudio.set_audio_backend("soundfile")` at module-init time, and
+# torchaudio>=2.0 (which the rest of the stack wants) REMOVED that
+# method. Result: `import whisperx` raises AttributeError at boot,
+# WhisperX word-level boundary refinement silently disables, logs spam
+# with tracebacks on every clip. Pinning to 3.1.1 drops the removed
+# call. The defensive guard in whisperx_transcribe.py stays as
+# belt-and-suspenders for any future torchaudio / pyannote regressions.
+pyannote.audio==3.1.1
 # WhisperX — Phase 4 selective wav2vec2 forced alignment. Used ONLY when:
 #   (a) Phase-1 faster-whisper alignment falls below match-rate threshold, OR
 #   (b) top-k clip refinement wants ≤50ms boundary precision.
