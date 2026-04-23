@@ -40,6 +40,7 @@ import threading
 import time
 import urllib.parse
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -854,26 +855,50 @@ class ProviderRegistry:
     def get(self, name: str) -> Provider | None:
         return self._by_name.get(name)
 
-    def search_all(self, query: str, max_results_per_provider: int) -> list[ProviderCandidate]:
+    def search_all(
+        self,
+        query: str,
+        max_results_per_provider: int,
+        *,
+        per_provider_timeout_sec: float = 15.0,
+    ) -> list[ProviderCandidate]:
         """
-        Fan out search across every registered provider. Returns the
-        concatenated list in registry order; deduplication by video_url
-        is the caller's responsibility. Dormant when the feature flag is off.
+        Fan out search across every registered provider **in parallel**.
+        Results are concatenated in registry order (Vimeo → Dailymotion →
+        Bilibili → TikTok → Twitch) regardless of completion order, so the
+        output is deterministic. Deduplication by video_url is the caller's
+        responsibility. Dormant when the feature flag is off.
         """
         if not self.enabled:
             return []
         query = (query or "").strip()
         if not query:
             return []
+        if not self._providers:
+            return []
         limit = max(1, int(max_results_per_provider or 1))
+        results_by_idx: dict[int, list[ProviderCandidate]] = {}
+        workers = min(max(1, len(self._providers)), 5)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {
+                executor.submit(provider.search, query, limit): idx
+                for idx, provider in enumerate(self._providers)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    rows = future.result(timeout=per_provider_timeout_sec)
+                except Exception as exc:
+                    # Providers already swallow their own network errors and
+                    # return []; this catches unanticipated bugs + timeouts.
+                    logger.debug(
+                        "%s.search raised: %s", self._providers[idx].name, exc
+                    )
+                    rows = []
+                results_by_idx[idx] = list(rows or [])
         out: list[ProviderCandidate] = []
-        for provider in self._providers:
-            try:
-                out.extend(provider.search(query, limit))
-            except Exception as exc:
-                # Defense in depth: providers already swallow network errors
-                # and return []; this guard catches unanticipated bugs.
-                logger.debug("%s.search raised: %s", provider.name, exc)
+        for idx in range(len(self._providers)):
+            out.extend(results_by_idx.get(idx, []))
         return out
 
     def fetch_transcript(self, provider: str, video_id: str) -> ProviderTranscript | None:

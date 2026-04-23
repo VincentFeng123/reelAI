@@ -796,6 +796,14 @@ class YouTubeService:
                         variant_limit=variant_limit,
                     )
                     videos = self._merge_unique_videos(videos, external_rows, None)
+            videos = self._merge_provider_registry_candidates(
+                videos,
+                query=query,
+                max_results=max_results,
+                retrieval_strategy=retrieval_strategy,
+                retrieval_stage=retrieval_stage,
+                source_surface=source_surface,
+            )
             videos = self._finalize_search_rows(
                 videos,
                 query=query,
@@ -961,6 +969,14 @@ class YouTubeService:
                 deadline=deadline,
                 root_terms=normalized_root_terms,
             )
+        videos = self._merge_provider_registry_candidates(
+            videos,
+            query=query,
+            max_results=max_results,
+            retrieval_strategy=retrieval_strategy,
+            retrieval_stage=retrieval_stage,
+            source_surface=source_surface,
+        )
         videos = self._finalize_search_rows(
             videos,
             query=query,
@@ -1626,27 +1642,12 @@ class YouTubeService:
         for rows in ordered_external_rows:
             if rows:
                 results = self._merge_unique_videos(results, rows, None)
-        # Multi-platform provider fallback: ask the registry for candidates
-        # from Vimeo / Dailymotion / Bilibili / TikTok / Twitch. Dormant when
-        # `provider_registry_enabled` is False, so zero overhead by default.
-        if self._provider_registry.enabled:
-            try:
-                provider_candidates = self._provider_registry.search_all(
-                    query,
-                    per_variant_budget,
-                )
-            except Exception:
-                provider_candidates = []
-            if provider_candidates:
-                provider_rows = [self._candidate_to_row(c) for c in provider_candidates]
-                self._annotate_search_rows(
-                    provider_rows,
-                    search_source="provider_registry",
-                    retrieval_strategy=retrieval_strategy,
-                    retrieval_stage=retrieval_stage,
-                    search_query=query,
-                )
-                results = self._merge_unique_videos(results, provider_rows, None)
+        # Provider registry used to be called here too. That call was
+        # removed because `_merge_provider_registry_candidates` now runs
+        # at the `search_videos` orchestration level on every request,
+        # regardless of whether the YouTube pool was low — which is the
+        # actual "mix other platforms into every search" behavior users
+        # expect. Keeping it here would just double-fire network calls.
         return self._finalize_search_rows(
             results,
             query=query,
@@ -2562,6 +2563,48 @@ class YouTubeService:
             "seed_channel_id": "",
             "crawl_depth": 0,
         }
+
+    def _merge_provider_registry_candidates(
+        self,
+        videos: list[dict[str, Any]],
+        *,
+        query: str,
+        max_results: int,
+        retrieval_strategy: str,
+        retrieval_stage: str,
+        source_surface: str,
+    ) -> list[dict[str, Any]]:
+        """Fan out to every provider in ProviderRegistry and merge their
+        candidates into `videos`. Dormant (no-op) when the master flag
+        PROVIDER_REGISTRY_ENABLED is off. Runs on **every** search so
+        cross-platform results are visible without waiting for YouTube
+        to run out — this is the "always mix" behavior, not "fallback
+        only". Providers run in parallel inside `search_all`; this method
+        is effectively one bounded-latency step in the overall search
+        pipeline.
+        """
+        if not self._provider_registry.enabled:
+            return videos
+        # Each provider returns up to ~max_results/3 candidates. Floor at 3
+        # so niche providers still contribute something even when the user
+        # asked for very few results.
+        per_provider = max(3, int(max_results or 1) // 3)
+        try:
+            provider_candidates = self._provider_registry.search_all(query, per_provider)
+        except Exception as exc:
+            logger.debug("provider_registry.search_all raised: %s", exc)
+            return videos
+        if not provider_candidates:
+            return videos
+        provider_rows = [self._candidate_to_row(c) for c in provider_candidates]
+        self._annotate_search_rows(
+            provider_rows,
+            search_source=f"provider_registry_{source_surface or 'mix'}",
+            retrieval_strategy=retrieval_strategy,
+            retrieval_stage=retrieval_stage,
+            search_query=query,
+        )
+        return self._merge_unique_videos(videos, provider_rows, None)
 
     @staticmethod
     def _candidate_to_row(candidate: ProviderCandidate) -> dict[str, Any]:
