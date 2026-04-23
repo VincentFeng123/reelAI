@@ -53,6 +53,10 @@ _WHISPERX_DEVICE = os.getenv("WHISPERX_DEVICE", "cpu")
 _WHISPERX_ASR_MODEL = os.getenv("WHISPERX_ASR_MODEL", "small")
 
 _whisperx_module: Any | None = None
+# Sentinel stored in `_whisperx_module` once an import attempt has failed,
+# so subsequent calls short-circuit without re-running the broken import
+# (and re-spamming the log). Compared with `is`, never dereferenced.
+_WHISPERX_UNAVAILABLE = object()
 _align_model_cache: dict[str, tuple[Any, Any]] = {}
 _asr_model_cache: dict[str, Any] = {}
 
@@ -71,12 +75,27 @@ def _get_whisperx_module() -> Any | None:
     global _whisperx_module
     if not _WHISPERX_ENABLED:
         return None
+    if _whisperx_module is _WHISPERX_UNAVAILABLE:
+        # Prior import attempt already failed; don't retry per call.
+        return None
     if _whisperx_module is not None:
         return _whisperx_module
     try:
         import whisperx  # type: ignore
-    except ImportError:
-        logger.info("whisperx package not installed; whisperx alignment disabled")
+    except Exception as exc:
+        # Catch Exception (not just ImportError) because the import chain
+        # evaluates pyannote.audio at module-init time, and some
+        # torchaudio>=2.0 + pyannote.audio combinations raise
+        # AttributeError (torchaudio dropped set_audio_backend in 2.0).
+        # Any failure here means WhisperX is unusable — cache the
+        # sentinel so callers fall back to faster-whisper cleanly and
+        # the log isn't spammed with one traceback per clip.
+        logger.info(
+            "whisperx unavailable (%s: %s); alignment disabled, "
+            "using faster-whisper fallback",
+            type(exc).__name__, exc,
+        )
+        _whisperx_module = _WHISPERX_UNAVAILABLE
         return None
     version = getattr(whisperx, "__version__", None)
     if version is not None and str(version) != _PINNED_WHISPERX_VERSION:
