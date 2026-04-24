@@ -1351,10 +1351,10 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-1.5">
                   <p className="text-sm font-semibold text-white/95">Search all platforms</p>
-                  <SettingsInfoTooltip text="When on, topic / text / file submits scrape real reels from YouTube, Instagram, and TikTok. When off, searches use the legacy YouTube-only pipeline (faster, narrower coverage)." />
+                  <SettingsInfoTooltip text="When on, topic / text / file submits augment YouTube search with provider APIs such as Dailymotion, Bilibili, Vimeo, TikTok, and Twitch. When off, searches use the YouTube-only pipeline." />
                 </div>
                 <p className="mt-1 text-[11px] text-white/58">
-                  {multiPlatformSearch ? "YouTube + Instagram + TikTok" : "YouTube only (faster)"}
+                  {multiPlatformSearch ? "YouTube + provider APIs" : "YouTube only (faster)"}
                 </p>
               </div>
               <button

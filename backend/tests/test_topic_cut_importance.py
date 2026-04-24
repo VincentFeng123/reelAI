@@ -73,17 +73,32 @@ class TopicCutImportanceTests(unittest.TestCase):
         reels, cues = _physics_fixture()
 
         with mock.patch("backend.app.services.topic_cut._compute_semantic_scores", return_value=None):
-            with mock.patch.dict(os.environ, {}, clear=False):
-                os.environ.pop("REELS_IMPORTANCE_RANKER_ENABLED", None)
-                baseline = _filter_reels_by_query(reels, "torque", cues=cues, video_duration_sec=240.0)
             with mock.patch.dict(
                 os.environ,
                 {"REELS_IMPORTANCE_RANKER_ENABLED": "0"},
                 clear=False,
             ):
                 disabled = _filter_reels_by_query(reels, "torque", cues=cues, video_duration_sec=240.0)
+            with mock.patch.dict(
+                os.environ,
+                {"REELS_IMPORTANCE_RANKER_ENABLED": "false"},
+                clear=False,
+            ):
+                disabled_false = _filter_reels_by_query(reels, "torque", cues=cues, video_duration_sec=240.0)
 
-        self.assertEqual(_reel_payloads(baseline), _reel_payloads(disabled))
+        self.assertEqual(_reel_payloads(disabled_false), _reel_payloads(disabled))
+
+    def test_flag_default_matches_enabled(self) -> None:
+        reels, cues = _physics_fixture()
+
+        with mock.patch("backend.app.services.topic_cut._compute_semantic_scores", return_value=None):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("REELS_IMPORTANCE_RANKER_ENABLED", None)
+                defaulted = _filter_reels_by_query(reels, "torque", cues=cues, video_duration_sec=240.0)
+            with mock.patch.dict(os.environ, {"REELS_IMPORTANCE_RANKER_ENABLED": "1"}, clear=False):
+                enabled = _filter_reels_by_query(reels, "torque", cues=cues, video_duration_sec=240.0)
+
+        self.assertEqual(_reel_payloads(defaulted), _reel_payloads(enabled))
 
     def test_sponsor_intro_recap_outro_reels_are_excluded(self) -> None:
         reels, cues = _physics_fixture()

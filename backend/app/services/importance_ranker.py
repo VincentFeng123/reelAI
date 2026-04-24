@@ -95,6 +95,8 @@ _CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L12-v2"
 def get_cross_encoder() -> Any | None:
     """Lazy-load the cross-encoder. Returns None if unavailable."""
     global _CROSS_ENCODER, _CROSS_ENCODER_TRIED
+    if os.getenv("REELS_CROSS_ENCODER_ENABLED", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return None
     if _CROSS_ENCODER_TRIED:
         return _CROSS_ENCODER
     if os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME"):

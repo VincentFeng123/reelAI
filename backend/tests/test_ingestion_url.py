@@ -320,6 +320,8 @@ class IngestionUrlTests(unittest.TestCase):
         main_module.ingestion_pipeline._openai_client = None
 
         # Force the pipeline out of "serverless" mode so the preflight check passes.
+        self._original_serverless_mode = main_module.SERVERLESS_MODE
+        main_module.SERVERLESS_MODE = False
         main_module.ingestion_pipeline._serverless_mode = False
 
         # Clear the per-IP rate-limit buckets so tests can make multiple requests
@@ -342,6 +344,7 @@ class IngestionUrlTests(unittest.TestCase):
         main_module.settings = get_settings()
 
     def _restore_pipeline(self) -> None:
+        main_module.SERVERLESS_MODE = self._original_serverless_mode
         main_module.ingestion_pipeline._openai_client = self._original_openai_client
         main_module.ingestion_pipeline._adapters = [
             adapter

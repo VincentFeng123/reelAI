@@ -77,8 +77,8 @@ def _topic_cut_importance_flag() -> bool:
     """Mirror of ``reels._importance_ranker_enabled`` — kept local to avoid
     importing reels.py (heavy dependency tree) just for one env read.
     """
-    raw = os.environ.get("REELS_IMPORTANCE_RANKER_ENABLED", "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    raw = os.environ.get("REELS_IMPORTANCE_RANKER_ENABLED", "true")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 logger = logging.getLogger(__name__)
 _STRUCTURAL_SKIP_LABELS = {"sponsor", "outro", "intro", "recap"}
@@ -818,7 +818,11 @@ def _strip_code_fences(raw: str) -> str:
     return raw
 
 
-def _parse_llm_segments_json(raw: str) -> list[_SegmentTuple]:
+def _parse_llm_segments_json(
+    raw: str,
+    *,
+    cues: Sequence[TranscriptCue] | None = None,
+) -> list[_SegmentTuple]:
     """Parse timestamp-based JSON from any LLM into segment tuples.
 
     Expected JSON shape::
@@ -844,7 +848,18 @@ def _parse_llm_segments_json(raw: str) -> list[_SegmentTuple]:
             s = float(seg.get("start_time"))
             e = float(seg.get("end_time"))
         except (TypeError, ValueError):
-            continue
+            if cues is None:
+                continue
+            try:
+                start_idx = int(seg.get("start_idx"))
+                end_idx = int(seg.get("end_idx"))
+            except (TypeError, ValueError):
+                continue
+            if start_idx < 0 or end_idx < start_idx or start_idx >= len(cues):
+                continue
+            end_idx = min(end_idx, len(cues) - 1)
+            s = float(cues[start_idx].start)
+            e = float(cues[end_idx].end)
         if s < 0 or e < 0 or s >= e:
             continue
         label = str(seg.get("topic_label") or seg.get("label") or "").strip()
@@ -860,6 +875,27 @@ def _parse_llm_segments_json(raw: str) -> list[_SegmentTuple]:
                 pass
         out.append((s, e, label, summary, relevance))
     return out
+
+
+def _llm_topic_segments_openai_compat(
+    cues: Sequence[TranscriptCue],
+    *,
+    openai_client: Any,
+    model: str,
+    query: str | None = None,
+) -> list[_SegmentTuple]:
+    rendered = _render_transcript_for_llm(cues)
+    response = openai_client.chat.completions.create(
+        model=model,
+        temperature=0.1,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": _build_system_prompt(query=query)},
+            {"role": "user", "content": f"Segment this transcript.\n\n{rendered}"},
+        ],
+    )
+    raw = response.choices[0].message.content or "{}"
+    return _parse_llm_segments_json(raw, cues=cues)
 
 
 # --------------------------------------------------------------------------- #
@@ -1748,8 +1784,9 @@ def _topic_reels_from_chapters(
             t_end = min(t_end, float(video_duration_sec))
 
         # Drop unconditionally if the chapter is too short OR exceeds the
-        # absolute hard cap (12 min). For chapters that exceed the SOFT cap
-        # (`max_reel_sec`, e.g. the user's preferred 60s) we attempt to split.
+        # absolute hard cap. Split chapters that only exceed the user's soft
+        # max; if splitting would make unusably short clips, keep the natural
+        # chapter boundary.
         duration = t_end - t_start
         if duration < min_reel_sec or duration > abs_max_cap:
             logger.debug(
@@ -1758,11 +1795,18 @@ def _topic_reels_from_chapters(
             )
             continue
 
-        # Keep the full sentence-aligned range intact. Splitting into
-        # `max_reel_sec` chunks happens downstream in reels.py via
-        # `_split_into_consecutive_windows`, which enforces sentence
-        # boundaries on every sub-window.
         sub_ranges = [(t_start, t_end, label, summary)]
+        if duration > max_reel_sec:
+            split = _split_long_range(
+                t_start,
+                t_end,
+                label,
+                summary,
+                max_reel_sec=max_reel_sec,
+                min_reel_sec=min_reel_sec,
+            )
+            if split:
+                sub_ranges = split
 
         for sub_start, sub_end, sub_label, sub_summary in sub_ranges:
             s_idx = -1
@@ -2306,13 +2350,31 @@ def _snap_segments_to_cues(
             )
             continue
 
-        # Keep the full sentence-aligned range intact. Splitting into
-        # `max_reel_sec` chunks happens downstream in reels.py via
-        # `_split_into_consecutive_windows`, which enforces sentence
-        # boundaries on every sub-window.
         split = [(t_start, t_end, label, summary)]
+        if duration > max_reel_sec:
+            split_ranges = _split_long_range(
+                t_start,
+                t_end,
+                label,
+                summary,
+                max_reel_sec=max_reel_sec,
+                min_reel_sec=min_reel_sec,
+            )
+            if split_ranges:
+                split = split_ranges
 
         for sub_start, sub_end, sub_label, sub_summary in split:
+            sub_s_idx = s_idx
+            sub_e_idx = e_idx
+            for idx in range(s_idx, e_idx + 1):
+                if cues[idx].start >= sub_start - 0.01:
+                    sub_s_idx = idx
+                    break
+            for idx in range(sub_s_idx, e_idx + 1):
+                if cues[idx].end <= sub_end + 0.01:
+                    sub_e_idx = idx
+                else:
+                    break
             candidates.append(
                 TopicReel(
                     video_id=video_id,
@@ -2320,8 +2382,8 @@ def _snap_segments_to_cues(
                     t_end=round(sub_end, 2),
                     label=sub_label,
                     summary=sub_summary,
-                    cue_start_idx=s_idx,
-                    cue_end_idx=e_idx,
+                    cue_start_idx=sub_s_idx,
+                    cue_end_idx=sub_e_idx,
                 )
             )
 
@@ -3880,6 +3942,7 @@ def cut_video_into_topic_reels(
     refine_boundaries: bool = True,
     transcript: Sequence[TranscriptCue] | None = None,
     info_dict: dict[str, Any] | None = None,
+    openai_client: Any | None = None,
     min_reel_sec: float = MIN_TOPIC_REEL_SEC,
     max_reel_sec: float = MAX_TOPIC_REEL_SEC,
     # Phase A.4: optional word-level precision inputs.
@@ -3921,6 +3984,8 @@ def cut_video_into_topic_reels(
             non-empty `chapters` list, those chapters are used directly as
             topic boundaries — no LLM, no heuristic, no API cost. This is
             the highest-quality free signal we have.
+        openai_client: Optional OpenAI-compatible client retained for tests
+            and local callers that inject their own low-latency chat backend.
 
     Returns:
         (classification, reels). For Shorts, `reels` is always [].
@@ -3929,6 +3994,13 @@ def cut_video_into_topic_reels(
         a transcription fallback (Whisper) or skip.
     """
     video_id, _is_shorts_url = extract_video_id(url_or_id)
+    if _is_shorts_url:
+        classification = classify_video(
+            url_or_id,
+            duration_sec=duration_sec,
+            transcript=list(transcript or []),
+        )
+        return classification, []
 
     # Fetch transcript first — we need it both for classification (when
     # duration_sec is missing) and for the actual segmentation. Skip the
@@ -3941,7 +4013,7 @@ def cut_video_into_topic_reels(
         # the A1 refine gate needs — so per-clip Whisper refinement is skipped
         # on captioned videos. Falls through to `fetch_transcript` silently
         # when VTT is unavailable or has no <c> tags.
-        if ingest_cues_for_precision is None:
+        if ingest_cues_for_precision is None and query:
             precision_cues = _try_yt_dlp_vtt_precision(video_id)
             if precision_cues:
                 transcript = cues_from_ingest_cues(precision_cues)
@@ -4053,8 +4125,29 @@ def cut_video_into_topic_reels(
     used_llm = False
 
     if use_llm and len(transcript) <= MAX_CUES_FOR_LLM:
+        if openai_client is not None:
+            try:
+                llm_segments = _llm_topic_segments_openai_compat(
+                    transcript,
+                    openai_client=openai_client,
+                    model=model,
+                    query=query,
+                )
+                if llm_segments:
+                    used_llm = True
+                    logger.info(
+                        "video %s segmented via injected OpenAI-compatible client → %d segments",
+                        video_id, len(llm_segments),
+                    )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "injected OpenAI-compatible topic segmentation failed for video %s; trying configured providers",
+                    video_id,
+                )
+                llm_segments = []
+
         # 2.pre: Local Ollama server (only when OLLAMA_BASE_URL is set)
-        ollama = _build_ollama_client()
+        ollama = None if llm_segments else _build_ollama_client()
         if ollama:
             try:
                 llm_segments = _llm_topic_segments_ollama(

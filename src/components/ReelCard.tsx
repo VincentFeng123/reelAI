@@ -100,6 +100,21 @@ function detectVideoProvider(urlValue: string): VideoProvider {
   return "external";
 }
 
+function normalizeExternalEmbedUrl(urlValue: string): string | null {
+  try {
+    const parsed = new URL(urlValue);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      return null;
+    }
+    if (parsed.hostname.toLowerCase().includes("clips.twitch.tv") && typeof window !== "undefined") {
+      parsed.searchParams.set("parent", window.location.hostname);
+    }
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -165,13 +180,7 @@ export function ReelCard({
   const isYouTubeVideo = videoProvider === "youtube";
   const safeExternalUrl = useMemo(() => {
     if (isYouTubeVideo) return null;
-    try {
-      const parsed = new URL(reel.video_url);
-      if (parsed.protocol === "https:" || parsed.protocol === "http:") {
-        return parsed.href;
-      }
-    } catch { /* invalid URL */ }
-    return null;
+    return normalizeExternalEmbedUrl(reel.video_url);
   }, [reel.video_url, isYouTubeVideo]);
   const isCommunityImported = (reel.relevance_reason || "").trim() === "Opened from a community set.";
   // Upper bound from the server-reported video duration (when present). This

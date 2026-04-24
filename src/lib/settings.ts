@@ -57,10 +57,8 @@ export const DEFAULT_STUDY_REELS_SETTINGS: StudyReelsSettings = {
   targetClipDurationSec: 55,
   targetClipDurationMinSec: 20,
   targetClipDurationMaxSec: 55,
-  // Legacy YouTube HTML-scraping flow only. The /api/ingest/search path
-  // (yt-dlp + Instagram/TikTok) gets bounced by robots.txt and YouTube's
-  // cloud-IP bot detection, so the submit flow in UploadPanel ignores this
-  // and always routes through /api/material + /api/reels/generate-stream.
+  // Off by default because provider APIs add network fan-out; when enabled,
+  // the backend augments the fast /api/reels/generate-stream search path.
   multiPlatformSearch: false,
 };
 
@@ -289,13 +287,7 @@ export function normalizeStudyReelsSettings(raw: StudyReelsSettingsInput): Study
     ? Math.round(clampNumber(targetClipDurationSec, targetClipDurationMinSec, targetClipDurationMaxSec, midpointTarget))
     : midpointTarget;
 
-  // Force-override any stored value (true or false) back to false. The
-  // multi-platform /api/ingest/search path is broken on cloud IPs (YouTube
-  // bot detection + IG/TT robots.txt), so we strand existing users on the
-  // legacy flow regardless of their old persisted preference. The setting
-  // is still surfaced in SettingsPanel as a toggle but has no effect on
-  // the submit routing in UploadPanel.
-  const multiPlatformSearch = false;
+  const multiPlatformSearch = raw.multiPlatformSearch === true || raw.multiPlatformSearch === "1" || raw.multiPlatformSearch === "true";
 
   return {
     generationMode: toGenerationMode(raw.generationMode),

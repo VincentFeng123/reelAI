@@ -739,6 +739,7 @@ type GenerateReelsParams = {
   targetClipDurationSec?: number;
   targetClipDurationMinSec?: number;
   targetClipDurationMaxSec?: number;
+  multiPlatformSearch?: boolean;
 };
 
 // Max number of IDs we send on any request. After a long session the client's
@@ -791,6 +792,7 @@ function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<stri
     target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
       ? Math.round(params.targetClipDurationMaxSec as number)
       : undefined,
+    multi_platform_search: params.multiPlatformSearch === true,
   };
 }
 

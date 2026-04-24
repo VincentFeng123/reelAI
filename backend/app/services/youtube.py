@@ -638,6 +638,7 @@ class YouTubeService:
         variant_limit: int | None = None,
         graph_profile: GraphProfile = "off",
         root_terms: list[str] | None = None,
+        multi_platform_search: bool = False,
     ) -> list[dict[str, Any]]:
         if conn is None:
             with get_conn() as local_conn:
@@ -655,6 +656,7 @@ class YouTubeService:
                     variant_limit=variant_limit,
                     graph_profile=graph_profile,
                     root_terms=root_terms,
+                    multi_platform_search=multi_platform_search,
                 )
         return self._search_videos_with_conn(
             conn,
@@ -670,6 +672,7 @@ class YouTubeService:
             variant_limit=variant_limit,
             graph_profile=graph_profile,
             root_terms=root_terms,
+            multi_platform_search=multi_platform_search,
         )
 
     def _search_videos_with_conn(
@@ -687,6 +690,7 @@ class YouTubeService:
         variant_limit: int | None,
         graph_profile: GraphProfile = "off",
         root_terms: list[str] | None = None,
+        multi_platform_search: bool = False,
     ) -> list[dict[str, Any]]:
         duration_key = video_duration or "any"
         normalized_root_terms = self._normalized_root_terms(query=query, root_terms=root_terms)
@@ -704,6 +708,7 @@ class YouTubeService:
             str(variant_limit or 0),
             graph_profile,
             "||".join(normalized_root_terms),
+            str(bool(multi_platform_search)),
         )
         cached = fetch_one(conn, "SELECT response_json, created_at FROM search_cache WHERE cache_key = ?", (key,))
         if cached:
@@ -803,6 +808,7 @@ class YouTubeService:
                 retrieval_strategy=retrieval_strategy,
                 retrieval_stage=retrieval_stage,
                 source_surface=source_surface,
+                force_enabled=multi_platform_search,
             )
             videos = self._finalize_search_rows(
                 videos,
@@ -976,6 +982,7 @@ class YouTubeService:
             retrieval_strategy=retrieval_strategy,
             retrieval_stage=retrieval_stage,
             source_surface=source_surface,
+            force_enabled=multi_platform_search,
         )
         videos = self._finalize_search_rows(
             videos,
@@ -2573,6 +2580,7 @@ class YouTubeService:
         retrieval_strategy: str,
         retrieval_stage: str,
         source_surface: str,
+        force_enabled: bool = False,
     ) -> list[dict[str, Any]]:
         """Fan out to every provider in ProviderRegistry and merge their
         candidates into `videos`. Dormant (no-op) when the master flag
@@ -2583,7 +2591,7 @@ class YouTubeService:
         is effectively one bounded-latency step in the overall search
         pipeline.
         """
-        if not self._provider_registry.enabled:
+        if not self._provider_registry.enabled and not force_enabled:
             logger.warning(
                 "provider_registry: skip (flag off); YouTube-only results q=%r",
                 query[:60],
@@ -2595,7 +2603,11 @@ class YouTubeService:
         per_provider = max(3, int(max_results or 1) // 3)
         before = len(videos)
         try:
-            provider_candidates = self._provider_registry.search_all(query, per_provider)
+            provider_candidates = self._provider_registry.search_all(
+                query,
+                per_provider,
+                force_enabled=force_enabled,
+            )
         except Exception as exc:
             logger.warning("provider_registry.search_all raised: %s: %s", type(exc).__name__, exc)
             return videos

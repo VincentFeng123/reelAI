@@ -40,9 +40,9 @@ logger = logging.getLogger(__name__)
 
 
 def _importance_ranker_enabled() -> bool:
-    """Read ``REELS_IMPORTANCE_RANKER_ENABLED`` env flag (default off)."""
-    raw = os.environ.get("REELS_IMPORTANCE_RANKER_ENABLED", "")
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    """Read ``REELS_IMPORTANCE_RANKER_ENABLED`` env flag (default on)."""
+    raw = os.environ.get("REELS_IMPORTANCE_RANKER_ENABLED", "true")
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 _IMPORTANCE_TARGET_N = {"narrow": 2, "broad": 5, "medium": 3, "none": 3}
@@ -1505,6 +1505,7 @@ class ReelService:
         recovery_stage: int = 0,
         on_reel_created: Callable[[dict[str, Any]], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        multi_platform_search: bool = False,
     ) -> list[dict[str, Any]]:
         def raise_if_cancelled() -> None:
             if should_cancel is None:
@@ -2104,6 +2105,7 @@ class ReelService:
                             if safe_retrieval_profile == "bootstrap"
                             else None
                         ),
+                        multi_platform_search=multi_platform_search,
                         subject_tag=subject_tag,
                         conn=conn,
                     )
@@ -2907,7 +2909,6 @@ class ReelService:
                                     video_duration_sec=video_duration,
                                     clip_min_len=clip_min_len,
                                     clip_max_len=clip_max_len,
-                                    clip_target_len=safe_target_clip_duration,
                                     max_segments=target_segment_budget,
                                     concept_terms=concept_terms,
                                 ),
@@ -6311,6 +6312,7 @@ class ReelService:
         recovery_stage: int,
         allow_external_fallbacks: bool = True,
         variant_limit: int | None = None,
+        multi_platform_search: bool = False,
         subject_tag: str | None = None,
         conn: Any = None,
     ) -> list[tuple[int, int, QueryCandidate, str | None, list[dict[str, Any]]]]:
@@ -6352,6 +6354,7 @@ class ReelService:
                         conn=conn,
                     ),
                     root_terms=list(query_candidate.source_terms),
+                    multi_platform_search=multi_platform_search,
                 )
                 output.append((query_idx, duration_idx, query_candidate, duration, videos))
             return output
@@ -6381,6 +6384,7 @@ class ReelService:
                         conn=conn,
                     ),
                     list(query_candidate.source_terms),
+                    multi_platform_search,
                 ): (query_idx, duration_idx, query_candidate, duration)
                 for query_idx, duration_idx, query_candidate, duration in jobs
             }
@@ -9225,7 +9229,8 @@ class ReelService:
         base_expansion: dict[str, Any],
         observed_examples: list[dict[str, str]],
     ) -> dict[str, Any]:
-        if not self.llm_available:
+        injected_client = getattr(self, "openai_client", None)
+        if not self.llm_available and injected_client is None:
             return {}
 
         observed_block = "\n".join(
@@ -9280,12 +9285,24 @@ class ReelService:
             "- no numbering, prose, or markdown"
         )
         try:
-            raw = llm_router.chat_completion(
-                system=system_prompt,
-                user=user_prompt,
-                temperature=0.2,
-                json_mode=True,
-            ) or "{}"
+            if injected_client is not None:
+                response = injected_client.chat.completions.create(
+                    model=self.chat_model,
+                    temperature=0.2,
+                    response_format={"type": "json_object"},
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                )
+                raw = response.choices[0].message.content or "{}"
+            else:
+                raw = llm_router.chat_completion(
+                    system=system_prompt,
+                    user=user_prompt,
+                    temperature=0.2,
+                    json_mode=True,
+                ) or "{}"
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 return {}
@@ -10415,6 +10432,7 @@ class ReelService:
                 "view_count": int(video.get("view_count") or 0),
                 "is_creative_commons": 1 if video.get("is_creative_commons") else 0,
                 "provider": provider,
+                "playback_url": str(video.get("playback_url") or "").strip() or None,
                 "created_at": now_iso(),
             },
         )
@@ -10542,7 +10560,6 @@ class ReelService:
         video_duration_sec: int,
         clip_min_len: int,
         clip_max_len: int,
-        clip_target_len: int,
         max_segments: int,
         concept_terms: list[str] | None = None,
     ) -> list[SegmentMatch]:
@@ -10803,16 +10820,20 @@ class ReelService:
                     # too-short clip.
                     continue
 
-            # Keep the full window intact here. Sentence-aligned splitting
-            # happens downstream in the main candidate loop via
-            # `_split_into_consecutive_windows`, which honours punctuation
-            # boundaries when the segment needs to be cut into sub-reels to
-            # respect the user's max_clip_duration. Pre-splitting here would
-            # produce arbitrary numeric cuts that later refinement can only
-            # partially correct.
             sub_windows: list[tuple[float, float]] = [(t_start, t_end)]
             multi_part = False
             cluster_group_id = ""
+            if duration > float(clip_max_len) + 1.0:
+                part_count = int(math.ceil(duration / max(1.0, float(clip_max_len))))
+                part_len = duration / float(part_count)
+                if part_len >= float(clip_min_len):
+                    sub_windows = []
+                    for part_idx in range(part_count):
+                        part_start = t_start + part_idx * part_len
+                        part_end = t_end if part_idx == part_count - 1 else t_start + (part_idx + 1) * part_len
+                        sub_windows.append((part_start, part_end))
+                    multi_part = part_count > 1
+                    cluster_group_id = f"{video_id}:topic_cluster:{win_idx}"
 
             for sub_idx, (a, b) in enumerate(sub_windows):
                 text_parts: list[str] = []
@@ -11469,7 +11490,7 @@ class ReelService:
             return None
         start_sec, end_sec = normalized_clip_window
         video_duration_sec = int(video.get("duration_sec") or 0)
-        if _importance_ranker_enabled() and transcript:
+        if transcript:
             trimmed_window = self._trim_structural_edges_from_clip(
                 transcript,
                 clip_start=float(start_sec),

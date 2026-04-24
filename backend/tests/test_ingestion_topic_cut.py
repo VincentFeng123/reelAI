@@ -133,6 +133,8 @@ class IngestionTopicCutTests(unittest.TestCase):
         # override with the mock when we want to exercise the LLM path.
         main_module.ingestion_pipeline._openai_client = None
 
+        self._original_serverless_mode = main_module.SERVERLESS_MODE
+        main_module.SERVERLESS_MODE = False
         main_module.ingestion_pipeline._serverless_mode = False
         main_module._rate_limit_hits.clear()
 
@@ -150,6 +152,7 @@ class IngestionTopicCutTests(unittest.TestCase):
         main_module.settings = get_settings()
 
     def _restore_pipeline(self) -> None:
+        main_module.SERVERLESS_MODE = self._original_serverless_mode
         main_module.ingestion_pipeline._openai_client = self._original_openai_client
         main_module.ingestion_pipeline._adapters = [
             adapter

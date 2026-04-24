@@ -28,8 +28,9 @@ Preferred (non-scraping) upstreams:
     TikTok       — yt-dlp tiktoksearch:  (existing adapter)
 
 Feature flag: `PROVIDER_REGISTRY_ENABLED` (default False). While dormant
-the registry exists in the import graph but returns empty for every query;
-no outbound HTTP fires.
+the registry exists in the import graph but returns empty for normal queries;
+per-request multi-platform search can still opt in without enabling it for
+every reel generation.
 """
 
 from __future__ import annotations
@@ -66,6 +67,23 @@ _DDG_HTML_URL = "https://html.duckduckgo.com/html/"
 _DDG_UA = "Mozilla/5.0 (compatible; ReelAI/1.0; +https://reelai.app/bot)"
 _VIMEO_ID_RE = re.compile(r"vimeo\.com/(\d{6,12})")
 _TWITCH_CLIP_RE = re.compile(r"clips\.twitch\.tv/([A-Za-z0-9][A-Za-z0-9_-]{7,})")
+_TWITCH_WKWEBVIEW_PARENT = "reelai.local"
+
+
+def _twitch_embed_url(clip_id: str, embed_url: str | None = None) -> str:
+    base = (embed_url or f"https://clips.twitch.tv/embed?clip={clip_id}").strip()
+    try:
+        parsed = urllib.parse.urlparse(base)
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        if "clip" not in query and clip_id:
+            query["clip"] = [clip_id]
+        if not any(value == _TWITCH_WKWEBVIEW_PARENT for value in query.get("parent", [])):
+            query.setdefault("parent", []).append(_TWITCH_WKWEBVIEW_PARENT)
+        return urllib.parse.urlunparse(
+            parsed._replace(query=urllib.parse.urlencode(query, doseq=True))
+        )
+    except Exception:
+        return f"https://clips.twitch.tv/embed?clip={clip_id}&parent={_TWITCH_WKWEBVIEW_PARENT}"
 
 
 def _ddg_find(
@@ -684,9 +702,7 @@ class TwitchProvider(Provider):
                     provider="twitch",
                     video_id=clip_id,
                     video_url=str(clip.get("url") or f"https://clips.twitch.tv/{clip_id}"),
-                    playback_url=str(
-                        clip.get("embed_url") or f"https://clips.twitch.tv/embed?clip={clip_id}"
-                    ),
+                    playback_url=_twitch_embed_url(clip_id, str(clip.get("embed_url") or "")),
                     title=str(clip.get("title") or "").strip(),
                     description="",
                     channel=str(clip.get("broadcaster_name") or "").strip(),
@@ -712,7 +728,7 @@ class TwitchProvider(Provider):
                 provider="twitch",
                 video_id=slug,
                 video_url=f"https://clips.twitch.tv/{slug}",
-                playback_url=f"https://clips.twitch.tv/embed?clip={slug}",
+                playback_url=_twitch_embed_url(slug),
                 title="",  # no keyless Twitch metadata API
                 description="",
                 channel="",
@@ -860,6 +876,7 @@ class ProviderRegistry:
         query: str,
         max_results_per_provider: int,
         *,
+        force_enabled: bool = False,
         per_provider_timeout_sec: float = 15.0,
     ) -> list[ProviderCandidate]:
         """
@@ -869,7 +886,7 @@ class ProviderRegistry:
         output is deterministic. Deduplication by video_url is the caller's
         responsibility. Dormant when the feature flag is off.
         """
-        if not self.enabled:
+        if not self.enabled and not force_enabled:
             # WARNING level on purpose: the app logger defaults to WARNING
             # in production, and operators need to SEE this line when
             # diagnosing "why am I not getting non-YouTube reels."
@@ -915,8 +932,6 @@ class ProviderRegistry:
 
     def fetch_transcript(self, provider: str, video_id: str) -> ProviderTranscript | None:
         """Dispatch by provider name. Returns None for unknown providers."""
-        if not self.enabled:
-            return None
         adapter = self._by_name.get(str(provider or "").strip().lower())
         if adapter is None:
             return None

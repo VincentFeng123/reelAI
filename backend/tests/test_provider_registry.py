@@ -511,7 +511,27 @@ class ProviderRegistryTests(unittest.TestCase):
             registry = ProviderRegistry()
             self.assertFalse(registry.enabled)
             self.assertEqual(registry.search_all("calculus", 5), [])
-            self.assertIsNone(registry.fetch_transcript("dailymotion", "x1"))
+
+    def test_search_all_force_enabled_ignores_global_flag(self):
+        stub = ProviderCandidate(
+            provider="dailymotion",
+            video_id="x1",
+            video_url="https://www.dailymotion.com/video/x1",
+            playback_url="https://www.dailymotion.com/embed/video/x1",
+            title="stub",
+        )
+
+        class _Mocked(DailymotionProvider):
+            def search(self, query, max_results):
+                return [stub]
+
+        registry = ProviderRegistry(providers=[_Mocked()])
+        with patch(
+            "backend.app.services.provider_registry.get_settings"
+        ) as mock_settings:
+            mock_settings.return_value = MagicMock(provider_registry_enabled=False)
+            results = registry.search_all("calculus", 3, force_enabled=True)
+        self.assertEqual(results, [stub])
 
     def test_search_all_fans_out_when_enabled(self):
         stub = ProviderCandidate(

@@ -935,6 +935,7 @@ def transcribe(
     language: str = "en",
     serverless_mode: bool = False,
     video_duration_sec: float | None = None,
+    whisper_fallback_available: bool | None = None,
 ) -> list[IngestTranscriptCue]:
     """
     Return a timestamped transcript for the ingested reel.
@@ -1112,7 +1113,12 @@ def transcribe(
         )
 
     # Strategy 5: Groq Whisper API fallback (whisper-large-v3)
-    if not llm_router.gemini_or_groq_available():
+    remote_whisper_available = (
+        llm_router.gemini_or_groq_available()
+        if whisper_fallback_available is None
+        else bool(whisper_fallback_available)
+    )
+    if not remote_whisper_available:
         # Return best-effort result if we have one, even if coverage is low.
         if best_cues:
             logger.warning(

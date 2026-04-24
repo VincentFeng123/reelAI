@@ -49,6 +49,7 @@ class ReelsGenerateRequest(BaseModel):
     target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
     target_clip_duration_min_sec: int | None = Field(default=None, ge=15, le=180)
     target_clip_duration_max_sec: int | None = Field(default=None, ge=15, le=180)
+    multi_platform_search: bool = False
 
     @model_validator(mode="after")
     def _validate_clip_bounds(self) -> "ReelsGenerateRequest":

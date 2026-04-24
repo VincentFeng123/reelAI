@@ -82,8 +82,9 @@ pyannote.audio==3.1.1
 whisperx==3.1.1
 # PR-6 importance ranker. All four are lazy-loaded with regex/stdlib
 # fallbacks (services/segment_features.py + services/importance_ranker.py)
-# so a missing wheel only degrades quality, never crashes. Gated behind
-# REELS_IMPORTANCE_RANKER_ENABLED so the legacy ranker still runs by default.
+# so a missing wheel only degrades quality, never crashes. Ranker defaults on;
+# set REELS_IMPORTANCE_RANKER_ENABLED=0 to fall back. Cross-encoder rerank
+# remains opt-in via REELS_CROSS_ENCODER_ENABLED=1.
 #  - sklearn: per-video TF-IDF for keyphrase extraction (TfidfVectorizer)
 #  - spaCy + en_core_web_lg: lemmatization + NER (PERSON/GPE/ORG/DATE/EVENT)
 #  - networkx: TextRank-style PageRank on the segment cosine graph

@@ -1885,6 +1885,7 @@ def _build_generation_request_key(
     target_clip_duration_sec: int,
     target_clip_duration_min_sec: int | None,
     target_clip_duration_max_sec: int | None,
+    multi_platform_search: bool = False,
 ) -> str:
     payload = {
         "material_id": material_id,
@@ -1896,6 +1897,7 @@ def _build_generation_request_key(
         "target_clip_duration_sec": int(target_clip_duration_sec),
         "target_clip_duration_min_sec": int(target_clip_duration_min_sec or 0),
         "target_clip_duration_max_sec": int(target_clip_duration_max_sec or 0),
+        "multi_platform_search": bool(multi_platform_search),
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -3259,6 +3261,7 @@ def _extend_active_generation(
     page_hint: int = 1,
     on_reel_created: Callable[[dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    multi_platform_search: bool = False,
 ) -> dict[str, Any]:
     if should_cancel is not None and should_cancel():
         raise GenerationCancelledError("Generation cancelled.")
@@ -3295,6 +3298,7 @@ def _extend_active_generation(
         recovery_stage=_initial_recovery_stage(page_hint=page_hint),
         on_reel_created=on_reel_created,
         should_cancel=should_cancel,
+        multi_platform_search=multi_platform_search,
     )
 
     if _count_generation_reels(conn, next_generation_id) <= 0:
@@ -3375,6 +3379,7 @@ def _extend_active_generation(
         min_relevance=min_relevance,
         page_hint=page_hint,
         page_size_hint=max(5, min(25, required_count)),
+        multi_platform_search=multi_platform_search,
     )
     response_payload = _build_generation_response_payload(
         reels=expanded_reels,
@@ -3889,6 +3894,7 @@ def _build_refinement_request_params(
     no_new_visible_reels_passes: int = 0,
     stage_exhausted: dict[str, bool] | None = None,
     growth_reason: str | None = None,
+    multi_platform_search: bool = False,
 ) -> dict[str, Any]:
     safe_required_count = max(1, int(required_count or 1))
     safe_page_hint = max(1, int(page_hint or 1))
@@ -3921,6 +3927,7 @@ def _build_refinement_request_params(
         "target_clip_duration_sec": target_clip_duration_sec,
         "target_clip_duration_min_sec": target_clip_duration_min_sec,
         "target_clip_duration_max_sec": target_clip_duration_max_sec,
+        "multi_platform_search": bool(multi_platform_search),
         "required_reel_count": safe_required_count,
         "inventory_target_count": inventory_target_count,
         "target_reel_count": target_reel_count,
@@ -4001,6 +4008,7 @@ def _queue_refinement_if_needed(
     no_new_visible_reels_passes: int = 0,
     stage_exhausted: dict[str, bool] | None = None,
     growth_reason: str | None = None,
+    multi_platform_search: bool = False,
 ) -> dict[str, Any] | None:
     if not generation_id:
         return None
@@ -4061,6 +4069,7 @@ def _queue_refinement_if_needed(
             no_new_visible_reels_passes=no_new_visible_reels_passes,
             stage_exhausted=normalized_stage_exhausted,
             growth_reason=growth_reason,
+            multi_platform_search=multi_platform_search,
         ),
     )
 
@@ -4204,6 +4213,7 @@ def _run_refinement_job(job_id: str) -> None:
             safe_no_new_sources_passes = max(0, int(request_params.get("no_new_sources_passes") or 0))
             safe_no_new_windows_passes = max(0, int(request_params.get("no_new_windows_passes") or 0))
             safe_no_new_visible_reels_passes = max(0, int(request_params.get("no_new_visible_reels_passes") or 0))
+            safe_multi_platform_search = bool(request_params.get("multi_platform_search", False))
             safe_required_reel_count = max(1, int(request_params.get("required_reel_count") or request_params.get("target_reel_count") or 1))
             source_reel_count = int(source_generation.get("reel_count") or 0)
             inventory_target_count = max(
@@ -4265,6 +4275,7 @@ def _run_refinement_job(job_id: str) -> None:
                 min_relevance_threshold=safe_min_relevance,
                 page_hint=safe_target_page,
                 recovery_stage=safe_recovery_stage,
+                multi_platform_search=safe_multi_platform_search,
             )
             _publish_progress_event(
                 "stage_end",
@@ -4453,6 +4464,7 @@ def _ensure_generation_for_request(
     on_reel_created: Callable[[dict[str, Any]], None] | None = None,
     emit_existing_reels: bool = False,
     should_cancel: Callable[[], bool] | None = None,
+    multi_platform_search: bool = False,
 ) -> dict[str, Any]:
     if should_cancel is not None and should_cancel():
         raise GenerationCancelledError("Generation cancelled.")
@@ -4466,6 +4478,7 @@ def _ensure_generation_for_request(
         target_clip_duration_sec=target_clip_duration_sec,
         target_clip_duration_min_sec=target_clip_duration_min_sec,
         target_clip_duration_max_sec=target_clip_duration_max_sec,
+        multi_platform_search=multi_platform_search,
     )
     fast_mode = generation_mode == "fast"
     normalized_excluded_video_ids = _normalize_excluded_video_ids(exclude_video_ids)
@@ -4516,6 +4529,7 @@ def _ensure_generation_for_request(
             min_relevance=min_relevance,
             page_hint=page_hint,
             page_size_hint=max(1, int(page_size_hint or 1)),
+            multi_platform_search=multi_platform_search,
         )
         if emit_existing_reels and on_reel_created is not None:
             for reel in active_reels[: max(1, required_count)]:
@@ -4550,6 +4564,7 @@ def _ensure_generation_for_request(
                     page_hint=page_hint,
                     on_reel_created=on_reel_created,
                     should_cancel=should_cancel,
+                    multi_platform_search=multi_platform_search,
                 )
         if (
             len(active_reels) >= required_count
@@ -4607,6 +4622,7 @@ def _ensure_generation_for_request(
         recovery_stage=0,
         on_reel_created=on_reel_created,
         should_cancel=should_cancel,
+        multi_platform_search=multi_platform_search,
     )
     filtered = _ranked_request_reels(
         conn,
@@ -4653,6 +4669,7 @@ def _ensure_generation_for_request(
             recovery_stage=_initial_recovery_stage(page_hint=page_hint),
             on_reel_created=on_reel_created,
             should_cancel=should_cancel,
+            multi_platform_search=multi_platform_search,
         )
         filtered = _ranked_request_reels(
             conn,
@@ -4734,6 +4751,7 @@ def _ensure_generation_for_request(
         min_relevance=min_relevance,
         page_hint=1,
         page_size_hint=max(1, int(page_size_hint or 1)),
+        multi_platform_search=multi_platform_search,
     )
     response_payload = _build_generation_response_payload(
         reels=filtered,
@@ -5774,6 +5792,7 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 target_clip_duration_max_sec=safe_target_clip_max_sec,
                 exclude_video_ids=payload.exclude_video_ids,
                 page_hint=1,
+                multi_platform_search=payload.multi_platform_search,
             )
         except YouTubeApiRequestError as e:
             logger.warning(
@@ -6121,6 +6140,7 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
                         on_reel_created=emit_reel,
                         emit_existing_reels=True,
                         should_cancel=should_cancel_or_deadline,
+                        multi_platform_search=payload.multi_platform_search,
                     )
                 emit_event(
                     {

@@ -317,15 +317,10 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
       const activeSettings = readStudyReelsSettings();
       const generationModeForSearch = activeSettings.generationMode;
 
-      // NOTE: the multi-platform /api/ingest/search path is disabled. It routes
-      // through yt-dlp which (a) bounces on IG/TT robots.txt and (b) hits
-      // YouTube bot-detection from Railway's data-center IPs. All topic / text
-      // / file submits fall through to the legacy /api/material +
-      // /api/reels/generate-stream flow below, which uses the HTML-scraping
-      // path in YouTubeService._search_without_data_api — free, no API key,
-      // no server-side video download, works on cloud IPs. The
-      // `multiPlatformSearch` setting in SettingsPanel is kept for backward
-      // compat but has no effect on submit routing.
+      // Topic / text / file submits stay on the fast /api/material +
+      // /api/reels/generate-stream path. When enabled, `multiPlatformSearch`
+      // augments that backend search with provider APIs; it does not route
+      // through the slower /api/ingest/search yt-dlp download pipeline.
 
       // URL ingest path diverges completely from the material-upload path: we call
       // /api/ingest/url instead of /api/material, then land on the feed scoped to

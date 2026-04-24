@@ -85,6 +85,7 @@ type FeedTuningSettings = {
   targetClipDurationSec: number;
   targetClipDurationMinSec: number;
   targetClipDurationMaxSec: number;
+  multiPlatformSearch: boolean;
 };
 
 type ReelFeedbackState = {
@@ -1163,6 +1164,7 @@ function FeedPageInner() {
       targetClipDurationSec: settings.targetClipDurationSec,
       targetClipDurationMinSec: settings.targetClipDurationMinSec,
       targetClipDurationMaxSec: settings.targetClipDurationMaxSec,
+      multiPlatformSearch: settings.multiPlatformSearch,
     };
   }, [mergeFeedSettingsSnapshot]);
 
@@ -1885,6 +1887,7 @@ function FeedPageInner() {
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+              multiPlatformSearch: tuning.multiPlatformSearch,
               signal: searchScope.controller.signal,
               onReel: (reel) => {
                 if (!isSearchScopeActive(searchScope)) {
@@ -2367,6 +2370,7 @@ function FeedPageInner() {
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+              multiPlatformSearch: tuning.multiPlatformSearch,
               signal: searchScope.controller.signal,
               onReel: (reel) => {
                 if (!isSearchScopeActive(searchScope)) {

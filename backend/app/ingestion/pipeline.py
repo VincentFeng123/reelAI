@@ -156,6 +156,7 @@ class IngestionPipeline:
         self._youtube_service = youtube_service
         self._embedding_service = embedding_service
         self._settings = settings
+        self._openai_client = None
         self._adapters: list[BaseAdapter] = adapters or [YtDlpAdapter()]
         self._rate_limiter = rate_limiter or _PlatformRateLimiter()
         if serverless_mode is None:
@@ -1240,6 +1241,7 @@ class IngestionPipeline:
                 language=language,
                 serverless_mode=self._serverless_mode,
                 video_duration_sec=video_duration_sec,
+                whisper_fallback_available=(True if self._openai_client is not None else None),
             )
 
     def _persist_ingest(

@@ -103,6 +103,7 @@ CREATE TABLE IF NOT EXISTS videos (
     view_count INTEGER DEFAULT 0,
     is_creative_commons INTEGER DEFAULT 0,
     provider TEXT DEFAULT 'youtube',
+    playback_url TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -887,6 +888,7 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS quality_status TEXT")
                 cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS quality_rejection_reason TEXT")
                 cur.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'youtube'")
+                cur.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS playback_url TEXT")
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             conn.commit()
@@ -903,6 +905,10 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE videos ADD COLUMN provider TEXT DEFAULT 'youtube'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE videos ADD COLUMN playback_url TEXT")
         except sqlite3.OperationalError:
             pass
         try:
