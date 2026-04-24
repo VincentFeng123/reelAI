@@ -11383,7 +11383,17 @@ class ReelService:
     ) -> dict[str, Any]:
         start_sec, end_sec = clip_window
         video_id = str(video.get("id") or "").strip()
-        video_url = f"https://www.youtube.com/embed/{video_id}?start={start_sec}&end={end_sec}" if video_id else ""
+        provider = str(video.get("provider") or "youtube").strip().lower() or "youtube"
+        if provider == "youtube" and video_id:
+            video_url = f"https://www.youtube.com/embed/{video_id}?start={start_sec}&end={end_sec}"
+        else:
+            # Non-YouTube providers (Dailymotion / Vimeo / Bilibili / TikTok /
+            # Twitch) carry their own embed URL through the row — use it as-is
+            # so the client's detectVideoProvider routes them to the plain
+            # <iframe> path instead of the YouTube iframe API. Time offsets
+            # (Vimeo #t=, Dailymotion ?start=) aren't applied here; the client
+            # enforces clip_start/clip_end via the progress timer.
+            video_url = str(video.get("playback_url") or video.get("video_url") or "").strip()
         matched_terms = [
             str(term).strip()
             for term in (relevance_context or {}).get("matched_terms", [])
@@ -11479,11 +11489,22 @@ class ReelService:
             fallback_text=segment.text,
         )
         video_id = video["id"]
-        url = (
-            f"https://www.youtube.com/embed/{video_id}?start={start_sec}&end={end_sec}"
-            f"&playlist={video_id}&autoplay=1&mute=1&playsinline=1"
-            "&loop=1&controls=1&modestbranding=1&iv_load_policy=3&rel=0"
-        )
+        provider = str(video.get("provider") or "youtube").strip().lower() or "youtube"
+        if provider == "youtube":
+            url = (
+                f"https://www.youtube.com/embed/{video_id}?start={start_sec}&end={end_sec}"
+                f"&playlist={video_id}&autoplay=1&mute=1&playsinline=1"
+                "&loop=1&controls=1&modestbranding=1&iv_load_policy=3&rel=0"
+            )
+        else:
+            # Non-YouTube providers (Dailymotion / Vimeo / Bilibili / TikTok /
+            # Twitch) bring their own embed URL from ProviderCandidate →
+            # _candidate_to_row → videos row. The client's detectVideoProvider
+            # keys off this URL's host to pick the right renderer (YouTube
+            # iframe API vs plain <iframe>). Without this branch every reel
+            # would get a YouTube embed with a non-YouTube video_id and fail
+            # to load entirely — the reason the feed was empty.
+            url = str(video.get("playback_url") or video.get("video_url") or "").strip()
         takeaways = build_takeaways(concept, transcript_snippet or segment.text)
         captions = self._build_caption_cues(
             transcript=transcript or [],
