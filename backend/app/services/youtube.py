@@ -2584,17 +2584,23 @@ class YouTubeService:
         pipeline.
         """
         if not self._provider_registry.enabled:
+            logger.info(
+                "provider_registry: skip (flag off); YouTube-only results q=%r",
+                query[:60],
+            )
             return videos
         # Each provider returns up to ~max_results/3 candidates. Floor at 3
         # so niche providers still contribute something even when the user
         # asked for very few results.
         per_provider = max(3, int(max_results or 1) // 3)
+        before = len(videos)
         try:
             provider_candidates = self._provider_registry.search_all(query, per_provider)
         except Exception as exc:
-            logger.debug("provider_registry.search_all raised: %s", exc)
+            logger.warning("provider_registry.search_all raised: %s: %s", type(exc).__name__, exc)
             return videos
         if not provider_candidates:
+            logger.info("provider_registry: no candidates returned q=%r", query[:60])
             return videos
         provider_rows = [self._candidate_to_row(c) for c in provider_candidates]
         self._annotate_search_rows(
@@ -2604,7 +2610,12 @@ class YouTubeService:
             retrieval_stage=retrieval_stage,
             search_query=query,
         )
-        return self._merge_unique_videos(videos, provider_rows, None)
+        merged = self._merge_unique_videos(videos, provider_rows, None)
+        logger.info(
+            "provider_registry: merged %d non-YouTube candidates (pool %d->%d) q=%r",
+            len(provider_rows), before, len(merged), query[:60],
+        )
+        return merged
 
     @staticmethod
     def _candidate_to_row(candidate: ProviderCandidate) -> dict[str, Any]:

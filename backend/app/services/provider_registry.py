@@ -870,6 +870,7 @@ class ProviderRegistry:
         responsibility. Dormant when the feature flag is off.
         """
         if not self.enabled:
+            logger.info("provider_registry.search_all: dormant (PROVIDER_REGISTRY_ENABLED=false)")
             return []
         query = (query or "").strip()
         if not query:
@@ -891,14 +892,22 @@ class ProviderRegistry:
                 except Exception as exc:
                     # Providers already swallow their own network errors and
                     # return []; this catches unanticipated bugs + timeouts.
-                    logger.debug(
-                        "%s.search raised: %s", self._providers[idx].name, exc
+                    logger.warning(
+                        "provider_registry %s.search raised: %s: %s",
+                        self._providers[idx].name, type(exc).__name__, exc,
                     )
                     rows = []
                 results_by_idx[idx] = list(rows or [])
         out: list[ProviderCandidate] = []
+        counts: list[str] = []
         for idx in range(len(self._providers)):
-            out.extend(results_by_idx.get(idx, []))
+            provider_rows = results_by_idx.get(idx, [])
+            out.extend(provider_rows)
+            counts.append(f"{self._providers[idx].name}={len(provider_rows)}")
+        logger.info(
+            "provider_registry.search_all q=%r total=%d (%s)",
+            query[:60], len(out), ", ".join(counts),
+        )
         return out
 
     def fetch_transcript(self, provider: str, video_id: str) -> ProviderTranscript | None:
