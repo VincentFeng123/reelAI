@@ -870,7 +870,10 @@ class ProviderRegistry:
         responsibility. Dormant when the feature flag is off.
         """
         if not self.enabled:
-            logger.info("provider_registry.search_all: dormant (PROVIDER_REGISTRY_ENABLED=false)")
+            # WARNING level on purpose: the app logger defaults to WARNING
+            # in production, and operators need to SEE this line when
+            # diagnosing "why am I not getting non-YouTube reels."
+            logger.warning("provider_registry.search_all: dormant (PROVIDER_REGISTRY_ENABLED=false)")
             return []
         query = (query or "").strip()
         if not query:
@@ -904,7 +907,7 @@ class ProviderRegistry:
             provider_rows = results_by_idx.get(idx, [])
             out.extend(provider_rows)
             counts.append(f"{self._providers[idx].name}={len(provider_rows)}")
-        logger.info(
+        logger.warning(
             "provider_registry.search_all q=%r total=%d (%s)",
             query[:60], len(out), ", ".join(counts),
         )

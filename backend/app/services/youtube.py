@@ -2584,7 +2584,7 @@ class YouTubeService:
         pipeline.
         """
         if not self._provider_registry.enabled:
-            logger.info(
+            logger.warning(
                 "provider_registry: skip (flag off); YouTube-only results q=%r",
                 query[:60],
             )
@@ -2600,7 +2600,7 @@ class YouTubeService:
             logger.warning("provider_registry.search_all raised: %s: %s", type(exc).__name__, exc)
             return videos
         if not provider_candidates:
-            logger.info("provider_registry: no candidates returned q=%r", query[:60])
+            logger.warning("provider_registry: no candidates returned q=%r", query[:60])
             return videos
         provider_rows = [self._candidate_to_row(c) for c in provider_candidates]
         self._annotate_search_rows(
@@ -2611,7 +2611,7 @@ class YouTubeService:
             search_query=query,
         )
         merged = self._merge_unique_videos(videos, provider_rows, None)
-        logger.info(
+        logger.warning(
             "provider_registry: merged %d non-YouTube candidates (pool %d->%d) q=%r",
             len(provider_rows), before, len(merged), query[:60],
         )
