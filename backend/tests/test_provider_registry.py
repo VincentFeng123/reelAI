@@ -100,7 +100,7 @@ class DailymotionProviderTests(unittest.TestCase):
                     "description": "Intro to derivatives",
                     "duration": 480,
                     "thumbnail_480_url": "https://thumb/x.jpg",
-                    "channel.screenname": "MathProf",
+                    "owner.screenname": "MathProf",
                     "created_time": "2020-01-01T00:00:00Z",
                     "views_total": 1234,
                     "url": "https://www.dailymotion.com/video/x12345",
@@ -752,57 +752,44 @@ class TikTokProviderTests(unittest.TestCase):
         self.assertEqual(TikTokProvider().search("", 3), [])
         self.assertEqual(TikTokProvider().search("   ", 3), [])
 
-    def test_search_happy_path(self):
-        info = {
-            "entries": [
-                {
-                    "id": "7123456789",
-                    "title": "Quick calculus demo",
-                    "uploader": "mathlady",
-                    "webpage_url": "https://www.tiktok.com/@mathlady/video/7123456789",
-                    "duration": 42,
-                    "thumbnail": "https://p16.tiktok/t.jpg",
-                    "view_count": 50000,
-                },
-                {
-                    "id": "7998887776",
-                    "title": "Second result",
-                    "channel": "otherguy",
-                    "duration": 15,
-                    "view_count": 20,
-                },
-                {"title": "skipped — no id"},
-            ]
-        }
-        ydl_class, ydl_instance = _mock_ydl(info)
-        with patch("yt_dlp.YoutubeDL", ydl_class):
+    def test_search_happy_path_via_ddg(self):
+        # yt-dlp has no TikTok search extractor (only individual video URLs),
+        # so TikTokProvider.search routes through DuckDuckGo with
+        # `site:tiktok.com` and extracts 19-digit video IDs from the result
+        # URLs. Each hit becomes a minimal ProviderCandidate.
+        ddg_html = (
+            '<a class="result__a" '
+            'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.tiktok.com%2F%40mathlady%2Fvideo%2F7123456789000000000">ok</a>'
+            '<a class="result__a" '
+            'href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.tiktok.com%2F%40otherguy%2Fvideo%2F7998887776000000000">two</a>'
+        )
+        ddg_resp = MagicMock(text=ddg_html, status_code=200)
+        ddg_resp.raise_for_status = MagicMock()
+        with patch(
+            "backend.app.services.provider_registry.requests.get",
+            return_value=ddg_resp,
+        ):
             results = TikTokProvider().search("calculus", 3)
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0].provider, "tiktok")
-        self.assertEqual(results[0].video_id, "7123456789")
-        self.assertEqual(results[0].channel, "mathlady")
-        self.assertEqual(results[0].duration_sec, 42)
-        self.assertTrue(results[0].playback_url.endswith("/embed/v2/7123456789"))
-        # When webpage_url missing, it's synthesised from uploader.
-        self.assertIn("7998887776", results[1].video_url)
-        # Pseudo-URL format was used.
-        args, _ = ydl_instance.extract_info.call_args
-        self.assertIn("tiktoksearch", args[0])
+        self.assertEqual(results[0].video_id, "7123456789000000000")
+        self.assertTrue(results[0].playback_url.endswith("/embed/v2/7123456789000000000"))
+        self.assertIn("7998887776000000000", results[1].video_url)
 
-    def test_search_caps_max_results(self):
-        # max_results > 20 should be clamped; pseudo-URL must reflect that.
-        ydl_class, ydl_instance = _mock_ydl({"entries": []})
-        with patch("yt_dlp.YoutubeDL", ydl_class):
-            TikTokProvider().search("x", 999)
-        pseudo = ydl_instance.extract_info.call_args[0][0]
-        # tiktoksearch{N}: where N is capped at 20.
-        self.assertTrue(pseudo.startswith("tiktoksearch20:"))
+    def test_search_empty_ddg_returns_empty(self):
+        ddg_resp = MagicMock(text="<html></html>", status_code=200)
+        ddg_resp.raise_for_status = MagicMock()
+        with patch(
+            "backend.app.services.provider_registry.requests.get",
+            return_value=ddg_resp,
+        ):
+            self.assertEqual(TikTokProvider().search("calculus", 3), [])
 
-    def test_search_swallows_extractor_errors(self):
-        ydl_class = MagicMock()
-        ydl_class.return_value.__enter__.return_value.extract_info.side_effect = RuntimeError("boom")
-        ydl_class.return_value.__exit__.return_value = False
-        with patch("yt_dlp.YoutubeDL", ydl_class):
+    def test_search_swallows_network_errors(self):
+        with patch(
+            "backend.app.services.provider_registry.requests.get",
+            side_effect=requests.ConnectionError("boom"),
+        ):
             self.assertEqual(TikTokProvider().search("x", 3), [])
 
     def test_fetch_transcript_empty_id(self):

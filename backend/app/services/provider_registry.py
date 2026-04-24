@@ -64,9 +64,21 @@ _SUBTITLE_TIMESTAMP_RE = re.compile(
 # stable bot-friendly surface; it wraps real URLs in a `/l/?uddg=` redirect,
 # which we normalise by URL-unquoting the whole body before regexing.
 _DDG_HTML_URL = "https://html.duckduckgo.com/html/"
-_DDG_UA = "Mozilla/5.0 (compatible; ReelAI/1.0; +https://reelai.app/bot)"
+# Real Chrome UA string. DDG returns HTTP 202 (anti-bot challenge page) to any
+# UA that contains `bot`, `compatible`, `curl`, `python`, etc. Our earlier
+# `compatible; ReelAI/1.0; +https://reelai.app/bot` UA tripped that challenge
+# on every request and silently returned zero URLs. Must stay a plausible
+# desktop browser string until we wire proxy rotation through this path.
+_DDG_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+)
 _VIMEO_ID_RE = re.compile(r"vimeo\.com/(\d{6,12})")
 _TWITCH_CLIP_RE = re.compile(r"clips\.twitch\.tv/([A-Za-z0-9][A-Za-z0-9_-]{7,})")
+# TikTok video URL: `tiktok.com/@uploader/video/{19-digit-id}`. Capture the id
+# only; the `@_` canonical form works for yt-dlp + embed, and TikTok redirects
+# it to the real uploader path.
+_TIKTOK_VIDEO_RE = re.compile(r"tiktok\.com/@[\w.-]+/video/(\d{15,25})")
 _TWITCH_WKWEBVIEW_PARENT = "reelai.local"
 
 
@@ -178,9 +190,13 @@ class DailymotionProvider(Provider):
     name = "dailymotion"
     SEARCH_URL = "https://api.dailymotion.com/videos"
     SUBTITLES_URL = "https://api.dailymotion.com/video/{id}/subtitles"
+    # Dailymotion rejects `channel.screenname` with 400 Bad Request. The
+    # correct field name for the channel display name is `owner.screenname`
+    # (videos have an `owner`, which is distinct from the optional `channel`
+    # grouping). Using the wrong field made every search return 0 results.
     _FIELDS = (
         "id,title,description,duration,thumbnail_480_url,"
-        "channel.screenname,created_time,views_total,url"
+        "owner.screenname,created_time,views_total,url"
     )
 
     def search(self, query: str, max_results: int) -> list[ProviderCandidate]:
@@ -222,7 +238,7 @@ class DailymotionProvider(Provider):
                     playback_url=f"https://www.dailymotion.com/embed/video/{video_id}",
                     title=str(entry.get("title") or "").strip(),
                     description=str(entry.get("description") or "").strip(),
-                    channel=str(entry.get("channel.screenname") or "").strip(),
+                    channel=str(entry.get("owner.screenname") or "").strip(),
                     duration_sec=int(entry.get("duration") or 0),
                     thumbnail_url=str(entry.get("thumbnail_480_url") or "").strip(),
                     published_at=str(entry.get("created_time") or "") or None,
@@ -284,10 +300,18 @@ class DailymotionProvider(Provider):
 class BilibiliProvider(Provider):
     name = "bilibili"
     SEARCH_URL = "https://api.bilibili.com/x/web-interface/search/type"
+    # Bilibili ships HTTP 412 (Precondition Failed) to any request whose UA
+    # contains `bot`, `compatible`, or `python` — the response body isn't
+    # JSON, which used to surface as a silent 0-candidates return. Send a
+    # realistic desktop Chrome UA plus the Referer and Accept-* headers a
+    # real browser would send.
     _HEADERS = {
-        # Bilibili rejects requests without a browser-like UA. Keep this
-        # modest; scraping isn't the goal here, just their public JSON API.
-        "User-Agent": "Mozilla/5.0 (compatible; ReelAI/1.0)",
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
         "Referer": "https://www.bilibili.com/",
     }
 
@@ -754,9 +778,11 @@ class TwitchProvider(Provider):
 
 class TikTokProvider(Provider):
     """
-    TikTok via yt-dlp's `tiktoksearch{N}:{query}` pseudo-URL. yt-dlp is the
-    ONLY sustainable search path for TikTok — there is no public keyword
-    API, and scraping their web search HTML gets flagged immediately.
+    TikTok via yt-dlp. yt-dlp doesn't expose a `tiktoksearch:` pseudo-URL
+    the way it does `ytsearch:` / `scsearch:` — the extractor surfaces
+    TikTok search via the real search URL instead. We mirror what
+    `ingestion/adapters/yt_dlp_adapter.build_search_url` produces:
+    `https://www.tiktok.com/search?q={query}`.
 
     `extract_flat=True` keeps the metadata round-trip cheap: yt-dlp only
     pulls the search-results page, not each video. Transcripts DO need a
@@ -774,58 +800,37 @@ class TikTokProvider(Provider):
         query = (query or "").strip()
         if not query:
             return []
-        try:
-            import yt_dlp  # type: ignore
-        except Exception:
-            return []
+        # yt-dlp doesn't ship a TikTok search extractor — only individual
+        # video URLs work (TikTokIE / TikTokUserIE / TikTokLiveIE). Falling
+        # back to DuckDuckGo with `site:tiktok.com` to recover video IDs,
+        # same pattern we use for the keyless Vimeo + Twitch paths. Each
+        # hit becomes a ProviderCandidate with minimal metadata; titles
+        # stay blank until we wire per-video yt-dlp extract_info (slow).
         capped = max(1, min(int(max_results or 1), self._MAX_RESULTS))
-        pseudo_url = f"tiktoksearch{capped}:{query}"
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": True,
-            "skip_download": True,
-            "socket_timeout": int(self._TIMEOUT_SEC),
-        }
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(pseudo_url, download=False)
-        except Exception as exc:
-            logger.debug("tiktok search failed: %s", exc)
+        video_ids = _ddg_find(
+            query,
+            site_filter="tiktok.com",
+            pattern=_TIKTOK_VIDEO_RE,
+            max_results=capped,
+        )
+        if not video_ids:
             return []
-        entries = (info or {}).get("entries") if isinstance(info, dict) else None
-        if not isinstance(entries, list):
-            return []
-        candidates: list[ProviderCandidate] = []
-        for entry in entries:
-            if not isinstance(entry, dict):
-                continue
-            video_id = str(entry.get("id") or "").strip()
-            if not video_id:
-                continue
-            uploader = str(entry.get("uploader") or entry.get("channel") or "").strip()
-            canonical = str(
-                entry.get("webpage_url")
-                or entry.get("url")
-                or f"https://www.tiktok.com/@{(uploader.lstrip('@') or '_')}/video/{video_id}"
-            ).strip()
-            candidates.append(
-                ProviderCandidate(
-                    provider="tiktok",
-                    video_id=video_id,
-                    video_url=canonical,
-                    playback_url=f"https://www.tiktok.com/embed/v2/{video_id}",
-                    title=str(entry.get("title") or "").strip(),
-                    description=str(entry.get("description") or "").strip(),
-                    channel=uploader,
-                    duration_sec=int(entry.get("duration") or 0),
-                    thumbnail_url=str(entry.get("thumbnail") or "").strip(),
-                    published_at=str(entry.get("upload_date") or "") or None,
-                    view_count=int(entry.get("view_count") or 0),
-                    raw=entry,
-                )
+        return [
+            ProviderCandidate(
+                provider="tiktok",
+                video_id=vid,
+                video_url=f"https://www.tiktok.com/@_/video/{vid}",
+                playback_url=f"https://www.tiktok.com/embed/v2/{vid}",
+                title="",
+                description="",
+                channel="",
+                duration_sec=0,
+                thumbnail_url="",
+                published_at=None,
+                view_count=0,
             )
-        return candidates
+            for vid in video_ids
+        ]
 
     def fetch_transcript(self, video_id: str) -> ProviderTranscript | None:
         vid = str(video_id or "").strip()
