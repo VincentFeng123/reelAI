@@ -4032,11 +4032,11 @@ class ReelService:
     def _topic_cut_video_timeout_sec(self) -> float:
         raw = os.environ.get("TOPIC_CUT_VIDEO_TIMEOUT_SEC")
         if raw is None or not raw.strip():
-            return 45.0
+            return 180.0
         try:
-            return max(5.0, float(raw))
+            return max(30.0, float(raw))
         except (TypeError, ValueError):
-            return 45.0
+            return 180.0
 
     def _run_with_video_timeout(
         self,

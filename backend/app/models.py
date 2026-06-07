@@ -42,7 +42,7 @@ class ReelsGenerateRequest(BaseModel):
     num_reels: int = Field(default=8, ge=1, le=60)
     exclude_video_ids: list[str] = Field(default_factory=list, max_length=500)
     creative_commons_only: bool = False
-    generation_mode: Literal["slow", "fast"] = "fast"
+    generation_mode: Literal["slow", "fast"] = "slow"
     min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
     video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first"
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
@@ -169,7 +169,7 @@ class ReelsCanGenerateResponse(BaseModel):
 class ReelsCanGenerateAnyRequest(BaseModel):
     material_ids: list[str] = Field(default_factory=list, max_length=50)
     creative_commons_only: bool = False
-    generation_mode: Literal["slow", "fast"] = "fast"
+    generation_mode: Literal["slow", "fast"] = "slow"
     min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
     video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first"
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
@@ -447,7 +447,7 @@ class CommunityHistoryItemIn(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     updated_at: int = Field(ge=0)
     starred: bool = False
-    generation_mode: Literal["slow", "fast"] = "fast"
+    generation_mode: Literal["slow", "fast"] = "slow"
     source: Literal["search", "community"] = "search"
     feed_query: str | None = Field(default=None, max_length=4000)
     active_index: int | None = Field(default=None, ge=0)
@@ -459,7 +459,7 @@ class CommunityHistoryItemOut(BaseModel):
     title: str
     updated_at: int
     starred: bool = False
-    generation_mode: Literal["slow", "fast"] = "fast"
+    generation_mode: Literal["slow", "fast"] = "slow"
     source: Literal["search", "community"] = "search"
     feed_query: str | None = None
     active_index: int | None = None
@@ -475,7 +475,7 @@ class CommunityHistoryResponse(BaseModel):
 
 
 class CommunitySettingsPayload(BaseModel):
-    generation_mode: Literal["slow", "fast"] = "fast"
+    generation_mode: Literal["slow", "fast"] = "slow"
     default_input_mode: Literal["topic", "source", "file"] = "source"
     min_relevance_threshold: float = Field(default=0.3, ge=0.0, le=0.6)
     start_muted: bool = True

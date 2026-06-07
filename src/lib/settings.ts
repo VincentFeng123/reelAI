@@ -47,7 +47,7 @@ export const TARGET_CLIP_DURATION_MAX = 180;
 export const TARGET_CLIP_DURATION_MIN_GAP = 15;
 
 export const DEFAULT_STUDY_REELS_SETTINGS: StudyReelsSettings = {
-  generationMode: "fast",
+  generationMode: "slow",
   defaultInputMode: "source",
   minRelevanceThreshold: 0.3,
   startMuted: true,
@@ -58,7 +58,7 @@ export const DEFAULT_STUDY_REELS_SETTINGS: StudyReelsSettings = {
   targetClipDurationMinSec: 20,
   targetClipDurationMaxSec: 55,
   // Off by default because provider APIs add network fan-out; when enabled,
-  // the backend augments the fast /api/reels/generate-stream search path.
+  // the backend augments the /api/reels/generate-stream search path.
   multiPlatformSearch: false,
 };
 
@@ -79,7 +79,7 @@ type StudyReelsSettingsInput = {
 let activeSettingsScopeMemoryFallback: string | null = null;
 
 function toGenerationMode(value: string | null | undefined): GenerationMode {
-  return value === "slow" ? "slow" : "fast";
+  return value === "fast" ? "fast" : "slow";
 }
 
 function toInputMode(value: string | null | undefined): SearchInputMode {

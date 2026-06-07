@@ -63,7 +63,7 @@ export function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | nu
     title: title || "New Study Session",
     updatedAt: Math.max(0, Math.floor(Number(row.updatedAt) || 0)),
     starred: Boolean(row.starred),
-    generationMode: row.generationMode === "slow" ? "slow" : "fast",
+    generationMode: row.generationMode === "fast" ? "fast" : "slow",
     source: row.source === "community" ? "community" : "search",
     feedQuery: typeof row.feedQuery === "string" && row.feedQuery.trim() ? row.feedQuery.trim() : undefined,
     activeIndex,

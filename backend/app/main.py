@@ -275,6 +275,16 @@ youtube_service = YouTubeService()
 reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service)
 SERVERLESS_MODE = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
 
+
+def _reels_generate_stream_deadline_sec() -> float:
+    raw = os.getenv("REELS_GENERATE_STREAM_DEADLINE_SEC")
+    if raw is None or not raw.strip():
+        return 900.0
+    try:
+        return max(120.0, float(raw))
+    except (TypeError, ValueError):
+        return 900.0
+
 ingestion_pipeline = IngestionPipeline(
     youtube_service=youtube_service,
     embedding_service=embedding_service,
@@ -1731,7 +1741,7 @@ def _resolve_target_clip_duration_bounds(
 def _serialize_community_settings(row: dict | None) -> CommunitySettingsResponse:
     source = row or {}
     generation_mode_raw = str(source.get("generation_mode") or "").strip().lower()
-    generation_mode = generation_mode_raw if generation_mode_raw in {"slow", "fast"} else "fast"
+    generation_mode = generation_mode_raw if generation_mode_raw in {"slow", "fast"} else "slow"
     default_input_mode = _normalize_default_input_mode(str(source.get("default_input_mode") or "").strip().lower() or None)
     min_relevance_threshold = _normalize_settings_min_relevance_threshold(source.get("min_relevance_threshold"))
     start_muted = _normalize_settings_start_muted(source.get("start_muted", 1 if DEFAULT_SETTINGS_START_MUTED else 0))
@@ -3058,7 +3068,7 @@ def _complete_generation(
             "material_id": str(row.get("material_id") or ""),
             "concept_id": row.get("concept_id"),
             "request_key": str(row.get("request_key") or ""),
-            "generation_mode": str(row.get("generation_mode") or "fast"),
+            "generation_mode": str(row.get("generation_mode") or "slow"),
             "retrieval_profile": retrieval_profile,
             "status": status,
             "source_generation_id": row.get("source_generation_id"),
@@ -4167,7 +4177,7 @@ def _run_refinement_job(job_id: str) -> None:
             material_id=str(job_row.get("material_id") or ""),
             concept_id=str(job_row.get("concept_id") or "") or None,
             request_key=str(job_row.get("request_key") or ""),
-            generation_mode=str(source_generation.get("generation_mode") or "fast"),  # type: ignore[arg-type]
+            generation_mode=str(source_generation.get("generation_mode") or "slow"),  # type: ignore[arg-type]
             retrieval_profile="deep",
             source_generation_id=source_generation_id,
         )
@@ -4179,7 +4189,7 @@ def _run_refinement_job(job_id: str) -> None:
                 request_params = {}
             if not isinstance(request_params, dict):
                 request_params = {}
-            fast_mode = str(source_generation.get("generation_mode") or "fast") == "fast"
+            fast_mode = str(source_generation.get("generation_mode") or "slow") == "fast"
             generation_mode: Literal["slow", "fast"] = "fast" if fast_mode else "slow"
             safe_video_pool_mode = _normalize_video_pool_mode(str(request_params.get("video_pool_mode") or "short-first"))
             safe_video_duration_pref = _normalize_preferred_video_duration(
@@ -4973,7 +4983,7 @@ def _try_get_community_account(conn: Any, request: Request) -> dict[str, object]
 def _serialize_community_history_item(row: dict) -> CommunityHistoryItemOut:
     generation_mode = str(row.get("generation_mode") or "").strip().lower()
     if generation_mode not in {"slow", "fast"}:
-        generation_mode = "fast"
+        generation_mode = "slow"
     source = str(row.get("source") or "").strip().lower()
     if source not in {"search", "community"}:
         source = "search"
@@ -5005,7 +5015,7 @@ def _normalize_community_history_items(payload_items) -> list[dict[str, object]]
         title = str(item.title or "").strip() or "New Study Session"
         generation_mode = str(item.generation_mode or "").strip().lower()
         if generation_mode not in {"slow", "fast"}:
-            generation_mode = "fast"
+            generation_mode = "slow"
         source = str(item.source or "").strip().lower()
         if source not in {"search", "community"}:
             source = "search"
@@ -6088,9 +6098,10 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
         event_queue: Queue[dict[str, Any] | None] = Queue(maxsize=256)
         emitted_reels: set[tuple[str, str]] = set()
         cancel_event = threading.Event()
-        # Hard wall-clock deadline for the whole generation so a runaway LLM /
-        # YouTube call cannot bill LLM credits forever for a disconnected client.
-        STREAM_DEADLINE_SEC = 25.0 if SERVERLESS_MODE else 90.0
+        # Long but finite wall-clock deadline. Quality-oriented retrieval can
+        # spend several minutes on transcript/topic-boundary work; disconnected
+        # clients still cancel through `request.is_disconnected()`.
+        STREAM_DEADLINE_SEC = _reels_generate_stream_deadline_sec()
         deadline = time.monotonic() + STREAM_DEADLINE_SEC
 
         def emit_event(event: dict[str, Any]) -> None:
@@ -6691,7 +6702,7 @@ def feed(
     autofill: bool = True,
     prefetch: int = 7,
     creative_commons_only: bool = False,
-    generation_mode: Literal["slow", "fast"] = "fast",
+    generation_mode: Literal["slow", "fast"] = "slow",
     min_relevance: float | None = None,
     video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first",
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any",

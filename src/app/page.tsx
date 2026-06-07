@@ -137,7 +137,7 @@ function parseLegacyTopicHistory(raw: string | null): HistoryItem[] {
         title: String(item.topic).trim(),
         updatedAt: Number(item.updatedAt) || 0,
         starred: false,
-        generationMode: "fast",
+        generationMode: "slow",
         source: "search",
         feedQuery: undefined,
       }))
@@ -159,7 +159,7 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
       map.set(item.materialId, {
         ...item,
         starred: item.starred || existing.starred,
-        generationMode: item.generationMode || existing.generationMode || "fast",
+        generationMode: item.generationMode || existing.generationMode || "slow",
         source: item.source || existing.source || "search",
         feedQuery: item.feedQuery ?? existing.feedQuery,
         activeIndex: item.activeIndex ?? existing.activeIndex,
@@ -170,7 +170,7 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
     map.set(item.materialId, {
       ...existing,
       starred: existing.starred || item.starred,
-      generationMode: existing.generationMode || item.generationMode || "fast",
+      generationMode: existing.generationMode || item.generationMode || "slow",
       source: existing.source || item.source || "search",
       feedQuery: existing.feedQuery ?? item.feedQuery,
       activeIndex: existing.activeIndex ?? item.activeIndex,
@@ -688,7 +688,7 @@ function HomePageContent() {
         title: entry.title,
         updatedAt: entry.updatedAt,
         starred: entry.starred ?? existing?.starred ?? false,
-        generationMode: entry.generationMode ?? existing?.generationMode ?? "fast",
+        generationMode: entry.generationMode ?? existing?.generationMode ?? "slow",
         source: entry.source ?? existing?.source ?? "search",
         feedQuery: entry.feedQuery ?? existing?.feedQuery,
         activeIndex: entry.activeIndex ?? existing?.activeIndex,
@@ -1078,7 +1078,7 @@ function HomePageContent() {
           return;
         }
       }
-      const mode = existing?.generationMode ?? "fast";
+      const mode = existing?.generationMode ?? "slow";
       const returnTab = activeSidebarTab === "history"
         ? "history"
         : activeSidebarTab === "community" || activeSidebarTab === "create" || activeSidebarTab === "edit"
@@ -1215,7 +1215,7 @@ function HomePageContent() {
         materialId: `community:${encodeURIComponent(normalizedSetId)}`,
         title,
         updatedAt: Date.now(),
-        generationMode: "fast",
+        generationMode: "slow",
         source: "community",
         feedQuery: payload.feedQuery.trim() || undefined,
         activeReelId: payload.selectedReelId.trim() || undefined,

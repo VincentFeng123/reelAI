@@ -346,7 +346,7 @@ function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapsh
         page,
         total,
         canRequestMore: row.canRequestMore !== false,
-        generationMode: row.generationMode === "slow" ? "slow" : "fast",
+        generationMode: row.generationMode === "fast" ? "fast" : "slow",
         mutedPreference: row.mutedPreference !== false,
         autoplayEnabled: row.autoplayEnabled === true || row.autoplayEnabled === "1" || row.autoplayEnabled === "true",
         playbackRate: normalizeFeedPlaybackRate(row.playbackRate),
@@ -864,7 +864,7 @@ function FeedPageInner() {
   const [chatError, setChatError] = useState<string | null>(null);
   const [rightPanelWidthPx, setRightPanelWidthPx] = useState(360);
   const [rightTopRatio, setRightTopRatio] = useState(0.62);
-  const [generationMode, setGenerationMode] = useState<GenerationMode>("fast");
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
   const [sessionHydrated, setSessionHydrated] = useState(false);
   const [initialFeedScreenReady, setInitialFeedScreenReady] = useState(false);
   const [authAccountId, setAuthAccountId] = useState<string | null>(null);

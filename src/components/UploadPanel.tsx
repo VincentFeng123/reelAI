@@ -271,7 +271,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const [generationMode, setGenerationMode] = useState<GenerationMode>("fast");
+  const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
   const selectedFileName = file?.name ?? "";
 
   useEffect(() => {

@@ -1453,6 +1453,16 @@ class GenerateReelsWiringTest(unittest.TestCase):
             f"_topic_cut_segments_for_concept signature changed: {actual}",
         )
 
+    def test_topic_boundary_timeout_default_prioritizes_quality(self) -> None:
+        import os
+        from backend.app.services.reels import ReelService
+
+        service = ReelService.__new__(ReelService)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(service._topic_cut_video_timeout_sec(), 180.0)
+        with mock.patch.dict(os.environ, {"TOPIC_CUT_VIDEO_TIMEOUT_SEC": "240"}, clear=True):
+            self.assertEqual(service._topic_cut_video_timeout_sec(), 240.0)
+
 
 # --------------------------------------------------------------------------- #
 # Phase 3 — distribute_ranked_to_topic_reels + TopicReel sub-score serialization

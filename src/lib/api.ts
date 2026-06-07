@@ -781,7 +781,7 @@ function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<stri
     num_reels: params.numReels ?? 7,
     exclude_video_ids: normalizeVideoIdList(params.excludeVideoIds),
     creative_commons_only: false,
-    generation_mode: params.generationMode ?? "fast",
+    generation_mode: params.generationMode ?? "slow",
     min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
     video_pool_mode: params.videoPoolMode ?? "short-first",
     preferred_video_duration: params.preferredVideoDuration ?? "any",
@@ -806,6 +806,7 @@ export async function generateReels(params: GenerateReelsParams): Promise<ReelsG
       ...communityOwnerHeaders(),
     },
     body: JSON.stringify(buildGenerateReelsRequestBody(params)),
+    timeoutMs: 900_000,
   });
 
   return parseJsonResponse<ReelsGenerateResponse>(res);
@@ -939,7 +940,7 @@ export async function generateReelsStream(
     },
     body: JSON.stringify(buildGenerateReelsRequestBody(params)),
     signal: params.signal,
-    timeoutMs: 120_000,
+    timeoutMs: 900_000,
   });
 
   const contentType = (res.headers.get("content-type") || "").toLowerCase();
@@ -1029,7 +1030,7 @@ export async function checkReelsCanGenerate(params: {
       concept_id: params.conceptId,
       num_reels: 1,
       creative_commons_only: false,
-      generation_mode: params.generationMode ?? "fast",
+      generation_mode: params.generationMode ?? "slow",
       min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
       video_pool_mode: params.videoPoolMode ?? "short-first",
       preferred_video_duration: params.preferredVideoDuration ?? "any",
@@ -1067,7 +1068,7 @@ export async function checkReelsCanGenerateAny(params: {
     body: JSON.stringify({
       material_ids: materialIds,
       creative_commons_only: false,
-      generation_mode: params.generationMode ?? "fast",
+      generation_mode: params.generationMode ?? "slow",
       min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
       video_pool_mode: params.videoPoolMode ?? "short-first",
       preferred_video_duration: params.preferredVideoDuration ?? "any",
@@ -1106,7 +1107,7 @@ export async function fetchFeed(params: {
     autofill: String(params.autofill ?? true),
     prefetch: String(params.prefetch ?? 7),
     creative_commons_only: "false",
-    generation_mode: params.generationMode ?? "fast",
+    generation_mode: params.generationMode ?? "slow",
     video_pool_mode: params.videoPoolMode ?? "short-first",
     preferred_video_duration: params.preferredVideoDuration ?? "any",
     target_clip_duration_sec: String(
@@ -1133,7 +1134,7 @@ export async function fetchFeed(params: {
       ...communityOwnerHeaders(),
     },
     signal: params.signal,
-    timeoutMs: 45_000,
+    timeoutMs: 300_000,
   });
 
   return parseJsonResponse<FeedResponse>(res);
@@ -1418,7 +1419,7 @@ function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | null {
     title,
     updatedAt: Math.max(0, Math.floor(Number(row.updated_at) || 0)),
     starred: Boolean(row.starred),
-    generationMode: row.generation_mode === "slow" ? "slow" : "fast",
+    generationMode: row.generation_mode === "fast" ? "fast" : "slow",
     source: row.source === "community" ? "community" : "search",
     feedQuery: typeof row.feed_query === "string" && row.feed_query.trim() ? row.feed_query.trim() : undefined,
     activeIndex: Number.isFinite(activeIndex) && activeIndex >= 0 ? Math.floor(activeIndex) : undefined,

@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS reel_generations (
     material_id TEXT NOT NULL,
     concept_id TEXT,
     request_key TEXT NOT NULL,
-    generation_mode TEXT NOT NULL DEFAULT 'fast',
+    generation_mode TEXT NOT NULL DEFAULT 'slow',
     retrieval_profile TEXT NOT NULL DEFAULT 'bootstrap',
     status TEXT NOT NULL DEFAULT 'pending',
     source_generation_id TEXT,
@@ -428,7 +428,7 @@ CREATE TABLE IF NOT EXISTS community_material_history (
     title TEXT NOT NULL,
     updated_at BIGINT NOT NULL,
     starred INTEGER NOT NULL DEFAULT 0,
-    generation_mode TEXT NOT NULL DEFAULT 'fast',
+    generation_mode TEXT NOT NULL DEFAULT 'slow',
     source TEXT NOT NULL DEFAULT 'search',
     feed_query TEXT,
     active_index INTEGER,
@@ -442,7 +442,7 @@ ON community_material_history(account_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS community_account_settings (
     account_id TEXT PRIMARY KEY,
-    generation_mode TEXT NOT NULL DEFAULT 'fast',
+    generation_mode TEXT NOT NULL DEFAULT 'slow',
     default_input_mode TEXT NOT NULL DEFAULT 'source',
     min_relevance_threshold REAL NOT NULL DEFAULT 0.3,
     start_muted INTEGER NOT NULL DEFAULT 1,
