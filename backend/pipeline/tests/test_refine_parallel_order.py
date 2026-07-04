@@ -37,13 +37,17 @@ def _spec_from_clips(clips):
 
 def _make_windows(spec):
     """A plain (no coordination) `_whisper_window`: recover the clip from the window start and
-    return sentences engineered so `_pick_start`→target_start and `_pick_end`→target_end."""
+    return sentences engineered so `_pick_start`→target_start and `_pick_end`→target_end.
+    Three sentences: sents[0] is a prev-word with terminator "." (gap before sents[1] is
+    measurable); sents[2] is a trailing sentence giving a 0.5 s gap after sents[1] so
+    _pick_end is satisfied in one combined window."""
     def _win(audio, win_start, win_end):
         s0 = round(win_start + PAD, 3)                    # short-clip window is (s0-PAD, e0+PAD)
         _idx, tgt_start, tgt_end = spec[s0]
-        # sents[0] is a "fragment" (dropped by _pick_start; not a valid end); sents[1] is the real
-        # sentence whose start/end drive the picks.
-        return [_sent(0, s0 - 20.0, s0 - 19.0, ""), _sent(1, tgt_start, tgt_end, ".")]
+        sents = [_sent(0, s0 - 20.0, s0 - 19.0, "."),     # prev word (terminated) → start gap measurable
+                 _sent(1, tgt_start, tgt_end, "."),        # the chosen sentence
+                 _sent(2, tgt_end + 0.5, tgt_end + 3.0, ".")]  # trailing → measurable end gap
+        return sents, None
     return _win
 
 
@@ -55,12 +59,14 @@ def _make_reversed_windows(spec, n):
     def _win(audio, win_start, win_end):
         s0 = round(win_start + PAD, 3)
         idx, tgt_start, tgt_end = spec[s0]
-        sents = [_sent(0, s0 - 20.0, s0 - 19.0, ""), _sent(1, tgt_start, tgt_end, ".")]
+        sents = [_sent(0, s0 - 20.0, s0 - 19.0, "."),     # prev word (terminated) → start gap measurable
+                 _sent(1, tgt_start, tgt_end, "."),
+                 _sent(2, tgt_end + 0.5, tgt_end + 3.0, ".")]  # trailing → measurable end gap
         if idx + 1 < n:                       # wait for the next-higher clip to finish first
             events[idx + 1].wait(5.0)
             time.sleep(0.02)                  # let that clip's _refine_one fully return
         events[idx].set()
-        return sents
+        return sents, None
     return _win
 
 
@@ -94,7 +100,9 @@ def test_parallel_reversed_completion_matches_serial_distinct(monkeypatch):
     # every clip snapped to its own offset, and order is preserved
     assert _key(serial) == _key(parallel)
     assert [c["id"] for c in serial] == ["c0", "c1", "c2", "c3"]
-    assert [round(c["start"], 3) for c in serial] == [99.0, 198.0, 297.0, 396.0]  # s0-(i+1)
+    # Task 5: _pick_start now cuts into the leading gap (tgt_start - lead_pad=0.06);
+    # stubs use term="." for sents[0] → terminated-prev / measurable-gap path → cut = tgt_start - lead_pad.
+    assert [round(c["start"], 3) for c in serial] == [98.94, 197.94, 296.94, 395.94]
 
 
 # ── start-tie: THE guard. Two clips snap to the SAME start; _resolve_overlaps' stable sort

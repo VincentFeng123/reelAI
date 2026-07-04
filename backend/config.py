@@ -56,11 +56,28 @@ WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")   # tiny|base|small|med
 WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8")  # int8 is fast on CPU
 WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")     # faster-whisper: cpu (no MPS)
 
+# Precise-boundary REFINE uses a dedicated (usually larger) Whisper model than full
+# transcription: the window is small so cost is modest, and word timestamps are more precise.
+# Default "medium"; set REFINE_WHISPER_MODEL="" to fall back to WHISPER_MODEL. (~1.5 GB one-time
+# download on first CPU/int8 run.)
+REFINE_WHISPER_MODEL = os.environ.get("REFINE_WHISPER_MODEL", "medium") or WHISPER_MODEL
+# VAD on the refine window pads speech segments (speech_pad_ms), giving usable silence margin.
+REFINE_VAD = os.environ.get("REFINE_VAD", "1") not in ("0", "false", "")
+
 # ── Precise boundary refinement ──────────────────────────────────────────────
 # After the LLM picks rough ranges (from coarse Supadata captions), run Whisper on
 # a small window around each boundary to snap start→sentence start, end→period.
 PRECISE_BOUNDARIES = os.environ.get("PRECISE_BOUNDARIES", "1") not in ("0", "false", "")
 BOUNDARY_PAD_S = float(os.environ.get("BOUNDARY_PAD_S", "10"))   # window half-width / max snap drift
+# When no period-terminated sentence end with a usable trailing gap is in the window, the refine
+# pass GROWS the window (pad→2·pad→4·pad…) and re-transcribes, up to this forward/backward reach.
+MAX_BOUNDARY_SEARCH_S = float(os.environ.get("MAX_BOUNDARY_SEARCH_S", "45"))
+# A word-gap must be at least this wide to count as a clean cut site (the cut lands inside it).
+SILENCE_MIN_GAP_S = float(os.environ.get("SILENCE_MIN_GAP_S", "0.12"))
+# HYBRID end policy (handoff §8): when the chosen complete-sentence end has no trailing pause,
+# advance the clip END to the next period-terminated sentence WITH a gap only within this budget
+# (~one sentence). Beyond it, best-available tight cut at the original end.
+END_EXTEND_MAX_S = float(os.environ.get("END_EXTEND_MAX_S", "8"))
 # Latency lever: the per-clip whisper edge-window passes in refine_clip_boundaries are
 # independent, so they run concurrently over a thread pool sharing the singleton model.
 # CPU-bound (local whisper), so cap near physical cores — over-subscribing thrashes.
@@ -124,7 +141,8 @@ DEFAULTS: dict = {
     "allow_question_exclaim_ends": False,   # vestigial: sentences ending in '?'/'!' are now valid
                                             # clip ends too (see Sentence.ends_with_period)
     "mmr_lambda": MMR_LAMBDA,               # 1.0 = pure relevance, 0 = pure diversity
-    "tail_pad_s": 0.05,
+    "tail_pad_s": 0.15,   # trailing cushion — the cut lands in the gap AFTER the last word
+    "lead_pad_s": 0.06,   # leading cushion — the cut lands in the gap BEFORE the first word
     "min_clip_duration_s": 15.0,     # a complete short thought can be brief
     "target_clip_duration_s": 45.0,  # Instagram-short AIM (scoring target, not a cutter)
     "max_clip_duration_s": 180.0,    # HARD ship cap / overflow ceiling (was 240). NOT a soft
