@@ -141,20 +141,65 @@ def _energy_min_snap(wav_path, win_start: float, a: float, b: float,
     return win_start + (best_i + frame / 2) / sr
 
 
+def _gap_before(sents, idx: int) -> "tuple[float, float] | None":
+    """(prev.end, S.start) for the sentence at idx, or None if idx is the window's first sentence."""
+    if idx <= 0 or idx >= len(sents):
+        return None
+    return sents[idx - 1].end, sents[idx].start
+
+
+def _snap_start_cut(s_start: float, prev_end: float, lead_pad: float, energy_fn) -> "tuple[float, tuple]":
+    """Cut into the gap BEFORE s_start: max(s_start-lead_pad, midpoint(prev_end, s_start)), then
+    energy-snap within [that, s_start]. Never < prev_end, never > s_start."""
+    mid = (prev_end + s_start) / 2.0
+    pad_cut = max(s_start - lead_pad, mid)
+    cut = pad_cut
+    if energy_fn is not None:
+        snapped = energy_fn(pad_cut, s_start)
+        if snapped is not None:
+            cut = min(max(snapped, pad_cut), s_start)
+    return max(prev_end, min(cut, s_start)), ()
+
+
 def _pick_start(sents: list[Sentence], rough: float, pad: float,
                 keep_first: bool = False, *, lead_pad: float = 0.06,
                 gap_min: float = 0.12, energy_fn=None) -> Pick:
-    """Latest real sentence-start at/just before the rough start (begin at a thought).
-    keep_first: the window began at t<=0, so sents[0] is a real start, not a cut fragment."""
+    """Begin at a thought's onset, cutting into the leading inter-word gap (never into the prev
+    word). Direction-safe: never chooses a start later than rough+1s. The START never re-selects
+    an earlier sentence — if the previous word isn't visible, it asks _refine_start to grow the
+    window (satisfied=False)."""
     if not sents:
         return Pick(rough, (), True)
-    pool = sents if keep_first else sents[1:]
-    starts = [s.start for s in pool] or [s.start for s in sents]
-    before = [x for x in starts if x <= rough + 1.0]
+    # candidate starts: exclude the window's first sentence as a fragment unless keep_first
+    cand = [(i, s.start) for i, s in enumerate(sents) if (keep_first or i >= 1)]
+    before = [(i, x) for (i, x) in cand if x <= rough + 1.0]
     if not before:
-        return Pick(rough, (), True)              # direction-safe: never move the start LATER than rough+1s
-    cand = max(before)
-    return Pick(cand if abs(cand - rough) <= pad else rough, (), True)
+        return Pick(rough, (), True)                 # direction-safe: keep rough
+    idx, s_start = max(before, key=lambda t: t[1])
+    if abs(s_start - rough) > pad:
+        return Pick(rough, (), True)                 # nearest onset too far → keep rough
+    gap = _gap_before(sents, idx)
+    # Determine if the previous word is visible/reliable.
+    # When S=sents[1] (idx==1) and not keep_first, sents[0] is the window's first entry.
+    # If sents[0] is an unterminated fragment (terminator=""), its .end is mid-speech and
+    # cannot serve as a reliable inter-word boundary → treat prev as unseen.
+    # NOTE: use .terminator (not .ends_with_period) because "" in ".?!" is True in Python.
+    prev_unseen = gap is None
+    if (not prev_unseen and idx == 1 and not keep_first
+            and not sents[0].terminator):
+        prev_unseen = True
+    if prev_unseen:
+        cut = max(0.0, s_start - lead_pad)
+        if energy_fn is not None:
+            snapped = energy_fn(cut, s_start)
+            if snapped is not None:
+                cut = min(max(snapped, cut), s_start)
+        if keep_first:
+            return Pick(round(cut, 3), (), True)     # window at t=0 → real onset, no prev needed
+        return Pick(round(cut, 3), ("start_prev_unseen",), False)   # prev not visible → grow back
+    prev_end, _ = gap
+    cut, flags = _snap_start_cut(s_start, prev_end, lead_pad, energy_fn)
+    return Pick(round(cut, 3), flags, True)
 
 
 def _pick_end(sents: list[Sentence], rough: float, pad: float, allow_qe: bool, *,

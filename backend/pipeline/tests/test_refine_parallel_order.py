@@ -94,7 +94,9 @@ def test_parallel_reversed_completion_matches_serial_distinct(monkeypatch):
     # every clip snapped to its own offset, and order is preserved
     assert _key(serial) == _key(parallel)
     assert [c["id"] for c in serial] == ["c0", "c1", "c2", "c3"]
-    assert [round(c["start"], 3) for c in serial] == [99.0, 198.0, 297.0, 396.0]  # s0-(i+1)
+    # Task 5: _pick_start now cuts into the leading gap (tgt_start - lead_pad=0.06);
+    # stubs use term="" for sents[0] → prev-unseen path → cut = tgt_start - 0.06.
+    assert [round(c["start"], 3) for c in serial] == [98.94, 197.94, 296.94, 395.94]
 
 
 # ── start-tie: THE guard. Two clips snap to the SAME start; _resolve_overlaps' stable sort

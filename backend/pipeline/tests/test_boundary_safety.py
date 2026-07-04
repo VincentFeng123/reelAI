@@ -45,8 +45,9 @@ def test_pick_start_never_moves_later_than_window_ceiling():
 
 
 def test_pick_start_normal_path_unchanged():
+    # S = sents[1] @44.2, prev = sents[0] end 36.0 → big gap → cut = 44.2 - lead(0.06) = 44.14
     sents = [_sent(0, 35.0, 36.0), _sent(1, 44.2, 47.0), _sent(2, 47.1, 49.0)]
-    assert _pick_start(sents, rough=45.0, pad=10.0, lead_pad=0.06, gap_min=0.12).time == 44.2
+    assert abs(_pick_start(sents, rough=45.0, pad=10.0, lead_pad=0.06, gap_min=0.12).time - 44.14) < 1e-6
 
 
 def test_pick_start_keep_first_at_video_start():
