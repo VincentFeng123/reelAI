@@ -123,4 +123,20 @@ def test_refine_one_combined_window_fast_path(monkeypatch):
     assert len(windows) == 1                        # single combined transcription (fast path)
     assert 89.4 < out["start"] < 90.0               # start snapped into its gap
     assert 104.0 < out["end"] < 104.6               # end snapped into its gap
-    assert out["cut_end"] == round(out["end"] + 0.15, 3)
+    assert out["cut_end"] == round(out["end"], 3)
+
+
+# ── the physical cut (cut_end) must never enter the next word, even for a small valid gap ──
+def test_end_cut_never_bleeds_into_next_word(monkeypatch):
+    # E ends 104.0, next word starts 104.20 → a valid 0.20 s gap in [gap_min, 2*tail_pad).
+    def _w(audio, ws, we):
+        return [_s(0, 88.0, 89.4, "."), _s(1, 90.0, 92.0, "."), _s(2, 100.0, 104.0, "."),
+                _s(3, 104.20, 108.0, ".")], None
+    monkeypatch.setattr(bmod, "_whisper_window", _w)
+    c = {"start": 90.0, "end": 104.0, "facet": "x"}
+    out = bmod._refine_one(c, audio=None, pad=10.0, allow_qe=False, tail_pad=0.15, lead_pad=0.06,
+                           gap_min=0.12, end_extend_max=8.0, max_search=45.0, max_clip_dur=180.0)
+    next_start = 104.20
+    assert out["cut_end"] <= next_start                 # physical cut never enters the next word
+    assert out["cut_end"] == round(out["end"], 3)        # cut_end == end (no double pad)
+    assert out["end"] > 104.0                            # still cushioned past E.end (inside the gap)

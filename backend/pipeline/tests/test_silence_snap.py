@@ -29,6 +29,7 @@ def test_start_small_gap_uses_midpoint():
     p = _pick_start(sents, rough=10.0, pad=10.0, lead_pad=LEAD, gap_min=GAP, energy_fn=None)
     assert abs(p.time - 9.98) < 1e-6
     assert 9.96 < p.time < 10.00
+    assert p.satisfied
 
 
 def test_start_prev_absent_keep_first_uses_lead_pad():

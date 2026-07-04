@@ -259,7 +259,7 @@ def _pick_end(sents: list[Sentence], rough: float, pad: float, allow_qe: bool, *
     return Pick(round(cut, 3), ("tight_end_no_gap",), True)
 
 
-def _resolve_overlaps(clips: list[dict], min_dur: float, tail_pad: float) -> list[dict]:
+def _resolve_overlaps(clips: list[dict], min_dur: float) -> list[dict]:
     """After independent boundary snapping, ensure clips don't overlap. Trim a clip's
     start to the previous clip's (period) end — a clean sentence boundary — and drop
     any leftover that's too short."""
@@ -273,7 +273,9 @@ def _resolve_overlaps(clips: list[dict], min_dur: float, tail_pad: float) -> lis
             c["warnings"] = tuple(set(c.get("warnings") or ()) | {"trimmed_start"})
         if c["end"] - c["start"] < min_dur:
             continue
-        c["cut_end"] = round(c["end"] + tail_pad, 3)
+        # end is already snapped into the trailing gap (≤ next word onset) by _snap_end_cut;
+        # the trailing cushion is baked into end, so re-adding tail_pad would bleed into the next word.
+        c["cut_end"] = round(c["end"], 3)
         out.append(c)
         last_end = c["end"]
     return out
@@ -367,7 +369,9 @@ def _refine_one(c, audio, pad, allow_qe, tail_pad, lead_pad, gap_min, end_extend
     d = dict(c)
     d["start"] = round(new_start, 3)
     d["end"] = round(new_end, 3)
-    d["cut_end"] = round(new_end + tail_pad, 3)
+    # new_end is already snapped into the trailing gap by _snap_end_cut (≤ next word onset);
+    # re-adding tail_pad would bleed into the next word.
+    d["cut_end"] = round(new_end, 3)
     if flags:
         d["warnings"] = tuple(sorted(set(d.get("warnings") or ()) | set(flags)))
     return d
@@ -418,4 +422,4 @@ def refine_clip_boundaries(clips: list[dict], url: str, video_id: str, settings:
             if progress:
                 progress(done / total, f"Refining boundary {done}/{n}")
     out = [d for d in results if d is not None]         # rebuilt in ORIGINAL index order
-    return _resolve_overlaps(out, min_dur, tail_pad)
+    return _resolve_overlaps(out, min_dur)

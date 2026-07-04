@@ -101,7 +101,7 @@ def test_parallel_reversed_completion_matches_serial_distinct(monkeypatch):
     assert _key(serial) == _key(parallel)
     assert [c["id"] for c in serial] == ["c0", "c1", "c2", "c3"]
     # Task 5: _pick_start now cuts into the leading gap (tgt_start - lead_pad=0.06);
-    # stubs use term="" for sents[0] → prev-unseen path → cut = tgt_start - 0.06.
+    # stubs use term="." for sents[0] → terminated-prev / measurable-gap path → cut = tgt_start - lead_pad.
     assert [round(c["start"], 3) for c in serial] == [98.94, 197.94, 296.94, 395.94]
 
 
