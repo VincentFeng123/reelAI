@@ -933,3 +933,45 @@ git commit -m "docs: discourse-onset before/after results"
   `CORE_VERDICT_FIELDS`.
 - **Fixture caveats flagged inline:** `Candidate` (Task 4) and the graph builder (Task 6) tell the
   implementer to read the real constructor/helper rather than invent one.
+
+---
+
+## Results (2026-07-04)
+
+**Full backend test suite:** `701 passed` (all mechanisms + zero regressions across boundary,
+closure, judge, repair, metric, understand suites).
+
+**Opening-onset rate — before vs after (LLM-free, real corpus of 142 shipped clips / 10 videos):**
+measured with the shipped `opening_onset_rate` metric over the actual pre-change `shipped.json`
+specs (before) and with the Task-3 `_snap_one` start guard applied to those same boundaries (after).
+
+| video | clips | before | after |
+|---|---|---|---|
+| -KfG8kH-r3Y | 22 | 55% | 100% |
+| 5yfh5cf4-0w | 21 | 81% | 100% |
+| 54_XRjHhZzI | 16 | 88% | 100% |
+| 7K1sB05pE0A | 16 | 44% | 100% |
+| WsQQvHm4lSw | 14 | 93% | 100% |
+| 5iTOphGnCtg | 13 | 85% | 100% |
+| dHjWVlfNraM | 13 | 85% | 100% |
+| qP-9wwRrJbg | 13 | 77% | 100% |
+| GiCojsAWRj0 | 8 | 100% | 100% |
+| 1bH_ukYn81c | 6 | 67% | 100% |
+| **CORPUS** | **142** | **75%** | **~100%** |
+
+Named-clip fixes on `-KfG8kH-r3Y`: #1 `"And then mg which stands for magnesium,"` → real onset;
+#5 `"However we do have a subscript…"` → onset; #12 `"So if you were to type in… organic
+chemistry tutor in YouTube"` → onset. #8 `"So the answer is magnesium bromide."` is flagged weak
+by `opens_mid_thought` (unit-tested) and extended back by the guard.
+
+**Caveats (honest scope of this measurement):**
+- The "after" applies ONLY the Task-3 start guard to the OLD boundaries (LLM-free). It does not
+  capture the closure onset-inline (T6), the `opening_in_context` judge gate (T5), or the
+  fewer/shorter-clips config (T7) — those require the full pipeline (the LLM clip judge).
+- Backward reach here was unbounded because old specs carry no `node_span`; the production
+  pipeline is node-bounded, so a few clips may ship flagged `weak_start_boundary` rather than a
+  literal 100%. The improvement is nonetheless large and real.
+- A full `run_eval --freeze --runs 3` on the corpus (invokes the Gemini clip judge) yields the
+  complete after-metrics incl. `comprehension`, `context_complete_rate`, and clips/video. It is
+  user-runnable (needs the Gemini key + a few minutes) and is the recommended acceptance gate for
+  Important #2 (soft-budget 120 non-onset completeness — must not regress `context_complete_rate`).
