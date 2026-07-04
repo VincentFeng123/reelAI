@@ -38,6 +38,17 @@ def _is_weak_end(s: Sentence) -> bool:
     return words[-1].lower() in _END_STOPWORDS
 
 
+_STRONG_START_LOOKBACK = 8          # sentences scanned BACK for a strong onset before flagging
+
+
+def _is_weak_start(s: Sentence) -> bool:
+    """A start sentence is WEAK when it opens the clip mid-thought (leading continuation
+    marker without framing, dangling anaphor, context-dependent definite NP, or fragment).
+    Symmetric to _is_weak_end; preferred against, never a hard reject."""
+    from .discourse import opens_mid_thought
+    return opens_mid_thought(s.text or "")
+
+
 def _end_acceptor(sentences: list[Sentence], allow_qe: bool) -> Callable[[Sentence], bool]:
     """BND1 SAFE FALLBACK. Return an end-acceptability predicate: a real terminator is always
     acceptable; when NO sentence carries a real terminator (a fully-unpunctuated caption
@@ -100,6 +111,27 @@ def _snap_one(cand: dict, sentences: list[Sentence], allow_qe: bool,
         ei = si
 
     warnings: list[str] = []
+    # START guard (symmetric to the END guard below): if the start sentence opens mid-thought,
+    # extend the start BACKWARD to the nearest onset, bounded to the anchor's topic node
+    # (cand["node_span"]) so we never cross into an unrelated topic. Only-weak starts still
+    # ship, flagged weak_start_boundary — a clip is NEVER dropped by this guard.
+    if _is_weak_start(sentences[si]):
+        node_lo = None
+        ns = cand.get("node_span")
+        if ns:
+            node_lo = float(ns[0]) - 1e-6
+        strong = None
+        lo = max(0, si - _STRONG_START_LOOKBACK)
+        for k in range(si - 1, lo - 1, -1):
+            if node_lo is not None and sentences[k].start < node_lo:
+                break                                   # do not cross the topic-node boundary
+            if not _is_weak_start(sentences[k]):
+                strong = k
+                break
+        if strong is not None:
+            si = strong
+        else:
+            warnings.append("weak_start_boundary")      # only a weak start reachable — flagged
     # BND1: a real terminator beats a fabricated chunk edge (end_ok); on a fully-unpunctuated
     # caption video chunk edges are the only cut points and the snapper falls back to them so
     # placement never fails.
