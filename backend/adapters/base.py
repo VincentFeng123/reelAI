@@ -143,7 +143,8 @@ GENERIC_CONTRACTS: dict[str, CompletenessContract] = {
 # as a worked example (P1).
 _PROBLEM_ROLES = frozenset({"result", "solution", "worked_example", "derivation", "calculation"})
 CORE_VERDICT_FIELDS = ("topic_identifiable", "purpose_identifiable",
-                       "all_references_resolved", "prerequisites_satisfied", "source_grounded")
+                       "all_references_resolved", "prerequisites_satisfied", "source_grounded",
+                       "opening_in_context")
 
 
 class BaseAdapter:

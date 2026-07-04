@@ -54,6 +54,8 @@ class JudgeVerdict(BaseModel):
     reasoning_complete: bool = True
     result_complete: bool = True
     source_grounded: bool = True
+    opening_in_context: bool = True   # does the FIRST sentence stand on its own (not mid-thought
+                                      # / not at the answer before the question is posed)?
     # W25-E atomicity: ADVISORY this wave — deliberately NOT in _hard_core_ok or
     # required_verdict_fields (no calibration labels yet); False without a VERIFIED
     # over_inclusion-family reason ⇒ ship warning only, never a gate or kill.
@@ -103,6 +105,11 @@ JUDGE_SYSTEM = (
     "- problem_statement_complete / reasoning_complete / result_complete: for a worked problem, is the "
     "question stated, the reasoning shown, and the result reached? (Set true/NA if not a problem.)\n"
     "- source_grounded: the clip stands on its own words (not obviously mid-argument).\n"
+    "- opening_in_context: does the FIRST sentence open the thought — introducing its own "
+    "subject/problem/equation/question — rather than continuing one ('and then…', 'so the "
+    "answer is…') or referring back ('this', 'the answer') to material shown before the clip? "
+    "A CONTEXT CARD does NOT satisfy this — the spoken opening itself must stand on its own. "
+    "If FALSE, add a failure_reason kind 'not_source_grounded' quoting the mid-thought opener.\n"
     "- single_idea: FALSE when the clip contains more than one self-contained idea or material "
     "off-idea content (step 4); add an over_inclusion failure_reason with the evidence.\n"
     "Give an overall 'understandable' boolean. For each problem add a failure_reason whose 'kind' "
