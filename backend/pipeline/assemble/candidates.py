@@ -503,21 +503,25 @@ def build_arc_candidate(arc: ArcCandidate, graph, adapter, units: list[Unit],
     hull_s = float(sentences[i_end].end) - float(sentences[i_start].start)
     opener = units_by_id.get(arc.opener_ids[0]) if arc.opener_ids else None
     if hull_s > max_span:
-        # unshippable hull → closure build on the re-roled terminal (real unit id, so the
-        # graph/contract machinery and repair-trim protections keep working).
         synth = (terminal if terminal.role == arc.terminal_role
                  else terminal.model_copy(update={"role": arc.terminal_role}))
         cand = build_candidate(synth, graph, adapter, units, units_by_id, sentences,
                                relevance, settings)
         if cand is None:
             return None
-        ref = list(cand.referential)
-        have = {uid for uid, _rel in ref} | set(cand.unit_ids)
-        for uid in arc.opener_ids:             # the paired prompt/setup must surface via card
-            if uid not in have:
-                ref.append((uid, "answers" if arc.arc_role == "practice_pair" else "prerequisite"))
+        # Overflow (locked decision): keep the opener IN the span, never card it. Extend the
+        # candidate's unit set + i_start/start back to the opener rather than pushing it to a card —
+        # but only when the resulting span fits within max_span (the effective ship cap). When the
+        # opener + terminal span exceeds the cap (pathological arc: e.g. 310s hull, 100s cap) the
+        # opener stays referential; the clip is still shipped without it being a card.
+        if opener is not None and opener.unit_id not in cand.unit_ids:
+            new_start = min(cand.start, float(sentences[opener.sentence_range[0]].start))
+            new_dur = float(sentences[cand.i_end].end) - new_start
+            if new_dur <= max_span:
+                new_ids = [opener.unit_id] + list(cand.unit_ids)
+                i_start = min(cand.i_start, opener.sentence_range[0])
+                cand = replace(cand, unit_ids=new_ids, i_start=i_start, start=new_start)
         return replace(cand, cand_id=f"c_{arc.arc_id}", arc_id=arc.arc_id,
-                       referential=ref, truncated=True,
                        warnings=tuple(set(cand.warnings or ()) | set(clamp_warn)))
     unit_ids, referential = true_contents([m.unit_id for m in members], [], units, i_start, i_end)
     return Candidate(
@@ -542,10 +546,13 @@ def build_arc_candidate(arc: ArcCandidate, graph, adapter, units: list[Unit],
 
 def build_candidate(anchor: Unit, graph, adapter, units: list[Unit], units_by_id: dict[str, Unit],
                     sentences: list[Sentence], relevance: dict[str, float], settings: dict) -> Optional[Candidate]:
-    # judged text must be shippable: closure span budget can never exceed the ship cap
-    budget = ClosureBudget(max_span_s=min(
-        float(settings.get("closure_max_span_s", config.CLOSURE_MAX_SPAN_S)),
-        float(settings.get("max_clip_duration_s", config.DEFAULTS["max_clip_duration_s"]))))
+    # judged text must be shippable: closure span budget can never exceed the ship cap;
+    # hard_max_span_s gates the onset force-inline (overflow soft budget only, not hard cap).
+    _ship_cap = float(settings.get("max_clip_duration_s", config.DEFAULTS["max_clip_duration_s"]))
+    budget = ClosureBudget(
+        max_span_s=min(float(settings.get("closure_max_span_s", config.CLOSURE_MAX_SPAN_S)),
+                       _ship_cap),
+        hard_max_span_s=_ship_cap)
     cl = compute_closure(anchor, graph, units_by_id, adapter, units, budget)
     inline = [units_by_id[uid] for uid in cl.unit_ids if uid in units_by_id]
     if not inline:
