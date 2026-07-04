@@ -1126,14 +1126,38 @@ def test_end_exhaustion_flags_and_ships(monkeypatch):
 # ── END: never advances past max_clip_end even when a later clean gap exists ──────────────
 def test_end_respects_max_clip_end(monkeypatch):
     def fn(ws, we):
-        # a clean period+gap exists at 150, but max_clip_end caps the window well before it
-        return [_s(0, 99.0, 104.0, term=""), _s(1, 104.0, 150.0, "."), _s(2, 150.6, 153.0, ".")]
+        # a clean period+gap at 150 exists, but is only VISIBLE once the window reaches it;
+        # max_clip_end caps the window at 120, so it can never be transcribed.
+        sents = [_s(0, 99.0, 104.0, term="")]
+        if we >= 150.6:
+            sents += [_s(1, 104.0, 150.0, "."), _s(2, 150.6, 153.0, ".")]
+        else:
+            sents += [_s(1, 104.0, we, term="")]     # run-on to the (capped) window edge
+        return sents
 
     monkeypatch.setattr(bmod, "_whisper_window", _stub_window(fn))
     p = bmod._refine_end(audio=None, e0=100.0, pad=10.0, allow_qe=False, tail_pad=0.15,
                          gap_min=0.12, end_extend_max=30.0, max_search=45.0, max_clip_end=120.0)
-    # window never reaches 150 → the 150 end is unusable → exhausted fallback, not an advance to 150
+    # window never reaches 150 → the 150 end is never seen → exhausted fallback, not an advance
     assert p.time < 150.0
+    assert not p.satisfied
+
+
+# ── END: a far period found ONLY after growth is ACCEPTED, not rejected for being > pad away ─
+# (guards against re-introducing the §4d bug: a period-terminated end far from the coarse rough
+#  must be snapped to, never discarded for the coarse mid-sentence fallback.)
+def test_end_accepts_far_period_found_via_growth(monkeypatch):
+    def fn(ws, we):
+        if we >= 118.6:                              # period+gap at 118 (rough+18) visible now
+            return [_s(0, 99.0, 110.0, term=""), _s(1, 110.0, 118.0, "."), _s(2, 118.6, 121.0, ".")]
+        return [_s(0, 95.0, 99.0, term=""), _s(1, 99.1, we, term="")]    # run-on to window edge
+
+    monkeypatch.setattr(bmod, "_whisper_window", _stub_window(fn))
+    p = bmod._refine_end(audio=None, e0=100.0, pad=10.0, allow_qe=False, tail_pad=0.15,
+                         gap_min=0.12, end_extend_max=8.0, max_search=45.0, max_clip_end=1e9)
+    assert p.satisfied                               # far period accepted, NOT exhausted
+    assert 118.0 < p.time < 118.6                    # cut in the gap after the found period
+    assert "boundary_search_exhausted" not in p.flags
 
 
 # ── START: backward growth reveals the previous word so the leading gap can be measured ───
@@ -1178,7 +1202,32 @@ Expected: FAIL (`_refine_start`/`_refine_end` not defined; `_refine_one` signatu
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add `_refine_start`/`_refine_end` and rewrite `_refine_one` in `backend/pipeline/boundary.py`:
+**First, correct `_pick_end` for the grown-window case.** From Task 6, `_pick_end` still carries a
+forward drift cap that is dead in a single window but becomes HARMFUL once `_refine_end` grows the
+window. Make exactly these two edits to `_pick_end`:
+
+1. **Delete** this rejection entirely — it would discard a legitimately-found far period and grow
+   to exhaustion, landing on the coarse mid-sentence fallback (the exact §4d bug this feature fixes):
+   ```python
+   if abs(sents[e_idx].end - rough) > pad and sents[e_idx].end > rough + pad:
+       return Pick(rough, (), False)
+   ```
+   The earliest valid period-terminated end at/after `rough` is now always accepted; clip-end
+   distance is bounded by `max_clip_end` and `MAX_BOUNDARY_SEARCH_S` inside `_refine_end`.
+2. **Re-anchor the hybrid nudge budget to the chosen end `E`** (§8: advance ~one sentence beyond the
+   complete thought, not beyond the coarse rough):
+   ```python
+   for i in at_after:
+       if sents[i].end > sents[e_idx].end + end_extend_max:   # was: rough + end_extend_max
+           break
+   ```
+
+Both edits keep every Task 6 test in `test_silence_snap.py` green (there `E.end ≈ rough`) and are
+covered by the new `test_end_accepts_far_period_found_via_growth`. Do NOT change any other part of
+`_pick_end` (the direction-safe `at_after`, the last-sentence grow, the tight/`end_extended`/
+`tight_end_no_gap` returns all stay).
+
+Then add `_refine_start`/`_refine_end` and rewrite `_refine_one` in `backend/pipeline/boundary.py`:
 ```python
 def _refine_end(audio, e0, pad, allow_qe, *, tail_pad, gap_min, end_extend_max,
                 max_search, max_clip_end) -> Pick:
