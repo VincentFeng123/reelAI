@@ -14,6 +14,7 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import wave
+from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
@@ -24,7 +25,9 @@ from .. import config
 from ..errors import PipelineError
 from . import download as download_mod
 from .sentences import Sentence, build_sentence_index
-from .transcribe import _get_whisper
+from .transcribe import _get_refine_whisper, _get_whisper
+
+Pick = namedtuple("Pick", ["time", "flags", "satisfied"])
 
 ProgressCb = Optional[Callable[[float, str], None]]
 
@@ -71,32 +74,41 @@ def _ensure_audio(url: str, video_id: str) -> Path:
     return audio
 
 
-def _whisper_window(audio: Path, win_start: float, win_end: float) -> list[Sentence]:
+def _whisper_window(audio: Path, win_start: float, win_end: float) -> "tuple[list[Sentence], Path | None]":
     win_start = max(0.0, win_start)
     win_len = max(1.0, win_end - win_start)
     tmp = Path(tempfile.mkstemp(suffix=".wav", dir=str(audio.parent))[1])
+    ok = False
     try:
         subprocess.run(
             [config.FFMPEG_BIN, "-nostdin", "-y", "-ss", f"{win_start:.3f}", "-t", f"{win_len:.3f}",
              "-i", str(audio), "-ar", "16000", "-ac", "1", str(tmp)],
             capture_output=True,
         )
-        model = _get_whisper()
-        segments, _ = model.transcribe(str(tmp), word_timestamps=True, beam_size=5)
+        model = _get_refine_whisper()
+        kw = dict(word_timestamps=True, beam_size=5, temperature=0.0,
+                  condition_on_previous_text=False)
+        if config.REFINE_VAD:
+            kw["vad_filter"] = True
+            kw["vad_parameters"] = dict(speech_pad_ms=200)
+        segments, _ = model.transcribe(str(tmp), **kw)
         words, segs = [], []
         for seg in segments:
             segs.append({"start": float(seg.start), "end": float(seg.end), "text": seg.text})
             for w in (seg.words or []):
                 words.append({"word": w.word, "start": float(w.start), "end": float(w.end)})
+        ok = True
     finally:
-        tmp.unlink(missing_ok=True)
+        if not ok:
+            tmp.unlink(missing_ok=True)
     if not words:
-        return []
+        tmp.unlink(missing_ok=True)
+        return [], None
     sents = build_sentence_index({"words": words, "segments": segs})
     for s in sents:  # shift to absolute video time
         s.start += win_start
         s.end += win_start
-    return sents
+    return sents, tmp        # caller owns tmp cleanup (energy step reads it first)
 
 
 def _energy_min_snap(wav_path, win_start: float, a: float, b: float,
@@ -130,35 +142,38 @@ def _energy_min_snap(wav_path, win_start: float, a: float, b: float,
 
 
 def _pick_start(sents: list[Sentence], rough: float, pad: float,
-                keep_first: bool = False) -> float:
+                keep_first: bool = False, *, lead_pad: float = 0.06,
+                gap_min: float = 0.12, energy_fn=None) -> Pick:
     """Latest real sentence-start at/just before the rough start (begin at a thought).
     keep_first: the window began at t<=0, so sents[0] is a real start, not a cut fragment."""
     if not sents:
-        return rough
+        return Pick(rough, (), True)
     pool = sents if keep_first else sents[1:]
     starts = [s.start for s in pool] or [s.start for s in sents]
     before = [x for x in starts if x <= rough + 1.0]
     if not before:
-        return rough              # direction-safe: never move the start LATER than rough+1s
+        return Pick(rough, (), True)              # direction-safe: never move the start LATER than rough+1s
     cand = max(before)
-    return cand if abs(cand - rough) <= pad else rough
+    return Pick(cand if abs(cand - rough) <= pad else rough, (), True)
 
 
-def _pick_end(sents: list[Sentence], rough: float, pad: float, allow_qe: bool) -> float:
+def _pick_end(sents: list[Sentence], rough: float, pad: float, allow_qe: bool, *,
+              tail_pad: float = 0.15, gap_min: float = 0.12,
+              end_extend_max: float = 8.0, energy_fn=None) -> Pick:
     """Earliest period-terminated end at/just after the rough end (complete the thought)."""
     if not sents:
-        return rough
+        return Pick(rough, (), True)
     ends = [s.end for s in sents if s.is_valid_end(allow_qe)]
     if not ends:
-        return rough
+        return Pick(rough, (), True)
     # Prefer ends >= rough; fall back to ends >= rough - 1.0
     after = [x for x in ends if x >= rough]
     if not after:
         after = [x for x in ends if x >= rough - 1.0]
     if not after:
-        return rough              # direction-safe: never truncate EARLIER than rough-1s
+        return Pick(rough, (), True)              # direction-safe: never truncate EARLIER than rough-1s
     cand = min(after)
-    return cand if abs(cand - rough) <= pad else rough
+    return Pick(cand if abs(cand - rough) <= pad else rough, (), True)
 
 
 def _resolve_overlaps(clips: list[dict], min_dur: float, tail_pad: float) -> list[dict]:
@@ -189,19 +204,28 @@ def _refine_one(c: dict, audio: Path, pad: float, allow_qe: bool, tail_pad: floa
     tasks share no mutable state. The returned dict is IDENTICAL to what the serial loop
     computed for this clip."""
     s0, e0 = float(c["start"]), float(c["end"])
+    wavs: list = []
     try:
+        def _win(a, b):
+            sents, wav = _whisper_window(audio, a, b)
+            if wav is not None:
+                wavs.append(wav)
+            return sents
         if e0 - s0 <= 2 * pad + 20:   # short clip → one window covers both ends
-            w = _whisper_window(audio, s0 - pad, e0 + pad)
-            new_start = _pick_start(w, s0, pad, keep_first=(s0 - pad <= 0.0))
-            new_end = _pick_end(w, e0, pad, allow_qe)
+            w = _win(s0 - pad, e0 + pad)
+            new_start = _pick_start(w, s0, pad, keep_first=(s0 - pad <= 0.0)).time
+            new_end = _pick_end(w, e0, pad, allow_qe).time
         else:
-            new_start = _pick_start(_whisper_window(audio, s0 - pad, s0 + pad), s0, pad,
-                                    keep_first=(s0 - pad <= 0.0))
-            new_end = _pick_end(_whisper_window(audio, e0 - pad, e0 + pad), e0, pad, allow_qe)
+            new_start = _pick_start(_win(s0 - pad, s0 + pad), s0, pad,
+                                    keep_first=(s0 - pad <= 0.0)).time
+            new_end = _pick_end(_win(e0 - pad, e0 + pad), e0, pad, allow_qe).time
         if new_end <= new_start:
             new_start, new_end = s0, e0
     except Exception:
         new_start, new_end = s0, e0
+    finally:
+        for wav in wavs:
+            wav.unlink(missing_ok=True)
     d = dict(c)
     d["start"] = round(new_start, 3)
     d["end"] = round(new_end, 3)

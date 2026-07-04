@@ -43,7 +43,7 @@ def _make_windows(spec):
         _idx, tgt_start, tgt_end = spec[s0]
         # sents[0] is a "fragment" (dropped by _pick_start; not a valid end); sents[1] is the real
         # sentence whose start/end drive the picks.
-        return [_sent(0, s0 - 20.0, s0 - 19.0, ""), _sent(1, tgt_start, tgt_end, ".")]
+        return [_sent(0, s0 - 20.0, s0 - 19.0, ""), _sent(1, tgt_start, tgt_end, ".")], None
     return _win
 
 
@@ -60,7 +60,7 @@ def _make_reversed_windows(spec, n):
             events[idx + 1].wait(5.0)
             time.sleep(0.02)                  # let that clip's _refine_one fully return
         events[idx].set()
-        return sents
+        return sents, None
     return _win
 
 
