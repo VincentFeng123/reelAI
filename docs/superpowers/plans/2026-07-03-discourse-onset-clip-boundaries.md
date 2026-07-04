@@ -817,11 +817,17 @@ from backend import config
 
 
 def test_short_instagram_targets():
-    assert config.DEFAULTS["target_clip_duration_s"] == 45.0
-    # soft ceiling replaces the old 240s (overflow still allowed by the assembler, but the
-    # DEFAULT ceiling is Instagram-short)
-    assert config.DEFAULTS["max_clip_duration_s"] <= 90.0
-    assert config.DEFAULTS["min_clip_duration_s"] <= 20.0
+    assert config.DEFAULTS["target_clip_duration_s"] == 45.0   # scoring aim (30-60s)
+    assert config.DEFAULTS["min_clip_duration_s"] <= 15.0
+    # max_clip_duration_s is the HARD overflow ceiling / ship cap (NOT a soft 90 cut): shorter
+    # than the old 240 but well ABOVE the soft closure budget so onset-overflow has headroom.
+    assert config.DEFAULTS["max_clip_duration_s"] == 180.0
+
+
+def test_soft_budget_below_hard_ceiling():
+    # the onset-overflow window (soft, hard] must be NON-EMPTY, else force-inline is inert
+    # (Task 6 review Critical). CLOSURE_MAX_SPAN_S (soft) is set to 120 by the Task 6 fix.
+    assert config.CLOSURE_MAX_SPAN_S < config.DEFAULTS["max_clip_duration_s"]
 
 
 def test_fewer_clips_by_default():
@@ -837,21 +843,26 @@ Expected: FAIL — `target_clip_duration_s` missing; `max_clip_duration_s == 240
 
 Line 118: `MAX_SEGMENTS = 12` → `MAX_SEGMENTS = 8`
 
-Lines 128-133 `DEFAULTS` — set the short targets (keep the `max_clips: None` inherit behavior):
+Lines 128-133 `DEFAULTS` — set the short target + the HARD overflow ceiling (keep `max_clips: None`):
 
 ```python
     "min_clip_duration_s": 15.0,     # a complete short thought can be brief
-    "target_clip_duration_s": 45.0,  # Instagram-short aim (scoring target, not a cutter)
-    "max_clip_duration_s": 90.0,     # SOFT ceiling; the assembler allows overflow for a
-                                     # complete thought (never split/trim-middle/drop to hit it)
+    "target_clip_duration_s": 45.0,  # Instagram-short AIM (scoring target, not a cutter)
+    "max_clip_duration_s": 180.0,    # HARD ship cap / overflow ceiling (was 240). NOT a soft
+                                     # 90 cut: the onset overflows the SOFT closure budget
+                                     # (CLOSURE_MAX_SPAN_S=120, set in the Task 6 fix) up to
+                                     # this hard cap. Must stay > CLOSURE_MAX_SPAN_S.
 ```
 
 Line 254: `ANCHOR_MIN_PRIORITY = 40` → `ANCHOR_MIN_PRIORITY = 45` (drop the weakest anchors →
 fewer, stronger clips).
 
-> Note: `max_clip_duration_s` is now a soft ceiling. Task 6 already lets the opener overflow it;
-> `refine._snap_one`'s max-duration cap (lines 162-176) still applies to the END only, which is
-> correct — it trims trailing content, never the protected onset.
+> Why 180 and not 90: `max_clip_duration_s` is the HARD cap consumed by `refine._snap_one`'s
+> max-duration END cap AND by `hard_max_span_s` (Task 6). Setting it to 90 would (a) truncate the
+> END of a legitimately-long complete thought and (b) collapse onto the soft budget so onset-
+> overflow becomes inert (the Task 6 review Critical). Shortness comes from
+> `target_clip_duration_s=45` + the soft closure budget (120) + anchor selectivity — NOT a hard 90
+> cut. Overflow (up to 180) is reserved for a complete thought that genuinely needs it.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -862,7 +873,7 @@ Expected: PASS
 
 ```bash
 git add backend/config.py backend/pipeline/tests/test_config_targets.py
-git commit -m "feat: short-clip targets (45s target / 90s soft ceiling) + fewer clips"
+git commit -m "feat: short-clip targets (45s aim / 180s hard overflow ceiling) + fewer clips"
 ```
 
 ---
