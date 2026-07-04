@@ -826,7 +826,10 @@ def test_short_instagram_targets():
 
 def test_soft_budget_below_hard_ceiling():
     # the onset-overflow window (soft, hard] must be NON-EMPTY, else force-inline is inert
-    # (Task 6 review Critical). CLOSURE_MAX_SPAN_S (soft) is set to 120 by the Task 6 fix.
+    # (Task 6 review Critical). The value that actually reaches build_candidate is
+    # DEFAULTS["closure_max_span_s"] (a DEFAULTS entry, NOT the module constant) — guard BOTH
+    # so the feature cannot silently re-inert if someone raises the soft budget later.
+    assert config.DEFAULTS["closure_max_span_s"] < config.DEFAULTS["max_clip_duration_s"]
     assert config.CLOSURE_MAX_SPAN_S < config.DEFAULTS["max_clip_duration_s"]
 
 
