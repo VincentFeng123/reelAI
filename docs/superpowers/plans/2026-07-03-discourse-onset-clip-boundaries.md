@@ -471,13 +471,13 @@ git commit -m "feat: backward-extension discourse-onset START guard in _snap_one
 The repair loop trims units farthest from the anchor (`_trim_lattice`), which can advance the start past a leading setup/onset unit. Protect the temporally-earliest in-span unit. Also fix the misleading `NON_ANCHOR` "trimmable" comment by introducing a correct `EDGE_TRIMMABLE` set.
 
 **Files:**
-- Modify: `backend/roles.py` (add `EDGE_TRIMMABLE`; correct the `NON_ANCHOR` comment)
+- Modify: `backend/roles.py` (correct the misleading `NON_ANCHOR` "safe to trim" comment)
 - Modify: `backend/pipeline/assemble/validate.py::_protected_unit_ids` (line 715-729)
 - Test: `backend/pipeline/assemble/tests/test_onset_protection.py`
 
 **Interfaces:**
 - Consumes: `Candidate.unit_ids`, `Candidate.anchor_id`, `units_by_id`, adapter (existing `_protected_unit_ids` signature).
-- Produces: `_protected_unit_ids` now also protects the earliest in-span unit (the onset); `roles.EDGE_TRIMMABLE: frozenset[str]`.
+- Produces: `_protected_unit_ids` now also protects the earliest in-span unit (the onset).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -521,30 +521,19 @@ def test_leading_onset_unit_is_protected_from_trim():
 Run: `cd clips && python -m pytest backend/pipeline/assemble/tests/test_onset_protection.py -v`
 Expected: FAIL — `assert "u0" in protected` (leading unit not yet protected)
 
-- [ ] **Step 3: Add `EDGE_TRIMMABLE` to `backend/roles.py`**
+- [ ] **Step 3: Correct the misleading `NON_ANCHOR` comment in `backend/roles.py`**
 
-Replace the `NON_ANCHOR` comment + block (lines 40-47) with:
+Replace the `NON_ANCHOR` comment (lines 40-41) with an accurate one — `NON_ANCHOR` is an
+anchor-policy set, NOT a trim signal, and `setup` must be kept when it is the clip's onset:
 
 ```python
-# Structural "connective tissue" — never a clip anchor (used only by the adapter's anchor
-# policy). NOTE: this is NOT a leading-edge trim signal (setup is a NON_ANCHOR but must be
-# KEPT when it is the clip's onset). Filler that IS safe to trim from a clip's edge is
-# EDGE_TRIMMABLE below.
-NON_ANCHOR: frozenset[str] = frozenset({
-    UniversalRole.SETUP.value,
-    UniversalRole.TRANSITION.value,
-    UniversalRole.ADMINISTRATIVE.value,
-    UniversalRole.IRRELEVANT.value,
-})
-
-# Pure filler safe to trim from a clip's leading/trailing edge — NEVER setup/example_setup/
-# practice_prompt (those establish the onset and must stay in the media).
-EDGE_TRIMMABLE: frozenset[str] = frozenset({
-    UniversalRole.TRANSITION.value,
-    UniversalRole.ADMINISTRATIVE.value,
-    UniversalRole.IRRELEVANT.value,
-})
+# Structural "connective tissue" — never a clip ANCHOR (this set is consumed only by the
+# adapter's anchor policy). NOTE: it is NOT a leading-edge trim signal — a `setup` unit that
+# forms the clip's onset (the problem-read / equation-introduction) must be KEPT, not trimmed.
+# Onset protection lives in validate._protected_unit_ids.
 ```
+
+(Leave the `frozenset({...})` membership unchanged.)
 
 - [ ] **Step 4: Protect the leading unit in `_protected_unit_ids`**
 
@@ -922,8 +911,9 @@ git commit -m "docs: discourse-onset before/after results"
   #6 → Task 2; #7 (punctuation-restoration, Mode A durability) is deferred per spec §7 and is
   intentionally **not** a task here (Task 1's mid-clause check is the interim mitigation).
 - **Correction vs spec:** `NON_ANCHOR` is used only for anchor policy, not trimming; the operative
-  onset-trim protection is in `validate._protected_unit_ids` (Task 4), with `EDGE_TRIMMABLE` added
-  as forward-looking hygiene.
+  onset-trim protection is in `validate._protected_unit_ids` (Task 4). The spec's `EDGE_TRIMMABLE`
+  split is dropped as YAGNI (no filler-edge-trim task consumes it); only the misleading `NON_ANCHOR`
+  comment is corrected.
 - **Type consistency:** `opens_mid_thought(text)`/`is_onset(text)` (Task 1) are the exact names used
   in Tasks 2 and 3; `opening_in_context` field name is identical in Task 5's field, prompt, and
   `CORE_VERDICT_FIELDS`.
