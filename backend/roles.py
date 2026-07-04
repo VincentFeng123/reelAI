@@ -37,8 +37,10 @@ class UniversalRole(str, Enum):
 
 ALL_UNIVERSAL_ROLES: tuple[str, ...] = tuple(r.value for r in UniversalRole)
 
-# Structural "connective tissue" — never a clip anchor; safe to trim from a clip's
-# leading/trailing edge during boundary refinement.
+# Structural "connective tissue" — never a clip ANCHOR (this set is consumed only by the
+# adapter's anchor policy). NOTE: it is NOT a leading-edge trim signal — a `setup` unit that
+# forms the clip's onset (the problem-read / equation-introduction) must be KEPT, not trimmed.
+# Onset protection lives in validate._protected_unit_ids.
 NON_ANCHOR: frozenset[str] = frozenset({
     UniversalRole.SETUP.value,
     UniversalRole.TRANSITION.value,

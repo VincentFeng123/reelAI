@@ -712,9 +712,17 @@ def _excess_verified(v, clip_text: str) -> bool:
     return False
 
 
-def _protected_unit_ids(cand: Candidate, units_by_id: dict[str, Unit], adapter) -> set[str]:
+def _protected_unit_ids(cand: Candidate, units_by_id: dict[str, Unit], adapter,
+                        onset_uid: Optional[str] = None) -> set[str]:
     """Units a trim may NEVER drop (P2b): the anchor + every in-span unit whose role
-    satisfies a REQUIRED element of the CURRENT bound contract."""
+    satisfies a REQUIRED element of the CURRENT bound contract + the clip's onset unit.
+
+    ``onset_uid`` is the original leading unit of the candidate BEFORE any grow/expand
+    mutations.  Callers inside validate_and_repair compute it once from the original span
+    and thread it here so that units GROWN IN after assembly are not mistakenly treated as
+    the onset.  When called directly (e.g. tests), ``onset_uid=None`` causes the function
+    to derive the onset from the current ``cand.unit_ids`` — correct for any span that has
+    not been mutated by grow."""
     protected = {cand.anchor_id}
     contract = adapter.contract_for(cand.contract_role or cand.role)
     if contract:
@@ -726,11 +734,24 @@ def _protected_unit_ids(cand: Candidate, units_by_id: dict[str, Unit], adapter) 
             u = units_by_id.get(uid)
             if u is not None and u.role in required_roles:
                 protected.add(uid)
+    # Protect the clip's LEADING (temporally earliest) in-span unit: trimming it would advance
+    # the start past the setup/problem-read and re-open the clip mid-thought (the discourse-onset
+    # invariant). The end guard already protects completeness; this protects the opening.
+    if onset_uid is not None:
+        # Caller has already resolved the onset from the pre-grow span — use it directly.
+        if onset_uid in units_by_id:
+            protected.add(onset_uid)
+    else:
+        # Fallback: derive from the current span (correct when cand has not been mutated).
+        in_span = [units_by_id[uid] for uid in cand.unit_ids if uid in units_by_id]
+        if in_span:
+            leading = min(in_span, key=lambda u: (u.start, u.sentence_range[0]))
+            protected.add(leading.unit_id)
     return protected
 
 
 def _trim_lattice(cand: Candidate, units: list[Unit], units_by_id: dict[str, Unit],
-                  adapter) -> tuple[list[str], int]:
+                  adapter, onset_uid: Optional[str] = None) -> tuple[list[str], int]:
     """(span units ordered protected-first then nearest-anchor-first, protected count).
     Prefix k of this order is the trim-lattice point keeping the k units closest to the
     anchor (protected units always kept): dropping a suffix drops the temporally farthest
@@ -738,7 +759,7 @@ def _trim_lattice(cand: Candidate, units: list[Unit], units_by_id: dict[str, Uni
     order = {u.unit_id: i for i, u in enumerate(units)}
     ai = order.get(cand.anchor_id, 0)
     in_span = [uid for uid in cand.unit_ids if uid in units_by_id]
-    protected = _protected_unit_ids(cand, units_by_id, adapter)
+    protected = _protected_unit_ids(cand, units_by_id, adapter, onset_uid=onset_uid)
     prot = [uid for uid in in_span if uid in protected]
     rest = sorted((uid for uid in in_span if uid not in protected),
                   key=lambda uid: (abs(order.get(uid, 0) - ai), order.get(uid, 0)))
@@ -853,8 +874,17 @@ def validate_and_repair(cand: Candidate, sentences: list[Sentence], graph, units
     # whose verdict cleared the hard core.
     last_good: Optional[Candidate] = replace(cand) if _hard_core_ok(verdict) else None
 
+    # Discourse-onset invariant: identify the clip's leading unit from the ORIGINAL span
+    # (before any grow/expand mutations) so that units grown in later are never mistakenly
+    # treated as the onset and locked from bisection.
+    _orig_in_span = [units_by_id[uid] for uid in cand.unit_ids if uid in units_by_id]
+    _onset_uid: Optional[str] = (
+        min(_orig_in_span, key=lambda u: (u.start, u.sentence_range[0])).unit_id
+        if _orig_in_span else None
+    )
+
     def _removable(c: Candidate) -> bool:
-        lattice, n_prot = _trim_lattice(c, units, units_by_id, adapter)
+        lattice, n_prot = _trim_lattice(c, units, units_by_id, adapter, onset_uid=_onset_uid)
         return n_prot >= 1 and len(lattice) > n_prot
 
     # ── grow phase: missing-content verdicts (references / prerequisites / problem /
@@ -893,7 +923,7 @@ def validate_and_repair(cand: Candidate, sentences: list[Sentence], graph, units
     # lattice (unit-prefixes by distance from anchor) is searched by BISECTION between
     # last-known-good and the failing span; the text-hash cache makes revisits free. ──────
     if _trim_flavored(verdict):
-        lattice, n_protected = _trim_lattice(cand, units, units_by_id, adapter)
+        lattice, n_protected = _trim_lattice(cand, units, units_by_id, adapter, onset_uid=_onset_uid)
         n = len(lattice)
         if n_protected >= 1 and n > n_protected:
             lo = n_protected - 1            # virtual floor: just below the untrimmable minimum
