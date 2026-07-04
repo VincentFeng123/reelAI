@@ -799,7 +799,8 @@ def validate_and_repair(cand: Candidate, sentences: list[Sentence], graph, units
                         settings: dict, visual_summary_fn, topic: str,
                         cache: dict, cache_lock=None) -> tuple[Optional[Candidate], Optional["Rejection"]]:
     min_score = float(settings.get("min_comprehension_score", config.JUDGE_MIN_SCORE))
-    # judged text must be shippable: repair expansion cap can never exceed the ship cap
+    # judged text must be shippable: repair expansion cap = min(soft closure budget, ship cap)
+    # (test_repair_expansion_smaller_closure_span_wins pins repair growth to the SOFT budget).
     max_span = min(float(settings.get("closure_max_span_s", config.CLOSURE_MAX_SPAN_S)),
                    float(settings.get("max_clip_duration_s", config.DEFAULTS["max_clip_duration_s"])))
     budget = config.JUDGE_MAX_REPAIR + 1     # total NEW judgments; verdict-cache hits are free

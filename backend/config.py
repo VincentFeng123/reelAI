@@ -145,7 +145,11 @@ DEFAULTS: dict = {
     # A NUMBER is an explicit user dial and wins outright (no scaling).
     "max_anchors": None,
     "refund_rounds": None,                  # None → inherit config.REFUND_ROUNDS (Q1e)
-    "closure_max_span_s": 300.0,
+    "closure_max_span_s": 120.0,            # SOFT closure budget for NON-onset context; sits
+                                            # BELOW the hard ship cap (max_clip_duration_s=240)
+                                            # so the onset-overflow window (120, 240] is LIVE.
+                                            # (This DEFAULTS value — not config.CLOSURE_MAX_SPAN_S —
+                                            # is the one that reaches build_candidate in prod.)
     "min_comprehension_score": 0.70,
     "quality_floor": None,                  # None → inherit config.QUALITY_FLOOR (W25-G)
     "diarization": False,
@@ -297,7 +301,9 @@ MIN_ARC_SUBSTANCE_S = float(os.environ.get("MIN_ARC_SUBSTANCE_S", "12.0"))
 MAX_ARC_MEMBER_GAP_S = float(os.environ.get("MAX_ARC_MEMBER_GAP_S", "30.0"))
 CLOSURE_MAX_EXTRA_UNITS = 6  # context-closure growth budget (units)
 CLOSURE_MAX_GAP_S = 25.0     # a context unit farther than this is referential, not inlined
-CLOSURE_MAX_SPAN_S = 300.0   # refine still caps to max_clip_duration_s
+CLOSURE_MAX_SPAN_S = 120.0   # SOFT closure budget for NON-onset context; must sit BELOW the
+                             # hard ship cap (DEFAULTS["max_clip_duration_s"]=240) so the
+                             # onset-overflow window (soft, hard] = (120, 240] is non-empty.
 
 # ── Clip-only judge / repair (also the eval comprehension scorer) ───────────
 JUDGE_ENABLED = os.environ.get("JUDGE_ENABLED", "1") not in ("0", "false", "")
