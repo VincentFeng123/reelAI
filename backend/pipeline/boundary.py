@@ -239,8 +239,6 @@ def _pick_end(sents: list[Sentence], rough: float, pad: float, allow_qe: bool, *
         return Pick(rough, (), False)                    # no valid end at all → grow
     at_after.sort(key=lambda i: sents[i].end)
     e_idx = at_after[0]
-    if abs(sents[e_idx].end - rough) > pad and sents[e_idx].end > rough + pad:
-        return Pick(rough, (), False)                    # nearest end beyond the window → grow
     gap = _gap_after(sents, e_idx)
     if gap is None:
         return Pick(round(sents[e_idx].end + tail_pad, 3), (), False)   # last in window → grow
@@ -250,7 +248,7 @@ def _pick_end(sents: list[Sentence], rough: float, pad: float, allow_qe: bool, *
         return Pick(round(cut, 3), flags, True)          # tight cut in a real gap
     # hybrid: look forward within budget for a later end WITH a usable gap
     for i in at_after:
-        if sents[i].end > rough + end_extend_max:
+        if sents[i].end > sents[e_idx].end + end_extend_max:
             break
         g = _gap_after(sents, i)
         if g and (g[1] - g[0]) >= gap_min:
@@ -281,40 +279,97 @@ def _resolve_overlaps(clips: list[dict], min_dur: float, tail_pad: float) -> lis
     return out
 
 
-def _refine_one(c: dict, audio: Path, pad: float, allow_qe: bool, tail_pad: float) -> dict:
-    """Snap ONE clip's boundaries with its own edge-window Whisper pass. Safe to run
-    concurrently over a thread pool: it owns its temp wav (unique mkstemp) and returns a NEW
-    clip dict; the Whisper model is a threadsafe singleton (CTranslate2 num_workers); and the
-    pysbd segmenter reached via build_sentence_index is thread-LOCAL (sentences.py) — so sibling
-    tasks share no mutable state. The returned dict is IDENTICAL to what the serial loop
-    computed for this clip."""
-    s0, e0 = float(c["start"]), float(c["end"])
-    wavs: list = []
-    try:
-        def _win(a, b):
-            sents, wav = _whisper_window(audio, a, b)
+def _refine_end(audio, e0, pad, allow_qe, *, tail_pad, gap_min, end_extend_max,
+                max_search, max_clip_end) -> Pick:
+    grow = pad
+    last = Pick(e0, (), False)
+    while True:
+        win_start = max(0.0, e0 - pad)
+        win_end = min(e0 + grow, e0 + max_search, max_clip_end)
+        sents, wav = _whisper_window(audio, win_start, win_end)
+        try:
+            energy_fn = (lambda a, b: _energy_min_snap(wav, win_start, a, b)) if wav else None
+            last = _pick_end(sents, e0, pad, allow_qe, tail_pad=tail_pad, gap_min=gap_min,
+                             end_extend_max=end_extend_max, energy_fn=energy_fn)
+        finally:
             if wav is not None:
-                wavs.append(wav)
-            return sents
-        if e0 - s0 <= 2 * pad + 20:   # short clip → one window covers both ends
-            w = _win(s0 - pad, e0 + pad)
-            new_start = _pick_start(w, s0, pad, keep_first=(s0 - pad <= 0.0)).time
-            new_end = _pick_end(w, e0, pad, allow_qe).time
+                wav.unlink(missing_ok=True)
+        if last.satisfied:
+            return last
+        if win_end >= e0 + max_search - 1e-6 or win_end >= max_clip_end - 1e-6:
+            break
+        grow *= 2
+    return Pick(last.time, tuple(sorted(set(last.flags) | {"boundary_search_exhausted"})), False)
+
+
+def _refine_start(audio, s0, pad, *, lead_pad, gap_min, max_search) -> Pick:
+    grow = pad
+    last = Pick(s0, (), False)
+    while True:
+        win_start = max(0.0, s0 - grow)
+        win_end = s0 + pad
+        sents, wav = _whisper_window(audio, win_start, win_end)
+        try:
+            energy_fn = (lambda a, b: _energy_min_snap(wav, win_start, a, b)) if wav else None
+            last = _pick_start(sents, s0, pad, keep_first=(win_start <= 0.0),
+                               lead_pad=lead_pad, gap_min=gap_min, energy_fn=energy_fn)
+        finally:
+            if wav is not None:
+                wav.unlink(missing_ok=True)
+        if last.satisfied:
+            return last
+        if win_start <= 0.0 or (s0 - win_start) >= max_search - 1e-6:
+            break
+        grow *= 2
+    return Pick(last.time, tuple(sorted(set(last.flags) | {"start_prev_unseen"})), False)
+
+
+def _refine_one(c, audio, pad, allow_qe, tail_pad, lead_pad, gap_min, end_extend_max,
+                max_search, max_clip_dur) -> dict:
+    """Snap ONE clip's boundaries using window-extending Whisper passes. Safe to run
+    concurrently over a thread pool: each call owns its temp wavs (unique mkstemp), returns a
+    NEW clip dict, and shares no mutable state with sibling tasks."""
+    s0, e0 = float(c["start"]), float(c["end"])
+    flags: tuple = ()
+    try:
+        max_clip_end = s0 + max_clip_dur
+        if e0 - s0 <= 2 * pad + 20:                       # short clip → try one combined window
+            win_start = max(0.0, s0 - pad)
+            sents, wav = _whisper_window(audio, s0 - pad, e0 + pad)
+            try:
+                energy_fn = (lambda a, b: _energy_min_snap(wav, win_start, a, b)) if wav else None
+                sp = _pick_start(sents, s0, pad, keep_first=(win_start <= 0.0),
+                                 lead_pad=lead_pad, gap_min=gap_min, energy_fn=energy_fn)
+                ep = _pick_end(sents, e0, pad, allow_qe, tail_pad=tail_pad, gap_min=gap_min,
+                               end_extend_max=end_extend_max, energy_fn=energy_fn)
+            finally:
+                if wav is not None:
+                    wav.unlink(missing_ok=True)
+            if not sp.satisfied:
+                sp = _refine_start(audio, s0, pad, lead_pad=lead_pad, gap_min=gap_min,
+                                   max_search=max_search)
+            if not ep.satisfied:
+                ep = _refine_end(audio, e0, pad, allow_qe, tail_pad=tail_pad, gap_min=gap_min,
+                                 end_extend_max=end_extend_max, max_search=max_search,
+                                 max_clip_end=max_clip_end)
         else:
-            new_start = _pick_start(_win(s0 - pad, s0 + pad), s0, pad,
-                                    keep_first=(s0 - pad <= 0.0)).time
-            new_end = _pick_end(_win(e0 - pad, e0 + pad), e0, pad, allow_qe).time
+            sp = _refine_start(audio, s0, pad, lead_pad=lead_pad, gap_min=gap_min,
+                               max_search=max_search)
+            ep = _refine_end(audio, e0, pad, allow_qe, tail_pad=tail_pad, gap_min=gap_min,
+                             end_extend_max=end_extend_max, max_search=max_search,
+                             max_clip_end=max_clip_end)
+        new_start, new_end = sp.time, ep.time
+        flags = tuple(sorted(set(sp.flags) | set(ep.flags)))
         if new_end <= new_start:
-            new_start, new_end = s0, e0
+            new_start, new_end, flags = s0, e0, tuple(sorted(set(flags) | {"refine_degenerate"}))
     except Exception:
-        new_start, new_end = s0, e0
-    finally:
-        for wav in wavs:
-            wav.unlink(missing_ok=True)
+        new_start, new_end, flags = s0, e0, ()
     d = dict(c)
     d["start"] = round(new_start, 3)
     d["end"] = round(new_end, 3)
     d["cut_end"] = round(new_end + tail_pad, 3)
+    if flags:
+        d["warnings"] = tuple(sorted(set(d.get("warnings") or ()) | set(flags)))
     return d
 
 
@@ -351,7 +406,10 @@ def refine_clip_boundaries(clips: list[dict], url: str, video_id: str, settings:
         except Exception:
             pass
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        fut_to_idx = {pool.submit(_refine_one, c, audio, pad, allow_qe, tail_pad): i
+        fut_to_idx = {pool.submit(_refine_one, c, audio, pad, allow_qe, tail_pad,
+                                  config.DEFAULTS["lead_pad_s"], config.SILENCE_MIN_GAP_S,
+                                  config.END_EXTEND_MAX_S, config.MAX_BOUNDARY_SEARCH_S,
+                                  config.DEFAULTS["max_clip_duration_s"]): i
                       for i, c in enumerate(clips)}
         for done, fut in enumerate(as_completed(fut_to_idx), start=1):
             results[fut_to_idx[fut]] = fut.result()   # index slot, NOT completion order
