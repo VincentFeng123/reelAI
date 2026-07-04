@@ -25,7 +25,7 @@ from .. import config
 from ..errors import PipelineError
 from . import download as download_mod
 from .sentences import Sentence, build_sentence_index
-from .transcribe import _get_refine_whisper, _get_whisper
+from .transcribe import _get_refine_whisper
 
 Pick = namedtuple("Pick", ["time", "flags", "satisfied"])
 
@@ -377,7 +377,12 @@ def refine_clip_boundaries(clips: list[dict], url: str, video_id: str, settings:
                            progress: ProgressCb = None) -> list[dict]:
     allow_qe = bool(settings.get("allow_question_exclaim_ends", False))
     tail_pad = float(settings.get("tail_pad_s", config.DEFAULTS["tail_pad_s"]))
+    lead_pad = float(settings.get("lead_pad_s", config.DEFAULTS["lead_pad_s"]))
     min_dur = float(settings.get("min_clip_duration_s", config.DEFAULTS["min_clip_duration_s"]))
+    max_dur = float(settings.get("max_clip_duration_s", config.DEFAULTS["max_clip_duration_s"]))
+    gap_min = config.SILENCE_MIN_GAP_S
+    end_extend_max = config.END_EXTEND_MAX_S
+    max_search = config.MAX_BOUNDARY_SEARCH_S
     pad = config.BOUNDARY_PAD_S
     try:
         audio = _ensure_audio(url, video_id)
@@ -396,21 +401,18 @@ def refine_clip_boundaries(clips: list[dict], url: str, video_id: str, settings:
     results: list[Optional[dict]] = [None] * n
     workers = max(1, min(config.REFINE_WORKERS, n))
     if workers > 1:
-        # Pre-warm the shared Whisper singleton in THIS thread so the pool workers don't race
-        # its unguarded lazy init (default TRANSCRIBER=supadata leaves it cold until refine, so
-        # multiple threads would otherwise each construct a full model). Once built, concurrent
+        # Pre-warm the shared refine Whisper singleton in THIS thread so the pool workers don't
+        # race its unguarded lazy init (default TRANSCRIBER=supadata leaves it cold until refine,
+        # so multiple threads would otherwise each construct a full model). Once built, concurrent
         # transcribe() is safe (num_workers). The pysbd segmenter is thread-local, so workers
         # build their own cheaply — nothing else is shared.
         try:
-            _get_whisper()
+            _get_refine_whisper()
         except Exception:
             pass
+    args = (pad, allow_qe, tail_pad, lead_pad, gap_min, end_extend_max, max_search, max_dur)
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        fut_to_idx = {pool.submit(_refine_one, c, audio, pad, allow_qe, tail_pad,
-                                  config.DEFAULTS["lead_pad_s"], config.SILENCE_MIN_GAP_S,
-                                  config.END_EXTEND_MAX_S, config.MAX_BOUNDARY_SEARCH_S,
-                                  config.DEFAULTS["max_clip_duration_s"]): i
-                      for i, c in enumerate(clips)}
+        fut_to_idx = {pool.submit(_refine_one, c, audio, *args): i for i, c in enumerate(clips)}
         for done, fut in enumerate(as_completed(fut_to_idx), start=1):
             results[fut_to_idx[fut]] = fut.result()   # index slot, NOT completion order
             if progress:
