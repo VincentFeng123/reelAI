@@ -281,6 +281,7 @@ def _measure(st, specs, sents, adapter, det, topic, gold, settings, verbose=Fals
         "carded_rate": round(metrics.grounding_ok_rate(specs), 3),
         "grounding_precision": _round_nan(metrics.grounding_precision(specs, units_by_id)),
     }
+    m["opening_onset_rate"] = _round_nan(metrics.opening_onset_rate(specs, sents))
     # VID2 edge-probe advisory rates (NaN → null when no probe ran, i.e. the default).
     _edge_starts, _edge_ends = metrics.edge_clean_rates(specs)
     m["edge_starts_clean_rate"] = _round_nan(_edge_starts)

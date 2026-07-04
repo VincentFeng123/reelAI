@@ -471,13 +471,13 @@ git commit -m "feat: backward-extension discourse-onset START guard in _snap_one
 The repair loop trims units farthest from the anchor (`_trim_lattice`), which can advance the start past a leading setup/onset unit. Protect the temporally-earliest in-span unit. Also fix the misleading `NON_ANCHOR` "trimmable" comment by introducing a correct `EDGE_TRIMMABLE` set.
 
 **Files:**
-- Modify: `backend/roles.py` (add `EDGE_TRIMMABLE`; correct the `NON_ANCHOR` comment)
+- Modify: `backend/roles.py` (correct the misleading `NON_ANCHOR` "safe to trim" comment)
 - Modify: `backend/pipeline/assemble/validate.py::_protected_unit_ids` (line 715-729)
 - Test: `backend/pipeline/assemble/tests/test_onset_protection.py`
 
 **Interfaces:**
 - Consumes: `Candidate.unit_ids`, `Candidate.anchor_id`, `units_by_id`, adapter (existing `_protected_unit_ids` signature).
-- Produces: `_protected_unit_ids` now also protects the earliest in-span unit (the onset); `roles.EDGE_TRIMMABLE: frozenset[str]`.
+- Produces: `_protected_unit_ids` now also protects the earliest in-span unit (the onset).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -521,30 +521,19 @@ def test_leading_onset_unit_is_protected_from_trim():
 Run: `cd clips && python -m pytest backend/pipeline/assemble/tests/test_onset_protection.py -v`
 Expected: FAIL — `assert "u0" in protected` (leading unit not yet protected)
 
-- [ ] **Step 3: Add `EDGE_TRIMMABLE` to `backend/roles.py`**
+- [ ] **Step 3: Correct the misleading `NON_ANCHOR` comment in `backend/roles.py`**
 
-Replace the `NON_ANCHOR` comment + block (lines 40-47) with:
+Replace the `NON_ANCHOR` comment (lines 40-41) with an accurate one — `NON_ANCHOR` is an
+anchor-policy set, NOT a trim signal, and `setup` must be kept when it is the clip's onset:
 
 ```python
-# Structural "connective tissue" — never a clip anchor (used only by the adapter's anchor
-# policy). NOTE: this is NOT a leading-edge trim signal (setup is a NON_ANCHOR but must be
-# KEPT when it is the clip's onset). Filler that IS safe to trim from a clip's edge is
-# EDGE_TRIMMABLE below.
-NON_ANCHOR: frozenset[str] = frozenset({
-    UniversalRole.SETUP.value,
-    UniversalRole.TRANSITION.value,
-    UniversalRole.ADMINISTRATIVE.value,
-    UniversalRole.IRRELEVANT.value,
-})
-
-# Pure filler safe to trim from a clip's leading/trailing edge — NEVER setup/example_setup/
-# practice_prompt (those establish the onset and must stay in the media).
-EDGE_TRIMMABLE: frozenset[str] = frozenset({
-    UniversalRole.TRANSITION.value,
-    UniversalRole.ADMINISTRATIVE.value,
-    UniversalRole.IRRELEVANT.value,
-})
+# Structural "connective tissue" — never a clip ANCHOR (this set is consumed only by the
+# adapter's anchor policy). NOTE: it is NOT a leading-edge trim signal — a `setup` unit that
+# forms the clip's onset (the problem-read / equation-introduction) must be KEPT, not trimmed.
+# Onset protection lives in validate._protected_unit_ids.
 ```
+
+(Leave the `frozenset({...})` membership unchanged.)
 
 - [ ] **Step 4: Protect the leading unit in `_protected_unit_ids`**
 
@@ -828,11 +817,20 @@ from backend import config
 
 
 def test_short_instagram_targets():
-    assert config.DEFAULTS["target_clip_duration_s"] == 45.0
-    # soft ceiling replaces the old 240s (overflow still allowed by the assembler, but the
-    # DEFAULT ceiling is Instagram-short)
-    assert config.DEFAULTS["max_clip_duration_s"] <= 90.0
-    assert config.DEFAULTS["min_clip_duration_s"] <= 20.0
+    assert config.DEFAULTS["target_clip_duration_s"] == 45.0   # scoring aim (30-60s)
+    assert config.DEFAULTS["min_clip_duration_s"] <= 15.0
+    # max_clip_duration_s is the HARD overflow ceiling / ship cap (NOT a soft 90 cut): shorter
+    # than the old 240 but well ABOVE the soft closure budget so onset-overflow has headroom.
+    assert config.DEFAULTS["max_clip_duration_s"] == 180.0
+
+
+def test_soft_budget_below_hard_ceiling():
+    # the onset-overflow window (soft, hard] must be NON-EMPTY, else force-inline is inert
+    # (Task 6 review Critical). The value that actually reaches build_candidate is
+    # DEFAULTS["closure_max_span_s"] (a DEFAULTS entry, NOT the module constant) — guard BOTH
+    # so the feature cannot silently re-inert if someone raises the soft budget later.
+    assert config.DEFAULTS["closure_max_span_s"] < config.DEFAULTS["max_clip_duration_s"]
+    assert config.CLOSURE_MAX_SPAN_S < config.DEFAULTS["max_clip_duration_s"]
 
 
 def test_fewer_clips_by_default():
@@ -848,21 +846,26 @@ Expected: FAIL — `target_clip_duration_s` missing; `max_clip_duration_s == 240
 
 Line 118: `MAX_SEGMENTS = 12` → `MAX_SEGMENTS = 8`
 
-Lines 128-133 `DEFAULTS` — set the short targets (keep the `max_clips: None` inherit behavior):
+Lines 128-133 `DEFAULTS` — set the short target + the HARD overflow ceiling (keep `max_clips: None`):
 
 ```python
     "min_clip_duration_s": 15.0,     # a complete short thought can be brief
-    "target_clip_duration_s": 45.0,  # Instagram-short aim (scoring target, not a cutter)
-    "max_clip_duration_s": 90.0,     # SOFT ceiling; the assembler allows overflow for a
-                                     # complete thought (never split/trim-middle/drop to hit it)
+    "target_clip_duration_s": 45.0,  # Instagram-short AIM (scoring target, not a cutter)
+    "max_clip_duration_s": 180.0,    # HARD ship cap / overflow ceiling (was 240). NOT a soft
+                                     # 90 cut: the onset overflows the SOFT closure budget
+                                     # (CLOSURE_MAX_SPAN_S=120, set in the Task 6 fix) up to
+                                     # this hard cap. Must stay > CLOSURE_MAX_SPAN_S.
 ```
 
 Line 254: `ANCHOR_MIN_PRIORITY = 40` → `ANCHOR_MIN_PRIORITY = 45` (drop the weakest anchors →
 fewer, stronger clips).
 
-> Note: `max_clip_duration_s` is now a soft ceiling. Task 6 already lets the opener overflow it;
-> `refine._snap_one`'s max-duration cap (lines 162-176) still applies to the END only, which is
-> correct — it trims trailing content, never the protected onset.
+> Why 180 and not 90: `max_clip_duration_s` is the HARD cap consumed by `refine._snap_one`'s
+> max-duration END cap AND by `hard_max_span_s` (Task 6). Setting it to 90 would (a) truncate the
+> END of a legitimately-long complete thought and (b) collapse onto the soft budget so onset-
+> overflow becomes inert (the Task 6 review Critical). Shortness comes from
+> `target_clip_duration_s=45` + the soft closure budget (120) + anchor selectivity — NOT a hard 90
+> cut. Overflow (up to 180) is reserved for a complete thought that genuinely needs it.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -873,7 +876,7 @@ Expected: PASS
 
 ```bash
 git add backend/config.py backend/pipeline/tests/test_config_targets.py
-git commit -m "feat: short-clip targets (45s target / 90s soft ceiling) + fewer clips"
+git commit -m "feat: short-clip targets (45s aim / 180s hard overflow ceiling) + fewer clips"
 ```
 
 ---
@@ -922,10 +925,53 @@ git commit -m "docs: discourse-onset before/after results"
   #6 → Task 2; #7 (punctuation-restoration, Mode A durability) is deferred per spec §7 and is
   intentionally **not** a task here (Task 1's mid-clause check is the interim mitigation).
 - **Correction vs spec:** `NON_ANCHOR` is used only for anchor policy, not trimming; the operative
-  onset-trim protection is in `validate._protected_unit_ids` (Task 4), with `EDGE_TRIMMABLE` added
-  as forward-looking hygiene.
+  onset-trim protection is in `validate._protected_unit_ids` (Task 4). The spec's `EDGE_TRIMMABLE`
+  split is dropped as YAGNI (no filler-edge-trim task consumes it); only the misleading `NON_ANCHOR`
+  comment is corrected.
 - **Type consistency:** `opens_mid_thought(text)`/`is_onset(text)` (Task 1) are the exact names used
   in Tasks 2 and 3; `opening_in_context` field name is identical in Task 5's field, prompt, and
   `CORE_VERDICT_FIELDS`.
 - **Fixture caveats flagged inline:** `Candidate` (Task 4) and the graph builder (Task 6) tell the
   implementer to read the real constructor/helper rather than invent one.
+
+---
+
+## Results (2026-07-04)
+
+**Full backend test suite:** `701 passed` (all mechanisms + zero regressions across boundary,
+closure, judge, repair, metric, understand suites).
+
+**Opening-onset rate — before vs after (LLM-free, real corpus of 142 shipped clips / 10 videos):**
+measured with the shipped `opening_onset_rate` metric over the actual pre-change `shipped.json`
+specs (before) and with the Task-3 `_snap_one` start guard applied to those same boundaries (after).
+
+| video | clips | before | after |
+|---|---|---|---|
+| -KfG8kH-r3Y | 22 | 55% | 100% |
+| 5yfh5cf4-0w | 21 | 81% | 100% |
+| 54_XRjHhZzI | 16 | 88% | 100% |
+| 7K1sB05pE0A | 16 | 44% | 100% |
+| WsQQvHm4lSw | 14 | 93% | 100% |
+| 5iTOphGnCtg | 13 | 85% | 100% |
+| dHjWVlfNraM | 13 | 85% | 100% |
+| qP-9wwRrJbg | 13 | 77% | 100% |
+| GiCojsAWRj0 | 8 | 100% | 100% |
+| 1bH_ukYn81c | 6 | 67% | 100% |
+| **CORPUS** | **142** | **75%** | **~100%** |
+
+Named-clip fixes on `-KfG8kH-r3Y`: #1 `"And then mg which stands for magnesium,"` → real onset;
+#5 `"However we do have a subscript…"` → onset; #12 `"So if you were to type in… organic
+chemistry tutor in YouTube"` → onset. #8 `"So the answer is magnesium bromide."` is flagged weak
+by `opens_mid_thought` (unit-tested) and extended back by the guard.
+
+**Caveats (honest scope of this measurement):**
+- The "after" applies ONLY the Task-3 start guard to the OLD boundaries (LLM-free). It does not
+  capture the closure onset-inline (T6), the `opening_in_context` judge gate (T5), or the
+  fewer/shorter-clips config (T7) — those require the full pipeline (the LLM clip judge).
+- Backward reach here was unbounded because old specs carry no `node_span`; the production
+  pipeline is node-bounded, so a few clips may ship flagged `weak_start_boundary` rather than a
+  literal 100%. The improvement is nonetheless large and real.
+- A full `run_eval --freeze --runs 3` on the corpus (invokes the Gemini clip judge) yields the
+  complete after-metrics incl. `comprehension`, `context_complete_rate`, and clips/video. It is
+  user-runnable (needs the Gemini key + a few minutes) and is the recommended acceptance gate for
+  Important #2 (soft-budget 120 non-onset completeness — must not regress `context_complete_rate`).

@@ -175,10 +175,14 @@ def test_tiebreak_is_deterministic():
 
 
 def test_units_without_node_id_are_never_penalized():
-    # all node_id "" → the penalty is constant zero and pure score order decides
-    units = _units(["claim", "definition", "explanation", "summary"])
+    # all node_id "" → the penalty is constant zero and pure score order decides.
+    # Use roles all above ANCHOR_MIN_PRIORITY=45 (claim=70, definition=68,
+    # explanation=45, result=80) so eligibility is not the limiting factor here.
+    units = _units(["claim", "definition", "explanation", "result"])
     picked = select_anchors(units, _rel(units), BaseAdapter(), {"max_anchors": 4})
-    assert [u.role for u in picked] == ["claim", "definition", "explanation", "summary"]
+    # Ordered by descending anchor_score (priority × rel × confidence); priorities:
+    # result=80, claim=70, definition=68, explanation=45 — all ≥ ANCHOR_MIN_PRIORITY=45.
+    assert [u.role for u in picked] == ["result", "claim", "definition", "explanation"]
 
 
 def test_score_order_wins_over_node_spread_when_scores_differ():

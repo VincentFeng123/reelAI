@@ -23,6 +23,13 @@ class ClosureBudget:
     max_extra_units: int = config.CLOSURE_MAX_EXTRA_UNITS
     max_gap_s: float = config.CLOSURE_MAX_GAP_S
     max_span_s: float = config.CLOSURE_MAX_SPAN_S
+    # hard_max_span_s: the absolute ship cap (max_clip_duration_s). When set (> 0), the
+    # onset force-inline is gated: we overflow the SOFT max_span_s budget but never exceed
+    # the hard cap — a clip physically cannot contain both onset and anchor if the combined
+    # span > max_clip_duration_s, so the onset falls back to referential. 0 means no hard
+    # cap (unit tests that call compute_closure directly with a tight max_span_s; the
+    # force-inline is unconditional in that case).
+    hard_max_span_s: float = 0.0
 
 
 @dataclass
@@ -77,6 +84,24 @@ def _element_run(units: list[Unit], start_i: int, want: set[str], step: int,
     return run
 
 
+def _required_before_ids(anchor: Unit, adapter, units: list[Unit], order: dict[str, int]) -> set[str]:
+    """Unit ids satisfying a REQUIRED, position='before' contract element of the anchor — the
+    onset (problem-read / equation-introduction) that the clip must open with."""
+    contract = adapter.contract_for(anchor.role)
+    if not contract:
+        return set()
+    ai = order.get(anchor.unit_id, 0)
+    ids: set[str] = set()
+    for el in contract.elements:
+        if el.necessity != "required" or el.position != "before":
+            continue
+        want = set(el.roles)
+        cand = [u for u in units if order[u.unit_id] < ai and u.role in want]
+        if cand:
+            ids.add(cand[-1].unit_id)          # nearest preceding onset unit
+    return ids
+
+
 def _contract_needs(anchor: Unit, adapter, units: list[Unit], order: dict[str, int],
                     budget: ClosureBudget) -> tuple[list[str], list[tuple[str, str, float]]]:
     """Return (required_element_unit_ids, recommended_needs). Required elements define the
@@ -119,14 +144,24 @@ def compute_closure(anchor: Unit, graph, units_by_id: dict[str, Unit], adapter,
     referential: list[tuple[str, str]] = []
     truncated = False
 
-    # 1. contract-required elements → inline span-bounded (they ARE the event) ----
+    # 1. contract-required elements → inline. A required *before* onset (problem_statement /
+    #    example_setup / practice_prompt / setup) is FORCE-inlined even past the span budget:
+    #    the clip must open with it (discourse-onset invariant, overflow allowed). Other
+    #    required elements keep the budget check.
     required_ids, recommended = _contract_needs(anchor, adapter, units, order, budget)
+    onset_ids = _required_before_ids(anchor, adapter, units, order)   # new helper, see below
     for uid in sorted(set(required_ids), key=lambda x: order.get(x, 0)):
         u = units_by_id.get(uid)
         if not u or uid in inline:
             continue
         new_span = [min(span[0], u.start), max(span[1], u.end)]
-        if (new_span[1] - new_span[0]) <= budget.max_span_s:
+        new_dur = new_span[1] - new_span[0]
+        # Force-inline the onset (required before) even past the soft span budget, as long as
+        # the combined span fits within the hard ship cap (hard_max_span_s). When no hard cap
+        # is set (0), force-inline unconditionally (unit-test / direct-closure-call path).
+        force = (uid in onset_ids and
+                 (budget.hard_max_span_s == 0 or new_dur <= budget.hard_max_span_s))
+        if force or new_dur <= budget.max_span_s:
             inline.add(uid)
             span = new_span
         else:

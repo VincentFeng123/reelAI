@@ -234,8 +234,8 @@ def test_problem_gates_close_the_anchor_role_bypass(monkeypatch):
     assert is_complete(kept.verdict, kept.contract_role, adapter, 0.7) is False   # gated
     assert is_complete(kept.verdict, kept.role, adapter, 0.7) is True             # old bypass
     from backend.pipeline.assemble.scoring import completeness_score
-    # scored under the SAME contract the judge used: 7/8 verdict fields, not 5/5
-    assert completeness_score(kept.verdict, kept.contract_role, adapter) == pytest.approx(7 / 8)
+    # scored under the SAME contract the judge used: 8/9 verdict fields (6 core + 3 problem, result_complete=False)
+    assert completeness_score(kept.verdict, kept.contract_role, adapter) == pytest.approx(8 / 9)
     assert completeness_score(kept.verdict, kept.role, adapter) == pytest.approx(1.0)
 
 
@@ -386,5 +386,5 @@ def test_post_snap_mutation_rebinds_before_rejudge(monkeypatch):
     assert "CLIP ROLE: claim" in users[0]            # judged as a bare claim originally
     assert "CLIP ROLE: result" in users[-1]          # re-judge briefed under the new contract
     assert "problem_statement" in users[-1]
-    # completeness scored under the SAME contract the fresh verdict used (7/8, not 5/5)
-    assert s["completeness_score"] == pytest.approx(7 / 8)
+    # completeness scored under the SAME contract the fresh verdict used (8/9, not 6/6)
+    assert s["completeness_score"] == pytest.approx(8 / 9)

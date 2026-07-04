@@ -115,7 +115,7 @@ QUOTE_WORDS = 8
 MMR_LAMBDA = 0.6
 REL_FLOOR = 0.28                  # topic cosine (vs enriched topic prototype); below = off-topic, stop
 REDUNDANCY_SIM = 0.82            # cosine between two clips above which the later is a near-dup, skip
-MAX_SEGMENTS = 12
+MAX_SEGMENTS = 8
 OVERLAP_IOU_DROP = 0.5            # sentence-range IoU above which the dup is dropped
 
 # ── Per-job settings (overridable via the request body) ────────────────────
@@ -125,8 +125,12 @@ DEFAULTS: dict = {
                                             # clip ends too (see Sentence.ends_with_period)
     "mmr_lambda": MMR_LAMBDA,               # 1.0 = pure relevance, 0 = pure diversity
     "tail_pad_s": 0.05,
-    "min_clip_duration_s": 20.0,    # clips need room for context
-    "max_clip_duration_s": 240.0,   # generous: a full worked problem may run ~3-4 min
+    "min_clip_duration_s": 15.0,     # a complete short thought can be brief
+    "target_clip_duration_s": 45.0,  # Instagram-short AIM (scoring target, not a cutter)
+    "max_clip_duration_s": 180.0,    # HARD ship cap / overflow ceiling (was 240). NOT a soft
+                                     # 90 cut: the onset overflows the SOFT closure budget
+                                     # (CLOSURE_MAX_SPAN_S=120, set in the Task 6 fix) up to
+                                     # this hard cap. Must stay > CLOSURE_MAX_SPAN_S.
     # None → inherit: the ship cap becomes max(MAX_SEGMENTS, per-video anchor budget) so the
     # final truncation never undercuts the content-scaled budget (Q1a). A NUMBER here (or in
     # the request body) is an EXPLICIT user dial and is respected exactly — even when smaller.
@@ -145,7 +149,11 @@ DEFAULTS: dict = {
     # A NUMBER is an explicit user dial and wins outright (no scaling).
     "max_anchors": None,
     "refund_rounds": None,                  # None → inherit config.REFUND_ROUNDS (Q1e)
-    "closure_max_span_s": 300.0,
+    "closure_max_span_s": 120.0,            # SOFT closure budget for NON-onset context; sits
+                                            # BELOW the hard ship cap (max_clip_duration_s=180)
+                                            # so the onset-overflow window (120, 180] is LIVE.
+                                            # (This DEFAULTS value — not config.CLOSURE_MAX_SPAN_S —
+                                            # is the one that reaches build_candidate in prod.)
     "min_comprehension_score": 0.70,
     "quality_floor": None,                  # None → inherit config.QUALITY_FLOOR (W25-G)
     "diarization": False,
@@ -251,7 +259,7 @@ MAX_ANCHORS_CEIL = int(os.environ.get("MAX_ANCHORS_CEIL", "32"))   # budget ceil
 # rounds re-run over the anchor-eligible units no surviving spec covers, refilling the
 # budget dedupe collapsed. 0 disables refunds.
 REFUND_ROUNDS = int(os.environ.get("REFUND_ROUNDS", "2"))
-ANCHOR_MIN_PRIORITY = 40     # ignore anchor roles below this priority
+ANCHOR_MIN_PRIORITY = 45     # ignore anchor roles below this priority
 ANCHOR_REL_FLOOR = 0.25      # topic cosine floor for an anchor to count as on-topic
 # Anchor selector (Wave 2 P3). "plan" (default): ONE authoring-model call proposes WHAT to
 # extract from the video's ACTUAL inventory (content map + unit table + detected arcs), with
@@ -297,7 +305,9 @@ MIN_ARC_SUBSTANCE_S = float(os.environ.get("MIN_ARC_SUBSTANCE_S", "12.0"))
 MAX_ARC_MEMBER_GAP_S = float(os.environ.get("MAX_ARC_MEMBER_GAP_S", "30.0"))
 CLOSURE_MAX_EXTRA_UNITS = 6  # context-closure growth budget (units)
 CLOSURE_MAX_GAP_S = 25.0     # a context unit farther than this is referential, not inlined
-CLOSURE_MAX_SPAN_S = 300.0   # refine still caps to max_clip_duration_s
+CLOSURE_MAX_SPAN_S = 120.0   # SOFT closure budget for NON-onset context; must sit BELOW the
+                             # hard ship cap (DEFAULTS["max_clip_duration_s"]=240) so the
+                             # onset-overflow window (soft, hard] = (120, 240] is non-empty.
 
 # ── Clip-only judge / repair (also the eval comprehension scorer) ───────────
 JUDGE_ENABLED = os.environ.get("JUDGE_ENABLED", "1") not in ("0", "false", "")

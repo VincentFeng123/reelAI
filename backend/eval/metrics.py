@@ -81,6 +81,22 @@ def unresolved_reference_rate(specs, units_by_id) -> float:
     return bad / len(specs)
 
 
+def opening_onset_rate(specs, sentences) -> float:
+    """Fraction of clips whose FIRST sentence is a discourse-onset (not mid-thought /
+    not at the answer). Operationalizes 'a cold viewer isn't dropped in the middle'
+    (PodReels' audience-confusion signal). The headline START-quality number."""
+    from ..pipeline.discourse import opens_mid_thought
+    if not specs:
+        return 0.0
+    good = 0
+    for s in specs:
+        i0 = s.get("sentence_start_idx", 0)
+        i0 = max(0, min(i0, len(sentences) - 1)) if sentences else 0
+        text = sentences[i0].text if sentences else ""
+        good += 0 if opens_mid_thought(text) else 1
+    return good / len(specs)
+
+
 def grounding_ok_rate(specs) -> float:
     """Fraction of non-empty context cards (empty == omitted-not-hallucinated is fine)."""
     carded = [s for s in specs if s.get("context_card")]
