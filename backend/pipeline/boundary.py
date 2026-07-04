@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
+
+import numpy as np
 
 from .. import config
 from ..errors import PipelineError
@@ -94,6 +97,36 @@ def _whisper_window(audio: Path, win_start: float, win_end: float) -> list[Sente
         s.start += win_start
         s.end += win_start
     return sents
+
+
+def _energy_min_snap(wav_path, win_start: float, a: float, b: float,
+                     frame_ms: int = 10) -> "float | None":
+    """Absolute time of the lowest-RMS ``frame_ms`` frame within ``[a, b]`` — the quietest instant
+    in the pause. ``win_start`` is the wav's absolute start time. Returns None on a bad/short read
+    so the caller keeps its pad/midpoint fallback (never raises)."""
+    if wav_path is None or b <= a:
+        return None
+    try:
+        with wave.open(str(wav_path), "rb") as wf:
+            sr = wf.getframerate()
+            raw = wf.readframes(wf.getnframes())
+        samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    except Exception:
+        return None
+    if samples.size == 0:
+        return None
+    frame = max(1, int(sr * frame_ms / 1000))
+    lo = max(0, int((a - win_start) * sr))
+    hi = min(samples.size, int((b - win_start) * sr))
+    if hi - lo < frame:
+        return None
+    best_i, best_rms = lo, None
+    for i in range(lo, hi - frame + 1, frame):
+        seg = samples[i:i + frame]
+        rms = float(np.sqrt(np.mean(seg * seg)))
+        if best_rms is None or rms < best_rms:
+            best_rms, best_i = rms, i
+    return win_start + (best_i + frame / 2) / sr
 
 
 def _pick_start(sents: list[Sentence], rough: float, pad: float,
