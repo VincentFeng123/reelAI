@@ -38,6 +38,26 @@ def _get_whisper():
     return _whisper_model
 
 
+# Dedicated singleton for the boundary-REFINE pass, which uses a (usually larger) model than full
+# transcription for more precise word timestamps. Keyed by REFINE_WHISPER_MODEL. When it equals
+# WHISPER_MODEL we reuse the full-transcription singleton so the model loads only once. Threadsafe
+# once built (CTranslate2 num_workers); refine_clip_boundaries pre-warms it before its thread pool.
+_refine_whisper_model = None
+
+
+def _get_refine_whisper():
+    global _refine_whisper_model
+    if config.REFINE_WHISPER_MODEL == config.WHISPER_MODEL:
+        return _get_whisper()
+    if _refine_whisper_model is None:
+        from faster_whisper import WhisperModel
+        _refine_whisper_model = WhisperModel(
+            config.REFINE_WHISPER_MODEL, device=config.WHISPER_DEVICE,
+            compute_type=config.WHISPER_COMPUTE, num_workers=max(1, config.REFINE_WORKERS),
+        )
+    return _refine_whisper_model
+
+
 def _transcribe_local(audio_path: str, lang: str, emit) -> dict:
     model = _get_whisper()
     emit(0.05, f"Transcribing locally (Whisper {config.WHISPER_MODEL})…")
