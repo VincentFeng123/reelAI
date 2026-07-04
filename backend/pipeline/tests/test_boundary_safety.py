@@ -26,16 +26,19 @@ def test_refine_returns_input_unchanged_on_audio_failure(monkeypatch):
 
 # ── fix 7: direction-safe fallbacks ──────────────────────────────────────────
 def test_pick_end_never_moves_earlier_than_window_floor():
-    # only valid end is at 31.0, far BEFORE rough-1.0 (rough=45): old code returned 31.0
+    # only valid end is at 31.0, far BEFORE rough-1.0 (rough=45): no at_after → satisfied=False, time==rough
     sents = [_sent(0, 28.0, 31.0)]
-    assert _pick_end(sents, rough=45.0, pad=10.0, allow_qe=False,
-                     tail_pad=0.15, gap_min=0.12, end_extend_max=8.0).time == 45.0
+    p = _pick_end(sents, rough=45.0, pad=10.0, allow_qe=False,
+                  tail_pad=0.15, gap_min=0.12, end_extend_max=8.0)
+    assert p.time == 45.0 and not p.satisfied
 
 
 def test_pick_end_normal_path_unchanged():
-    sents = [_sent(0, 40.0, 44.5), _sent(1, 44.6, 46.2)]
-    assert _pick_end(sents, rough=45.0, pad=10.0, allow_qe=False,
-                     tail_pad=0.15, gap_min=0.12, end_extend_max=8.0).time == 46.2
+    # E @46.2, next @46.7 → 0.5 s gap → tight cut at 46.2 + tail(0.15) = 46.35
+    sents = [_sent(0, 40.0, 44.5), _sent(1, 44.6, 46.2), _sent(2, 46.7, 48.0)]
+    p = _pick_end(sents, rough=45.0, pad=10.0, allow_qe=False,
+                  tail_pad=0.15, gap_min=0.12, end_extend_max=8.0)
+    assert abs(p.time - 46.35) < 1e-6 and p.satisfied
 
 
 def test_pick_start_never_moves_later_than_window_ceiling():

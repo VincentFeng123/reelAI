@@ -202,23 +202,63 @@ def _pick_start(sents: list[Sentence], rough: float, pad: float,
     return Pick(round(cut, 3), flags, True)
 
 
+def _gap_after(sents, idx: int) -> "tuple[float, float] | None":
+    """(E.end, next.start) for the sentence at idx, or None if idx is the window's last sentence."""
+    if idx < 0 or idx + 1 >= len(sents):
+        return None
+    return sents[idx].end, sents[idx + 1].start
+
+
+def _snap_end_cut(e_end: float, next_start: float, tail_pad: float, energy_fn) -> "tuple[float, tuple]":
+    """Cut into the gap AFTER e_end: min(e_end+tail_pad, midpoint(e_end, next_start)), then
+    energy-snap within [e_end, that]. Never > next_start, never < e_end."""
+    mid = (e_end + next_start) / 2.0
+    pad_cut = min(e_end + tail_pad, mid)
+    cut = pad_cut
+    if energy_fn is not None:
+        snapped = energy_fn(e_end, pad_cut)
+        if snapped is not None:
+            cut = min(max(snapped, e_end), pad_cut)
+    return min(next_start, max(cut, e_end)), ()
+
+
 def _pick_end(sents: list[Sentence], rough: float, pad: float, allow_qe: bool, *,
               tail_pad: float = 0.15, gap_min: float = 0.12,
               end_extend_max: float = 8.0, energy_fn=None) -> Pick:
-    """Earliest period-terminated end at/just after the rough end (complete the thought)."""
+    """Complete the thought, cutting into the trailing inter-word gap (never into the next word).
+    HYBRID (handoff §8): tight cut at the chosen complete sentence when it has a usable trailing
+    gap; only nudge forward to a later gap within end_extend_max; else keep tight + flag. Direction-
+    safe: never truncates earlier than rough-1s. satisfied=False only when no valid end with a
+    MEASURABLE gap is in the window (→ _refine_end grows)."""
     if not sents:
-        return Pick(rough, (), True)
-    ends = [s.end for s in sents if s.is_valid_end(allow_qe)]
-    if not ends:
-        return Pick(rough, (), True)
-    # Prefer ends >= rough; fall back to ends >= rough - 1.0
-    after = [x for x in ends if x >= rough]
-    if not after:
-        after = [x for x in ends if x >= rough - 1.0]
-    if not after:
-        return Pick(rough, (), True)              # direction-safe: never truncate EARLIER than rough-1s
-    cand = min(after)
-    return Pick(cand if abs(cand - rough) <= pad else rough, (), True)
+        return Pick(rough, (), False)
+    valids = [i for i, s in enumerate(sents) if s.is_valid_end(allow_qe)]
+    at_after = [i for i in valids if sents[i].end >= rough] or \
+               [i for i in valids if sents[i].end >= rough - 1.0]
+    if not at_after:
+        return Pick(rough, (), False)                    # no valid end at all → grow
+    at_after.sort(key=lambda i: sents[i].end)
+    e_idx = at_after[0]
+    if abs(sents[e_idx].end - rough) > pad and sents[e_idx].end > rough + pad:
+        return Pick(rough, (), False)                    # nearest end beyond the window → grow
+    gap = _gap_after(sents, e_idx)
+    if gap is None:
+        return Pick(round(sents[e_idx].end + tail_pad, 3), (), False)   # last in window → grow
+    e_end, nxt = gap
+    if (nxt - e_end) >= gap_min:
+        cut, flags = _snap_end_cut(e_end, nxt, tail_pad, energy_fn)
+        return Pick(round(cut, 3), flags, True)          # tight cut in a real gap
+    # hybrid: look forward within budget for a later end WITH a usable gap
+    for i in at_after:
+        if sents[i].end > rough + end_extend_max:
+            break
+        g = _gap_after(sents, i)
+        if g and (g[1] - g[0]) >= gap_min:
+            cut, _ = _snap_end_cut(g[0], g[1], tail_pad, energy_fn)
+            return Pick(round(cut, 3), ("end_extended",), True)
+    # none in budget → best-available tight cut at E, flagged
+    cut, _ = _snap_end_cut(e_end, nxt, tail_pad, energy_fn)
+    return Pick(round(cut, 3), ("tight_end_no_gap",), True)
 
 
 def _resolve_overlaps(clips: list[dict], min_dur: float, tail_pad: float) -> list[dict]:
