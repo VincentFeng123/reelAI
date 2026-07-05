@@ -12,6 +12,7 @@
 
 - **Offline tests only.** Every test monkeypatches the LLM (`backend.pipeline.assemble.topics.llm_json`); no test performs network I/O. The suite is 735 green today.
 - **Authoring LLM = Gemini via `llm_json`.** Call `from ...llm import llm_json` → `llm_json(system: str, user: str, SchemaClass, temperature=..., model=None)` returns a validated pydantic instance; it raises on final failure. Default model is `gemini-2.5-flash`. **Never** call `gemini_client.generate_json` directly.
+- **Topic‑first model split (user decision 2026‑07‑04):** `select_topics` and `extract_best_window` pass `model=config.TOPIC_MODEL` (`gemini-3.1-pro-preview`, verified working via `generate_json`) — the quality‑critical calls. All bulk authoring (punctuation/units/content‑map) stays on `GEMINI_MODEL` = `gemini-2.5-flash` to protect latency/RPM. `config.TOPIC_MODEL` already exists (Task 1).
 - **`Sentence` field names (dataclass, `backend/pipeline/sentences.py`):** `idx:int, text:str, start:float, end:float, terminator:str ('.'/'?'/'!'/''), ends_with_period:bool (True for any terminator), word_start_idx:int, word_end_idx:int, align_confidence:float, warnings:tuple`. It is `idx` (NOT `index`); there is no `tokenIds`. Never infer a terminator from `text[-1]` — read `ends_with_period`/`terminator`.
 - **`ContentNode.sentence_range` is half‑open `(i0, i1)`** (i0 inclusive, i1 exclusive), same as `Unit.sentence_range`.
 - **Spec dict contract:** `_build_embed_clips` (orchestrator.py:41) reads every key via `.get()` **except `c["start"]` and `c["end"]`** (mandatory floats). `final_quality` may be `None`. `cut_clips` reads `start,end,cut_end(optional),facet,reason`. So a topic spec MUST set `start`+`end`; everything else is defaulted downstream.
@@ -345,7 +346,7 @@ def select_topics(structure: Structure, sentences: list[Sentence],
     by_id = {node.node_id: node for node in topics}
     try:
         sel = llm_json(SELECT_SYSTEM, _topic_prompt(topics, sentences),
-                       TopicSelection, temperature=0.1)
+                       TopicSelection, temperature=0.1, model=config.TOPIC_MODEL)
         judged = {j.node_id: j for j in sel.topics if j.node_id in by_id}
     except Exception:
         judged = {}
@@ -532,7 +533,8 @@ def extract_best_window(pick: TopicPick, sentences: list[Sentence],
     max_s = float(settings.get("clip_max_s") or config.CLIP_MAX_S)
     try:
         sys = WINDOW_SYSTEM.format(max_s=int(max_s), target_s=int(config.CLIP_TARGET_S))
-        ch = llm_json(sys, _window_prompt(sentences, lo, hi), WindowChoice, temperature=0.1)
+        ch = llm_json(sys, _window_prompt(sentences, lo, hi), WindowChoice,
+                      temperature=0.1, model=config.TOPIC_MODEL)
         a, b, title, why = int(ch.start_idx), int(ch.end_idx), ch.title, ch.why
     except Exception:
         a, b, title, why = i0, hi, node.title, ""    # fall back to the whole topic span
