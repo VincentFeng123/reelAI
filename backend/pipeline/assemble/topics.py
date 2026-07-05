@@ -137,3 +137,80 @@ def select_topics(structure: Structure, sentences: list[Sentence],
     kept_ids = {p.node.node_id for p in kept}
     dropped = [p for p in picks if p.node.node_id not in kept_ids]
     return kept, dropped
+
+
+# ── window extraction ─────────────────────────────────────────────────────────
+WINDOW_SYSTEM = (
+    "You trim ONE topic to the single best self-contained clip. Choose inclusive sentence "
+    "indices start_idx and end_idx from the list. The clip MUST: open on a sentence that frames "
+    "the idea for a COLD viewer (never a dangling 'this/these/that/it' pointing outside the clip); "
+    "close on a sentence that completes a thought; and carry the topic's core (definition+"
+    "explanation, or mechanism+example), dropping recaps, meta-asides and tangents. Keep it at most "
+    "{max_s} seconds (aim ~{target_s}s). The '+Ns' marker after each index is elapsed seconds; a "
+    "trailing ' .' marks a sentence that ends on a terminator — prefer those as the close."
+)
+
+
+def _window_prompt(sentences: list[Sentence], lo: int, hi: int) -> str:
+    t0 = sentences[lo].start
+    out = []
+    for i in range(lo, hi + 1):
+        s = sentences[i]
+        mark = " ." if s.ends_with_period else ""
+        out.append(f"[{i}] (+{s.end - t0:.0f}s){mark} {s.text}")
+    return "SENTENCES:\n" + "\n".join(out)
+
+
+def _snap_end_to_terminator(sentences: list[Sentence], a: int, b: int, warnings: list[str]) -> int:
+    """Walk the end back to the nearest terminator-ending sentence >= a."""
+    j = b
+    while j > a and not sentences[j].ends_with_period:
+        j -= 1
+    if not sentences[j].ends_with_period:           # none in [a, b]
+        warnings.append("window_close_forced")
+        return b
+    if j != b:
+        warnings.append("window_close_snapped")
+    return j
+
+
+def _fit_budget(sentences: list[Sentence], a: int, b: int, max_s: float, warnings: list[str]) -> int:
+    """Truncate the end to the last terminator-ending sentence within max_s of the start."""
+    if sentences[b].end - sentences[a].start <= max_s:
+        return b
+    j = b
+    while j > a and sentences[j].end - sentences[a].start > max_s:
+        j -= 1
+    k = j                                            # prefer a terminator within budget
+    while k > a and not sentences[k].ends_with_period:
+        k -= 1
+    warnings.append("window_truncated_to_budget")
+    return k if sentences[k].ends_with_period and k > a else j
+
+
+def extract_best_window(pick: TopicPick, sentences: list[Sentence],
+                        settings: dict) -> Optional[Window]:
+    """Pick the best <=CLIP_MAX_S self-contained window inside (and just before) a topic."""
+    node = pick.node
+    i0, i1 = node.sentence_range                     # half-open
+    win = int(settings.get("boundary_window") or config.TOPIC_BOUNDARY_WINDOW)
+    lo = max(0, i0 - win)                             # allow opening a little earlier
+    hi = min(len(sentences) - 1, i1 - 1)
+    if hi < lo:
+        return None
+    max_s = float(settings.get("clip_max_s") or config.CLIP_MAX_S)
+    try:
+        sys = WINDOW_SYSTEM.format(max_s=int(max_s), target_s=int(config.CLIP_TARGET_S))
+        ch = llm_json(sys, _window_prompt(sentences, lo, hi), WindowChoice,
+                      temperature=0.1, model=config.TOPIC_MODEL)
+        a, b, title, why = int(ch.start_idx), int(ch.end_idx), ch.title, ch.why
+    except Exception:
+        a, b, title, why = i0, hi, node.title, ""    # fall back to the whole topic span
+
+    a = min(max(a, lo), hi)                           # clamp into the shown range
+    b = min(max(b, a), hi)
+    warnings: list[str] = list(pick.warnings)
+    b = _snap_end_to_terminator(sentences, a, b, warnings)
+    b = _fit_budget(sentences, a, b, max_s, warnings)
+    return Window(node.node_id, a, b, sentences[a].start, sentences[b].end,
+                  title or node.title, pick.type, why, tuple(warnings))
