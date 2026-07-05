@@ -176,6 +176,7 @@ DEFAULTS: dict = {
     "quality_floor": None,                  # None → inherit config.QUALITY_FLOOR (W25-G)
     "diarization": False,
     "edge_probe": None,                     # None → inherit config.EDGE_PROBE_ENABLED (VID2, default OFF)
+    "clip_engine": None,                    # None → inherit config.CLIP_ENGINE ("topic"|"unit")
 }
 
 # ── ffmpeg cutting ─────────────────────────────────────────────────────────
@@ -216,6 +217,17 @@ OUTPUT_MODE = os.environ.get("OUTPUT_MODE", "embed")           # "embed" | "cut"
 # new topic skips ingest/perception/structuring and runs only the topic half.
 STRUCTURE_CACHE = os.environ.get("STRUCTURE_CACHE", "1") not in ("0", "false", "")
 FEED_DEFAULT_PROFILE = os.environ.get("FEED_DEFAULT_PROFILE", "fast")
+
+# ── Topic-first clip engine (CLIP_ENGINE=topic) ─────────────────────────────
+# "topic": select substantive teaching topics from the content_map, then ship ONE
+# best <=CLIP_MAX_S self-contained window per topic. "unit": legacy unit-anchored
+# assemble_clips (revert switch). See docs/superpowers/specs/2026-07-04-topic-first-clipping-design.md
+CLIP_ENGINE = os.environ.get("CLIP_ENGINE", "topic")            # "topic" | "unit"
+TOPIC_MAX_CLIPS = int(os.environ.get("TOPIC_MAX_CLIPS", "10"))  # max clips (one window per kept topic)
+CLIP_TARGET_S = float(os.environ.get("CLIP_TARGET_S", "58"))    # window length aim
+CLIP_MAX_S = float(os.environ.get("CLIP_MAX_S", "75"))          # hard-ish ceiling (finish the sentence)
+TOPIC_INFORMATIVENESS_MIN = float(os.environ.get("TOPIC_INFORMATIVENESS_MIN", "0.5"))
+TOPIC_BOUNDARY_WINDOW = int(os.environ.get("TOPIC_BOUNDARY_WINDOW", "3"))  # sentences of slack each side
 
 # ── Content-type detection ──────────────────────────────────────────────────
 DETECT_SAMPLE_SEGMENTS = 25
