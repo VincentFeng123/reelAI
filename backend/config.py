@@ -49,7 +49,7 @@ AUDIO_CHUNK_OVERLAP_S = 5                         # overlap when splitting audio
 
 # ── Gemini (Google AI Studio; free tier) ────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
 # ── faster-whisper (local transcription) ────────────────────────────────────
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")   # tiny|base|small|medium|large-v3
