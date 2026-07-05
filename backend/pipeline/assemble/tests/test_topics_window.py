@@ -5,7 +5,7 @@ from backend.pipeline.sentences import Sentence
 
 
 def _sent(idx, text, start, end, term="."):
-    return Sentence(idx, text, start, end, term, term in ".?!", idx, idx, 1.0, ())
+    return Sentence(idx, text, start, end, term, term in (".", "?", "!"), idx, idx, 1.0, ())
 
 
 def _pick(i0, i1, start, end, title="Topic"):
