@@ -280,7 +280,7 @@ def test_select_keeps_teaching_drops_filler(monkeypatch):
 def test_select_respects_max_clips(monkeypatch):
     monkeypatch.setattr(T, "llm_json", lambda *a, **k: JUDGMENTS)
     kept, _ = T.select_topics(_structure(NODES), SENTS, {"max_clips": 1})
-    assert [p.node.node_id for p in kept] == ["t3"]           # highest informativeness first, then chrono
+    assert [p.node.node_id for p in kept] == ["t1"]           # keep the single MOST informative (t1=0.9 > t3=0.7)
 
 
 def test_select_never_zero_on_llm_failure(monkeypatch):
