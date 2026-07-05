@@ -9,3 +9,9 @@ def test_topic_engine_defaults():
     assert config.TOPIC_INFORMATIVENESS_MIN == 0.5
     assert config.TOPIC_BOUNDARY_WINDOW == 3
     assert "clip_engine" in config.DEFAULTS and config.DEFAULTS["clip_engine"] is None
+
+
+def test_authoring_model_is_flash_topic_model_is_pro():
+    # bulk authoring stays on the fast model; only the new topic calls use the pro model
+    assert config.GEMINI_MODEL == "gemini-2.5-flash"
+    assert config.TOPIC_MODEL == "gemini-3.1-pro-preview"

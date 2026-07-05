@@ -49,7 +49,13 @@ AUDIO_CHUNK_OVERLAP_S = 5                         # overlap when splitting audio
 
 # ── Gemini (Google AI Studio; free tier) ────────────────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-pro-preview")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Authoring model for the NEW topic-first calls ONLY (select_topics / extract_best_window) —
+# the quality-critical redesign. Verified working via generate_json (generate_content +
+# response_schema + thinking_budget=0). Kept OFF the high-volume authoring path (punctuation /
+# units / content map stay on GEMINI_MODEL) so the Pro-preview latency/RPM cost lands only on
+# the ~1 + N_kept selection/window calls per video. Empty / == GEMINI_MODEL disables the split.
+TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 
 # ── faster-whisper (local transcription) ────────────────────────────────────
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")   # tiny|base|small|medium|large-v3
