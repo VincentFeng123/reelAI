@@ -229,7 +229,10 @@ FEED_DEFAULT_PROFILE = os.environ.get("FEED_DEFAULT_PROFILE", "fast")
 # best <=CLIP_MAX_S self-contained window per topic. "unit": legacy unit-anchored
 # assemble_clips (revert switch). See docs/superpowers/specs/2026-07-04-topic-first-clipping-design.md
 CLIP_ENGINE = os.environ.get("CLIP_ENGINE", "topic")            # "topic" | "unit"
-TOPIC_MAX_CLIPS = int(os.environ.get("TOPIC_MAX_CLIPS", "10"))  # max clips (one window per kept topic)
+# SAFETY ceiling, not a curation dial: ship ALL substantive teaching topics (the type +
+# TOPIC_INFORMATIVENESS_MIN filter is the only real gate). TreeSeg caps the topic tree at
+# TREESEG_MAX_TOPICS=24, so this only binds on a runaway non-TreeSeg content map.
+TOPIC_MAX_CLIPS = int(os.environ.get("TOPIC_MAX_CLIPS", "40"))
 CLIP_TARGET_S = float(os.environ.get("CLIP_TARGET_S", "58"))    # window length aim
 CLIP_MAX_S = float(os.environ.get("CLIP_MAX_S", "75"))          # hard-ish ceiling (finish the sentence)
 TOPIC_INFORMATIVENESS_MIN = float(os.environ.get("TOPIC_INFORMATIVENESS_MIN", "0.5"))
