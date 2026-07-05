@@ -657,3 +657,15 @@ def assemble_clips(structure: Structure, topic: str, sentences: list[Sentence], 
     for note in selection_notes:               # plan-fallback / arc-verify degradations (P3d)
         notes += f" ({note})"
     return specs, notes, rejections
+
+
+def _resolve_assemble_fn(settings: dict):
+    """Return the assembly callable for the configured clip_engine.
+
+    Reads ``settings["clip_engine"]`` first; falls back to ``config.CLIP_ENGINE``
+    (default ``"topic"``).  Returns ``assemble_topic_clips`` for ``"topic"`` and
+    ``assemble_clips`` for ``"unit"`` (or any unrecognised value).
+    """
+    from .topics import assemble_topic_clips  # local to avoid circular at module init
+    engine = str(settings.get("clip_engine") or config.CLIP_ENGINE).lower()
+    return assemble_topic_clips if engine == "topic" else assemble_clips

@@ -210,7 +210,7 @@ async def _run_full(job: Job, transcript: dict, video_id: str, sentences, run, e
     mp4s once a video is available.
     """
     from .adapters import get_adapter, select_adapter
-    from .pipeline.assemble import assemble_clips
+    from .pipeline.assemble import assemble_clips, _resolve_assemble_fn
     from .pipeline.assemble.artifacts import write_run_artifacts
     from .pipeline.understand import Perception, build_structure, load_structure, save_structure
 
@@ -314,7 +314,7 @@ async def _run_full(job: Job, transcript: dict, video_id: str, sentences, run, e
     registry.publish(job, ProgressEvent("assembling", 72.0, "Assembling self-contained clips…"))
     stats: dict = {}                           # machine-readable run signals (I1/W25-G)
     clips_spec, notes, rejections = await run(
-        assemble_clips, structure, job.topic, sentences, job.url, video_id,
+        _resolve_assemble_fn(settings), structure, job.topic, sentences, job.url, video_id,
         settings, adapter, emit("assembling", 72, 90), stats,
     )
     # W25-G: persist the run's plan/arcs/shipped/ledger (work/<id>/runs/<ts>/) — jobs are

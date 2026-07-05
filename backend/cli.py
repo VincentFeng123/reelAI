@@ -14,6 +14,8 @@ import asyncio
 import sys
 
 from . import config
+from .pipeline.assemble import assemble_clips, _resolve_assemble_fn
+from .pipeline.assemble.topics import assemble_topic_clips  # noqa: F401 — sentinel target
 from .pipeline.download import download, extract_video_id
 from .pipeline.punctuation.service import build_sentences
 from .pipeline.refine import refine_and_snap
@@ -54,7 +56,6 @@ async def run(url: str, topic: str, profile: str = "full") -> None:
 
     if profile == "full":
         from .adapters import select_adapter
-        from .pipeline.assemble import assemble_clips
         from .pipeline.understand import build_structure
 
         # ── perceive (multimodal only; downloads the video, cached) ──
@@ -83,7 +84,8 @@ async def run(url: str, topic: str, profile: str = "full") -> None:
               f"{len(st.content_map.topics())} topics")
         print(f"  visual: {len(st.visual_events)} events, has_perception={st.has_perception}, "
               f"degraded={st.degraded}; units w/ visual_deps={withdep} ({linked} linked)")
-        clips_spec, notes, rejections = assemble_clips(st, topic, sents, url, video_id, settings, adapter, _p("assemble"))
+        clips_spec, notes, rejections = _resolve_assemble_fn(settings)(
+            st, topic, sents, url, video_id, settings, adapter, _p("assemble"))
     else:
         rejections = []
         clips_spec, notes = select_segments(sents, topic, settings, _p("select"))
