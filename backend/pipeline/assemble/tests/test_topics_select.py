@@ -56,3 +56,4 @@ def test_select_never_zero_on_llm_failure(monkeypatch):
     monkeypatch.setattr(T, "llm_json", boom)
     kept, _ = T.select_topics(_structure(NODES), SENTS, {})
     assert len(kept) >= 1                                     # unknown ⇒ neutral-teaching, never empty
+    assert all("low_confidence_selection" in p.warnings for p in kept)  # outage routes through flagged fallback

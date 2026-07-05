@@ -15,7 +15,6 @@ import sys
 
 from . import config
 from .pipeline.assemble import assemble_clips, _resolve_assemble_fn
-from .pipeline.assemble.topics import assemble_topic_clips  # noqa: F401 — sentinel target
 from .pipeline.download import download, extract_video_id
 from .pipeline.punctuation.service import build_sentences
 from .pipeline.refine import refine_and_snap

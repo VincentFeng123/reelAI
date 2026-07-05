@@ -9,7 +9,7 @@ Spec: docs/superpowers/specs/2026-07-04-topic-first-clipping-design.md
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 from pydantic import BaseModel, Field
@@ -116,11 +116,17 @@ def select_topics(structure: Structure, sentences: list[Sentence],
     except Exception:
         judged = {}
 
+    # A node the LLM didn't score gets a neutral placeholder — but on a TOTAL failure (no
+    # usable judgments at all, e.g. a TOPIC_MODEL outage) it must NOT clear the keep
+    # threshold, or every filler topic ships as confident teaching. Score it at 0.0 so `kept`
+    # comes back empty → the low_confidence_selection fallback ships a FLAGGED top-N instead.
+    neutral = 0.5 if judged else 0.0
+
     picks: list[TopicPick] = []
     for nid, node in by_id.items():
         j = judged.get(nid)
         if j is None:                       # unknown ⇒ neutral teaching (never silently lost)
-            picks.append(TopicPick(node, _TEACHING, 0.5, 0.5, ""))
+            picks.append(TopicPick(node, _TEACHING, neutral, neutral, ""))
         else:
             picks.append(TopicPick(node, (j.type or _TEACHING).strip().lower(),
                                    float(j.informativeness), float(j.self_contained), j.why))
@@ -181,11 +187,16 @@ def _fit_budget(sentences: list[Sentence], a: int, b: int, max_s: float, warning
     j = b
     while j > a and sentences[j].end - sentences[a].start > max_s:
         j -= 1
-    k = j                                            # prefer a terminator within budget
+    warnings.append("window_truncated_to_budget")
+    # Prefer a terminator-ending sentence within budget; accept k == a (a terminal
+    # single-sentence window beats a longer non-terminal one — spec #3 ends-on-terminator).
+    k = j
     while k > a and not sentences[k].ends_with_period:
         k -= 1
-    warnings.append("window_truncated_to_budget")
-    return k if sentences[k].ends_with_period and k > a else j
+    if sentences[k].ends_with_period:
+        return k
+    warnings.append("window_close_forced")   # no terminator anywhere in the budgeted span
+    return j
 
 
 def extract_best_window(pick: TopicPick, sentences: list[Sentence],
