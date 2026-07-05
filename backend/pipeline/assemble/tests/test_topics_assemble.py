@@ -1,4 +1,5 @@
 import backend.pipeline.assemble.topics as T
+from backend import config
 from backend.pipeline.understand.models import ContentMap, ContentNode, Structure
 from backend.pipeline.sentences import Sentence
 
@@ -50,6 +51,7 @@ def test_assemble_builds_specs_drops_filler(monkeypatch):
         assert s["cut_end"] >= s["end"]
     assert [r.stage for r in rejections] == ["topic_select"]          # the dropped intro
     assert stats["n_topics_kept"] == 2 and stats["n_topics_total"] == 3
+    assert stats["n_topics_dropped"] == 1
 
 
 def test_assemble_empty_when_no_topics(monkeypatch):
@@ -57,3 +59,30 @@ def test_assemble_empty_when_no_topics(monkeypatch):
     specs, notes, rejections = T.assemble_topic_clips(
         st, "x", SENTS, "u", "vid", {}, adapter=None, stats={})
     assert specs == [] and "segment" in notes.lower()
+
+
+def test_serial_extract_best_window_failure_isolated(monkeypatch):
+    """Verify that extract_best_window raising in serial path (workers==1) doesn't crash."""
+    call_count = [0]
+
+    def _extract_raises_on_first(pick, sentences, settings):
+        """Raises for first pick (Reflex arc), returns valid Window for others."""
+        call_count[0] += 1
+        if call_count[0] == 1:  # First call: Reflex arc node
+            raise ValueError("Simulated extraction failure")
+        # Second call: Pitch node — return a valid window
+        i0, i1 = pick.node.sentence_range
+        return T.Window(pick.node.node_id, i0, i1 - 1, sentences[i0].start, sentences[i1 - 1].end,
+                        pick.node.title, pick.type, pick.why, ())
+
+    monkeypatch.setattr(config, "UNDERSTAND_WORKERS", 1)  # Force serial path
+    monkeypatch.setattr(T, "select_topics", _fake_select)
+    monkeypatch.setattr(T, "extract_best_window", _extract_raises_on_first)
+
+    st = Structure(video_id="vid", content_map=ContentMap(nodes=NODES, engine="treeseg"))
+    specs, notes, rejections = T.assemble_topic_clips(
+        st, "test", SENTS, "http://x", "vid", {}, adapter=None, stats={})
+
+    # Should NOT raise, should return 1 spec (Pitch), and skip Reflex arc
+    assert len(specs) == 1
+    assert specs[0]["title"] == "Pitch"

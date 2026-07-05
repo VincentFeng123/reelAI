@@ -251,7 +251,10 @@ def assemble_topic_clips(structure: Structure, topic: str, sentences: list[Sente
     windows: list[Optional[Window]] = [None] * len(kept)
     if workers == 1:
         for i, p in enumerate(kept):
-            windows[i] = extract_best_window(p, sentences, settings)
+            try:
+                windows[i] = extract_best_window(p, sentences, settings)
+            except Exception:
+                windows[i] = None       # one bad window never kills the batch (matches parallel path)
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(extract_best_window, p, sentences, settings): i
