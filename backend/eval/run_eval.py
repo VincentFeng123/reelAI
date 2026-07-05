@@ -44,6 +44,7 @@ from ..pipeline.understand import (
 )
 from . import metrics
 from .golden import gold_chapters, load_golden
+from .metrics import topic_selectivity, window_len_stats
 
 
 def _sentences(transcript, video_id=None):
@@ -141,6 +142,9 @@ def _wave2_columns(st, specs, stats) -> dict:
                                if "index_clamp_events" in stats else None),
         "n_min_duration_extensions": metrics.min_duration_extensions(specs),
         "forward_requires_edges": metrics.forward_requires_edges(st),
+        # topic-first-clipping engine columns (safe on non-topic runs: stats returns 0.0)
+        "window_len": window_len_stats(specs),
+        "topic_selectivity": topic_selectivity(stats),
     }
     m["severed_pairs_linked"], m["severed_pairs_merged"] = metrics.severed_pair_counts(specs)
     return m

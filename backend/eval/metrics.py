@@ -437,6 +437,24 @@ def min_duration_extensions(specs) -> int:
                if "extended_for_min_duration" in (s.get("warnings") or ()))
 
 
+def window_len_stats(clips: list[dict]) -> dict:
+    """Min/max/mean duration (seconds, rounded to 1 dp) of the shipped clips.
+    Returns {min: 0.0, max: 0.0, mean: 0.0} when the list is empty."""
+    durs = [float(c["end"]) - float(c["start"]) for c in clips if c.get("end") is not None]
+    if not durs:
+        return {"min": 0.0, "max": 0.0, "mean": 0.0}
+    return {"min": round(min(durs), 1), "max": round(max(durs), 1),
+            "mean": round(sum(durs) / len(durs), 1)}
+
+
+def topic_selectivity(stats: dict) -> float:
+    """Fraction of candidate topics kept by the topic-first engine (kept / total).
+    Returns 0.0 when n_topics_total is missing or zero — never raises ZeroDivisionError."""
+    total = int(stats.get("n_topics_total") or 0)
+    kept = int(stats.get("n_topics_kept") or 0)
+    return round(kept / total, 3) if total else 0.0
+
+
 def forward_requires_edges(structure) -> int:
     """W25-G graph lint recomputed in eval (never trusts a persisted counter): 'requires'
     edges pointing FORWARD in unit order — the source presupposes a unit that hasn't
