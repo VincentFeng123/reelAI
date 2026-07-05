@@ -214,3 +214,83 @@ def extract_best_window(pick: TopicPick, sentences: list[Sentence],
     b = _fit_budget(sentences, a, b, max_s, warnings)
     return Window(node.node_id, a, b, sentences[a].start, sentences[b].end,
                   title or node.title, pick.type, why, tuple(warnings))
+
+
+def assemble_topic_clips(structure: Structure, topic: str, sentences: list[Sentence], url: str,
+                         video_id: str, settings: dict, adapter,
+                         progress=None, stats: Optional[dict] = None) -> tuple[list[dict], str, list[Rejection]]:
+    """CLIP_ENGINE=topic entry. Mirrors assemble_clips' (specs, notes, rejections) contract."""
+    stats = stats if stats is not None else {}
+
+    def emit(frac: float, msg: str = "") -> None:
+        if progress:
+            progress(max(0.0, min(1.0, frac)), msg)
+
+    rejections: list[Rejection] = []
+    if not sentences:
+        return [], "No transcript was available to clip.", rejections
+    topics = structure.content_map.topics() or structure.content_map.chapters()
+    if not topics:
+        return [], "This video couldn't be segmented into topics.", rejections
+
+    emit(0.05, "Selecting substantive topics…")
+    kept, dropped = select_topics(structure, sentences, settings)
+    stats["n_topics_total"] = len(topics)
+    stats["n_topics_kept"] = len(kept)
+    stats["n_topics_dropped"] = len(dropped)
+    for p in dropped:
+        rejections.append(Rejection(
+            cand_id=p.node.node_id, title=p.node.title or "", role=p.type, stage="topic_select",
+            reason=f"dropped as {p.type} (informativeness {p.informativeness:.2f})",
+            start=p.node.start, end=p.node.end))
+    if not kept:
+        return [], "No substantive teaching topics were found in this video.", rejections
+
+    emit(0.2, "Trimming to the best windows…")
+    workers = max(1, min(config.UNDERSTAND_WORKERS, len(kept)))
+    windows: list[Optional[Window]] = [None] * len(kept)
+    if workers == 1:
+        for i, p in enumerate(kept):
+            windows[i] = extract_best_window(p, sentences, settings)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(extract_best_window, p, sentences, settings): i
+                    for i, p in enumerate(kept)}
+            for fut in as_completed(futs):
+                try:
+                    windows[futs[fut]] = fut.result()
+                except Exception:
+                    windows[futs[fut]] = None       # one bad window never kills the batch
+
+    tail = float(settings.get("tail_pad_s") or config.DEFAULTS["tail_pad_s"])
+    specs: list[dict] = []
+    for w in windows:
+        if w is None:
+            continue
+        specs.append({
+            "start": float(round(w.start_s, 3)),
+            "end": float(round(w.end_s, 3)),
+            "cut_end": float(round(w.end_s + tail, 3)),
+            "facet": (w.facet or "other"),
+            "reason": w.why,
+            "title": w.title,
+            "role": "",
+            "context_card": "",
+            "sentence_start_idx": w.start_idx,
+            "sentence_end_idx": w.end_idx,
+            "unit_ids": [],
+            "final_quality": None,
+            "warnings": w.warnings,
+            "ship_flagged": False,
+            "notes": [],
+        })
+
+    specs.sort(key=lambda s: s["start"])
+    for i, s in enumerate(specs):
+        s["sequence_index"] = i + 1
+        s["prerequisite_clips"] = []
+
+    emit(1.0, f"Assembled {len(specs)} clip(s)")
+    notes = (f"{len(specs)} clip(s) from {len(kept)} topic(s)"
+             + (f"; {len(dropped)} filler topic(s) dropped." if dropped else "."))
+    return specs, notes, rejections
