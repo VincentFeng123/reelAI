@@ -86,7 +86,7 @@ window from — instead of rebuilding from 400 units. Measured against the topic
 | Selection bar | **Only substantive teaching topics**; drop intro/outro/plug/transition/admin/aside |
 | Length | **Target ~55–60 s, hard‑ish max ~75 s** (allow finishing the closing sentence); pick the window that maximizes quality within budget; never end mid‑thought to hit a number |
 | Approach | **A — topic‑node‑first**; select topics, extract best window, reuse the cutter |
-| `MAX_CLIPS` | target **~10** (config) |
+| `MAX_CLIPS` | **safety ceiling ~40** — ship ALL substantive teaching topics (smoke-tuned 2026-07-04; 10 dropped real content) |
 | One window per topic | **Yes** — no multi‑part splitting; a topic contributes at most one clip |
 
 ## 4. Architecture
@@ -189,7 +189,8 @@ vs prev end `170.485`). The new front‑end hands **sentence‑boundary** spans 
 | Key | Default | Meaning |
 |---|---|---|
 | `CLIP_ENGINE` | `topic` | `topic` (new) or `unit` (legacy, temporary) |
-| `MAX_CLIPS` | `10` | cap on kept topics (= max clips, one window each) |
+| `TOPIC_MAX_CLIPS` | `40` | safety ceiling only — ship all substantive topics (TreeSeg caps at 24) |
+| `TOPIC_MODEL` | `gemini-3.1-pro-preview` | model for the selection+window calls (bulk authoring stays flash) |
 | `INFORMATIVENESS_MIN` | `0.5` | selection threshold (tune on real videos) |
 | `CLIP_TARGET_S` | `58` | target window length |
 | `CLIP_MAX_S` | `75` | hard‑ish ceiling; a window may reach this to finish a sentence |
