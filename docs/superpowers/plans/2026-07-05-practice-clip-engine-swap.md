@@ -705,8 +705,9 @@ git commit -m "feat(clip_engine): discovery orchestrator"
 - [ ] **Step 1: Copy the gemini-path modules**
 
 Copy these files from `practice/clips/backend/` into `backend/app/clip_engine/clipper/`, preserving the sub-paths:
-`__init__.py`, `config.py`, `errors.py`, `llm.py`, `embed.py`, `gemini_client.py`, `supadata_client.py`,
+`__init__.py`, `config.py`, `errors.py`, `llm.py`, `embed.py`, `gemini_client.py`, `supadata_client.py`, `groq_client.py`,
 `pipeline/__init__.py`, `pipeline/transcribe.py`, `pipeline/gemini_segment.py`, `pipeline/sentences.py`.
+(`groq_client.py` is included because `transcribe.py` references it; its `groq` import is made lazy in Step 3 so the `groq` package is NOT required on the default path.)
 
 ```bash
 # Run from the repo root: reelai/reelAI copy 2
@@ -749,7 +750,12 @@ SUPADATA_CHUNK_SIZE = 180
 
 - [ ] **Step 3: Make heavy imports lazy + write the import smoke test**
 
-In `clipper/pipeline/transcribe.py`, confirm `faster_whisper` is only imported *inside* the local/refine functions (it already is — `_get_whisper` imports lazily). Delete or stub any module-level import that pulls `torch` / `sentence_transformers` / `yt_dlp` on this path (the gemini path uses only `transcribe_supadata` + `supadata_client`). If `llm.py` imports `from .pipeline.select import estimate_tokens`, keep the existing `try/except` fallback (it already guards it). Remove any `groq_client` module-level import chains not needed by the gemini path (make them lazy).
+Import-graph facts (verified against the source) and the exact lazy-import edits required:
+- `embed.py` imports only `math`; `gemini_segment.py` imports `config` (shim) + `..llm` and lazily `rapidfuzz` (inside `_locate_quote`); `llm.py` imports `config` + `pydantic` at module level and lazily imports `gemini_client` / `groq_client` / `.pipeline.select` *inside* functions (already guarded). So importing `gemini_segment` + `embed` (the Task 6 smoke test) pulls NO heavy deps — good, do not change these.
+- `gemini_client.py` imports `from google import genai` at module level. It is only reached lazily via `llm.py`, so the smoke test never triggers it; `google-genai` is added to deps in Task 13. Leave it.
+- **Required edit — `clipper/pipeline/transcribe.py`:** move the module-level `from ..groq_client import transcribe_audio` (≈line 17) INTO the Groq/whisper function that actually uses it, so importing `transcribe` does not require Groq. `faster_whisper` is already lazy in `_get_whisper` — confirm and leave.
+- **Required edit — `clipper/groq_client.py`:** move the module-level `groq` SDK import (`import groq` / `from groq import ...`) INSIDE the functions that use it, so `import ...clipper.groq_client` succeeds without the `groq` package installed (the default `TRANSCRIBER=supadata` + `LLM_PROVIDER=gemini` path never calls Groq). Do NOT add `groq` to requirements.
+- Do not otherwise modify the vendored logic. If any *other* module-level import pulls `torch` / `sentence_transformers` / `yt_dlp` on the imported path, make it lazy the same way and note it in your report.
 
 ```python
 # backend/tests/clip_engine/test_clipper_import.py
@@ -807,14 +813,14 @@ def test_rejects_non_youtube():
 def test_clip_builds_embed_urls(monkeypatch):
     fake_tx = {"segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
                "words": [], "duration": 5.0}
-    monkeypatch.setattr(run, "_transcribe", lambda vid, lang: fake_tx)
+    monkeypatch.setattr(run, "_transcribe", lambda url, video_id, settings: fake_tx)
     monkeypatch.setattr(run.gemini_segment, "segment_clips",
                         lambda transcript, settings, progress=None: (
                             [{"start": 1.0, "end": 4.0, "cut_end": 4.15, "title": "Bit",
                               "facet": "concept", "reason": "", "sequence_index": 1}], "1 clip"))
-    out = run.clip("https://www.youtube.com/watch?v=abc123", "topic")
-    assert out["video_id"] == "abc123"
-    assert out["clips"][0]["embed_url"] == "https://www.youtube.com/embed/abc123?start=1&end=4&rel=0"
+    out = run.clip("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "topic")
+    assert out["video_id"] == "dQw4w9WgXcQ"
+    assert out["clips"][0]["embed_url"] == "https://www.youtube.com/embed/dQw4w9WgXcQ?start=1&end=4&rel=0"
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -838,11 +844,11 @@ from .errors import ClipError, TranscriptError, UnsupportedURLError
 from .metadata import extract_video_id
 
 
-def _transcribe(video_id: str, lang: str) -> dict:
-    """Fetch a timestamped Supadata transcript as {segments, words, duration}."""
+def _transcribe(url: str, video_id: str, settings: dict) -> dict:
+    """Fetch a timestamped Supadata transcript as {segments, words, duration, ...}."""
     from .clipper.pipeline.transcribe import transcribe_supadata  # lazy
     try:
-        return transcribe_supadata(video_id, lang=lang)
+        return transcribe_supadata(url, video_id, settings)
     except Exception as exc:  # normalize to engine error
         raise TranscriptError(f"Supadata transcript failed for {video_id}: {exc}") from exc
 
@@ -856,8 +862,7 @@ def clip(url: str, topic: str, settings: dict | None = None) -> dict:
     settings.setdefault("segment_fine_snap", config.SEGMENT_FINE_SNAP)
     settings.setdefault("segment_min_clip_s", config.SEGMENT_MIN_CLIP_S)
 
-    lang = settings.get("language", "en")
-    transcript = _transcribe(video_id, lang)
+    transcript = _transcribe(url, video_id, settings)
     if not (transcript.get("segments")):
         raise TranscriptError(f"Empty transcript for {video_id}")
 
@@ -867,7 +872,10 @@ def clip(url: str, topic: str, settings: dict | None = None) -> dict:
         raise ClipError(f"Gemini segmentation failed for {video_id}: {exc}") from exc
 
     for c in clips:
-        c["embed_url"] = embed.embed_url(video_id, c["start"], c.get("cut_end", c["end"]))
+        # Embed end uses c["end"] (the semantic clip end), NOT cut_end (which adds
+        # tail_pad for the ffmpeg cut path we don't use in embed mode). This keeps the
+        # embed window consistent with the adapter's t_end.
+        c["embed_url"] = embed.embed_url(video_id, c["start"], c["end"])
     return {"video_id": video_id, "clips": clips, "transcript": transcript, "notes": notes}
 ```
 
@@ -922,7 +930,7 @@ def youtube_metadata(video_id: str) -> dict:
 Run: `backend/.venv/bin/python -m pytest backend/tests/clip_engine/test_run.py -v`
 Expected: PASS.
 
-> **Note for the implementer:** confirm `transcribe_supadata`'s real signature in the vendored `clipper/pipeline/transcribe.py`. If it takes a full URL or a work-dir arg, adjust `_transcribe` accordingly (pass `f"https://www.youtube.com/watch?v={video_id}"`). The test mocks `_transcribe`, so the contract is the return shape `{segments, words, duration}`, which `gemini_segment.segment_clips` requires.
+> **Confirmed signature (verified in the vendored code):** `transcribe_supadata(url: str, video_id: str, settings: dict, progress=None) -> dict` returning `{text, duration, words, segments, source, chunks}`. It caches to `config.WORK_DIR/video_id/transcript.json`, so the clipper config shim's `WORK_DIR` must be a writable path at runtime (NOT exercised by this task's mocked test). `_transcribe(url, video_id, settings)` passes the full watch URL, the id, and `settings` (which carries `language`). `segment_clips` needs `segments` (each `{start,end,text}`) + `words` (each `{word,start,end}`).
 
 - [ ] **Step 5: Commit**
 
@@ -956,7 +964,7 @@ from backend.app.clip_engine import adapter
 def test_to_reel_out_maps_core_fields():
     clip = {"start": 10.0, "end": 40.0, "cut_end": 40.15, "title": "Chain rule",
             "facet": "concept", "reason": "core idea", "sequence_index": 1,
-            "embed_url": "https://www.youtube.com/embed/abc123?start=10&end=41&rel=0"}
+            "embed_url": "https://www.youtube.com/embed/dQw4w9WgXcQ?start=10&end=41&rel=0"}
     transcript = {"segments": [
         {"start": 9.0, "end": 12.0, "text": "before"},
         {"start": 12.0, "end": 38.0, "text": "the chain rule says"},
@@ -964,8 +972,8 @@ def test_to_reel_out_maps_core_fields():
     meta = {"title": "Calculus 101", "author_name": "MathChan", "duration_sec": 600.0,
             "thumbnail_url": "http://t", "description": "d"}
     reel = adapter.to_reel_out(clip, transcript, meta, reel_id="r1", material_id="m1",
-                               concept_id="c1", concept_title="Chain rule", video_id="abc123",
-                               source_url="https://www.youtube.com/watch?v=abc123")
+                               concept_id="c1", concept_title="Chain rule", video_id="dQw4w9WgXcQ",
+                               source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ")
     assert reel.video_url == clip["embed_url"]
     assert reel.t_start == 10.0 and reel.t_end == 40.0
     assert reel.video_title == "Calculus 101"
@@ -1081,21 +1089,21 @@ import pytest
 def test_ingest_url_returns_ingest_result(monkeypatch, ingestion_pipeline):
     from backend.app.clip_engine import run as engine_run
     monkeypatch.setattr(engine_run, "clip", lambda url, topic, settings=None: {
-        "video_id": "abc123",
+        "video_id": "dQw4w9WgXcQ",
         "clips": [{"start": 5.0, "end": 35.0, "cut_end": 35.1, "title": "Bit", "facet": "c",
                    "reason": "", "sequence_index": 1,
-                   "embed_url": "https://www.youtube.com/embed/abc123?start=5&end=35&rel=0"}],
+                   "embed_url": "https://www.youtube.com/embed/dQw4w9WgXcQ?start=5&end=35&rel=0"}],
         "transcript": {"segments": [{"start": 5.0, "end": 35.0, "text": "hi"}], "words": [], "duration": 300.0},
         "notes": "1 clip"})
     from backend.app.clip_engine import metadata
     monkeypatch.setattr(metadata, "youtube_metadata", lambda vid: {"title": "V", "duration_sec": 300.0})
 
-    result = ingestion_pipeline.ingest_url(source_url="https://www.youtube.com/watch?v=abc123",
+    result = ingestion_pipeline.ingest_url(source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                                            material_id="m1", concept_id=None,
                                            target_clip_duration_sec=45,
                                            target_clip_duration_min_sec=15,
                                            target_clip_duration_max_sec=60, language="en")
-    assert result.reel.video_url.startswith("https://www.youtube.com/embed/abc123")
+    assert result.reel.video_url.startswith("https://www.youtube.com/embed/dQw4w9WgXcQ")
     assert result.metadata.platform == "yt"
     assert result.reel.t_start == 5.0
 
@@ -1209,16 +1217,16 @@ git commit -m "feat(ingest): route ingest_url through the clip engine (YouTube-o
 def test_topic_cut_returns_all_clips(monkeypatch, ingestion_pipeline):
     from backend.app.clip_engine import run as engine_run, metadata
     monkeypatch.setattr(engine_run, "clip", lambda url, topic, settings=None: {
-        "video_id": "abc123",
+        "video_id": "dQw4w9WgXcQ",
         "clips": [
             {"start": 0.0, "end": 30.0, "cut_end": 30.1, "title": "A", "facet": "c", "reason": "",
-             "sequence_index": 1, "embed_url": "https://www.youtube.com/embed/abc123?start=0&end=30&rel=0"},
+             "sequence_index": 1, "embed_url": "https://www.youtube.com/embed/dQw4w9WgXcQ?start=0&end=30&rel=0"},
             {"start": 31.0, "end": 70.0, "cut_end": 70.1, "title": "B", "facet": "c", "reason": "",
-             "sequence_index": 2, "embed_url": "https://www.youtube.com/embed/abc123?start=31&end=70&rel=0"}],
+             "sequence_index": 2, "embed_url": "https://www.youtube.com/embed/dQw4w9WgXcQ?start=31&end=70&rel=0"}],
         "transcript": {"segments": [{"start": 0.0, "end": 70.0, "text": "x"}], "words": [], "duration": 600.0},
         "notes": "2"})
     monkeypatch.setattr(metadata, "youtube_metadata", lambda vid: {"title": "V", "duration_sec": 600.0})
-    result = ingestion_pipeline.ingest_topic_cut(source_url="https://www.youtube.com/watch?v=abc123",
+    result = ingestion_pipeline.ingest_topic_cut(source_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                                                  material_id="m1", concept_id=None, language="en",
                                                  use_llm=True, query="topic")
     assert result.reel_count == 2
@@ -1285,12 +1293,12 @@ def test_search_ingests_youtube_results(monkeypatch, ingestion_pipeline):
     from backend.app.clip_engine import search, run as engine_run, metadata
     monkeypatch.setattr(search, "discover", lambda topic, limit, exclude_video_ids=None, breadth=None: {
         "corrected": "calc", "credits_used": 1, "warning": None,
-        "videos": [{"id": "v1", "url": "https://www.youtube.com/watch?v=v1", "title": "V1",
+        "videos": [{"id": "9bZkp7q19f0", "url": "https://www.youtube.com/watch?v=9bZkp7q19f0", "title": "V1",
                     "channel": "Ch", "duration": 300, "view_count": 10, "thumbnail": "t", "upload_date": ""}]})
     monkeypatch.setattr(engine_run, "clip", lambda url, topic, settings=None: {
-        "video_id": "v1", "clips": [{"start": 3.0, "end": 33.0, "cut_end": 33.1, "title": "X",
+        "video_id": "9bZkp7q19f0", "clips": [{"start": 3.0, "end": 33.0, "cut_end": 33.1, "title": "X",
         "facet": "c", "reason": "", "sequence_index": 1,
-        "embed_url": "https://www.youtube.com/embed/v1?start=3&end=33&rel=0"}],
+        "embed_url": "https://www.youtube.com/embed/9bZkp7q19f0?start=3&end=33&rel=0"}],
         "transcript": {"segments": [{"start": 3.0, "end": 33.0, "text": "x"}], "words": [], "duration": 300.0},
         "notes": "1"})
     monkeypatch.setattr(metadata, "youtube_metadata", lambda vid: {})
@@ -1301,7 +1309,7 @@ def test_search_ingests_youtube_results(monkeypatch, ingestion_pipeline):
                                               exclude_video_ids=[])
     assert result.platforms == ["yt"]
     assert result.succeeded == 1
-    assert result.items[0].reel.video_url.startswith("https://www.youtube.com/embed/v1")
+    assert result.items[0].reel.video_url.startswith("https://www.youtube.com/embed/9bZkp7q19f0")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1386,11 +1394,11 @@ git commit -m "feat(ingest): route ingest_search through Supadata + clip engine 
 def test_feed_ingests_resolved_urls(monkeypatch, ingestion_pipeline):
     from backend.app.clip_engine import metadata, run as engine_run
     monkeypatch.setattr(metadata, "resolve_feed_urls",
-                        lambda feed_url, max_items: ["https://www.youtube.com/watch?v=v1"])
+                        lambda feed_url, max_items: ["https://www.youtube.com/watch?v=9bZkp7q19f0"])
     monkeypatch.setattr(engine_run, "clip", lambda url, topic, settings=None: {
-        "video_id": "v1", "clips": [{"start": 1.0, "end": 20.0, "cut_end": 20.1, "title": "T",
+        "video_id": "9bZkp7q19f0", "clips": [{"start": 1.0, "end": 20.0, "cut_end": 20.1, "title": "T",
         "facet": "c", "reason": "", "sequence_index": 1,
-        "embed_url": "https://www.youtube.com/embed/v1?start=1&end=20&rel=0"}],
+        "embed_url": "https://www.youtube.com/embed/9bZkp7q19f0?start=1&end=20&rel=0"}],
         "transcript": {"segments": [{"start": 1.0, "end": 20.0, "text": "x"}], "words": [], "duration": 120.0},
         "notes": "1"})
     monkeypatch.setattr(metadata, "youtube_metadata", lambda vid: {})
@@ -1467,15 +1475,15 @@ def test_ingest_url_response_schema(monkeypatch):
     # The engine is mocked; this asserts the HTTP layer still emits the ReelOut contract.
     from backend.app.clip_engine import run as engine_run, metadata
     monkeypatch.setattr(engine_run, "clip", lambda url, topic, settings=None: {
-        "video_id": "abc123", "notes": "1",
+        "video_id": "dQw4w9WgXcQ", "notes": "1",
         "clips": [{"start": 5.0, "end": 35.0, "cut_end": 35.1, "title": "T", "facet": "c",
                    "reason": "", "sequence_index": 1,
-                   "embed_url": "https://www.youtube.com/embed/abc123?start=5&end=35&rel=0"}],
+                   "embed_url": "https://www.youtube.com/embed/dQw4w9WgXcQ?start=5&end=35&rel=0"}],
         "transcript": {"segments": [{"start": 5.0, "end": 35.0, "text": "x"}], "words": [], "duration": 300.0}})
     monkeypatch.setattr(metadata, "youtube_metadata", lambda vid: {"title": "V", "duration_sec": 300.0})
     from backend.app.main import app
     client = TestClient(app)
-    r = client.post("/api/ingest/url", json={"source_url": "https://www.youtube.com/watch?v=abc123",
+    r = client.post("/api/ingest/url", json={"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
                                              "material_id": "m1"})
     assert r.status_code == 200
     body = r.json()
@@ -1484,7 +1492,7 @@ def test_ingest_url_response_schema(monkeypatch):
     reel = body["reel"]
     for key in ("reel_id", "video_url", "t_start", "t_end", "captions", "video_duration_sec"):
         assert key in reel
-    assert reel["video_url"].startswith("https://www.youtube.com/embed/abc123")
+    assert reel["video_url"].startswith("https://www.youtube.com/embed/dQw4w9WgXcQ")
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
