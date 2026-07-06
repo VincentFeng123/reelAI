@@ -149,6 +149,22 @@ def filter_by_query(
     return scored
 
 
+# ── Best-clip selection ───────────────────────────────────────────────────────
+
+
+def pick_best_clip(clips: list[dict], target_sec: float, max_sec: float) -> dict:
+    """Pick the single best clip for a single-clip endpoint: prefer clips whose
+    duration is within max_sec (short-form UX), and among those the one closest to
+    target_sec. If NO clip is within max_sec, return the closest-to-target overall —
+    we return the full topic clip rather than clamping it mid-thought (the gemini
+    engine ships whole self-contained topics)."""
+    def dur(c: dict) -> float:
+        return float(c["end"]) - float(c["start"])
+    in_bounds = [c for c in clips if dur(c) <= max_sec]
+    pool = in_bounds or clips
+    return min(pool, key=lambda c: abs(dur(c) - target_sec))
+
+
 __all__ = [
     "to_cues",
     "window_text",
@@ -157,4 +173,5 @@ __all__ = [
     "to_segment",
     "relevance_score",
     "filter_by_query",
+    "pick_best_clip",
 ]

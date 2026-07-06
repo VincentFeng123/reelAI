@@ -249,6 +249,60 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
         self.assertAlmostEqual(result.reel.t_start, 30.0)
         self.assertAlmostEqual(result.reel.t_end, 74.0)
 
+    # --------------------------------------------------------------------- #
+    # Idempotency: calling ingest_url twice with the same URL + material_id
+    # must return the same reel_id (unique-index collision → load_existing_reel)
+    # --------------------------------------------------------------------- #
+
+    def test_ingest_url_idempotent_same_reel_id(self) -> None:
+        source_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        material_id = "mat-dedup-test"
+
+        with (
+            mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
+            mock.patch.object(pipeline_module, "clip_engine_meta") as mock_meta,
+        ):
+            mock_meta.extract_video_id.return_value = "dQw4w9WgXcQ"
+            mock_meta.youtube_metadata.return_value = {
+                "title": "Never Gonna Give You Up",
+                "duration_sec": 300.0,
+                "author_name": "Rick Astley",
+                "description": "The classic",
+                "thumbnail_url": "",
+                "view_count": 1_000_000,
+            }
+            mock_run.clip.return_value = _fake_engine_out()
+
+            result1 = main_module.ingestion_pipeline.ingest_url(
+                source_url=source_url,
+                material_id=material_id,
+                concept_id=None,
+                target_clip_duration_sec=45,
+                target_clip_duration_min_sec=15,
+                target_clip_duration_max_sec=60,
+                language="en",
+            )
+            result2 = main_module.ingestion_pipeline.ingest_url(
+                source_url=source_url,
+                material_id=material_id,
+                concept_id=None,
+                target_clip_duration_sec=45,
+                target_clip_duration_min_sec=15,
+                target_clip_duration_max_sec=60,
+                language="en",
+            )
+
+        # Both calls must resolve to the same persisted reel row
+        self.assertEqual(result1.reel.reel_id, result2.reel.reel_id)
+        # Verify DB only has one row for this (material_id, video_id, t_start, t_end)
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS cnt FROM reels WHERE id = ?",
+                (result1.reel.reel_id,),
+            )
+            self.assertEqual(row["cnt"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

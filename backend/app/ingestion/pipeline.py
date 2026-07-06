@@ -241,7 +241,7 @@ class IngestionPipeline:
         if not clips:
             raise SegmentationError("no on-topic clip could be produced")
 
-        best = min(clips, key=lambda c: abs((c["end"] - c["start"]) - target_clip_duration_sec))
+        best = clip_engine_bridge.pick_best_clip(clips, target_clip_duration_sec, target_clip_duration_max_sec)
 
         meta = clip_engine_meta.youtube_metadata(video_id) or {}
         if not meta.get("duration_sec"):
@@ -590,10 +590,7 @@ class IngestionPipeline:
                     items.append(IngestFeedItem(source_url=url, status="skipped"))
                     continue
 
-                best = min(
-                    engine_out["clips"],
-                    key=lambda c: abs((c["end"] - c["start"]) - target_clip_duration_sec),
-                )
+                best = clip_engine_bridge.pick_best_clip(engine_out["clips"], target_clip_duration_sec, target_clip_duration_max_sec)
 
                 meta = clip_engine_meta.youtube_metadata(video_id) or {}
                 if not meta.get("duration_sec"):
@@ -799,6 +796,10 @@ class IngestionPipeline:
             query, limit=limit, exclude_video_ids=exclude_video_ids or []
         )
 
+        _search_warning = disc.get("warning")
+        if _search_warning:
+            log_event(logger, logging.WARNING, "ingest_search_warning", warning=_search_warning)
+
         items: list[IngestSearchItem] = []
         succeeded = 0
         failed = 0
@@ -814,10 +815,7 @@ class IngestionPipeline:
                     ))
                     continue
 
-                best = min(
-                    engine_out["clips"],
-                    key=lambda c: abs((c["end"] - c["start"]) - target_clip_duration_sec),
-                )
+                best = clip_engine_bridge.pick_best_clip(engine_out["clips"], target_clip_duration_sec, target_clip_duration_max_sec)
 
                 meta = {
                     "title": v.get("title", ""),
@@ -873,7 +871,7 @@ class IngestionPipeline:
             per_platform_resolved={"yt": len(disc["videos"])},
             per_platform_succeeded={"yt": succeeded},
             per_platform_failed={"yt": failed},
-            per_platform_errors={},
+            per_platform_errors={"yt": _search_warning} if _search_warning else {},
             total_resolved=len(disc["videos"]),
             succeeded=succeeded,
             failed=failed,

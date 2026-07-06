@@ -254,3 +254,25 @@ def test_filter_by_query_no_mutate_on_no_query():
     original_clip = clips[0].copy()
     bridge.filter_by_query(clips, TRANSCRIPT, None)
     assert clips[0] == original_clip
+
+
+# ── pick_best_clip ────────────────────────────────────────────────────────────
+
+
+def _make_clip(start: float, end: float) -> dict:
+    return {"start": start, "end": end, "title": f"{int(end - start)}s clip"}
+
+
+def test_pick_best_clip_prefers_in_bounds():
+    # clips: 70s, 40s, 200s; target=45, max=60 → in-bounds are 40s and 70s is out
+    # Wait: 70s > 60 so in-bounds = [40s]. Returns 40s.
+    clips = [_make_clip(0, 70), _make_clip(100, 140), _make_clip(200, 400)]
+    result = bridge.pick_best_clip(clips, target_sec=45.0, max_sec=60.0)
+    assert float(result["end"]) - float(result["start"]) == 40.0
+
+
+def test_pick_best_clip_fallback_when_none_in_bounds():
+    # clips: 90s, 200s; both exceed max=60 → fallback to full pool, closest to 45 is 90s
+    clips = [_make_clip(0, 90), _make_clip(100, 300)]
+    result = bridge.pick_best_clip(clips, target_sec=45.0, max_sec=60.0)
+    assert float(result["end"]) - float(result["start"]) == 90.0

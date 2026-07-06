@@ -260,6 +260,45 @@ class ClipEngineSearchTests(unittest.TestCase):
         self.assertIn("network timeout", result.items[0].error)
 
     # --------------------------------------------------------------------- #
+    # Discover warning → surfaces in per_platform_errors
+    # --------------------------------------------------------------------- #
+
+    def test_discover_warning_surfaces_in_per_platform_errors(self) -> None:
+        """
+        When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,
+        ingest_search must propagate it into per_platform_errors["yt"] and report
+        total_resolved == 0, not silently return HTTP 200 with empty items.
+        """
+        warn_discover = {
+            "corrected": "x",
+            "credits_used": 0,
+            "warning": "out of Supadata credits",
+            "videos": [],
+        }
+
+        with (
+            mock.patch.object(pipeline_module, "clip_engine_search") as mock_search,
+            mock.patch.object(pipeline_module, "clip_engine_run") as _mock_run,
+        ):
+            mock_search.discover.return_value = warn_discover
+
+            result = main_module.ingestion_pipeline.ingest_search(
+                query="calc",
+                platforms=["yt"],
+                max_per_platform=5,
+                material_id="m-warn",
+                concept_id=None,
+                target_clip_duration_sec=45,
+                target_clip_duration_min_sec=15,
+                target_clip_duration_max_sec=60,
+                language="en",
+                exclude_video_ids=[],
+            )
+
+        self.assertEqual(result.total_resolved, 0)
+        self.assertEqual(result.per_platform_errors, {"yt": "out of Supadata credits"})
+
+    # --------------------------------------------------------------------- #
     # No material_id → sentinel material created deterministically
     # --------------------------------------------------------------------- #
 
