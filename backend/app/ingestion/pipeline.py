@@ -304,33 +304,14 @@ class IngestionPipeline:
         """
         Topic-aware variant of `ingest_url` that emits MULTIPLE reels per video.
 
-        Reuses the existing download → transcribe machinery, then hands the
-        cues to `services.topic_cut.cut_video_into_topic_reels` which:
-          1. Classifies the video as Short or long-form (Shorts are returned
-             with an empty `reels` list — caller leaves them alone).
-          2. For long-form: asks the LLM to identify topic boundaries by cue
-             index, snaps the boundaries to natural cue gaps, and drops any
-             segment outside [30s, 12min].
-          3. Falls back to the lexical-novelty heuristic if no LLM provider
-             (Gemini/Groq) is available or the LLM call fails.
+        Routes through the clip engine (same as `ingest_url`), then applies
+        query-relevance filtering via `clip_engine_bridge.filter_by_query`.
+        Each kept clip is persisted via `_persist_ingest`, producing a list of
+        `ReelOutWithAttribution` rows that decode cleanly into the iOS Reel struct.
 
-        Each TopicReel is then persisted via the same sentinel-material path
-        used by `_persist_ingest`, producing a list of `ReelOutWithAttribution`
-        rows that decode cleanly into the iOS `Reel` struct.
-
-        Concurrency note: this method is single-threaded — topic segmentation
-        is one LLM call, persistence is one transaction. The pipeline-wide
-        rate limiter is acquired once per video, just like `ingest_url`.
+        `use_llm` is accepted for API signature compatibility — the clip engine
+        always uses its internal LLM; this param has no effect.
         """
-        # Local import to break the import cycle: services.topic_cut imports
-        # nothing from the ingestion package, but we don't want this module to
-        # take on a top-level dependency on services either.
-        from ..services.topic_cut import (
-            VideoClassification,
-            cues_from_ingest_cues,
-            cut_video_into_topic_reels,
-        )
-
         effective_trace = set_trace_id(trace_id or new_trace_id())
         log_event(
             logger,
@@ -343,102 +324,60 @@ class IngestionPipeline:
         )
         started = time.monotonic()
 
-        self._preflight()
+        video_id = clip_engine_meta.extract_video_id(source_url)
+        if not video_id:
+            raise UnsupportedSourceError("Only YouTube URLs are supported.")
 
-        adapter = self._pick_adapter(source_url)
-        platform: PlatformCode = adapter.platform_for(source_url)
-        self._rate_limiter.acquire(platform)
+        self._rate_limiter.acquire("yt")
 
-        with TempWorkspace() as workspace:
-            adapter_result = adapter.resolve(source_url, workspace)
-            metadata = map_info_dict_to_metadata(
-                adapter_result.info_dict,
-                platform=platform,
-                source_url=source_url,
-                source_id=adapter_result.source_id,
-                playback_url=adapter_result.playback_url,
+        try:
+            engine_out = clip_engine_run.clip(
+                source_url,
+                topic=(query or ""),
+                settings={"language": language},
             )
+        except _ClipUnsupportedURLError as exc:
+            raise UnsupportedSourceError(str(exc)) from exc
+        except _ClipTranscriptError as exc:
+            raise TranscriptionError(str(exc)) from exc
+        except _ClipError as exc:
+            raise SegmentationError(str(exc)) from exc
 
-            duration_sec = metadata.duration_sec
-            if not duration_sec or duration_sec <= 0:
-                try:
-                    duration_sec = probe_duration(adapter_result.video_path)
-                    metadata = metadata.model_copy(update={"duration_sec": duration_sec})
-                except DownloadError as exc:
-                    raise DownloadError(
-                        "Could not determine video duration",
-                        detail=exc.detail or exc.message,
-                    ) from exc
-
-            try:
-                cues = self._transcribe_with_conn(
-                    platform=platform,
-                    source_id=adapter_result.source_id,
-                    info_dict=adapter_result.info_dict,
-                    video_path=adapter_result.video_path,
-                    workspace=workspace,
-                    language=language,
-                    video_duration_sec=float(duration_sec) if duration_sec else None,
-                )
-            except (TranscriptionError, ServerlessUnavailable):
-                raise
-            except Exception as exc:
-                raise TranscriptionError("unexpected error during transcription", detail=str(exc)) from exc
-
-            if not cues:
-                raise TranscriptionError("no transcript cues were produced")
-
-            # Stash the info_dict so we can pass it (and its `chapters` key)
-            # to topic_cut after the workspace exits. Most ingest paths only
-            # need the metadata that map_info_dict_to_metadata extracted, but
-            # topic_cut wants the raw `chapters` list which we've never
-            # propagated until now.
-            info_dict_snapshot: dict[str, Any] = dict(adapter_result.info_dict or {})
-
-            # Phase A.4: silence ranges let ClipBoundaryEngine prefer sentence
-            # endings near silence (= clean breaks / speaker pauses).
-            silence_ranges_for_topic_cut: list[tuple[float, float]] = []
-            audio_path_for_silence = workspace / "audio_16k.wav"
-            try:
-                if audio_path_for_silence.exists():
-                    silence_ranges_for_topic_cut = silencedetect(audio_path_for_silence)
-            except SegmentationError:
-                logger.warning(
-                    "silencedetect failed in topic_cut path; continuing without silence tiebreakers"
-                )
-                silence_ranges_for_topic_cut = []
-
-        # Outside the workspace ctx-manager: the temp dir + downloaded video are
-        # gone, but cues + metadata are pure-Python and survive.
-        topic_cues = cues_from_ingest_cues(cues)
-        classification, topic_reels = cut_video_into_topic_reels(
-            source_url,
-            query=query,
-            duration_sec=float(duration_sec or 0.0),
-            use_llm=use_llm,
-            transcript=topic_cues,
-            info_dict=info_dict_snapshot,
-            # Phase A.4: precision inputs. `cues` carries word-level timestamps
-            # when Whisper was used (see transcribe.py A.1 changes).
-            ingest_cues_for_precision=cues,
-            silence_ranges=silence_ranges_for_topic_cut or None,
-            # The topic_cut endpoint has no notion of user clip-duration settings
-            # today; engine defaults (min=MIN_TOPIC_REEL_SEC, max=MAX_TOPIC_REEL_SEC)
-            # apply. /api/ingest/url and /api/feed callers that DO have user
-            # settings pass them through below.
+        kept = clip_engine_bridge.filter_by_query(
+            engine_out["clips"], engine_out["transcript"], query
         )
 
-        persisted_reels: list[ReelOutWithAttribution] = []
-        if not classification.is_short and topic_reels:
-            persisted_reels = self._persist_topic_reels(
-                topic_reels=topic_reels,
-                cues=cues,
-                adapter_result=adapter_result,
-                metadata=metadata,
-                material_id=material_id,
-                concept_id=concept_id,
-                query=query,
-            )
+        meta = clip_engine_meta.youtube_metadata(video_id) or {}
+        duration = float(
+            meta.get("duration_sec") or engine_out["transcript"].get("duration") or 0.0
+        )
+
+        is_short = bool(duration and duration < 60.0 and not kept)
+
+        reels: list[ReelOutWithAttribution] = []
+        metadata = clip_engine_bridge.to_metadata(video_id, meta, source_url)
+
+        if not is_short and kept:
+            adapter_result = clip_engine_bridge.synth_adapter_result(video_id, source_url)
+            cues = clip_engine_bridge.to_cues(engine_out["transcript"])
+
+            for clip in kept:
+                chosen = clip_engine_bridge.to_segment(clip, engine_out["transcript"])
+                snippet = clip_engine_bridge.window_text(
+                    engine_out["transcript"], chosen.t_start, chosen.t_end
+                )[:700]
+                persisted = self._persist_ingest(
+                    adapter_result=adapter_result,
+                    metadata=metadata,
+                    cues=cues,
+                    chosen=chosen,
+                    snippet=snippet,
+                    material_id=material_id,
+                    concept_id=concept_id,
+                    clip_window=(chosen.t_start, chosen.t_end),
+                    target_max=720,  # MAX_TOPIC_REEL_SEC = 12 * 60
+                )
+                reels.append(persisted)
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
         log_event(
@@ -446,21 +385,20 @@ class IngestionPipeline:
             logging.INFO,
             "ingest_topic_cut_completed",
             source_url=source_url,
-            video_id=classification.video_id,
-            platform=platform,
-            is_short=classification.is_short,
-            reel_count=len(persisted_reels),
+            video_id=video_id,
+            is_short=is_short,
+            reel_count=len(reels),
             elapsed_ms=elapsed_ms,
         )
 
         return IngestTopicCutResult(
             source_url=source_url,
-            video_id=classification.video_id,
-            is_short=classification.is_short,
-            classification_reason=classification.reason,
-            duration_sec=float(classification.duration_sec or duration_sec or 0.0),
-            reel_count=len(persisted_reels),
-            reels=persisted_reels,
+            video_id=video_id,
+            is_short=is_short,
+            classification_reason=("short" if is_short else "long-form"),
+            duration_sec=duration,
+            reel_count=len(reels),
+            reels=reels,
             metadata=metadata,
             terms_notice=TERMS_NOTICE,
             trace_id=effective_trace,
