@@ -77,7 +77,7 @@ from .persistence import (
 )
 from .segment import normalize_clip_window, pick_segments, snippet_for_window
 from .transcribe import transcribe
-from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta  # noqa: F401
+from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta, config as clip_engine_config  # noqa: F401
 from ..clip_engine.errors import (
     ClipError as _ClipError,
     TranscriptError as _ClipTranscriptError,
@@ -779,267 +779,97 @@ class IngestionPipeline:
         is handled correctly by ingest_url() via load_existing_reel.
         """
         effective_trace = set_trace_id(trace_id or new_trace_id())
-        # Default to YouTube only. Instagram and TikTok robots.txt explicitly
-        # disallow the ReelAIBot user agent, so resolving them from here would
-        # always bounce at the robots.txt check in yt_dlp_adapter. Callers can
-        # still opt in by passing a platforms list explicitly.
-        effective_platforms: list[PlatformLiteral] = list(platforms) if platforms else ["yt"]
-        exclude = {str(v).strip() for v in (exclude_video_ids or []) if v}
 
-        log_event(
-            logger,
-            logging.INFO,
-            "ingest_search_start",
-            query=query,
-            platforms=effective_platforms,
-            max_per_platform=max_per_platform,
-            exclude_count=len(exclude),
+        # Coerce to YouTube-only regardless of what the caller requested.
+        resolved_material_id = material_id or self._ensure_search_material(query)
+        limit = min(int(max_per_platform), clip_engine_config.CLIP_SEARCH_MAX_VIDEOS)
+
+        self._rate_limiter.acquire("yt")
+
+        disc = clip_engine_search.discover(
+            query, limit=limit, exclude_video_ids=exclude_video_ids or []
         )
-
-        started = time.monotonic()
-        self._preflight()
-
-        adapter = self._pick_search_adapter()
-
-        per_platform_resolved: dict[str, int] = {p: 0 for p in effective_platforms}
-        per_platform_succeeded: dict[str, int] = {p: 0 for p in effective_platforms}
-        per_platform_failed: dict[str, int] = {p: 0 for p in effective_platforms}
-        per_platform_errors: dict[str, str] = {}
-
-        resolved_urls: list[tuple[PlatformLiteral, str]] = []
-        seen_urls: set[str] = set()
-        seen_source_ids: set[str] = set()
-
-        # ---- Phase 1: resolve each platform's URL list (best-effort per platform) ----
-        for platform in effective_platforms:
-            try:
-                search_url = adapter.build_search_url(query, platform, max_per_platform)
-            except IngestError as exc:
-                per_platform_failed[platform] = per_platform_failed.get(platform, 0) + 1
-                per_platform_errors[platform] = exc.message
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "search_url_build_failed",
-                    platform=platform,
-                    error=exc.message,
-                )
-                continue
-
-            try:
-                urls = adapter.resolve_feed(search_url, max_items=max_per_platform)
-            except IngestError as exc:
-                per_platform_failed[platform] = per_platform_failed.get(platform, 0) + 1
-                per_platform_errors[platform] = exc.message
-                log_event(
-                    logger,
-                    logging.WARNING,
-                    "search_resolve_failed",
-                    platform=platform,
-                    error=exc.message,
-                )
-                continue
-            except Exception as exc:
-                per_platform_failed[platform] = per_platform_failed.get(platform, 0) + 1
-                per_platform_errors[platform] = f"unexpected: {exc}"
-                logger.exception(
-                    "search resolve_feed crashed for platform=%s query=%s", platform, query
-                )
-                continue
-
-            # Filter: skip duplicates, skip URLs whose extracted source_id is already seen.
-            accepted_this_platform = 0
-            for url in urls:
-                if url in seen_urls:
-                    continue
-                source_id = None
-                if hasattr(adapter, "extract_source_id_from_url"):
-                    try:
-                        source_id = adapter.extract_source_id_from_url(url, platform)
-                    except Exception:
-                        source_id = None
-                if source_id and source_id in exclude:
-                    continue
-                if source_id and source_id in seen_source_ids:
-                    continue
-                seen_urls.add(url)
-                if source_id:
-                    seen_source_ids.add(source_id)
-                resolved_urls.append((platform, url))
-                accepted_this_platform += 1
-            per_platform_resolved[platform] = accepted_this_platform
-
-        total_resolved = len(resolved_urls)
-        if total_resolved == 0:
-            log_event(
-                logger,
-                logging.WARNING,
-                "ingest_search_no_urls",
-                query=query,
-                per_platform_errors=per_platform_errors,
-            )
-
-        # ---- Phase 2: scope a material for the query and run ingestion ----
-        if material_id:
-            effective_material_id = material_id
-            effective_concept_id = concept_id
-        else:
-            effective_material_id = self._ensure_search_material(query)
-            # The search-scoped concept row is created alongside the material in
-            # `_ensure_search_material` and its id is deterministic, so we derive it
-            # here rather than doing another SELECT. Reels inserted below will JOIN
-            # cleanly to this concept from the legacy `/api/feed` endpoint.
-            effective_concept_id = concept_id or f"{effective_material_id}:concept"
-
-        def _ingest_one(platform: PlatformLiteral, reel_url: str) -> list[IngestSearchItem]:
-            # Try the topic-cut path first (YouTube only) — produces multiple
-            # query-filtered reels per video.  Falls back to the legacy single-
-            # clip path when topic-cut returns nothing.
-            if platform == "yt":
-                try:
-                    reels = self._ingest_url_with_topic_cut(
-                        source_url=reel_url,
-                        query=query,
-                        material_id=effective_material_id,
-                        concept_id=effective_concept_id,
-                        language=language,
-                        trace_id=effective_trace,
-                    )
-                    if reels:
-                        return [
-                            IngestSearchItem(
-                                platform=platform,
-                                source_url=reel_url,
-                                status="ok",
-                                reel=r,
-                                metadata=None,
-                            )
-                            for r in reels
-                        ]
-                    # topic-cut returned nothing (Short, all topics filtered) —
-                    # fall through to legacy single-clip path below.
-                except Exception:
-                    logger.debug(
-                        "topic-cut failed for %s, falling back to ingest_url",
-                        reel_url,
-                        exc_info=True,
-                    )
-
-            # Legacy single-clip fallback (also the primary path for IG/TT).
-            try:
-                result = self.ingest_url(
-                    source_url=reel_url,
-                    material_id=effective_material_id,
-                    concept_id=effective_concept_id,
-                    target_clip_duration_sec=target_clip_duration_sec,
-                    target_clip_duration_min_sec=target_clip_duration_min_sec,
-                    target_clip_duration_max_sec=target_clip_duration_max_sec,
-                    language=language,
-                    trace_id=effective_trace,
-                )
-                return [IngestSearchItem(
-                    platform=platform,
-                    source_url=reel_url,
-                    status="ok",
-                    reel=result.reel,
-                    metadata=result.metadata,
-                )]
-            except RateLimitedError as exc:
-                logger.warning(
-                    "search item rate-limited platform=%s url=%s retry_after=%s",
-                    platform,
-                    reel_url,
-                    exc.retry_after_sec,
-                )
-                return [IngestSearchItem(
-                    platform=platform,
-                    source_url=reel_url,
-                    status="rate_limited",
-                    error=exc.message,
-                )]
-            except IngestError as exc:
-                logger.warning(
-                    "search item failed platform=%s url=%s error=%s",
-                    platform,
-                    reel_url,
-                    exc.message,
-                )
-                return [IngestSearchItem(
-                    platform=platform,
-                    source_url=reel_url,
-                    status="error",
-                    error=exc.message,
-                )]
-            except Exception as exc:
-                logger.exception("search item crashed platform=%s url=%s", platform, reel_url)
-                return [IngestSearchItem(
-                    platform=platform,
-                    source_url=reel_url,
-                    status="error",
-                    error=str(exc),
-                )]
 
         items: list[IngestSearchItem] = []
-        if resolved_urls:
-            future_to_key = {
-                self._feed_executor.submit(_ingest_one, platform, url): (platform, url)
-                for platform, url in resolved_urls
-            }
-            for future in as_completed(future_to_key):
-                platform, url = future_to_key[future]
-                try:
-                    batch = future.result()
-                except Exception as exc:
-                    logger.exception("search future raised unexpectedly platform=%s", platform)
-                    batch = [IngestSearchItem(
-                        platform=platform,
-                        source_url=url,
-                        status="error",
-                        error=str(exc),
-                    )]
-                for item in batch:
-                    items.append(item)
-                    if item.status == "ok":
-                        per_platform_succeeded[item.platform] = per_platform_succeeded.get(item.platform, 0) + 1
-                    else:
-                        per_platform_failed[item.platform] = per_platform_failed.get(item.platform, 0) + 1
+        succeeded = 0
+        failed = 0
 
-        # Order items deterministically: resolved order, not completion order.
-        url_to_order = {url: idx for idx, (_p, url) in enumerate(resolved_urls)}
-        items.sort(key=lambda it: url_to_order.get(it.source_url, 1_000_000))
+        for v in disc["videos"]:
+            try:
+                engine_out = clip_engine_run.clip(
+                    v["url"], topic=query, settings={"language": language}
+                )
+                if not engine_out["clips"]:
+                    items.append(IngestSearchItem(
+                        platform="yt", source_url=v["url"], status="skipped"
+                    ))
+                    continue
 
-        succeeded = sum(1 for i in items if i.status == "ok")
-        failed = sum(1 for i in items if i.status in ("error", "rate_limited"))
+                best = min(
+                    engine_out["clips"],
+                    key=lambda c: abs((c["end"] - c["start"]) - target_clip_duration_sec),
+                )
 
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        log_event(
-            logger,
-            logging.INFO,
-            "ingest_search_completed",
-            query=query,
-            material_id=effective_material_id,
-            total_resolved=total_resolved,
-            succeeded=succeeded,
-            failed=failed,
-            per_platform_resolved=per_platform_resolved,
-            per_platform_succeeded=per_platform_succeeded,
-            per_platform_failed=per_platform_failed,
-            elapsed_ms=elapsed_ms,
-        )
+                meta = {
+                    "title": v.get("title", ""),
+                    "author_name": v.get("channel", ""),
+                    "duration_sec": v.get("duration") or engine_out["transcript"].get("duration"),
+                    "thumbnail_url": v.get("thumbnail", ""),
+                    "view_count": v.get("view_count"),
+                    "upload_date_iso": v.get("upload_date"),
+                }
+
+                adapter_result = clip_engine_bridge.synth_adapter_result(v["id"], v["url"])
+                metadata = clip_engine_bridge.to_metadata(v["id"], meta, v["url"])
+                cues = clip_engine_bridge.to_cues(engine_out["transcript"])
+                chosen = clip_engine_bridge.to_segment(best, engine_out["transcript"])
+                snippet = clip_engine_bridge.window_text(
+                    engine_out["transcript"], chosen.t_start, chosen.t_end
+                )[:700]
+
+                persisted = self._persist_ingest(
+                    adapter_result=adapter_result,
+                    metadata=metadata,
+                    cues=cues,
+                    chosen=chosen,
+                    snippet=snippet,
+                    material_id=resolved_material_id,
+                    concept_id=concept_id,
+                    clip_window=(chosen.t_start, chosen.t_end),
+                    target_max=int(target_clip_duration_max_sec),
+                )
+
+                items.append(IngestSearchItem(
+                    platform="yt",
+                    source_url=v["url"],
+                    status="ok",
+                    reel=persisted,
+                    metadata=metadata,
+                ))
+                succeeded += 1
+
+            except Exception as exc:
+                failed += 1
+                items.append(IngestSearchItem(
+                    platform="yt",
+                    source_url=v["url"],
+                    status="error",
+                    error=str(exc),
+                ))
 
         return IngestSearchResult(
             query=query,
-            material_id=effective_material_id,
-            platforms=effective_platforms,
-            per_platform_resolved=per_platform_resolved,
-            per_platform_succeeded=per_platform_succeeded,
-            per_platform_failed=per_platform_failed,
-            per_platform_errors=per_platform_errors,
-            total_resolved=total_resolved,
+            material_id=resolved_material_id,
+            platforms=["yt"],
+            per_platform_resolved={"yt": len(disc["videos"])},
+            per_platform_succeeded={"yt": succeeded},
+            per_platform_failed={"yt": failed},
+            per_platform_errors={},
+            total_resolved=len(disc["videos"]),
             succeeded=succeeded,
             failed=failed,
             items=items,
-            terms_notice=TERMS_NOTICE,
+            terms_notice=TERMS_NOTICE + " Search is YouTube-only.",
             trace_id=effective_trace,
         )
 
