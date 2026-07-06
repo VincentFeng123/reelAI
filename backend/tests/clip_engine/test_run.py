@@ -17,6 +17,6 @@ def test_clip_builds_embed_urls(monkeypatch):
                         lambda transcript, settings, progress=None: (
                             [{"start": 1.0, "end": 4.0, "cut_end": 4.15, "title": "Bit",
                               "facet": "concept", "reason": "", "sequence_index": 1}], "1 clip"))
-    out = run.clip("https://www.youtube.com/watch?v=abc123", "topic")
-    assert out["video_id"] == "abc123"
-    assert out["clips"][0]["embed_url"] == "https://www.youtube.com/embed/abc123?start=1&end=4&rel=0"
+    out = run.clip("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "topic")
+    assert out["video_id"] == "dQw4w9WgXcQ"
+    assert out["clips"][0]["embed_url"] == "https://www.youtube.com/embed/dQw4w9WgXcQ?start=1&end=4&rel=0"
