@@ -77,6 +77,12 @@ from .persistence import (
 )
 from .segment import normalize_clip_window, pick_segments, snippet_for_window
 from .transcribe import transcribe
+from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta  # noqa: F401
+from ..clip_engine.errors import (
+    ClipError as _ClipError,
+    TranscriptError as _ClipTranscriptError,
+    UnsupportedURLError as _ClipUnsupportedURLError,
+)
 
 logger: logging.Logger = get_ingest_logger(__name__)
 
@@ -212,103 +218,52 @@ class IngestionPipeline:
         log_event(logger, logging.INFO, "ingest_start", source_url=source_url, material_id=material_id, concept_id=concept_id)
         started = time.monotonic()
 
-        self._preflight()
+        video_id = clip_engine_meta.extract_video_id(source_url)
+        if not video_id:
+            raise UnsupportedSourceError("Only YouTube URLs are supported.")
 
-        adapter = self._pick_adapter(source_url)
-        platform: PlatformCode = adapter.platform_for(source_url)
-        self._rate_limiter.acquire(platform)
+        self._rate_limiter.acquire("yt")
 
-        with TempWorkspace() as workspace:
-            adapter_result = adapter.resolve(source_url, workspace)
-            metadata = map_info_dict_to_metadata(
-                adapter_result.info_dict,
-                platform=platform,
-                source_url=source_url,
-                source_id=adapter_result.source_id,
-                playback_url=adapter_result.playback_url,
+        try:
+            engine_out = clip_engine_run.clip(
+                source_url,
+                topic=(concept_id or ""),
+                settings={"language": language},
             )
+        except _ClipUnsupportedURLError as exc:
+            raise UnsupportedSourceError(str(exc)) from exc
+        except _ClipTranscriptError as exc:
+            raise TranscriptionError(str(exc)) from exc
+        except _ClipError as exc:
+            raise SegmentationError(str(exc)) from exc
 
-            duration_sec = metadata.duration_sec
-            if not duration_sec or duration_sec <= 0:
-                try:
-                    duration_sec = probe_duration(adapter_result.video_path)
-                    metadata = metadata.model_copy(update={"duration_sec": duration_sec})
-                except DownloadError as exc:
-                    raise DownloadError(
-                        "Could not determine video duration",
-                        detail=exc.detail or exc.message,
-                    ) from exc
+        clips = engine_out["clips"]
+        if not clips:
+            raise SegmentationError("no on-topic clip could be produced")
 
-            # Transcribe — opens its own short-lived connection for cache read/write.
-            try:
-                cues = self._transcribe_with_conn(
-                    platform=platform,
-                    source_id=adapter_result.source_id,
-                    info_dict=adapter_result.info_dict,
-                    video_path=adapter_result.video_path,
-                    workspace=workspace,
-                    language=language,
-                    video_duration_sec=float(duration_sec) if duration_sec else None,
-                )
-            except (TranscriptionError, ServerlessUnavailable):
-                raise
-            except Exception as exc:
-                raise TranscriptionError("unexpected error during transcription", detail=str(exc)) from exc
+        best = min(clips, key=lambda c: abs((c["end"] - c["start"]) - target_clip_duration_sec))
 
-            if not cues:
-                raise TranscriptionError("no transcript cues were produced")
+        meta = clip_engine_meta.youtube_metadata(video_id) or {}
+        if not meta.get("duration_sec"):
+            meta["duration_sec"] = engine_out["transcript"].get("duration")
 
-            # Silence detection
-            silence_ranges: list[tuple[float, float]] = []
-            audio_path = workspace / "audio_16k.wav"
-            try:
-                if audio_path.exists():
-                    silence_ranges = silencedetect(audio_path)
-            except SegmentationError:
-                logger.warning("silencedetect failed; continuing without silence boundaries")
-                silence_ranges = []
+        adapter_result = clip_engine_bridge.synth_adapter_result(video_id, source_url)
+        metadata = clip_engine_bridge.to_metadata(video_id, meta, source_url)
+        cues = clip_engine_bridge.to_cues(engine_out["transcript"])
+        chosen = clip_engine_bridge.to_segment(best, engine_out["transcript"])
+        snippet = clip_engine_bridge.window_text(engine_out["transcript"], chosen.t_start, chosen.t_end)[:700]
 
-            # Segmentation
-            segments = pick_segments(
-                cues,
-                float(duration_sec or 0.0),
-                target_sec=int(target_clip_duration_sec),
-                min_sec=int(target_clip_duration_min_sec),
-                max_sec=int(target_clip_duration_max_sec),
-                silence_ranges=silence_ranges,
-                top_k=1,
-            )
-            if not segments:
-                raise SegmentationError("no valid clip window could be produced")
-            chosen = segments[0]
-
-            # Final window normalization (defense in depth)
-            window = normalize_clip_window(
-                chosen.t_start,
-                chosen.t_end,
-                int(duration_sec or 0),
-                min_len=int(target_clip_duration_min_sec),
-                max_len=int(target_clip_duration_max_sec),
-            )
-            if window is None:
-                raise SegmentationError("normalize_clip_window rejected the chosen segment")
-            clip_start, clip_end = float(window[0]), float(window[1])
-            chosen = IngestSegment(t_start=clip_start, t_end=clip_end, text=chosen.text, score=chosen.score)
-
-            snippet = snippet_for_window(cues, clip_start, clip_end, max_chars=700)
-
-            # Persist
-            persisted = self._persist_ingest(
-                adapter_result=adapter_result,
-                metadata=metadata,
-                cues=cues,
-                chosen=chosen,
-                snippet=snippet,
-                material_id=material_id,
-                concept_id=concept_id,
-                clip_window=(clip_start, clip_end),
-                target_max=int(target_clip_duration_max_sec),
-            )
+        persisted = self._persist_ingest(
+            adapter_result=adapter_result,
+            metadata=metadata,
+            cues=cues,
+            chosen=chosen,
+            snippet=snippet,
+            material_id=material_id,
+            concept_id=concept_id,
+            clip_window=(chosen.t_start, chosen.t_end),
+            target_max=int(target_clip_duration_max_sec),
+        )
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
         log_event(
@@ -317,11 +272,8 @@ class IngestionPipeline:
             "ingest_completed",
             source_url=source_url,
             reel_id=persisted.reel_id,
-            platform=platform,
-            source_id=adapter_result.source_id,
-            author_handle=metadata.author_handle,
-            author_name=metadata.author_name,
-            duration_sec=metadata.duration_sec,
+            platform="yt",
+            source_id=video_id,
             t_start=chosen.t_start,
             t_end=chosen.t_end,
             elapsed_ms=elapsed_ms,
