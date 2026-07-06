@@ -39,3 +39,21 @@ def youtube_metadata(video_id: str) -> dict:
         }
     except Exception:
         return {}
+
+
+def resolve_feed_urls(feed_url: str, max_items: int) -> list[str]:
+    """Resolve a channel/playlist URL to individual YouTube watch URLs (no download)."""
+    try:
+        import yt_dlp  # lazy
+        opts = {"quiet": True, "skip_download": True, "extract_flat": True, "playlistend": max_items}
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(feed_url, download=False)
+        entries = (info or {}).get("entries") or []
+        urls = []
+        for e in entries[:max_items]:
+            vid = (e or {}).get("id")
+            if vid and extract_video_id(f"https://www.youtube.com/watch?v={vid}"):
+                urls.append(f"https://www.youtube.com/watch?v={vid}")
+        return urls
+    except Exception:
+        return []

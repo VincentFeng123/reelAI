@@ -570,62 +570,66 @@ class IngestionPipeline:
         trace_id: str | None = None,
     ) -> IngestFeedResult:
         effective_trace = set_trace_id(trace_id or new_trace_id())
-        log_event(logger, logging.INFO, "ingest_feed_start", feed_url=feed_url, max_items=max_items)
-        self._preflight()
+        self._rate_limiter.acquire("yt")
 
-        adapter = self._pick_adapter(feed_url)
-        # We intentionally do NOT check platform rate limit for the feed discovery call —
-        # flat_playlist is a single lightweight request. Per-URL limits apply when we
-        # resolve each item.
-        reel_urls = adapter.resolve_feed(feed_url, max_items=max_items)
+        urls = clip_engine_meta.resolve_feed_urls(feed_url, max_items)
 
         items: list[IngestFeedItem] = []
+        succeeded = 0
+        failed = 0
 
-        def _one(reel_url: str) -> IngestFeedItem:
+        for url in urls:
             try:
-                result = self.ingest_url(
-                    source_url=reel_url,
+                video_id = clip_engine_meta.extract_video_id(url)
+                engine_out = clip_engine_run.clip(url, topic="", settings={"language": language})
+                if not engine_out["clips"]:
+                    items.append(IngestFeedItem(source_url=url, status="skipped"))
+                    continue
+
+                best = min(
+                    engine_out["clips"],
+                    key=lambda c: abs((c["end"] - c["start"]) - target_clip_duration_sec),
+                )
+
+                meta = clip_engine_meta.youtube_metadata(video_id) or {}
+                if not meta.get("duration_sec"):
+                    meta["duration_sec"] = engine_out["transcript"].get("duration")
+
+                adapter_result = clip_engine_bridge.synth_adapter_result(video_id, url)
+                metadata = clip_engine_bridge.to_metadata(video_id, meta, url)
+                cues = clip_engine_bridge.to_cues(engine_out["transcript"])
+                chosen = clip_engine_bridge.to_segment(best, engine_out["transcript"])
+                snippet = clip_engine_bridge.window_text(
+                    engine_out["transcript"], chosen.t_start, chosen.t_end
+                )[:700]
+
+                persisted = self._persist_ingest(
+                    adapter_result=adapter_result,
+                    metadata=metadata,
+                    cues=cues,
+                    chosen=chosen,
+                    snippet=snippet,
                     material_id=material_id,
                     concept_id=concept_id,
-                    target_clip_duration_sec=target_clip_duration_sec,
-                    target_clip_duration_min_sec=target_clip_duration_min_sec,
-                    target_clip_duration_max_sec=target_clip_duration_max_sec,
-                    language=language,
-                    trace_id=effective_trace,  # share trace id across siblings
+                    clip_window=(chosen.t_start, chosen.t_end),
+                    target_max=int(target_clip_duration_max_sec),
                 )
-                return IngestFeedItem(
-                    source_url=reel_url,
+
+                items.append(IngestFeedItem(
+                    source_url=url,
                     status="ok",
-                    reel=result.reel,
-                    metadata=result.metadata,
-                )
-            except IngestError as exc:
-                logger.warning("feed item failed url=%s error=%s", reel_url, exc)
-                return IngestFeedItem(source_url=reel_url, status="error", error=exc.message)
+                    reel=persisted,
+                    metadata=metadata,
+                ))
+                succeeded += 1
+
             except Exception as exc:
-                logger.exception("feed item crashed url=%s", reel_url)
-                return IngestFeedItem(source_url=reel_url, status="error", error=str(exc))
+                failed += 1
+                items.append(IngestFeedItem(source_url=url, status="error", error=str(exc)))
 
-        # Use the executor, but collect in the original order for stable responses.
-        futures = [self._feed_executor.submit(_one, u) for u in reel_urls]
-        for fut in futures:
-            items.append(fut.result())
-
-        succeeded = sum(1 for i in items if i.status == "ok")
-        failed = sum(1 for i in items if i.status == "error")
-
-        log_event(
-            logger,
-            logging.INFO,
-            "ingest_feed_completed",
-            feed_url=feed_url,
-            total_resolved=len(reel_urls),
-            succeeded=succeeded,
-            failed=failed,
-        )
         return IngestFeedResult(
             feed_url=feed_url,
-            total_resolved=len(reel_urls),
+            total_resolved=len(urls),
             succeeded=succeeded,
             failed=failed,
             items=items,
