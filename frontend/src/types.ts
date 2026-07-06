@@ -40,6 +40,9 @@ export interface Settings {
   allow_question_exclaim_ends: boolean;
   mmr_lambda: number;
   export_resolution: number;
+  // Opt-in engine: "gemini" = one fast Gemini pass segments topics directly
+  // (no punctuation/understanding/refine). Undefined → server default ("topic").
+  clip_engine?: string;
 }
 
 export type Phase = "input" | "processing" | "results" | "error";

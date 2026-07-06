@@ -57,6 +57,21 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 # the ~1 + N_kept selection/window calls per video. Empty / == GEMINI_MODEL disables the split.
 TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 
+# ── Gemini-segment clip engine (CLIP_ENGINE=gemini, opt-in) ──────────────────
+# A single Gemini pass reads the timestamped supadata transcript and returns substantive
+# topic clips {title,start,end} directly — NO punctuation / structure understanding / whisper
+# refine / multimodal. Toggle per job via settings["clip_engine"]="gemini" (or CLIP_ENGINE=gemini
+# globally). Uses the Pro model for real comprehension (section-level topics); boundaries are
+# fine-snapped onto supadata's interpolated per-word times when SEGMENT_FINE_SNAP is on.
+SEGMENT_MODEL = os.environ.get("SEGMENT_MODEL", TOPIC_MODEL)
+SEGMENT_FINE_SNAP = os.environ.get("SEGMENT_FINE_SNAP", "1") not in ("0", "false", "")
+SEGMENT_MIN_CLIP_S = float(os.environ.get("SEGMENT_MIN_CLIP_S", "15"))    # drop clips shorter than this
+SEGMENT_MAX_CLIPS = int(os.environ.get("SEGMENT_MAX_CLIPS", "40"))        # safety ceiling
+# The whole-transcript plan (many topics × title+quotes) is a large JSON, and a thinking/pro
+# model spends output budget on thinking too — so this cap must be well above the 8192 default
+# or the plan JSON truncates mid-string.
+SEGMENT_MAX_OUTPUT_TOKENS = int(os.environ.get("SEGMENT_MAX_OUTPUT_TOKENS", "24576"))
+
 # ── faster-whisper (local transcription) ────────────────────────────────────
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small")   # tiny|base|small|medium|large-v3
 WHISPER_COMPUTE = os.environ.get("WHISPER_COMPUTE", "int8")  # int8 is fast on CPU
@@ -182,7 +197,7 @@ DEFAULTS: dict = {
     "quality_floor": None,                  # None → inherit config.QUALITY_FLOOR (W25-G)
     "diarization": False,
     "edge_probe": None,                     # None → inherit config.EDGE_PROBE_ENABLED (VID2, default OFF)
-    "clip_engine": None,                    # None → inherit config.CLIP_ENGINE ("topic"|"unit")
+    "clip_engine": None,                    # None → inherit config.CLIP_ENGINE ("topic"|"unit"|"gemini")
 }
 
 # ── ffmpeg cutting ─────────────────────────────────────────────────────────
@@ -228,7 +243,7 @@ FEED_DEFAULT_PROFILE = os.environ.get("FEED_DEFAULT_PROFILE", "fast")
 # "topic": select substantive teaching topics from the content_map, then ship ONE
 # best <=CLIP_MAX_S self-contained window per topic. "unit": legacy unit-anchored
 # assemble_clips (revert switch). See docs/superpowers/specs/2026-07-04-topic-first-clipping-design.md
-CLIP_ENGINE = os.environ.get("CLIP_ENGINE", "topic")            # "topic" | "unit"
+CLIP_ENGINE = os.environ.get("CLIP_ENGINE", "topic")            # "topic" | "unit" | "gemini"
 # SAFETY ceiling, not a curation dial: ship ALL substantive teaching topics (the type +
 # TOPIC_INFORMATIVENESS_MIN filter is the only real gate). TreeSeg caps the topic tree at
 # TREESEG_MAX_TOPICS=24, so this only binds on a runaway non-TreeSeg content map.

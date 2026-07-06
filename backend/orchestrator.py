@@ -120,6 +120,7 @@ async def run_pipeline(job: Job, executor: ThreadPoolExecutor) -> None:
     # skips the download entirely in embed mode) never wastes a ~40s download. download() is URL-only,
     # idempotent + cache-keyed and has NO transcript dependency, so starting it early is byte-neutral.
     profile = str(job.settings.get("analysis_profile", config.ANALYSIS_PROFILE)).lower()
+    engine = str(job.settings.get("clip_engine") or config.CLIP_ENGINE).lower()
     prefetch_dl = None
     try:
         # ── TRANSCRIBE (shared) ─────────────────────────────────────────────
@@ -129,7 +130,8 @@ async def run_pipeline(job: Job, executor: ThreadPoolExecutor) -> None:
                 return registry.fail(job, "Couldn't read the YouTube video id from that URL.")
             registry.set_meta(job, video_id=video_id)
             # speculative prefetch — only on a cold cache-miss for the full+multimodal path.
-            if (profile == "full" and _want_multimodal(job.settings) and config.STRUCTURE_CACHE
+            if (engine != "gemini" and profile == "full" and _want_multimodal(job.settings)
+                    and config.STRUCTURE_CACHE
                     and not (config.WORK_DIR / video_id / "structure.json").exists()):
                 prefetch_dl = asyncio.ensure_future(run(download, job.url, job.settings))
                 # retrieve any error on completion so an unconsumed task never logs
@@ -148,6 +150,11 @@ async def run_pipeline(job: Job, executor: ThreadPoolExecutor) -> None:
                 transcribe, dl["audio_path"], video_id, job.settings, emit("transcribing", 25, 40)
             )
         transcript.setdefault("title", job.title or "")
+
+        # ── Gemini-segment engine (opt-in): one comprehension pass over the transcript →
+        # clips, skipping sentences/understanding/refine/multimodal entirely. ──────────
+        if engine == "gemini":
+            return await _run_gemini_segment(job, transcript, video_id, run, emit)
 
         sentences = await run(
             build_sentences, transcript, video_id, job.settings, emit("punctuating", 40, 44))
@@ -381,3 +388,35 @@ async def _run_fast(job: Job, transcript: dict, video_id: str, sentences, run, e
             refine_clip_boundaries, clips_spec, job.url, video_id, job.settings, emit("refining", 86, 99))
 
     registry.finish(job, _build_embed_clips(clips_spec, video_id), notes=notes)
+
+
+async def _run_gemini_segment(job: Job, transcript: dict, video_id: str, run, emit) -> None:
+    """Opt-in Gemini-segment engine (``clip_engine="gemini"``): a single Gemini comprehension
+    pass over the timestamped transcript returns substantive topic clips directly — skipping
+    sentence indexing, structure understanding, Whisper refine, and multimodal perception.
+    Renders mp4s only when ``output_mode="cut"`` (downloads the source video only then)."""
+    from .pipeline.gemini_segment import segment_clips
+
+    settings = job.settings
+    registry.publish(job, ProgressEvent("selecting", 20.0, "Reading the whole transcript…"))
+    clips_spec, notes = await run(segment_clips, transcript, settings, emit("selecting", 20, 90))
+    if not clips_spec:
+        return registry.fail(job, notes or "No substantive topics found to clip.", notes=notes)
+
+    clips = _build_embed_clips(clips_spec, video_id)
+    if str(settings.get("output_mode", config.OUTPUT_MODE)).lower() == "cut":
+        try:
+            dl = await run(download, job.url, settings, emit("cutting", 90, 93))
+            video_path = dl.get("video_path")
+            if video_path:
+                registry.publish(job, ProgressEvent("cutting", 93.0, "Cutting clips…"))
+                cut_results = await cut_clips(
+                    video_path, video_id, clips_spec, settings, emit("cutting", 93, 100))
+                by_n = {c["n"]: c for c in cut_results}
+                for i, clip in enumerate(clips):        # cut n == segment index + 1
+                    cr = by_n.get(i + 1)
+                    if cr and cr.get("path"):
+                        clip["path"] = cr["path"]
+        except Exception:
+            pass                                        # keep embed clips (path stays None)
+    registry.finish(job, clips, notes=notes)

@@ -66,6 +66,24 @@ export function SettingsDrawer({
 
           <label className="flex items-center justify-between gap-3 cursor-pointer">
             <span className="text-sm text-white/70">
+              ⚡ Fast Gemini segmentation
+              <span className="block text-xs text-white/40">
+                One Gemini pass picks topics & boundaries — much faster, skips punctuation &
+                precise-cut refinement. Experimental.
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              className="h-5 w-5 accent-violet-500"
+              checked={settings.clip_engine === "gemini"}
+              onChange={(e) =>
+                onChange({ ...settings, clip_engine: e.target.checked ? "gemini" : undefined })
+              }
+            />
+          </label>
+
+          <label className="flex items-center justify-between gap-3 cursor-pointer">
+            <span className="text-sm text-white/70">
               Allow clips to end on “?” or “!”
               <span className="block text-xs text-white/40">Default: end on a period.</span>
             </span>

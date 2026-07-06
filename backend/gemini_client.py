@@ -64,8 +64,12 @@ def _retry(call) -> str:
 
 
 def generate_json(system: str, user: str, schema, temperature: float = 0.2,
-                  model: Optional[str] = None) -> str:
-    """Return a JSON string conforming to `schema` (a Pydantic model class)."""
+                  model: Optional[str] = None, max_output_tokens: int = 8192) -> str:
+    """Return a JSON string conforming to `schema` (a Pydantic model class).
+
+    ``max_output_tokens`` bounds the response; raise it for calls whose JSON is large
+    OR that use a thinking model (thinking tokens share this budget, so an 8192 cap can
+    truncate the JSON on a preview/pro model that ignores thinking_budget=0)."""
     client = get_client()
     mdl = model or config.GEMINI_MODEL
 
@@ -75,7 +79,7 @@ def generate_json(system: str, user: str, schema, temperature: float = 0.2,
             response_mime_type="application/json",
             response_schema=schema,
             temperature=temperature,
-            max_output_tokens=8192,
+            max_output_tokens=max_output_tokens,
         )
         if not thinking:
             # Disable 2.5-flash "thinking" → much faster for structured extraction.

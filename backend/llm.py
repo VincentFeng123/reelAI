@@ -65,6 +65,7 @@ def llm_json(
     est_tokens: int = 0,
     provider: Optional[str] = None,
     model: Optional[str] = None,
+    max_output_tokens: int = 8192,
 ) -> T:
     """Return a validated ``schema`` instance from the configured LLM provider.
 
@@ -77,12 +78,14 @@ def llm_json(
 
     if prov == "gemini":
         from . import gemini_client
-        raw = gemini_client.generate_json(system, user, schema, temperature=temperature, model=model)
+        raw = gemini_client.generate_json(system, user, schema, temperature=temperature,
+                                          model=model, max_output_tokens=max_output_tokens)
         try:
             return schema.model_validate_json(_strip_fences(raw))
         except (ValidationError, json.JSONDecodeError, ValueError):
             raw = gemini_client.generate_json(
-                system, user + "\n\n" + _json_instruction(schema), schema, temperature=temperature, model=model
+                system, user + "\n\n" + _json_instruction(schema), schema, temperature=temperature,
+                model=model, max_output_tokens=max_output_tokens,
             )
             return schema.model_validate_json(_strip_fences(raw))
 
