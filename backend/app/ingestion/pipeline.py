@@ -277,6 +277,9 @@ class IngestionPipeline:
             t_start=chosen.t_start,
             t_end=chosen.t_end,
             elapsed_ms=elapsed_ms,
+            author_handle=metadata.author_handle,
+            author_name=metadata.author_name,
+            duration_sec=metadata.duration_sec,
         )
 
         return IngestResult(
@@ -570,6 +573,7 @@ class IngestionPipeline:
         trace_id: str | None = None,
     ) -> IngestFeedResult:
         effective_trace = set_trace_id(trace_id or new_trace_id())
+        log_event(logger, logging.INFO, "ingest_feed_start", feed_url=feed_url)
         self._rate_limiter.acquire("yt")
 
         urls = clip_engine_meta.resolve_feed_urls(feed_url, max_items)
@@ -627,6 +631,7 @@ class IngestionPipeline:
                 failed += 1
                 items.append(IngestFeedItem(source_url=url, status="error", error=str(exc)))
 
+        log_event(logger, logging.INFO, "ingest_feed_completed", feed_url=feed_url, total_resolved=len(urls), succeeded=succeeded, failed=failed)
         return IngestFeedResult(
             feed_url=feed_url,
             total_resolved=len(urls),

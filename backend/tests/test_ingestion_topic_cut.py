@@ -168,6 +168,7 @@ class IngestionTopicCutTests(unittest.TestCase):
     # Long-form happy path with LLM
     # ----------------------------------------------------------------- #
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_long_form_llm_path_returns_multiple_reels(self) -> None:
         source_url = "https://www.youtube.com/watch?v=aircAruvnKk"
         info_dict = dict(_fake_info_dict_youtube())
@@ -246,6 +247,7 @@ class IngestionTopicCutTests(unittest.TestCase):
     # YouTube Short → empty reels, no DB writes
     # ----------------------------------------------------------------- #
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_shorts_url_returns_empty_reels_and_no_db_writes(self) -> None:
         source_url = "https://www.youtube.com/shorts/1AlFJOxAY00"
         info_dict = dict(_fake_info_dict_youtube(source_id="1AlFJOxAY00"))
@@ -286,6 +288,7 @@ class IngestionTopicCutTests(unittest.TestCase):
     # use_llm=False → heuristic path still produces reels
     # ----------------------------------------------------------------- #
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_heuristic_path_still_produces_reels(self) -> None:
         source_url = "https://www.youtube.com/watch?v=aircAruvnKk"
         info_dict = dict(_fake_info_dict_youtube())
@@ -328,6 +331,7 @@ class IngestionTopicCutTests(unittest.TestCase):
     # Idempotency — re-ingesting the same URL doesn't create duplicate rows
     # ----------------------------------------------------------------- #
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_re_ingest_is_idempotent(self) -> None:
         source_url = "https://www.youtube.com/watch?v=aircAruvnKk"
         info_dict = dict(_fake_info_dict_youtube())
@@ -378,6 +382,7 @@ class IngestionTopicCutTests(unittest.TestCase):
     # YouTube chapters short-circuit the LLM/heuristic
     # ----------------------------------------------------------------- #
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_chapters_in_info_dict_drive_reels_directly(self) -> None:
         source_url = "https://www.youtube.com/watch?v=aircAruvnKk"
         # Build an info_dict with creator-authored chapter markers. The

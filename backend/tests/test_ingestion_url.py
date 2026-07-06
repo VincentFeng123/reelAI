@@ -360,6 +360,7 @@ class IngestionUrlTests(unittest.TestCase):
     # Happy path — YouTube via captions, no Whisper needed
     # --------------------------------------------------------------------- #
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_ingest_url_youtube_happy_path(self) -> None:
         source_url = "https://www.youtube.com/watch?v=aircAruvnKk"
         fake_adapter = _FakeAdapter(
@@ -443,6 +444,7 @@ class IngestionUrlTests(unittest.TestCase):
     # Whisper fallback path — Instagram with no captions
     # --------------------------------------------------------------------- #
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_ingest_url_instagram_whisper_fallback(self) -> None:
         source_url = "https://www.instagram.com/reel/C8abc123/"
         fake_adapter = _FakeAdapter(
@@ -490,6 +492,7 @@ class IngestionUrlTests(unittest.TestCase):
     # Duplicate ingest returns the existing reel id instead of crashing
     # --------------------------------------------------------------------- #
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_duplicate_ingest_idempotent(self) -> None:
         source_url = "https://www.youtube.com/watch?v=aircAruvnKk"
         fake_adapter = _FakeAdapter(
@@ -529,6 +532,7 @@ class IngestionUrlTests(unittest.TestCase):
     # Feed crawl
     # --------------------------------------------------------------------- #
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_ingest_feed_crawls_multiple_items(self) -> None:
         fake_adapter = _FakeAdapter(
             platform="ig",
@@ -664,6 +668,7 @@ class IngestionUrlTests(unittest.TestCase):
             overrides={"yt": (1000, 60.0), "ig": (1000, 60.0), "tt": (1000, 60.0)}
         )
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_ingest_search_multi_platform_happy_path(self) -> None:
         self._install_high_rate_limits()
         main_module.ingestion_pipeline._openai_client = object()
@@ -751,6 +756,7 @@ class IngestionUrlTests(unittest.TestCase):
             self.assertIn("ig:igA", video_ids)
             self.assertIn("tt:ttA", video_ids)
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_ingest_search_instagram_failure_is_nonfatal(self) -> None:
         """If IG scraping breaks, YT and TT results still flow and IG is noted in errors."""
         self._install_high_rate_limits()
@@ -801,6 +807,7 @@ class IngestionUrlTests(unittest.TestCase):
         statuses = {item["platform"]: item["status"] for item in payload["items"]}
         self.assertEqual(statuses, {"yt": "ok", "tt": "ok"})
 
+    @unittest.skip("retired: old yt-dlp/Whisper ingest path replaced by the clip engine (clip-engine-swap); superseded by test_clip_engine_*.py — Phase 4 removes the old path + these tests")
     def test_ingest_search_exclude_video_ids_skips_seen_reels(self) -> None:
         """Infinite-scroll pagination: exclude_video_ids skips already-seen reels."""
         self._install_high_rate_limits()

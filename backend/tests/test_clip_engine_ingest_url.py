@@ -149,7 +149,7 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
         self.assertAlmostEqual(result.metadata.duration_sec, 300.0)
 
         # Envelope
-        self.assertEqual(result.trace_id, result.trace_id)  # non-empty
+        self.assertTrue(result.trace_id)
         self.assertTrue(result.terms_notice.lower().startswith("reelai"))
 
         # DB sanity — reel row exists
