@@ -21,4 +21,7 @@ dependencies = [
   "psycopg[binary]==3.2.10",
   "resend==2.10.0",
   "pysbd==0.3.4",
+  "google-genai>=1.0",
+  "tiktoken==0.8.0",
+  "rapidfuzz==3.10.1",
 ]

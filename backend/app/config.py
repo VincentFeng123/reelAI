@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     database_url: str = ""
 
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-2.5-flash"
     groq_api_key: str = ""
     groq_model: str = "llama-3.3-70b-versatile"
     cerebras_api_key: str = ""
@@ -100,6 +100,13 @@ class Settings(BaseSettings):
     twitch_client_secret: str = ""
     # Dailymotion + Bilibili + TikTok are keyless in the current scaffolding
     # (public APIs / yt-dlp). If those APIs later require keys, add them here.
+
+    # Clip engine configuration (Phase 2).
+    clip_engine: str = "gemini"
+    supadata_api_key: str = ""
+    supadata_base: str = "https://api.supadata.ai/v1"
+    segment_model: str = ""
+    clip_search_max_videos: int = 5
 
 
 @lru_cache
