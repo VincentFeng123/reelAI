@@ -983,6 +983,7 @@ class IngestionPipeline:
         concept_id: str | None,
         clip_window: tuple[float, float],
         target_max: int,
+        generation_id: str | None = None,
     ) -> ReelOutWithAttribution:
         clip_start, clip_end = clip_window
         from .persistence import build_video_id  # local import to avoid cycle surprises
@@ -1035,6 +1036,7 @@ class IngestionPipeline:
                 transcript_snippet=snippet,
                 takeaways=takeaways,
                 base_score=float(chosen.score),
+                generation_id=generation_id,
             )
 
             if not inserted:
@@ -1045,6 +1047,7 @@ class IngestionPipeline:
                     video_id=video_id,
                     t_start=clip_start,
                     t_end=clip_end,
+                    generation_id=generation_id,
                 )
                 if existing:
                     reel_id = existing["id"]

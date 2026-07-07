@@ -156,11 +156,13 @@ def load_existing_reel(
     video_id: str,
     t_start: float,
     t_end: float,
+    generation_id: str | None = None,
 ) -> dict[str, Any] | None:
     """
     Look up a reel row by the fields in the unique index
-    `(material_id, generation_id, video_id, t_start, t_end)` — we treat `generation_id`
-    as NULL for anonymous ingests.
+    `(material_id, generation_id, video_id, t_start, t_end)`.
+    Passing `generation_id=None` (the default) matches anonymous (NULL-or-empty) rows,
+    preserving backward-compatible behavior.
     """
     try:
         row = fetch_one(
@@ -173,11 +175,11 @@ def load_existing_reel(
                AND video_id = ?
                AND t_start = ?
                AND t_end = ?
-               AND (generation_id IS NULL OR generation_id = '')
+               AND COALESCE(generation_id, '') = COALESCE(?, '')
              ORDER BY created_at DESC
              LIMIT 1
             """,
-            (material_id, video_id, float(t_start), float(t_end)),
+            (material_id, video_id, float(t_start), float(t_end), generation_id),
         )
     except Exception:
         logger.exception(
@@ -202,6 +204,7 @@ def upsert_reel_row(
     transcript_snippet: str,
     takeaways: list[str],
     base_score: float = 1.0,
+    generation_id: str | None = None,
 ) -> bool:
     """
     Insert a reel row. Returns True on success, False if the unique index rejected a
@@ -209,7 +212,7 @@ def upsert_reel_row(
     """
     row = {
         "id": reel_id,
-        "generation_id": None,
+        "generation_id": generation_id,
         "material_id": material_id,
         "concept_id": concept_id,
         "video_id": video_id,
