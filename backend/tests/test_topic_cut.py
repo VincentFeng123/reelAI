@@ -1396,6 +1396,7 @@ class ConceptClusterAnchoringTests(unittest.TestCase):
 class GenerateReelsWiringTest(unittest.TestCase):
     """Verify the topic_cut helper is wired into ReelService.generate_reels."""
 
+    @unittest.skip("retired legacy search/clip path — clip-engine-swap Phase 3")
     def test_helper_is_called_from_generate_reels_source(self) -> None:
         import inspect
         from backend.app.services.reels import ReelService
