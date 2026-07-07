@@ -272,8 +272,14 @@ storage = get_storage()
 embedding_service = EmbeddingService()
 material_intelligence_service = MaterialIntelligenceService()
 youtube_service = YouTubeService()
-reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service)
 SERVERLESS_MODE = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
+ingestion_pipeline = IngestionPipeline(
+    youtube_service=youtube_service,
+    embedding_service=embedding_service,
+    settings=settings,
+    serverless_mode=SERVERLESS_MODE,
+)
+reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service, ingestion_pipeline=ingestion_pipeline)
 
 
 def _reels_generate_stream_deadline_sec() -> float:
@@ -284,13 +290,6 @@ def _reels_generate_stream_deadline_sec() -> float:
         return max(120.0, float(raw))
     except (TypeError, ValueError):
         return 900.0
-
-ingestion_pipeline = IngestionPipeline(
-    youtube_service=youtube_service,
-    embedding_service=embedding_service,
-    settings=settings,
-    serverless_mode=SERVERLESS_MODE,
-)
 
 REFINEMENT_JOB_WORKERS = 2
 _refinement_jobs_lock = threading.Lock()

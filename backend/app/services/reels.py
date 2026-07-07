@@ -1275,10 +1275,11 @@ class ReelService:
     REFILL_STAGE_RECOVERY_GRAPH = 5
     MAX_REFILL_STAGE = REFILL_STAGE_RECOVERY_GRAPH
 
-    def __init__(self, embedding_service, youtube_service) -> None:
+    def __init__(self, embedding_service, youtube_service, ingestion_pipeline=None) -> None:
         settings = get_settings()
         self.embedding_service = embedding_service
         self.youtube_service = youtube_service
+        self.ingestion_pipeline = ingestion_pipeline
         self.chat_model = settings.gemini_model
         self.retrieval_engine_v2_enabled = bool(settings.retrieval_engine_v2_enabled)
         self.retrieval_tier2_enabled = bool(settings.retrieval_tier2_enabled)
@@ -5377,6 +5378,29 @@ class ReelService:
         )
         if not clean_disambiguator and len(normalize_terms([clean_title])) <= 1 and not exact_subject_root:
             for term in keywords[:2]:
+                cleaned = self._clean_query_text(term)
+                if not cleaned:
+                    continue
+                if self._normalize_query_key(cleaned) == self._normalize_query_key(clean_title):
+                    continue
+                parts.append(cleaned)
+                break
+        return self._clean_query_text(" ".join(parts))
+
+    def _concept_topic_query(self, concept_row: dict) -> str:
+        """Return a search-engine topic string for a concept row.
+
+        Mirrors the single-token-keyword rule from ``_build_literal_query`` but
+        without disambiguator or subject_tag — concepts don't carry those.
+        """
+        title = str(concept_row.get("title") or "")
+        clean_title = self._clean_query_text(title)
+        if not clean_title:
+            return ""
+        parts: list[str] = [clean_title]
+        if len(normalize_terms([clean_title])) <= 1:
+            keywords = self._parse_keywords_json(concept_row.get("keywords_json"))
+            for term in keywords:
                 cleaned = self._clean_query_text(term)
                 if not cleaned:
                     continue
