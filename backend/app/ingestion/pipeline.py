@@ -30,7 +30,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..db import DatabaseIntegrityError, dumps_json, get_conn, now_iso, upsert
 from . import TERMS_NOTICE
@@ -817,32 +817,12 @@ class IngestionPipeline:
 
                 best = clip_engine_bridge.pick_best_clip(engine_out["clips"], target_clip_duration_sec, target_clip_duration_max_sec)
 
-                meta = {
-                    "title": v.get("title", ""),
-                    "author_name": v.get("channel", ""),
-                    "duration_sec": v.get("duration") or engine_out["transcript"].get("duration"),
-                    "thumbnail_url": v.get("thumbnail", ""),
-                    "view_count": v.get("view_count"),
-                    "upload_date_iso": v.get("upload_date"),
-                }
-
-                adapter_result = clip_engine_bridge.synth_adapter_result(v["id"], v["url"])
-                metadata = clip_engine_bridge.to_metadata(v["id"], meta, v["url"])
-                cues = clip_engine_bridge.to_cues(engine_out["transcript"])
-                chosen = clip_engine_bridge.to_segment(best, engine_out["transcript"])
-                snippet = clip_engine_bridge.window_text(
-                    engine_out["transcript"], chosen.t_start, chosen.t_end
-                )[:700]
-
-                persisted = self._persist_ingest(
-                    adapter_result=adapter_result,
-                    metadata=metadata,
-                    cues=cues,
-                    chosen=chosen,
-                    snippet=snippet,
+                persisted, metadata = self._persist_engine_clip(
+                    v=v,
+                    clip=best,
+                    engine_out=engine_out,
                     material_id=resolved_material_id,
                     concept_id=concept_id,
-                    clip_window=(chosen.t_start, chosen.t_end),
                     target_max=int(target_clip_duration_max_sec),
                 )
 
@@ -879,6 +859,134 @@ class IngestionPipeline:
             terms_notice=TERMS_NOTICE + " Search is YouTube-only.",
             trace_id=effective_trace,
         )
+
+    # --------------------------------------------------------------------- #
+    # Material topic — multi-clip, one concept per call
+    # --------------------------------------------------------------------- #
+
+    def ingest_topic(
+        self,
+        *,
+        topic: str,
+        material_id: str,
+        concept_id: str,
+        generation_id: str | None = None,
+        exclude_video_ids: list[str] | None = None,
+        target_clip_duration_sec: int = 45,
+        target_clip_duration_min_sec: int = 15,
+        target_clip_duration_max_sec: int = 60,
+        language: str = "en",
+        max_videos: int = 3,
+        max_reels: int | None = None,
+        on_reel_created: Callable[[ReelOutWithAttribution], None] | None = None,
+        dry_run: bool = False,
+    ) -> tuple[list[ReelOutWithAttribution], list[str]]:
+        """
+        Route ONE study concept through the clip engine and persist EVERY
+        relevance-surviving clip per video (multiple reels per video), unlike
+        `ingest_search`'s one-best `pick_best_clip`. This is the per-concept
+        engine the material→reels rewire calls.
+
+        Returns `(reels, resolved_video_ids)`: `reels` in discover order then
+        clip order within a video; `resolved_video_ids` = the video ids
+        `discover` returned (a viability probe callers consume even under
+        `dry_run`).
+
+        Cost/latency guardrail: `max_videos` bounds the paid `run.clip` calls;
+        the per-video clip+filter FETCH runs concurrently, but persist +
+        `on_reel_created` + the `max_reels` early-stop run SEQUENTIALLY in
+        discover order so ordering and the global cap stay deterministic.
+        """
+        limit = min(int(max_videos), clip_engine_config.CLIP_SEARCH_MAX_VIDEOS)
+
+        self._rate_limiter.acquire("yt")
+
+        disc = clip_engine_search.discover(
+            topic, limit=limit, exclude_video_ids=exclude_video_ids or []
+        )
+
+        warning = disc.get("warning")
+        if warning:
+            log_event(logger, logging.WARNING, "ingest_topic_warning", warning=warning)
+
+        resolved_video_ids = [v["id"] for v in disc["videos"]]
+
+        # dry_run: discover-only viability probe — no run.clip, no DB writes.
+        if dry_run:
+            return [], resolved_video_ids
+
+        videos = disc["videos"]
+
+        # FETCH stage: clip + relevance-filter each video. Parallelize the paid
+        # network/Gemini work (≥2 videos) but keep persistence single-threaded.
+        fetched: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]] = []
+        if len(videos) >= 2:
+            with ThreadPoolExecutor(max_workers=min(4, len(videos))) as executor:
+                futures = [
+                    executor.submit(self._clip_and_filter, v, topic, language)
+                    for v in videos
+                ]
+                for v, future in zip(videos, futures):
+                    try:
+                        fetched.append(future.result())
+                    except Exception as exc:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "ingest_topic_video_failed",
+                            video_id=v.get("id"),
+                            error=str(exc),
+                        )
+        else:
+            for v in videos:
+                try:
+                    fetched.append(self._clip_and_filter(v, topic, language))
+                except Exception as exc:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "ingest_topic_video_failed",
+                        video_id=v.get("id"),
+                        error=str(exc),
+                    )
+
+        # PERSIST stage: sequential, discover order — the `on_reel_created`
+        # ordering and the global `max_reels` early-stop must stay deterministic.
+        reels: list[ReelOutWithAttribution] = []
+        for v, kept, engine_out in fetched:
+            for clip in kept:
+                if max_reels is not None and len(reels) >= max_reels:
+                    return reels, resolved_video_ids
+                reel, _ = self._persist_engine_clip(
+                    v=v,
+                    clip=clip,
+                    engine_out=engine_out,
+                    material_id=material_id,
+                    concept_id=concept_id,
+                    target_max=int(target_clip_duration_max_sec),
+                    generation_id=generation_id,
+                )
+                reels.append(reel)
+                if on_reel_created is not None:
+                    on_reel_created(reel)
+
+        return reels, resolved_video_ids
+
+    def _clip_and_filter(
+        self, v: dict[str, Any], topic: str, language: str
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+        """Fetch + relevance-filter ONE discovered video's clips. Returns
+        `(v, kept_clips, engine_out)`; the concurrent fetch unit for
+        `ingest_topic`. Empty `clips` yields no kept clips (video is skipped)."""
+        engine_out = clip_engine_run.clip(
+            v["url"], topic=topic, settings={"language": language}
+        )
+        if not engine_out["clips"]:
+            return v, [], engine_out
+        kept = clip_engine_bridge.filter_by_query(
+            engine_out["clips"], engine_out["transcript"], topic
+        )
+        return v, kept, engine_out
 
     def _pick_search_adapter(self) -> Any:
         """The search adapter is the first adapter that exposes build_search_url."""
@@ -970,6 +1078,57 @@ class IngestionPipeline:
                 video_duration_sec=video_duration_sec,
                 whisper_fallback_available=(True if self._openai_client is not None else None),
             )
+
+    def _persist_engine_clip(
+        self,
+        *,
+        v: dict[str, Any],
+        clip: dict[str, Any],
+        engine_out: dict[str, Any],
+        material_id: str | None,
+        concept_id: str | None,
+        target_max: int,
+        generation_id: str | None = None,
+    ) -> tuple[ReelOutWithAttribution, IngestMetadata]:
+        """
+        Build the persist inputs for ONE engine clip of a discovered video `v`
+        (source metadata from the discover dict, transcript fallbacks from
+        `engine_out`) and persist it. Shared by `ingest_search` (its one
+        `pick_best_clip`) and `ingest_topic` (every surviving clip).
+
+        Returns `(reel, metadata)`; callers that only want the reel ignore the
+        second element.
+        """
+        meta = {
+            "title": v.get("title", ""),
+            "author_name": v.get("channel", ""),
+            "duration_sec": v.get("duration") or engine_out["transcript"].get("duration"),
+            "thumbnail_url": v.get("thumbnail", ""),
+            "view_count": v.get("view_count"),
+            "upload_date_iso": v.get("upload_date"),
+        }
+
+        adapter_result = clip_engine_bridge.synth_adapter_result(v["id"], v["url"])
+        metadata = clip_engine_bridge.to_metadata(v["id"], meta, v["url"])
+        cues = clip_engine_bridge.to_cues(engine_out["transcript"])
+        chosen = clip_engine_bridge.to_segment(clip, engine_out["transcript"])
+        snippet = clip_engine_bridge.window_text(
+            engine_out["transcript"], chosen.t_start, chosen.t_end
+        )[:700]
+
+        reel = self._persist_ingest(
+            adapter_result=adapter_result,
+            metadata=metadata,
+            cues=cues,
+            chosen=chosen,
+            snippet=snippet,
+            material_id=material_id,
+            concept_id=concept_id,
+            clip_window=(chosen.t_start, chosen.t_end),
+            target_max=target_max,
+            generation_id=generation_id,
+        )
+        return reel, metadata
 
     def _persist_ingest(
         self,
