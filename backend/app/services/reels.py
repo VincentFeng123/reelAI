@@ -62,6 +62,8 @@ _STRUCTURAL_EDGE_TRIM_LABELS = _STRUCTURAL_HARD_SKIP_LABELS | {"transition"}
 # doesn't double-play the padded region).
 REEL_PAD_START_SEC = 0.3
 REEL_PAD_END_SEC = 0.3
+STRICT_WORD_BOUNDARY_PRE_ROLL_SEC = 0.08
+STRICT_WORD_BOUNDARY_POST_ROLL_SEC = 0.08
 
 
 # A2: ratio-based auto-punctuation gate. Restoration fires on transcripts
@@ -2894,6 +2896,7 @@ class ReelService:
                                 concept_terms=concept_terms,
                                 concept_title=str(concept.get("title") or ""),
                                 info_dict=video.get("info_dict"),
+                                provider=str(video.get("provider") or "youtube"),
                             ),
                             timeout_sec=_video_timeout_sec,
                             video_id=video_id,
@@ -3017,17 +3020,28 @@ class ReelService:
                 # gap in the emitted reel sequence.
                 dead_chain_ids: set[str] = set()
 
-                # Process segments in TEMPORAL order so consecutive clusters
-                # in the video are refined in the same order they appear.
-                # Sub-parts of the same cluster naturally sort in
-                # cluster_sub_index order because their t_start values are
-                # strictly increasing.
+                # Process continuation chains in temporal order, but standalone
+                # topic-cut picks by score so the feed does not accept an early
+                # weak mention before a later dense explanation.
+                def _segment_processing_key(item: tuple[SegmentMatch, dict[str, Any]]) -> tuple[Any, ...]:
+                    seg = item[0]
+                    chain_id = str(getattr(seg, "cluster_group_id", "") or "")
+                    if chain_id:
+                        return (
+                            0,
+                            chain_id,
+                            int(getattr(seg, "cluster_sub_index", 0)),
+                            float(seg.t_start),
+                        )
+                    return (
+                        1,
+                        -float(seg.score),
+                        float(seg.t_start),
+                    )
+
                 segment_candidates = sorted(
                     segment_candidates,
-                    key=lambda item: (
-                        float(item[0].t_start),
-                        int(getattr(item[0], "cluster_sub_index", 0)),
-                    ),
+                    key=_segment_processing_key,
                 )
 
                 for segment, segment_relevance in segment_candidates:
@@ -3271,6 +3285,7 @@ class ReelService:
                                 break
                             continue
                         start_sec, end_sec = clip_window
+                        finalized_clip_window = False
                         clip_key = self._clip_key(video_id, start_sec, end_sec)
                         # --- Per-window quality gates ---
                         # For continuation chains (multi-window splits from a
@@ -3315,6 +3330,52 @@ class ReelService:
                             + 0.28 * float(ranking.get("discovery_score") or 0.0)
                             + 0.14 * float(ranking.get("clipability_score") or 0.0)
                         )
+                        topic_rank_score = float(getattr(segment, "final_rank_score", 0.0) or 0.0)
+                        if topic_rank_score > 0:
+                            relevance_context["topic_cut_rank_score"] = topic_rank_score
+                            relevance_context["boundary_quality"] = str(getattr(segment, "boundary_quality", "") or "")
+                            relevance_context["score"] = max(
+                                float(relevance_context.get("score") or 0.0),
+                                0.45 * float(relevance_context.get("score") or 0.0) + 0.55 * topic_rank_score,
+                            )
+                        if not dry_run and not use_full_short_clip:
+                            finalized = self._finalize_search_clip_window(
+                                conn,
+                                video=video,
+                                clip_window=(float(start_sec), float(end_sec)),
+                                clip_min_len=clip_min_len,
+                                clip_max_len=clip_max_len,
+                            )
+                            if finalized is None:
+                                retrieval_metrics["bad_boundary"] += 1
+                                if self.retrieval_debug_logging:
+                                    logger.info(
+                                        "reels.loop drop concept=%s video=%s win=(%.2f,%.2f) reason=bad_boundary",
+                                        str(concept.get("id") or ""),
+                                        video_id,
+                                        float(start_sec),
+                                        float(end_sec),
+                                    )
+                                if is_continuation_chain:
+                                    chain_broken = True
+                                    break
+                                continue
+                            clip_window, finalized_clip_window = finalized
+                            start_sec, end_sec = clip_window
+                            clip_key = self._clip_key(video_id, start_sec, end_sec)
+                            if clip_key in existing_clip_keys or clip_key in generated_clip_keys:
+                                if self.retrieval_debug_logging:
+                                    logger.info(
+                                        "reels.loop drop concept=%s video=%s win=(%.2f,%.2f) reason=clip_key_dup_after_refine",
+                                        str(concept.get("id") or ""),
+                                        video_id,
+                                        float(start_sec),
+                                        float(end_sec),
+                                    )
+                                if is_continuation_chain:
+                                    chain_broken = True
+                                    break
+                                continue
                         if not skip_per_window_gates and not bool(relevance_context.get("passes", True)):
                             retrieval_metrics["low_relevance"] += 1
                             if self.retrieval_debug_logging:
@@ -3443,7 +3504,10 @@ class ReelService:
                                     relevance_context=relevance_context,
                                     fast_mode=fast_mode,
                                     target_clip_duration_sec=safe_target_clip_duration,
+                                    target_clip_duration_min_sec=target_clip_duration_min_sec,
+                                    target_clip_duration_max_sec=target_clip_duration_max_sec,
                                     generation_id=generation_id,
+                                    finalized_clip_window=finalized_clip_window,
                                 )
                             except Exception:
                                 # Surface previously-silent exceptions so a broken
@@ -4037,6 +4101,86 @@ class ReelService:
             return max(30.0, float(raw))
         except (TypeError, ValueError):
             return 180.0
+
+    def _finalize_search_clip_window(
+        self,
+        conn,
+        *,
+        video: dict[str, Any],
+        clip_window: tuple[float, float],
+        clip_min_len: int,
+        clip_max_len: int,
+    ) -> tuple[tuple[float, float], bool] | None:
+        """Return the final playback window for a generated search clip.
+
+        YouTube clips get a strict acoustic word-edge pass. Non-YouTube
+        providers keep their existing embed window for now because the current
+        audio refiner only knows how to download YouTube audio by video id.
+        """
+        provider = str(video.get("provider") or "youtube").strip().lower() or "youtube"
+        if provider != "youtube":
+            return clip_window, False
+        video_id = str(video.get("id") or video.get("video_id") or "").strip()
+        if not video_id:
+            return None
+        start_sec, end_sec = float(clip_window[0]), float(clip_window[1])
+        if end_sec <= start_sec:
+            return None
+        try:
+            from .clip_boundary import _word_is_filler
+            from .clip_whisper_refine import refine_clip_with_whisper
+        except Exception:
+            logger.exception("strict clip boundary imports failed for video %s", video_id)
+            return None
+        try:
+            refined = refine_clip_with_whisper(
+                video_id=video_id,
+                t_start=start_sec,
+                t_end=end_sec,
+                conn=conn,
+                force=True,
+            )
+        except Exception:
+            logger.exception("strict clip boundary refinement raised for video %s", video_id)
+            return None
+        if refined is None:
+            return None
+        words = [
+            w for w in list(getattr(refined, "words", []) or [])
+            if float(getattr(w, "end", 0.0)) > float(getattr(w, "start", 0.0))
+        ]
+        words.sort(key=lambda w: float(getattr(w, "start", 0.0)))
+        if not words:
+            return None
+        first_word = next(
+            (w for w in words if not _word_is_filler(str(getattr(w, "text", "") or ""))),
+            words[0],
+        )
+
+        def _is_terminal_word(word: Any) -> bool:
+            text = str(getattr(word, "text", "") or "").strip().rstrip("\"')]}")
+            return bool(text) and text[-1] in ".?!…"
+
+        last_word = next((w for w in reversed(words) if _is_terminal_word(w)), None)
+        if last_word is None:
+            return None
+
+        final_start = max(
+            0.0,
+            float(getattr(first_word, "start", start_sec)) - STRICT_WORD_BOUNDARY_PRE_ROLL_SEC,
+        )
+        final_end = float(getattr(last_word, "end", end_sec)) + STRICT_WORD_BOUNDARY_POST_ROLL_SEC
+        video_duration = float(video.get("duration_sec") or 0.0)
+        if video_duration > 0:
+            final_end = min(video_duration, final_end)
+        duration = final_end - final_start
+        if duration <= 0:
+            return None
+        min_floor = max(1.0, float(clip_min_len) - 0.5)
+        max_ceiling = float(clip_max_len) + 8.0
+        if duration < min_floor or duration > max_ceiling:
+            return None
+        return (round(final_start, 3), round(final_end, 3)), True
 
     def _run_with_video_timeout(
         self,
@@ -10230,6 +10374,13 @@ class ReelService:
                         text=segment.text,
                         score=combined_score,
                         source=getattr(segment, "source", "legacy"),
+                        final_rank_score=float(getattr(segment, "final_rank_score", 0.0) or 0.0),
+                        relevance_score=getattr(segment, "relevance_score", None),
+                        engagement_score=float(getattr(segment, "engagement_score", 0.0) or 0.0),
+                        completeness_score=float(getattr(segment, "completeness_score", 0.0) or 0.0),
+                        boundary_confidence=float(getattr(segment, "boundary_confidence", 0.0) or 0.0),
+                        boundary_quality=str(getattr(segment, "boundary_quality", "") or ""),
+                        hook_pattern=str(getattr(segment, "hook_pattern", "") or ""),
                         cluster_group_id=getattr(segment, "cluster_group_id", ""),
                         cluster_sub_index=getattr(segment, "cluster_sub_index", 0),
                         cluster_is_last=getattr(segment, "cluster_is_last", False),
@@ -10884,6 +11035,7 @@ class ReelService:
         concept_terms: list[str] | None = None,
         concept_title: str = "",
         info_dict: dict[str, Any] | None = None,
+        provider: str = "youtube",
     ) -> list[SegmentMatch]:
         """
         Use the proper topic-boundary detection from `topic_cut.py` to find
@@ -10906,6 +11058,7 @@ class ReelService:
 
         from .topic_cut import (
             TranscriptCue as TopicCutCue,
+            cues_from_ingest_cues,
             cut_video_into_topic_reels,
         )
 
@@ -10927,6 +11080,17 @@ class ReelService:
 
         # Build a query from concept_title + concept_terms for relevance filtering.
         query = concept_title or " ".join(concept_terms[:5])
+        precision_cues: list[Any] | None = None
+        topic_transcript = tc_cues
+        if str(provider or "youtube").strip().lower() == "youtube":
+            try:
+                from .topic_cut import _try_yt_dlp_vtt_precision
+
+                precision_cues = _try_yt_dlp_vtt_precision(video_id)
+                if precision_cues:
+                    topic_transcript = cues_from_ingest_cues(precision_cues)
+            except Exception:
+                logger.debug("topic_cut VTT precision fetch failed for %s", video_id, exc_info=True)
 
         try:
             classification, topic_reels = cut_video_into_topic_reels(
@@ -10935,7 +11099,7 @@ class ReelService:
                 duration_sec=float(video_duration_sec) if video_duration_sec else None,
                 use_llm=True,
                 refine_boundaries=True,
-                transcript=tc_cues,
+                transcript=topic_transcript,
                 info_dict=info_dict,
                 # Topic-segmentation bounds — kept wider than user clip
                 # bounds so a topic can encompass multiple clip-sized
@@ -10951,6 +11115,7 @@ class ReelService:
                 user_min_sec=float(clip_min_len),
                 user_max_sec=float(clip_max_len),
                 user_target_sec=float(clip_target_len),
+                ingest_cues_for_precision=precision_cues,
             )
         except Exception:
             logger.exception(
@@ -10978,6 +11143,16 @@ class ReelService:
                     break
                 text_parts.append(str(entry.get("text") or "").strip())
             joined_text = " ".join(text_parts).strip()
+            tr_relevance = float(tr.relevance_score) if tr.relevance_score is not None else 0.0
+            tr_rank = float(getattr(tr, "final_rank_score", 0.0) or 0.0)
+            tr_score = max(
+                tr_rank,
+                tr_relevance,
+                0.45 * float(getattr(tr, "engagement_score", 0.0) or 0.0)
+                + 0.35 * float(getattr(tr, "completeness_score", 0.0) or 0.0)
+                + 0.20 * float(getattr(tr, "boundary_confidence", 0.0) or 0.0),
+                0.10,
+            )
 
             segments.append(
                 SegmentMatch(
@@ -10985,8 +11160,15 @@ class ReelService:
                     t_start=float(tr.t_start),
                     t_end=float(tr.t_end),
                     text=joined_text or tr.label,
-                    score=1.0,
+                    score=float(tr_score),
                     source="topic_cut",
+                    final_rank_score=tr_rank,
+                    relevance_score=tr.relevance_score,
+                    engagement_score=float(getattr(tr, "engagement_score", 0.0) or 0.0),
+                    completeness_score=float(getattr(tr, "completeness_score", 0.0) or 0.0),
+                    boundary_confidence=float(getattr(tr, "boundary_confidence", 0.0) or 0.0),
+                    boundary_quality=str(getattr(tr, "boundary_quality", "") or ""),
+                    hook_pattern=str(getattr(tr, "hook_pattern", "") or ""),
                 )
             )
 
@@ -11462,6 +11644,7 @@ class ReelService:
         target_clip_duration_min_sec: int | None = None,
         target_clip_duration_max_sec: int | None = None,
         generation_id: str | None = None,
+        finalized_clip_window: bool = False,
     ) -> dict[str, Any] | None:
         reel_id = str(uuid.uuid4())
         clip_min_len, clip_max_len, _ = self._resolve_clip_duration_bounds(
@@ -11470,7 +11653,26 @@ class ReelService:
             target_clip_duration_max_sec=target_clip_duration_max_sec,
         )
         normalized_clip_window: tuple[float, float] | None
-        if clip_window is None:
+        if finalized_clip_window and clip_window is not None:
+            try:
+                raw_start = float(clip_window[0])
+                raw_end = float(clip_window[1])
+            except (TypeError, ValueError):
+                return None
+            video_duration = float(video.get("duration_sec") or 0)
+            start_f = max(0.0, raw_start)
+            end_f = raw_end
+            if video_duration > 0:
+                end_f = min(video_duration, end_f)
+            duration = end_f - start_f
+            if duration <= 0:
+                return None
+            if duration < max(1.0, float(clip_min_len) - 0.5):
+                return None
+            if clip_max_len > 0 and duration > float(clip_max_len) + 8.0:
+                return None
+            normalized_clip_window = (round(start_f, 3), round(end_f, 3))
+        elif clip_window is None:
             normalized_clip_window = self._normalize_clip_window(
                 segment.t_start,
                 segment.t_end,
@@ -11490,7 +11692,7 @@ class ReelService:
             return None
         start_sec, end_sec = normalized_clip_window
         video_duration_sec = int(video.get("duration_sec") or 0)
-        if transcript:
+        if transcript and not finalized_clip_window:
             trimmed_window = self._trim_structural_edges_from_clip(
                 transcript,
                 clip_start=float(start_sec),

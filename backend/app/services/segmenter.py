@@ -20,6 +20,13 @@ class SegmentMatch:
     text: str
     score: float
     source: str = "legacy"  # "legacy" or "topic_cut" — determines post-processing
+    final_rank_score: float = 0.0
+    relevance_score: float | None = None
+    engagement_score: float = 0.0
+    completeness_score: float = 0.0
+    boundary_confidence: float = 0.0
+    boundary_quality: str = ""
+    hook_pattern: str = ""
     # Chaining metadata for topic_cut segments that were split into
     # consecutive sub-parts because a single topic cluster exceeded the
     # user's max clip length. Segments sharing a ``cluster_group_id`` must

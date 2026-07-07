@@ -580,6 +580,7 @@ def refine_clip_with_whisper(
     t_start: float,
     t_end: float,
     conn: Any | None = None,
+    force: bool = False,
 ) -> WhisperRefinement | None:
     """Run Whisper on the audio at [t_start − 1s, t_end + 1s] and return
     refined (t_start, t_end) + word timings. Returns None when the
@@ -590,7 +591,7 @@ def refine_clip_with_whisper(
     accurate to ~30-80ms on clean speech; combined with the pre/post
     roll the final contract is ≤50ms in well-recorded content.
     """
-    if not whisper_clip_refine_enabled():
+    if not force and not whisper_clip_refine_enabled():
         return None
     if t_end <= t_start:
         return None
