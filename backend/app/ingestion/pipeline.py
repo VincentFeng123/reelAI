@@ -672,18 +672,14 @@ class IngestionPipeline:
                     )
 
         # PERSIST stage: sequential, discover order — the `on_reel_created`
-        # ordering and the global `max_reels` early-stop must stay deterministic.
-        clip_max_allowed = int(target_clip_duration_max_sec) + 8
+        # ordering and the (optional) `max_reels` early-stop stay deterministic.
+        # RAW-PRACTICE: no clip-duration gate — whole-topic clips of ANY length
+        # persist exactly as the engine cut them.
         reels: list[ReelOutWithAttribution] = []
         for v, kept, engine_out in fetched:
             for clip in kept:
                 if max_reels is not None and len(reels) >= max_reels:
                     return reels, resolved_video_ids
-                # Enforce the clip-duration contract at creation time (mirrors the
-                # legacy _create_reel "reject over clip_max+8" rule). The Gemini engine
-                # can return whole-topic clips minutes long; skip the over-length ones.
-                if (float(clip["end"]) - float(clip["start"])) > clip_max_allowed:
-                    continue
                 reel, _ = self._persist_engine_clip(
                     v=v,
                     clip=clip,
@@ -702,17 +698,24 @@ class IngestionPipeline:
     def _clip_and_filter(
         self, v: dict[str, Any], topic: str, language: str
     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-        """Fetch + relevance-filter ONE discovered video's clips. Returns
-        `(v, kept_clips, engine_out)`; the concurrent fetch unit for
-        `ingest_topic`. Empty `clips` yields no kept clips (video is skipped)."""
+        """Fetch ONE discovered video's clips and annotate each with its
+        query-relevance `score` for feed ordering. Returns `(v, scored_clips,
+        engine_out)`, scored_clips sorted by score DESCENDING. Empty `clips`
+        yields no clips (video is skipped).
+
+        RAW-PRACTICE: the material path persists EVERY clip the engine cuts — no
+        relevance drop. (`ingest_search`/`ingest_topic_cut` still drop via
+        `filter_by_query`; this per-concept engine is deliberately raw.)"""
         engine_out = clip_engine_run.clip(
             v["url"], topic=topic, settings={"language": language}
         )
         if not engine_out["clips"]:
             return v, [], engine_out
-        kept = clip_engine_bridge.filter_by_query(
-            engine_out["clips"], engine_out["transcript"], topic
-        )
+        for clip in engine_out["clips"]:
+            clip["score"] = clip_engine_bridge.relevance_score(
+                clip, engine_out["transcript"], topic
+            )
+        kept = sorted(engine_out["clips"], key=lambda c: c["score"], reverse=True)
         return v, kept, engine_out
 
     def _ensure_search_material(self, query: str) -> str:

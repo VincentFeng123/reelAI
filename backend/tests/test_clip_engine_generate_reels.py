@@ -101,6 +101,34 @@ def _multi_clip_engine_out() -> dict:
     }
 
 
+def _five_minute_engine_out() -> dict:
+    """One 300s whole-topic clip — the kind the practice (Gemini) engine cuts for
+    a long lecture segment. RAW-PRACTICE: it must persist and be served intact."""
+    return {
+        "video_id": VIDEO_ID,
+        "clips": [
+            {
+                "start": 0.0,
+                "end": 300.0,
+                "cut_end": 300.0,
+                "title": "Cellular respiration full walkthrough",
+                "facet": "biology",
+                "reason": "whole topic",
+                "sequence_index": 0,
+                "embed_url": "",
+            },
+        ],
+        "transcript": {
+            "segments": [
+                {"start": 0.0, "end": 300.0, "text": "Cellular respiration explained end to end."},
+            ],
+            "words": [],
+            "duration": 300.0,
+        },
+        "notes": "",
+    }
+
+
 class ClipEngineGenerateReelsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -219,9 +247,10 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertTrue(first["video_url"].startswith(f"https://www.youtube.com/embed/{VIDEO_ID}"))
 
     # ------------------------------------------------------------------ #
-    # num_reels cap: a 2-clip video with num_reels=1 yields exactly 1 reel
+    # RAW-PRACTICE: num_reels no longer truncates PERSISTENCE — a 2-clip video
+    # with num_reels=1 persists BOTH clips; only the RESPONSE page is shaped.
     # ------------------------------------------------------------------ #
-    def test_generate_reels_respects_num_reels_cap(self) -> None:
+    def test_num_reels_shapes_response_not_persistence(self) -> None:
         self._patched_engine(_multi_clip_engine_out())
         collector: list[dict] = []
 
@@ -236,15 +265,61 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 on_reel_created=collector.append,
             )
 
+        # Both engine clips persist (no persistence cap) and stream once each.
         with db_module.get_conn() as conn:
             rows = db_module.fetch_all(
                 conn,
                 "SELECT id FROM reels WHERE generation_id = ?",
                 ("gen-cap",),
             )
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(collector), 2)
+        # The RESPONSE page is still shaped to num_reels by _finalize_generated_reels.
         self.assertEqual(len(result), 1)
-        self.assertEqual(len(collector), 1)
+
+        # ranked_feed serves BOTH persisted clips back regardless of num_reels.
+        with db_module.get_conn() as conn:
+            feed = main_module.reel_service.ranked_feed(
+                conn, material_id=MATERIAL_ID, generation_id="gen-cap"
+            )
+        self.assertEqual(len(feed), 2)
+
+    # ------------------------------------------------------------------ #
+    # RAW-PRACTICE: a 5-minute whole-topic clip persists AND is served by
+    # ranked_feed (no duration gate anywhere on the material/serving path).
+    # ------------------------------------------------------------------ #
+    def test_five_minute_clip_persists_and_served_by_ranked_feed(self) -> None:
+        self._patched_engine(_five_minute_engine_out())
+
+        with db_module.get_conn() as conn:
+            main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=None,
+                num_reels=5,
+                creative_commons_only=False,
+                generation_id="gen-5min",
+            )
+
+        with db_module.get_conn() as conn:
+            rows = db_module.fetch_all(
+                conn,
+                "SELECT id, t_start, t_end FROM reels WHERE generation_id = ?",
+                ("gen-5min",),
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["t_end"] - rows[0]["t_start"], 300.0, places=3)
+
+        with db_module.get_conn() as conn:
+            feed = main_module.reel_service.ranked_feed(
+                conn, material_id=MATERIAL_ID, generation_id="gen-5min"
+            )
+        self.assertEqual(len(feed), 1)
+        served = feed[0]
+        self.assertAlmostEqual(
+            float(served["t_end"]) - float(served["t_start"]), 300.0, places=3
+        )
+        self.assertAlmostEqual(float(served["clip_duration_sec"]), 300.0, places=1)
 
     # ------------------------------------------------------------------ #
     # dry_run: discover-only viability probe, zero DB writes, non-empty

@@ -311,7 +311,7 @@ class IngestTopicTests(unittest.TestCase):
         for r in reels:
             self.assertEqual(r.channel_name, "BioChan")
 
-    # ---- 8. over-length clips are skipped at persist (Finding #2) ---- #
+    # ---- 8. over-length clips PERSIST at persist (RAW-PRACTICE reversal) ---- #
 
     def _patch_single_video(self, engine_out: dict):
         vid = {
@@ -333,7 +333,7 @@ class IngestTopicTests(unittest.TestCase):
         run.clip.return_value = engine_out
         return search, run
 
-    def test_over_length_clip_skipped(self) -> None:
+    def test_over_length_clip_persists(self) -> None:
         engine_out = {
             "video_id": "vidCCCCCCCC",
             "clips": [
@@ -360,12 +360,16 @@ class IngestTopicTests(unittest.TestCase):
             target_clip_duration_max_sec=60,
             max_videos=1,
         )
-        # Only the 45s clip survives; the 220s clip exceeds 60+8 and is skipped.
-        self.assertEqual(len(reels), 1)
-        self.assertEqual(reels[0].t_start, 30.0)
-        self.assertEqual(reels[0].t_end, 75.0)
+        # RAW-PRACTICE: the 220s clip exceeds the retired 60+8 window but PERSISTS
+        # exactly as cut (not clamped) alongside the 45s clip.
+        self.assertEqual(len(reels), 2)
+        durations = sorted(round(r.t_end - r.t_start) for r in reels)
+        self.assertEqual(durations, [45, 220])
+        over = next(r for r in reels if round(r.t_end - r.t_start) == 220)
+        self.assertEqual(over.t_start, 30.0)
+        self.assertEqual(over.t_end, 250.0)
         rows = self._reels_for_generation("gen-8")
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows), 2)
 
     # ---- 9. captions windowed to the clip + rebased clip-relative (Finding #5) ---- #
 

@@ -1745,14 +1745,14 @@ class ReelService:
 
         for idx, concept in enumerate(concepts):
             raise_if_cancelled()
-            if len(generated) >= num_reels:
-                break
+            # RAW-PRACTICE: no `len(generated) >= num_reels` break — persistence
+            # of engine clips is no longer truncated by num_reels; only the COST
+            # guardrail below (MATERIAL_GEN_MAX_VIDEOS) bounds the paid work.
             if videos_processed >= MATERIAL_GEN_MAX_VIDEOS:
                 break
             topic = self._concept_topic_query(concept)
             if not topic:
                 continue
-            remaining_reels = max(0, num_reels - len(generated))
             video_budget = min(
                 MATERIAL_MAX_VIDEOS_PER_CONCEPT,
                 MATERIAL_GEN_MAX_VIDEOS - videos_processed,
@@ -1779,7 +1779,7 @@ class ReelService:
                     target_clip_duration_max_sec=clip_max_len,
                     language="en",
                     max_videos=video_budget,
-                    max_reels=remaining_reels,
+                    max_reels=None,
                     on_reel_created=(None if dry_run else _stream),
                     dry_run=dry_run,
                 )

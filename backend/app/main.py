@@ -1854,12 +1854,11 @@ def _filter_reels_by_video_preferences(
     target_clip_duration_max_sec: int | None = None,
 ) -> list[dict]:
     safe_duration_pref = _normalize_preferred_video_duration(preferred_video_duration)
-    _, clip_min, clip_max = _resolve_target_clip_duration_bounds(
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-    )
-
+    # RAW-PRACTICE: the clip-length window (target_clip_duration_*) is retired as a
+    # serving-path drop — clips of ANY length are served exactly as the engine cut
+    # them. The video-duration preference (short/medium/long source video) remains
+    # a live knob. target_clip_duration_* params stay in the signature (callers/iOS
+    # still pass them) but no longer drop clips here.
     filtered: list[dict] = []
     for reel in reels:
         if safe_duration_pref != "any":
@@ -1874,8 +1873,6 @@ def _filter_reels_by_video_preferences(
             except (TypeError, ValueError):
                 clip_duration = 0.0
         clip_duration_value = float(clip_duration or 0.0)
-        if clip_duration_value > 0 and (clip_duration_value < clip_min or clip_duration_value > clip_max):
-            continue
 
         normalized = dict(reel)
         if clip_duration_value > 0:
