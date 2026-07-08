@@ -28,15 +28,13 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
 from ..db import DatabaseIntegrityError, dumps_json, get_conn, now_iso, upsert
 from . import TERMS_NOTICE
-from .adapters.base import AdapterResult, BaseAdapter, PlatformCode
-from .adapters.yt_dlp_adapter import YtDlpAdapter
-from .download import TempWorkspace
+from .adapters.base import AdapterResult
 from .errors import (
     DownloadError,
     IngestError,
@@ -46,13 +44,11 @@ from .errors import (
     TranscriptionError,
     UnsupportedSourceError,
 )
-from .ffmpeg_tools import check_ffmpeg_available, probe_duration, silencedetect
 from .logging_config import get_ingest_logger, log_event, new_trace_id, set_trace_id
 from .metadata import (
     brief_ai_summary,
     build_takeaways_for_ingest,
     format_attribution,
-    map_info_dict_to_metadata,
 )
 from .models import (
     IngestFeedItem,
@@ -75,8 +71,6 @@ from .persistence import (
     upsert_reel_row,
     upsert_video,
 )
-from .segment import normalize_clip_window, pick_segments, snippet_for_window
-from .transcribe import transcribe
 from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta, config as clip_engine_config  # noqa: F401
 from ..clip_engine.errors import (
     ClipError as _ClipError,
@@ -154,16 +148,13 @@ class IngestionPipeline:
         youtube_service: Any,
         embedding_service: Any,
         settings: Any = None,
-        adapters: list[BaseAdapter] | None = None,
         rate_limiter: _PlatformRateLimiter | None = None,
         serverless_mode: bool | None = None,
-        feed_concurrency: int = 2,
     ) -> None:
         self._youtube_service = youtube_service
         self._embedding_service = embedding_service
         self._settings = settings
         self._openai_client = None
-        self._adapters: list[BaseAdapter] = adapters or [YtDlpAdapter()]
         self._rate_limiter = rate_limiter or _PlatformRateLimiter()
         if serverless_mode is None:
             serverless_mode = bool(
@@ -172,31 +163,6 @@ class IngestionPipeline:
                 or os.environ.get("K_SERVICE")
             )
         self._serverless_mode = serverless_mode
-        self._feed_executor = ThreadPoolExecutor(max_workers=max(1, int(feed_concurrency)))
-
-    # --------------------------------------------------------------------- #
-    # Adapter routing
-    # --------------------------------------------------------------------- #
-
-    def _pick_adapter(self, url: str) -> BaseAdapter:
-        for adapter in self._adapters:
-            try:
-                if adapter.supports(url):
-                    return adapter
-            except Exception:
-                logger.exception("adapter.supports crashed for %s (%s)", adapter.name, url)
-        raise UnsupportedSourceError(f"No adapter supports URL: {url}")
-
-    # --------------------------------------------------------------------- #
-    # Preflight
-    # --------------------------------------------------------------------- #
-
-    def _preflight(self) -> None:
-        if not check_ffmpeg_available():
-            raise DownloadError(
-                "ffmpeg/ffprobe are not installed on this host. "
-                "Install via railpack.toml or the deploy Dockerfile."
-            )
 
     # --------------------------------------------------------------------- #
     # Single-URL ingest
@@ -407,154 +373,6 @@ class IngestionPipeline:
             trace_id=effective_trace,
         )
 
-    def _persist_topic_reels(
-        self,
-        *,
-        topic_reels: list[Any],  # list[TopicReel] — typed as Any to avoid the import
-        cues: list[IngestTranscriptCue],
-        adapter_result: AdapterResult,
-        metadata: IngestMetadata,
-        material_id: str | None,
-        concept_id: str | None,
-        query: str | None,
-    ) -> list[ReelOutWithAttribution]:
-        """
-        Insert each TopicReel as a `reels` row and return the client-facing
-        ReelOutWithAttribution list.
-
-        Mirrors `_persist_ingest` per-row but in a single shared transaction so
-        a 12-reel video doesn't open 12 connections. Each reel is uniquely
-        keyed by `(material_id, video_id, t_start, t_end)`; if a duplicate
-        sneaks through (e.g. a re-ingest of the same URL), we reuse the
-        existing row's reel_id.
-        """
-        from .persistence import build_video_id  # local import per the existing pattern
-
-        video_id = build_video_id(adapter_result.platform, adapter_result.source_id)
-        attribution = format_attribution(metadata)
-        out: list[ReelOutWithAttribution] = []
-
-        with get_conn(transactional=True) as conn:
-            effective_material_id = material_id or ensure_sentinel_material(conn)
-            effective_concept_id = concept_id or ensure_sentinel_concept(conn, effective_material_id)
-            upsert_video(
-                conn,
-                platform=adapter_result.platform,
-                source_id=adapter_result.source_id,
-                metadata=metadata,
-            )
-
-            for tr in topic_reels:
-                clip_start = float(tr.t_start)
-                clip_end = float(tr.t_end)
-
-                if adapter_result.platform == "yt":
-                    video_url = (
-                        f"https://www.youtube.com/embed/{adapter_result.source_id}"
-                        f"?start={int(clip_start)}&end={int(clip_end)}"
-                        "&modestbranding=1&rel=0&playsinline=1"
-                    )
-                else:
-                    video_url = adapter_result.playback_url
-
-                snippet = snippet_for_window(
-                    cues,
-                    clip_start,
-                    clip_end,
-                    max_chars=700,
-                    focus_query=query,
-                )
-                takeaways = build_takeaways_for_ingest(
-                    concept_title=tr.label or metadata.title or "",
-                    transcript_snippet=snippet,
-                    hashtags=metadata.hashtags,
-                    limit=3,
-                )
-
-                # Per-segment AI summary, cached on disk via `brief_ai_summary`'s
-                # llm_cache key. Skipping the LLM here when no client is configured
-                # is fine — the topic_cut label is already a usable headline.
-                ai_summary = brief_ai_summary(
-                    conn,
-                    concept_title=tr.label or metadata.title or "",
-                    video_title=metadata.title or "",
-                    video_description=metadata.description,
-                    transcript_snippet=snippet,
-                    takeaways=takeaways,
-                    cache_key_suffix=(
-                        f"topic_cut:{adapter_result.platform}:"
-                        f"{adapter_result.source_id}:{int(clip_start)}-{int(clip_end)}"
-                    ),
-                )
-
-                reel_id = f"topic-{uuid.uuid4().hex[:16]}"
-                inserted = upsert_reel_row(
-                    conn,
-                    reel_id=reel_id,
-                    material_id=effective_material_id,
-                    concept_id=effective_concept_id,
-                    video_id=video_id,
-                    video_url=video_url,
-                    t_start=clip_start,
-                    t_end=clip_end,
-                    transcript_snippet=snippet,
-                    takeaways=takeaways,
-                    base_score=1.0,
-                )
-                if not inserted:
-                    existing = load_existing_reel(
-                        conn,
-                        material_id=effective_material_id,
-                        video_id=video_id,
-                        t_start=clip_start,
-                        t_end=clip_end,
-                    )
-                    if existing:
-                        reel_id = existing["id"]
-
-                store_ingest_metadata_blob(conn, reel_id=reel_id, metadata=metadata)
-
-                clip_captions = [
-                    {"start": cue.start, "end": cue.end, "text": cue.text}
-                    for cue in cues
-                    if cue.text and clip_start <= cue.start <= clip_end
-                ]
-                clip_duration = max(0.0, clip_end - clip_start)
-
-                out.append(
-                    ReelOutWithAttribution(
-                        reel_id=reel_id,
-                        material_id=effective_material_id,
-                        concept_id=effective_concept_id,
-                        concept_title=tr.label or metadata.title or "",
-                        video_title=metadata.title or "",
-                        video_description=metadata.description,
-                        ai_summary=ai_summary,
-                        video_url=video_url,
-                        t_start=clip_start,
-                        t_end=clip_end,
-                        transcript_snippet=snippet,
-                        takeaways=takeaways,
-                        captions=clip_captions,
-                        score=1.0,
-                        relevance_score=getattr(tr, 'relevance_score', None),
-                        discovery_score=None,
-                        clipability_score=1.0,
-                        query_strategy="topic_cut",
-                        retrieval_stage="topic_cut",
-                        source_surface=f"ingest:{adapter_result.platform}:topic_cut",
-                        matched_terms=[],
-                        relevance_reason=tr.summary or "",
-                        concept_position=None,
-                        total_concepts=None,
-                        video_duration_sec=int(metadata.duration_sec) if metadata.duration_sec else None,
-                        clip_duration_sec=float(clip_duration),
-                        source_attribution=attribution,
-                    )
-                )
-
-        return out
-
     # --------------------------------------------------------------------- #
     # Feed ingest
     # --------------------------------------------------------------------- #
@@ -638,112 +456,6 @@ class IngestionPipeline:
             terms_notice=TERMS_NOTICE,
             trace_id=effective_trace,
         )
-
-    # --------------------------------------------------------------------- #
-    # Topic-cut variant for search — multiple query-filtered reels per URL
-    # --------------------------------------------------------------------- #
-
-    def _ingest_url_with_topic_cut(
-        self,
-        *,
-        source_url: str,
-        query: str,
-        material_id: str | None = None,
-        concept_id: str | None = None,
-        language: str = "en",
-        trace_id: str | None = None,
-    ) -> list[ReelOutWithAttribution]:
-        """
-        Download + transcribe + topic-cut a single URL, returning only the
-        topic reels that match *query*.  Used by `ingest_search` to produce
-        multiple precise clips per video instead of a single heuristic window.
-
-        Falls back to the standard `ingest_url` (single clip) when topic-cut
-        produces no results (e.g. Shorts, missing transcript, all topics
-        filtered out).
-        """
-        from ..services.topic_cut import (
-            cues_from_ingest_cues,
-            cut_video_into_topic_reels,
-        )
-
-        effective_trace = set_trace_id(trace_id or new_trace_id())
-        self._preflight()
-
-        adapter = self._pick_adapter(source_url)
-        platform: PlatformCode = adapter.platform_for(source_url)
-        self._rate_limiter.acquire(platform)
-
-        with TempWorkspace() as workspace:
-            adapter_result = adapter.resolve(source_url, workspace)
-            metadata = map_info_dict_to_metadata(
-                adapter_result.info_dict,
-                platform=platform,
-                source_url=source_url,
-                source_id=adapter_result.source_id,
-                playback_url=adapter_result.playback_url,
-            )
-
-            duration_sec = metadata.duration_sec
-            if not duration_sec or duration_sec <= 0:
-                try:
-                    duration_sec = probe_duration(adapter_result.video_path)
-                    metadata = metadata.model_copy(update={"duration_sec": duration_sec})
-                except DownloadError as exc:
-                    raise DownloadError(
-                        "Could not determine video duration",
-                        detail=exc.detail or exc.message,
-                    ) from exc
-
-            try:
-                cues = self._transcribe_with_conn(
-                    platform=platform,
-                    source_id=adapter_result.source_id,
-                    info_dict=adapter_result.info_dict,
-                    video_path=adapter_result.video_path,
-                    workspace=workspace,
-                    language=language,
-                    video_duration_sec=float(duration_sec) if duration_sec else None,
-                )
-            except (TranscriptionError, ServerlessUnavailable):
-                raise
-            except Exception as exc:
-                raise TranscriptionError(
-                    "unexpected error during transcription", detail=str(exc)
-                ) from exc
-
-            if not cues:
-                raise TranscriptionError("no transcript cues were produced")
-
-            info_dict_snapshot: dict[str, Any] = dict(adapter_result.info_dict or {})
-
-        # Outside workspace — temp dir is gone, cues + metadata survive.
-        topic_cues = cues_from_ingest_cues(cues)
-        classification, topic_reels = cut_video_into_topic_reels(
-            source_url,
-            query=query,
-            duration_sec=float(duration_sec or 0.0),
-            use_llm=True,
-            transcript=topic_cues,
-            info_dict=info_dict_snapshot,
-        )
-
-        if not classification.is_short and topic_reels:
-            persisted = self._persist_topic_reels(
-                topic_reels=topic_reels,
-                cues=cues,
-                adapter_result=adapter_result,
-                metadata=metadata,
-                material_id=material_id,
-                concept_id=concept_id,
-                query=query,
-            )
-            if persisted:
-                return persisted
-
-        # Fallback: topic-cut produced nothing usable (Short, no transcript,
-        # all topics filtered out). Return empty — caller handles gracefully.
-        return []
 
     # --------------------------------------------------------------------- #
     # Topic search — multi-platform fan-out
@@ -988,13 +700,6 @@ class IngestionPipeline:
         )
         return v, kept, engine_out
 
-    def _pick_search_adapter(self) -> Any:
-        """The search adapter is the first adapter that exposes build_search_url."""
-        for adapter in self._adapters:
-            if hasattr(adapter, "build_search_url"):
-                return adapter
-        raise UnsupportedSourceError("No search-capable adapter is installed")
-
     def _ensure_search_material(self, query: str) -> str:
         """
         Idempotently create a query-scoped sentinel material so /api/feed can scope to
@@ -1052,32 +757,6 @@ class IngestionPipeline:
     # --------------------------------------------------------------------- #
     # Helpers that need a DB connection
     # --------------------------------------------------------------------- #
-
-    def _transcribe_with_conn(
-        self,
-        *,
-        platform: PlatformLiteral,
-        source_id: str,
-        info_dict: dict[str, Any],
-        video_path: Path,
-        workspace: Path,
-        language: str,
-        video_duration_sec: float | None = None,
-    ) -> list[IngestTranscriptCue]:
-        with get_conn() as conn:
-            return transcribe(
-                conn,
-                platform=platform,
-                source_id=source_id,
-                info_dict=info_dict,
-                video_path=video_path,
-                workspace=workspace,
-                youtube_service=self._youtube_service,
-                language=language,
-                serverless_mode=self._serverless_mode,
-                video_duration_sec=video_duration_sec,
-                whisper_fallback_available=(True if self._openai_client is not None else None),
-            )
 
     def _persist_engine_clip(
         self,
