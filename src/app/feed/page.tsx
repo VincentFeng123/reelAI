@@ -3615,7 +3615,7 @@ function FeedPageInner() {
               {renderMobileFeedbackButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
             </div>
           ) : null}
-          {generationProgress !== null ? (
+          {generationProgress !== null && reels.length > 0 ? (
             <GenerationProgress received={generationProgress.received} requested={generationProgress.requested} />
           ) : null}
           <div
@@ -3650,25 +3650,26 @@ function FeedPageInner() {
               <div className="absolute inset-0 grid place-items-center p-6">
                 <div className="max-w-sm rounded-3xl border border-white/20 bg-black/68 px-5 py-4 text-center text-white backdrop-blur">
                   {loading || bootstrappingFirstReels || generatingMore ? (
-                    <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-white/62">Loading feed</p>
-                  ) : null}
-                  <p className="text-sm font-semibold">
-                    {loading || bootstrappingFirstReels || generatingMore ? "Preparing your first reels..." : "No reels yet"}
-                  </p>
-                  <p className="mt-2 text-xs text-white/72">
-                    {loading || bootstrappingFirstReels || generatingMore
-                      ? "This can take a little while on first generation."
-                      : "Try generating again, or adjust your topic/material for broader matches."}
-                  </p>
-                  {!loading && !bootstrappingFirstReels && !generatingMore ? (
-                    <button
-                      type="button"
-                      onClick={() => void bootstrapFirstReels(true)}
-                      className="mt-3 rounded-xl border border-white/25 bg-white px-3.5 py-2 text-xs font-semibold text-black"
-                    >
-                      Generate Reels
-                    </button>
-                  ) : null}
+                    <GenerationProgress
+                      received={generationProgress?.received ?? 0}
+                      requested={generationProgress?.requested ?? 5}
+                      variant="center"
+                    />
+                  ) : (
+                    <>
+                      <p className="text-sm font-semibold">No reels yet</p>
+                      <p className="mt-2 text-xs text-white/72">
+                        Try generating again, or adjust your topic/material for broader matches.
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void bootstrapFirstReels(true)}
+                        className="mt-3 rounded-xl border border-white/25 bg-white px-3.5 py-2 text-xs font-semibold text-black"
+                      >
+                        Generate Reels
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
             ) : null}

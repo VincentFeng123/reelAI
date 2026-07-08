@@ -8,9 +8,10 @@ const HINT_INTERVAL_MS = 6000;
 interface GenerationProgressProps {
   received: number;
   requested: number;
+  variant?: "bar" | "center";
 }
 
-export function GenerationProgress({ received, requested }: GenerationProgressProps) {
+export function GenerationProgress({ received, requested, variant = "bar" }: GenerationProgressProps) {
   const [hintIndex, setHintIndex] = useState(0);
 
   useEffect(() => {
@@ -23,6 +24,27 @@ export function GenerationProgress({ received, requested }: GenerationProgressPr
 
   const isIndeterminate = received === 0;
   const pct = requested > 0 ? Math.min(1, received / requested) : 0;
+
+  if (variant === "center") {
+    return (
+      <div role="status" aria-live="polite" className="w-full">
+        <div className="relative h-1 overflow-hidden rounded-full bg-white/10">
+          {isIndeterminate ? (
+            <div className="animate-progress-shimmer absolute inset-y-0 w-1/3 bg-gradient-to-r from-transparent via-white/60 to-transparent" />
+          ) : (
+            <div
+              className="absolute inset-y-0 left-0 bg-white/80 transition-all duration-500 ease-out"
+              style={{ width: `${pct * 100}%` }}
+            />
+          )}
+        </div>
+        <p className="mt-3 text-sm font-semibold">
+          {isIndeterminate ? STAGE_HINTS[hintIndex] : `${received} of ${requested} reels ready`}
+        </p>
+        <p className="mt-1 text-xs text-white/72">This can take a little while on first generation.</p>
+      </div>
+    );
+  }
 
   return (
     <div
