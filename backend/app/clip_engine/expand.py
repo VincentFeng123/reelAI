@@ -9,10 +9,14 @@ import re
 from . import config
 
 _SYSTEM = (
-    "You expand a user's search topic into a diverse set of YouTube search queries that "
-    "maximize topical coverage. Spellcheck and correct the input, infer intent, then produce "
-    "up to N distinct queries covering the corrected topic, close synonyms, important "
-    "sub-topics, and phrase variants (\"X tutorial\", \"X explained\", \"X for beginners\"). "
+    "You expand a user's study topic into diverse YouTube search queries that surface "
+    "EDUCATIONAL content — lectures, explainers, university courses, tutorials, and "
+    "documentaries. Spellcheck and correct the input, infer the academic field or discipline "
+    "(e.g. ambiguous 'jaguar' → 'jaguar animal biology'), then produce up to N distinct queries "
+    "using phrasings like 'X explained', 'X lecture', 'how X works', 'X course', 'X for "
+    "students', 'introduction to X', 'X fundamentals', and field-qualified variants. "
+    "AVOID entertainment phrasings such as reactions, memes, funny compilations, top-10 lists, "
+    "vlogs, or challenge videos — this is a study product. "
     "Return ONLY strict JSON: {\"corrected\": \"...\", \"queries\": [\"q1\", ...]} with the "
     "corrected topic first in queries. No prose, no code fences."
 )
@@ -61,7 +65,15 @@ def _normalize(corrected: str | None, queries, fallback: str, n: int) -> list[st
 
 
 def free_expand(topic: str, n: int) -> dict:
-    variants = [topic, f"{topic} explained", f"{topic} tutorial", f"{topic} for beginners"]
+    variants = [
+        topic,
+        f"{topic} explained",
+        f"{topic} lecture",
+        f"{topic} tutorial",
+        f"how {topic} works",
+        f"{topic} course",
+        f"{topic} for beginners",
+    ]
     return {"corrected": topic, "queries": _normalize(topic, variants, topic, n),
             "provider_used": "free"}
 
@@ -82,7 +94,7 @@ def expand_query(topic: str, n: int) -> dict:
     if not config.GEMINI_API_KEY:
         return free_expand(topic, n)
     try:
-        raw = _gemini_expand_raw(_SYSTEM, _user(topic, n), config.GEMINI_MODEL)
+        raw = _gemini_expand_raw(_SYSTEM, _user(topic, n), config.EXPAND_MODEL)
         parsed = _safe_json(raw)
         if parsed:
             return {"corrected": parsed.get("corrected") or topic,

@@ -17,3 +17,47 @@ def test_ranks_by_match_count_then_views():
 def test_skips_videos_without_id():
     ranked = merge_and_rank([{"query": "a", "videos": [{"title": "no id"}]}])
     assert ranked == []
+
+
+def test_educational_ranking_and_bounds():
+    """
+    Covers 3 invariants:
+    1. Same match_count: boosted edu video outranks penalised entertainment video.
+    2. edu_score is stored on each video and bounded to [-3.0, +3.0].
+    3. Cross-match-count: a penalised 2-match video still beats a boosted 1-match video.
+    """
+    # Invariant 1 + 2: same match_count, educational beats entertainment
+    per_query_same = [{"query": "q", "videos": [
+        {"id": "edu", "title": "Photosynthesis explained — MIT lecture", "viewCount": 1000},
+        {"id": "ent", "title": "Photosynthesis funny moments compilation", "viewCount": 1000},
+    ]}]
+    ranked_same = merge_and_rank(per_query_same)
+    assert ranked_same[0]["id"] == "edu", "boosted video should rank first at same match_count"
+    assert ranked_same[0]["edu_score"] > 0
+    assert ranked_same[1]["edu_score"] < 0
+    # edu_score bounded
+    for v in ranked_same:
+        assert -3.0 <= v["edu_score"] <= 3.0
+
+    # Boundary: many boost hits still capped at +3.0
+    heavy = {"id": "h", "title": (
+        "lecture explained tutorial course fundamentals basics introduction intro to "
+        "how things works professor university documentary crash course khan academy"
+    ), "viewCount": 0}
+    ranked_heavy = merge_and_rank([{"query": "q", "videos": [heavy]}])
+    assert ranked_heavy[0]["edu_score"] <= 3.0
+
+    # Invariant 3: penalised 2-match beats boosted 1-match (sort key unchanged)
+    per_query_cross = [
+        {"query": "q1", "videos": [
+            {"id": "two_match", "title": "X reaction compilation funny meme", "viewCount": 100},
+        ]},
+        {"query": "q2", "videos": [
+            {"id": "two_match", "title": "X reaction compilation funny meme", "viewCount": 100},
+            {"id": "one_match", "title": "X explained lecture course tutorial", "viewCount": 100},
+        ]},
+    ]
+    ranked_cross = merge_and_rank(per_query_cross)
+    assert ranked_cross[0]["id"] == "two_match", "match_count wins over edu_score"
+    assert ranked_cross[0]["match_count"] == 2
+    assert ranked_cross[1]["match_count"] == 1

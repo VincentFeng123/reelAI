@@ -22,6 +22,8 @@ SUPADATA_SEARCH_URL = f"{SUPADATA_BASE}/youtube/search"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 SEGMENT_MODEL = os.environ.get("SEGMENT_MODEL", GEMINI_MODEL)
+# Query-expansion uses the cheaper lite tier; segmentation keeps its own model.
+EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "gemini-2.5-flash-lite")
 
 CLIP_ENGINE = os.environ.get("CLIP_ENGINE", "gemini")
 OUTPUT_MODE = os.environ.get("OUTPUT_MODE", "embed")
