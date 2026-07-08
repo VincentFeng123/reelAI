@@ -1,8 +1,20 @@
 import os
 from functools import lru_cache
+from pathlib import Path
 
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Export backend/.env into os.environ (anchored to this file, not the cwd).
+# The clip engine reads os.environ directly — pydantic's env_file only fills
+# the Settings object — so launchers that don't `source backend/.env`
+# (host-up.sh, plain uvicorn) would otherwise run the engine key-less.
+# override=False keeps explicitly exported values authoritative.
+# REELAI_SKIP_DOTENV is set by the test conftest: tests must stay hermetic
+# (no real keys in os.environ → offline fallback paths).
+if not os.environ.get("REELAI_SKIP_DOTENV"):
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
 
 
 def _default_data_dir() -> str:
