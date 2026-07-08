@@ -36,9 +36,6 @@ export function applySearchFeedSettingsToParams(
   params.set("min_relevance", String(Number(settings.minRelevanceThreshold.toFixed(2))));
   params.set("video_pool_mode", settings.videoPoolMode);
   params.set("preferred_video_duration", settings.preferredVideoDuration);
-  params.set("target_clip_duration_sec", String(Math.round(settings.targetClipDurationSec)));
-  params.set("target_clip_duration_min_sec", String(Math.round(settings.targetClipDurationMinSec)));
-  params.set("target_clip_duration_max_sec", String(Math.round(settings.targetClipDurationMaxSec)));
   params.set("start_muted", settings.startMuted ? "1" : "0");
   return params;
 }

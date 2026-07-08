@@ -785,13 +785,6 @@ function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<stri
     min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
     video_pool_mode: params.videoPoolMode ?? "short-first",
     preferred_video_duration: params.preferredVideoDuration ?? "any",
-    target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : undefined,
-    target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
-      ? Math.round(params.targetClipDurationMinSec as number)
-      : undefined,
-    target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
-      ? Math.round(params.targetClipDurationMaxSec as number)
-      : undefined,
     multi_platform_search: params.multiPlatformSearch === true,
   };
 }
@@ -869,15 +862,6 @@ export async function ingestSearch(params: IngestSearchParams): Promise<IngestSe
       : undefined,
     material_id: params.materialId ?? undefined,
     concept_id: params.conceptId ?? undefined,
-    target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec)
-      ? Math.round(params.targetClipDurationSec as number)
-      : undefined,
-    target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
-      ? Math.round(params.targetClipDurationMinSec as number)
-      : undefined,
-    target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
-      ? Math.round(params.targetClipDurationMaxSec as number)
-      : undefined,
     language: params.language,
     exclude_video_ids: params.excludeVideoIds,
   };
@@ -900,15 +884,6 @@ export async function ingestUrl(params: IngestUrlParams): Promise<IngestResult> 
     source_url: params.sourceUrl,
     material_id: params.materialId ?? undefined,
     concept_id: params.conceptId ?? undefined,
-    target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec)
-      ? Math.round(params.targetClipDurationSec as number)
-      : undefined,
-    target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
-      ? Math.round(params.targetClipDurationMinSec as number)
-      : undefined,
-    target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
-      ? Math.round(params.targetClipDurationMaxSec as number)
-      : undefined,
     language: params.language,
   };
 
@@ -1034,13 +1009,6 @@ export async function checkReelsCanGenerate(params: {
       min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
       video_pool_mode: params.videoPoolMode ?? "short-first",
       preferred_video_duration: params.preferredVideoDuration ?? "any",
-      target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : undefined,
-      target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
-        ? Math.round(params.targetClipDurationMinSec as number)
-        : undefined,
-      target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
-        ? Math.round(params.targetClipDurationMaxSec as number)
-        : undefined,
     }),
   });
   return parseJsonResponse<ReelsCanGenerateResponse>(res);
@@ -1072,13 +1040,6 @@ export async function checkReelsCanGenerateAny(params: {
       min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
       video_pool_mode: params.videoPoolMode ?? "short-first",
       preferred_video_duration: params.preferredVideoDuration ?? "any",
-      target_clip_duration_sec: Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : undefined,
-      target_clip_duration_min_sec: Number.isFinite(params.targetClipDurationMinSec)
-        ? Math.round(params.targetClipDurationMinSec as number)
-        : undefined,
-      target_clip_duration_max_sec: Number.isFinite(params.targetClipDurationMaxSec)
-        ? Math.round(params.targetClipDurationMaxSec as number)
-        : undefined,
     }),
   });
   return parseJsonResponse<ReelsCanGenerateAnyResponse>(res);
@@ -1110,16 +1071,7 @@ export async function fetchFeed(params: {
     generation_mode: params.generationMode ?? "slow",
     video_pool_mode: params.videoPoolMode ?? "short-first",
     preferred_video_duration: params.preferredVideoDuration ?? "any",
-    target_clip_duration_sec: String(
-      Number.isFinite(params.targetClipDurationSec) ? Math.round(params.targetClipDurationSec as number) : 55,
-    ),
   });
-  if (Number.isFinite(params.targetClipDurationMinSec)) {
-    query.set("target_clip_duration_min_sec", String(Math.round(params.targetClipDurationMinSec as number)));
-  }
-  if (Number.isFinite(params.targetClipDurationMaxSec)) {
-    query.set("target_clip_duration_max_sec", String(Math.round(params.targetClipDurationMaxSec as number)));
-  }
   if (Number.isFinite(params.minRelevance)) {
     query.set("min_relevance", String(params.minRelevance));
   }

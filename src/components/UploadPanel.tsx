@@ -778,38 +778,6 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
       <div className="relative z-20 mt-6 shrink-0 flex flex-col gap-2 md:mt-6">
         <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>
         <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
-          <div className="w-full md:max-w-[220px]">
-            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Generation Speed</label>
-            <div className="relative grid h-12 grid-cols-2 items-center rounded-2xl border border-white/15 bg-white/[0.08] p-1 backdrop-blur-[18px] backdrop-saturate-150">
-              <span
-                aria-hidden="true"
-                className={`pointer-events-none absolute bottom-1 left-1 top-1 w-[calc(50%-4px)] rounded-xl bg-white transition-transform duration-300 ease-out ${
-                  generationMode === "fast" ? "translate-x-full" : "translate-x-0"
-                }`}
-              />
-              <button
-                type="button"
-                onClick={() => setGenerationMode("slow")}
-                className={`relative z-10 rounded-xl px-2 py-2 text-[11px] font-semibold uppercase tracking-[0.04em] transition-colors duration-200 ${
-                  generationMode === "slow" ? "text-black" : "text-white/75 hover:text-white"
-                }`}
-                aria-pressed={generationMode === "slow"}
-              >
-                Slow
-              </button>
-              <button
-                type="button"
-                onClick={() => setGenerationMode("fast")}
-                className={`relative z-10 rounded-xl px-2 py-2 text-[11px] font-semibold uppercase tracking-[0.04em] transition-colors duration-200 ${
-                  generationMode === "fast" ? "text-black" : "text-white/75 hover:text-white"
-                }`}
-                aria-pressed={generationMode === "fast"}
-              >
-                Fast
-              </button>
-            </div>
-          </div>
-
           <button
             type="submit"
             disabled={disabled}

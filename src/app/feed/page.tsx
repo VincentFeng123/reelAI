@@ -41,7 +41,6 @@ import {
 import type { ChatMessage, Reel } from "@/lib/types";
 
 const PAGE_SIZE = 5;
-const INITIAL_FAST_PREFETCH = 6;
 const INITIAL_SLOW_PREFETCH = 4;
 const REEL_SNAP_DURATION_MS = 300;
 const POST_SNAP_COOLDOWN_MS = 30;
@@ -1333,7 +1332,6 @@ function FeedPageInner() {
   }, [renewActiveSearchScope]);
 
   const hasMore = !feedPagesExhausted && reels.length < total;
-  const isFastGeneration = generationMode === "fast";
   const hasExplicitGenerationModeParam = generationModeParam === "fast" || generationModeParam === "slow";
 
   useEffect(() => {
@@ -1655,7 +1653,7 @@ function FeedPageInner() {
     if (feedMaterialIds.length === 0) {
       return false;
     }
-    const minimumPerTopic = generationMode === "fast" ? 3 : 5;
+    const minimumPerTopic = 5;
     return feedMaterialIds.some((id) => countReelsForMaterial(id) < minimumPerTopic);
   }, [countReelsForMaterial, generationMode, getFeedMaterialIds]);
 
@@ -1705,7 +1703,7 @@ function FeedPageInner() {
                 limit: PAGE_SIZE,
                 excludeVideoIds: getExcludedSourceVideoIds(),
                 autofill: options?.autofill ?? true,
-                prefetch: generationMode === "fast" ? INITIAL_FAST_PREFETCH : INITIAL_SLOW_PREFETCH,
+                prefetch: INITIAL_SLOW_PREFETCH,
                 generationMode,
                 minRelevance: tuning.minRelevance,
                 videoPoolMode: tuning.videoPoolMode,
@@ -1864,7 +1862,7 @@ function FeedPageInner() {
     }
     const searchScope = activeSearchScopeRef.current;
     const tuning = getFeedTuningSettings();
-    const batchSize = isFastGeneration ? 10 : 14;
+    const batchSize = 14;
     const perTopicBatch = Math.max(1, Math.ceil(batchSize / feedMaterialIds.length));
     isGeneratingRef.current = true;
     setGeneratingMore(true);
@@ -1881,7 +1879,7 @@ function FeedPageInner() {
         feedMaterialIds.map(async (id) => {
           const streamedReels: Reel[] = [];
           const currentCount = countReelsForMaterial(id);
-          const initialTarget = generationMode === "fast" ? 3 : 5;
+          const initialTarget = 5;
           // Keep extending the requested total upward so broad topics do not stall at a client-side cap.
           const targetTotal = currentCount > 0 ? currentCount + perTopicBatch : initialTarget;
           try {
@@ -2020,7 +2018,6 @@ function FeedPageInner() {
     getExcludedSourceVideoIds,
     hasPendingRefinementForFeed,
     interleaveReelBatches,
-    isFastGeneration,
     isIngestMaterial,
     isSearchScopeActive,
     markRecoveryProgress,
@@ -3443,42 +3440,6 @@ function FeedPageInner() {
     [activeFeedback, activeReel],
   );
 
-  const renderGenerationModeToggle = (className?: string) => (
-    <div
-      role="group"
-      aria-label="Generation mode"
-      className={[
-        "relative grid h-10 w-[128px] grid-cols-2 items-center overflow-hidden rounded-2xl border border-white/25 bg-white/[0.06] p-1 text-[10px] font-semibold uppercase tracking-[0.06em] text-white backdrop-blur-lg",
-        className,
-      ]
-        .filter(Boolean)
-        .join(" ")}
-    >
-      <span aria-hidden="true" className="pointer-events-none absolute inset-0 bg-black/45" />
-      <span
-        aria-hidden="true"
-        className={`pointer-events-none absolute bottom-1 left-1 top-1 z-10 w-[calc(50%-4px)] rounded-xl bg-white transition-transform duration-300 ease-out ${
-          generationMode === "fast" ? "translate-x-full" : "translate-x-0"
-        }`}
-      />
-      <button
-        type="button"
-        onClick={() => setGenerationModeWithUrlSync("slow")}
-        className={`relative z-10 rounded-xl px-2 py-1 transition-colors ${generationMode === "slow" ? "text-black" : "text-white/82"}`}
-        aria-pressed={generationMode === "slow"}
-      >
-        Slow
-      </button>
-      <button
-        type="button"
-        onClick={() => setGenerationModeWithUrlSync("fast")}
-        className={`relative z-10 rounded-xl px-2 py-1 transition-colors ${generationMode === "fast" ? "text-black" : "text-white/82"}`}
-        aria-pressed={generationMode === "fast"}
-      >
-        Fast
-      </button>
-    </div>
-  );
   const renderMobileFeedbackButton = (action: FeedbackAction, label: string, iconClass: string, active: boolean) => (
     <button
       type="button"
@@ -3591,9 +3552,6 @@ function FeedPageInner() {
       >
         <i className="fa-solid fa-arrow-left text-xs" aria-hidden="true" />
       </button>
-      <div className="absolute right-3 top-3 z-[9999] lg:hidden">
-        {renderGenerationModeToggle("shadow-[0_8px_24px_rgba(0,0,0,0.35)]")}
-      </div>
       {error ? (
         <div className="absolute left-0 right-0 top-3 z-[2147483647] mx-auto w-fit">
           <div className="relative overflow-hidden rounded-xl border border-gray-300/45 bg-white/10 px-4 py-2 text-xs text-white shadow-[0_12px_28px_rgba(0,0,0,0.35)] backdrop-blur-xl backdrop-saturate-150">
@@ -3605,9 +3563,6 @@ function FeedPageInner() {
 
       <div ref={desktopShellRef} className="h-full min-h-[100dvh] md:min-h-0 lg:flex">
         <section className="relative h-[100dvh] min-h-[100dvh] md:h-full md:min-h-0 lg:min-w-0 lg:flex-1">
-          <div className="absolute right-3 top-3 z-30 hidden lg:block">
-            {renderGenerationModeToggle("shadow-[0_8px_24px_rgba(0,0,0,0.35)]")}
-          </div>
           {activeReel && !mobileDetailsOpen ? (
             <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2">
               {renderMobileFeedbackButton("helpful", "Helpful", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
