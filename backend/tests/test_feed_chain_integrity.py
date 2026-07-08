@@ -325,5 +325,46 @@ class MergeRequestReelListsChainIntegrityTests(unittest.TestCase):
         self.assertIn("orphan", ids)
 
 
+class MergeNearDuplicateSpanTests(unittest.TestCase):
+    """Cross-generation near-duplicate spans (fine-snap jitter defeats the
+    exact clip_key) must be dropped by span overlap; first-seen wins."""
+
+    @staticmethod
+    def _reel(reel_id: str, video_key: str, t_start: float, t_end: float, score: float) -> dict:
+        return {
+            "reel_id": reel_id,
+            "video_url": f"https://www.youtube.com/embed/{video_key}",
+            "t_start": t_start,
+            "t_end": t_end,
+            "score": score,
+            "created_at": "2026-04-16T00:00:00+00:00",
+        }
+
+    def test_jittered_duplicate_dropped_across_generations(self) -> None:
+        import backend.app.main as main_module
+
+        gen1 = [self._reel("A1", "vidA", 30.0, 90.0, score=1.0)]
+        # same footage, sub-second boundary jitter → different exact clip_key
+        gen2 = [self._reel("A1-dup", "vidA", 30.4, 90.2, score=0.9)]
+        merged = main_module._merge_request_reel_lists(gen1, gen2)
+        self.assertEqual([r["reel_id"] for r in merged], ["A1"])
+
+    def test_distinct_spans_of_same_video_both_kept(self) -> None:
+        import backend.app.main as main_module
+
+        gen1 = [self._reel("A1", "vidA", 30.0, 90.0, score=1.0)]
+        gen2 = [self._reel("A2", "vidA", 120.0, 170.0, score=0.9)]
+        merged = main_module._merge_request_reel_lists(gen1, gen2)
+        self.assertEqual({r["reel_id"] for r in merged}, {"A1", "A2"})
+
+    def test_same_span_different_videos_both_kept(self) -> None:
+        import backend.app.main as main_module
+
+        gen1 = [self._reel("A1", "vidA", 30.0, 90.0, score=1.0)]
+        gen2 = [self._reel("B1", "vidB", 30.0, 90.0, score=0.9)]
+        merged = main_module._merge_request_reel_lists(gen1, gen2)
+        self.assertEqual({r["reel_id"] for r in merged}, {"A1", "B1"})
+
+
 if __name__ == "__main__":
     unittest.main()

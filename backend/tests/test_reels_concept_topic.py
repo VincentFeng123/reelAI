@@ -6,10 +6,9 @@ youtube_service=None (pattern established by test_reels_saliency.py).
 VERCEL=1 sets serverless_mode=True inside __init__, avoiding any outbound
 calls from llm_router / TopicExpansionService / ProviderRegistry.
 
-Note on "single-token title":
-  normalize_terms returns stems + variants.  "Osmosis" → {'osmosi','osmosis'}
-  (len=2) so it does NOT qualify as single-token by that rule.  Use acronyms
-  like "ATP" (→ {'atp'}, len=1) to hit the keyword-append branch.
+The query is the concept's CLEAN TITLE, nothing more: wiki-keyword appending
+was removed — the clip engine's discover() expansion (spellcheck + field
+inference) owns disambiguation, and appended keywords polluted seed queries.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("VERCEL", "1")
 
@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import backend.app.services.reels as reels_module  # noqa: E402
 from backend.app.services.reels import ReelService  # noqa: E402
 
 
@@ -39,18 +40,16 @@ def _row(title: str, keywords: list[str]) -> dict:
 
 class ConceptTopicQueryTests(unittest.TestCase):
     # ------------------------------------------------------------------
-    # Test 1: single-token title → first differing keyword appended
-    # normalize_terms(['ATP']) == {'atp'}, len=1 → single-token branch
-    # 'cell biology' normalized ('cell biology') != 'atp' → appended
+    # Test 1: single-token title → clean title only, keywords IGNORED
+    # (keyword appending removed; discover() expansion disambiguates)
     # ------------------------------------------------------------------
-    def test_single_token_title_appends_first_differing_keyword(self) -> None:
+    def test_single_token_title_ignores_keywords(self) -> None:
         svc = _svc()
         result = svc._concept_topic_query(_row("ATP", ["cell biology", "synthesis"]))
-        self.assertEqual(result, "ATP cell biology")
+        self.assertEqual(result, "ATP")
 
     # ------------------------------------------------------------------
-    # Test 2: multi-token title → no keyword appended
-    # normalize_terms(['Cellular respiration stages']) has len>1
+    # Test 2: multi-token title → clean title only
     # ------------------------------------------------------------------
     def test_multi_token_title_no_keyword_appended(self) -> None:
         svc = _svc()
@@ -66,15 +65,6 @@ class ConceptTopicQueryTests(unittest.TestCase):
         self.assertEqual(svc._concept_topic_query(_row("   ", ["diffusion"])), "")
 
     # ------------------------------------------------------------------
-    # Test 4: keyword identical (normalized) to single-token title is skipped
-    # 'atp' normalized == 'atp' (title) → skipped; 'synthesis' != 'atp' → used
-    # ------------------------------------------------------------------
-    def test_identical_keyword_skipped_uses_next(self) -> None:
-        svc = _svc()
-        result = svc._concept_topic_query(_row("ATP", ["atp", "synthesis"]))
-        self.assertEqual(result, "ATP synthesis")
-
-    # ------------------------------------------------------------------
     # Bonus: ingestion_pipeline param is stored
     # ------------------------------------------------------------------
     def test_ingestion_pipeline_stored(self) -> None:
@@ -85,6 +75,58 @@ class ConceptTopicQueryTests(unittest.TestCase):
     def test_ingestion_pipeline_defaults_none(self) -> None:
         svc = _svc()
         self.assertIsNone(svc.ingestion_pipeline)
+
+
+class CorrectedSubjectTagTests(unittest.TestCase):
+    """_corrected_subject_tag: conservative spellfix only, cached on success,
+    NOT cached on transient failure."""
+
+    def setUp(self) -> None:
+        ReelService._SUBJECT_CORRECTION_CACHE.clear()
+        self.addCleanup(ReelService._SUBJECT_CORRECTION_CACHE.clear)
+
+    def _patch_expand(self, **kwargs):
+        return mock.patch.object(
+            reels_module._clip_engine_expand, "expand_query", **kwargs
+        )
+
+    def test_conservative_spellfix_accepted(self) -> None:
+        svc = _svc()
+        with self._patch_expand(
+            return_value={"corrected": "psychology", "queries": ["psychology"]}
+        ):
+            self.assertEqual(svc._corrected_subject_tag("pychology"), "psychology")
+
+    def test_field_qualifying_rewrite_rejected(self) -> None:
+        svc = _svc()
+        with self._patch_expand(
+            return_value={"corrected": "jaguar animal biology", "queries": []}
+        ):
+            self.assertEqual(svc._corrected_subject_tag("jaguar"), "jaguar")
+
+    def test_dissimilar_single_word_rewrite_rejected(self) -> None:
+        svc = _svc()
+        with self._patch_expand(return_value={"corrected": "chemistry", "queries": []}):
+            self.assertEqual(svc._corrected_subject_tag("physics"), "physics")
+
+    def test_correction_cached_after_success(self) -> None:
+        svc = _svc()
+        with self._patch_expand(
+            return_value={"corrected": "psychology", "queries": []}
+        ):
+            svc._corrected_subject_tag("pychology")
+        with self._patch_expand(side_effect=AssertionError("must not be called")):
+            self.assertEqual(svc._corrected_subject_tag("pychology"), "psychology")
+
+    def test_transient_failure_not_cached(self) -> None:
+        svc = _svc()
+        with self._patch_expand(side_effect=RuntimeError("gemini down")):
+            self.assertEqual(svc._corrected_subject_tag("pychology"), "pychology")
+        # the failed lookup must NOT poison the cache — the next call retries
+        with self._patch_expand(
+            return_value={"corrected": "psychology", "queries": []}
+        ):
+            self.assertEqual(svc._corrected_subject_tag("pychology"), "psychology")
 
 
 if __name__ == "__main__":

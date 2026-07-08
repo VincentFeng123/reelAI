@@ -24,6 +24,7 @@ from __future__ import annotations
 import collections
 import hashlib
 import logging
+import math
 import os
 import threading
 import time
@@ -79,6 +80,13 @@ from ..clip_engine.errors import (
 )
 
 logger: logging.Logger = get_ingest_logger(__name__)
+
+# Feed curation: keep only the best clips of each discovered video (ranked by
+# relevance x informativeness) instead of persisting the engine's whole tiling.
+INGEST_TOPIC_MAX_CLIPS_PER_VIDEO = int(os.environ.get("INGEST_TOPIC_MAX_CLIPS_PER_VIDEO", "3"))
+# Per-video wall-clock budget for clip+filter (VidScout's feed abandons a
+# video's job after 180s); a pathological video must not stall the generation.
+INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "180"))
 
 
 # --------------------------------------------------------------------- #
@@ -193,7 +201,10 @@ class IngestionPipeline:
         try:
             engine_out = clip_engine_run.clip(
                 source_url,
-                topic=(concept_id or ""),
+                # concept_id is an opaque row id, NOT a topic — it must never
+                # steer segmentation (it flows to _persist_ingest for row
+                # association only, like ingest_feed).
+                topic="",
                 settings={"language": language},
             )
         except _ClipUnsupportedURLError as exc:
@@ -638,18 +649,21 @@ class IngestionPipeline:
 
         videos = disc["videos"]
 
-        # FETCH stage: clip + relevance-filter each video. Parallelize the paid
-        # network/Gemini work (≥2 videos) but keep persistence single-threaded.
+        # FETCH stage: clip + relevance-filter each video concurrently, with a
+        # per-video wall-clock deadline; persistence stays single-threaded.
+        # shutdown(wait=False) abandons a stuck video's thread rather than
+        # blocking the whole generation on it.
         fetched: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]] = []
-        if len(videos) >= 2:
-            with ThreadPoolExecutor(max_workers=min(4, len(videos))) as executor:
+        if videos:
+            executor = ThreadPoolExecutor(max_workers=min(4, len(videos)))
+            try:
                 futures = [
                     executor.submit(self._clip_and_filter, v, topic, language)
                     for v in videos
                 ]
                 for v, future in zip(videos, futures):
                     try:
-                        fetched.append(future.result())
+                        fetched.append(future.result(timeout=INGEST_TOPIC_VIDEO_TIMEOUT_SEC))
                     except Exception as exc:
                         log_event(
                             logger,
@@ -658,23 +672,13 @@ class IngestionPipeline:
                             video_id=v.get("id"),
                             error=str(exc),
                         )
-        else:
-            for v in videos:
-                try:
-                    fetched.append(self._clip_and_filter(v, topic, language))
-                except Exception as exc:
-                    log_event(
-                        logger,
-                        logging.WARNING,
-                        "ingest_topic_video_failed",
-                        video_id=v.get("id"),
-                        error=str(exc),
-                    )
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
         # PERSIST stage: sequential, discover order — the `on_reel_created`
         # ordering and the (optional) `max_reels` early-stop stay deterministic.
-        # RAW-PRACTICE: no clip-duration gate — whole-topic clips of ANY length
-        # persist exactly as the engine cut them.
+        # Duration/kind/informativeness gates already ran inside the engine;
+        # `_clip_and_filter` keeps only the best clips per video.
         reels: list[ReelOutWithAttribution] = []
         for v, kept, engine_out in fetched:
             for clip in kept:
@@ -698,25 +702,28 @@ class IngestionPipeline:
     def _clip_and_filter(
         self, v: dict[str, Any], topic: str, language: str
     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-        """Fetch ONE discovered video's clips and annotate each with its
-        query-relevance `score` for feed ordering. Returns `(v, scored_clips,
+        """Fetch ONE discovered video's clips, score each (query relevance
+        blended with the engine's informativeness so one-word topics still get
+        a ranking signal), and keep only the top
+        ``INGEST_TOPIC_MAX_CLIPS_PER_VIDEO``. Returns `(v, scored_clips,
         engine_out)`, scored_clips sorted by score DESCENDING. Empty `clips`
-        yields no clips (video is skipped).
-
-        RAW-PRACTICE: the material path persists EVERY clip the engine cuts — no
-        relevance drop. (`ingest_search`/`ingest_topic_cut` still drop via
-        `filter_by_query`; this per-concept engine is deliberately raw.)"""
+        yields no clips (video is skipped)."""
         engine_out = clip_engine_run.clip(
             v["url"], topic=topic, settings={"language": language}
         )
         if not engine_out["clips"]:
             return v, [], engine_out
         for clip in engine_out["clips"]:
-            clip["score"] = clip_engine_bridge.relevance_score(
+            relevance = clip_engine_bridge.relevance_score(
                 clip, engine_out["transcript"], topic
             )
+            raw_info = clip.get("informativeness")
+            informativeness = (
+                0.5 if raw_info is None else max(0.0, min(1.0, float(raw_info)))
+            )
+            clip["score"] = relevance * (0.5 + 0.5 * informativeness)
         kept = sorted(engine_out["clips"], key=lambda c: c["score"], reverse=True)
-        return v, kept, engine_out
+        return v, kept[:INGEST_TOPIC_MAX_CLIPS_PER_VIDEO], engine_out
 
     def _ensure_search_material(self, query: str) -> str:
         """
@@ -824,6 +831,7 @@ class IngestionPipeline:
             clip_window=(chosen.t_start, chosen.t_end),
             target_max=target_max,
             generation_id=generation_id,
+            clip_title=str(clip.get("title") or "").strip(),
         )
         return reel, metadata
 
@@ -840,6 +848,7 @@ class IngestionPipeline:
         clip_window: tuple[float, float],
         target_max: int,
         generation_id: str | None = None,
+        clip_title: str = "",
     ) -> ReelOutWithAttribution:
         clip_start, clip_end = clip_window
         from .persistence import build_video_id  # local import to avoid cycle surprises
@@ -847,10 +856,14 @@ class IngestionPipeline:
         video_id = build_video_id(adapter_result.platform, adapter_result.source_id)
 
         # Build the client-facing video_url: YouTube honors start/end params; IG/TT don't.
+        # floor(start)/ceil(end) with a >=1s guard, matching the engine's embed_url —
+        # int()-truncating the end cut up to ~1s off every reel's final word.
         if adapter_result.platform == "yt":
+            embed_start = int(clip_start)
+            embed_end = max(embed_start + 1, math.ceil(clip_end))
             video_url = (
                 f"https://www.youtube.com/embed/{adapter_result.source_id}"
-                f"?start={int(clip_start)}&end={int(clip_end)}"
+                f"?start={embed_start}&end={embed_end}"
                 "&modestbranding=1&rel=0&playsinline=1"
             )
         else:
@@ -862,16 +875,22 @@ class IngestionPipeline:
 
             upsert_video(conn, platform=adapter_result.platform, source_id=adapter_result.source_id, metadata=metadata)
 
+            # The engine's per-clip topic title (when present) describes what the
+            # CLIP teaches; the video title is only a fallback. It also leads the
+            # takeaways — takeaways_json is the only per-reel field that round-trips
+            # to both clients, so this is what makes the title user-visible.
             takeaways = build_takeaways_for_ingest(
-                concept_title=metadata.title or "",
+                concept_title=clip_title or metadata.title or "",
                 transcript_snippet=snippet,
                 hashtags=metadata.hashtags,
                 limit=3,
             )
+            if clip_title:
+                takeaways = ([clip_title] + [t for t in takeaways if t != clip_title])[:3]
 
             ai_summary = brief_ai_summary(
                 conn,
-                concept_title=metadata.title or "",
+                concept_title=clip_title or metadata.title or "",
                 video_title=metadata.title or "",
                 video_description=metadata.description,
                 transcript_snippet=snippet,

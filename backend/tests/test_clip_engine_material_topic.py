@@ -413,5 +413,129 @@ class IngestTopicTests(unittest.TestCase):
         self.assertEqual(reel.captions[1].end, clip_len)
 
 
+class PerVideoCapAndBlendTests(IngestTopicTests):
+    """INGEST_TOPIC_MAX_CLIPS_PER_VIDEO cap + relevance x informativeness blend.
+
+    Fixture order deliberately differs from blended-score order so a revert of
+    the blend (back to pure token-overlap relevance) fails the ordering assert.
+    """
+
+    @staticmethod
+    def _blend_engine_out(*_a, **_kw) -> dict:
+        # (title, start, end, informativeness, on_topic)
+        specs = [
+            ("Segment 0", 30.0, 75.0, 0.5, True),     # rel 1.0 -> score 0.75
+            ("Segment 1", 120.0, 165.0, 1.0, True),   # rel 1.0 -> score 1.00 (best)
+            ("Segment 2", 200.0, 245.0, 1.0, False),  # rel 0.0 -> score 0.00 (capped out)
+            ("Segment 3", 300.0, 345.0, 0.6, True),   # rel 1.0 -> score 0.80
+        ]
+        clips, segments = [], []
+        for i, (title, start, end, info, on_topic) in enumerate(specs):
+            clips.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "cut_end": end,
+                    "title": title,
+                    "facet": "",
+                    "reason": "",
+                    "informativeness": info,
+                    "sequence_index": i,
+                    "embed_url": f"https://www.youtube.com/embed/vidAAAAAAAA?start={int(start)}",
+                }
+            )
+            text = "here we explain photosynthesis" if on_topic else "unrelated words only"
+            segments.append({"start": start, "end": end, "text": text})
+        return {
+            "video_id": "vidAAAAAAAA",
+            "clips": clips,
+            "transcript": {"segments": segments, "words": [], "duration": 600.0},
+            "notes": "",
+        }
+
+    def _run_with_cap(self, cap: int, suffix: str):
+        with _Patched() as (mock_search, mock_run):
+            mock_search.discover.side_effect = (
+                lambda topic, limit, exclude_video_ids=None, **kw: {
+                    "corrected": topic,
+                    "videos": [VID_A],
+                    "credits_used": 0,
+                    "warning": None,
+                }
+            )
+            mock_run.clip.side_effect = self._blend_engine_out
+            with mock.patch.object(pipeline_module, "INGEST_TOPIC_MAX_CLIPS_PER_VIDEO", cap):
+                reels, _ = main_module.ingestion_pipeline.ingest_topic(
+                    topic=TOPIC,
+                    material_id=f"mat-{suffix}",
+                    concept_id=f"con-{suffix}",
+                    generation_id=f"gen-{suffix}",
+                    max_videos=1,
+                )
+        return reels
+
+    def test_top_k_by_blended_score(self) -> None:
+        reels = self._run_with_cap(3, "cap3")
+        # top-3 of 4 by relevance*(0.5+0.5*informativeness), score-descending:
+        # Segment 1 (1.0) > Segment 3 (0.8) > Segment 0 (0.75); Segment 2 capped out
+        self.assertEqual([r.t_start for r in reels], [120.0, 300.0, 30.0])
+
+    def test_cap_override(self) -> None:
+        reels = self._run_with_cap(1, "cap1")
+        self.assertEqual([r.t_start for r in reels], [120.0])
+
+
+class EmbedUrlCeilTests(IngestTopicTests):
+    """Persisted video_url must floor the start and CEIL the end (>= start+1):
+    int()-truncating the end cut up to ~1s off every reel's final word."""
+
+    @staticmethod
+    def _fractional_engine_out(*_a, **_kw) -> dict:
+        return {
+            "video_id": "vidAAAAAAAA",
+            "clips": [
+                {
+                    "start": 30.6,
+                    "end": 74.4,
+                    "cut_end": 74.55,
+                    "title": "Fractional",
+                    "facet": "",
+                    "reason": "",
+                    "sequence_index": 0,
+                    "embed_url": "https://www.youtube.com/embed/vidAAAAAAAA?start=30&end=75&rel=0",
+                }
+            ],
+            "transcript": {
+                "segments": [
+                    {"start": 30.6, "end": 74.4, "text": "here we explain photosynthesis"}
+                ],
+                "words": [],
+                "duration": 600.0,
+            },
+            "notes": "",
+        }
+
+    def test_video_url_floors_start_and_ceils_end(self) -> None:
+        with _Patched() as (mock_search, mock_run):
+            mock_search.discover.side_effect = (
+                lambda topic, limit, exclude_video_ids=None, **kw: {
+                    "corrected": topic,
+                    "videos": [VID_A],
+                    "credits_used": 0,
+                    "warning": None,
+                }
+            )
+            mock_run.clip.side_effect = self._fractional_engine_out
+            reels, _ = main_module.ingestion_pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="mat-ceil",
+                concept_id="con-ceil",
+                generation_id="gen-ceil",
+                max_videos=1,
+            )
+        self.assertEqual(len(reels), 1)
+        self.assertIn("start=30&end=75", reels[0].video_url)
+
+
 if __name__ == "__main__":
     unittest.main()

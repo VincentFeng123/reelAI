@@ -1,3 +1,4 @@
+import difflib
 import hashlib
 import json
 import logging
@@ -16,11 +17,13 @@ from typing import Any, Callable, Literal
 import numpy as np
 
 from ..config import get_settings
-from ..db import DatabaseIntegrityError, dumps_json, fetch_all, fetch_one, now_iso, upsert
+from ..db import DatabaseIntegrityError, dumps_json, execute_modify, fetch_all, fetch_one, now_iso, upsert
 from . import llm_router
 from .concepts import build_takeaways
 from ..ingestion.errors import RateLimitedError as _IngestRateLimitedError
 from ..ingestion.segment import normalize_clip_window as _normalize_clip_window_fn
+from ..clip_engine import expand as _clip_engine_expand
+from ..clip_engine.config import SEGMENT_MAX_CLIP_S as _SEGMENT_MAX_CLIP_S
 from ..clip_engine.metadata import extract_video_id as _extract_embed_video_id
 from .provider_registry import ProviderRegistry
 from .segmenter import (
@@ -33,6 +36,25 @@ from .segmenter import (
 )
 from .topic_expansion import TopicExpansionService
 from .structural_classifier import classify_passage
+
+# Serving-side ceiling: legacy whole-video slabs (persisted before the engine's
+# SEGMENT_MAX_CLIP_S curation gate existed) must not surface in ranked feeds.
+_SERVING_MAX_CLIP_SEC = float(_SEGMENT_MAX_CLIP_S) + 15.0
+
+
+def clip_spans_duplicate(
+    a_start: float, a_end: float, b_start: float, b_end: float,
+    threshold: float = 0.6,
+) -> bool:
+    """True when two clips of the SAME video cover substantially the same
+    footage: overlap ≥ ``threshold`` of the shorter clip. Catches the
+    near-duplicate spans that exact-key dedup misses (fine-snap jitter across
+    concurrent generations)."""
+    overlap = min(a_end, b_end) - max(a_start, b_start)
+    if overlap <= 0:
+        return False
+    shorter = max(0.1, min(a_end - a_start, b_end - b_start))
+    return overlap / shorter >= threshold
 
 logger = logging.getLogger(__name__)
 
@@ -1271,7 +1293,7 @@ class ReelService:
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
-    RANKED_FEED_CACHE_VERSION = 5
+    RANKED_FEED_CACHE_VERSION = 6
     REFILL_STAGE_EXACT_ROOT = 0
     REFILL_STAGE_ROOT_COMPANION = 1
     REFILL_STAGE_MULTI_CLIP_STRICT = 2
@@ -1360,6 +1382,7 @@ class ReelService:
                 FROM reels r
                 WHERE {reel_where}
                   AND (r.t_end - r.t_start) >= 1
+                  AND (r.t_end - r.t_start) <= {_SERVING_MAX_CLIP_SEC}
             )
         """
         reel_stats = fetch_one(
@@ -1553,6 +1576,20 @@ class ReelService:
         material = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
         strict_topic_only = str((material or {}).get("source_type") or "").strip().lower() == "topic"
+        if strict_topic_only and subject_tag:
+            # Spellcheck ONCE so the wiki concept expansion and every downstream
+            # search seed off a clean topic ('pychology' → junk concepts like
+            # 'Contemporary Jewry' poisoned whole generations). Persisted so the
+            # read side (ranked_feed anchors, cache fingerprints, concept sync)
+            # sees the same subject the reels were generated for.
+            _corrected = self._corrected_subject_tag(subject_tag)
+            if _corrected != subject_tag:
+                execute_modify(
+                    conn,
+                    "UPDATE materials SET subject_tag = ? WHERE id = ?",
+                    (_corrected, material_id),
+                )
+                subject_tag = _corrected
         if not concepts and strict_topic_only and subject_tag:
             concepts = self._build_topic_only_concepts_from_expansion(
                 conn,
@@ -1740,6 +1777,22 @@ class ReelService:
             if _bare and _bare not in _already_excluded:
                 accumulated_exclusions.append(_bare)
                 _already_excluded.add(_bare)
+        # The user's actual topic (root concept) always gets the first tranche of
+        # the video budget: _order_concepts sorts by (mastery, reel_count, ...) so
+        # once the root has reels it sinks behind fresh wiki subtopics, starving
+        # the real topic on refinement pages.
+        if strict_topic_only and subject_tag:
+            _subject_key = self._normalize_query_key(subject_tag)
+            _root_idx = next(
+                (
+                    i
+                    for i, c in enumerate(concepts)
+                    if self._normalize_query_key(str(c.get("title") or "")) == _subject_key
+                ),
+                -1,
+            )
+            if _root_idx > 0:
+                concepts.insert(0, concepts.pop(_root_idx))
         videos_processed = 0
         total_concepts = len(concepts)
 
@@ -2993,28 +3046,54 @@ class ReelService:
                 break
         return self._clean_query_text(" ".join(parts))
 
-    def _concept_topic_query(self, concept_row: dict) -> str:
-        """Return a search-engine topic string for a concept row.
+    # Process-wide correction cache: can-generate probes and refinements re-run
+    # generate_reels for the same subject many times; correct each subject once.
+    _SUBJECT_CORRECTION_CACHE: dict[str, str] = {}
 
-        Mirrors the single-token-keyword rule from ``_build_literal_query`` but
-        without disambiguator or subject_tag — concepts don't carry those.
+    def _corrected_subject_tag(self, subject_tag: str) -> str:
+        """Spellcheck a topic-material subject via the clip engine's expansion
+        pass (Gemini flash-lite when keyed; the keyless fallback returns it
+        unchanged, so this never breaks offline paths).
+
+        Only conservative SPELLING fixes are accepted ('pychology' →
+        'psychology'); field-qualifying rewrites ('jaguar' → 'jaguar animal
+        biology') are rejected — discover()'s expansion applies those per-query
+        without renaming the user's topic."""
+        cache_key = subject_tag.strip().lower()
+        cached = self._SUBJECT_CORRECTION_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            corrected = str(
+                _clip_engine_expand.expand_query(subject_tag, 1).get("corrected") or ""
+            ).strip()
+        except Exception:
+            # Transient failure: fall back WITHOUT caching, so a later
+            # generation can still pick up the real correction.
+            logger.exception("subject correction failed; using raw subject %r", subject_tag)
+            return subject_tag
+        result = subject_tag
+        if corrected and corrected.lower() != cache_key:
+            same_word_count = len(corrected.split()) == len(subject_tag.split())
+            similarity = difflib.SequenceMatcher(
+                None, cache_key, corrected.lower()
+            ).ratio()
+            if same_word_count and similarity >= 0.75:
+                result = corrected
+        if len(self._SUBJECT_CORRECTION_CACHE) < 512:
+            self._SUBJECT_CORRECTION_CACHE[cache_key] = result
+        return result
+
+    def _concept_topic_query(self, concept_row: dict) -> str:
+        """Return a search-engine topic string for a concept row: its clean title.
+
+        No wiki-keyword append — the clip engine's `discover()` expansion
+        (spellcheck + field inference + educational phrasings) owns
+        disambiguation now, and appended `keywords_json` terms polluted the
+        seed query with unrelated wiki noise.
         """
         title = str(concept_row.get("title") or "")
-        clean_title = self._clean_query_text(title)
-        if not clean_title:
-            return ""
-        parts: list[str] = [clean_title]
-        if len(normalize_terms([clean_title])) <= 1:
-            keywords = self._parse_keywords_json(concept_row.get("keywords_json"))
-            for term in keywords:
-                cleaned = self._clean_query_text(term)
-                if not cleaned:
-                    continue
-                if self._normalize_query_key(cleaned) == self._normalize_query_key(clean_title):
-                    continue
-                parts.append(cleaned)
-                break
-        return self._clean_query_text(" ".join(parts))
+        return self._clean_query_text(title)
 
     def _build_intent_query(
         self,
@@ -7956,6 +8035,7 @@ class ReelService:
             LEFT JOIN reel_feedback f ON f.reel_id = r.id
             WHERE {reel_where}
               AND (r.t_end - r.t_start) >= 1
+              AND (r.t_end - r.t_start) <= {_SERVING_MAX_CLIP_SEC}
             GROUP BY
                 r.id,
                 r.concept_id,
@@ -8202,6 +8282,7 @@ class ReelService:
         deduped: list[dict[str, Any]] = []
         seen_reel_ids: set[str] = set()
         seen_clip_keys: set[str] = set()
+        kept_spans_by_video: dict[str, list[tuple[float, float]]] = {}
         for item in scored:
             reel_id = str(item.get("reel_id") or "")
             if reel_id and reel_id in seen_reel_ids:
@@ -8209,12 +8290,21 @@ class ReelService:
             video_id = str(item.get("video_id") or "")
             if not video_id:
                 continue
-            clip_key = self._clip_key(video_id, float(item.get("t_start") or 0), float(item.get("t_end") or 0))
+            t_start = float(item.get("t_start") or 0)
+            t_end = float(item.get("t_end") or 0)
+            clip_key = self._clip_key(video_id, t_start, t_end)
             if clip_key in seen_clip_keys:
+                continue
+            # Score-descending order → the best of a near-duplicate cluster wins.
+            if any(
+                clip_spans_duplicate(t_start, t_end, k0, k1)
+                for k0, k1 in kept_spans_by_video.get(video_id, ())
+            ):
                 continue
             if reel_id:
                 seen_reel_ids.add(reel_id)
             seen_clip_keys.add(clip_key)
+            kept_spans_by_video.setdefault(video_id, []).append((t_start, t_end))
             deduped.append(dict(item))
 
         # --- Same-video grouping ---

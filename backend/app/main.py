@@ -109,7 +109,7 @@ from .services.liveness import is_video_alive
 from .services.material_intelligence import MaterialIntelligenceService
 from .services.parsers import ParseError, extract_text_from_file
 from .services import progress_bus
-from .services.reels import GenerationCancelledError, ReelService
+from .services.reels import GenerationCancelledError, ReelService, clip_spans_duplicate
 from .services.storage import get_storage
 from .services.text_utils import chunk_text, normalize_whitespace
 from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8601_duration
@@ -3148,6 +3148,7 @@ def _merge_request_reel_lists(*reel_lists: list[dict[str, Any]]) -> list[dict[st
     merged: list[dict[str, Any]] = []
     seen_reel_ids: set[str] = set()
     seen_clip_keys: set[str] = set()
+    kept_spans_by_video: dict[str, list[tuple[float, float]]] = {}
     for reel_list in reel_lists:
         for reel in reel_list:
             reel_id, clip_key = _reel_identity_key(reel)
@@ -3155,9 +3156,22 @@ def _merge_request_reel_lists(*reel_lists: list[dict[str, Any]]) -> list[dict[st
                 continue
             if clip_key in seen_clip_keys:
                 continue
+            # Cross-generation near-duplicates: concurrent generations can
+            # persist the same footage with fine-snap jitter, which defeats
+            # the exact clip_key — drop by span overlap within a video.
+            video_identity = clip_key.split(":", 1)[0] if clip_key else ""
+            t_start = float(reel.get("t_start") or 0.0)
+            t_end = float(reel.get("t_end") or 0.0)
+            if video_identity and any(
+                clip_spans_duplicate(t_start, t_end, k0, k1)
+                for k0, k1 in kept_spans_by_video.get(video_identity, ())
+            ):
+                continue
             if reel_id:
                 seen_reel_ids.add(reel_id)
             seen_clip_keys.add(clip_key)
+            if video_identity:
+                kept_spans_by_video.setdefault(video_identity, []).append((t_start, t_end))
             merged.append(reel)
 
     if not merged:

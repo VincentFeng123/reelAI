@@ -285,10 +285,11 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertEqual(len(feed), 2)
 
     # ------------------------------------------------------------------ #
-    # RAW-PRACTICE: a 5-minute whole-topic clip persists AND is served by
-    # ranked_feed (no duration gate anywhere on the material/serving path).
+    # Curation: a 5-minute whole-topic clip still PERSISTS (no persist gate),
+    # but ranked_feed EXCLUDES it — whole-video slabs must never be served
+    # (serving ceiling = SEGMENT_MAX_CLIP_S + 15).
     # ------------------------------------------------------------------ #
-    def test_five_minute_clip_persists_and_served_by_ranked_feed(self) -> None:
+    def test_five_minute_clip_persists_but_is_not_served(self) -> None:
         self._patched_engine(_five_minute_engine_out())
 
         with db_module.get_conn() as conn:
@@ -314,12 +315,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             feed = main_module.reel_service.ranked_feed(
                 conn, material_id=MATERIAL_ID, generation_id="gen-5min"
             )
-        self.assertEqual(len(feed), 1)
-        served = feed[0]
-        self.assertAlmostEqual(
-            float(served["t_end"]) - float(served["t_start"]), 300.0, places=3
-        )
-        self.assertAlmostEqual(float(served["clip_duration_sec"]), 300.0, places=1)
+        self.assertEqual(len(feed), 0)
 
     # ------------------------------------------------------------------ #
     # dry_run: discover-only viability probe, zero DB writes, non-empty
