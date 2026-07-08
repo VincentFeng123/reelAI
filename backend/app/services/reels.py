@@ -1273,7 +1273,8 @@ class ReelService:
     TRANSCRIPT_FETCH_WORKERS_SLOW = 10
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
-    RANKED_FEED_CACHE_VERSION = 4
+    # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
+    RANKED_FEED_CACHE_VERSION = 5
     REFILL_STAGE_EXACT_ROOT = 0
     REFILL_STAGE_ROOT_COMPANION = 1
     REFILL_STAGE_MULTI_CLIP_STRICT = 2
