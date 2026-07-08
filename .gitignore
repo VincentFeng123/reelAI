@@ -22,6 +22,9 @@ backend/.env
 .logs/
 .pids/
 
+# clip_engine transcript cache
+backend/work/
+
 # Mass-audit ephemera (isolated sqlite workdir + per-run logs/smoke CSVs)
 audit_work/
 audit_*.log

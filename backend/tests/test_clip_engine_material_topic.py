@@ -296,6 +296,118 @@ class IngestTopicTests(unittest.TestCase):
         self.assertTrue(all(isinstance(r, ReelOutWithAttribution) for r in reels))
         self.assertEqual(resolved, ["vidAAAAAAAA", "vidBBBBBBBB"])
 
+    # ---- 7. channel_name populated from discover metadata (Finding #6) ---- #
+
+    def test_channel_name_populated(self) -> None:
+        with _Patched():
+            reels, _ = main_module.ingestion_pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="mat-7",
+                concept_id="con-7",
+                generation_id="gen-7",
+                max_videos=3,
+            )
+        self.assertTrue(reels)
+        for r in reels:
+            self.assertEqual(r.channel_name, "BioChan")
+
+    # ---- 8. over-length clips are skipped at persist (Finding #2) ---- #
+
+    def _patch_single_video(self, engine_out: dict):
+        vid = {
+            "id": "vidCCCCCCCC",
+            "url": "https://www.youtube.com/watch?v=vidCCCCCCCC",
+            "title": "Photosynthesis deep",
+            "channel": "BioChan",
+            "duration": 600.0,
+            "thumbnail": "",
+            "view_count": 1,
+            "upload_date": "20230101",
+        }
+        search = mock.patch.object(pipeline_module, "clip_engine_search").start()
+        run = mock.patch.object(pipeline_module, "clip_engine_run").start()
+        self.addCleanup(mock.patch.stopall)
+        search.discover.return_value = {
+            "corrected": TOPIC, "videos": [vid], "credits_used": 0, "warning": None,
+        }
+        run.clip.return_value = engine_out
+        return search, run
+
+    def test_over_length_clip_skipped(self) -> None:
+        engine_out = {
+            "video_id": "vidCCCCCCCC",
+            "clips": [
+                {"start": 30.0, "end": 75.0, "cut_end": 75.0, "title": "photosynthesis in range",
+                 "facet": "", "reason": "", "sequence_index": 0, "embed_url": ""},
+                {"start": 30.0, "end": 250.0, "cut_end": 250.0, "title": "photosynthesis over length",
+                 "facet": "", "reason": "", "sequence_index": 1, "embed_url": ""},
+            ],
+            "transcript": {
+                "segments": [
+                    {"start": 30.0, "end": 75.0, "text": "photosynthesis part in range."},
+                    {"start": 80.0, "end": 250.0, "text": "photosynthesis deep dive continues."},
+                ],
+                "words": [], "duration": 600.0,
+            },
+            "notes": "",
+        }
+        self._patch_single_video(engine_out)
+        reels, _ = main_module.ingestion_pipeline.ingest_topic(
+            topic=TOPIC,
+            material_id="mat-8",
+            concept_id="con-8",
+            generation_id="gen-8",
+            target_clip_duration_max_sec=60,
+            max_videos=1,
+        )
+        # Only the 45s clip survives; the 220s clip exceeds 60+8 and is skipped.
+        self.assertEqual(len(reels), 1)
+        self.assertEqual(reels[0].t_start, 30.0)
+        self.assertEqual(reels[0].t_end, 75.0)
+        rows = self._reels_for_generation("gen-8")
+        self.assertEqual(len(rows), 1)
+
+    # ---- 9. captions windowed to the clip + rebased clip-relative (Finding #5) ---- #
+
+    def test_captions_windowed_and_rebased(self) -> None:
+        engine_out = {
+            "video_id": "vidCCCCCCCC",
+            "clips": [
+                {"start": 30.0, "end": 75.0, "cut_end": 75.0, "title": "photosynthesis clip",
+                 "facet": "", "reason": "", "sequence_index": 0, "embed_url": ""},
+            ],
+            "transcript": {
+                "segments": [
+                    {"start": 20.0, "end": 50.0, "text": "photosynthesis alpha spanning the start."},
+                    {"start": 60.0, "end": 90.0, "text": "photosynthesis beta spanning the end."},
+                    {"start": 100.0, "end": 145.0, "text": "photosynthesis gamma outside the window."},
+                ],
+                "words": [], "duration": 600.0,
+            },
+            "notes": "",
+        }
+        self._patch_single_video(engine_out)
+        reels, _ = main_module.ingestion_pipeline.ingest_topic(
+            topic=TOPIC,
+            material_id="mat-9",
+            concept_id="con-9",
+            generation_id="gen-9",
+            max_videos=1,
+        )
+        self.assertEqual(len(reels), 1)
+        reel = reels[0]
+        clip_len = reel.t_end - reel.t_start  # 45.0
+        self.assertEqual(len(reel.captions), 2, "gamma cue is outside [30,75] and must be dropped")
+        for cue in reel.captions:
+            self.assertGreaterEqual(cue.start, 0.0)
+            self.assertLessEqual(cue.end, clip_len)
+            self.assertLessEqual(cue.start, cue.end)
+        # alpha [20,50] -> [0,20]; beta [60,90] -> [30,45]
+        self.assertEqual(reel.captions[0].start, 0.0)
+        self.assertEqual(reel.captions[0].end, 20.0)
+        self.assertEqual(reel.captions[1].start, 30.0)
+        self.assertEqual(reel.captions[1].end, clip_len)
+
 
 if __name__ == "__main__":
     unittest.main()

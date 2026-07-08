@@ -613,8 +613,17 @@ class IngestionPipeline:
 
         self._rate_limiter.acquire("yt")
 
+        # Defensively strip any `yt:`-prefixed ids (e.g. prior-generation reel rows
+        # wired into the caller's exclusions) so a prefixed id can't leak into the
+        # Supadata discover query, where it would never match a bare source id.
+        bare_exclusions = [
+            str(v or "").strip().split(":", 1)[-1]
+            for v in (exclude_video_ids or [])
+            if str(v or "").strip()
+        ]
+
         disc = clip_engine_search.discover(
-            topic, limit=limit, exclude_video_ids=exclude_video_ids or []
+            topic, limit=limit, exclude_video_ids=bare_exclusions
         )
 
         warning = disc.get("warning")
@@ -664,11 +673,17 @@ class IngestionPipeline:
 
         # PERSIST stage: sequential, discover order — the `on_reel_created`
         # ordering and the global `max_reels` early-stop must stay deterministic.
+        clip_max_allowed = int(target_clip_duration_max_sec) + 8
         reels: list[ReelOutWithAttribution] = []
         for v, kept, engine_out in fetched:
             for clip in kept:
                 if max_reels is not None and len(reels) >= max_reels:
                     return reels, resolved_video_ids
+                # Enforce the clip-duration contract at creation time (mirrors the
+                # legacy _create_reel "reject over clip_max+8" rule). The Gemini engine
+                # can return whole-topic clips minutes long; skip the over-length ones.
+                if (float(clip["end"]) - float(clip["start"])) > clip_max_allowed:
+                    continue
                 reel, _ = self._persist_engine_clip(
                     v=v,
                     clip=clip,
@@ -892,21 +907,34 @@ class IngestionPipeline:
                     # Still store metadata blob (may have changed since prior ingest).
             store_ingest_metadata_blob(conn, reel_id=reel_id, metadata=metadata)
 
-        captions = [
-            {"start": cue.start, "end": cue.end, "text": cue.text}
-            for cue in cues
-            if cue.text
-        ]
+        clip_duration = max(0.0, clip_end - clip_start)
+
+        # Window the whole-video cues to this clip's [start, end] and rebase to
+        # clip-relative timestamps (legacy `_build_caption_cues` semantics), so the
+        # client renders captions aligned to the trimmed clip, not the source video.
+        captions = []
+        for cue in cues:
+            if not cue.text:
+                continue
+            if cue.end <= clip_start or cue.start >= clip_end:
+                continue  # no overlap with the clip window
+            captions.append(
+                {
+                    "start": max(0.0, cue.start - clip_start),
+                    "end": min(clip_duration, cue.end - clip_start),
+                    "text": cue.text,
+                }
+            )
 
         attribution = format_attribution(metadata)
 
-        clip_duration = max(0.0, clip_end - clip_start)
         return ReelOutWithAttribution(
             reel_id=reel_id,
             material_id=effective_material_id,
             concept_id=effective_concept_id,
             concept_title=metadata.title or "",
             video_title=metadata.title or "",
+            channel_name=metadata.author_name or "",
             video_description=metadata.description,
             ai_summary=ai_summary,
             video_url=video_url,

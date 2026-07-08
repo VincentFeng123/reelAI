@@ -128,6 +128,7 @@ from .ingestion.errors import (
     TranscriptionError as IngestTranscriptionError,
     UnsupportedSourceError as IngestUnsupportedSourceError,
 )
+from .clip_engine.errors import EngineError as ClipEngineError
 from .ingestion.models import (
     IngestFeedRequest,
     IngestFeedResult,
@@ -3458,14 +3459,14 @@ def _ranked_request_reels(
             generation_id=generation_id,
         )
     excluded_video_id_set = {
-        str(video_id or "").strip()
+        _bare_video_id(video_id)
         for video_id in (exclude_video_ids or [])
-        if str(video_id or "").strip()
+        if _bare_video_id(video_id)
     }
     if excluded_video_id_set:
         ranked = [
             reel for reel in ranked
-            if str(reel.get("video_id") or "").strip() not in excluded_video_id_set
+            if _bare_video_id(reel.get("video_id")) not in excluded_video_id_set
         ]
 
     unique_vids = {
@@ -3541,6 +3542,17 @@ def _build_generation_response_payload(
         "refinement_job_id": str((job_row or {}).get("id") or "") or None,
         "refinement_status": str((job_row or {}).get("status") or "") or None,
     }
+
+
+def _bare_video_id(value: str | None) -> str:
+    """Strip a platform prefix (`yt:`/`ig:`/`tt:`) → the bare source id.
+
+    Clip-engine reels persist with a `yt:<id>`-prefixed DB video_id while legacy
+    rows and every client use the BARE 11-char id (derived from video_url).
+    Normalizing both sides at comparison time keeps client pagination exclusion
+    working across legacy + clip-engine rows.
+    """
+    return str(value or "").strip().split(":", 1)[-1]
 
 
 def _normalize_excluded_video_ids(values: list[str] | tuple[str, ...] | set[str] | None) -> list[str]:
@@ -5803,6 +5815,13 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 page_hint=1,
                 multi_platform_search=payload.multi_platform_search,
             )
+        except IngestRateLimitedError as e:
+            # Clip-engine per-platform rate limiter tripped → 429 + Retry-After.
+            raise _ingest_error_to_http(e) from e
+        except ClipEngineError as e:
+            # Clip-engine config/search/transcript failure → upstream dependency error.
+            logger.warning("Reels generate clip-engine failure: %s", e)
+            raise HTTPException(status_code=502, detail=str(e)) from e
         except YouTubeApiRequestError as e:
             logger.warning(
                 "Reels generate request failed: %s",
@@ -6524,6 +6543,11 @@ def can_generate_reels(request: Request, payload: ReelsGenerateRequest):
                 target_clip_duration_min_sec=safe_target_clip_min_sec,
                 target_clip_duration_max_sec=safe_target_clip_max_sec,
             )
+        except IngestRateLimitedError as e:
+            raise _ingest_error_to_http(e) from e
+        except ClipEngineError as e:
+            logger.warning("can-generate clip-engine failure: %s", e)
+            raise HTTPException(status_code=502, detail=str(e)) from e
         except YouTubeApiRequestError as e:
             raise HTTPException(status_code=502, detail=str(e)) from e
 

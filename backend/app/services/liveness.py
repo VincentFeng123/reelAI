@@ -38,7 +38,10 @@ def _parse_iso(raw: str) -> datetime | None:
 
 
 def _probe(video_id: str) -> bool:
-    url = f"{_OEMBED_ENDPOINT}?url=https://www.youtube.com/watch?v={video_id}&format=json"
+    # Reel rows carry `yt:<id>`-prefixed video ids; YouTube's watch URL needs the
+    # bare 11-char id or it 400s (which would fail open and defeat the probe).
+    bare_id = str(video_id or "").split(":", 1)[-1]
+    url = f"{_OEMBED_ENDPOINT}?url=https://www.youtube.com/watch?v={bare_id}&format=json"
     try:
         response = httpx.head(url, timeout=_PROBE_TIMEOUT_SEC, follow_redirects=True)
     except httpx.HTTPError as exc:

@@ -25,10 +25,14 @@ if str(ROOT) not in sys.path:
 # Skip the import-time orphan sweep so tests don't poke at /tmp during import.
 os.environ.setdefault("REELAI_INGEST_SKIP_IMPORT_SWEEP", "1")
 
+from fastapi.testclient import TestClient  # noqa: E402
+
 from backend.app import db as db_module  # noqa: E402
 from backend.app.config import get_settings  # noqa: E402
 import backend.app.main as main_module  # noqa: E402
+from backend.app.main import app, COMMUNITY_OWNER_HEADER  # noqa: E402
 from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
+from backend.app.ingestion.errors import RateLimitedError as IngestRateLimitedError  # noqa: E402
 
 # 11-char YouTube-style id so the embed video_url round-trips through
 # clip_engine.metadata.extract_video_id in _reel_attribution_to_dict.
@@ -273,6 +277,115 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 ("gen-dry",),
             )
         self.assertEqual(len(rows), 0)
+
+    # ------------------------------------------------------------------ #
+    # Finding #3: refinement/extension excludes prior-generation video ids
+    # ------------------------------------------------------------------ #
+    def test_excludes_prior_generation_video_ids_from_discover(self) -> None:
+        search, _run = self._patched_engine(_multi_clip_engine_out())
+
+        # gen-1: persist reels for VIDEO_ID (stored as yt:<id>).
+        with db_module.get_conn() as conn:
+            main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=None,
+                num_reels=5,
+                creative_commons_only=False,
+                generation_id="gen-1",
+            )
+        with db_module.get_conn() as conn:
+            rows = db_module.fetch_all(
+                conn, "SELECT DISTINCT video_id FROM reels WHERE generation_id = ?", ("gen-1",)
+            )
+        self.assertEqual({r["video_id"] for r in rows}, {f"yt:{VIDEO_ID}"})
+
+        search.discover.reset_mock()
+
+        # gen-2 excludes gen-1 → discover must receive gen-1's BARE video id.
+        with db_module.get_conn() as conn:
+            main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=None,
+                num_reels=5,
+                creative_commons_only=False,
+                generation_id="gen-2",
+                exclude_generation_ids=["gen-1"],
+            )
+
+        self.assertTrue(search.discover.called)
+        passed = search.discover.call_args.kwargs.get("exclude_video_ids") or []
+        self.assertIn(VIDEO_ID, passed)
+        self.assertNotIn(f"yt:{VIDEO_ID}", passed)
+
+    # ------------------------------------------------------------------ #
+    # Finding #4a: one concept's engine failure must not abort the run
+    # ------------------------------------------------------------------ #
+    def test_one_concept_failure_does_not_abort_generation(self) -> None:
+        # Seed a second concept so two concepts are processed.
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute(
+                "INSERT INTO concepts (id, material_id, title, keywords_json, summary, embedding_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "concept-t4-gen-2",
+                    MATERIAL_ID,
+                    "Cellular respiration stages",
+                    '["cellular respiration", "atp"]',
+                    "The stages of respiration.",
+                    None,
+                    "2026-07-06T00:02:00+00:00",
+                ),
+            )
+
+        search, run = self._patched_engine(_multi_clip_engine_out())
+        call_count = {"n": 0}
+
+        def _discover_side_effect(topic, limit, exclude_video_ids=None, **kw):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("engine down for the first concept")
+            return _discover_result()
+
+        search.discover.side_effect = _discover_side_effect
+
+        with db_module.get_conn() as conn:
+            result = main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=None,
+                num_reels=5,
+                creative_commons_only=False,
+                generation_id="gen-partial",
+            )
+
+        # The surviving concept still produced reels despite the first concept failing.
+        self.assertTrue(result, "a failing concept must not abort the whole generation")
+        with db_module.get_conn() as conn:
+            rows = db_module.fetch_all(
+                conn, "SELECT id FROM reels WHERE generation_id = ?", ("gen-partial",)
+            )
+        self.assertGreaterEqual(len(rows), 1)
+
+    # ------------------------------------------------------------------ #
+    # Finding #4b: rate-limit surfaces as HTTP 429 at the generate endpoint
+    # ------------------------------------------------------------------ #
+    def test_generate_endpoint_maps_rate_limit_to_429(self) -> None:
+        client = TestClient(app)
+        self.addCleanup(client.close)
+        with mock.patch.object(
+            main_module,
+            "_ensure_generation_for_request",
+            side_effect=IngestRateLimitedError("ingestion rate limit", retry_after_sec=42),
+        ):
+            resp = client.post(
+                "/api/reels/generate",
+                json={"material_id": MATERIAL_ID, "num_reels": 3},
+                headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
+            )
+        self.assertEqual(resp.status_code, 429, resp.text)
+        self.assertIn("retry-after", {k.lower() for k in resp.headers})
 
 
 if __name__ == "__main__":

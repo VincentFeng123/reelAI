@@ -19,6 +19,7 @@ from ..config import get_settings
 from ..db import DatabaseIntegrityError, dumps_json, fetch_all, fetch_one, now_iso, upsert
 from . import llm_router
 from .concepts import build_takeaways
+from ..ingestion.errors import RateLimitedError as _IngestRateLimitedError
 from ..ingestion.segment import normalize_clip_window as _normalize_clip_window_fn
 from ..clip_engine.metadata import extract_video_id as _extract_embed_video_id
 from .provider_registry import ProviderRegistry
@@ -1535,14 +1536,6 @@ class ReelService:
             recovery_stage=safe_recovery_stage,
         )
         safe_retrieval_profile = self._normalize_retrieval_profile(retrieval_profile)
-        request_key = ""
-        if generation_id:
-            generation_row = fetch_one(
-                conn,
-                "SELECT request_key FROM reel_generations WHERE id = ?",
-                (generation_id,),
-            )
-            request_key = str((generation_row or {}).get("request_key") or "").strip()
         params: tuple[Any, ...] = (material_id,)
         concept_where = "WHERE material_id = ?"
         if concept_id:
@@ -1600,13 +1593,6 @@ class ReelService:
         concepts = self._order_concepts(conn, material_id, concepts)
         safe_video_pool_mode = self._normalize_video_pool_mode(video_pool_mode)
         safe_video_duration_pref = self._normalize_preferred_video_duration(preferred_video_duration)
-        max_generation_target = self._generation_target_cap(
-            num_reels=num_reels,
-            preferred_video_duration=safe_video_duration_pref,
-            fast_mode=fast_mode,
-        )
-        if self.serverless_mode:
-            max_generation_target = min(max_generation_target, max(3, num_reels))
         clip_min_len, clip_max_len, safe_target_clip_duration = self._resolve_clip_duration_bounds(
             target_clip_duration_sec=target_clip_duration_sec,
             target_clip_duration_min_sec=target_clip_duration_min_sec,
@@ -1742,8 +1728,18 @@ class ReelService:
                     expansion=topic_expansion,
                     concepts=concepts,
                 )
-        material_context_terms = self._build_material_context_terms(concepts=concepts, subject_tag=subject_tag)
         accumulated_exclusions: list[str] = list(exclude_video_ids or [])
+        # Finding #3: exclude videos we've already clipped for this generation and
+        # videos from the excluded prior generations (exclude_generation_ids) so
+        # refinement/extension doesn't re-pay the engine to re-discover + re-clip the
+        # same videos. `existing_video_counts` aggregates both scans; rows carry
+        # `yt:`-prefixed ids while discover matches BARE ids, so normalize.
+        _already_excluded = set(accumulated_exclusions)
+        for _prior_video_id in existing_video_counts:
+            _bare = str(_prior_video_id or "").strip().split(":", 1)[-1]
+            if _bare and _bare not in _already_excluded:
+                accumulated_exclusions.append(_bare)
+                _already_excluded.add(_bare)
         videos_processed = 0
         total_concepts = len(concepts)
 
@@ -1771,21 +1767,34 @@ class ReelService:
                         chain_id="",
                     )
 
-            reels, resolved_ids = self.ingestion_pipeline.ingest_topic(
-                topic=topic,
-                material_id=material_id,
-                concept_id=concept["id"],
-                generation_id=generation_id,
-                exclude_video_ids=accumulated_exclusions,
-                target_clip_duration_sec=safe_target_clip_duration,
-                target_clip_duration_min_sec=clip_min_len,
-                target_clip_duration_max_sec=clip_max_len,
-                language="en",
-                max_videos=video_budget,
-                max_reels=remaining_reels,
-                on_reel_created=(None if dry_run else _stream),
-                dry_run=dry_run,
-            )
+            try:
+                reels, resolved_ids = self.ingestion_pipeline.ingest_topic(
+                    topic=topic,
+                    material_id=material_id,
+                    concept_id=concept["id"],
+                    generation_id=generation_id,
+                    exclude_video_ids=accumulated_exclusions,
+                    target_clip_duration_sec=safe_target_clip_duration,
+                    target_clip_duration_min_sec=clip_min_len,
+                    target_clip_duration_max_sec=clip_max_len,
+                    language="en",
+                    max_videos=video_budget,
+                    max_reels=remaining_reels,
+                    on_reel_created=(None if dry_run else _stream),
+                    dry_run=dry_run,
+                )
+            except _IngestRateLimitedError:
+                # Process-wide rate limit tripped: subsequent concepts would hit it
+                # too. Stop and surface it so the endpoint maps it to HTTP 429.
+                raise
+            except Exception:
+                # One concept's engine failure must not abort the whole generation —
+                # log it and move on to the next concept (Finding #4a).
+                logger.exception(
+                    "generate_reels: ingest_topic failed for concept=%s; skipping to next concept",
+                    concept.get("id"),
+                )
+                continue
             accumulated_exclusions.extend(resolved_ids)
             videos_processed += len(resolved_ids)
 
