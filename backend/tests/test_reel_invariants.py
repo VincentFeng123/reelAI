@@ -18,9 +18,9 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from app.services.embeddings import EmbeddingService
-from app.services.reels import ReelService
-from app.services.youtube import YouTubeService
+from backend.app.services.embeddings import EmbeddingService
+from backend.app.services.reels import ReelService
+from backend.app.services.youtube import YouTubeService
 
 
 # ---------- helpers ---------- #
@@ -81,7 +81,7 @@ class SettingsEnforcementTests(unittest.TestCase):
     def test_ambiguous_concept_drops_entertainment_tier(self) -> None:
         # The hard-drop gate runs inside the candidate loop, but we can verify
         # the pieces it depends on: ambiguity detection + tier classification.
-        from app.services.segmenter import normalize_terms
+        from backend.app.services.segmenter import normalize_terms
         tokens = normalize_terms(["calculus", "derivatives"])
         self.assertTrue(tokens & self.rs.AMBIGUOUS_CONCEPT_TOKENS)
         tier = self.rs._infer_channel_tier(
@@ -129,7 +129,7 @@ class BoundaryPaddingTests(unittest.TestCase):
     def test_padding_constants_exported(self) -> None:
         """Production callers import REEL_PAD_START_SEC / REEL_PAD_END_SEC.
         Lock in the current values so drift triggers an explicit review."""
-        from app.services.reels import REEL_PAD_START_SEC, REEL_PAD_END_SEC
+        from backend.app.services.reels import REEL_PAD_START_SEC, REEL_PAD_END_SEC
         self.assertEqual(REEL_PAD_START_SEC, 0.3)
         self.assertEqual(REEL_PAD_END_SEC, 0.3)
 

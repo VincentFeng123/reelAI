@@ -16,9 +16,9 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 
-from app.services.embeddings import EmbeddingService
-from app.services.reels import ReelService
-from app.services.youtube import YouTubeService
+from backend.app.services.embeddings import EmbeddingService
+from backend.app.services.reels import ReelService
+from backend.app.services.youtube import YouTubeService
 
 
 def _build_educational_transcript(video_id: str) -> list[dict[str, Any]]:
@@ -159,7 +159,7 @@ class SearchSimulationTests(unittest.TestCase):
             },
         ]
 
-        from app.services.segmenter import normalize_terms
+        from backend.app.services.segmenter import normalize_terms
 
         subject_tag = "calculus"
         concept_title = "calculus derivatives"

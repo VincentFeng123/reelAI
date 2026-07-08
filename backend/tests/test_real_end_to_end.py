@@ -15,9 +15,9 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from app.services.embeddings import EmbeddingService
-from app.services.reels import ReelService
-from app.services.youtube import YouTubeService
+from backend.app.services.embeddings import EmbeddingService
+from backend.app.services.reels import ReelService
+from backend.app.services.youtube import YouTubeService
 
 
 # Real excerpt from 3Blue1Brown — "The essence of calculus" (manual captions,
