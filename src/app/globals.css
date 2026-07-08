@@ -670,4 +670,17 @@ textarea:-webkit-autofill:focus {
   .animate-featured-slide-exit-backward {
     animation: featured-slide-exit-backward 520ms cubic-bezier(0.4, 0, 1, 1) both;
   }
+
+  .animate-progress-shimmer {
+    animation: progress-shimmer 1.6s ease-in-out infinite;
+  }
+}
+
+@keyframes progress-shimmer {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
 }

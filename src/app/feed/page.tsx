@@ -4,6 +4,7 @@ import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "rea
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
+import { GenerationProgress } from "@/components/GenerationProgress";
 import { ReelCard } from "@/components/ReelCard";
 import {
   COMMUNITY_AUTH_CHANGED_EVENT,
@@ -872,6 +873,7 @@ function FeedPageInner() {
   const [settingsScopeReady, setSettingsScopeReady] = useState(false);
   const [recoveryPhase, setRecoveryPhase] = useState<FeedRecoveryPhase>("idle");
   const [feedPagesExhausted, setFeedPagesExhausted] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState<{ received: number; requested: number } | null>(null);
 
   const feedViewportRef = useRef<HTMLDivElement | null>(null);
   const isFetchingRef = useRef(false);
@@ -909,6 +911,7 @@ function FeedPageInner() {
   const pendingHistorySyncRef = useRef<StoredHistoryItem[] | null>(null);
   const historySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recoveryRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const progressClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recoveryRequestIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const seenSourceVideoIdsRef = useRef<Set<string>>(new Set());
   const visibleTransportErrorRef = useRef(false);
@@ -1867,6 +1870,12 @@ function FeedPageInner() {
     setGeneratingMore(true);
     setRecoveryPhase("generating");
     armActiveRecoveryRequest(searchScope, "generating");
+    if (progressClearTimerRef.current) {
+      clearTimeout(progressClearTimerRef.current);
+      progressClearTimerRef.current = null;
+    }
+    setGenerationProgress({ received: 0, requested: batchSize });
+    let progressErrored = false;
     try {
       const generatedRows = await Promise.all(
         feedMaterialIds.map(async (id) => {
@@ -1893,6 +1902,7 @@ function FeedPageInner() {
                 if (!isSearchScopeActive(searchScope)) {
                   return;
                 }
+                setGenerationProgress((prev) => (prev ? { ...prev, received: prev.received + 1 } : null));
                 const appended = appendGeneratedReels([reel]);
                 if (appended.addedCount > 0) {
                   streamedReels.push(...appended.addedReels);
@@ -1969,6 +1979,7 @@ function FeedPageInner() {
       if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
         return [];
       }
+      progressErrored = true;
       console.warn("Background reel generation failed:", e);
       markRecoveryProgress(0);
       if (isTransportError(e)) {
@@ -1983,6 +1994,17 @@ function FeedPageInner() {
         finishActiveRecoveryRequest(searchScope);
         setGeneratingMore(false);
         isGeneratingRef.current = false;
+        if (progressErrored) {
+          setGenerationProgress(null);
+        } else {
+          setGenerationProgress((p) => (p ? { ...p, received: p.requested } : null));
+          progressClearTimerRef.current = setTimeout(() => {
+            progressClearTimerRef.current = null;
+            setGenerationProgress(null);
+          }, 800);
+        }
+      } else {
+        setGenerationProgress(null);
       }
     }
   }, [
@@ -3592,6 +3614,9 @@ function FeedPageInner() {
               {renderMobileFeedbackButton("confusing", "Confusing", "fa-circle-question", Boolean(activeFeedback.confusing))}
               {renderMobileFeedbackButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
             </div>
+          ) : null}
+          {generationProgress !== null ? (
+            <GenerationProgress received={generationProgress.received} requested={generationProgress.requested} />
           ) : null}
           <div
             ref={feedViewportRef}
