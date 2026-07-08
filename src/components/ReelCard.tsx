@@ -39,6 +39,9 @@ const RESUME_MASK_MS = 480;
 const AUTOPLAY_RETRY_DELAY_MS = 320;
 const AUTOPLAY_MAX_RETRIES = 5;
 const PLAYBACK_SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
+// Word timestamps are interpolated from caption cues (±hundreds of ms); starting slightly
+// early is the least-bad fix for mid-word clip entries without audio analysis.
+const CLIP_START_LEAD_IN_SEC = 0.4;
 
 function detectTouchLikeDevice(): boolean {
   if (typeof window === "undefined") {
@@ -197,6 +200,7 @@ export function ReelCard({
     Number.isFinite(clipStartRaw) && clipStartRaw >= 0
       ? Math.min(videoDurationCap, clipStartRaw)
       : 0;
+  const seekStart = Math.max(0, clipStart - CLIP_START_LEAD_IN_SEC);
   const configuredClipEnd =
     Number.isFinite(clipEndRaw) && clipEndRaw > clipStart
       ? Math.min(
@@ -421,7 +425,7 @@ export function ReelCard({
           onRequestNextReel();
           return;
         }
-        player.seekTo(clipStart, true);
+        player.seekTo(seekStart, true);
         if (isActive) {
           player.playVideo();
         }
@@ -429,7 +433,7 @@ export function ReelCard({
       const rel = clamp(now - clipStart, 0, clipDuration);
       setCurrentSec(rel);
     }, 160);
-  }, [clipDuration, clipEnd, clipStart, isActive, onRequestNextReel, stopProgressTimer, syncDetectedDurationFromPlayer]);
+  }, [clipDuration, clipEnd, clipStart, isActive, onRequestNextReel, seekStart, stopProgressTimer, syncDetectedDurationFromPlayer]);
 
   useEffect(() => {
     if (!isYouTubeVideo || !isActive || !isReady || !isPlaying) {
@@ -593,7 +597,7 @@ export function ReelCard({
             playsinline: 1,
             iv_load_policy: 3,
             modestbranding: 1,
-            start: clipStart,
+            start: Math.floor(seekStart),
             mute: 1,
             enablejsapi: 1,
             origin: window.location.origin,
@@ -612,7 +616,7 @@ export function ReelCard({
                 event.target.mute();
                 isMutedRef.current = true;
                 setIsMuted(true);
-                event.target.seekTo(clipStart, true);
+                event.target.seekTo(seekStart, true);
                 event.target.playVideo();
               };
               const queueAutoplayRetry = () => {
@@ -686,7 +690,7 @@ export function ReelCard({
                       event.target.unMute();
                       setIsMuted(false);
                     }
-                    event.target.seekTo(clipStart, true);
+                    event.target.seekTo(seekStart, true);
                     event.target.playVideo();
                   }, AUTOPLAY_RETRY_DELAY_MS);
                 }
@@ -702,7 +706,7 @@ export function ReelCard({
                   return;
                 }
                 manualPauseRequestedRef.current = false;
-                event.target.seekTo(clipStart, true);
+                event.target.seekTo(seekStart, true);
                 event.target.playVideo();
                 setIsPlaying(true);
                 setIsSurfaceVisible(true);
@@ -761,6 +765,7 @@ export function ReelCard({
     clipStart,
     isActive,
     scheduleSurfaceReveal,
+    seekStart,
     showResumeMask,
     startProgressTimer,
     stopProgressTimer,
