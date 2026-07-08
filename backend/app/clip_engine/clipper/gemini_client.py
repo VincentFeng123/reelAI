@@ -143,7 +143,7 @@ def generate_json_video(system: str, parts: list, schema, media_resolution=None,
 
     ``parts`` is a list of ``types.Part`` (interleaved text + inline video bytes), sent as the
     single user turn — same thinking-off-then-on + backoff machinery as ``generate_json_mm``.
-    Gemini-only (Groq has no video input); the caller invokes this directly, never through
+    Gemini-only; the caller invokes this directly, never through
     llm.py/llm_json. Defaults to ``config.VIDEO_JUDGE_MODEL`` (flash-lite)."""
     client = get_client()
     mdl = model or config.VIDEO_JUDGE_MODEL

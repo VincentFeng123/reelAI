@@ -17,7 +17,6 @@ _CLIPPER_ROOT = (
 _SCAN_MODULES = [
     _CLIPPER_ROOT / "llm.py",
     _CLIPPER_ROOT / "gemini_client.py",
-    _CLIPPER_ROOT / "groq_client.py",
     _CLIPPER_ROOT / "embed.py",
     _CLIPPER_ROOT / "pipeline" / "gemini_segment.py",
     _CLIPPER_ROOT / "pipeline" / "transcribe.py",

@@ -30,11 +30,6 @@ SUPADATA_CHUNK_SIZE = 180
 # ── Token budgeting ────────────────────────────────────────────────────────────
 EXPECTED_OUTPUT_TOKENS = 2_500
 
-# ── Groq LLM names ────────────────────────────────────────────────────────────
-LLM_PRIMARY = "openai/gpt-oss-120b"
-LLM_FALLBACK = "llama-3.3-70b-versatile"
-FALLBACK_RETRIES = 2
-
 # ── Backoff ────────────────────────────────────────────────────────────────────
 BACKOFF_MAX_RETRIES = 6
 BACKOFF_BASE = 1.0
@@ -42,23 +37,6 @@ BACKOFF_CAP = 60.0
 
 # ── Video judge ────────────────────────────────────────────────────────────────
 VIDEO_JUDGE_MODEL = os.environ.get("VIDEO_JUDGE_MODEL", "gemini-2.5-flash-lite")
-
-# ── Groq API ───────────────────────────────────────────────────────────────────
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-STT_MODEL = "whisper-large-v3-turbo"
-GROQ_MAX_FILE_MB = 25
-AUDIO_CHUNK_OVERLAP_S = 5
-
-# ── Groq rate limits ───────────────────────────────────────────────────────────
-RPM_LIMIT = 30
-TPM_LIMIT = 12_000
-TPM_SAFETY = 0.85
-
-# ── Audio processing ───────────────────────────────────────────────────────────
-TARGET_AUDIO_SR = 16000
-TARGET_AUDIO_CH = 1
-AUDIO_BITRATE_K = 48
-FFMPEG_BIN = os.environ.get("FFMPEG_BIN", "/opt/homebrew/bin/ffmpeg")
 
 # ── Transcription provider / local Whisper ────────────────────────────────────
 TRANSCRIBER = os.environ.get("TRANSCRIBER", "supadata")
