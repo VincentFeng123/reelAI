@@ -21,7 +21,10 @@ SUPADATA_SEARCH_URL = f"{SUPADATA_BASE}/youtube/search"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-SEGMENT_MODEL = os.environ.get("SEGMENT_MODEL", GEMINI_MODEL)
+# Comprehension (segmentation) runs on the Pro tier like the practice engine:
+# SEGMENT_MODEL falls back to TOPIC_MODEL, NOT to the cheaper GEMINI_MODEL.
+TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
+SEGMENT_MODEL = os.environ.get("SEGMENT_MODEL", TOPIC_MODEL)
 # Query-expansion uses the cheaper lite tier; segmentation keeps its own model.
 EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "gemini-2.5-flash-lite")
 
@@ -31,12 +34,17 @@ PRECISE_BOUNDARIES = _flag("PRECISE_BOUNDARIES", False)
 SEGMENT_FINE_SNAP = _flag("SEGMENT_FINE_SNAP", True)
 
 SEGMENT_MIN_CLIP_S = float(os.environ.get("SEGMENT_MIN_CLIP_S", "15"))
+# Curation gates (practice topic-engine parity: CLIP_MAX_S=75, informativeness>=0.5).
+SEGMENT_MAX_CLIP_S = float(os.environ.get("SEGMENT_MAX_CLIP_S", "75"))
+SEGMENT_INFORMATIVENESS_MIN = float(os.environ.get("SEGMENT_INFORMATIVENESS_MIN", "0.5"))
 SEGMENT_MAX_CLIPS = int(os.environ.get("SEGMENT_MAX_CLIPS", "40"))
 SEGMENT_MAX_OUTPUT_TOKENS = int(os.environ.get("SEGMENT_MAX_OUTPUT_TOKENS", "24576"))
 TAIL_PAD_S = float(os.environ.get("SEGMENT_TAIL_PAD_S", "0.15"))
 
 CLIP_SEARCH_MAX_VIDEOS = int(os.environ.get("CLIP_SEARCH_MAX_VIDEOS", "5"))
-SEARCH_BREADTH = int(os.environ.get("CLIP_SEARCH_BREADTH", "5"))
+# VidScout's clip-feed mode searches with breadth >=8 expanded queries; the
+# cross-query match count is the strongest ranking signal, so match it.
+SEARCH_BREADTH = int(os.environ.get("CLIP_SEARCH_BREADTH", "8"))
 
 
 def require_supadata_key() -> str:

@@ -60,7 +60,10 @@ def search_all(queries: list[str], filters: dict | None = None) -> dict:
             res = search_one(q, filters)
             credits_used += res["billed"]
             per_query.append(res)
-        except SearchError as e:
+        except (SearchError, httpx.HTTPError) as e:
+            # Per-query containment (practice searchAll parity): a transient
+            # network failure on one query degrades to partial results instead
+            # of killing the whole discovery fan-out.
             credits_used += getattr(e, "billed", 0) or 0
             status = getattr(e, "status", None)
             errors.append({"query": q, "status": status, "message": str(e)})

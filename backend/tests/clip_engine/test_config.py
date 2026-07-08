@@ -13,6 +13,46 @@ def test_defaults_are_gemini_embed(monkeypatch):
     assert cfg.CLIP_SEARCH_MAX_VIDEOS == 5
 
 
+def test_segment_model_defaults_to_pro_tier(monkeypatch):
+    """Segmentation must fall back to the PRO tier (TOPIC_MODEL), never to the
+    cheap GEMINI_MODEL — the silent flash downgrade was a root cause of the
+    bad-reels regression."""
+    monkeypatch.delenv("TOPIC_MODEL", raising=False)
+    monkeypatch.delenv("SEGMENT_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
+    assert cfg.TOPIC_MODEL == "gemini-3.1-pro-preview"
+    assert cfg.SEGMENT_MODEL == cfg.TOPIC_MODEL
+    assert cfg.SEGMENT_MODEL != cfg.GEMINI_MODEL
+
+
+def test_curation_gate_defaults(monkeypatch):
+    monkeypatch.delenv("SEGMENT_MAX_CLIP_S", raising=False)
+    monkeypatch.delenv("SEGMENT_INFORMATIVENESS_MIN", raising=False)
+    cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
+    assert cfg.SEGMENT_MAX_CLIP_S == 75.0
+    assert cfg.SEGMENT_INFORMATIVENESS_MIN == 0.5
+
+
+def test_search_breadth_matches_vidscout_feed(monkeypatch):
+    monkeypatch.delenv("CLIP_SEARCH_BREADTH", raising=False)
+    cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
+    assert cfg.SEARCH_BREADTH == 8
+
+
+def test_extract_video_id_accepts_v_param_anywhere():
+    from backend.app.clip_engine.metadata import extract_video_id
+
+    assert extract_video_id(
+        "https://www.youtube.com/watch?feature=share&v=dQw4w9WgXcQ"
+    ) == "dQw4w9WgXcQ"
+    assert extract_video_id(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    ) == "dQw4w9WgXcQ"
+    assert extract_video_id("https://youtu.be/dQw4w9WgXcQ") == "dQw4w9WgXcQ"
+    assert extract_video_id("https://vimeo.com/123") is None
+
+
 def test_require_supadata_key_raises_when_missing(monkeypatch):
     monkeypatch.delenv("SUPADATA_API_KEY", raising=False)
     cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))

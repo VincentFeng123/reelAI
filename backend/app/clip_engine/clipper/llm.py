@@ -9,12 +9,15 @@ Pydantic instance.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Optional, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from . import config
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -65,8 +68,21 @@ def llm_json(
     # provider param kept for API compatibility; only "gemini" is supported.
     est = est_tokens or (_estimate_tokens(system + user) + config.EXPECTED_OUTPUT_TOKENS)  # noqa: F841
     from . import gemini_client
-    raw = gemini_client.generate_json(system, user, schema, temperature=temperature,
-                                      model=model, max_output_tokens=max_output_tokens)
+    try:
+        raw = gemini_client.generate_json(system, user, schema, temperature=temperature,
+                                          model=model, max_output_tokens=max_output_tokens)
+    except Exception as e:
+        # One-shot fallback: an explicitly-requested model (e.g. the pro-preview
+        # segmentation tier) that this key can't use must degrade to the default
+        # model, not silently zero out every generation.
+        if not (model and model != config.GEMINI_MODEL
+                and gemini_client.is_model_unavailable(e)):
+            raise
+        logger.warning("model %s unavailable (%s); falling back to %s",
+                       model, e, config.GEMINI_MODEL)
+        model = config.GEMINI_MODEL
+        raw = gemini_client.generate_json(system, user, schema, temperature=temperature,
+                                          model=model, max_output_tokens=max_output_tokens)
     try:
         return schema.model_validate_json(_strip_fences(raw))
     except (ValidationError, json.JSONDecodeError, ValueError):

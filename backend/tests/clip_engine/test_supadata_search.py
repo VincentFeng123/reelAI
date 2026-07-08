@@ -40,3 +40,25 @@ def test_search_all_aggregates_and_warns_on_402(monkeypatch):
     assert out["credits_used"] == 1
     assert "out of Supadata credits" in out["warning"]
     assert len(out["per_query"]) == 2
+
+
+def test_search_all_contains_network_errors_per_query(monkeypatch):
+    """A transient network failure on ONE query degrades to partial results
+    (VidScout searchAll parity) instead of killing the whole fan-out."""
+    monkeypatch.setattr(ss.config, "SUPADATA_API_KEY", "sd_test")
+    responses = iter([
+        _Resp(200, {"results": [{"id": "a", "type": "video"}]}, {"x-billable-requests": "1"}),
+    ])
+
+    def flaky_get(*a, **k):
+        try:
+            return next(responses)
+        except StopIteration:
+            raise ss.httpx.ConnectError("connection reset")
+
+    monkeypatch.setattr(ss.httpx, "get", flaky_get)
+    monkeypatch.setattr(ss.time, "sleep", lambda *_: None)
+    out = ss.search_all(["good", "flaky"])
+    assert [v["id"] for v in out["per_query"][0]["videos"]] == ["a"]
+    assert out["per_query"][1]["videos"] == []
+    assert "1 of 2 searches failed" in out["warning"]

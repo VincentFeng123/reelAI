@@ -5,8 +5,9 @@ from __future__ import annotations
 import re
 
 _YT_ID = re.compile(
-    r"(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/|youtube\.com/embed/|"
-    r"youtube\.com/live/|m\.youtube\.com/watch\?v=)([A-Za-z0-9_-]{11})",
+    r"(?:youtube\.com/watch\?(?:[^#]*&)?v=|youtu\.be/|youtube\.com/shorts/|"
+    r"youtube\.com/embed/|youtube\.com/live/|m\.youtube\.com/watch\?(?:[^#]*&)?v=)"
+    r"([A-Za-z0-9_-]{11})",
     re.IGNORECASE,
 )
 

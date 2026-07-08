@@ -34,7 +34,7 @@ def clip(url: str, topic: str, settings: dict | None = None) -> dict:
         raise TranscriptError(f"Empty transcript for {video_id}")
 
     try:
-        clips, notes = gemini_segment.segment_clips(transcript, settings)
+        clips, notes = gemini_segment.segment_clips(transcript, settings, topic=topic or "")
     except Exception as exc:
         raise ClipError(f"Gemini segmentation failed for {video_id}: {exc}") from exc
 

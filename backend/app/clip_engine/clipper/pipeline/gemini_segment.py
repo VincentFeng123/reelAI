@@ -35,6 +35,28 @@ class _Topic(BaseModel):
     end_quote: str = ""        # last few words of the topic (for fine-snapping the end)
     reason: str = ""
     facet: str = "other"
+    kind: str = "content"      # content|intro|outro|admin|promo — only content ships
+    informativeness: float = 0.5  # 0..1, how much a motivated student learns
+
+
+# Segment kinds that never ship (structural/filler, not teaching). Includes
+# near-miss labels the model may emit despite the prompt's enum.
+_DROP_KINDS = {
+    "intro", "introduction", "greeting", "outro", "admin", "housekeeping",
+    "announcement", "promo", "promotion", "sponsor", "sponsorship",
+    "ad", "ads", "advertisement", "filler",
+}
+
+
+def _norm_informativeness(value: float) -> float:
+    """Clamp to [0, 1], tolerating models that answer on a 0-10 or 0-100 scale
+    (7 → 0.7, 85 → 0.85) instead of saturating every mis-scaled score to 1.0."""
+    v = float(value)
+    if v > 10.0:
+        v = v / 100.0
+    elif v > 1.0:
+        v = v / 10.0
+    return max(0.0, min(1.0, v))
 
 
 class _Plan(BaseModel):
@@ -46,25 +68,36 @@ def _mmss(s: float) -> str:
     return f"{int(s // 60):02d}:{int(s % 60):02d}"
 
 
-def _prompts(lines: str, n: int) -> "tuple[str, str]":
+def _prompts(lines: str, n: int, topic: str = "") -> "tuple[str, str]":
+    topic_rule = ""
+    if topic.strip():
+        topic_rule = (
+            f"The viewer is studying: {topic.strip()!r}. Only return clips that TEACH "
+            "material relevant to that topic; skip unrelated sections entirely.\n"
+        )
     system = (
-        "You segment a lecture/talk transcript into self-contained CLIPS for a short-form "
-        "learning feed. First read and understand the WHOLE transcript. Then split it into "
-        "each SUBSTANTIVE topic — one coherent idea, concept, worked example, or section, "
-        "taught from its introduction through to its natural conclusion. Skip pure filler "
-        "(greetings, admin, 'like and subscribe', tangents).\n"
-        "For every topic return: title; start_line (the line where the idea is INTRODUCED); "
+        "You select self-contained CLIPS from a lecture/talk transcript for a short-form "
+        "learning feed. First read and understand the WHOLE transcript. Then pick the "
+        "SUBSTANTIVE teaching moments — one coherent idea, concept, worked example, or "
+        "section, taught from its introduction through to its natural conclusion. Skip pure "
+        "filler (greetings, admin, 'like and subscribe', tangents), course-logistics intros, "
+        "and wrap-up outros.\n" + topic_rule +
+        "For every clip return: title; start_line (the line where the idea is INTRODUCED); "
         "end_line (the line where it CLOSES); start_quote (the first ~6 words spoken at the "
         "start, copied verbatim from that line); end_quote (the last ~6 words, verbatim); a "
-        "short reason. Rules: (1) a clip must START at the beginning of the topic and END at "
-        "its end — never mid-thought; (2) clips must NOT overlap — each line belongs to at "
-        "most one clip; (3) go in chronological order; (4) line indices range from 0 to "
+        "short reason; kind — one of content|intro|outro|admin|promo (only 'content' ships); "
+        "informativeness — 0.0 to 1.0, how much a motivated student learns from this clip "
+        "ALONE (0.9+: a complete idea taught well; ~0.5: partial value; <0.5: little value). "
+        "Rules: (1) a clip must START at the beginning of the idea and END at its end — "
+        "never mid-thought; (2) clips must NOT overlap — each line belongs to at most one "
+        "clip; (3) go in chronological order; (4) prefer TIGHT clips of roughly 20-70 "
+        "seconds — one idea, not a whole chapter; (5) line indices range from 0 to "
         f"{n - 1} — never exceed {n - 1}."
     )
     user = (
         f"Transcript ({n} lines, each formatted `[index] MM:SS text`):\n\n" + lines +
-        "\n\nReturn every substantive topic as {title, start_line, end_line, start_quote, "
-        "end_quote, reason, facet}."
+        "\n\nReturn every substantive teaching clip as {title, start_line, end_line, "
+        "start_quote, end_quote, reason, facet, kind, informativeness}."
     )
     return system, user
 
@@ -116,10 +149,19 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
     fine = settings.get("segment_fine_snap")
     fine = config.SEGMENT_FINE_SNAP if fine is None else bool(fine)
     min_s = float(settings.get("segment_min_clip_s") or config.SEGMENT_MIN_CLIP_S)
+    max_s = float(settings.get("segment_max_clip_s") or config.SEGMENT_MAX_CLIP_S)
+    info_min = settings.get("segment_informativeness_min")
+    info_min = config.SEGMENT_INFORMATIVENESS_MIN if info_min is None else float(info_min)
     tail_pad = float(settings.get("tail_pad_s", config.DEFAULTS["tail_pad_s"]))
 
     raw: list[dict] = []
     for tp in plan.topics:
+        kind = (tp.kind or "content").strip().lower() or "content"
+        info = _norm_informativeness(tp.informativeness)
+        if kind in _DROP_KINDS:
+            continue                                  # structural/filler — never ships
+        if info < info_min:
+            continue                                  # not informative enough on its own
         a = max(0, min(int(tp.start_line), n - 1))
         b = max(a, min(int(tp.end_line), n - 1))
         start = float(segs[a]["start"])
@@ -132,9 +174,11 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
                 start = st
             if en is not None and en > start:
                 end = en
-        raw.append({"start": start, "end": end, "title": (tp.title or "").strip(),
+        raw.append({"start": start, "end": end, "orig_end": end,
+                    "title": (tp.title or "").strip(),
                     "facet": (tp.facet or "other").strip() or "other",
-                    "reason": (tp.reason or "").strip()})
+                    "reason": (tp.reason or "").strip(),
+                    "informativeness": info})
 
     raw.sort(key=lambda c: (c["start"], c["end"]))
     # deterministic overlap trim: each clip starts strictly after the previous clip's end
@@ -143,6 +187,18 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
     for c in raw:
         if c["start"] < prev_end:
             c["start"] = prev_end
+        if c["end"] - c["start"] > max_s:
+            # Whole-chapter slab: walk the end back to the last transcript-chunk
+            # boundary within budget (the chunk-granularity analogue of the
+            # practice engine's terminator walk-back) instead of dropping the
+            # topic outright. No boundary in budget → drop below via min_s.
+            budget_end = c["start"] + max_s
+            fitted = max(
+                (float(s["end"]) for s in segs
+                 if c["start"] < float(s["end"]) <= budget_end),
+                default=c["start"],
+            )
+            c["end"] = fitted
         if c["end"] - c["start"] < min_s:
             continue                                  # too short after trimming — drop
         c["cut_end"] = round(c["end"] + tail_pad, 3)
@@ -150,6 +206,31 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
         c["end"] = round(c["end"], 3)
         prev_end = c["end"]
         clips.append(c)
+
+    if not clips and raw:
+        # Every kind/informativeness survivor died on duration fitting — ship the
+        # single most informative one trimmed to budget rather than zeroing out a
+        # paid video (mirrors practice's low-confidence selection backstop).
+        # NOTE: the loop above mutates raw entries in place; orig_end preserves
+        # the model's chosen end.
+        best = max(raw, key=lambda c: c.get("informativeness", 0.0))
+        start = float(best["start"])
+        target_end = float(best.get("orig_end", best["end"]))
+        budget_end = start + max_s
+        if target_end > budget_end:
+            # chunk boundary within budget if one exists, else hard-cut at budget
+            target_end = max(
+                (float(s["end"]) for s in segs
+                 if start < float(s["end"]) <= budget_end),
+                default=budget_end,
+            )
+        if target_end - start >= min_s:
+            best = dict(best)
+            best["start"] = round(start, 3)
+            best["end"] = round(target_end, 3)
+            best["cut_end"] = round(target_end + tail_pad, 3)
+            best["low_confidence"] = True
+            clips = [best]
 
     max_clips = int(settings.get("max_clips") or config.SEGMENT_MAX_CLIPS)
     clips = clips[:max_clips]
@@ -160,8 +241,10 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
 
 # ── public entry point ───────────────────────────────────────────────────────
 def segment_clips(transcript: dict, settings: dict,
-                  progress: ProgressCb = None) -> "tuple[list[dict], str]":
-    """One Gemini comprehension pass → substantive topic clips. Returns (clips_spec, notes)."""
+                  progress: ProgressCb = None, topic: str = "") -> "tuple[list[dict], str]":
+    """One Gemini comprehension pass → curated teaching clips (topic-relevant when
+    ``topic`` is given; intro/outro/low-informativeness/over-length segments dropped).
+    Returns (clips_spec, notes)."""
     segs = transcript.get("segments") or []
     words = transcript.get("words") or []
     if not segs:
@@ -169,7 +252,7 @@ def segment_clips(transcript: dict, settings: dict,
     n = len(segs)
     lines = "\n".join(f"[{i}] {_mmss(s.get('start', 0.0))} {(s.get('text') or '').strip()}"
                       for i, s in enumerate(segs))
-    system, user = _prompts(lines, n)
+    system, user = _prompts(lines, n, topic)
     model = settings.get("segment_model") or config.SEGMENT_MODEL
 
     if progress:

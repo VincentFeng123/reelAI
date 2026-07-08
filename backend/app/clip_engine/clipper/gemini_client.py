@@ -37,11 +37,39 @@ def get_client() -> genai.Client:
     return _client
 
 
+def _error_code(e: Exception) -> Optional[int]:
+    code = getattr(e, "code", None)
+    if code is None:
+        code = getattr(e, "status_code", None)
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _is_retryable(e: Exception) -> bool:
+    # Prefer the structured google-genai APIError code: 403/404 (no access /
+    # bad model name) must fail fast, not burn 6 backoff rounds.
+    code = _error_code(e)
+    if code is not None:
+        return code in (429, 500, 503)
     s = str(e).lower()
     return (
         "429" in s or "resource_exhausted" in s or "rate" in s
         or "503" in s or "500" in s or "unavailable" in s or "overloaded" in s
+    )
+
+
+def is_model_unavailable(e: Exception) -> bool:
+    """A non-transient model-access failure (bad name / no access): callers may
+    fall back to the default model instead of failing the whole video."""
+    code = _error_code(e)
+    if code in (403, 404):
+        return True
+    s = str(e).lower()
+    return (
+        "not_found" in s or "not found" in s
+        or "permission_denied" in s or "permission denied" in s
     )
 
 
