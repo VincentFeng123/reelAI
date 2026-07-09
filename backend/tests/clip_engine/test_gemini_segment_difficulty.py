@@ -24,7 +24,8 @@ def test_difficulty_carried_on_clip():
 
 
 def test_difficulty_defaults_to_half_when_omitted():
-    t = _Topic(title="T", start_line=0, end_line=1, informativeness=0.9)
+    # Simulate parsed JSON with no difficulty key at all (the model omitted it).
+    t = _Topic.model_validate({"title": "T", "start_line": 0, "end_line": 1, "informativeness": 0.9})
     clips = _run([t])
     assert clips[0]["difficulty"] == pytest.approx(0.5)
 
@@ -33,6 +34,10 @@ def test_misscaled_difficulty_normalized():
     t = _Topic(title="T", start_line=0, end_line=1, informativeness=0.9, difficulty=7)
     clips = _run([t])
     assert clips[0]["difficulty"] == pytest.approx(0.7)
+    # 0-100 scale branch
+    t = _Topic(title="T", start_line=0, end_line=1, informativeness=0.9, difficulty=85)
+    clips = _run([t])
+    assert clips[0]["difficulty"] == pytest.approx(0.85)
 
 
 def test_extreme_difficulty_never_gates():
@@ -44,5 +49,5 @@ def test_extreme_difficulty_never_gates():
 
 def test_prompt_documents_difficulty_scale():
     system, user = _prompts("[0] 00:00 hi", 1)
-    assert "difficulty" in system
+    assert "difficulty — 0.0 to 1.0" in system
     assert "difficulty" in user
