@@ -599,6 +599,7 @@ class IngestionPipeline:
         target_clip_duration_min_sec: int = 15,
         target_clip_duration_max_sec: int = 60,
         language: str = "en",
+        knowledge_level: str | None = None,
         max_videos: int = 3,
         max_reels: int | None = None,
         on_reel_created: Callable[[ReelOutWithAttribution], None] | None = None,
@@ -634,7 +635,7 @@ class IngestionPipeline:
         ]
 
         disc = clip_engine_search.discover(
-            topic, limit=limit, exclude_video_ids=bare_exclusions
+            topic, limit=limit, exclude_video_ids=bare_exclusions, level=knowledge_level
         )
 
         warning = disc.get("warning")

@@ -613,5 +613,17 @@ class DifficultyPersistenceTests(IngestTopicTests):
         self.assertIsNone(row["difficulty"])
 
 
+class LevelThreadingTests(IngestTopicTests):
+    def test_ingest_topic_passes_level_to_discover(self) -> None:
+        with _Patched() as (mock_search, mock_run):
+            mock_run.clip.side_effect = _clip_side_effect
+            main_module.ingestion_pipeline.ingest_topic(
+                topic=TOPIC, material_id="mat-lvl", concept_id="con-lvl",
+                generation_id="gen-lvl", max_videos=1, knowledge_level="advanced",
+            )
+            _, kwargs = mock_search.discover.call_args
+            self.assertEqual(kwargs.get("level"), "advanced")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1573,7 +1573,12 @@ class ReelService:
             ),
             params,
         )
-        material = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
+        material = fetch_one(
+            conn,
+            "SELECT subject_tag, source_type, knowledge_level, level_adjustment FROM materials WHERE id = ?",
+            (material_id,),
+        )
+        material_knowledge_level = str((material or {}).get("knowledge_level") or "beginner")
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
         strict_topic_only = str((material or {}).get("source_type") or "").strip().lower() == "topic"
         if strict_topic_only and subject_tag:
@@ -1831,6 +1836,7 @@ class ReelService:
                     target_clip_duration_min_sec=clip_min_len,
                     target_clip_duration_max_sec=clip_max_len,
                     language="en",
+                    knowledge_level=material_knowledge_level,
                     max_videos=video_budget,
                     max_reels=None,
                     on_reel_created=(None if dry_run else _stream),
