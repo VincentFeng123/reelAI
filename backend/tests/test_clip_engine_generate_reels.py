@@ -459,5 +459,56 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertIn("retry-after", {k.lower() for k in resp.headers})
 
 
+class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
+    """Serve-time level scoring: matched clips first, off-level kept at the
+    back, and a level change re-sorts WITHOUT regeneration."""
+
+    def _seed_two_reels_with_difficulty(self) -> None:
+        # Two persisted reels on the same material: one easy, one hard.
+        # videos table: id, title, channel_title, duration_sec, created_at
+        # reels table: id, material_id, concept_id, video_id, video_url,
+        #              t_start, t_end, transcript_snippet, takeaways_json,
+        #              base_score, generation_id, difficulty, created_at
+        # Use cellular-respiration content so both reels pass the relevance gate.
+        with db_module.get_conn(transactional=True) as conn:
+            for reel_id, vid, d in (("r-easy", "videasy00001", 0.15),
+                                    ("r-hard", "vidhard00001", 0.85)):
+                conn.execute(
+                    "INSERT INTO videos (id, title, channel_title, duration_sec, created_at) "
+                    "VALUES (?, 'Cellular respiration explained', 'Chan', 600, '2026-07-08T00:00:00+00:00')",
+                    (vid,),
+                )
+                conn.execute(
+                    "INSERT INTO reels (id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+                    "transcript_snippet, takeaways_json, base_score, generation_id, difficulty, created_at) "
+                    "VALUES (?, ?, ?, ?, 'https://www.youtube.com/embed/x?start=0&end=30', 0, 30, "
+                    "'cellular respiration process in mitochondria', '[]', 0.8, 'gen-lvl', ?, '2026-07-08T00:00:00+00:00')",
+                    (reel_id, MATERIAL_ID, CONCEPT_ID, vid, d),
+                )
+
+    def test_beginner_feed_puts_easy_first_but_keeps_hard(self) -> None:
+        self._seed_two_reels_with_difficulty()
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute("UPDATE materials SET knowledge_level='beginner', level_adjustment=0 WHERE id=?",
+                         (MATERIAL_ID,))
+        with db_module.get_conn() as conn:
+            feed = main_module.reel_service.ranked_feed(conn, material_id=MATERIAL_ID, generation_id="gen-lvl")
+        ids = [r["reel_id"] for r in feed]
+        self.assertEqual(ids[0], "r-easy")
+        self.assertIn("r-hard", ids)          # NEVER hidden — waits at the back
+
+    def test_level_change_resorts_without_regeneration(self) -> None:
+        self._seed_two_reels_with_difficulty()
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute("UPDATE materials SET knowledge_level='advanced', level_adjustment=0 WHERE id=?",
+                         (MATERIAL_ID,))
+        with db_module.get_conn() as conn:
+            feed = main_module.reel_service.ranked_feed(conn, material_id=MATERIAL_ID, generation_id="gen-lvl")
+        self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
+
+    def test_cache_version_is_7(self) -> None:
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 7)
+
+
 if __name__ == "__main__":
     unittest.main()

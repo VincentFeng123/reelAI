@@ -36,6 +36,7 @@ from .segmenter import (
 )
 from .topic_expansion import TopicExpansionService
 from .structural_classifier import classify_passage
+from .knowledge_level import effective_level_target
 
 # Serving-side ceiling: legacy whole-video slabs (persisted before the engine's
 # SEGMENT_MAX_CLIP_S curation gate existed) must not surface in ranked feeds.
@@ -1293,7 +1294,7 @@ class ReelService:
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
-    RANKED_FEED_CACHE_VERSION = 6
+    RANKED_FEED_CACHE_VERSION = 7
     REFILL_STAGE_EXACT_ROOT = 0
     REFILL_STAGE_ROOT_COMPANION = 1
     REFILL_STAGE_MULTI_CLIP_STRICT = 2
@@ -1348,18 +1349,21 @@ class ReelService:
         fast_mode: bool,
         subject_tag: str | None = None,
         strict_topic_only: bool = False,
+        level_target: float = 0.5,
     ) -> str:
         # Include subject_tag + strict_topic_only in the key because ranked_feed's
         # relevance gates (`_passes_relevance_gate`, strict topic filter, hard-
         # blocked check) consult them and their output is baked into the cached
         # rows. Without this the cache would return stale pre-filtered data when
         # the caller's context (topic/source) changed.
+        # level_target is included so a level change invalidates the cached order.
         payload = {
             "material_id": material_id,
             "generation_id": generation_id or "",
             "fast_mode": bool(fast_mode),
             "subject_tag": (subject_tag or "").strip().lower(),
             "strict_topic_only": bool(strict_topic_only),
+            "level_target": round(float(level_target), 3),
             "version": self.RANKED_FEED_CACHE_VERSION,
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -1455,6 +1459,7 @@ class ReelService:
         source_fingerprint: str,
         subject_tag: str | None = None,
         strict_topic_only: bool = False,
+        level_target: float = 0.5,
     ) -> list[dict[str, Any]] | None:
         cache_key = self._ranked_feed_cache_key(
             material_id=material_id,
@@ -1462,6 +1467,7 @@ class ReelService:
             fast_mode=fast_mode,
             subject_tag=subject_tag,
             strict_topic_only=strict_topic_only,
+            level_target=level_target,
         )
         cached = fetch_one(
             conn,
@@ -1489,6 +1495,7 @@ class ReelService:
         reels: list[dict[str, Any]],
         subject_tag: str | None = None,
         strict_topic_only: bool = False,
+        level_target: float = 0.5,
     ) -> None:
         timestamp = now_iso()
         upsert(
@@ -1501,6 +1508,7 @@ class ReelService:
                     fast_mode=fast_mode,
                     subject_tag=subject_tag,
                     strict_topic_only=strict_topic_only,
+                    level_target=level_target,
                 ),
                 "material_id": material_id,
                 "generation_id": generation_id or "",
@@ -7978,10 +7986,17 @@ class ReelService:
         material_id: str,
         fast_mode: bool = False,
         generation_id: str | None = None,
+        page_hint: int = 1,
     ) -> list[dict[str, Any]]:
-        material = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
+        material = fetch_one(conn, "SELECT subject_tag, source_type, knowledge_level, level_adjustment FROM materials WHERE id = ?", (material_id,))
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
         strict_topic_only = str((material or {}).get("source_type") or "").strip().lower() == "topic"
+        level_target = effective_level_target(
+            (material or {}).get("knowledge_level"),
+            (material or {}).get("level_adjustment"),
+        )
+        self._last_effective_level_target = level_target
+        self._last_knowledge_level = str((material or {}).get("knowledge_level") or "beginner")
 
         reel_where, reel_params = self._reel_scope_where(
             material_id=material_id,
@@ -8005,6 +8020,7 @@ class ReelService:
             source_fingerprint=source_fingerprint,
             subject_tag=subject_tag,
             strict_topic_only=strict_topic_only,
+            level_target=level_target,
         )
         if cached is not None:
             return cached
@@ -8030,6 +8046,7 @@ class ReelService:
                 r.transcript_snippet,
                 r.takeaways_json,
                 r.base_score,
+                r.difficulty,
                 COALESCE(SUM(f.helpful), 0) AS helpful_votes,
                 COALESCE(SUM(f.confusing), 0) AS confusing_votes,
                 COALESCE(AVG(f.rating), 3.0) AS avg_rating,
@@ -8060,6 +8077,7 @@ class ReelService:
                 r.transcript_snippet,
                 r.takeaways_json,
                 r.base_score,
+                r.difficulty,
                 r.created_at
             """,
             reel_params,
@@ -8236,6 +8254,8 @@ class ReelService:
                 takeaways=takeaways,
                 fast_mode=fast_mode,
             )
+            safe_page_hint = max(1, int(page_hint))
+            _diff = 0.5 if row.get("difficulty") is None else float(row["difficulty"])
             score = (
                 float(row["base_score"])
                 + 0.18 * float(row["helpful_votes"])
@@ -8247,6 +8267,8 @@ class ReelService:
                 + 0.22 * float(relevance_context.get("score") or 0.0)
                 - 0.12 * float(relevance.get("off_topic_penalty") or 0.0)
                 + 0.04 * float(self.SOURCE_SURFACE_PRIOR.get(str(retrieval_candidate.get("source_surface") or ""), 0.82))
+                + 0.12 * (1.0 - 2.0 * abs(_diff - level_target))
+                + 0.05 * (1.0 - _diff) * max(0.0, 1.0 - (safe_page_hint - 1) / 2.0)
             )
             scored.append(
                 {
@@ -8280,6 +8302,7 @@ class ReelService:
                     "total_concepts": total_concepts,
                     "video_duration_sec": int(row.get("video_duration_sec") or 0),
                     "clip_duration_sec": round(max(0.0, float(row["t_end"]) - float(row["t_start"])), 2),
+                    "difficulty": (None if row.get("difficulty") is None else float(row["difficulty"])),
                     "created_at": row["created_at"],
                 }
             )
@@ -8400,5 +8423,6 @@ class ReelService:
             reels=response_rows,
             subject_tag=subject_tag,
             strict_topic_only=strict_topic_only,
+            level_target=level_target,
         )
         return response_rows

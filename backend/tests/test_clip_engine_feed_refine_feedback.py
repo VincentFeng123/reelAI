@@ -359,13 +359,13 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # T5-4: cache version guard
     # ------------------------------------------------------------------ #
-    def test_ranked_feed_cache_version_is_6(self) -> None:
-        """RANKED_FEED_CACHE_VERSION must equal 6 after the curation fixes."""
+    def test_ranked_feed_cache_version_is_7(self) -> None:
+        """RANKED_FEED_CACHE_VERSION must equal 7 after level-aware scoring."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            6,
-            "RANKED_FEED_CACHE_VERSION must be bumped to 6 (curation fixes — stale "
-            "pre-curation ranked feeds must not be served after the quality overhaul).",
+            7,
+            "RANKED_FEED_CACHE_VERSION must be bumped to 7 (level-aware scoring — stale "
+            "pre-level ranked feeds must not be served after the level bonus was added).",
         )
 
 

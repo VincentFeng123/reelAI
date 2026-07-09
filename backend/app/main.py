@@ -3457,6 +3457,7 @@ def _ranked_request_reels(
                 material_id,
                 fast_mode=fast_mode,
                 generation_id=current_generation_id,
+                page_hint=page,
             )
             for current_generation_id in generation_ids
             if current_generation_id
@@ -3468,6 +3469,7 @@ def _ranked_request_reels(
             material_id,
             fast_mode=fast_mode,
             generation_id=generation_id,
+            page_hint=page,
         )
     excluded_video_id_set = {
         _bare_video_id(video_id)
