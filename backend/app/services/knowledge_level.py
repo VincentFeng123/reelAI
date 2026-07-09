@@ -33,5 +33,6 @@ def normalize_knowledge_level(value: str | None) -> str:
 def effective_level_target(level: str | None, adjustment: float | None) -> float:
     """The difficulty the feed should aim at RIGHT NOW for this material."""
     base = LEVEL_VALUES[normalize_knowledge_level(level)]
-    adj = max(-ADJUSTMENT_BOUND, min(ADJUSTMENT_BOUND, float(adjustment or 0.0)))
+    adj = 0.0 if adjustment is None else float(adjustment)
+    adj = max(-ADJUSTMENT_BOUND, min(ADJUSTMENT_BOUND, adj))
     return max(0.0, min(1.0, base + adj))

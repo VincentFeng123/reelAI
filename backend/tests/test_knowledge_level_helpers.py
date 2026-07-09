@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.app.services.knowledge_level import (  # noqa: E402
+    KNOWLEDGE_LEVELS,
     LEVEL_VALUES,
     effective_level_target,
     normalize_knowledge_level,
@@ -30,6 +31,7 @@ class NormalizeTests(unittest.TestCase):
 
 class TargetTests(unittest.TestCase):
     def test_mapping(self) -> None:
+        self.assertEqual(KNOWLEDGE_LEVELS, ("beginner", "intermediate", "advanced"))
         self.assertEqual(LEVEL_VALUES["beginner"], 0.15)
         self.assertEqual(LEVEL_VALUES["intermediate"], 0.50)
         self.assertEqual(LEVEL_VALUES["advanced"], 0.85)
