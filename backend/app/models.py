@@ -203,6 +203,10 @@ class ReelsCanGenerateAnyResponse(BaseModel):
     message: str = ""
 
 
+class MaterialLevelUpdateRequest(BaseModel):
+    knowledge_level: Literal["beginner", "intermediate", "advanced"]
+
+
 class FeedResponse(BaseModel):
     page: int
     limit: int
@@ -220,6 +224,8 @@ class FeedResponse(BaseModel):
     # True when the server downgraded the client's requested mode. Clients
     # can show an advisory; clients that don't care can ignore it.
     generation_mode_overridden: bool = False
+    knowledge_level: str | None = None
+    effective_level_target: float | None = None
 
 
 class RefinementStatusResponse(BaseModel):

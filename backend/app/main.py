@@ -89,6 +89,7 @@ from .models import (
     FeedbackRequest,
     FeedbackResponse,
     FeedResponse,
+    MaterialLevelUpdateRequest,
     MaterialResponse,
     RefinementStatusResponse,
     ReelsCanGenerateAnyRequest,
@@ -5667,10 +5668,16 @@ async def create_material(
     file: UploadFile | None = File(default=None),
     text: str | None = Form(default=None),
     subject_tag: str | None = Form(default=None),
+    knowledge_level: str | None = Form(default=None),
 ):
     _enforce_rate_limit(request, "material", limit=MATERIAL_RATE_LIMIT_PER_WINDOW)
     if not file and not text and not subject_tag:
         raise HTTPException(status_code=400, detail="Provide at least one of: topic, text, or file")
+    from .services.knowledge_level import normalize_knowledge_level
+    try:
+        normalized_level = normalize_knowledge_level(knowledge_level)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="knowledge_level must be beginner, intermediate, or advanced")
 
     source_parts: list[str] = []
     source_type = "mixed"
@@ -5739,6 +5746,7 @@ async def create_material(
                 "source_type": source_type,
                 "source_path": source_path,
                 "created_at": created_at,
+                "knowledge_level": normalized_level,
             },
         )
 
@@ -5780,6 +5788,25 @@ async def create_material(
     return {
         "material_id": material_id,
         "extracted_concepts": concepts,
+    }
+
+
+@app.patch("/api/materials/{material_id}/level")
+def update_material_level(material_id: str, payload: MaterialLevelUpdateRequest):
+    from .services.knowledge_level import effective_level_target
+    with get_conn(transactional=True) as conn:
+        row = fetch_one(conn, "SELECT id FROM materials WHERE id = ? LIMIT 1", (material_id,))
+        if not row:
+            raise HTTPException(status_code=404, detail="material not found")
+        # Explicit choice supersedes accumulated drift.
+        execute_modify(
+            conn,
+            "UPDATE materials SET knowledge_level = ?, level_adjustment = 0.0 WHERE id = ?",
+            (payload.knowledge_level, material_id),
+        )
+    return {
+        "knowledge_level": payload.knowledge_level,
+        "effective_level_target": effective_level_target(payload.knowledge_level, 0.0),
     }
 
 
@@ -6765,13 +6792,18 @@ def feed(
         prefetch = 30
 
     with get_conn() as conn:
-        material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
+        material = fetch_one(conn, "SELECT id, knowledge_level, level_adjustment FROM materials WHERE id = ?", (material_id,))
         if not material:
             # Keep the string detail form so existing deployed clients that
             # substring-match on "material_id not found" continue to work.
             # iOS/web clients should prefer HTTP 404 + this marker over
             # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
+
+        from .services.knowledge_level import effective_level_target as _effective_level_target
+        _mat_knowledge_level = str(material["knowledge_level"] or "beginner")
+        _mat_level_adjustment = float(material["level_adjustment"] or 0.0)
+        _mat_effective_level = _effective_level_target(_mat_knowledge_level, _mat_level_adjustment)
 
         fast_mode = generation_mode == "fast"
         client_requested_slow = generation_mode == "slow"
@@ -6844,6 +6876,8 @@ def feed(
                 "refinement_status": str((refinement_job or {}).get("status") or "") or None,
                 "effective_generation_mode": effective_generation_mode,
                 "generation_mode_overridden": generation_mode_overridden,
+                "knowledge_level": _mat_knowledge_level,
+                "effective_level_target": _mat_effective_level,
             }
         # Cumulative cap: if this material already has MAX_REELS_PER_MATERIAL
         # reels on disk, don't queue another refinement. Stops unbounded
@@ -6900,6 +6934,8 @@ def feed(
         "refinement_status": str((refinement_job or {}).get("status") or "") or None,
         "effective_generation_mode": effective_generation_mode,
         "generation_mode_overridden": generation_mode_overridden,
+        "knowledge_level": _mat_knowledge_level,
+        "effective_level_target": _mat_effective_level,
     }
 
 
