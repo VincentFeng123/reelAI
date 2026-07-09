@@ -576,6 +576,42 @@ class DifficultyPersistenceTests(IngestTopicTests):
             )[0]
         self.assertAlmostEqual(float(row["difficulty"]), 0.8)
 
+    @staticmethod
+    def _no_difficulty_engine_out(*_a, **_kw) -> dict:
+        return {
+            "video_id": "vidAAAAAAAA",
+            "clips": [{
+                "start": 30.0, "end": 75.0, "cut_end": 75.15,
+                "title": "Unscored", "facet": "", "reason": "",
+                "informativeness": 0.9,
+                "sequence_index": 0,
+                "embed_url": "https://www.youtube.com/embed/vidAAAAAAAA?start=30&end=75&rel=0",
+            }],
+            "transcript": {"segments": [
+                {"start": 30.0, "end": 75.0, "text": "here we explain photosynthesis"}
+            ], "words": [], "duration": 600.0},
+            "notes": "",
+        }
+
+    def test_difficulty_absent_stays_null(self) -> None:
+        with _Patched() as (mock_search, mock_run):
+            mock_search.discover.side_effect = (
+                lambda topic, limit, exclude_video_ids=None, **kw: {
+                    "corrected": topic, "videos": [VID_A],
+                    "credits_used": 0, "warning": None,
+                }
+            )
+            mock_run.clip.side_effect = self._no_difficulty_engine_out
+            main_module.ingestion_pipeline.ingest_topic(
+                topic=TOPIC, material_id="mat-nodiff", concept_id="con-nodiff",
+                generation_id="gen-nodiff", max_videos=1,
+            )
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_all(
+                conn, "SELECT difficulty FROM reels WHERE generation_id = ?", ("gen-nodiff",)
+            )[0]
+        self.assertIsNone(row["difficulty"])
+
 
 if __name__ == "__main__":
     unittest.main()
