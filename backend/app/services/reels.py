@@ -7086,6 +7086,46 @@ class ReelService:
     def _concept_mastery(self, helpful: float, confusing: float, avg_rating: float) -> float:
         return 0.25 * helpful - 0.35 * confusing + 0.15 * (avg_rating - 3.0)
 
+    LEVEL_FEEDBACK_WINDOW = 20
+    LEVEL_FEEDBACK_MIN_ROWS = 5
+
+    def update_level_adjustment(self, conn, material_id: str) -> float:
+        """Recompute the material's level drift from its most recent feedback.
+
+        signal = 0.25*helpful_rate - 0.35*confusing_rate + 0.15*(avg_rating-3)/2
+        (same shape as _concept_mastery), clamped to ±ADJUSTMENT_BOUND.
+        Fewer than LEVEL_FEEDBACK_MIN_ROWS rows -> 0 (cold-start gate)."""
+        from .knowledge_level import ADJUSTMENT_BOUND
+
+        rows = fetch_all(
+            conn,
+            """
+            SELECT f.helpful, f.confusing, f.rating
+            FROM reel_feedback f
+            JOIN reels r ON r.id = f.reel_id
+            WHERE r.material_id = ?
+            ORDER BY f.created_at DESC
+            LIMIT ?
+            """,
+            (material_id, self.LEVEL_FEEDBACK_WINDOW),
+        )
+        if len(rows) < self.LEVEL_FEEDBACK_MIN_ROWS:
+            adjustment = 0.0
+        else:
+            n = len(rows)
+            helpful_rate = sum(1 for r in rows if int(r["helpful"] or 0) > 0) / n
+            confusing_rate = sum(1 for r in rows if int(r["confusing"] or 0) > 0) / n
+            ratings = [float(r["rating"]) for r in rows if r["rating"] is not None]
+            avg_rating = (sum(ratings) / len(ratings)) if ratings else 3.0
+            signal = 0.25 * helpful_rate - 0.35 * confusing_rate + 0.15 * (avg_rating - 3.0) / 2.0
+            adjustment = max(-ADJUSTMENT_BOUND, min(ADJUSTMENT_BOUND, signal))
+        execute_modify(
+            conn,
+            "UPDATE materials SET level_adjustment = ? WHERE id = ?",
+            (adjustment, material_id),
+        )
+        return adjustment
+
 
 
 
@@ -7979,6 +8019,12 @@ class ReelService:
             },
             pk="reel_id",
         )
+        try:
+            reel_row = fetch_one(conn, "SELECT material_id FROM reels WHERE id = ?", (reel_id,))
+            if reel_row and reel_row.get("material_id"):
+                self.update_level_adjustment(conn, str(reel_row["material_id"]))
+        except Exception:
+            logger.exception("level adjustment recompute failed for reel %s", reel_id)
 
     def ranked_feed(
         self,
