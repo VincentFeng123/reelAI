@@ -23,7 +23,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from backend.app import db as db_module  # noqa: E402
 from backend.app.config import get_settings  # noqa: E402
 import backend.app.main as main_module  # noqa: E402
-from backend.app.main import app  # noqa: E402
+from backend.app.main import app, COMMUNITY_OWNER_HEADER  # noqa: E402
 
 
 def _fake_concepts(conn, text: str, subject_tag=None, max_concepts: int = 12):
@@ -112,6 +112,19 @@ class KnowledgeLevelApiTests(unittest.TestCase):
                 conn, "SELECT knowledge_level, level_adjustment FROM materials WHERE id = ?", (mid,))
         self.assertEqual(row["knowledge_level"], "advanced")
         self.assertEqual(float(row["level_adjustment"]), 0.0)
+
+    def test_feed_reports_level_fields(self) -> None:
+        created = self.client.post("/api/material",
+                                   data={"subject_tag": "physics", "knowledge_level": "advanced"})
+        mid = created.json()["material_id"]
+        resp = self.client.get(
+            f"/api/feed?material_id={mid}",
+            headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
+        )
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["knowledge_level"], "advanced")
+        self.assertAlmostEqual(body["effective_level_target"], 0.85)
 
     def test_patch_unknown_material_404_and_bad_level_422(self) -> None:
         self.assertEqual(

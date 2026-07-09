@@ -6774,6 +6774,8 @@ def feed(
     target_clip_duration_max_sec: int | None = None,
     exclude_video_ids: str = "",
 ):
+    from .services.knowledge_level import effective_level_target as _effective_level_target
+
     _require_community_client_identity(request)
     _enforce_rate_limit(request, "feed", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
     if page < 1:
@@ -6800,10 +6802,16 @@ def feed(
             # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
 
-        from .services.knowledge_level import effective_level_target as _effective_level_target
-        _mat_knowledge_level = str(material["knowledge_level"] or "beginner")
-        _mat_level_adjustment = float(material["level_adjustment"] or 0.0)
-        _mat_effective_level = _effective_level_target(_mat_knowledge_level, _mat_level_adjustment)
+        try:
+            _mat_knowledge_level = str(material["knowledge_level"] or "beginner")
+            _mat_effective_level = _effective_level_target(
+                _mat_knowledge_level, float(material["level_adjustment"] or 0.0)
+            )
+        except ValueError:
+            # Corrupt stored level: report beginner semantics instead of a 500,
+            # and keep the raw stored string out of the response.
+            _mat_knowledge_level = "beginner"
+            _mat_effective_level = _effective_level_target("beginner", 0.0)
 
         fast_mode = generation_mode == "fast"
         client_requested_slow = generation_mode == "slow"

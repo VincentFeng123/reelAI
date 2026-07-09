@@ -8041,8 +8041,6 @@ class ReelService:
             (material or {}).get("knowledge_level"),
             (material or {}).get("level_adjustment"),
         )
-        self._last_effective_level_target = level_target
-        self._last_knowledge_level = str((material or {}).get("knowledge_level") or "beginner")
 
         reel_where, reel_params = self._reel_scope_where(
             material_id=material_id,
