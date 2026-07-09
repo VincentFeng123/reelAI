@@ -47,3 +47,29 @@ def test_gemini_path_parses_json(monkeypatch):
     assert out["provider_used"] == "gemini"
     assert out["corrected"] == "calculus"
     assert out["queries"][:2] == ["calculus", "derivatives"]
+
+
+def test_expand_level_steering_lines(monkeypatch):
+    from backend.app.clip_engine import expand as ex
+    seen = {}
+
+    def fake_raw(system, user, model):
+        seen["system"] = system
+        return '{"corrected": "physics", "queries": ["physics"]}'
+
+    monkeypatch.setattr(ex.config, "GEMINI_API_KEY", "k")
+    monkeypatch.setattr(ex, "_gemini_expand_raw", fake_raw)
+
+    ex.expand_query("physics", 3, level="beginner")
+    assert "beginner" in seen["system"].lower()
+    assert "introduction to" in seen["system"]
+
+    ex.expand_query("physics", 3, level="advanced")
+    assert "advanced" in seen["system"].lower()
+    assert "graduate" in seen["system"]
+
+    ex.expand_query("physics", 3, level="intermediate")
+    assert "graduate" not in seen["system"] and "for beginners" not in seen["system"]
+
+    ex.expand_query("physics", 3)  # None unchanged
+    assert "graduate" not in seen["system"] and "for beginners" not in seen["system"]

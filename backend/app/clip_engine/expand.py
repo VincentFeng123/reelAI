@@ -89,12 +89,27 @@ def _gemini_expand_raw(system: str, user: str, model: str) -> str:
     return getattr(resp, "text", "") or ""
 
 
-def expand_query(topic: str, n: int) -> dict:
+_LEVEL_LINES = {
+    "beginner": (
+        " The viewer is a BEGINNER on this topic: prefer phrasings like "
+        "'introduction to X', 'X basics', 'X for beginners', 'X crash course'; "
+        "avoid graduate-level or research phrasings."
+    ),
+    "advanced": (
+        " The viewer is ADVANCED on this topic: prefer phrasings like "
+        "'advanced X', 'graduate X lecture', 'X deep dive', 'X seminar'; "
+        "avoid 'for beginners' phrasings."
+    ),
+}
+
+
+def expand_query(topic: str, n: int, level: str | None = None) -> dict:
     topic = topic.strip()
+    system = _SYSTEM + _LEVEL_LINES.get((level or "").strip().lower(), "")
     if not config.GEMINI_API_KEY:
         return free_expand(topic, n)
     try:
-        raw = _gemini_expand_raw(_SYSTEM, _user(topic, n), config.EXPAND_MODEL)
+        raw = _gemini_expand_raw(system, _user(topic, n), config.EXPAND_MODEL)
         parsed = _safe_json(raw)
         if parsed:
             return {"corrected": parsed.get("corrected") or topic,
