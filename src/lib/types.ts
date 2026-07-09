@@ -102,6 +102,8 @@ export type FeedResponse = {
   response_profile?: string | null;
   refinement_job_id?: string | null;
   refinement_status?: string | null;
+  knowledge_level?: string | null;
+  effective_level_target?: number | null;
 };
 
 export type RefinementStatusResponse = {

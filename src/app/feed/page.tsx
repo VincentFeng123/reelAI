@@ -20,6 +20,7 @@ import {
   queueCommunityHistorySync,
   readCommunityAuthSession,
   sendFeedback,
+  updateMaterialLevel,
   uploadMaterial,
 } from "@/lib/api";
 import { applySearchFeedSettingsToParams, mergeSearchFeedQuerySettings, readSearchFeedQuerySettings } from "@/lib/feedQuery";
@@ -865,6 +866,7 @@ function FeedPageInner() {
   const [rightPanelWidthPx, setRightPanelWidthPx] = useState(360);
   const [rightTopRatio, setRightTopRatio] = useState(0.62);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
+  const [knowledgeLevel, setKnowledgeLevel] = useState<string | null>(null);
   const [sessionHydrated, setSessionHydrated] = useState(false);
   const [initialFeedScreenReady, setInitialFeedScreenReady] = useState(false);
   const [authAccountId, setAuthAccountId] = useState<string | null>(null);
@@ -1775,6 +1777,10 @@ function FeedPageInner() {
         setPage(targetPage);
         if (targetPage === 1) {
           setTotal(Math.max(fetchedTotal, merged.reels.length));
+          const firstLevel = successful[0]?.data?.knowledge_level;
+          if (firstLevel && typeof firstLevel === "string") {
+            setKnowledgeLevel(firstLevel);
+          }
         } else {
           setTotal((prevTotal) => Math.max(prevTotal, fetchedTotal, merged.reels.length));
         }
@@ -3502,6 +3508,21 @@ function FeedPageInner() {
     router.push(feedFallbackPath);
   }, [abortActiveSearchScope, feedFallbackPath, returnTabParam, router]);
 
+  const cycleLevel = useCallback(async () => {
+    if (!materialId || !knowledgeLevel) {
+      return;
+    }
+    const order = ["beginner", "intermediate", "advanced"] as const;
+    const next = order[(order.indexOf(knowledgeLevel as typeof order[number]) + 1) % order.length];
+    try {
+      const updated = await updateMaterialLevel({ materialId, knowledgeLevel: next });
+      setKnowledgeLevel(updated.knowledge_level);
+      void loadPage(1, { autofill: true });
+    } catch {
+      // Silently ignore — level display stays at current value.
+    }
+  }, [knowledgeLevel, loadPage, materialId]);
+
   if (!materialId && !communityPreviewReel && invalidCommunityHandoff) {
     return (
       <main className="fixed inset-0 px-6 md:inset-4">
@@ -3552,6 +3573,16 @@ function FeedPageInner() {
       >
         <i className="fa-solid fa-arrow-left text-xs" aria-hidden="true" />
       </button>
+      {knowledgeLevel && materialId ? (
+        <button
+          type="button"
+          onClick={() => void cycleLevel()}
+          className="absolute left-14 top-3 z-[9999] flex h-9 items-center rounded-xl border border-white/20 bg-black/50 px-3 text-xs font-semibold text-white shadow-[0_8px_24px_rgba(0,0,0,0.35)] backdrop-blur-md transition opacity-80 hover:opacity-100"
+          title="Tap to change your level for this topic"
+        >
+          {knowledgeLevel.charAt(0).toUpperCase() + knowledgeLevel.slice(1)} · auto-adjusting
+        </button>
+      ) : null}
       {error ? (
         <div className="absolute left-0 right-0 top-3 z-[2147483647] mx-auto w-fit">
           <div className="relative overflow-hidden rounded-xl border border-gray-300/45 bg-white/10 px-4 py-2 text-xs text-white shadow-[0_12px_28px_rgba(0,0,0,0.35)] backdrop-blur-xl backdrop-saturate-150">

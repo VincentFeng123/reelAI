@@ -263,6 +263,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
   const touchStartYRef = useRef<number | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
   const [topics, setTopics] = useState<string[]>([""]);
+  const [knowledgeLevel, setKnowledgeLevel] = useState<"beginner" | "intermediate" | "advanced">("beginner");
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | undefined>();
   const [reelUrl, setReelUrl] = useState("");
@@ -403,7 +404,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         // must not orphan successfully-created materials for the others —
         // Promise.all rejects the whole batch and would do exactly that.
         const settled = await Promise.allSettled(
-          topicList.map((topic) => uploadMaterial({ subjectTag: topic })),
+          topicList.map((topic) => uploadMaterial({ subjectTag: topic, knowledgeLevel })),
         );
         const succeededIds = settled
           .map((result) =>
@@ -431,6 +432,7 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
           text: textValue || undefined,
           file: fileValue,
           subjectTag: topicValue || undefined,
+          knowledgeLevel: inputMode === "topic" ? knowledgeLevel : undefined,
         });
         materialIds = [material.material_id];
       }
@@ -774,6 +776,27 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
           </>
         ) : null}
       </div>
+
+      {inputMode === "topic" ? (
+        <div className="relative z-20 mt-3 flex gap-2" role="radiogroup" aria-label="How well do you know this topic?">
+          {(["beginner", "intermediate", "advanced"] as const).map((level) => (
+            <button
+              key={level}
+              type="button"
+              role="radio"
+              aria-checked={knowledgeLevel === level}
+              onClick={() => setKnowledgeLevel(level)}
+              className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition-colors duration-200 ${
+                knowledgeLevel === level
+                  ? "bg-white text-black"
+                  : "border border-white/15 bg-white/[0.08] text-white/70 hover:text-white"
+              }`}
+            >
+              {level.charAt(0).toUpperCase() + level.slice(1)}
+            </button>
+          ))}
+        </div>
+      ) : null}
 
       <div className="relative z-20 mt-6 shrink-0 flex flex-col gap-2 md:mt-6">
         <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>

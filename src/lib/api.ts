@@ -706,6 +706,7 @@ export async function uploadMaterial(params: {
   text?: string;
   file?: File;
   subjectTag?: string;
+  knowledgeLevel?: "beginner" | "intermediate" | "advanced";
   signal?: AbortSignal;
 }): Promise<MaterialResponse> {
   const form = new FormData();
@@ -718,6 +719,9 @@ export async function uploadMaterial(params: {
   if (params.subjectTag) {
     form.append("subject_tag", params.subjectTag);
   }
+  if (params.knowledgeLevel) {
+    form.append("knowledge_level", params.knowledgeLevel);
+  }
 
   const res = await safeFetch(apiUrl("/material"), {
     method: "POST",
@@ -725,6 +729,21 @@ export async function uploadMaterial(params: {
     signal: params.signal,
   });
   return parseJsonResponse<MaterialResponse>(res);
+}
+
+export async function updateMaterialLevel(params: {
+  materialId: string;
+  knowledgeLevel: "beginner" | "intermediate" | "advanced";
+}): Promise<{ knowledge_level: string; effective_level_target: number }> {
+  const res = await safeFetch(apiUrl(`/materials/${encodeURIComponent(params.materialId)}/level`), {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityOwnerHeaders(),
+    },
+    body: JSON.stringify({ knowledge_level: params.knowledgeLevel }),
+  });
+  return parseJsonResponse<{ knowledge_level: string; effective_level_target: number }>(res);
 }
 
 type GenerateReelsParams = {
