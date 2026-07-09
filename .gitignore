@@ -30,3 +30,8 @@ audit_work/
 audit_*.log
 audit_smoke*.csv
 audit_smoke*.md
+
+# session scratch + user uploads (never commit)
+.superpowers/
+data/uploads/
+tsconfig.tsbuildinfo
