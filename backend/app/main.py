@@ -155,14 +155,11 @@ async def lifespan(app_instance):
     init_db()
     _resume_pending_refinement_jobs()
     _warn_if_hosted_auth_email_is_unconfigured()
-    # A2: eagerly warm the punctuation-restoration pipeline so the first
-    # user-facing search doesn't pay the 3-5s model-load cost. Failure is
-    # non-fatal — the sentinel in ReelService flips to False and subsequent
-    # ingests fall back to pause-boundary segmentation.
-    try:
-        ReelService.warm_punct_pipeline()
-    except Exception:
-        logger.exception("punct pipeline warmup raised; continuing without it")
+    # The punctuation-restoration pipeline is NOT warmed here anymore: the
+    # gemini clip engine never punctuates, and the only consumer chain
+    # (_create_reel -> _trim_structural_edges_from_clip) has no callers since
+    # the engine swap. Eager-loading its ~2.5GB model tripled idle RSS for
+    # nothing; ReelService._get_punct_pipeline still lazy-loads if ever used.
     yield
 
 app = FastAPI(title="StudyReels API", version="0.1.0", lifespan=lifespan)
