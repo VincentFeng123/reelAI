@@ -867,6 +867,7 @@ function FeedPageInner() {
   const [rightTopRatio, setRightTopRatio] = useState(0.62);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
   const [knowledgeLevel, setKnowledgeLevel] = useState<string | null>(null);
+  const cycleLevelInFlightRef = useRef(false);
   const [sessionHydrated, setSessionHydrated] = useState(false);
   const [initialFeedScreenReady, setInitialFeedScreenReady] = useState(false);
   const [authAccountId, setAuthAccountId] = useState<string | null>(null);
@@ -1780,6 +1781,8 @@ function FeedPageInner() {
           const firstLevel = successful[0]?.data?.knowledge_level;
           if (firstLevel && typeof firstLevel === "string") {
             setKnowledgeLevel(firstLevel);
+          } else {
+            setKnowledgeLevel(null);
           }
         } else {
           setTotal((prevTotal) => Math.max(prevTotal, fetchedTotal, merged.reels.length));
@@ -2093,6 +2096,7 @@ function FeedPageInner() {
       setMobileDetailsOpen(false);
       setBootstrappingFirstReels(false);
       setGeneratingMore(false);
+      setKnowledgeLevel(null);
       zeroProgressAttemptCountRef.current = 0;
       bootstrapAttemptedRef.current = false;
       pendingAutoplayAdvanceRef.current = false;
@@ -2110,6 +2114,7 @@ function FeedPageInner() {
     }
     hydratedMaterialIdRef.current = materialId;
     setSessionHydrated(false);
+    setKnowledgeLevel(null);
     let resumeTarget: FeedProgressEntry | null = null;
     let restoredSession: FeedSessionSnapshot | null = null;
     let feedMaterialIds = [materialId];
@@ -3509,17 +3514,20 @@ function FeedPageInner() {
   }, [abortActiveSearchScope, feedFallbackPath, returnTabParam, router]);
 
   const cycleLevel = useCallback(async () => {
-    if (!materialId || !knowledgeLevel) {
+    if (!materialId || !knowledgeLevel || cycleLevelInFlightRef.current) {
       return;
     }
+    cycleLevelInFlightRef.current = true;
     const order = ["beginner", "intermediate", "advanced"] as const;
     const next = order[(order.indexOf(knowledgeLevel as typeof order[number]) + 1) % order.length];
     try {
       const updated = await updateMaterialLevel({ materialId, knowledgeLevel: next });
       setKnowledgeLevel(updated.knowledge_level);
-      void loadPage(1, { autofill: true });
+      await loadPage(1, { autofill: true });
     } catch {
       // Silently ignore — level display stays at current value.
+    } finally {
+      cycleLevelInFlightRef.current = false;
     }
   }, [knowledgeLevel, loadPage, materialId]);
 
@@ -3577,6 +3585,7 @@ function FeedPageInner() {
         <button
           type="button"
           onClick={() => void cycleLevel()}
+          aria-label="Change knowledge level"
           className="absolute left-14 top-3 z-[9999] flex h-9 items-center rounded-xl border border-white/20 bg-black/50 px-3 text-xs font-semibold text-white shadow-[0_8px_24px_rgba(0,0,0,0.35)] backdrop-blur-md transition opacity-80 hover:opacity-100"
           title="Tap to change your level for this topic"
         >
