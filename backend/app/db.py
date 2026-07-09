@@ -63,6 +63,8 @@ PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS materials (
     id TEXT PRIMARY KEY,
     subject_tag TEXT,
+    knowledge_level TEXT NOT NULL DEFAULT 'beginner',
+    level_adjustment REAL NOT NULL DEFAULT 0.0,
     raw_text TEXT NOT NULL,
     source_type TEXT NOT NULL,
     source_path TEXT,
@@ -189,6 +191,7 @@ CREATE TABLE IF NOT EXISTS reels (
     transcript_snippet TEXT NOT NULL,
     takeaways_json TEXT NOT NULL,
     base_score REAL NOT NULL,
+    difficulty REAL,
     created_at TEXT NOT NULL,
     FOREIGN KEY(material_id) REFERENCES materials(id),
     FOREIGN KEY(concept_id) REFERENCES concepts(id),
@@ -756,6 +759,23 @@ def _migrate_reels_unique_clip_index_postgres(conn: Any) -> None:
         )
 
 
+def _migrate_knowledge_level_sqlite(conn: sqlite3.Connection) -> None:
+    """Add knowledge-level columns to pre-existing DBs (sqlite lacks
+    ADD COLUMN IF NOT EXISTS)."""
+    material_cols = {r[1] for r in conn.execute("PRAGMA table_info(materials)").fetchall()}
+    if "knowledge_level" not in material_cols:
+        conn.execute(
+            "ALTER TABLE materials ADD COLUMN knowledge_level TEXT NOT NULL DEFAULT 'beginner'"
+        )
+    if "level_adjustment" not in material_cols:
+        conn.execute(
+            "ALTER TABLE materials ADD COLUMN level_adjustment REAL NOT NULL DEFAULT 0.0"
+        )
+    reel_cols = {r[1] for r in conn.execute("PRAGMA table_info(reels)").fetchall()}
+    if "difficulty" not in reel_cols:
+        conn.execute("ALTER TABLE reels ADD COLUMN difficulty REAL")
+
+
 def _ensure_reels_generation_index_sqlite(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reels_generation_id ON reels(generation_id)")
 
@@ -889,6 +909,9 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE transcript_cache ADD COLUMN IF NOT EXISTS quality_rejection_reason TEXT")
                 cur.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS provider TEXT DEFAULT 'youtube'")
                 cur.execute("ALTER TABLE videos ADD COLUMN IF NOT EXISTS playback_url TEXT")
+                cur.execute("ALTER TABLE materials ADD COLUMN IF NOT EXISTS knowledge_level TEXT NOT NULL DEFAULT 'beginner'")
+                cur.execute("ALTER TABLE materials ADD COLUMN IF NOT EXISTS level_adjustment REAL NOT NULL DEFAULT 0.0")
+                cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS difficulty REAL")
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             conn.commit()
@@ -1074,6 +1097,7 @@ def init_db() -> None:
             except sqlite3.OperationalError:
                 pass
         _migrate_reels_unique_clip_index_sqlite(conn)
+        _migrate_knowledge_level_sqlite(conn)
         _migrate_reel_feedback_uniqueness_sqlite(conn)
         conn.commit()
     finally:
