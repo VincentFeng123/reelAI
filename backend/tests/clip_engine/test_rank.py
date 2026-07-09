@@ -78,7 +78,11 @@ def test_level_score_bands():
 def test_level_score_clamped():
     from backend.app.clip_engine.rank import _level_score
     stacked = {"title": "intro introduction basics beginner 101 crash course", "channel": ""}
-    assert _level_score(stacked, "beginner") <= 2.0
+    assert -2.0 <= _level_score(stacked, "beginner") <= 2.0
+    # Lower bound: a title stacked with advanced terms scored against "beginner"
+    # accumulates opposite-band misses and must clamp at -2.0.
+    stacked_adv = {"title": "advanced graduate seminar research proofs lecture 101", "channel": ""}
+    assert _level_score(stacked_adv, "beginner") >= -2.0
 
 
 def test_merge_and_rank_level_reorders_within_match_band():
@@ -91,3 +95,7 @@ def test_merge_and_rank_level_reorders_within_match_band():
     assert [v["id"] for v in ranked][0] == "beg"
     ranked_none = merge_and_rank(per_query)  # level omitted -> original behavior
     assert len(ranked_none) == 2
+    # Without a level, "adv" wins deterministically: equal match_count/viewCount
+    # and both edu_score 0, but "adv" sits at list index 0 so its best_rank
+    # gives rank_score 1.0 (vs 0.5) -> score ~14.04 vs ~13.04.
+    assert ranked_none[0]["id"] == "adv"
