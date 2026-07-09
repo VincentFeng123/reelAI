@@ -37,6 +37,7 @@ class _Topic(BaseModel):
     facet: str = "other"
     kind: str = "content"      # content|intro|outro|admin|promo — only content ships
     informativeness: float = 0.5  # 0..1, how much a motivated student learns
+    difficulty: float = 0.5   # 0 = assumes no prior knowledge, 1 = expert-level
 
 
 # Segment kinds that never ship (structural/filler, not teaching). Includes
@@ -87,7 +88,9 @@ def _prompts(lines: str, n: int, topic: str = "") -> "tuple[str, str]":
         "start, copied verbatim from that line); end_quote (the last ~6 words, verbatim); a "
         "short reason; kind — one of content|intro|outro|admin|promo (only 'content' ships); "
         "informativeness — 0.0 to 1.0, how much a motivated student learns from this clip "
-        "ALONE (0.9+: a complete idea taught well; ~0.5: partial value; <0.5: little value). "
+        "ALONE (0.9+: a complete idea taught well; ~0.5: partial value; <0.5: little value); "
+        "difficulty — 0.0 to 1.0, the prior knowledge the clip ASSUMES (0.1: no background, "
+        "first exposure; 0.5: comfortable with the basics; 0.9: graduate/expert material). "
         "Rules: (1) a clip must START at the beginning of the idea and END at its end — "
         "never mid-thought; (2) clips must NOT overlap — each line belongs to at most one "
         "clip; (3) go in chronological order; (4) prefer TIGHT clips of roughly 20-70 "
@@ -97,7 +100,7 @@ def _prompts(lines: str, n: int, topic: str = "") -> "tuple[str, str]":
     user = (
         f"Transcript ({n} lines, each formatted `[index] MM:SS text`):\n\n" + lines +
         "\n\nReturn every substantive teaching clip as {title, start_line, end_line, "
-        "start_quote, end_quote, reason, facet, kind, informativeness}."
+        "start_quote, end_quote, reason, facet, kind, informativeness, difficulty}."
     )
     return system, user
 
@@ -178,7 +181,8 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
                     "title": (tp.title or "").strip(),
                     "facet": (tp.facet or "other").strip() or "other",
                     "reason": (tp.reason or "").strip(),
-                    "informativeness": info})
+                    "informativeness": info,
+                    "difficulty": _norm_informativeness(tp.difficulty)})
 
     raw.sort(key=lambda c: (c["start"], c["end"]))
     # deterministic overlap trim: each clip starts strictly after the previous clip's end
