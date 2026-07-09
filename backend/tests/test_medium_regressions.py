@@ -31,7 +31,9 @@ class MediumRegressionTests(unittest.TestCase):
             CREATE TABLE materials (
                 id TEXT PRIMARY KEY,
                 subject_tag TEXT,
-                source_type TEXT
+                source_type TEXT,
+                knowledge_level TEXT NOT NULL DEFAULT 'beginner',
+                level_adjustment REAL NOT NULL DEFAULT 0.0
             );
 
             CREATE TABLE reel_generations (
@@ -129,6 +131,7 @@ class MediumRegressionTests(unittest.TestCase):
                 transcript_snippet TEXT NOT NULL DEFAULT '',
                 takeaways_json TEXT NOT NULL DEFAULT '[]',
                 base_score REAL NOT NULL DEFAULT 0,
+                difficulty REAL,
                 created_at TEXT NOT NULL DEFAULT ''
             );
             """
