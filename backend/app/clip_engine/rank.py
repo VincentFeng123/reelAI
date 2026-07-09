@@ -47,6 +47,45 @@ def _edu_score(v: dict) -> float:
     return max(-3.0, min(3.0, boost - penalty))
 
 
+# -- Knowledge-level ranking signal ------------------------------------------ #
+# +1.0 per distinct hit matching the viewer's band, -1.0 per hit in the
+# opposite band, clamped to ±2.0. Added to `score` only — the
+# (match_count, score, view_count) sort-key structure stays unchanged,
+# same convention as _edu_score.
+
+_BEGINNER_BAND = [
+    re.compile(r'\bintro(?:duction)?\b', re.I),
+    re.compile(r'\bbasics\b', re.I),
+    re.compile(r'\bbeginners?\b', re.I),
+    re.compile(r'\b101\b'),
+    re.compile(r'\bcrash\s+course\b', re.I),
+    re.compile(r'\bfor\s+dummies\b', re.I),
+]
+
+_ADVANCED_BAND = [
+    re.compile(r'\badvanced\b', re.I),
+    re.compile(r'\bgraduate\b', re.I),
+    re.compile(r'\bseminar\b', re.I),
+    re.compile(r'\bresearch\b', re.I),
+    re.compile(r'\bproofs?\b', re.I),
+    re.compile(r'\blecture\s+\d{2,3}\b', re.I),
+]
+
+
+def _level_score(v: dict, level: str | None) -> float:
+    lvl = (level or "").strip().lower()
+    if lvl == "beginner":
+        match_band, opposite_band = _BEGINNER_BAND, _ADVANCED_BAND
+    elif lvl == "advanced":
+        match_band, opposite_band = _ADVANCED_BAND, _BEGINNER_BAND
+    else:
+        return 0.0
+    text = f"{v.get('title', '')} {_channel_name(v)}"
+    hits = sum(1.0 for p in match_band if p.search(text))
+    misses = sum(1.0 for p in opposite_band if p.search(text))
+    return max(-2.0, min(2.0, hits - misses))
+
+
 def _channel_name(v: dict) -> str:
     ch = v.get("channel")
     if isinstance(ch, dict):
@@ -54,7 +93,7 @@ def _channel_name(v: dict) -> str:
     return ch or ""
 
 
-def merge_and_rank(per_query: list[dict]) -> list[dict]:
+def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict]:
     by_id: dict[str, dict] = {}
     for res in per_query or []:
         for rank, v in enumerate(res.get("videos") or []):
@@ -90,7 +129,7 @@ def merge_and_rank(per_query: list[dict]) -> list[dict]:
         rank_score = 1 / (1 + v["best_rank"])
         edu = _edu_score(v)
         v["edu_score"] = edu
-        v["score"] = v["match_count"] * 10 + view_score + rank_score * 2 + edu
+        v["score"] = v["match_count"] * 10 + view_score + rank_score * 2 + edu + _level_score(v, level)
     items.sort(key=lambda v: (v["match_count"], v["score"], v["view_count"]), reverse=True)
     for v in items:
         v.pop("best_rank", None)

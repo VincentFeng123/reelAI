@@ -61,3 +61,33 @@ def test_educational_ranking_and_bounds():
     assert ranked_cross[0]["id"] == "two_match", "match_count wins over edu_score"
     assert ranked_cross[0]["match_count"] == 2
     assert ranked_cross[1]["match_count"] == 1
+
+
+def test_level_score_bands():
+    from backend.app.clip_engine.rank import _level_score
+    intro = {"title": "Introduction to Physics 101", "channel": ""}
+    grad = {"title": "Graduate Physics Seminar", "channel": ""}
+    assert _level_score(intro, "beginner") > 0
+    assert _level_score(grad, "beginner") < 0
+    assert _level_score(grad, "advanced") > 0
+    assert _level_score(intro, "advanced") < 0
+    assert _level_score(intro, None) == 0.0
+    assert _level_score(intro, "intermediate") == 0.0
+
+
+def test_level_score_clamped():
+    from backend.app.clip_engine.rank import _level_score
+    stacked = {"title": "intro introduction basics beginner 101 crash course", "channel": ""}
+    assert _level_score(stacked, "beginner") <= 2.0
+
+
+def test_merge_and_rank_level_reorders_within_match_band():
+    from backend.app.clip_engine.rank import merge_and_rank
+    per_query = [{"videos": [
+        {"id": "adv", "title": "Graduate Physics Seminar", "viewCount": 100},
+        {"id": "beg", "title": "Physics for Beginners", "viewCount": 100},
+    ]}]
+    ranked = merge_and_rank(per_query, level="beginner")
+    assert [v["id"] for v in ranked][0] == "beg"
+    ranked_none = merge_and_rank(per_query)  # level omitted -> original behavior
+    assert len(ranked_none) == 2
