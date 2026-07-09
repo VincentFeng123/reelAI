@@ -832,6 +832,9 @@ class IngestionPipeline:
             target_max=target_max,
             generation_id=generation_id,
             clip_title=str(clip.get("title") or "").strip(),
+            clip_difficulty=(
+                None if clip.get("difficulty") is None else float(clip["difficulty"])
+            ),
         )
         return reel, metadata
 
@@ -849,6 +852,7 @@ class IngestionPipeline:
         target_max: int,
         generation_id: str | None = None,
         clip_title: str = "",
+        clip_difficulty: float | None = None,
     ) -> ReelOutWithAttribution:
         clip_start, clip_end = clip_window
         from .persistence import build_video_id  # local import to avoid cycle surprises
@@ -912,6 +916,7 @@ class IngestionPipeline:
                 takeaways=takeaways,
                 base_score=float(chosen.score),
                 generation_id=generation_id,
+                difficulty=clip_difficulty,
             )
 
             if not inserted:

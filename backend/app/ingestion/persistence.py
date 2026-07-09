@@ -205,6 +205,7 @@ def upsert_reel_row(
     takeaways: list[str],
     base_score: float = 1.0,
     generation_id: str | None = None,
+    difficulty: float | None = None,
 ) -> bool:
     """
     Insert a reel row. Returns True on success, False if the unique index rejected a
@@ -222,6 +223,7 @@ def upsert_reel_row(
         "transcript_snippet": transcript_snippet[:7000],
         "takeaways_json": dumps_json(list(takeaways or [])),
         "base_score": float(base_score),
+        "difficulty": difficulty,
         "created_at": now_iso(),
     }
     try:
