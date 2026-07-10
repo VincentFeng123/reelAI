@@ -112,9 +112,11 @@ def expand_query(topic: str, n: int, level: str | None = None) -> dict:
         raw = _gemini_expand_raw(system, _user(topic, n), config.EXPAND_MODEL)
         parsed = _safe_json(raw)
         if parsed:
-            return {"corrected": parsed.get("corrected") or topic,
-                    "queries": _normalize(parsed.get("corrected"), parsed.get("queries"), topic, n),
-                    "provider_used": "gemini"}
+            corrected = parsed.get("corrected") or topic
+            queries = _normalize(corrected, parsed.get("queries"), topic, n)
+            if len(queries) < n:
+                queries = _normalize(corrected, [*queries, *free_expand(corrected, n)["queries"]], topic, n)
+            return {"corrected": corrected, "queries": queries, "provider_used": "gemini"}
     except Exception:
         pass
     return free_expand(topic, n)

@@ -15,9 +15,8 @@ LEVEL_VALUES: dict[str, float] = {
     "advanced": 0.85,
 }
 
-# Auto-adjust drift can never exceed one level step; the user's explicit
-# choice stays authoritative.
-ADJUSTMENT_BOUND: float = 0.35
+# Learner-global drift is deliberately smaller than a level step.
+ADJUSTMENT_BOUND: float = 0.20
 
 
 def normalize_knowledge_level(value: str | None) -> str:

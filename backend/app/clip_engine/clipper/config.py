@@ -16,6 +16,7 @@ SEGMENT_FINE_SNAP = _engine.SEGMENT_FINE_SNAP
 SEGMENT_MIN_CLIP_S = _engine.SEGMENT_MIN_CLIP_S
 SEGMENT_MAX_CLIP_S = _engine.SEGMENT_MAX_CLIP_S
 SEGMENT_INFORMATIVENESS_MIN = _engine.SEGMENT_INFORMATIVENESS_MIN
+SEGMENT_TOPIC_RELEVANCE_MIN = _engine.SEGMENT_TOPIC_RELEVANCE_MIN
 SEGMENT_MAX_CLIPS = _engine.SEGMENT_MAX_CLIPS
 SEGMENT_MAX_OUTPUT_TOKENS = _engine.SEGMENT_MAX_OUTPUT_TOKENS
 GEMINI_MODEL = _engine.GEMINI_MODEL
@@ -26,7 +27,7 @@ SUPADATA_BASE = _engine.SUPADATA_BASE
 # ── LLM provider ──────────────────────────────────────────────────────────────
 LLM_PROVIDER = "gemini"
 CHARS_PER_TOKEN = 4
-DEFAULTS = {"tail_pad_s": _engine.TAIL_PAD_S, "lead_pad_s": 0.06}
+DEFAULTS = {"lead_pad_s": 0.06}
 SUPADATA_CHUNK_SIZE = 180
 
 # ── Token budgeting ────────────────────────────────────────────────────────────

@@ -84,7 +84,7 @@ def synth_adapter_result(video_id: str, source_url: str) -> AdapterResult:
 
 def to_segment(clip: dict, transcript: dict) -> IngestSegment:
     """Build IngestSegment from a clip dict; text is in-window transcript or clip title."""
-    t0, t1 = clip["start"], clip["end"]
+    t0, t1 = round(float(clip["start"]), 3), round(float(clip["end"]), 3)
     text = window_text(transcript, t0, t1) or clip.get("title", "")
     return IngestSegment(
         t_start=t0,

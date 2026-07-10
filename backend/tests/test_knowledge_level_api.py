@@ -19,6 +19,7 @@ os.environ.setdefault("REELAI_INGEST_SKIP_IMPORT_SWEEP", "1")
 import numpy as np  # noqa: E402
 
 from fastapi.testclient import TestClient  # noqa: E402
+from starlette.requests import Request  # noqa: E402
 
 from backend.app import db as db_module  # noqa: E402
 from backend.app.config import get_settings  # noqa: E402
@@ -38,6 +39,8 @@ def _fake_embed(conn, texts):
 
 
 class KnowledgeLevelApiTests(unittest.TestCase):
+    OWNER = "owner-key-abcdefghijklmnopqrstuvwxyz"
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
@@ -97,21 +100,40 @@ class KnowledgeLevelApiTests(unittest.TestCase):
         self.assertEqual(bad.status_code, 422)
 
     def test_patch_level_updates_and_resets_adjustment(self) -> None:
-        created = self.client.post("/api/material", data={"subject_tag": "physics"})
+        headers = {COMMUNITY_OWNER_HEADER: self.OWNER}
+        created = self.client.post(
+            "/api/material", data={"subject_tag": "physics"}, headers=headers
+        )
         mid = created.json()["material_id"]
         with db_module.get_conn(transactional=True) as conn:
             conn.execute("UPDATE materials SET level_adjustment = 0.3 WHERE id = ?", (mid,))
+            conn.execute(
+                "UPDATE learner_material_progress SET global_adjustment = 0.18 "
+                "WHERE material_id = ?",
+                (mid,),
+            )
         resp = self.client.patch(f"/api/materials/{mid}/level",
-                                 json={"knowledge_level": "advanced"})
+                                 json={"knowledge_level": "advanced"}, headers=headers)
         self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()
         self.assertEqual(body["knowledge_level"], "advanced")
         self.assertAlmostEqual(body["effective_level_target"], 0.85)
         with db_module.get_conn() as conn:
-            row = db_module.fetch_one(
+            material = db_module.fetch_one(
                 conn, "SELECT knowledge_level, level_adjustment FROM materials WHERE id = ?", (mid,))
-        self.assertEqual(row["knowledge_level"], "advanced")
-        self.assertEqual(float(row["level_adjustment"]), 0.0)
+            progress = db_module.fetch_one(
+                conn,
+                "SELECT selected_level, global_adjustment, difficulty_reset_at, feedback_revision "
+                "FROM learner_material_progress WHERE material_id = ?",
+                (mid,),
+            )
+        # Material columns remain legacy defaults; the learner row owns new changes.
+        self.assertEqual(material["knowledge_level"], "beginner")
+        self.assertEqual(float(material["level_adjustment"]), 0.3)
+        self.assertEqual(progress["selected_level"], "advanced")
+        self.assertEqual(float(progress["global_adjustment"]), 0.0)
+        self.assertTrue(progress["difficulty_reset_at"])
+        self.assertEqual(int(progress["feedback_revision"]), 1)
 
     def test_feed_reports_level_fields(self) -> None:
         created = self.client.post("/api/material",
@@ -119,12 +141,118 @@ class KnowledgeLevelApiTests(unittest.TestCase):
         mid = created.json()["material_id"]
         resp = self.client.get(
             f"/api/feed?material_id={mid}",
-            headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
+            headers={COMMUNITY_OWNER_HEADER: self.OWNER},
         )
         self.assertEqual(resp.status_code, 200, resp.text)
         body = resp.json()
         self.assertEqual(body["knowledge_level"], "advanced")
         self.assertAlmostEqual(body["effective_level_target"], 0.85)
+
+    def test_levels_are_isolated_by_anonymous_owner(self) -> None:
+        owner_a = {COMMUNITY_OWNER_HEADER: self.OWNER}
+        owner_b = {COMMUNITY_OWNER_HEADER: "another-owner-key-abcdefghijklmnopqrstuvwxyz"}
+        created = self.client.post(
+            "/api/material",
+            data={"subject_tag": "physics", "knowledge_level": "intermediate"},
+            headers=owner_a,
+        )
+        mid = created.json()["material_id"]
+        changed = self.client.patch(
+            f"/api/materials/{mid}/level",
+            json={"knowledge_level": "advanced"},
+            headers=owner_a,
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+
+        feed_a = self.client.get(f"/api/feed?material_id={mid}", headers=owner_a)
+        feed_b = self.client.get(f"/api/feed?material_id={mid}", headers=owner_b)
+        self.assertEqual(feed_a.status_code, 200, feed_a.text)
+        self.assertEqual(feed_b.status_code, 200, feed_b.text)
+        self.assertEqual(feed_a.json()["knowledge_level"], "advanced")
+        self.assertEqual(feed_b.json()["knowledge_level"], "intermediate")
+
+    def test_authenticated_account_identity_takes_precedence_over_owner(self) -> None:
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": "/",
+                "headers": [
+                    (COMMUNITY_OWNER_HEADER.lower().encode(), self.OWNER.encode()),
+                ],
+            }
+        )
+        with (
+            db_module.get_conn() as conn,
+            mock.patch.object(
+                main_module, "_try_get_community_account", return_value={"id": "account-1"}
+            ),
+        ):
+            learner_id = main_module._resolve_learner_identity(conn, request)
+        self.assertEqual(learner_id, "account:account-1")
+
+    def test_feedback_is_unique_per_learner_and_reel(self) -> None:
+        created = self.client.post(
+            "/api/material", data={"subject_tag": "physics"},
+            headers={COMMUNITY_OWNER_HEADER: self.OWNER},
+        )
+        mid = created.json()["material_id"]
+        reel_id = "shared-feedback-reel"
+        with db_module.get_conn(transactional=True) as conn:
+            concept = db_module.fetch_one(
+                conn, "SELECT id FROM concepts WHERE material_id = ? LIMIT 1", (mid,)
+            )
+            db_module.upsert(
+                conn,
+                "videos",
+                {
+                    "id": "shared-video",
+                    "title": "Shared video",
+                    "channel_title": "Teacher",
+                    "duration_sec": 120,
+                    "created_at": db_module.now_iso(),
+                },
+            )
+            db_module.upsert(
+                conn,
+                "reels",
+                {
+                    "id": reel_id,
+                    "material_id": mid,
+                    "concept_id": concept["id"],
+                    "video_id": "shared-video",
+                    "video_url": "https://youtu.be/shared-video",
+                    "t_start": 1.0,
+                    "t_end": 21.0,
+                    "transcript_snippet": "A complete explanation.",
+                    "takeaways_json": "[]",
+                    "base_score": 1.0,
+                    "created_at": db_module.now_iso(),
+                },
+            )
+        owner_a = {COMMUNITY_OWNER_HEADER: self.OWNER}
+        owner_b = {COMMUNITY_OWNER_HEADER: "another-owner-key-abcdefghijklmnopqrstuvwxyz"}
+        got_it = self.client.post(
+            "/api/reels/feedback",
+            json={"reel_id": reel_id, "helpful": True, "confusing": False, "rating": 5, "saved": True},
+            headers=owner_a,
+        )
+        need_help = self.client.post(
+            "/api/reels/feedback",
+            json={"reel_id": reel_id, "helpful": False, "confusing": True, "rating": 2, "saved": False},
+            headers=owner_b,
+        )
+        self.assertEqual(got_it.status_code, 200, got_it.text)
+        self.assertEqual(need_help.status_code, 200, need_help.text)
+        with db_module.get_conn() as conn:
+            rows = db_module.fetch_all(
+                conn,
+                "SELECT helpful, confusing, saved FROM reel_feedback WHERE reel_id = ? ORDER BY helpful DESC",
+                (reel_id,),
+            )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[0]["helpful"], rows[0]["confusing"], rows[0]["saved"]), (1, 0, 1))
+        self.assertEqual((rows[1]["helpful"], rows[1]["confusing"], rows[1]["saved"]), (0, 1, 0))
 
     def test_patch_unknown_material_404_and_bad_level_422(self) -> None:
         self.assertEqual(
@@ -135,6 +263,22 @@ class KnowledgeLevelApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.patch(f"/api/materials/{mid}/level",
                               json={"knowledge_level": "expert"}).status_code, 422)
+
+    def test_identityless_legacy_patch_updates_material_default(self) -> None:
+        created = self.client.post(
+            "/api/material", data={"subject_tag": "physics", "knowledge_level": "beginner"}
+        )
+        mid = created.json()["material_id"]
+        changed = self.client.patch(
+            f"/api/materials/{mid}/level", json={"knowledge_level": "intermediate"}
+        )
+        self.assertEqual(changed.status_code, 200, changed.text)
+        fresh_owner_feed = self.client.get(
+            f"/api/feed?material_id={mid}",
+            headers={COMMUNITY_OWNER_HEADER: "fresh-owner-key-abcdefghijklmnopqrstuvwxyz"},
+        )
+        self.assertEqual(fresh_owner_feed.status_code, 200, fresh_owner_feed.text)
+        self.assertEqual(fresh_owner_feed.json()["knowledge_level"], "intermediate")
 
 
 if __name__ == "__main__":

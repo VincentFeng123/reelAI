@@ -17,7 +17,16 @@ from typing import Any, Callable, Literal
 import numpy as np
 
 from ..config import get_settings
-from ..db import DatabaseIntegrityError, dumps_json, execute_modify, fetch_all, fetch_one, now_iso, upsert
+from ..db import (
+    LEGACY_LEARNER_ID,
+    DatabaseIntegrityError,
+    dumps_json,
+    execute_modify,
+    fetch_all,
+    fetch_one,
+    now_iso,
+    upsert,
+)
 from . import llm_router
 from .concepts import build_takeaways
 from ..ingestion.errors import RateLimitedError as _IngestRateLimitedError
@@ -40,22 +49,7 @@ from .knowledge_level import effective_level_target
 
 # Serving-side ceiling: legacy whole-video slabs (persisted before the engine's
 # SEGMENT_MAX_CLIP_S curation gate existed) must not surface in ranked feeds.
-_SERVING_MAX_CLIP_SEC = float(_SEGMENT_MAX_CLIP_S) + 15.0
-
-
-def clip_spans_duplicate(
-    a_start: float, a_end: float, b_start: float, b_end: float,
-    threshold: float = 0.6,
-) -> bool:
-    """True when two clips of the SAME video cover substantially the same
-    footage: overlap ≥ ``threshold`` of the shorter clip. Catches the
-    near-duplicate spans that exact-key dedup misses (fine-snap jitter across
-    concurrent generations)."""
-    overlap = min(a_end, b_end) - max(a_start, b_start)
-    if overlap <= 0:
-        return False
-    shorter = max(0.1, min(a_end - a_start, b_end - b_start))
-    return overlap / shorter >= threshold
+_SERVING_MAX_CLIP_SEC = min(180.0, float(_SEGMENT_MAX_CLIP_S))
 
 logger = logging.getLogger(__name__)
 
@@ -1294,7 +1288,12 @@ class ReelService:
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
-    RANKED_FEED_CACHE_VERSION = 7
+    RANKED_FEED_CACHE_VERSION = 8
+    CONCEPT_ADJUSTMENT_BOUND = 0.25
+    GOT_IT_CONCEPT_STEP = 0.12
+    NEED_HELP_CONCEPT_STEP = 0.15
+    GLOBAL_FEEDBACK_WINDOW = 12
+    GLOBAL_FEEDBACK_MIN_ROWS = 3
     REFILL_STAGE_EXACT_ROOT = 0
     REFILL_STAGE_ROOT_COMPANION = 1
     REFILL_STAGE_MULTI_CLIP_STRICT = 2
@@ -1329,6 +1328,68 @@ class ReelService:
         # `_get_transcript` when the caller only has a video_id string.
         self._provider_by_video_id: dict[str, str] = {}
 
+    def learner_progress(self, conn, material_id: str, learner_id: str) -> dict[str, Any]:
+        """Return learner-scoped progress, lazily seeded from the material default."""
+        learner_id = str(learner_id or LEGACY_LEARNER_ID)
+        existing = fetch_one(
+            conn,
+            "SELECT * FROM learner_material_progress WHERE learner_id = ? AND material_id = ?",
+            (learner_id, material_id),
+        )
+        if existing:
+            return existing
+        material = fetch_one(
+            conn,
+            "SELECT knowledge_level FROM materials WHERE id = ?",
+            (material_id,),
+        )
+        if not material:
+            raise ValueError(f"unknown material_id: {material_id}")
+        level = str(material.get("knowledge_level") or "beginner")
+        timestamp = now_iso()
+        upsert(
+            conn,
+            "learner_material_progress",
+            {
+                "learner_id": learner_id,
+                "material_id": material_id,
+                "selected_level": level,
+                "global_adjustment": 0.0,
+                # Legacy rows remain aggregate-only, but legacy service callers
+                # still see their historical feedback in compatibility tests.
+                "difficulty_reset_at": "" if learner_id == LEGACY_LEARNER_ID else timestamp,
+                "feedback_revision": 0,
+                "updated_at": timestamp,
+            },
+            pk=["learner_id", "material_id"],
+        )
+        return fetch_one(
+            conn,
+            "SELECT * FROM learner_material_progress WHERE learner_id = ? AND material_id = ?",
+            (learner_id, material_id),
+        ) or {}
+
+    def set_learner_level(
+        self, conn, material_id: str, learner_id: str, selected_level: str,
+    ) -> dict[str, Any]:
+        progress = self.learner_progress(conn, material_id, learner_id)
+        timestamp = now_iso()
+        execute_modify(
+            conn,
+            """
+            UPDATE learner_material_progress
+            SET selected_level = ?, global_adjustment = 0.0,
+                difficulty_reset_at = ?, feedback_revision = feedback_revision + 1,
+                updated_at = ?
+            WHERE learner_id = ? AND material_id = ?
+            """,
+            (selected_level, timestamp, timestamp, learner_id, material_id),
+        )
+        return {**progress, "selected_level": selected_level, "global_adjustment": 0.0,
+                "difficulty_reset_at": timestamp,
+                "feedback_revision": int(progress.get("feedback_revision") or 0) + 1,
+                "updated_at": timestamp}
+
     def _reel_scope_where(
         self,
         *,
@@ -1350,6 +1411,8 @@ class ReelService:
         subject_tag: str | None = None,
         strict_topic_only: bool = False,
         level_target: float = 0.5,
+        learner_id: str = LEGACY_LEARNER_ID,
+        feedback_revision: int = 0,
     ) -> str:
         # Include subject_tag + strict_topic_only in the key because ranked_feed's
         # relevance gates (`_passes_relevance_gate`, strict topic filter, hard-
@@ -1364,6 +1427,8 @@ class ReelService:
             "subject_tag": (subject_tag or "").strip().lower(),
             "strict_topic_only": bool(strict_topic_only),
             "level_target": round(float(level_target), 3),
+            "learner_id": str(learner_id),
+            "feedback_revision": int(feedback_revision),
             "version": self.RANKED_FEED_CACHE_VERSION,
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -1398,7 +1463,7 @@ class ReelService:
                 COALESCE(MAX(relevant_reels.created_at), '') AS reel_updated_at,
                 COALESCE(MAX(v.created_at), '') AS video_updated_at,
                 COALESCE(COUNT(f.reel_id), 0) AS feedback_count,
-                COALESCE(MAX(f.created_at), '') AS feedback_updated_at
+                COALESCE(MAX(COALESCE(NULLIF(f.updated_at, ''), f.created_at)), '') AS feedback_updated_at
             FROM relevant_reels
             LEFT JOIN videos v ON v.id = relevant_reels.video_id
             LEFT JOIN reel_feedback f ON f.reel_id = relevant_reels.id
@@ -1460,6 +1525,8 @@ class ReelService:
         subject_tag: str | None = None,
         strict_topic_only: bool = False,
         level_target: float = 0.5,
+        learner_id: str = LEGACY_LEARNER_ID,
+        feedback_revision: int = 0,
     ) -> list[dict[str, Any]] | None:
         cache_key = self._ranked_feed_cache_key(
             material_id=material_id,
@@ -1468,6 +1535,8 @@ class ReelService:
             subject_tag=subject_tag,
             strict_topic_only=strict_topic_only,
             level_target=level_target,
+            learner_id=learner_id,
+            feedback_revision=feedback_revision,
         )
         cached = fetch_one(
             conn,
@@ -1496,6 +1565,8 @@ class ReelService:
         subject_tag: str | None = None,
         strict_topic_only: bool = False,
         level_target: float = 0.5,
+        learner_id: str = LEGACY_LEARNER_ID,
+        feedback_revision: int = 0,
     ) -> None:
         timestamp = now_iso()
         upsert(
@@ -1509,6 +1580,8 @@ class ReelService:
                     subject_tag=subject_tag,
                     strict_topic_only=strict_topic_only,
                     level_target=level_target,
+                    learner_id=learner_id,
+                    feedback_revision=feedback_revision,
                 ),
                 "material_id": material_id,
                 "generation_id": generation_id or "",
@@ -1545,6 +1618,8 @@ class ReelService:
         on_reel_created: Callable[[dict[str, Any]], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         multi_platform_search: bool = False,
+        knowledge_level_override: str | None = None,
+        learner_id: str = LEGACY_LEARNER_ID,
     ) -> list[dict[str, Any]]:
         def raise_if_cancelled() -> None:
             if should_cancel is None:
@@ -1586,7 +1661,13 @@ class ReelService:
             "SELECT subject_tag, source_type, knowledge_level, level_adjustment FROM materials WHERE id = ?",
             (material_id,),
         )
-        material_knowledge_level = str((material or {}).get("knowledge_level") or "beginner")
+        stored_knowledge_level = str((material or {}).get("knowledge_level") or "beginner")
+        requested_knowledge_level = str(knowledge_level_override or "").strip().lower()
+        material_knowledge_level = (
+            requested_knowledge_level
+            if requested_knowledge_level in {"beginner", "intermediate", "advanced"}
+            else stored_knowledge_level
+        )
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
         strict_topic_only = str((material or {}).get("source_type") or "").strip().lower() == "topic"
         if strict_topic_only and subject_tag:
@@ -1640,7 +1721,7 @@ class ReelService:
                     subject_tag=subject_tag,
                     material_id=material_id,
                 )
-        concepts = self._order_concepts(conn, material_id, concepts)
+        concepts = self._order_concepts(conn, material_id, concepts, learner_id)
         safe_video_pool_mode = self._normalize_video_pool_mode(video_pool_mode)
         safe_video_duration_pref = self._normalize_preferred_video_duration(preferred_video_duration)
         clip_min_len, clip_max_len, safe_target_clip_duration = self._resolve_clip_duration_bounds(
@@ -2323,34 +2404,35 @@ class ReelService:
         return self._group_by_video(selected)
 
     def _group_by_video(self, reels: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Reorder a flat list so all clips from the same video appear
-        contiguously. Video order follows the best clip in each group
-        (highest generation score first); within a video the clips play
-        in chronological order (ascending t_start). Preserves the input
-        list's membership — only the order changes."""
+        """Interleave sources while preserving chronological order per source."""
         if len(reels) <= 1:
             return list(reels)
         groups: dict[str, list[dict[str, Any]]] = {}
-        order: list[str] = []
         for reel in reels:
             video_id = str(reel.get("video_id") or "").strip()
-            if video_id not in groups:
-                groups[video_id] = []
-                order.append(video_id)
-            groups[video_id].append(reel)
-
-        def _group_best_score(video_id: str) -> float:
-            return max(
-                (self._generation_result_score(r) for r in groups[video_id]),
-                default=0.0,
-            )
-
-        order.sort(key=_group_best_score, reverse=True)
+            groups.setdefault(video_id, []).append(reel)
+        for group in groups.values():
+            group.sort(key=lambda row: float(row.get("t_start") or 0.0))
         result: list[dict[str, Any]] = []
-        for video_id in order:
-            group = groups[video_id]
-            group.sort(key=lambda r: float(r.get("t_start") or 0.0))
-            result.extend(group)
+        last_video = ""
+        last_concept = ""
+        while groups:
+            heads = [(video_id, group[0]) for video_id, group in groups.items() if group]
+            candidates = [pair for pair in heads if pair[0] != last_video] or heads
+            different_concept = [
+                pair for pair in candidates
+                if str(pair[1].get("concept_id") or "") != last_concept
+            ]
+            candidates = different_concept or candidates
+            video_id, chosen = max(
+                candidates, key=lambda pair: self._generation_result_score(pair[1])
+            )
+            groups[video_id].pop(0)
+            if not groups[video_id]:
+                groups.pop(video_id)
+            result.append(chosen)
+            last_video = video_id
+            last_concept = str(chosen.get("concept_id") or "")
         return result
 
     def _parse_keywords_json(self, value: Any) -> list[str]:
@@ -7034,11 +7116,17 @@ class ReelService:
         return min(0.42, penalty)
 
     def _clip_key(self, video_id: str, t_start: float, t_end: float) -> str:
-        start = Decimal(str(float(t_start))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        end = Decimal(str(float(t_end))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        start = Decimal(str(float(t_start))).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+        end = Decimal(str(float(t_end))).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
         return f"{video_id}:{start}:{end}"
 
-    def _order_concepts(self, conn, material_id: str, concepts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _order_concepts(
+        self,
+        conn,
+        material_id: str,
+        concepts: list[dict[str, Any]],
+        learner_id: str = LEGACY_LEARNER_ID,
+    ) -> list[dict[str, Any]]:
         concept_counts = {
             row["concept_id"]: int(row["reel_count"])
             for row in fetch_all(
@@ -7062,11 +7150,13 @@ class ReelService:
                     COALESCE(SUM(f.confusing), 0) AS confusing_votes,
                     COALESCE(AVG(f.rating), 3.0) AS avg_rating
                 FROM reels r
-                LEFT JOIN reel_feedback f ON f.reel_id = r.id
+                LEFT JOIN reel_feedback f
+                  ON f.reel_id = r.id
+                 AND f.learner_id = ?
                 WHERE r.material_id = ?
                 GROUP BY r.concept_id
                 """,
-                (material_id,),
+                (str(learner_id or LEGACY_LEARNER_ID), material_id),
             )
         }
 
@@ -7086,45 +7176,214 @@ class ReelService:
     def _concept_mastery(self, helpful: float, confusing: float, avg_rating: float) -> float:
         return 0.25 * helpful - 0.35 * confusing + 0.15 * (avg_rating - 3.0)
 
-    LEVEL_FEEDBACK_WINDOW = 20
-    LEVEL_FEEDBACK_MIN_ROWS = 5
-
-    def update_level_adjustment(self, conn, material_id: str) -> float:
-        """Recompute the material's level drift from its most recent feedback.
-
-        signal = 0.25*helpful_rate - 0.35*confusing_rate + 0.15*(avg_rating-3)/2
-        (same shape as _concept_mastery), clamped to ±ADJUSTMENT_BOUND.
-        Fewer than LEVEL_FEEDBACK_MIN_ROWS rows -> 0 (cold-start gate)."""
+    def update_level_adjustment(
+        self, conn, material_id: str, learner_id: str = LEGACY_LEARNER_ID,
+    ) -> float:
+        """Recompute learner-global drift from the latest 12 mastery responses."""
         from .knowledge_level import ADJUSTMENT_BOUND
 
+        progress = self.learner_progress(conn, material_id, learner_id)
+        reset_at = str(progress.get("difficulty_reset_at") or "")
         rows = fetch_all(
             conn,
             """
-            SELECT f.helpful, f.confusing, f.rating
+            SELECT f.helpful, f.confusing, r.concept_id
             FROM reel_feedback f
             JOIN reels r ON r.id = f.reel_id
-            WHERE r.material_id = ?
-            ORDER BY f.created_at DESC
+            WHERE f.learner_id = ?
+              AND r.material_id = ?
+              AND f.mastery_updated_at IS NOT NULL
+              AND f.mastery_updated_at > ?
+              AND (f.helpful <> 0 OR f.confusing <> 0)
+            ORDER BY f.mastery_updated_at DESC
             LIMIT ?
             """,
-            (material_id, self.LEVEL_FEEDBACK_WINDOW),
+            (learner_id, material_id, reset_at, self.GLOBAL_FEEDBACK_WINDOW),
         )
-        if len(rows) < self.LEVEL_FEEDBACK_MIN_ROWS:
+        distinct_concepts = {str(row.get("concept_id") or "") for row in rows}
+        if len(rows) < self.GLOBAL_FEEDBACK_MIN_ROWS or len(distinct_concepts) < 2:
             adjustment = 0.0
         else:
             n = len(rows)
-            helpful_rate = sum(1 for r in rows if int(r["helpful"] or 0) > 0) / n
-            confusing_rate = sum(1 for r in rows if int(r["confusing"] or 0) > 0) / n
-            ratings = [float(r["rating"]) for r in rows if r["rating"] is not None]
-            avg_rating = (sum(ratings) / len(ratings)) if ratings else 3.0
-            signal = 0.25 * helpful_rate - 0.35 * confusing_rate + 0.15 * (avg_rating - 3.0) / 2.0
+            got_it = sum(1 for row in rows if int(row.get("helpful") or 0) > 0)
+            need_help = sum(1 for row in rows if int(row.get("confusing") or 0) > 0)
+            signal = 0.20 * (got_it - need_help) / n
             adjustment = max(-ADJUSTMENT_BOUND, min(ADJUSTMENT_BOUND, signal))
         execute_modify(
             conn,
-            "UPDATE materials SET level_adjustment = ? WHERE id = ?",
-            (adjustment, material_id),
+            """
+            UPDATE learner_material_progress
+            SET global_adjustment = ?, updated_at = ?
+            WHERE learner_id = ? AND material_id = ?
+            """,
+            (adjustment, now_iso(), learner_id, material_id),
         )
         return adjustment
+
+    def _learner_adaptation_context(
+        self, conn, material_id: str, learner_id: str,
+    ) -> tuple[dict[str, dict[str, float]], dict[str, float], dict[str, Any] | None, float]:
+        progress = self.learner_progress(conn, material_id, learner_id)
+        reset_at = str(progress.get("difficulty_reset_at") or "")
+        rows = fetch_all(
+            conn,
+            """
+            SELECT f.reel_id, f.helpful, f.confusing, f.mastery_updated_at,
+                   r.concept_id, r.video_id, r.difficulty
+            FROM reel_feedback f
+            JOIN reels r ON r.id = f.reel_id
+            WHERE f.learner_id = ? AND r.material_id = ?
+            """,
+            (learner_id, material_id),
+        )
+        coverage: dict[str, dict[str, float]] = {}
+        post_reset: dict[str, list[float]] = {}
+        mastery_rows: list[dict[str, Any]] = []
+        for row in rows:
+            concept_id = str(row.get("concept_id") or "")
+            if not concept_id:
+                continue
+            bucket = coverage.setdefault(concept_id, {"helpful": 0.0, "confusing": 0.0})
+            bucket["helpful"] += 1.0 if int(row.get("helpful") or 0) > 0 else 0.0
+            bucket["confusing"] += 1.0 if int(row.get("confusing") or 0) > 0 else 0.0
+            mastery_at = str(row.get("mastery_updated_at") or "")
+            if not mastery_at or mastery_at <= reset_at:
+                continue
+            values = post_reset.setdefault(concept_id, [0.0, 0.0])
+            values[0] += 1.0 if int(row.get("helpful") or 0) > 0 else 0.0
+            values[1] += 1.0 if int(row.get("confusing") or 0) > 0 else 0.0
+            if int(row.get("helpful") or 0) > 0 or int(row.get("confusing") or 0) > 0:
+                mastery_rows.append(row)
+        adjustments = {
+            concept_id: max(
+                -self.CONCEPT_ADJUSTMENT_BOUND,
+                min(
+                    self.CONCEPT_ADJUSTMENT_BOUND,
+                    self.GOT_IT_CONCEPT_STEP * values[0] - self.NEED_HELP_CONCEPT_STEP * values[1],
+                ),
+            )
+            for concept_id, values in post_reset.items()
+        }
+        latest = max(mastery_rows, key=lambda row: str(row.get("mastery_updated_at") or ""), default=None)
+        level_target = effective_level_target(
+            progress.get("selected_level"), progress.get("global_adjustment")
+        )
+        return coverage, adjustments, latest, level_target
+
+    @staticmethod
+    def _difficulty(item: dict[str, Any]) -> float:
+        value = item.get("difficulty")
+        if value is None:
+            return 0.5
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.5
+
+    def adaptive_curriculum_order(
+        self,
+        conn,
+        material_id: str,
+        learner_id: str,
+        items: list[dict[str, Any]],
+        previous_video_id: str = "",
+    ) -> list[dict[str, Any]]:
+        """Interleave source/concept queues while preserving each source's chronology."""
+        if len(items) <= 1:
+            return list(items)
+        try:
+            coverage, adjustments, latest, level_target = self._learner_adaptation_context(
+                conn, material_id, learner_id
+            )
+        except ValueError:
+            return list(items)
+        queues: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for raw in items:
+            item = dict(raw)
+            queues[str(item.get("video_id") or item.get("video_url") or item.get("reel_id") or "")].append(item)
+        for queue in queues.values():
+            queue.sort(key=lambda row: (float(row.get("t_start") or 0.0), float(row.get("t_end") or 0.0)))
+
+        ordered: list[dict[str, Any]] = []
+        last_video = str(previous_video_id or "")
+        last_concept = ""
+        latest_concept = str((latest or {}).get("concept_id") or "")
+        latest_video = str((latest or {}).get("video_id") or "")
+
+        heads = lambda: [(video_id, queue[0]) for video_id, queue in queues.items() if queue]
+
+        if latest and int(latest.get("confusing") or 0) > 0:
+            current_difficulty = self._difficulty(latest)
+            remediation = [
+                (video_id, row)
+                for video_id, row in heads()
+                if str(row.get("concept_id") or "") == latest_concept
+                and self._difficulty(row) < current_difficulty
+            ]
+            alternate = [pair for pair in remediation if pair[0] != latest_video]
+            boundary_safe_alternate = [pair for pair in alternate if pair[0] != last_video]
+            boundary_safe_fallback = [pair for pair in remediation if pair[0] != last_video]
+            pool = boundary_safe_alternate or boundary_safe_fallback or alternate or remediation
+            if pool:
+                concept_target = max(0.0, min(1.0, level_target + adjustments.get(latest_concept, 0.0)))
+                video_id, row = min(
+                    pool,
+                    key=lambda pair: (
+                        abs(self._difficulty(pair[1]) - concept_target),
+                        -float(pair[1].get("score") or 0.0),
+                    ),
+                )
+                queues[video_id].pop(0)
+                if not queues[video_id]:
+                    queues.pop(video_id, None)
+                ordered.append(row)
+                last_video = video_id
+                last_concept = latest_concept
+
+        first_after_helpful = bool(latest and int(latest.get("helpful") or 0) > 0)
+        while queues:
+            candidates = heads()
+            if len({video_id for video_id, _ in candidates}) > 1:
+                other_source = [pair for pair in candidates if pair[0] != last_video]
+                if other_source:
+                    candidates = other_source
+            if first_after_helpful and any(
+                str(row.get("concept_id") or "") != latest_concept for _, row in candidates
+            ):
+                candidates = [
+                    pair for pair in candidates
+                    if str(pair[1].get("concept_id") or "") != latest_concept
+                ]
+            elif any(str(row.get("concept_id") or "") != last_concept for _, row in candidates):
+                candidates = [
+                    pair for pair in candidates
+                    if str(pair[1].get("concept_id") or "") != last_concept
+                ]
+
+            def priority(pair: tuple[str, dict[str, Any]]) -> tuple[float, str]:
+                row = pair[1]
+                concept_id = str(row.get("concept_id") or "")
+                signal = coverage.get(concept_id, {})
+                coverage_shift = (
+                    -0.12 * float(signal.get("helpful") or 0.0)
+                    + 0.10 * float(signal.get("confusing") or 0.0)
+                )
+                concept_target = max(0.0, min(1.0, level_target + adjustments.get(concept_id, 0.0)))
+                difficulty_fit = 1.0 - abs(self._difficulty(row) - concept_target)
+                return (
+                    float(row.get("score") or 0.0) + coverage_shift + 0.20 * difficulty_fit,
+                    str(row.get("created_at") or ""),
+                )
+
+            video_id, chosen = max(candidates, key=priority)
+            queues[video_id].pop(0)
+            if not queues[video_id]:
+                queues.pop(video_id, None)
+            ordered.append(chosen)
+            last_video = video_id
+            last_concept = str(chosen.get("concept_id") or "")
+            first_after_helpful = False
+        return ordered
 
 
 
@@ -8003,28 +8262,65 @@ class ReelService:
         confusing: bool,
         rating: int | None,
         saved: bool,
-    ) -> None:
-        existing = fetch_one(conn, "SELECT id FROM reel_feedback WHERE reel_id = ?", (reel_id,))
+        learner_id: str = LEGACY_LEARNER_ID,
+    ) -> int:
+        reel_row = fetch_one(
+            conn, "SELECT material_id FROM reels WHERE id = ?", (reel_id,)
+        )
+        if not reel_row:
+            raise ValueError(f"unknown reel_id: {reel_id}")
+        material_id = str(reel_row["material_id"])
+        progress = self.learner_progress(conn, material_id, learner_id)
+        existing = fetch_one(
+            conn,
+            "SELECT * FROM reel_feedback WHERE learner_id = ? AND reel_id = ?",
+            (learner_id, reel_id),
+        )
+        helpful_value = 1 if helpful else 0
+        confusing_value = 1 if confusing else 0
+        mastery_changed = (
+            existing is None
+            and (helpful_value > 0 or confusing_value > 0)
+        ) or (
+            existing is not None
+            and (
+                int(existing.get("helpful") or 0) != helpful_value
+                or int(existing.get("confusing") or 0) != confusing_value
+            )
+        )
+        timestamp = now_iso()
         upsert(
             conn,
             "reel_feedback",
             {
                 "id": str((existing or {}).get("id") or uuid.uuid4()),
+                "learner_id": learner_id,
                 "reel_id": reel_id,
-                "helpful": 1 if helpful else 0,
-                "confusing": 1 if confusing else 0,
+                "helpful": helpful_value,
+                "confusing": confusing_value,
                 "rating": rating,
                 "saved": 1 if saved else 0,
-                "created_at": now_iso(),
+                "mastery_updated_at": (
+                    timestamp if mastery_changed else (existing or {}).get("mastery_updated_at")
+                ),
+                "updated_at": timestamp,
+                "created_at": str((existing or {}).get("created_at") or timestamp),
             },
-            pk="reel_id",
+            pk=["learner_id", "reel_id"],
         )
-        try:
-            reel_row = fetch_one(conn, "SELECT material_id FROM reels WHERE id = ?", (reel_id,))
-            if reel_row and reel_row.get("material_id"):
-                self.update_level_adjustment(conn, str(reel_row["material_id"]))
-        except Exception:
-            logger.exception("level adjustment recompute failed for reel %s", reel_id)
+        revision = int(progress.get("feedback_revision") or 0) + 1
+        execute_modify(
+            conn,
+            """
+            UPDATE learner_material_progress
+            SET feedback_revision = ?, updated_at = ?
+            WHERE learner_id = ? AND material_id = ?
+            """,
+            (revision, timestamp, learner_id, material_id),
+        )
+        if mastery_changed:
+            self.update_level_adjustment(conn, material_id, learner_id)
+        return revision
 
     def ranked_feed(
         self,
@@ -8033,14 +8329,17 @@ class ReelService:
         fast_mode: bool = False,
         generation_id: str | None = None,
         page_hint: int = 1,
+        learner_id: str = LEGACY_LEARNER_ID,
     ) -> list[dict[str, Any]]:
-        material = fetch_one(conn, "SELECT subject_tag, source_type, knowledge_level, level_adjustment FROM materials WHERE id = ?", (material_id,))
+        material = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
         strict_topic_only = str((material or {}).get("source_type") or "").strip().lower() == "topic"
+        progress = self.learner_progress(conn, material_id, learner_id)
         level_target = effective_level_target(
-            (material or {}).get("knowledge_level"),
-            (material or {}).get("level_adjustment"),
+            progress.get("selected_level"),
+            progress.get("global_adjustment"),
         )
+        feedback_revision = int(progress.get("feedback_revision") or 0)
 
         reel_where, reel_params = self._reel_scope_where(
             material_id=material_id,
@@ -8065,6 +8364,8 @@ class ReelService:
             subject_tag=subject_tag,
             strict_topic_only=strict_topic_only,
             level_target=level_target,
+            learner_id=learner_id,
+            feedback_revision=feedback_revision,
         )
         if cached is not None:
             return cached
@@ -8172,6 +8473,9 @@ class ReelService:
             concept_id: (totals[0], totals[1])
             for concept_id, totals in concept_signal_totals.items()
         }
+        learner_coverage, concept_adjustments, _, _ = self._learner_adaptation_context(
+            conn, material_id, learner_id
+        )
 
         concept_rows = fetch_all(
             conn,
@@ -8299,7 +8603,12 @@ class ReelService:
                 fast_mode=fast_mode,
             )
             safe_page_hint = max(1, int(page_hint))
-            _diff = 0.5 if row.get("difficulty") is None else float(row["difficulty"])
+            _diff = self._difficulty(row)
+            concept_target = max(
+                0.0,
+                min(1.0, level_target + concept_adjustments.get(str(row["concept_id"]), 0.0)),
+            )
+            learner_signal = learner_coverage.get(str(row["concept_id"]), {})
             score = (
                 float(row["base_score"])
                 + 0.18 * float(row["helpful_votes"])
@@ -8311,8 +8620,10 @@ class ReelService:
                 + 0.22 * float(relevance_context.get("score") or 0.0)
                 - 0.12 * float(relevance.get("off_topic_penalty") or 0.0)
                 + 0.04 * float(self.SOURCE_SURFACE_PRIOR.get(str(retrieval_candidate.get("source_surface") or ""), 0.82))
-                + 0.12 * (1.0 - 2.0 * abs(_diff - level_target))
+                + 0.12 * (1.0 - 2.0 * abs(_diff - concept_target))
                 + 0.05 * (1.0 - _diff) * max(0.0, 1.0 - (safe_page_hint - 1) / 2.0)
+                - 0.04 * float(learner_signal.get("helpful") or 0.0)
+                + 0.04 * float(learner_signal.get("confusing") or 0.0)
             )
             scored.append(
                 {
@@ -8346,7 +8657,7 @@ class ReelService:
                     "total_concepts": total_concepts,
                     "video_duration_sec": int(row.get("video_duration_sec") or 0),
                     "clip_duration_sec": round(max(0.0, float(row["t_end"]) - float(row["t_start"])), 2),
-                    "difficulty": (None if row.get("difficulty") is None else float(row["difficulty"])),
+                    "difficulty": self._difficulty(row),
                     "created_at": row["created_at"],
                 }
             )
@@ -8355,7 +8666,6 @@ class ReelService:
         deduped: list[dict[str, Any]] = []
         seen_reel_ids: set[str] = set()
         seen_clip_keys: set[str] = set()
-        kept_spans_by_video: dict[str, list[tuple[float, float]]] = {}
         for item in scored:
             reel_id = str(item.get("reel_id") or "")
             if reel_id and reel_id in seen_reel_ids:
@@ -8368,64 +8678,12 @@ class ReelService:
             clip_key = self._clip_key(video_id, t_start, t_end)
             if clip_key in seen_clip_keys:
                 continue
-            # Score-descending order → the best of a near-duplicate cluster wins.
-            if any(
-                clip_spans_duplicate(t_start, t_end, k0, k1)
-                for k0, k1 in kept_spans_by_video.get(video_id, ())
-            ):
-                continue
             if reel_id:
                 seen_reel_ids.add(reel_id)
             seen_clip_keys.add(clip_key)
-            kept_spans_by_video.setdefault(video_id, []).append((t_start, t_end))
             deduped.append(dict(item))
 
-        # --- Same-video grouping ---
-        # Without this, score-based sorting can interleave reels from
-        # different YouTube videos, so a multi-reel arc from one clip gets
-        # interrupted by a reel from another video. Users experience this
-        # as "videos from the same clip are interrupted by other videos."
-        # Fix: after score-sort + dedup, group reels by ``video_id`` and
-        # emit each group consecutively. Within a group, sort by
-        # ``t_start`` so the clip's narrative plays in chronological order
-        # (part 1 → part 2 → part 3). Groups themselves are ordered by
-        # their best (max) reel score, preserving overall ranking.
-        if deduped:
-            grouped_by_video: dict[str, list[dict[str, Any]]] = {}
-            video_first_seen_order: list[str] = []
-            video_best_score: dict[str, float] = {}
-            video_best_created_at: dict[str, str] = {}
-            for item in deduped:
-                vid = str(item.get("video_id") or "")
-                if vid not in grouped_by_video:
-                    grouped_by_video[vid] = []
-                    video_first_seen_order.append(vid)
-                grouped_by_video[vid].append(item)
-                s = float(item.get("score") or 0.0)
-                if s > video_best_score.get(vid, float("-inf")):
-                    video_best_score[vid] = s
-                    video_best_created_at[vid] = str(item.get("created_at") or "")
-            # Sort video groups by their best reel's score (desc), then by
-            # that reel's created_at (desc) for tiebreaks — mirrors the
-            # original per-reel sort key so ordering remains deterministic.
-            video_first_seen_order.sort(
-                key=lambda v: (
-                    video_best_score.get(v, 0.0),
-                    video_best_created_at.get(v, ""),
-                ),
-                reverse=True,
-            )
-            regrouped: list[dict[str, Any]] = []
-            for vid in video_first_seen_order:
-                group = sorted(
-                    grouped_by_video[vid],
-                    key=lambda x: (
-                        float(x.get("t_start") or 0.0),
-                        float(x.get("t_end") or 0.0),
-                    ),
-                )
-                regrouped.extend(group)
-            deduped = regrouped
+        deduped = self.adaptive_curriculum_order(conn, material_id, learner_id, deduped)
 
         deduped_video_ids = sorted({str(item.get("video_id") or "") for item in deduped if item.get("video_id")})
         transcript_by_video: dict[str, list[dict[str, Any]]] = {}
@@ -8468,5 +8726,7 @@ class ReelService:
             subject_tag=subject_tag,
             strict_topic_only=strict_topic_only,
             level_target=level_target,
+            learner_id=learner_id,
+            feedback_revision=feedback_revision,
         )
         return response_rows

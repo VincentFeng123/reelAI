@@ -21,7 +21,7 @@ from email.utils import parseaddr
 from queue import Empty, Queue
 from collections.abc import Iterable
 from typing import Any, Callable, Literal
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
@@ -34,6 +34,7 @@ from .db import (
     DEFAULT_COMMUNITY_VISIBILITY,
     DatabaseIntegrityError,
     LEGACY_COMMUNITY_OWNER_HASH,
+    LEGACY_LEARNER_ID,
     PUBLIC_COMMUNITY_VISIBILITY,
     dumps_json,
     execute_modify,
@@ -110,7 +111,7 @@ from .services.liveness import is_video_alive
 from .services.material_intelligence import MaterialIntelligenceService
 from .services.parsers import ParseError, extract_text_from_file
 from .services import progress_bus
-from .services.reels import GenerationCancelledError, ReelService, clip_spans_duplicate
+from .services.reels import GenerationCancelledError, ReelService
 from .services.storage import get_storage
 from .services.text_utils import chunk_text, normalize_whitespace
 from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8601_duration
@@ -3117,21 +3118,24 @@ def _activate_generation(conn, *, material_id: str, request_key: str, generation
 
 def _normalize_reel_identity_time(value: object) -> str:
     try:
-        parsed = round(float(value or 0.0), 2)
+        parsed = round(float(value or 0.0), 3)
     except (TypeError, ValueError):
         parsed = 0.0
-    return f"{parsed:.2f}"
+    return f"{parsed:.3f}"
 
 
 def _reel_identity_key(reel: dict[str, Any]) -> tuple[str, str]:
     reel_id = str(reel.get("reel_id") or "").strip()
     video_url = str(reel.get("video_url") or "").strip()
-    embed_match = re.search(r"/embed/([^?&/]+)", video_url)
-    if embed_match:
-        video_identity = embed_match.group(1)
-    else:
-        parsed = urlparse(video_url)
-        video_identity = parsed.path or video_url
+    video_identity = str(reel.get("video_id") or "").strip()
+    if not video_identity:
+        embed_match = re.search(r"/embed/([^?&/]+)", video_url)
+        if embed_match:
+            video_identity = embed_match.group(1)
+        else:
+            parsed = urlparse(video_url)
+            query_video_id = parse_qs(parsed.query).get("v", [""])[0]
+            video_identity = query_video_id or parsed.path or video_url
     clip_key = ":".join(
         [
             video_identity,
@@ -3146,7 +3150,6 @@ def _merge_request_reel_lists(*reel_lists: list[dict[str, Any]]) -> list[dict[st
     merged: list[dict[str, Any]] = []
     seen_reel_ids: set[str] = set()
     seen_clip_keys: set[str] = set()
-    kept_spans_by_video: dict[str, list[tuple[float, float]]] = {}
     for reel_list in reel_lists:
         for reel in reel_list:
             reel_id, clip_key = _reel_identity_key(reel)
@@ -3154,85 +3157,12 @@ def _merge_request_reel_lists(*reel_lists: list[dict[str, Any]]) -> list[dict[st
                 continue
             if clip_key in seen_clip_keys:
                 continue
-            # Cross-generation near-duplicates: concurrent generations can
-            # persist the same footage with fine-snap jitter, which defeats
-            # the exact clip_key — drop by span overlap within a video.
-            video_identity = clip_key.split(":", 1)[0] if clip_key else ""
-            t_start = float(reel.get("t_start") or 0.0)
-            t_end = float(reel.get("t_end") or 0.0)
-            if video_identity and any(
-                clip_spans_duplicate(t_start, t_end, k0, k1)
-                for k0, k1 in kept_spans_by_video.get(video_identity, ())
-            ):
-                continue
             if reel_id:
                 seen_reel_ids.add(reel_id)
             seen_clip_keys.add(clip_key)
-            if video_identity:
-                kept_spans_by_video.setdefault(video_identity, []).append((t_start, t_end))
             merged.append(reel)
 
-    if not merged:
-        return merged
-
-    # Cross-generation regrouping: each batch is already video-grouped by
-    # ``ranked_feed``, but concatenating batches can split a video's reels
-    # across generation boundaries (gen1's A-reels, other videos, then
-    # gen2's A-reels later). Re-group by video so same-clip reels play
-    # contiguously in chronological order — exact same behavior as
-    # ``ranked_feed`` produces within a single generation. This keeps the
-    # iOS and web feeds aligned with the within-generation grouping.
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    group_first_rank: dict[str, int] = {}
-    group_best_score: dict[str, float] = {}
-    group_best_created_at: dict[str, str] = {}
-    unkeyed: list[dict[str, Any]] = []
-    for idx, reel in enumerate(merged):
-        _, clip_key = _reel_identity_key(reel)
-        group_key = clip_key.split(":", 1)[0] if clip_key else ""
-        if not group_key:
-            # Defensive: reels without an identifiable video identity stay
-            # in their merged-order position via a stable rank sentinel.
-            unkeyed.append(reel)
-            continue
-        if group_key not in grouped:
-            grouped[group_key] = []
-            group_first_rank[group_key] = idx
-        grouped[group_key].append(reel)
-        try:
-            score = float(reel.get("score") or 0.0)
-        except (TypeError, ValueError):
-            score = 0.0
-        if score > group_best_score.get(group_key, float("-inf")):
-            group_best_score[group_key] = score
-            group_best_created_at[group_key] = str(reel.get("created_at") or "")
-
-    # Order groups by best score (desc), then by first-merged-rank (asc)
-    # as a deterministic tiebreak — preserving the original cross-batch
-    # ordering when scores are tied or absent.
-    ordered_groups = sorted(
-        grouped.keys(),
-        key=lambda k: (
-            -group_best_score.get(k, 0.0),
-            group_first_rank.get(k, 0),
-        ),
-    )
-    regrouped: list[dict[str, Any]] = []
-    for group_key in ordered_groups:
-        # Within each group, play reels in chronological order so a
-        # multi-part clip's narrative (part 1 → 2 → 3) stays intact.
-        group_reels = sorted(
-            grouped[group_key],
-            key=lambda r: (
-                float(r.get("t_start") or 0.0),
-                float(r.get("t_end") or 0.0),
-            ),
-        )
-        regrouped.extend(group_reels)
-    # Append any reels we couldn't group (missing video identity) at the
-    # tail, preserving their merged order.
-    regrouped.extend(unkeyed)
-    return regrouped
+    return merged
 
 
 def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
@@ -3281,6 +3211,8 @@ def _extend_active_generation(
     on_reel_created: Callable[[dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
     multi_platform_search: bool = False,
+    knowledge_level_override: str | None = None,
+    learner_id: str = LEGACY_LEARNER_ID,
 ) -> dict[str, Any]:
     if should_cancel is not None and should_cancel():
         raise GenerationCancelledError("Generation cancelled.")
@@ -3318,6 +3250,8 @@ def _extend_active_generation(
         on_reel_created=on_reel_created,
         should_cancel=should_cancel,
         multi_platform_search=multi_platform_search,
+        knowledge_level_override=knowledge_level_override,
+        learner_id=learner_id,
     )
 
     if _count_generation_reels(conn, next_generation_id) <= 0:
@@ -3341,6 +3275,7 @@ def _extend_active_generation(
             exclude_video_ids=exclude_video_ids,
             page=page_hint,
             limit=max(5, min(25, required_count)),
+            learner_id=learner_id,
         )
         response_payload = _build_generation_response_payload(
             reels=fallback_reels,
@@ -3379,6 +3314,7 @@ def _extend_active_generation(
         exclude_video_ids=exclude_video_ids,
         page=page_hint,
         limit=max(5, min(25, required_count)),
+        learner_id=learner_id,
     )
     job_row = _queue_refinement_if_needed(
         conn,
@@ -3399,6 +3335,8 @@ def _extend_active_generation(
         page_hint=page_hint,
         page_size_hint=max(5, min(25, required_count)),
         multi_platform_search=multi_platform_search,
+        knowledge_level_override=knowledge_level_override,
+        learner_id=learner_id,
     )
     response_payload = _build_generation_response_payload(
         reels=expanded_reels,
@@ -3432,6 +3370,8 @@ def _ranked_request_reels(
     exclude_video_ids: list[str] | None = None,
     page: int = 1,
     limit: int = 5,
+    learner_id: str = LEGACY_LEARNER_ID,
+    exclude_reel_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     try:
         material_row = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
@@ -3456,6 +3396,7 @@ def _ranked_request_reels(
                 fast_mode=fast_mode,
                 generation_id=current_generation_id,
                 page_hint=page,
+                learner_id=learner_id,
             )
             for current_generation_id in generation_ids
             if current_generation_id
@@ -3468,6 +3409,7 @@ def _ranked_request_reels(
             fast_mode=fast_mode,
             generation_id=generation_id,
             page_hint=page,
+            learner_id=learner_id,
         )
     excluded_video_id_set = {
         _bare_video_id(video_id)
@@ -3478,6 +3420,33 @@ def _ranked_request_reels(
         ranked = [
             reel for reel in ranked
             if _bare_video_id(reel.get("video_id")) not in excluded_video_id_set
+        ]
+    previous_video_id = ""
+    ordered_excluded_reel_ids = [
+        str(reel_id) for reel_id in (exclude_reel_ids or []) if str(reel_id)
+    ]
+    if ordered_excluded_reel_ids:
+        current_reel_id = ordered_excluded_reel_ids[-1]
+        previous_video_id = next(
+            (
+                str(reel.get("video_id") or "")
+                for reel in ranked
+                if str(reel.get("reel_id") or "") == current_reel_id
+            ),
+            "",
+        )
+        if not previous_video_id:
+            current_reel = fetch_one(
+                conn,
+                "SELECT video_id FROM reels WHERE id = ? AND material_id = ?",
+                (current_reel_id, material_id),
+            )
+            previous_video_id = str((current_reel or {}).get("video_id") or "")
+    excluded_reel_id_set = set(ordered_excluded_reel_ids)
+    if excluded_reel_id_set:
+        ranked = [
+            reel for reel in ranked
+            if str(reel.get("reel_id") or "") not in excluded_reel_id_set
         ]
 
     unique_vids = {
@@ -3501,7 +3470,7 @@ def _ranked_request_reels(
         ]
 
     if page <= 1:
-        return _shape_request_page_reels(
+        shaped = _shape_request_page_reels(
             ranked,
             page=page,
             limit=limit,
@@ -3512,6 +3481,13 @@ def _ranked_request_reels(
             target_clip_duration_sec=target_clip_duration_sec,
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
+        )
+        return reel_service.adaptive_curriculum_order(
+            conn,
+            material_id,
+            learner_id,
+            shaped,
+            previous_video_id=previous_video_id,
         )
 
     cumulative_batches: list[list[dict[str, Any]]] = []
@@ -3536,7 +3512,13 @@ def _ranked_request_reels(
                 target_clip_duration_max_sec=target_clip_duration_max_sec,
             )
         )
-    return _merge_request_reel_lists(*cumulative_batches)
+    return reel_service.adaptive_curriculum_order(
+        conn,
+        material_id,
+        learner_id,
+        _merge_request_reel_lists(*cumulative_batches),
+        previous_video_id=previous_video_id,
+    )
 
 
 def _build_generation_response_payload(
@@ -3589,6 +3571,15 @@ def _parse_excluded_video_ids_param(raw_value: str | None) -> list[str]:
     if len(normalized) > 500:
         normalized = normalized[-500:]
     return normalized
+
+
+def _parse_excluded_reel_ids_param(raw_value: str | None) -> list[str]:
+    if not raw_value:
+        return []
+    if len(raw_value) > 32_000:
+        raw_value = raw_value[:32_000]
+    normalized = _normalize_excluded_video_ids(raw_value.split(","))
+    return normalized[:200]
 
 
 def _short_debug_token(value: str | None, *, limit: int = 12) -> str | None:
@@ -3927,6 +3918,8 @@ def _build_refinement_request_params(
     stage_exhausted: dict[str, bool] | None = None,
     growth_reason: str | None = None,
     multi_platform_search: bool = False,
+    knowledge_level_override: str | None = None,
+    learner_id: str = LEGACY_LEARNER_ID,
 ) -> dict[str, Any]:
     safe_required_count = max(1, int(required_count or 1))
     safe_page_hint = max(1, int(page_hint or 1))
@@ -3960,6 +3953,8 @@ def _build_refinement_request_params(
         "target_clip_duration_min_sec": target_clip_duration_min_sec,
         "target_clip_duration_max_sec": target_clip_duration_max_sec,
         "multi_platform_search": bool(multi_platform_search),
+        "knowledge_level_override": knowledge_level_override,
+        "learner_id": str(learner_id or LEGACY_LEARNER_ID),
         "required_reel_count": safe_required_count,
         "inventory_target_count": inventory_target_count,
         "target_reel_count": target_reel_count,
@@ -4041,6 +4036,8 @@ def _queue_refinement_if_needed(
     stage_exhausted: dict[str, bool] | None = None,
     growth_reason: str | None = None,
     multi_platform_search: bool = False,
+    knowledge_level_override: str | None = None,
+    learner_id: str = LEGACY_LEARNER_ID,
 ) -> dict[str, Any] | None:
     if not generation_id:
         return None
@@ -4102,6 +4099,8 @@ def _queue_refinement_if_needed(
             stage_exhausted=normalized_stage_exhausted,
             growth_reason=growth_reason,
             multi_platform_search=multi_platform_search,
+            knowledge_level_override=knowledge_level_override,
+            learner_id=learner_id,
         ),
     )
 
@@ -4246,6 +4245,12 @@ def _run_refinement_job(job_id: str) -> None:
             safe_no_new_windows_passes = max(0, int(request_params.get("no_new_windows_passes") or 0))
             safe_no_new_visible_reels_passes = max(0, int(request_params.get("no_new_visible_reels_passes") or 0))
             safe_multi_platform_search = bool(request_params.get("multi_platform_search", False))
+            knowledge_level_override = str(
+                request_params.get("knowledge_level_override") or ""
+            ).strip() or None
+            learner_id = str(
+                request_params.get("learner_id") or LEGACY_LEARNER_ID
+            ).strip() or LEGACY_LEARNER_ID
             safe_required_reel_count = max(1, int(request_params.get("required_reel_count") or request_params.get("target_reel_count") or 1))
             source_reel_count = int(source_generation.get("reel_count") or 0)
             inventory_target_count = max(
@@ -4278,6 +4283,7 @@ def _run_refinement_job(job_id: str) -> None:
                 target_clip_duration_max_sec=safe_target_clip_max_sec,
                 page=safe_target_page,
                 limit=safe_page_size_hint,
+                learner_id=learner_id,
             )
             source_visible_keys = _visible_reel_clip_keys(source_visible_reels)
             _publish_progress_event(
@@ -4308,6 +4314,8 @@ def _run_refinement_job(job_id: str) -> None:
                 page_hint=safe_target_page,
                 recovery_stage=safe_recovery_stage,
                 multi_platform_search=safe_multi_platform_search,
+                knowledge_level_override=knowledge_level_override,
+                learner_id=learner_id,
             )
             _publish_progress_event(
                 "stage_end",
@@ -4438,6 +4446,7 @@ def _run_refinement_job(job_id: str) -> None:
             target_clip_duration_max_sec=safe_target_clip_max_sec,
             page=safe_target_page,
             limit=safe_page_size_hint,
+            learner_id=learner_id,
         )
         merged_visible_keys = _visible_reel_clip_keys(merged_reels)
         new_visible_reels: list[dict[str, Any]] = []
@@ -4497,6 +4506,8 @@ def _ensure_generation_for_request(
     emit_existing_reels: bool = False,
     should_cancel: Callable[[], bool] | None = None,
     multi_platform_search: bool = False,
+    knowledge_level_override: str | None = None,
+    learner_id: str = LEGACY_LEARNER_ID,
 ) -> dict[str, Any]:
     if should_cancel is not None and should_cancel():
         raise GenerationCancelledError("Generation cancelled.")
@@ -4541,6 +4552,7 @@ def _ensure_generation_for_request(
             exclude_video_ids=normalized_excluded_video_ids,
             page=page_hint,
             limit=max(page_size_hint, min(25, required_count)),
+            learner_id=learner_id,
         )
         active_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
         active_job = _queue_refinement_if_needed(
@@ -4562,6 +4574,8 @@ def _ensure_generation_for_request(
             page_hint=page_hint,
             page_size_hint=max(1, int(page_size_hint or 1)),
             multi_platform_search=multi_platform_search,
+            knowledge_level_override=knowledge_level_override,
+            learner_id=learner_id,
         )
         if emit_existing_reels and on_reel_created is not None:
             for reel in active_reels[: max(1, required_count)]:
@@ -4597,6 +4611,8 @@ def _ensure_generation_for_request(
                     on_reel_created=on_reel_created,
                     should_cancel=should_cancel,
                     multi_platform_search=multi_platform_search,
+                    knowledge_level_override=knowledge_level_override,
+                    learner_id=learner_id,
                 )
         if (
             len(active_reels) >= required_count
@@ -4655,6 +4671,8 @@ def _ensure_generation_for_request(
         on_reel_created=on_reel_created,
         should_cancel=should_cancel,
         multi_platform_search=multi_platform_search,
+        knowledge_level_override=knowledge_level_override,
+        learner_id=learner_id,
     )
     filtered = _ranked_request_reels(
         conn,
@@ -4669,6 +4687,7 @@ def _ensure_generation_for_request(
         exclude_video_ids=normalized_excluded_video_ids,
         page=page_hint,
         limit=max(page_size_hint, min(25, required_count)),
+        learner_id=learner_id,
     )
 
     response_profile = "bootstrap"
@@ -4702,6 +4721,8 @@ def _ensure_generation_for_request(
             on_reel_created=on_reel_created,
             should_cancel=should_cancel,
             multi_platform_search=multi_platform_search,
+            knowledge_level_override=knowledge_level_override,
+            learner_id=learner_id,
         )
         filtered = _ranked_request_reels(
             conn,
@@ -4714,6 +4735,7 @@ def _ensure_generation_for_request(
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
             exclude_video_ids=normalized_excluded_video_ids,
+            learner_id=learner_id,
         )
         if filtered:
             response_profile = "bootstrap_then_deep"
@@ -4739,6 +4761,7 @@ def _ensure_generation_for_request(
                 target_clip_duration_min_sec=target_clip_duration_min_sec,
                 target_clip_duration_max_sec=target_clip_duration_max_sec,
                 exclude_video_ids=normalized_excluded_video_ids,
+                learner_id=learner_id,
             )
         active_job = _fetch_refinement_job_for_generation(conn, str((active_generation or {}).get("id") or ""))
         response_payload = _build_generation_response_payload(
@@ -4784,6 +4807,8 @@ def _ensure_generation_for_request(
         page_hint=1,
         page_size_hint=max(1, int(page_size_hint or 1)),
         multi_platform_search=multi_platform_search,
+        knowledge_level_override=knowledge_level_override,
+        learner_id=learner_id,
     )
     response_payload = _build_generation_response_payload(
         reels=filtered,
@@ -5000,6 +5025,21 @@ def _try_get_community_account(conn: Any, request: Request) -> dict[str, object]
         return _require_authenticated_community_account(conn, request)
     except HTTPException:
         return None
+
+
+def _resolve_learner_identity(
+    conn: Any, request: Request, *, required: bool = True,
+) -> str | None:
+    """Prefer an authenticated account; otherwise use the hashed owner key."""
+    account = _try_get_community_account(conn, request)
+    if account and account.get("id"):
+        return f"account:{account['id']}"
+    owner_hash = _community_owner_hash_from_request_optional(request)
+    if owner_hash:
+        return f"owner:{owner_hash}"
+    if required:
+        raise HTTPException(status_code=401, detail="Missing client identity header.")
+    return None
 
 
 def _serialize_community_history_item(row: dict) -> CommunityHistoryItemOut:
@@ -5716,6 +5756,7 @@ async def create_material(
     created_at = now_iso()
 
     with get_conn() as conn:
+        learner_id = _resolve_learner_identity(conn, request, required=False)
         concept_limit = 6 if SERVERLESS_MODE else 12
         concepts, objectives = material_intelligence_service.extract_concepts_and_objectives(
             conn,
@@ -5781,6 +5822,8 @@ async def create_material(
                         "created_at": created_at,
                     },
                 )
+        if learner_id:
+            reel_service.learner_progress(conn, material_id, learner_id)
 
     return {
         "material_id": material_id,
@@ -5789,18 +5832,23 @@ async def create_material(
 
 
 @app.patch("/api/materials/{material_id}/level")
-def update_material_level(material_id: str, payload: MaterialLevelUpdateRequest):
+def update_material_level(material_id: str, request: Request, payload: MaterialLevelUpdateRequest):
     from .services.knowledge_level import effective_level_target
     with get_conn(transactional=True) as conn:
         row = fetch_one(conn, "SELECT id FROM materials WHERE id = ? LIMIT 1", (material_id,))
         if not row:
             raise HTTPException(status_code=404, detail="material not found")
-        # Explicit choice supersedes accumulated drift.
-        execute_modify(
-            conn,
-            "UPDATE materials SET knowledge_level = ?, level_adjustment = 0.0 WHERE id = ?",
-            (payload.knowledge_level, material_id),
-        )
+        learner_id = _resolve_learner_identity(conn, request, required=False)
+        if learner_id:
+            reel_service.set_learner_level(conn, material_id, learner_id, payload.knowledge_level)
+        else:
+            # Compatibility for pre-personalization clients: their PATCH request
+            # carried no identity, so retain the old material-default behavior.
+            execute_modify(
+                conn,
+                "UPDATE materials SET knowledge_level = ?, level_adjustment = 0.0 WHERE id = ?",
+                (payload.knowledge_level, material_id),
+            )
     return {
         "knowledge_level": payload.knowledge_level,
         "effective_level_target": effective_level_target(payload.knowledge_level, 0.0),
@@ -5831,6 +5879,9 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
             # iOS/web clients should prefer HTTP 404 + this marker over
             # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
+        learner_id = _resolve_learner_identity(conn, request)
+        learner_progress = reel_service.learner_progress(conn, payload.material_id, learner_id)
+        learner_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
 
         effective_generation_mode: Literal["slow", "fast"] = "fast" if SERVERLESS_MODE else payload.generation_mode
         try:
@@ -5851,6 +5902,8 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 exclude_video_ids=payload.exclude_video_ids,
                 page_hint=1,
                 multi_platform_search=payload.multi_platform_search,
+                knowledge_level_override=learner_knowledge_level,
+                learner_id=learner_id,
             )
         except IngestRateLimitedError as e:
             # Clip-engine per-platform rate limiter tripped → 429 + Retry-After.
@@ -6144,6 +6197,9 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
             # iOS/web clients should prefer HTTP 404 + this marker over
             # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
+        learner_id = _resolve_learner_identity(conn, request)
+        learner_progress = reel_service.learner_progress(conn, payload.material_id, learner_id)
+        learner_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
 
     effective_generation_mode: Literal["slow", "fast"] = "fast" if SERVERLESS_MODE else payload.generation_mode
 
@@ -6207,6 +6263,8 @@ async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest)
                         emit_existing_reels=True,
                         should_cancel=should_cancel_or_deadline,
                         multi_platform_search=payload.multi_platform_search,
+                        knowledge_level_override=learner_knowledge_level,
+                        learner_id=learner_id,
                     )
                 emit_event(
                     {
@@ -6770,10 +6828,10 @@ def feed(
     target_clip_duration_min_sec: int | None = None,
     target_clip_duration_max_sec: int | None = None,
     exclude_video_ids: str = "",
+    exclude_reel_ids: str = "",
 ):
     from .services.knowledge_level import effective_level_target as _effective_level_target
 
-    _require_community_client_identity(request)
     _enforce_rate_limit(request, "feed", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
     if page < 1:
         page = 1
@@ -6791,7 +6849,7 @@ def feed(
         prefetch = 30
 
     with get_conn() as conn:
-        material = fetch_one(conn, "SELECT id, knowledge_level, level_adjustment FROM materials WHERE id = ?", (material_id,))
+        material = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
         if not material:
             # Keep the string detail form so existing deployed clients that
             # substring-match on "material_id not found" continue to work.
@@ -6799,10 +6857,12 @@ def feed(
             # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
 
+        learner_id = _resolve_learner_identity(conn, request)
+        learner_progress = reel_service.learner_progress(conn, material_id, learner_id)
         try:
-            _mat_knowledge_level = str(material["knowledge_level"] or "beginner")
+            _mat_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
             _mat_effective_level = _effective_level_target(
-                _mat_knowledge_level, float(material["level_adjustment"] or 0.0)
+                _mat_knowledge_level, float(learner_progress.get("global_adjustment") or 0.0)
             )
         except ValueError:
             # Corrupt stored level: report beginner semantics instead of a 500,
@@ -6822,6 +6882,7 @@ def feed(
         effective_generation_mode = "fast" if fast_mode else "slow"
         safe_min_relevance = _normalize_min_relevance(min_relevance)
         normalized_excluded_video_ids = _parse_excluded_video_ids_param(exclude_video_ids)
+        normalized_excluded_reel_ids = _parse_excluded_reel_ids_param(exclude_reel_ids)
         safe_video_pool_mode = _normalize_video_pool_mode(video_pool_mode)
         safe_video_duration_pref = _normalize_preferred_video_duration(preferred_video_duration)
         safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
@@ -6861,6 +6922,8 @@ def feed(
             exclude_video_ids=normalized_excluded_video_ids,
             page=page,
             limit=limit,
+            learner_id=learner_id,
+            exclude_reel_ids=normalized_excluded_reel_ids,
         )
         response_profile = str((active_generation or {}).get("retrieval_profile") or "") or None
         refinement_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
@@ -6922,6 +6985,8 @@ def feed(
                 min_relevance=safe_min_relevance,
                 page_hint=page,
                 page_size_hint=limit,
+                knowledge_level_override=_mat_knowledge_level,
+                learner_id=learner_id,
             )
     total = len(filtered_ranked)
     start = (page - 1) * limit
@@ -6967,12 +7032,12 @@ def chat(request: Request, payload: ChatRequest):
 
 @app.post("/api/reels/feedback", response_model=FeedbackResponse)
 def feedback(request: Request, payload: FeedbackRequest):
-    _require_community_client_identity(request)
     _enforce_rate_limit(request, "feedback", limit=FEEDBACK_RATE_LIMIT_PER_WINDOW)
     clean_reel_id = str(payload.reel_id or "").strip()
     if not clean_reel_id or len(clean_reel_id) > 128:
         raise HTTPException(status_code=400, detail="Invalid reel_id.")
     with get_conn(transactional=True) as conn:
+        learner_id = _resolve_learner_identity(conn, request)
         # Existence check + write under a single transaction so a concurrent
         # delete of the reel can't race us into writing an orphan feedback row.
         exists = fetch_one(
@@ -6990,6 +7055,7 @@ def feedback(request: Request, payload: FeedbackRequest):
             confusing=payload.confusing,
             rating=payload.rating,
             saved=payload.saved,
+            learner_id=learner_id,
         )
 
     return {"status": "ok", "reel_id": clean_reel_id}

@@ -81,6 +81,72 @@ class RankedExclusionNormalizationTests(unittest.TestCase):
             "both the bare legacy row and the prefixed clip-engine row must be excluded",
         )
 
+    def test_reel_exclusion_keeps_other_clips_from_same_source(self) -> None:
+        ranked = [
+            {"video_id": "yt:SAMEVIDEO1", "reel_id": "r-watched", "t_start": 10.0, "t_end": 30.0},
+            {"video_id": "yt:SAMEVIDEO1", "reel_id": "r-sibling", "t_start": 40.0, "t_end": 60.0},
+        ]
+        with (
+            mock.patch.object(main_module.reel_service, "ranked_feed", return_value=ranked),
+            mock.patch.object(main_module, "is_video_alive", return_value=True),
+            mock.patch.object(main_module, "_shape_request_page_reels", side_effect=lambda r, **kw: r),
+            db_module.get_conn() as conn,
+        ):
+            result = main_module._ranked_request_reels(
+                conn,
+                material_id="mat-excl",
+                fast_mode=False,
+                generation_id=None,
+                min_relevance=None,
+                preferred_video_duration="any",
+                target_clip_duration_sec=45,
+                target_clip_duration_min_sec=None,
+                target_clip_duration_max_sec=None,
+                exclude_reel_ids=["r-watched"],
+                page=1,
+                limit=5,
+            )
+        self.assertEqual([row["reel_id"] for row in result], ["r-sibling"])
+
+    def test_reel_exclusion_anchors_tail_to_current_source(self) -> None:
+        ranked = [
+            {"video_id": "yt:CURRENT001", "reel_id": "r-current", "t_start": 10.0, "t_end": 30.0},
+            {"video_id": "yt:CURRENT001", "reel_id": "r-sibling", "t_start": 40.0, "t_end": 60.0},
+            {"video_id": "yt:OTHER00001", "reel_id": "r-other", "t_start": 10.0, "t_end": 30.0},
+        ]
+        with (
+            mock.patch.object(main_module.reel_service, "ranked_feed", return_value=ranked),
+            mock.patch.object(
+                main_module.reel_service,
+                "adaptive_curriculum_order",
+                side_effect=lambda conn, material_id, learner_id, rows, **kwargs: rows,
+            ) as adaptive_order,
+            mock.patch.object(main_module, "is_video_alive", return_value=True),
+            mock.patch.object(main_module, "_shape_request_page_reels", side_effect=lambda r, **kw: r),
+            db_module.get_conn() as conn,
+        ):
+            result = main_module._ranked_request_reels(
+                conn,
+                material_id="mat-excl",
+                fast_mode=False,
+                generation_id=None,
+                min_relevance=None,
+                preferred_video_duration="any",
+                target_clip_duration_sec=45,
+                target_clip_duration_min_sec=None,
+                target_clip_duration_max_sec=None,
+                exclude_reel_ids=["r-current"],
+                page=1,
+                limit=5,
+            )
+        self.assertEqual([row["reel_id"] for row in result], ["r-sibling", "r-other"])
+        self.assertEqual(adaptive_order.call_args.kwargs["previous_video_id"], "yt:CURRENT001")
+
+    def test_reel_exclusion_parser_is_exact_deduped_and_capped(self) -> None:
+        values = [f"r-{index}" for index in range(205)]
+        parsed = main_module._parse_excluded_reel_ids_param(",".join([*values, "r-1"]))
+        self.assertEqual(parsed, values[:200])
+
 
 if __name__ == "__main__":
     unittest.main()

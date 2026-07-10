@@ -1,4 +1,4 @@
-"""Gemini-segment clip engine (opt-in, ``clip_engine="gemini"``).
+"""ReelAI's one-pass Gemini educational clip selector.
 
 A single Gemini pass reads the timestamped supadata transcript and returns every
 substantive teaching topic as a clip {title, start, end}. No punctuation restoration,
@@ -6,10 +6,8 @@ no structure understanding, no local-Whisper refine, no multimodal — the whole
 ``understand → assemble → refine`` chain is replaced by one comprehension call.
 
 Boundaries: the model picks a start/end transcript LINE (a real caption-chunk with a
-real timestamp) plus a short opening/closing QUOTE. When SEGMENT_FINE_SNAP is on we
-locate the quote in supadata's per-word (interpolated) times to tighten the cut past
-the ~chunk granularity; otherwise we use the chunk edge. Overlaps are trimmed
-deterministically so no two clips share footage.
+real timestamp) plus a short opening/closing QUOTE. Quote matching supplies the
+semantic boundary; nearby caption gaps provide a cheap, audio-free pause boundary.
 """
 from __future__ import annotations
 
@@ -31,22 +29,19 @@ class _Topic(BaseModel):
     title: str
     start_line: int
     end_line: int
-    start_quote: str = ""      # first few words of the topic (for fine-snapping the start)
-    end_quote: str = ""        # last few words of the topic (for fine-snapping the end)
+    start_quote: str
+    end_quote: str
     reason: str = ""
     facet: str = "other"
-    kind: str = "content"      # content|intro|outro|admin|promo — only content ships
-    informativeness: float = 0.5  # 0..1, how much a motivated student learns
+    kind: Optional[str] = None
+    informativeness: Optional[float] = None
+    topic_relevance: Optional[float] = None
+    self_contained: Optional[bool] = None
     difficulty: float = 0.5   # 0 = assumes no prior knowledge, 1 = expert-level
 
 
-# Segment kinds that never ship (structural/filler, not teaching). Includes
-# near-miss labels the model may emit despite the prompt's enum.
-_DROP_KINDS = {
-    "intro", "introduction", "greeting", "outro", "admin", "housekeeping",
-    "announcement", "promo", "promotion", "sponsor", "sponsorship",
-    "ad", "ads", "advertisement", "filler",
-}
+# Only explicitly educational kinds ship; missing and novel labels fail closed.
+_ACCEPT_KINDS = {"content", "educational"}
 
 
 def _norm_informativeness(value: float) -> float:
@@ -58,6 +53,12 @@ def _norm_informativeness(value: float) -> float:
     elif v > 1.0:
         v = v / 10.0
     return max(0.0, min(1.0, v))
+
+
+def _norm_optional_confidence(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    return _norm_informativeness(value)
 
 
 class _Plan(BaseModel):
@@ -86,21 +87,24 @@ def _prompts(lines: str, n: int, topic: str = "") -> "tuple[str, str]":
         "For every clip return: title; start_line (the line where the idea is INTRODUCED); "
         "end_line (the line where it CLOSES); start_quote (the first ~6 words spoken at the "
         "start, copied verbatim from that line); end_quote (the last ~6 words, verbatim); a "
-        "short reason; kind — one of content|intro|outro|admin|promo (only 'content' ships); "
+        "short reason; kind — one of content|educational|intro|outro|admin|promo; "
         "informativeness — 0.0 to 1.0, how much a motivated student learns from this clip "
-        "ALONE (0.9+: a complete idea taught well; ~0.5: partial value; <0.5: little value); "
+        "ALONE; topic_relevance — 0.0 to 1.0, how directly it teaches the viewer's topic; "
+        "self_contained — true only when it makes sense without omitted context; "
         "difficulty — 0.0 to 1.0, the prior knowledge the clip ASSUMES (0.1: no background, "
         "first exposure; 0.5: comfortable with the basics; 0.9: graduate/expert material). "
         "Rules: (1) a clip must START at the beginning of the idea and END at its end — "
-        "never mid-thought; (2) clips must NOT overlap — each line belongs to at most one "
-        "clip; (3) go in chronological order; (4) prefer TIGHT clips of roughly 20-70 "
-        "seconds — one idea, not a whole chapter; (5) line indices range from 0 to "
+        "never mid-thought; (2) contextual overlap is allowed when two complete ideas share "
+        "setup; (3) go in chronological order; (4) prefer complete clips of 20-90 seconds. "
+        "Split longer sections into complete subtopics. A complete clip may be up to 180 "
+        "seconds, but never force or truncate a longer section; (5) line indices range from 0 to "
         f"{n - 1} — never exceed {n - 1}."
     )
     user = (
         f"Transcript ({n} lines, each formatted `[index] MM:SS text`):\n\n" + lines +
         "\n\nReturn every substantive teaching clip as {title, start_line, end_line, "
-        "start_quote, end_quote, reason, facet, kind, informativeness, difficulty}."
+        "start_quote, end_quote, reason, facet, kind, informativeness, topic_relevance, "
+        "self_contained, difficulty}."
     )
     return system, user
 
@@ -145,26 +149,63 @@ def _locate_quote(words: list[dict], quote: str, lo_t: float, hi_t: float,
     return best_t if best_score >= 70 else None
 
 
+def _caption_gap_boundary(
+    segs: list[dict], semantic_time: float, *, direction: str,
+    min_gap_s: float = 0.25, max_move_s: float = 2.0,
+) -> float:
+    """Move outward to the nearest qualifying caption-gap midpoint."""
+    candidates: list[float] = []
+    for left, right in zip(segs, segs[1:]):
+        gap_start = float(left.get("end", 0.0))
+        gap_end = float(right.get("start", gap_start))
+        if gap_end - gap_start < min_gap_s:
+            continue
+        midpoint = (gap_start + gap_end) / 2.0
+        delta = semantic_time - midpoint if direction == "start" else midpoint - semantic_time
+        if -1e-9 <= delta <= max_move_s + 1e-9:
+            candidates.append(midpoint)
+    if not candidates:
+        return semantic_time
+    if direction == "start":
+        return max(candidates)
+    return min(candidates)
+
+
+def _near_duplicate(a: dict, b: dict, threshold: float = 0.8) -> bool:
+    overlap = min(float(a["end"]), float(b["end"])) - max(float(a["start"]), float(b["start"]))
+    if overlap <= 0:
+        return False
+    shorter = min(float(a["end"]) - float(a["start"]), float(b["end"]) - float(b["start"]))
+    return shorter > 0 and overlap / shorter >= threshold
+
+
 # ── plan → clips ─────────────────────────────────────────────────────────────
 def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
                    settings: dict) -> list[dict]:
     n = len(segs)
     fine = settings.get("segment_fine_snap")
     fine = config.SEGMENT_FINE_SNAP if fine is None else bool(fine)
-    min_s = float(settings.get("segment_min_clip_s") or config.SEGMENT_MIN_CLIP_S)
-    max_s = float(settings.get("segment_max_clip_s") or config.SEGMENT_MAX_CLIP_S)
+    min_s = 1.0
+    max_s = 180.0
     info_min = settings.get("segment_informativeness_min")
-    info_min = config.SEGMENT_INFORMATIVENESS_MIN if info_min is None else float(info_min)
-    tail_pad = float(settings.get("tail_pad_s", config.DEFAULTS["tail_pad_s"]))
+    info_min = max(0.6, config.SEGMENT_INFORMATIVENESS_MIN if info_min is None else float(info_min))
+    relevance_min = settings.get("segment_topic_relevance_min")
+    relevance_min = max(0.6, config.SEGMENT_TOPIC_RELEVANCE_MIN if relevance_min is None else float(relevance_min))
 
     raw: list[dict] = []
     for tp in plan.topics:
-        kind = (tp.kind or "content").strip().lower() or "content"
-        info = _norm_informativeness(tp.informativeness)
-        if kind in _DROP_KINDS:
-            continue                                  # structural/filler — never ships
-        if info < info_min:
-            continue                                  # not informative enough on its own
+        kind = (tp.kind or "").strip().lower()
+        info = _norm_optional_confidence(tp.informativeness)
+        relevance = _norm_optional_confidence(tp.topic_relevance)
+        contained = tp.self_contained
+        if kind not in _ACCEPT_KINDS:
+            continue
+        if not tp.start_quote.strip() or not tp.end_quote.strip():
+            continue
+        if info is None or relevance is None or contained is not True:
+            continue
+        if info < info_min or relevance < relevance_min:
+            continue
         a = max(0, min(int(tp.start_line), n - 1))
         b = max(a, min(int(tp.end_line), n - 1))
         start = float(segs[a]["start"])
@@ -177,66 +218,37 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
                 start = st
             if en is not None and en > start:
                 end = en
-        raw.append({"start": start, "end": end, "orig_end": end,
+        start = _caption_gap_boundary(segs, start, direction="start")
+        end = _caption_gap_boundary(segs, end, direction="end")
+        raw.append({"start": round(start, 3), "end": round(end, 3),
                     "title": (tp.title or "").strip(),
                     "facet": (tp.facet or "other").strip() or "other",
                     "reason": (tp.reason or "").strip(),
+                    "kind": kind,
                     "informativeness": info,
+                    "topic_relevance": relevance,
+                    "self_contained": True,
                     "difficulty": _norm_informativeness(tp.difficulty)})
 
-    raw.sort(key=lambda c: (c["start"], c["end"]))
-    # deterministic overlap trim: each clip starts strictly after the previous clip's end
+    eligible = [c for c in raw if min_s <= c["end"] - c["start"] <= max_s]
+    # Highest-quality member of a near-duplicate cluster wins; contextual
+    # overlap below the threshold remains untouched.
+    quality_order = sorted(
+        eligible,
+        key=lambda c: (
+            c["informativeness"] + c["topic_relevance"],
+            -(c["end"] - c["start"]),
+        ),
+        reverse=True,
+    )
     clips: list[dict] = []
-    prev_end = -1.0
-    for c in raw:
-        if c["start"] < prev_end:
-            c["start"] = prev_end
-        if c["end"] - c["start"] > max_s:
-            # Whole-chapter slab: walk the end back to the last transcript-chunk
-            # boundary within budget (the chunk-granularity analogue of the
-            # practice engine's terminator walk-back) instead of dropping the
-            # topic outright. No boundary in budget → drop below via min_s.
-            budget_end = c["start"] + max_s
-            fitted = max(
-                (float(s["end"]) for s in segs
-                 if c["start"] < float(s["end"]) <= budget_end),
-                default=c["start"],
-            )
-            c["end"] = fitted
-        if c["end"] - c["start"] < min_s:
-            continue                                  # too short after trimming — drop
-        c["cut_end"] = round(c["end"] + tail_pad, 3)
-        c["start"] = round(c["start"], 3)
-        c["end"] = round(c["end"], 3)
-        prev_end = c["end"]
-        clips.append(c)
+    for candidate in quality_order:
+        if any(_near_duplicate(candidate, kept) for kept in clips):
+            continue
+        clips.append(candidate)
+    clips.sort(key=lambda c: (c["start"], c["end"]))
 
-    if not clips and raw:
-        # Every kind/informativeness survivor died on duration fitting — ship the
-        # single most informative one trimmed to budget rather than zeroing out a
-        # paid video (mirrors practice's low-confidence selection backstop).
-        # NOTE: the loop above mutates raw entries in place; orig_end preserves
-        # the model's chosen end.
-        best = max(raw, key=lambda c: c.get("informativeness", 0.0))
-        start = float(best["start"])
-        target_end = float(best.get("orig_end", best["end"]))
-        budget_end = start + max_s
-        if target_end > budget_end:
-            # chunk boundary within budget if one exists, else hard-cut at budget
-            target_end = max(
-                (float(s["end"]) for s in segs
-                 if start < float(s["end"]) <= budget_end),
-                default=budget_end,
-            )
-        if target_end - start >= min_s:
-            best = dict(best)
-            best["start"] = round(start, 3)
-            best["end"] = round(target_end, 3)
-            best["cut_end"] = round(target_end + tail_pad, 3)
-            best["low_confidence"] = True
-            clips = [best]
-
-    max_clips = int(settings.get("max_clips") or config.SEGMENT_MAX_CLIPS)
+    max_clips = min(40, int(settings.get("max_clips") or config.SEGMENT_MAX_CLIPS))
     clips = clips[:max_clips]
     for i, c in enumerate(clips):
         c["sequence_index"] = i + 1

@@ -246,6 +246,83 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertEqual(first["video_id"], VIDEO_ID)
         self.assertTrue(first["video_url"].startswith(f"https://www.youtube.com/embed/{VIDEO_ID}"))
 
+    def test_learner_level_override_reaches_discovery(self) -> None:
+        search, _run = self._patched_engine(_multi_clip_engine_out())
+        with db_module.get_conn() as conn:
+            main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=CONCEPT_ID,
+                num_reels=1,
+                creative_commons_only=False,
+                generation_id="gen-level-override",
+                knowledge_level_override="advanced",
+            )
+        self.assertEqual(search.discover.call_args.kwargs.get("level"), "advanced")
+
+    def test_concept_priority_uses_only_current_learner_feedback(self) -> None:
+        other_concept_id = "concept-t4-other"
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute(
+                "INSERT INTO concepts (id, material_id, title, keywords_json, summary, embedding_json, created_at) "
+                "VALUES (?, ?, 'ATP', '[]', '', NULL, '2026-07-06T00:01:00+00:00')",
+                (other_concept_id, MATERIAL_ID),
+            )
+            for reel_id, concept_id, video_id in (
+                ("reel-priority-primary", CONCEPT_ID, "video-priority-primary"),
+                ("reel-priority-other", other_concept_id, "video-priority-other"),
+            ):
+                conn.execute(
+                    "INSERT INTO videos (id, title, channel_title, duration_sec, created_at) "
+                    "VALUES (?, ?, 'channel', 300, '2026-07-06T00:01:00+00:00')",
+                    (video_id, video_id),
+                )
+                conn.execute(
+                    "INSERT INTO reels "
+                    "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+                    "transcript_snippet, takeaways_json, base_score, created_at) "
+                    "VALUES (?, ?, ?, ?, '', 0, 30, '', '[]', 1.0, '2026-07-06T00:02:00+00:00')",
+                    (reel_id, MATERIAL_ID, concept_id, video_id),
+                )
+
+            for learner_id, primary_helpful in (
+                ("owner:learner-a", True),
+                ("owner:learner-b", False),
+            ):
+                main_module.reel_service.record_feedback(
+                    conn,
+                    "reel-priority-primary",
+                    helpful=primary_helpful,
+                    confusing=not primary_helpful,
+                    rating=3,
+                    saved=False,
+                    learner_id=learner_id,
+                )
+                main_module.reel_service.record_feedback(
+                    conn,
+                    "reel-priority-other",
+                    helpful=not primary_helpful,
+                    confusing=primary_helpful,
+                    rating=3,
+                    saved=False,
+                    learner_id=learner_id,
+                )
+
+            concepts = db_module.fetch_all(
+                conn,
+                "SELECT * FROM concepts WHERE material_id = ? ORDER BY created_at, id",
+                (MATERIAL_ID,),
+            )
+            learner_a = main_module.reel_service._order_concepts(
+                conn, MATERIAL_ID, concepts, "owner:learner-a"
+            )
+            learner_b = main_module.reel_service._order_concepts(
+                conn, MATERIAL_ID, concepts, "owner:learner-b"
+            )
+
+        self.assertEqual([item["id"] for item in learner_a], [other_concept_id, CONCEPT_ID])
+        self.assertEqual([item["id"] for item in learner_b], [CONCEPT_ID, other_concept_id])
+
     # ------------------------------------------------------------------ #
     # RAW-PRACTICE: num_reels no longer truncates PERSISTENCE — a 2-clip video
     # with num_reels=1 persists BOTH clips; only the RESPONSE page is shaped.
@@ -506,8 +583,8 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
             feed = main_module.reel_service.ranked_feed(conn, material_id=MATERIAL_ID, generation_id="gen-lvl")
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
-    def test_cache_version_is_7(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 7)
+    def test_cache_version_is_8(self) -> None:
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 8)
 
 
 if __name__ == "__main__":

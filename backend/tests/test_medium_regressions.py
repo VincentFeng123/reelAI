@@ -134,6 +134,31 @@ class MediumRegressionTests(unittest.TestCase):
                 difficulty REAL,
                 created_at TEXT NOT NULL DEFAULT ''
             );
+
+            CREATE TABLE learner_material_progress (
+                learner_id TEXT NOT NULL,
+                material_id TEXT NOT NULL,
+                selected_level TEXT NOT NULL DEFAULT 'beginner',
+                global_adjustment REAL NOT NULL DEFAULT 0.0,
+                difficulty_reset_at TEXT NOT NULL DEFAULT '',
+                feedback_revision INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (learner_id, material_id)
+            );
+
+            CREATE TABLE reel_feedback (
+                id TEXT NOT NULL,
+                learner_id TEXT NOT NULL DEFAULT 'legacy',
+                reel_id TEXT NOT NULL,
+                helpful INTEGER NOT NULL DEFAULT 0,
+                confusing INTEGER NOT NULL DEFAULT 0,
+                rating INTEGER,
+                saved INTEGER NOT NULL DEFAULT 0,
+                mastery_updated_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (learner_id, reel_id)
+            );
             """
         )
         conn.execute("INSERT INTO materials (id) VALUES (?)", ("material-1",))
@@ -2015,6 +2040,7 @@ class MediumRegressionTests(unittest.TestCase):
     def test_ensure_generation_queues_refinement_when_bootstrap_is_sufficient(self) -> None:
         conn = self._build_generation_test_conn()
         generate_calls: list[str] = []
+        generated_for_learners: list[str] = []
 
         def fake_generate_reels(*args, **kwargs):
             generation_id = str(kwargs["generation_id"])
@@ -2022,6 +2048,7 @@ class MediumRegressionTests(unittest.TestCase):
             retrieval_profile = str(kwargs["retrieval_profile"])
             num_reels = int(kwargs["num_reels"])
             generate_calls.append(retrieval_profile)
+            generated_for_learners.append(str(kwargs.get("learner_id") or ""))
             for index in range(num_reels):
                 conn.execute(
                     """
@@ -2045,7 +2072,7 @@ class MediumRegressionTests(unittest.TestCase):
             main_module,
             "_ranked_request_reels",
             side_effect=lambda test_conn, **kwargs: self._fake_ranked_request_reels(test_conn, kwargs["generation_id"]),
-        ), mock.patch.object(
+        ) as ranked_reels, mock.patch.object(
             main_module,
             "_queue_refinement_job",
             return_value={"id": "job-1", "status": "queued"},
@@ -2063,14 +2090,24 @@ class MediumRegressionTests(unittest.TestCase):
                 target_clip_duration_sec=55,
                 target_clip_duration_min_sec=20,
                 target_clip_duration_max_sec=55,
+                learner_id="owner:learner-a",
             )
 
         self.assertEqual(generate_calls, ["bootstrap"])
+        self.assertEqual(generated_for_learners, ["owner:learner-a"])
+        self.assertTrue(ranked_reels.call_args_list)
+        self.assertTrue(
+            all(call.kwargs.get("learner_id") == "owner:learner-a" for call in ranked_reels.call_args_list)
+        )
         self.assertEqual(result["response_profile"], "bootstrap")
         self.assertEqual(result["refinement_job_id"], "job-1")
         self.assertEqual(result["refinement_status"], "queued")
         self.assertEqual(len(result["reels"]), 2)
         queue_job.assert_called_once()
+        self.assertEqual(
+            queue_job.call_args.kwargs["request_params"]["learner_id"],
+            "owner:learner-a",
+        )
         head = conn.execute("SELECT active_generation_id FROM reel_generation_heads").fetchone()
         self.assertIsNotNone(head)
         self.assertEqual(str(head["active_generation_id"]), str(result["generation_id"]))
@@ -2084,6 +2121,7 @@ class MediumRegressionTests(unittest.TestCase):
     def test_refinement_job_excludes_source_generation_reels_from_deep_generation(self) -> None:
         conn = self._build_generation_test_conn()
         captured_excluded_generation_ids: list[str] = []
+        captured_generation_learner_ids: list[str] = []
 
         source_generation_id = "bootstrap-gen"
         conn.execute(
@@ -2132,7 +2170,7 @@ class MediumRegressionTests(unittest.TestCase):
                 source_generation_id,
                 None,
                 "deep",
-                "{}",
+                json.dumps({"learner_id": "owner:learner-a"}),
                 "queued",
                 "2026-03-13T00:01:00+00:00",
                 None,
@@ -2143,6 +2181,7 @@ class MediumRegressionTests(unittest.TestCase):
 
         def fake_generate_reels(*args, **kwargs):
             captured_excluded_generation_ids[:] = list(kwargs.get("exclude_generation_ids") or [])
+            captured_generation_learner_ids.append(str(kwargs.get("learner_id") or ""))
             generation_id = str(kwargs["generation_id"])
             conn.execute(
                 """
@@ -2162,7 +2201,7 @@ class MediumRegressionTests(unittest.TestCase):
             )
             return []
 
-        with mock.patch.object(main_module, "_ranked_request_reels", return_value=[]), mock.patch.object(
+        with mock.patch.object(main_module, "_ranked_request_reels", return_value=[]) as ranked_reels, mock.patch.object(
             main_module.reel_service,
             "generate_reels",
             side_effect=fake_generate_reels,
@@ -2182,6 +2221,11 @@ class MediumRegressionTests(unittest.TestCase):
                 main_module._run_refinement_job("job-1")
 
         self.assertEqual(captured_excluded_generation_ids, [source_generation_id])
+        self.assertEqual(captured_generation_learner_ids, ["owner:learner-a"])
+        self.assertTrue(ranked_reels.call_args_list)
+        self.assertTrue(
+            all(call.kwargs.get("learner_id") == "owner:learner-a" for call in ranked_reels.call_args_list)
+        )
         queue_refinement.assert_not_called()
         updated_job = conn.execute(
             "SELECT status, result_generation_id FROM reel_generation_jobs WHERE id = ?",
@@ -3106,7 +3150,7 @@ class MediumRegressionTests(unittest.TestCase):
 
             patched_get_conn.return_value = _Ctx()
             result = main_module.feed(
-                mock.Mock(),
+                mock.Mock(headers={main_module.COMMUNITY_OWNER_HEADER: "a" * 32}),
                 material_id="material-1",
                 page=1,
                 limit=1,
@@ -3203,7 +3247,7 @@ class MediumRegressionTests(unittest.TestCase):
 
             patched_get_conn.return_value = _Ctx()
             result = main_module.feed(
-                mock.Mock(),
+                mock.Mock(headers={main_module.COMMUNITY_OWNER_HEADER: "a" * 32}),
                 material_id="material-1",
                 page=2,
                 limit=5,
@@ -3252,7 +3296,7 @@ class MediumRegressionTests(unittest.TestCase):
 
             patched_get_conn.return_value = _Ctx()
             result = main_module.feed(
-                mock.Mock(),
+                mock.Mock(headers={main_module.COMMUNITY_OWNER_HEADER: "a" * 32}),
                 material_id="material-1",
                 page=1,
                 limit=5,
@@ -6437,6 +6481,14 @@ class MediumRegressionTests(unittest.TestCase):
             main_module,
             "_ensure_generation_for_request",
             side_effect=fake_ensure_generation,
+        ) as ensure_generation, mock.patch.object(
+            main_module,
+            "_resolve_learner_identity",
+            return_value="owner:stream-learner",
+        ), mock.patch.object(
+            main_module.reel_service,
+            "learner_progress",
+            return_value={"selected_level": "intermediate"},
         ):
             client = TestClient(main_module.app)
             response = client.post(
@@ -6459,6 +6511,14 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual(events[0]["reel"]["reel_id"], "stream-reel-1")
         self.assertEqual(events[1]["reel"]["reel_id"], "stream-reel-2")
         self.assertEqual(events[2]["response"]["generation_id"], "gen-stream")
+        self.assertEqual(
+            ensure_generation.call_args.kwargs["learner_id"],
+            "owner:stream-learner",
+        )
+        self.assertEqual(
+            ensure_generation.call_args.kwargs["knowledge_level_override"],
+            "intermediate",
+        )
         self.assertEqual(events[2]["response"]["refinement_job_id"], "job-stream")
         conn.close()
 

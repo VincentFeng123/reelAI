@@ -38,12 +38,12 @@ class TargetTests(unittest.TestCase):
 
     def test_adjustment_applied_and_clamped(self) -> None:
         self.assertAlmostEqual(effective_level_target("beginner", 0.2), 0.35)
-        # adjustment beyond the bound is clamped to ±0.35
-        self.assertAlmostEqual(effective_level_target("beginner", 9.0), 0.50)
-        self.assertAlmostEqual(effective_level_target("advanced", -9.0), 0.50)
+        # Material-wide drift is bounded to ±0.20.
+        self.assertAlmostEqual(effective_level_target("beginner", 9.0), 0.35)
+        self.assertAlmostEqual(effective_level_target("advanced", -9.0), 0.65)
 
     def test_result_clamped_to_unit_interval(self) -> None:
-        self.assertAlmostEqual(effective_level_target("advanced", 0.35), 1.0)
+        self.assertAlmostEqual(effective_level_target("advanced", 0.20), 1.0)
 
     def test_none_inputs(self) -> None:
         self.assertAlmostEqual(effective_level_target(None, None), 0.15)

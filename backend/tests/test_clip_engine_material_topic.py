@@ -333,19 +333,19 @@ class IngestTopicTests(unittest.TestCase):
         run.clip.return_value = engine_out
         return search, run
 
-    def test_over_length_clip_persists(self) -> None:
+    def test_complete_clip_through_one_eighty_persists(self) -> None:
         engine_out = {
             "video_id": "vidCCCCCCCC",
             "clips": [
                 {"start": 30.0, "end": 75.0, "cut_end": 75.0, "title": "photosynthesis in range",
                  "facet": "", "reason": "", "sequence_index": 0, "embed_url": ""},
-                {"start": 30.0, "end": 250.0, "cut_end": 250.0, "title": "photosynthesis over length",
+                {"start": 30.0, "end": 200.0, "title": "photosynthesis long complete",
                  "facet": "", "reason": "", "sequence_index": 1, "embed_url": ""},
             ],
             "transcript": {
                 "segments": [
                     {"start": 30.0, "end": 75.0, "text": "photosynthesis part in range."},
-                    {"start": 80.0, "end": 250.0, "text": "photosynthesis deep dive continues."},
+                    {"start": 80.0, "end": 200.0, "text": "photosynthesis deep dive continues."},
                 ],
                 "words": [], "duration": 600.0,
             },
@@ -360,14 +360,13 @@ class IngestTopicTests(unittest.TestCase):
             target_clip_duration_max_sec=60,
             max_videos=1,
         )
-        # RAW-PRACTICE: the 220s clip exceeds the retired 60+8 window but PERSISTS
-        # exactly as cut (not clamped) alongside the 45s clip.
+        # The 170s complete clip persists exactly as selected alongside the 45s clip.
         self.assertEqual(len(reels), 2)
         durations = sorted(round(r.t_end - r.t_start) for r in reels)
-        self.assertEqual(durations, [45, 220])
-        over = next(r for r in reels if round(r.t_end - r.t_start) == 220)
+        self.assertEqual(durations, [45, 170])
+        over = next(r for r in reels if round(r.t_end - r.t_start) == 170)
         self.assertEqual(over.t_start, 30.0)
-        self.assertEqual(over.t_end, 250.0)
+        self.assertEqual(over.t_end, 200.0)
         rows = self._reels_for_generation("gen-8")
         self.assertEqual(len(rows), 2)
 
@@ -413,8 +412,8 @@ class IngestTopicTests(unittest.TestCase):
         self.assertEqual(reel.captions[1].end, clip_len)
 
 
-class PerVideoCapAndBlendTests(IngestTopicTests):
-    """INGEST_TOPIC_MAX_CLIPS_PER_VIDEO cap + relevance x informativeness blend.
+class PreserveEveryClipAndBlendTests(IngestTopicTests):
+    """Every accepted engine clip persists; blend affects ordering only.
 
     Fixture order deliberately differs from blended-score order so a revert of
     the blend (back to pure token-overlap relevance) fails the ordering assert.
@@ -453,7 +452,7 @@ class PerVideoCapAndBlendTests(IngestTopicTests):
             "notes": "",
         }
 
-    def _run_with_cap(self, cap: int, suffix: str):
+    def _run(self, suffix: str):
         with _Patched() as (mock_search, mock_run):
             mock_search.discover.side_effect = (
                 lambda topic, limit, exclude_video_ids=None, **kw: {
@@ -464,25 +463,18 @@ class PerVideoCapAndBlendTests(IngestTopicTests):
                 }
             )
             mock_run.clip.side_effect = self._blend_engine_out
-            with mock.patch.object(pipeline_module, "INGEST_TOPIC_MAX_CLIPS_PER_VIDEO", cap):
-                reels, _ = main_module.ingestion_pipeline.ingest_topic(
-                    topic=TOPIC,
-                    material_id=f"mat-{suffix}",
-                    concept_id=f"con-{suffix}",
-                    generation_id=f"gen-{suffix}",
-                    max_videos=1,
-                )
+            reels, _ = main_module.ingestion_pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id=f"mat-{suffix}",
+                concept_id=f"con-{suffix}",
+                generation_id=f"gen-{suffix}",
+                max_videos=1,
+            )
         return reels
 
-    def test_top_k_by_blended_score(self) -> None:
-        reels = self._run_with_cap(3, "cap3")
-        # top-3 of 4 by relevance*(0.5+0.5*informativeness), score-descending:
-        # Segment 1 (1.0) > Segment 3 (0.8) > Segment 0 (0.75); Segment 2 capped out
-        self.assertEqual([r.t_start for r in reels], [120.0, 300.0, 30.0])
-
-    def test_cap_override(self) -> None:
-        reels = self._run_with_cap(1, "cap1")
-        self.assertEqual([r.t_start for r in reels], [120.0])
+    def test_every_clip_persists_in_blended_score_order(self) -> None:
+        reels = self._run("all")
+        self.assertEqual([r.t_start for r in reels], [120.0, 300.0, 30.0, 200.0])
 
 
 class EmbedUrlCeilTests(IngestTopicTests):
@@ -495,9 +487,8 @@ class EmbedUrlCeilTests(IngestTopicTests):
             "video_id": "vidAAAAAAAA",
             "clips": [
                 {
-                    "start": 30.6,
-                    "end": 74.4,
-                    "cut_end": 74.55,
+                    "start": 30.6126,
+                    "end": 74.4567,
                     "title": "Fractional",
                     "facet": "",
                     "reason": "",
@@ -507,7 +498,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
             ],
             "transcript": {
                 "segments": [
-                    {"start": 30.6, "end": 74.4, "text": "here we explain photosynthesis"}
+                    {"start": 30.6126, "end": 74.4567, "text": "here we explain photosynthesis"}
                 ],
                 "words": [],
                 "duration": 600.0,
@@ -535,6 +526,12 @@ class EmbedUrlCeilTests(IngestTopicTests):
             )
         self.assertEqual(len(reels), 1)
         self.assertIn("start=30&end=75", reels[0].video_url)
+        self.assertEqual(reels[0].t_start, 30.613)
+        self.assertEqual(reels[0].t_end, 74.457)
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_one(conn, "SELECT t_start, t_end FROM reels WHERE id = ?", (reels[0].reel_id,))
+        self.assertEqual(float(row["t_start"]), 30.613)
+        self.assertEqual(float(row["t_end"]), 74.457)
 
 
 class DifficultyPersistenceTests(IngestTopicTests):

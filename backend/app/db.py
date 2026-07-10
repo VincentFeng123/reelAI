@@ -27,6 +27,9 @@ class DatabaseIntegrityError(Exception):
     pass
 
 
+LEGACY_LEARNER_ID = "legacy"
+
+
 # When init_db() runs during container startup on Railway, the Postgres add-on
 # may still be in its own boot sequence — ``psycopg.connect`` then raises
 # ``OperationalError: the database system is starting up``. We retry with
@@ -203,16 +206,34 @@ CREATE INDEX IF NOT EXISTS idx_reels_concept_id ON reels(concept_id);
 
 CREATE TABLE IF NOT EXISTS reel_feedback (
     id TEXT PRIMARY KEY,
+    learner_id TEXT NOT NULL DEFAULT 'legacy',
     reel_id TEXT NOT NULL,
     helpful INTEGER NOT NULL DEFAULT 0,
     confusing INTEGER NOT NULL DEFAULT 0,
     rating INTEGER,
     saved INTEGER NOT NULL DEFAULT 0,
+    mastery_updated_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     FOREIGN KEY(reel_id) REFERENCES reels(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_reel_feedback_reel_id ON reel_feedback(reel_id);
+
+CREATE TABLE IF NOT EXISTS learner_material_progress (
+    learner_id TEXT NOT NULL,
+    material_id TEXT NOT NULL,
+    selected_level TEXT NOT NULL DEFAULT 'beginner',
+    global_adjustment REAL NOT NULL DEFAULT 0.0,
+    difficulty_reset_at TEXT NOT NULL,
+    feedback_revision INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (learner_id, material_id),
+    FOREIGN KEY(material_id) REFERENCES materials(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_learner_material_progress_material
+ON learner_material_progress(material_id);
 
 CREATE TABLE IF NOT EXISTS retrieval_runs (
     id TEXT PRIMARY KEY,
@@ -679,39 +700,93 @@ def _postgres_schema_statements() -> list[str]:
 
 
 def _migrate_reel_feedback_uniqueness_sqlite(conn: sqlite3.Connection) -> None:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(reel_feedback)").fetchall()}
+    if "learner_id" not in columns:
+        conn.execute(
+            f"ALTER TABLE reel_feedback ADD COLUMN learner_id TEXT NOT NULL DEFAULT '{LEGACY_LEARNER_ID}'"
+        )
+    if "mastery_updated_at" not in columns:
+        conn.execute("ALTER TABLE reel_feedback ADD COLUMN mastery_updated_at TEXT")
+    if "updated_at" not in columns:
+        conn.execute("ALTER TABLE reel_feedback ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+    conn.execute(
+        "UPDATE reel_feedback SET learner_id = ? WHERE learner_id IS NULL OR TRIM(learner_id) = ''",
+        (LEGACY_LEARNER_ID,),
+    )
+    conn.execute(
+        "UPDATE reel_feedback SET updated_at = created_at WHERE updated_at IS NULL OR TRIM(updated_at) = ''"
+    )
+    conn.execute(
+        """
+        UPDATE reel_feedback
+        SET mastery_updated_at = created_at
+        WHERE mastery_updated_at IS NULL AND (helpful <> 0 OR confusing <> 0)
+        """
+    )
     conn.execute(
         """
         DELETE FROM reel_feedback
         WHERE EXISTS (
             SELECT 1
             FROM reel_feedback AS newer
-            WHERE newer.reel_id = reel_feedback.reel_id
+            WHERE newer.learner_id = reel_feedback.learner_id
+              AND newer.reel_id = reel_feedback.reel_id
               AND (
-                  newer.created_at > reel_feedback.created_at
-                  OR (newer.created_at = reel_feedback.created_at AND newer.rowid > reel_feedback.rowid)
+                  newer.updated_at > reel_feedback.updated_at
+                  OR (newer.updated_at = reel_feedback.updated_at AND newer.rowid > reel_feedback.rowid)
               )
         )
         """
     )
     conn.execute("DROP INDEX IF EXISTS idx_reel_feedback_reel_id")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_feedback_reel_id_unique ON reel_feedback(reel_id)")
+    conn.execute("DROP INDEX IF EXISTS idx_reel_feedback_reel_id_unique")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_reel_feedback_reel_id ON reel_feedback(reel_id)")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_feedback_learner_reel_unique "
+        "ON reel_feedback(learner_id, reel_id)"
+    )
 
 
 def _migrate_reel_feedback_uniqueness_postgres(conn: Any) -> None:
     with conn.cursor() as cur:
         cur.execute(
+            f"ALTER TABLE reel_feedback ADD COLUMN IF NOT EXISTS learner_id TEXT NOT NULL DEFAULT '{LEGACY_LEARNER_ID}'"
+        )
+        cur.execute("ALTER TABLE reel_feedback ADD COLUMN IF NOT EXISTS mastery_updated_at TEXT")
+        cur.execute("ALTER TABLE reel_feedback ADD COLUMN IF NOT EXISTS updated_at TEXT NOT NULL DEFAULT ''")
+        cur.execute(
+            "UPDATE reel_feedback SET learner_id = %s WHERE learner_id IS NULL OR BTRIM(learner_id) = ''",
+            (LEGACY_LEARNER_ID,),
+        )
+        cur.execute(
+            "UPDATE reel_feedback SET updated_at = created_at WHERE updated_at IS NULL OR BTRIM(updated_at) = ''"
+        )
+        cur.execute(
+            """
+            UPDATE reel_feedback
+            SET mastery_updated_at = created_at
+            WHERE mastery_updated_at IS NULL AND (helpful <> 0 OR confusing <> 0)
+            """
+        )
+        cur.execute(
             """
             DELETE FROM reel_feedback AS older
             USING reel_feedback AS newer
-            WHERE older.reel_id = newer.reel_id
+            WHERE older.learner_id = newer.learner_id
+              AND older.reel_id = newer.reel_id
               AND (
-                  older.created_at < newer.created_at
-                  OR (older.created_at = newer.created_at AND older.ctid < newer.ctid)
+                  older.updated_at < newer.updated_at
+                  OR (older.updated_at = newer.updated_at AND older.ctid < newer.ctid)
               )
             """
         )
         cur.execute("DROP INDEX IF EXISTS idx_reel_feedback_reel_id")
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_feedback_reel_id_unique ON reel_feedback(reel_id)")
+        cur.execute("DROP INDEX IF EXISTS idx_reel_feedback_reel_id_unique")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reel_feedback_reel_id ON reel_feedback(reel_id)")
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_feedback_learner_reel_unique "
+            "ON reel_feedback(learner_id, reel_id)"
+        )
 
 
 def _migrate_reels_unique_clip_index_sqlite(conn: sqlite3.Connection) -> None:

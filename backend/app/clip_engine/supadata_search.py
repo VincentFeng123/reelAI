@@ -4,6 +4,7 @@ One query = one page (~20 results) = 1 credit. Sequential with 429 backoff.
 from __future__ import annotations
 
 import time
+from typing import Callable
 
 import httpx
 
@@ -51,7 +52,13 @@ def search_one(query: str, filters: dict | None = None) -> dict:
         return {"query": query, "videos": videos, "billed": billed or 1}
 
 
-def search_all(queries: list[str], filters: dict | None = None) -> dict:
+def search_all(
+    queries: list[str],
+    filters: dict | None = None,
+    *,
+    minimum_queries: int = 0,
+    stop_when: Callable[[list[dict]], bool] | None = None,
+) -> dict:
     credits_used = 0
     per_query: list[dict] = []
     errors: list[dict] = []
@@ -69,6 +76,13 @@ def search_all(queries: list[str], filters: dict | None = None) -> dict:
             errors.append({"query": q, "status": status, "message": str(e)})
             per_query.append({"query": q, "videos": [], "billed": getattr(e, "billed", 0) or 0,
                               "error": str(e), "status": status})
+        should_stop = (
+            stop_when is not None
+            and len(per_query) >= max(0, int(minimum_queries))
+            and stop_when(per_query)
+        )
+        if should_stop:
+            break
         if i < len(queries) - 1:
             time.sleep(0.25)
 
@@ -78,5 +92,5 @@ def search_all(queries: list[str], filters: dict | None = None) -> dict:
         rate_limited = any(e["status"] == 429 for e in errors)
         reason = (" (out of Supadata credits)" if out_of_credits
                   else " (rate limited)" if rate_limited else "")
-        warning = f"{len(errors)} of {len(queries)} searches failed{reason}. Showing partial results."
+        warning = f"{len(errors)} of {len(per_query)} searches failed{reason}. Showing partial results."
     return {"per_query": per_query, "credits_used": credits_used, "warning": warning}

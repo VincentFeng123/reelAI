@@ -29,15 +29,17 @@ def test_segment_model_defaults_to_pro_tier(monkeypatch):
 def test_curation_gate_defaults(monkeypatch):
     monkeypatch.delenv("SEGMENT_MAX_CLIP_S", raising=False)
     monkeypatch.delenv("SEGMENT_INFORMATIVENESS_MIN", raising=False)
+    monkeypatch.delenv("SEGMENT_TOPIC_RELEVANCE_MIN", raising=False)
     cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
-    assert cfg.SEGMENT_MAX_CLIP_S == 75.0
-    assert cfg.SEGMENT_INFORMATIVENESS_MIN == 0.5
+    assert cfg.SEGMENT_MAX_CLIP_S == 180.0
+    assert cfg.SEGMENT_INFORMATIVENESS_MIN == 0.6
+    assert cfg.SEGMENT_TOPIC_RELEVANCE_MIN == 0.6
 
 
-def test_search_breadth_matches_vidscout_feed(monkeypatch):
+def test_search_breadth_matches_adaptive_consensus_ceiling(monkeypatch):
     monkeypatch.delenv("CLIP_SEARCH_BREADTH", raising=False)
     cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
-    assert cfg.SEARCH_BREADTH == 8
+    assert cfg.SEARCH_BREADTH == 6
 
 
 def test_extract_video_id_accepts_v_param_anywhere():

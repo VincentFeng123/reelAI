@@ -81,9 +81,6 @@ from ..clip_engine.errors import (
 
 logger: logging.Logger = get_ingest_logger(__name__)
 
-# Feed curation: keep only the best clips of each discovered video (ranked by
-# relevance x informativeness) instead of persisting the engine's whole tiling.
-INGEST_TOPIC_MAX_CLIPS_PER_VIDEO = int(os.environ.get("INGEST_TOPIC_MAX_CLIPS_PER_VIDEO", "3"))
 # Per-video wall-clock budget for clip+filter (VidScout's feed abandons a
 # video's job after 180s); a pathological video must not stall the generation.
 INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "180"))
@@ -678,8 +675,8 @@ class IngestionPipeline:
 
         # PERSIST stage: sequential, discover order — the `on_reel_created`
         # ordering and the (optional) `max_reels` early-stop stay deterministic.
-        # Duration/kind/informativeness gates already ran inside the engine;
-        # `_clip_and_filter` keeps only the best clips per video.
+        # Duration/kind/confidence gates already ran inside the engine;
+        # `_clip_and_filter` preserves every accepted clip per video.
         reels: list[ReelOutWithAttribution] = []
         for v, kept, engine_out in fetched:
             for clip in kept:
@@ -705,8 +702,7 @@ class IngestionPipeline:
     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         """Fetch ONE discovered video's clips, score each (query relevance
         blended with the engine's informativeness so one-word topics still get
-        a ranking signal), and keep only the top
-        ``INGEST_TOPIC_MAX_CLIPS_PER_VIDEO``. Returns `(v, scored_clips,
+        a ranking signal). Returns `(v, scored_clips,
         engine_out)`, scored_clips sorted by score DESCENDING. Empty `clips`
         yields no clips (video is skipped)."""
         engine_out = clip_engine_run.clip(
@@ -724,7 +720,7 @@ class IngestionPipeline:
             )
             clip["score"] = relevance * (0.5 + 0.5 * informativeness)
         kept = sorted(engine_out["clips"], key=lambda c: c["score"], reverse=True)
-        return v, kept[:INGEST_TOPIC_MAX_CLIPS_PER_VIDEO], engine_out
+        return v, kept, engine_out
 
     def _ensure_search_material(self, query: str) -> str:
         """
@@ -855,7 +851,8 @@ class IngestionPipeline:
         clip_title: str = "",
         clip_difficulty: float | None = None,
     ) -> ReelOutWithAttribution:
-        clip_start, clip_end = clip_window
+        clip_start = round(float(clip_window[0]), 3)
+        clip_end = round(float(clip_window[1]), 3)
         from .persistence import build_video_id  # local import to avoid cycle surprises
 
         video_id = build_video_id(adapter_result.platform, adapter_result.source_id)

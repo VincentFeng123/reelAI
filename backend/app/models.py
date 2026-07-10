@@ -98,6 +98,7 @@ class ReelOut(BaseModel):
     total_concepts: int | None = None
     video_duration_sec: int | None = None
     clip_duration_sec: float | None = None
+    difficulty: float = 0.5
 
 
 class ReelsGenerateResponse(BaseModel):

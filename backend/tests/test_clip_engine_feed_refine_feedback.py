@@ -359,13 +359,39 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # T5-4: cache version guard
     # ------------------------------------------------------------------ #
-    def test_ranked_feed_cache_version_is_7(self) -> None:
-        """RANKED_FEED_CACHE_VERSION must equal 7 after level-aware scoring."""
+    def test_ranked_feed_cache_key_isolates_learner_and_feedback_revision(self) -> None:
+        base = {
+            "material_id": MATERIAL_ID,
+            "generation_id": "gen-cache",
+            "fast_mode": True,
+            "level_target": 0.5,
+        }
+        learner_a_revision_1 = main_module.reel_service._ranked_feed_cache_key(
+            **base,
+            learner_id="owner:learner-a",
+            feedback_revision=1,
+        )
+        learner_b_revision_1 = main_module.reel_service._ranked_feed_cache_key(
+            **base,
+            learner_id="owner:learner-b",
+            feedback_revision=1,
+        )
+        learner_a_revision_2 = main_module.reel_service._ranked_feed_cache_key(
+            **base,
+            learner_id="owner:learner-a",
+            feedback_revision=2,
+        )
+
+        self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
+        self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
+
+    def test_ranked_feed_cache_version_is_8(self) -> None:
+        """RANKED_FEED_CACHE_VERSION must include learner-aware ranking inputs."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            7,
-            "RANKED_FEED_CACHE_VERSION must be bumped to 7 (level-aware scoring — stale "
-            "pre-level ranked feeds must not be served after the level bonus was added).",
+            8,
+            "RANKED_FEED_CACHE_VERSION must be bumped to 8 so learner-scoped ranked feeds "
+            "cannot reuse stale pre-personalization cache entries.",
         )
 
 
