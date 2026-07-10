@@ -21,6 +21,7 @@ backend/.env
 # Runtime artifacts
 .logs/
 .pids/
+graphify-out/cache/
 
 # clip_engine transcript cache
 backend/work/
