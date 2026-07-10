@@ -218,7 +218,12 @@ CUT_VIDEO_BITRATE = os.environ.get("CUT_VIDEO_BITRATE", "3000k")
 # ── Server ─────────────────────────────────────────────────────────────────
 HOST = "0.0.0.0"                 # bind 0.0.0.0 so phones on the LAN can reach it
 PORT = 8000
-DEV_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+DEV_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+]
 SSE_HEARTBEAT_S = 15
 
 # ── Backoff ────────────────────────────────────────────────────────────────
