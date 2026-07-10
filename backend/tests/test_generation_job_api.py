@@ -46,6 +46,22 @@ def _patch_request_context(monkeypatch, conn: sqlite3.Connection) -> None:
     )
 
 
+def test_generation_worker_lifecycle_state_is_initialized(monkeypatch) -> None:
+    main._stop_generation_worker()
+    monkeypatch.setattr(main, "_generation_worker_loop", lambda: None)
+
+    main._start_generation_worker()
+    worker = main._generation_worker_thread
+
+    assert worker is not None
+    assert main._generation_worker_id.startswith("worker-")
+    assert 0 < main.GENERATION_HEARTBEAT_SEC < main.GENERATION_LEASE_SEC
+    assert main.GENERATION_WORKER_POLL_SEC > 0
+    worker.join(timeout=1.0)
+    main._stop_generation_worker()
+    assert main._generation_worker_thread is None
+
+
 def test_generate_returns_202_and_idempotently_reuses_active_job(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)

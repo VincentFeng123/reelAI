@@ -94,6 +94,9 @@ class Settings(BaseSettings):
     supadata_base: str = "https://api.supadata.ai/v1"
     segment_model: str = ""
     clip_search_max_videos: int = 5
+    generation_job_heartbeat_sec: int = 15
+    generation_job_lease_sec: int = 90
+    generation_job_poll_sec: float = 1.0
 
 
 @lru_cache

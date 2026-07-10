@@ -146,6 +146,8 @@ from .ingestion.models import (
 )
 from .ingestion.pipeline import IngestionPipeline
 from .services.generation_jobs import (
+    DEFAULT_HEARTBEAT_SECONDS,
+    DEFAULT_LEASE_SECONDS,
     JobLeaseLostError,
     TERMINAL_STATUSES as GENERATION_TERMINAL_STATUSES,
     append_event as append_generation_event,
@@ -166,6 +168,26 @@ from .services.generation_jobs import (
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+GENERATION_LEASE_SEC = max(
+    2,
+    min(DEFAULT_LEASE_SECONDS, int(settings.generation_job_lease_sec)),
+)
+GENERATION_HEARTBEAT_SEC = max(
+    1,
+    min(
+        int(settings.generation_job_heartbeat_sec or DEFAULT_HEARTBEAT_SECONDS),
+        GENERATION_LEASE_SEC // 2,
+    ),
+)
+GENERATION_WORKER_POLL_SEC = max(
+    0.1,
+    min(30.0, float(settings.generation_job_poll_sec)),
+)
+_generation_worker_id = f"worker-{uuid.uuid4()}"
+_generation_worker_stop = threading.Event()
+_generation_worker_lock = threading.Lock()
+_generation_worker_thread: threading.Thread | None = None
 
 @asynccontextmanager
 async def lifespan(app_instance):
