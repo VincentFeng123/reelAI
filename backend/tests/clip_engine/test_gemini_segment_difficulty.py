@@ -18,7 +18,7 @@ def _run(topics, n=10, settings=None):
 
 
 def test_difficulty_carried_on_clip():
-    t = _Topic(title="T", start_line=0, end_line=1, start_quote="start", end_quote="end",
+    t = _Topic(title="T", start_line=0, end_line=1, start_quote="line 0", end_quote="line 1",
                kind="content", informativeness=0.9, topic_relevance=0.9,
                self_contained=True, difficulty=0.8)
     clips = _run([t])
@@ -28,7 +28,7 @@ def test_difficulty_carried_on_clip():
 def test_difficulty_defaults_to_half_when_omitted():
     # Simulate parsed JSON with no difficulty key at all (the model omitted it).
     t = _Topic.model_validate({"title": "T", "start_line": 0, "end_line": 1,
-                               "start_quote": "start", "end_quote": "end", "kind": "content",
+                               "start_quote": "line 0", "end_quote": "line 1", "kind": "content",
                                "informativeness": 0.9, "topic_relevance": 0.9,
                                "self_contained": True})
     clips = _run([t])
@@ -36,13 +36,13 @@ def test_difficulty_defaults_to_half_when_omitted():
 
 
 def test_misscaled_difficulty_normalized():
-    t = _Topic(title="T", start_line=0, end_line=1, start_quote="start", end_quote="end",
+    t = _Topic(title="T", start_line=0, end_line=1, start_quote="line 0", end_quote="line 1",
                kind="content", informativeness=0.9, topic_relevance=0.9,
                self_contained=True, difficulty=7)
     clips = _run([t])
     assert clips[0]["difficulty"] == pytest.approx(0.7)
     # 0-100 scale branch
-    t = _Topic(title="T", start_line=0, end_line=1, start_quote="start", end_quote="end",
+    t = _Topic(title="T", start_line=0, end_line=1, start_quote="line 0", end_quote="line 1",
                kind="content", informativeness=0.9, topic_relevance=0.9,
                self_contained=True, difficulty=85)
     clips = _run([t])
@@ -50,15 +50,17 @@ def test_misscaled_difficulty_normalized():
 
 
 def test_extreme_difficulty_never_gates():
-    common = {"start_quote": "start", "end_quote": "end", "kind": "content",
+    common = {"kind": "content",
               "informativeness": 0.9, "topic_relevance": 0.9, "self_contained": True}
-    hard = _Topic(title="H", start_line=0, end_line=1, difficulty=1.0, **common)
-    easy = _Topic(title="E", start_line=2, end_line=3, difficulty=0.0, **common)
+    hard = _Topic(title="H", start_line=0, end_line=1, start_quote="line 0",
+                  end_quote="line 1", difficulty=1.0, **common)
+    easy = _Topic(title="E", start_line=2, end_line=3, start_quote="line 2",
+                  end_quote="line 3", difficulty=0.0, **common)
     clips = _run([hard, easy])
     assert {c["title"] for c in clips} == {"H", "E"}
 
 
 def test_prompt_documents_difficulty_scale():
     system, user = _prompts("[0] 00:00 hi", 1)
-    assert "difficulty — 0.0 to 1.0" in system
+    assert "difficulty on a 0..1 scale" in system
     assert "difficulty" in user

@@ -1,51 +1,15 @@
-# StudyReels Backend (FastAPI)
+# ReelAI FastAPI backend
 
-## Run
+The Python backend runs only as a durable Railway service. It is not deployed as Vercel Python functions.
 
 ```bash
-cd backend
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-## Notes
+Production requires PostgreSQL plus `SUPADATA_API_KEY` and `GEMINI_API_KEY`. Configure the primary segmentation model with `SEGMENT_MODEL`; `SEGMENT_FALLBACK_MODEL` is optional and is the only allowed model substitution. Native YouTube captions are mandatory. Provider responses and model usage are persisted per generation, while successful search evidence is cached for six hours (empty results for 15 minutes) and validated native transcript artifacts for 30 days.
 
-- Uses SQLite by default, or PostgreSQL when `DATABASE_URL` is set (Railway-compatible).
-- Uses FAISS (with brute-force fallback if FAISS import fails).
-- Uses timestamp-based YouTube embed playback; no local video download.
-- Reel segments are forced to 20-60s and are selected from transcript-aligned timestamps.
-- Searches both short-form and long-form videos, then cuts matching transcript windows.
-- Caches YouTube search results, transcripts, embeddings, and LLM concept extraction in SQLite.
-- If `OPENAI_API_KEY` is set, upload parsing is enhanced with GPT-generated concepts/objectives; otherwise it falls back to heuristics.
-
-## Deploy on Vercel
-
-Deploy the repo as a single project from root (`.`).
-
-- Python entrypoint is `api/index.py`, which imports `backend.app.main:app`.
-- Root `requirements.txt` includes `backend/requirements.txt` for dependency install.
-- Set env vars in Vercel:
-  - `APP_ENV=prod`
-  - `FRONTEND_ORIGIN=https://<your-project-domain>`
-  - `FRONTEND_ORIGINS=https://<your-frontend-domain>[,https://another-domain]` (recommended)
-  - `OPENAI_ENABLED=0` (set `1` only if you want to enable OpenAI calls)
-  - `OPENAI_API_KEY=...`
-  - `YOUTUBE_API_KEY=...`
-  - `DATABASE_URL=postgresql://...` (recommended for durable hosted data, e.g. Railway)
-  - `COMMUNITY_EMAIL_VERIFICATION_REQUIRED=0` (default disabled; set `1` to require verification again)
-  - `VERIFICATION_HMAC_KEY=...` (required for hosted community-account verification)
-  - `SMTP_HOST=...`
-  - `SMTP_PORT=587`
-  - `SMTP_USERNAME=...`
-  - `SMTP_PASSWORD=...`
-  - `SMTP_FROM_EMAIL=...`
-  - Optional: `SMTP_USE_TLS=1`, `SMTP_USE_SSL=0`
-- `DATA_DIR` defaults to `/tmp/studyreels-data` on Vercel and is ephemeral.
-- If you intentionally stay on SQLite in hosted mode, tune lock waits with `SQLITE_BUSY_TIMEOUT_MS` (default `120000`).
-- With `COMMUNITY_EMAIL_VERIFICATION_REQUIRED=0`, accounts activate immediately after signup/login when an email is present.
-- Set `COMMUNITY_EMAIL_VERIFICATION_REQUIRED=1` to restore the verification-email flow.
-- Hosted community-account verification also requires `VERIFICATION_HMAC_KEY`.
-- Hosted community-account registration and email verification will fail with `503` until the SMTP settings above are configured when verification is enabled.
+Generation jobs are leased by the in-process worker with 15-second heartbeats, 90-second lease expiry, two maximum attempts, and an eight-minute deadline. See the repository README for API and duration semantics.

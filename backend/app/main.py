@@ -15,11 +15,9 @@ import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parseaddr
-from queue import Empty, Queue
 from collections.abc import Iterable
 from typing import Any, Callable, Literal
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
@@ -27,7 +25,7 @@ from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 import requests
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 
 from .config import get_settings
@@ -96,9 +94,10 @@ from .models import (
     FeedbackRequest,
     FeedbackResponse,
     FeedResponse,
+    GenerationJobQueuedResponse,
+    GenerationJobStatusResponse,
     MaterialLevelUpdateRequest,
     MaterialResponse,
-    RefinementStatusResponse,
     ReelsCanGenerateAnyRequest,
     ReelsCanGenerateAnyResponse,
     ReelsCanGenerateResponse,
@@ -106,12 +105,6 @@ from .models import (
     ReelsGenerateResponse,
     ReelProgressRequest,
     ReelProgressResponse,
-    AdminSimulationRequest,
-    AdminDiagnoseTopicRequest,
-    DiagnoseTopicResponse,
-    DiagnosticStageResult,
-    SimulationResponse,
-    SimulationTopicResult,
 )
 from .services.assessments import AssessmentCancelledError, AssessmentService
 from .services.email import send_welcome_email
@@ -119,16 +112,10 @@ from .services.embeddings import EmbeddingService
 from .services.liveness import is_video_alive
 from .services.material_intelligence import MaterialIntelligenceService
 from .services.parsers import ParseError, extract_text_from_file
-from .services import progress_bus
 from .services.reels import GenerationCancelledError, ReelService
 from .services.storage import get_storage
 from .services.text_utils import chunk_text, normalize_whitespace
 from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8601_duration
-
-from .ingestion.logging_config import (
-    publish_progress as _publish_progress_event,
-    set_job_id as _set_progress_job_id,
-)
 
 from .ingestion.errors import (
     DownloadError as IngestDownloadError,
@@ -140,6 +127,13 @@ from .ingestion.errors import (
     UnsupportedSourceError as IngestUnsupportedSourceError,
 )
 from .clip_engine.errors import CancellationError as ClipEngineCancellationError, EngineError as ClipEngineError
+from .clip_engine.errors import ProviderError as ClipEngineProviderError
+from .clip_engine.provider_cache import DatabaseProviderCache
+from .clip_engine.provider_cache import normalize_filters as normalize_provider_filters
+from .clip_engine.provider_cache import search_cache_key
+from .clip_engine.provider_runtime import GenerationContext, ProviderUsageRecord
+from .clip_engine.supadata_search import search_one as supadata_search_one
+from .clip_engine.metadata import canonicalize_youtube_url
 from .ingestion.models import (
     IngestFeedRequest,
     IngestFeedResult,
@@ -151,9 +145,23 @@ from .ingestion.models import (
     IngestTopicCutResult,
 )
 from .ingestion.pipeline import IngestionPipeline
-from .ingestion.whisperx_transcribe import (
-    _get_whisperx_module as _probe_whisperx_module,
-    whisperx_enabled,
+from .services.generation_jobs import (
+    JobLeaseLostError,
+    TERMINAL_STATUSES as GENERATION_TERMINAL_STATUSES,
+    append_event as append_generation_event,
+    build_request_key as build_durable_request_key,
+    cancellation_requested as generation_cancellation_requested,
+    find_completed_job as find_completed_generation_job,
+    get_job as get_generation_job,
+    heartbeat_job as heartbeat_generation_job,
+    lease_next_job,
+    material_content_fingerprint,
+    record_provider_usage,
+    replay_events as replay_generation_events,
+    request_cancellation as request_generation_cancellation,
+    submit_or_get_active as submit_generation_job,
+    transition_terminal as transition_generation_terminal,
+    update_progress as update_generation_progress,
 )
 
 settings = get_settings()
@@ -163,14 +171,17 @@ logger = logging.getLogger(__name__)
 async def lifespan(app_instance):
     os.makedirs(settings.data_dir, exist_ok=True)
     init_db()
-    _resume_pending_refinement_jobs()
+    _start_generation_worker()
     _warn_if_hosted_auth_email_is_unconfigured()
     # The punctuation-restoration pipeline is NOT warmed here anymore: the
     # gemini clip engine never punctuates, and the only consumer chain
     # (_create_reel -> _trim_structural_edges_from_clip) has no callers since
     # the engine swap. Eager-loading its ~2.5GB model tripled idle RSS for
     # nothing; ReelService._get_punct_pipeline still lazy-loads if ever used.
-    yield
+    try:
+        yield
+    finally:
+        _stop_generation_worker()
 
 app = FastAPI(title="StudyReels API", version="0.1.0", lifespan=lifespan)
 
@@ -281,7 +292,10 @@ storage = get_storage()
 embedding_service = EmbeddingService()
 material_intelligence_service = MaterialIntelligenceService()
 youtube_service = YouTubeService()
-SERVERLESS_MODE = bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
+# The Python service runs as a durable Railway process. Next.js remains on
+# Vercel and proxies API traffic here; request-scoped serverless execution is
+# intentionally unsupported for provider-backed generation.
+SERVERLESS_MODE = False
 ingestion_pipeline = IngestionPipeline(
     youtube_service=youtube_service,
     embedding_service=embedding_service,
@@ -292,35 +306,6 @@ reel_service = ReelService(embedding_service=embedding_service, youtube_service=
 assessment_service = AssessmentService()
 
 
-def _reels_generate_stream_deadline_sec() -> float:
-    raw = os.getenv("REELS_GENERATE_STREAM_DEADLINE_SEC")
-    if raw is None or not raw.strip():
-        return 900.0
-    try:
-        return max(120.0, float(raw))
-    except (TypeError, ValueError):
-        return 900.0
-
-REFINEMENT_JOB_WORKERS = 2
-_refinement_jobs_lock = threading.Lock()
-_refinement_job_executor = None if SERVERLESS_MODE else ThreadPoolExecutor(max_workers=REFINEMENT_JOB_WORKERS)
-_scheduled_refinement_job_ids: set[str] = set()
-FAST_INITIAL_RESPONSE_REELS = 3
-SLOW_INITIAL_RESPONSE_REELS = 5
-FAST_MIN_INITIAL_VISIBLE_REELS = 3
-SLOW_MIN_INITIAL_VISIBLE_REELS = 5
-FAST_MIN_REFINEMENT_TARGET_REELS = 8
-SLOW_MIN_REFINEMENT_TARGET_REELS = 10
-FAST_REFINEMENT_JOB_BURST_REELS = 8
-SLOW_REFINEMENT_JOB_BURST_REELS = 10
-REFINEMENT_STAGE_ROOT_EXACT = 0
-REFINEMENT_STAGE_ROOT_COMPANION = 1
-REFINEMENT_STAGE_MULTI_CLIP_STRICT = 2
-REFINEMENT_STAGE_ANCHORED_ADJACENT = 3
-REFINEMENT_STAGE_MULTI_CLIP_EXPANDED = 4
-REFINEMENT_STAGE_RECOVERY_GRAPH = 5
-MAX_REFINEMENT_RECOVERY_STAGE = REFINEMENT_STAGE_RECOVERY_GRAPH
-REFINEMENT_JOB_STALE_TIMEOUT_SEC = 300
 # Cumulative upper bound on reels stored per material across all feed pages.
 # The per-request generation cap in ReelService already bounds each individual
 # call, but without this ceiling a client that keeps paginating indefinitely
@@ -329,7 +314,6 @@ REFINEMENT_JOB_STALE_TIMEOUT_SEC = 300
 # sessions (3-50 reels) while guarding against runaway pagination.
 MAX_REELS_PER_MATERIAL = 300
 
-VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
 DEFAULT_TARGET_CLIP_DURATION_SEC = 55
@@ -341,7 +325,6 @@ MIN_SETTINGS_MIN_RELEVANCE_THRESHOLD = 0.0
 MAX_SETTINGS_MIN_RELEVANCE_THRESHOLD = 0.6
 DEFAULT_SETTINGS_DEFAULT_INPUT_MODE = "source"
 DEFAULT_SETTINGS_START_MUTED = True
-DEFAULT_SETTINGS_VIDEO_POOL_MODE = "short-first"
 DEFAULT_SETTINGS_PREFERRED_VIDEO_DURATION = "any"
 DEFAULT_SETTINGS_TARGET_CLIP_DURATION_MIN_SEC = 20
 DEFAULT_SETTINGS_TARGET_CLIP_DURATION_MAX_SEC = 55
@@ -368,7 +351,7 @@ CHAT_RATE_LIMIT_PER_WINDOW = 20
 MATERIAL_RATE_LIMIT_PER_WINDOW = 8
 REELS_RATE_LIMIT_PER_WINDOW = 12
 REELS_GENERATE_RATE_LIMIT_PER_WINDOW = 36
-REELS_REFINEMENT_STATUS_RATE_LIMIT_PER_WINDOW = 120
+GENERATION_JOB_STATUS_RATE_LIMIT_PER_WINDOW = 120
 FEEDBACK_RATE_LIMIT_PER_WINDOW = 60
 ASSESSMENT_PROGRESS_RATE_LIMIT_PER_WINDOW = 240
 ASSESSMENT_ACTION_RATE_LIMIT_PER_WINDOW = 60
@@ -382,11 +365,9 @@ COMMUNITY_SETTINGS_RATE_LIMIT_PER_WINDOW = 90
 INGEST_URL_RATE_LIMIT_PER_WINDOW = 6
 INGEST_FEED_RATE_LIMIT_PER_WINDOW = 2
 INGEST_SEARCH_RATE_LIMIT_PER_WINDOW = 3
-# Topic-cut runs one Whisper-or-cached transcribe + one chat-completions call
-# per video, so it's strictly cheaper than ingest_feed (which loops over many
-# items). 6/window matches /api/ingest/url's budget for one full video.
+# Topic-cut runs native-caption retrieval plus Gemini segmentation for one
+# video. Six requests per window matches /api/ingest/url's full-video budget.
 INGEST_TOPIC_CUT_RATE_LIMIT_PER_WINDOW = 6
-ADMIN_SIMULATION_RATE_LIMIT_PER_WINDOW = 2
 MAX_COMMUNITY_HISTORY_ITEMS = 120
 _rate_limit_lock = threading.Lock()
 _rate_limit_hits: dict[str, deque[float]] = {}
@@ -1673,12 +1654,6 @@ def _normalize_min_relevance(value: float | None) -> float | None:
     return max(-1.0, min(1.2, parsed))
 
 
-def _normalize_video_pool_mode(value: str | None) -> Literal["short-first", "balanced", "long-form"]:
-    if value in VALID_VIDEO_POOL_MODES:
-        return value
-    return "short-first"
-
-
 def _normalize_preferred_video_duration(value: str | None) -> Literal["any", "short", "medium", "long"]:
     if value in VALID_VIDEO_DURATION_PREFS:
         return value
@@ -1756,7 +1731,6 @@ def _serialize_community_settings(row: dict | None) -> CommunitySettingsResponse
     default_input_mode = _normalize_default_input_mode(str(source.get("default_input_mode") or "").strip().lower() or None)
     min_relevance_threshold = _normalize_settings_min_relevance_threshold(source.get("min_relevance_threshold"))
     start_muted = _normalize_settings_start_muted(source.get("start_muted", 1 if DEFAULT_SETTINGS_START_MUTED else 0))
-    video_pool_mode = _normalize_video_pool_mode(str(source.get("video_pool_mode") or "").strip().lower() or None)
     preferred_video_duration = _normalize_preferred_video_duration(
         str(source.get("preferred_video_duration") or "").strip().lower() or None
     )
@@ -1771,7 +1745,7 @@ def _serialize_community_settings(row: dict | None) -> CommunitySettingsResponse
         default_input_mode=default_input_mode,
         min_relevance_threshold=min_relevance_threshold,
         start_muted=start_muted,
-        video_pool_mode=video_pool_mode,
+        creative_commons_only=bool(source.get("creative_commons_only", False)),
         preferred_video_duration=preferred_video_duration,
         target_clip_duration_sec=target_clip_duration_sec,
         target_clip_duration_min_sec=target_clip_duration_min_sec,
@@ -1865,13 +1839,8 @@ def _filter_reels_by_video_preferences(
     target_clip_duration_max_sec: int | None = None,
 ) -> list[dict]:
     safe_duration_pref = _normalize_preferred_video_duration(preferred_video_duration)
-    # RAW-PRACTICE: the clip-length window (target_clip_duration_*) is retired as a
-    # serving-path drop — clips of ANY length are served exactly as the engine cut
-    # them. The video-duration preference (short/medium/long source video) remains
-    # a live knob. target_clip_duration_* params stay in the signature (callers/iOS
-    # still pass them) but no longer drop clips here.
-    filtered: list[dict] = []
-    for reel in reels:
+    ranked: list[tuple[int, float, int, dict[str, Any]]] = []
+    for original_index, reel in enumerate(reels):
         if safe_duration_pref != "any":
             bucket = _video_duration_bucket(reel.get("video_duration_sec"))
             if bucket != safe_duration_pref:
@@ -1888,36 +1857,79 @@ def _filter_reels_by_video_preferences(
         normalized = dict(reel)
         if clip_duration_value > 0:
             normalized["clip_duration_sec"] = round(clip_duration_value, 2)
-        filtered.append(normalized)
-    return filtered
+
+        duration_fit = "in_range"
+        distance = 0.0
+        if target_clip_duration_min_sec is not None and clip_duration_value < float(
+            target_clip_duration_min_sec
+        ):
+            duration_fit = "shorter"
+            distance = float(target_clip_duration_min_sec) - clip_duration_value
+        elif target_clip_duration_max_sec is not None and clip_duration_value > float(
+            target_clip_duration_max_sec
+        ):
+            duration_fit = "longer"
+            distance = clip_duration_value - float(target_clip_duration_max_sec)
+
+        normalized["duration_preference_met"] = duration_fit == "in_range"
+        normalized["duration_fit"] = duration_fit
+        ranked.append((0 if duration_fit == "in_range" else 1, distance, original_index, normalized))
+
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in ranked]
 
 
-def _build_generation_request_key(
+def _generation_content_fingerprint(
+    conn,
     *,
     material_id: str,
     concept_id: str | None,
-    creative_commons_only: bool,
-    generation_mode: Literal["slow", "fast"],
-    video_pool_mode: Literal["short-first", "balanced", "long-form"],
-    preferred_video_duration: Literal["any", "short", "medium", "long"],
-    target_clip_duration_sec: int,
-    target_clip_duration_min_sec: int | None,
-    target_clip_duration_max_sec: int | None,
-    multi_platform_search: bool = False,
 ) -> str:
+    try:
+        material = fetch_one(
+            conn,
+            "SELECT subject_tag, raw_text, source_type FROM materials WHERE id = ?",
+            (material_id,),
+        ) or {}
+    except Exception as exc:
+        if "column" not in str(exc).lower():
+            raise
+        material = fetch_one(conn, "SELECT * FROM materials WHERE id = ?", (material_id,)) or {}
+    params: tuple[Any, ...] = (material_id,)
+    concept_where = "material_id = ?"
+    if concept_id:
+        concept_where += " AND id = ?"
+        params = (material_id, concept_id)
+    try:
+        concepts = fetch_all(
+            conn,
+            "SELECT id, title, keywords_json, summary FROM concepts "
+            f"WHERE {concept_where} ORDER BY id",
+            params,
+        )
+    except Exception as exc:
+        if "column" not in str(exc).lower() and "no such table" not in str(exc).lower():
+            raise
+        try:
+            concepts = fetch_all(
+                conn,
+                f"SELECT * FROM concepts WHERE {concept_where} ORDER BY id",
+                params,
+            )
+        except Exception as fallback_exc:
+            if "no such table" not in str(fallback_exc).lower():
+                raise
+            concepts = []
     payload = {
-        "material_id": material_id,
-        "concept_id": concept_id or "",
-        "creative_commons_only": bool(creative_commons_only),
-        "generation_mode": generation_mode,
-        "video_pool_mode": video_pool_mode,
-        "preferred_video_duration": preferred_video_duration,
-        "target_clip_duration_sec": int(target_clip_duration_sec),
-        "target_clip_duration_min_sec": int(target_clip_duration_min_sec or 0),
-        "target_clip_duration_max_sec": int(target_clip_duration_max_sec or 0),
-        "multi_platform_search": bool(multi_platform_search),
+        "material": {
+            "id": material_id,
+            "subject_tag": str(material.get("subject_tag") or ""),
+            "raw_text": str(material.get("raw_text") or ""),
+            "source_type": str(material.get("source_type") or ""),
+        },
+        "concepts": concepts,
     }
-    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
@@ -2544,63 +2556,6 @@ def _fetch_generation_row(conn, generation_id: str | None) -> dict[str, Any] | N
     return fetch_one(conn, "SELECT * FROM reel_generations WHERE id = ?", (generation_id,))
 
 
-def _normalize_provider_stage(value: object) -> Literal["youtube", "youtube_graph", "youtube_external", "vimeo", "dailymotion", "bilibili", "tiktok", "twitch", "wikimedia", "stock"]:
-    clean = str(value or "").strip().lower()
-    if clean in {
-        "youtube",
-        "youtube_graph",
-        "youtube_external",
-        "vimeo",
-        "dailymotion",
-        "bilibili",
-        "tiktok",
-        "twitch",
-        "wikimedia",
-        "stock",
-    }:
-        return clean  # type: ignore[return-value]
-    if clean in {"wikimedia_commons", "internet_archive", "pexels_video", "pixabay_video"}:
-        return "stock" if clean != "wikimedia_commons" else "wikimedia"
-    return "youtube"
-
-
-def _next_provider_stage(current_stage: object) -> Literal["vimeo", "dailymotion", "bilibili", "tiktok", "twitch", "wikimedia", "stock"] | None:
-    current = _normalize_provider_stage(current_stage)
-    # User-specified ladder: YouTube → Vimeo → Dailymotion → Bilibili → TikTok
-    # → Twitch, then the pre-existing Wikimedia + generic stock fallbacks.
-    if current in {"youtube", "youtube_graph", "youtube_external"}:
-        return "vimeo"
-    if current == "vimeo":
-        return "dailymotion"
-    if current == "dailymotion":
-        return "bilibili"
-    if current == "bilibili":
-        return "tiktok"
-    if current == "tiktok":
-        return "twitch"
-    if current == "twitch":
-        return "wikimedia"
-    if current == "wikimedia":
-        return "stock"
-    return None
-
-
-def _search_status_provider_stage(
-    provider_stage: object,
-    *,
-    recovery_stage: int | None = None,
-) -> Literal["youtube", "youtube_graph", "youtube_external", "vimeo", "dailymotion", "bilibili", "tiktok", "twitch", "wikimedia", "stock"]:
-    normalized = _normalize_provider_stage(provider_stage)
-    if normalized != "youtube":
-        return normalized
-    safe_recovery_stage = max(0, int(recovery_stage or 0))
-    if safe_recovery_stage > MAX_REFINEMENT_RECOVERY_STAGE:
-        return "youtube_external"
-    if safe_recovery_stage >= REFINEMENT_STAGE_RECOVERY_GRAPH:
-        return "youtube_graph"
-    return "youtube"
-
-
 def _fetch_generation_head_row(conn, *, material_id: str, request_key: str) -> dict[str, Any] | None:
     return fetch_one(
         conn,
@@ -2609,418 +2564,11 @@ def _fetch_generation_head_row(conn, *, material_id: str, request_key: str) -> d
     )
 
 
-def _generation_head_row(
-    existing_row: dict[str, Any] | None,
-    *,
-    material_id: str,
-    request_key: str,
-) -> dict[str, Any]:
-    return {
-        "id": str((existing_row or {}).get("id") or _build_generation_head_id(material_id, request_key)),
-        "material_id": material_id,
-        "request_key": request_key,
-        "active_generation_id": str((existing_row or {}).get("active_generation_id") or ""),
-        "search_state": str((existing_row or {}).get("search_state") or "idle"),
-        "can_request_more": 1 if bool(_to_int((existing_row or {}).get("can_request_more"), 1)) else 0,
-        "exhausted_reason": str((existing_row or {}).get("exhausted_reason") or "") or None,
-        "provider_stage": _normalize_provider_stage((existing_row or {}).get("provider_stage")),
-        "provider_fallback_enabled": 1 if bool(_to_int((existing_row or {}).get("provider_fallback_enabled"), 0)) else 0,
-        "recovery_stage": max(0, _to_int((existing_row or {}).get("recovery_stage"), 0)),
-        "stage_exhausted_json": str((existing_row or {}).get("stage_exhausted_json") or "{}"),
-        "last_progress_at": str((existing_row or {}).get("last_progress_at") or "") or None,
-        "last_job_id": str((existing_row or {}).get("last_job_id") or "") or None,
-        "search_session_version": max(1, _to_int((existing_row or {}).get("search_session_version"), 1)),
-        "updated_at": str((existing_row or {}).get("updated_at") or now_iso()),
-    }
-
-
-def _upsert_generation_head(
-    conn,
-    *,
-    material_id: str,
-    request_key: str,
-    updates: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    row = _generation_head_row(
-        _fetch_generation_head_row(conn, material_id=material_id, request_key=request_key),
-        material_id=material_id,
-        request_key=request_key,
-    )
-    for key, value in (updates or {}).items():
-        if key == "provider_stage":
-            row[key] = _normalize_provider_stage(value)
-        elif key == "recovery_stage":
-            row[key] = max(0, _to_int(value, row["recovery_stage"]))
-        elif key == "search_session_version":
-            row[key] = max(1, _to_int(value, row["search_session_version"]))
-        elif key in {"can_request_more", "provider_fallback_enabled"}:
-            row[key] = 1 if bool(value) else 0
-        elif key == "stage_exhausted_json":
-            if isinstance(value, str):
-                row[key] = value or "{}"
-            else:
-                row[key] = dumps_json(_normalize_stage_exhausted(value))
-        elif key == "updated_at":
-            row[key] = str(value or row[key])
-        else:
-            row[key] = value
-    row["updated_at"] = str(row.get("updated_at") or now_iso())
-    if not str(row.get("stage_exhausted_json") or "").strip():
-        row["stage_exhausted_json"] = "{}"
-    try:
-        upsert(conn, "reel_generation_heads", row)
-    except (sqlite3.OperationalError, Exception) as exc:
-        if "no column named id" not in str(exc).lower() and "column" not in str(exc).lower():
-            raise
-        execute_modify(
-            conn,
-            """
-            INSERT INTO reel_generation_heads (material_id, request_key, active_generation_id, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(material_id, request_key) DO UPDATE SET
-                active_generation_id = excluded.active_generation_id,
-                updated_at = excluded.updated_at
-            """,
-            (
-                material_id,
-                request_key,
-                str(row.get("active_generation_id") or ""),
-                str(row.get("updated_at") or now_iso()),
-            ),
-        )
-    return row
-
-
-def _head_stage_exhausted(head_row: dict[str, Any] | None) -> dict[str, bool]:
-    if not head_row:
-        return {}
-    raw_value = head_row.get("stage_exhausted_json")
-    if isinstance(raw_value, str):
-        try:
-            parsed = json.loads(raw_value or "{}")
-        except json.JSONDecodeError:
-            parsed = {}
-        return _normalize_stage_exhausted(parsed)
-    return _normalize_stage_exhausted(raw_value)
-
-
-def _head_search_session_version(head_row: dict[str, Any] | None) -> int:
-    return max(1, _to_int((head_row or {}).get("search_session_version"), 1))
-
-
-def _search_status_from_head(
-    head_row: dict[str, Any] | None,
-    *,
-    job_row: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    if not head_row:
-        return {
-            "state": "idle",
-            "can_request_more": True,
-            "reason": None,
-            "provider_stage": "youtube",
-            "recovery_stage": 0,
-            "last_progress_at": None,
-        }
-    state = str(head_row.get("search_state") or "idle").strip().lower()
-    can_request_more = bool(_to_int(head_row.get("can_request_more"), 1))
-    reason = str(head_row.get("exhausted_reason") or "").strip() or None
-    recovery_stage = max(0, _to_int(head_row.get("recovery_stage"), 0))
-    provider_stage = _search_status_provider_stage(head_row.get("provider_stage"), recovery_stage=recovery_stage)
-    last_progress_at = _normalize_datetime_for_api(head_row.get("last_progress_at"))
-    job_status = str((job_row or {}).get("status") or "").strip().lower()
-    if state not in {"stalled", "exhausted", "failed"} and job_status in {"queued", "running"}:
-        state = "refining" if job_status == "running" else "active"
-    if state not in {"idle", "active", "refining", "stalled", "exhausted", "failed"}:
-        state = "idle"
-    return {
-        "state": state,
-        "can_request_more": can_request_more,
-        "reason": reason,
-        "provider_stage": provider_stage,
-        "recovery_stage": recovery_stage,
-        "last_progress_at": last_progress_at,
-    }
-
-
-def _job_activity_started_at(job_row: dict[str, Any] | None) -> datetime | None:
-    if not job_row:
-        return None
-    return _parse_optional_iso_datetime(job_row.get("started_at")) or _parse_optional_iso_datetime(job_row.get("created_at"))
-
-
-def _refinement_job_is_stale(job_row: dict[str, Any] | None) -> bool:
-    started_at = _job_activity_started_at(job_row)
-    if started_at is None:
-        return False
-    age_sec = (datetime.now(timezone.utc) - started_at).total_seconds()
-    return age_sec >= REFINEMENT_JOB_STALE_TIMEOUT_SEC
-
-
-def _update_head_for_search_state(
-    conn,
-    *,
-    material_id: str,
-    request_key: str,
-    search_state: str,
-    can_request_more: bool,
-    exhausted_reason: str | None = None,
-    provider_stage: object | None = None,
-    recovery_stage: int | None = None,
-    stage_exhausted: dict[str, bool] | None = None,
-    last_job_id: str | None = None,
-    last_progress_at: str | None = None,
-    provider_fallback_enabled: bool | None = None,
-    search_session_version: int | None = None,
-    active_generation_id: str | None = None,
-) -> dict[str, Any]:
-    updates: dict[str, Any] = {
-        "search_state": search_state,
-        "can_request_more": can_request_more,
-        "exhausted_reason": exhausted_reason,
-    }
-    if provider_stage is not None:
-        updates["provider_stage"] = provider_stage
-    if recovery_stage is not None:
-        updates["recovery_stage"] = recovery_stage
-    if stage_exhausted is not None:
-        updates["stage_exhausted_json"] = stage_exhausted
-    if last_job_id is not None:
-        updates["last_job_id"] = last_job_id
-    if last_progress_at is not None:
-        updates["last_progress_at"] = last_progress_at
-    if provider_fallback_enabled is not None:
-        updates["provider_fallback_enabled"] = provider_fallback_enabled
-    if search_session_version is not None:
-        updates["search_session_version"] = search_session_version
-    if active_generation_id is not None:
-        updates["active_generation_id"] = active_generation_id
-    return _upsert_generation_head(
-        conn,
-        material_id=material_id,
-        request_key=request_key,
-        updates=updates,
-    )
-
-
 def _fetch_active_generation_row(conn, *, material_id: str, request_key: str) -> dict[str, Any] | None:
     head = _fetch_generation_head_row(conn, material_id=material_id, request_key=request_key)
     if not head:
         return None
     return _fetch_generation_row(conn, str(head.get("active_generation_id") or ""))
-
-
-def _fetch_refinement_job_for_generation(conn, source_generation_id: str | None) -> dict[str, Any] | None:
-    if not source_generation_id:
-        return None
-    job_row = fetch_one(
-        conn,
-        """
-        SELECT *
-        FROM reel_generation_jobs
-        WHERE source_generation_id = ?
-          AND status IN ('queued', 'running')
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (source_generation_id,),
-    )
-    if not job_row:
-        return None
-    if str(job_row.get("status") or "").strip().lower() == "running" and _refinement_job_is_stale(job_row):
-        job_id = str(job_row.get("id") or "").strip()
-        logger.warning("Resetting stale refinement job %s to failed", job_id)
-        execute_modify(
-            conn,
-            "UPDATE reel_generation_jobs SET status = 'failed', error_text = 'stale (timed out)', completed_at = ? WHERE id = ?",
-            (now_iso(), job_id),
-        )
-        return None
-    if str(job_row.get("status") or "").strip().lower() == "queued":
-        resumed = _resume_queued_refinement_job(conn, job_row)
-        if resumed is None:
-            return None
-        job_row = resumed
-    return job_row
-
-
-def _submit_refinement_job(job_id: str) -> bool:
-    clean_job_id = str(job_id or "").strip()
-    if not clean_job_id or SERVERLESS_MODE:
-        return False
-    if _refinement_job_executor is None:
-        return False
-    with _refinement_jobs_lock:
-        if clean_job_id in _scheduled_refinement_job_ids:
-            return False
-        _scheduled_refinement_job_ids.add(clean_job_id)
-        try:
-            _refinement_job_executor.submit(_run_refinement_job_with_cleanup, clean_job_id)
-        except Exception:
-            _scheduled_refinement_job_ids.discard(clean_job_id)
-            raise
-    return True
-
-
-def _run_refinement_job_with_cleanup(job_id: str) -> None:
-    """
-    Instrumented wrapper around `_run_refinement_job` (Phase D.1 / D.2).
-
-    Binds the current thread's `job_id` contextvar so any `publish_progress(...)`
-    calls inside the worker auto-route onto the progress bus topic keyed on `job_id`.
-    Emits terminal `job_start` / `job_end` events and always calls
-    `progress_bus.terminate()` so attached NDJSON subscribers get a clean EOF.
-    """
-    clean_id = str(job_id or "").strip()
-    _set_progress_job_id(clean_id)
-    started_mono = time.monotonic()
-    _publish_progress_event("job_start", job_id=clean_id)
-    exc_class: str | None = None
-    try:
-        _run_refinement_job(job_id)
-    except BaseException as exc:
-        exc_class = type(exc).__name__
-        raise
-    finally:
-        duration_ms = int((time.monotonic() - started_mono) * 1000)
-        outcome = "ok" if exc_class is None else "error"
-        _publish_progress_event(
-            "job_end",
-            job_id=clean_id,
-            duration_ms=duration_ms,
-            outcome=outcome,
-            error_class=exc_class,
-        )
-        progress_bus.terminate(
-            clean_id,
-            final_event={
-                "event": "job_terminal",
-                "job_id": clean_id,
-                "outcome": outcome,
-                "error_class": exc_class,
-                "duration_ms": duration_ms,
-            },
-        )
-        with _refinement_jobs_lock:
-            _scheduled_refinement_job_ids.discard(clean_id)
-        _set_progress_job_id(None)
-
-
-def _resume_queued_refinement_job(conn, job_row: dict[str, Any]) -> dict[str, Any] | None:
-    job_id = str(job_row.get("id") or "").strip()
-    if not job_id or SERVERLESS_MODE or _refinement_job_executor is None:
-        return job_row
-
-    source_generation_id = str(job_row.get("source_generation_id") or "").strip()
-    source_generation = _fetch_generation_row(conn, source_generation_id)
-    if not source_generation:
-        upsert(
-            conn,
-            "reel_generation_jobs",
-            {
-                **job_row,
-                "status": "failed",
-                "completed_at": now_iso(),
-                "error_text": "source_generation_missing",
-            },
-        )
-        return None
-
-    active_generation = _fetch_active_generation_row(
-        conn,
-        material_id=str(job_row.get("material_id") or ""),
-        request_key=str(job_row.get("request_key") or ""),
-    )
-    active_generation_id = str((active_generation or {}).get("id") or "").strip()
-    if active_generation_id != source_generation_id:
-        upsert(
-            conn,
-            "reel_generation_jobs",
-            {
-                **job_row,
-                "status": "superseded",
-                "completed_at": now_iso(),
-                "error_text": None,
-            },
-        )
-        return None
-
-    with _refinement_jobs_lock:
-        _scheduled_refinement_job_ids.discard(job_id)
-    _submit_refinement_job(job_id)
-    return job_row
-
-
-def _resume_pending_refinement_jobs() -> None:
-    if SERVERLESS_MODE or _refinement_job_executor is None:
-        return
-
-    job_ids_to_resume: list[str] = []
-    with get_conn(transactional=True) as conn:
-        pending_jobs = fetch_all(
-            conn,
-            """
-            SELECT *
-            FROM reel_generation_jobs
-            WHERE status IN ('queued', 'running')
-            ORDER BY created_at ASC, id ASC
-            """,
-        )
-        for job_row in pending_jobs:
-            job_id = str(job_row.get("id") or "").strip()
-            if not job_id:
-                continue
-
-            source_generation_id = str(job_row.get("source_generation_id") or "").strip()
-            source_generation = _fetch_generation_row(conn, source_generation_id)
-            if not source_generation:
-                upsert(
-                    conn,
-                    "reel_generation_jobs",
-                    {
-                        **job_row,
-                        "status": "failed",
-                        "completed_at": now_iso(),
-                        "error_text": "source_generation_missing",
-                    },
-                )
-                continue
-
-            active_generation = _fetch_active_generation_row(
-                conn,
-                material_id=str(job_row.get("material_id") or ""),
-                request_key=str(job_row.get("request_key") or ""),
-            )
-            active_generation_id = str((active_generation or {}).get("id") or "").strip()
-            if active_generation_id != source_generation_id:
-                upsert(
-                    conn,
-                    "reel_generation_jobs",
-                    {
-                        **job_row,
-                        "status": "superseded",
-                        "completed_at": now_iso(),
-                        "error_text": None,
-                    },
-                )
-                continue
-
-            if str(job_row.get("status") or "").strip().lower() == "running":
-                upsert(
-                    conn,
-                    "reel_generation_jobs",
-                    {
-                        **job_row,
-                        "status": "queued",
-                        "started_at": None,
-                        "completed_at": None,
-                        "error_text": None,
-                    },
-                )
-            job_ids_to_resume.append(job_id)
-
-    for job_id in job_ids_to_resume:
-        _submit_refinement_job(job_id)
 
 
 def _create_generation_row(
@@ -3126,8 +2674,6 @@ def _activate_generation(conn, *, material_id: str, request_key: str, generation
             """,
             (material_id, request_key, generation_id, updated_at),
         )
-
-
 def _normalize_reel_identity_time(value: object) -> str:
     try:
         parsed = round(float(value or 0.0), 3)
@@ -3201,173 +2747,6 @@ def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
     return ordered
 
 
-def _extend_active_generation(
-    conn,
-    *,
-    material_id: str,
-    concept_id: str | None,
-    request_key: str,
-    required_count: int,
-    active_generation_id: str,
-    active_response_profile: str | None,
-    generation_mode: Literal["slow", "fast"],
-    creative_commons_only: bool,
-    min_relevance: float | None,
-    video_pool_mode: Literal["short-first", "balanced", "long-form"],
-    preferred_video_duration: Literal["any", "short", "medium", "long"],
-    target_clip_duration_sec: int,
-    target_clip_duration_min_sec: int | None,
-    target_clip_duration_max_sec: int | None,
-    exclude_video_ids: list[str] | None = None,
-    page_hint: int = 1,
-    on_reel_created: Callable[[dict[str, Any]], None] | None = None,
-    should_cancel: Callable[[], bool] | None = None,
-    multi_platform_search: bool = False,
-    knowledge_level_override: str | None = None,
-    learner_id: str = LEGACY_LEARNER_ID,
-) -> dict[str, Any]:
-    if should_cancel is not None and should_cancel():
-        raise GenerationCancelledError("Generation cancelled.")
-    fast_mode = generation_mode == "fast"
-    prior_generation_ids = _response_generation_ids(conn, active_generation_id)
-    next_generation_id = _create_generation_row(
-        conn,
-        material_id=material_id,
-        concept_id=concept_id,
-        request_key=request_key,
-        generation_mode=generation_mode,
-        retrieval_profile="deep",
-        source_generation_id=active_generation_id,
-    )
-
-    reel_service.generate_reels(
-        conn,
-        material_id=material_id,
-        concept_id=concept_id,
-        num_reels=max(1, int(required_count)),
-        creative_commons_only=creative_commons_only,
-        exclude_video_ids=exclude_video_ids,
-        fast_mode=fast_mode,
-        video_pool_mode=video_pool_mode,
-        preferred_video_duration=preferred_video_duration,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-        retrieval_profile="deep",
-        generation_id=next_generation_id,
-        exclude_generation_ids=prior_generation_ids,
-        min_relevance_threshold=float(min_relevance or 0.0),
-        page_hint=page_hint,
-        recovery_stage=_initial_recovery_stage(page_hint=page_hint),
-        on_reel_created=on_reel_created,
-        should_cancel=should_cancel,
-        multi_platform_search=multi_platform_search,
-        knowledge_level_override=knowledge_level_override,
-        learner_id=learner_id,
-    )
-
-    if _count_generation_reels(conn, next_generation_id) <= 0:
-        _complete_generation(
-            conn,
-            generation_id=next_generation_id,
-            retrieval_profile="deep",
-            status="failed",
-            error_text="no_reels_generated",
-        )
-        fallback_reels = _ranked_request_reels(
-            conn,
-            material_id=material_id,
-            fast_mode=fast_mode,
-            generation_id=active_generation_id,
-            min_relevance=min_relevance,
-            preferred_video_duration=preferred_video_duration,
-            target_clip_duration_sec=target_clip_duration_sec,
-            target_clip_duration_min_sec=target_clip_duration_min_sec,
-            target_clip_duration_max_sec=target_clip_duration_max_sec,
-            exclude_video_ids=exclude_video_ids,
-            page=page_hint,
-            limit=max(5, min(25, required_count)),
-            learner_id=learner_id,
-        )
-        response_payload = _build_generation_response_payload(
-            reels=fallback_reels,
-            generation_id=active_generation_id,
-            response_profile=active_response_profile,
-            job_row=None,
-        )
-        _log_generation_response_summary(
-            event="extend_active_generation_empty",
-            material_id=material_id,
-            request_key=request_key,
-            generation_mode=generation_mode,
-            required_count=required_count,
-            response_payload=response_payload,
-            page_hint=page_hint,
-        )
-        return {**response_payload, "request_key": request_key}
-
-    _activate_generation(
-        conn,
-        material_id=material_id,
-        request_key=request_key,
-        generation_id=next_generation_id,
-        retrieval_profile="deep",
-    )
-    expanded_reels = _ranked_request_reels(
-        conn,
-        material_id=material_id,
-        fast_mode=fast_mode,
-        generation_id=next_generation_id,
-        min_relevance=min_relevance,
-        preferred_video_duration=preferred_video_duration,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-        exclude_video_ids=exclude_video_ids,
-        page=page_hint,
-        limit=max(5, min(25, required_count)),
-        learner_id=learner_id,
-    )
-    job_row = _queue_refinement_if_needed(
-        conn,
-        material_id=material_id,
-        concept_id=concept_id,
-        request_key=request_key,
-        generation_id=next_generation_id,
-        current_reels=expanded_reels,
-        required_count=required_count,
-        generation_mode=generation_mode,
-        creative_commons_only=creative_commons_only,
-        preferred_video_duration=preferred_video_duration,
-        video_pool_mode=video_pool_mode,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-        min_relevance=min_relevance,
-        page_hint=page_hint,
-        page_size_hint=max(5, min(25, required_count)),
-        multi_platform_search=multi_platform_search,
-        knowledge_level_override=knowledge_level_override,
-        learner_id=learner_id,
-    )
-    response_payload = _build_generation_response_payload(
-        reels=expanded_reels,
-        generation_id=next_generation_id,
-        response_profile="deep",
-        job_row=job_row,
-    )
-    _log_generation_response_summary(
-        event="extend_active_generation_complete",
-        material_id=material_id,
-        request_key=request_key,
-        generation_mode=generation_mode,
-        required_count=required_count,
-        response_payload=response_payload,
-        page_hint=page_hint,
-    )
-    return {**response_payload, "request_key": request_key}
-
-
 def _ranked_request_reels(
     conn,
     *,
@@ -3399,6 +2778,21 @@ def _ranked_request_reels(
         subject_tag=subject_tag,
         strict_topic_only=strict_topic_only,
     )
+    exclusions_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "video_ids": sorted({_bare_video_id(value) for value in (exclude_video_ids or []) if _bare_video_id(value)}),
+                "reel_ids": sorted({str(value) for value in (exclude_reel_ids or []) if str(value)}),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    content_fingerprint = _generation_content_fingerprint(
+        conn,
+        material_id=material_id,
+        concept_id=None,
+    )
     generation_ids = _response_generation_ids(conn, generation_id)
     if generation_ids:
         ranked_batches = [
@@ -3409,6 +2803,8 @@ def _ranked_request_reels(
                 generation_id=current_generation_id,
                 page_hint=page,
                 learner_id=learner_id,
+                exclusions_fingerprint=exclusions_fingerprint,
+                content_fingerprint=content_fingerprint,
             )
             for current_generation_id in generation_ids
             if current_generation_id
@@ -3422,6 +2818,8 @@ def _ranked_request_reels(
             generation_id=generation_id,
             page_hint=page,
             learner_id=learner_id,
+            exclusions_fingerprint=exclusions_fingerprint,
+            content_fingerprint=content_fingerprint,
         )
     excluded_video_id_set = {
         _bare_video_id(video_id)
@@ -3533,22 +2931,6 @@ def _ranked_request_reels(
     )
 
 
-def _build_generation_response_payload(
-    *,
-    reels: list[dict[str, Any]],
-    generation_id: str | None,
-    response_profile: str | None,
-    job_row: dict[str, Any] | None,
-) -> dict[str, Any]:
-    return {
-        "reels": reels,
-        "generation_id": generation_id,
-        "response_profile": response_profile,
-        "refinement_job_id": str((job_row or {}).get("id") or "") or None,
-        "refinement_status": str((job_row or {}).get("status") or "") or None,
-    }
-
-
 def _bare_video_id(value: str | None) -> str:
     """Strip a platform prefix (`yt:`/`ig:`/`tt:`) → the bare source id.
 
@@ -3594,1254 +2976,420 @@ def _parse_excluded_reel_ids_param(raw_value: str | None) -> list[str]:
     return normalized[:200]
 
 
-def _short_debug_token(value: str | None, *, limit: int = 12) -> str | None:
-    clean = str(value or "").strip()
-    if not clean:
-        return None
-    if len(clean) <= limit:
-        return clean
-    return f"{clean[:limit]}..."
-
-
-def _generation_source_video_count(reels: list[dict[str, Any]]) -> int:
-    source_ids: set[str] = set()
-    for reel in reels:
-        source_id = str(reel.get("video_id") or reel.get("video_url") or "").strip()
-        if source_id:
-            source_ids.add(source_id)
-    return len(source_ids)
-
-
-def _log_generation_response_summary(
-    *,
-    event: str,
-    material_id: str,
-    request_key: str | None,
-    generation_mode: str,
-    required_count: int,
-    response_payload: dict[str, Any],
-    page_hint: int = 1,
-) -> None:
-    reels = list(response_payload.get("reels") or [])
-    payload = {
-        "event": event,
-        "material_id": material_id,
-        "request_key": _short_debug_token(request_key),
-        "generation_id": _short_debug_token(str(response_payload.get("generation_id") or "") or None),
-        "generation_mode": generation_mode,
-        "response_profile": str(response_payload.get("response_profile") or "") or None,
-        "required_count": int(max(1, required_count)),
-        "returned_count": len(reels),
-        "unique_source_videos": _generation_source_video_count(reels),
-        "page_hint": int(max(1, page_hint)),
-        "refinement_status": str(response_payload.get("refinement_status") or "") or None,
-    }
-    if len(reels) == 0:
-        logger.warning("Generation response summary: %s", json.dumps(payload, sort_keys=True))
-        return
-    if len(reels) < max(1, int(required_count or 1)) or settings.retrieval_debug_logging:
-        logger.info("Generation response summary: %s", json.dumps(payload, sort_keys=True))
-
-
-def _initial_response_reel_target(
-    *,
-    required_count: int,
-    generation_mode: Literal["slow", "fast"],
-    sync_deep_fallback: Literal["always", "if_empty", "never"],
-) -> int:
-    safe_required = max(1, int(required_count))
-    if sync_deep_fallback == "always":
-        return safe_required
-    if safe_required <= 2:
-        return safe_required
-    cap = FAST_INITIAL_RESPONSE_REELS if generation_mode == "fast" else SLOW_INITIAL_RESPONSE_REELS
-    return max(2, min(safe_required, cap))
-
-
-def _minimum_initial_response_reels(
-    *,
-    required_count: int,
-    generation_mode: Literal["slow", "fast"],
-    sync_deep_fallback: Literal["always", "if_empty", "never"],
-) -> int:
-    if sync_deep_fallback == "never":
-        return 1
-    safe_required = max(1, int(required_count))
-    floor = FAST_MIN_INITIAL_VISIBLE_REELS if generation_mode == "fast" else SLOW_MIN_INITIAL_VISIBLE_REELS
-    return max(1, min(safe_required, floor))
-
-
-def _refinement_target_reel_count(
-    *,
-    required_count: int,
-    generation_mode: Literal["slow", "fast"],
-    target_page: int = 1,
-    page_size_hint: int = 5,
-    existing_source_count: int = 0,
-) -> int:
-    safe_existing = max(0, int(existing_source_count))
-    inventory_target = _refinement_inventory_target_count(
-        required_count=required_count,
-        generation_mode=generation_mode,
-        target_page=target_page,
-        page_size_hint=page_size_hint,
-        existing_source_count=safe_existing,
-    )
-    remaining_gap = max(0, inventory_target - safe_existing)
-    if remaining_gap <= 0:
-        return 0
-    burst = FAST_REFINEMENT_JOB_BURST_REELS if generation_mode == "fast" else SLOW_REFINEMENT_JOB_BURST_REELS
-    minimum_seed = FAST_MIN_REFINEMENT_TARGET_REELS if generation_mode == "fast" else SLOW_MIN_REFINEMENT_TARGET_REELS
-    minimum_target = minimum_seed if safe_existing <= 0 else 1
-    return max(minimum_target, min(remaining_gap, burst))
-
-
-def _refinement_inventory_target_count(
-    *,
-    required_count: int,
-    generation_mode: Literal["slow", "fast"],
-    target_page: int = 1,
-    page_size_hint: int = 5,
-    existing_source_count: int = 0,
-) -> int:
-    safe_required = max(1, int(required_count))
-    safe_target_page = max(1, int(target_page or 1))
-    safe_page_size = max(1, int(page_size_hint or 1))
-    safe_existing = max(0, int(existing_source_count))
-    min_target = FAST_MIN_REFINEMENT_TARGET_REELS if generation_mode == "fast" else SLOW_MIN_REFINEMENT_TARGET_REELS
-    return max(min_target, safe_required, safe_target_page * safe_page_size, safe_existing)
-
-
-def _refinement_horizon_page(
-    *,
-    required_count: int,
-    generation_mode: Literal["slow", "fast"],
-    target_page: int = 1,
-    page_size_hint: int = 5,
-    existing_source_count: int = 0,
-) -> int:
-    safe_required = max(1, int(required_count or 1))
-    safe_target_page = max(1, int(target_page or 1))
-    safe_page_size = max(1, int(page_size_hint or 1))
-    safe_existing = max(0, int(existing_source_count or 0))
-    horizon_count = max(safe_required, safe_existing)
-    return max(safe_target_page, int(math.ceil(horizon_count / safe_page_size)))
-
-
-def _initial_recovery_stage(*, page_hint: int) -> int:
-    return 0
-
-
-def _normalize_stage_exhausted(raw_value: object) -> dict[str, bool]:
-    if isinstance(raw_value, dict):
-        return {str(key): bool(value) for key, value in raw_value.items()}
-    if isinstance(raw_value, list):
-        return {str(item): True for item in raw_value}
-    return {}
-
-
-def _first_unexhausted_recovery_stage(stage_exhausted: dict[str, bool] | None) -> int:
-    exhausted = stage_exhausted or {}
-    for stage in range(0, MAX_REFINEMENT_RECOVERY_STAGE + 1):
-        if not bool(exhausted.get(str(stage))):
-            return stage
-    return MAX_REFINEMENT_RECOVERY_STAGE + 1
-
-
-def _refinement_stage_kind(recovery_stage: int) -> str:
-    safe_stage = int(recovery_stage or 0)
-    return (
-        "window"
-        if safe_stage in {REFINEMENT_STAGE_MULTI_CLIP_STRICT, REFINEMENT_STAGE_MULTI_CLIP_EXPANDED}
-        else "source"
-    )
-
-
-def _visible_reel_clip_keys(reels: list[dict[str, Any]]) -> set[str]:
-    keys: set[str] = set()
-    for reel in reels:
-        _reel_id, clip_key = _reel_identity_key(reel)
-        if clip_key:
-            keys.add(clip_key)
-    return keys
-
-
-def _infer_frontier_family_from_reel(reel: dict[str, Any]) -> str:
-    retrieval_stage = str(reel.get("retrieval_stage") or "").strip().lower()
-    query_strategy = str(reel.get("query_strategy") or "").strip().lower()
-    source_surface = str(reel.get("source_surface") or "").strip().lower()
-    if retrieval_stage == "high_precision" and query_strategy == "literal":
-        return "root_exact"
-    if source_surface in {
-        "youtube_channel",
-        "youtube_related",
-        "duckduckgo_site",
-        "duckduckgo_quoted",
-        "bing_site",
-        "bing_quoted",
-        "local_cache",
-    }:
-        return "recovery_graph"
-    if retrieval_stage == "recovery" or query_strategy == "recovery_adjacent":
-        return "anchored_adjacent"
-    return "root_companion"
-
-
-def _update_frontier_visible_growth(
-    conn,
-    *,
-    material_id: str,
-    request_key: str,
-    reels: list[dict[str, Any]],
-) -> None:
-    if not material_id or not request_key or not reels:
-        return
-    visible_by_family: dict[str, int] = {}
-    for reel in reels:
-        family = _infer_frontier_family_from_reel(reel)
-        visible_by_family[family] = visible_by_family.get(family, 0) + 1
-    updated_at = now_iso()
-    for family, count in visible_by_family.items():
-        if count <= 0:
-            continue
-        entry = fetch_one(
+def _persist_generation_provider_usage(job_id: str, record: ProviderUsageRecord) -> None:
+    """Store every provider response instead of treating one rate-limit hit as a generation."""
+    with get_conn(transactional=True) as conn:
+        record_provider_usage(
             conn,
-            """
-            SELECT id, new_visible_reels
-            FROM request_frontier_entries
-            WHERE material_id = ?
-              AND request_key = ?
-              AND family_key LIKE ?
-              AND exhausted = 0
-            ORDER BY COALESCE(last_run_at, updated_at) DESC, updated_at DESC
-            LIMIT 1
-            """,
-            (material_id, request_key, f"{family}:%"),
-        )
-        if not entry:
-            entry = fetch_one(
-                conn,
-                """
-                SELECT id, new_visible_reels
-                FROM request_frontier_entries
-                WHERE material_id = ?
-                  AND request_key = ?
-                  AND family_key LIKE ?
-                ORDER BY COALESCE(last_run_at, updated_at) DESC, updated_at DESC
-                LIMIT 1
-                """,
-                (material_id, request_key, f"{family}:%"),
-            )
-        if not entry:
-            continue
-        execute_modify(
-            conn,
-            """
-            UPDATE request_frontier_entries
-            SET new_visible_reels = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            (max(0, int(entry.get("new_visible_reels") or 0)) + count, updated_at, str(entry.get("id") or "")),
-        )
-
-
-def _count_generation_unique_videos(conn, generation_id: str) -> int:
-    row = fetch_one(
-        conn,
-        "SELECT COUNT(DISTINCT video_id) AS video_count FROM reels WHERE generation_id = ?",
-        (generation_id,),
-    )
-    return max(0, int((row or {}).get("video_count") or 0))
-
-
-def _advance_refinement_state(
-    *,
-    recovery_stage: int,
-    stage_exhausted: dict[str, bool],
-    no_new_sources_passes: int,
-    no_new_windows_passes: int,
-    no_new_visible_reels_passes: int,
-    new_unique_videos: int,
-    new_unique_clip_windows: int,
-    new_unique_visible_reels: int,
-) -> dict[str, Any]:
-    safe_stage = max(0, int(recovery_stage or 0))
-    stage_kind = _refinement_stage_kind(safe_stage)
-    updated_stage_exhausted = dict(stage_exhausted)
-    next_no_new_sources_passes = 0 if new_unique_videos > 0 else no_new_sources_passes + 1
-    next_no_new_windows_passes = 0 if new_unique_clip_windows > 0 else no_new_windows_passes + 1
-    next_no_new_visible_reels_passes = 0 if new_unique_visible_reels > 0 else no_new_visible_reels_passes + 1
-    if stage_kind == "window":
-        stage_is_exhausted = next_no_new_windows_passes >= 2 and next_no_new_visible_reels_passes >= 2
-    else:
-        stage_is_exhausted = next_no_new_sources_passes >= 2 and next_no_new_visible_reels_passes >= 2
-    if stage_is_exhausted:
-        updated_stage_exhausted[str(safe_stage)] = True
-    next_stage = safe_stage
-    if stage_is_exhausted:
-        next_stage = _first_unexhausted_recovery_stage(updated_stage_exhausted)
-        if next_stage != safe_stage:
-            next_no_new_sources_passes = 0
-            next_no_new_windows_passes = 0
-            next_no_new_visible_reels_passes = 0
-    if new_unique_visible_reels > 0:
-        growth_reason = "new_visible_reels"
-    elif new_unique_clip_windows > 0:
-        growth_reason = "new_clip_windows"
-    elif new_unique_videos > 0:
-        growth_reason = "new_source_videos"
-    elif stage_is_exhausted:
-        growth_reason = "stage_exhausted"
-    else:
-        growth_reason = "no_growth"
-    return {
-        "next_stage": next_stage,
-        "stage_exhausted": updated_stage_exhausted,
-        "no_new_sources_passes": next_no_new_sources_passes,
-        "no_new_windows_passes": next_no_new_windows_passes,
-        "no_new_visible_reels_passes": next_no_new_visible_reels_passes,
-        "stage_is_exhausted": stage_is_exhausted,
-        "all_stages_exhausted": next_stage > MAX_REFINEMENT_RECOVERY_STAGE,
-        "growth_reason": growth_reason,
-    }
-
-
-def _build_refinement_request_params(
-    *,
-    creative_commons_only: bool,
-    video_pool_mode: Literal["short-first", "balanced", "long-form"],
-    preferred_video_duration: Literal["any", "short", "medium", "long"],
-    target_clip_duration_sec: int,
-    target_clip_duration_min_sec: int | None,
-    target_clip_duration_max_sec: int | None,
-    required_count: int,
-    generation_mode: Literal["slow", "fast"],
-    existing_source_count: int = 0,
-    min_relevance_threshold: float = 0.0,
-    page_hint: int = 1,
-    page_size_hint: int = 5,
-    target_page: int | None = None,
-    recovery_stage: int = 0,
-    refill_pass: int = 0,
-    no_new_sources_passes: int = 0,
-    no_new_windows_passes: int = 0,
-    no_new_visible_reels_passes: int = 0,
-    stage_exhausted: dict[str, bool] | None = None,
-    growth_reason: str | None = None,
-    multi_platform_search: bool = False,
-    knowledge_level_override: str | None = None,
-    learner_id: str = LEGACY_LEARNER_ID,
-) -> dict[str, Any]:
-    safe_required_count = max(1, int(required_count or 1))
-    safe_page_hint = max(1, int(page_hint or 1))
-    requested_target_page = max(safe_page_hint, int(target_page or safe_page_hint))
-    safe_target_page = _refinement_horizon_page(
-        required_count=safe_required_count,
-        generation_mode=generation_mode,
-        target_page=requested_target_page,
-        page_size_hint=page_size_hint,
-        existing_source_count=existing_source_count,
-    )
-    inventory_target_count = _refinement_inventory_target_count(
-        required_count=safe_required_count,
-        generation_mode=generation_mode,
-        target_page=safe_target_page,
-        page_size_hint=page_size_hint,
-        existing_source_count=existing_source_count,
-    )
-    target_reel_count = _refinement_target_reel_count(
-        required_count=safe_required_count,
-        generation_mode=generation_mode,
-        target_page=safe_target_page,
-        page_size_hint=page_size_hint,
-        existing_source_count=existing_source_count,
-    )
-    return {
-        "creative_commons_only": creative_commons_only,
-        "video_pool_mode": video_pool_mode,
-        "preferred_video_duration": preferred_video_duration,
-        "target_clip_duration_sec": target_clip_duration_sec,
-        "target_clip_duration_min_sec": target_clip_duration_min_sec,
-        "target_clip_duration_max_sec": target_clip_duration_max_sec,
-        "multi_platform_search": bool(multi_platform_search),
-        "knowledge_level_override": knowledge_level_override,
-        "learner_id": str(learner_id or LEGACY_LEARNER_ID),
-        "required_reel_count": safe_required_count,
-        "inventory_target_count": inventory_target_count,
-        "target_reel_count": target_reel_count,
-        "min_relevance_threshold": float(min_relevance_threshold or 0.0),
-        "page_hint": safe_page_hint,
-        "page_size_hint": max(1, int(page_size_hint or 1)),
-        "target_page": safe_target_page,
-        "recovery_stage": max(0, int(recovery_stage or 0)),
-        "refill_pass": max(0, int(refill_pass or 0)),
-        "no_new_sources_passes": max(0, int(no_new_sources_passes or 0)),
-        "no_new_windows_passes": max(0, int(no_new_windows_passes or 0)),
-        "no_new_visible_reels_passes": max(0, int(no_new_visible_reels_passes or 0)),
-        "stage_exhausted": stage_exhausted or {},
-        "growth_reason": str(growth_reason or "").strip(),
-    }
-
-
-def _merge_refinement_request_params(existing_job: dict[str, Any], request_params: dict[str, Any]) -> dict[str, Any]:
-    try:
-        existing_params = json.loads(str(existing_job.get("request_params_json") or "{}"))
-    except json.JSONDecodeError:
-        existing_params = {}
-    if not isinstance(existing_params, dict):
-        existing_params = {}
-    merged = dict(existing_params)
-    for key, value in request_params.items():
-        if key in {"inventory_target_count", "target_reel_count"}:
-            merged[key] = max(int(existing_params.get(key) or 0), int(value or 0))
-        elif key == "required_reel_count":
-            merged[key] = max(int(existing_params.get(key) or 0), int(value or 0))
-        elif key in {
-            "page_hint",
-            "page_size_hint",
-            "target_page",
-            "recovery_stage",
-            "refill_pass",
-            "no_new_sources_passes",
-            "no_new_windows_passes",
-            "no_new_visible_reels_passes",
-        }:
-            merged[key] = max(int(existing_params.get(key) or 0), int(value or 0))
-        elif key == "stage_exhausted":
-            merged[key] = {
-                **_normalize_stage_exhausted(existing_params.get(key)),
-                **_normalize_stage_exhausted(value),
-            }
-        elif value is not None:
-            merged[key] = value
-        elif key not in merged:
-            merged[key] = value
-    return merged
-
-
-def _queue_refinement_if_needed(
-    conn,
-    *,
-    material_id: str,
-    concept_id: str | None,
-    request_key: str,
-    generation_id: str | None,
-    current_reels: list[dict[str, Any]],
-    required_count: int,
-    generation_mode: Literal["slow", "fast"],
-    creative_commons_only: bool,
-    preferred_video_duration: Literal["any", "short", "medium", "long"],
-    video_pool_mode: Literal["short-first", "balanced", "long-form"],
-    target_clip_duration_sec: int,
-    target_clip_duration_min_sec: int | None,
-    target_clip_duration_max_sec: int | None,
-    min_relevance: float | None,
-    page_hint: int = 1,
-    target_page: int | None = None,
-    page_size_hint: int = 5,
-    recovery_stage: int | None = None,
-    refill_pass: int = 0,
-    no_new_sources_passes: int = 0,
-    no_new_windows_passes: int = 0,
-    no_new_visible_reels_passes: int = 0,
-    stage_exhausted: dict[str, bool] | None = None,
-    growth_reason: str | None = None,
-    multi_platform_search: bool = False,
-    knowledge_level_override: str | None = None,
-    learner_id: str = LEGACY_LEARNER_ID,
-) -> dict[str, Any] | None:
-    if not generation_id:
-        return None
-    safe_page_hint = max(1, int(page_hint or 1))
-    safe_target_page = max(safe_page_hint, int(target_page or safe_page_hint))
-    safe_page_size_hint = max(1, int(page_size_hint or 1))
-    normalized_stage_exhausted = _normalize_stage_exhausted(stage_exhausted)
-    inventory_target_count = _refinement_inventory_target_count(
-        required_count=required_count,
-        generation_mode=generation_mode,
-        target_page=safe_target_page,
-        page_size_hint=safe_page_size_hint,
-        existing_source_count=len(current_reels),
-    )
-    target_reel_count = _refinement_target_reel_count(
-        required_count=required_count,
-        generation_mode=generation_mode,
-        target_page=safe_target_page,
-        page_size_hint=safe_page_size_hint,
-        existing_source_count=len(current_reels),
-    )
-    if len(current_reels) >= inventory_target_count or target_reel_count <= 0:
-        return _fetch_refinement_job_for_generation(conn, generation_id)
-    if recovery_stage is None:
-        safe_recovery_stage = (
-            _first_unexhausted_recovery_stage(normalized_stage_exhausted)
-            if normalized_stage_exhausted
-            else _initial_recovery_stage(page_hint=safe_page_hint)
-        )
-    else:
-        safe_recovery_stage = max(0, int(recovery_stage or 0))
-    if safe_recovery_stage > MAX_REFINEMENT_RECOVERY_STAGE:
-        return _fetch_refinement_job_for_generation(conn, generation_id)
-    return _queue_refinement_job(
-        conn,
-        material_id=material_id,
-        concept_id=concept_id,
-        request_key=request_key,
-        source_generation_id=generation_id,
-        request_params=_build_refinement_request_params(
-            creative_commons_only=creative_commons_only,
-            video_pool_mode=video_pool_mode,
-            preferred_video_duration=preferred_video_duration,
-            target_clip_duration_sec=target_clip_duration_sec,
-            target_clip_duration_min_sec=target_clip_duration_min_sec,
-            target_clip_duration_max_sec=target_clip_duration_max_sec,
-            required_count=required_count,
-            generation_mode=generation_mode,
-            existing_source_count=len(current_reels),
-            min_relevance_threshold=float(min_relevance or 0.0),
-            page_hint=safe_page_hint,
-            page_size_hint=safe_page_size_hint,
-            target_page=safe_target_page,
-            recovery_stage=safe_recovery_stage,
-            refill_pass=refill_pass,
-            no_new_sources_passes=no_new_sources_passes,
-            no_new_windows_passes=no_new_windows_passes,
-            no_new_visible_reels_passes=no_new_visible_reels_passes,
-            stage_exhausted=normalized_stage_exhausted,
-            growth_reason=growth_reason,
-            multi_platform_search=multi_platform_search,
-            knowledge_level_override=knowledge_level_override,
-            learner_id=learner_id,
-        ),
-    )
-
-
-def _queue_refinement_job(
-    conn,
-    *,
-    material_id: str,
-    concept_id: str | None,
-    request_key: str,
-    source_generation_id: str,
-    request_params: dict[str, Any],
-) -> dict[str, Any] | None:
-    if SERVERLESS_MODE or _refinement_job_executor is None:
-        return None
-
-    existing = _fetch_refinement_job_for_generation(conn, source_generation_id)
-    if existing:
-        merged_params = _merge_refinement_request_params(existing, request_params)
-        if dumps_json(merged_params) != str(existing.get("request_params_json") or "{}"):
-            updated_existing = dict(existing)
-            updated_existing["request_params_json"] = dumps_json(merged_params)
-            upsert(conn, "reel_generation_jobs", updated_existing)
-            return updated_existing
-        return existing
-
-    job_id = str(uuid.uuid4())
-    created_at = now_iso()
-    job_row = {
-        "id": job_id,
-        "material_id": material_id,
-        "concept_id": concept_id,
-        "request_key": request_key,
-        "source_generation_id": source_generation_id,
-        "result_generation_id": None,
-        "target_profile": "deep",
-        "request_params_json": dumps_json(request_params),
-        "status": "queued",
-        "created_at": created_at,
-        "started_at": None,
-        "completed_at": None,
-        "error_text": None,
-    }
-    upsert(conn, "reel_generation_jobs", job_row)
-
-    _submit_refinement_job(job_id)
-    return job_row
-
-
-def _run_refinement_job(job_id: str) -> None:
-    with get_conn() as conn:
-        job_row = fetch_one(conn, "SELECT * FROM reel_generation_jobs WHERE id = ?", (job_id,))
-        if not job_row:
-            return
-        if str(job_row.get("status") or "").strip().lower() != "queued":
-            return
-
-        started_at = now_iso()
-        claimed = execute_modify(
-            conn,
-            """
-            UPDATE reel_generation_jobs
-            SET status = 'running',
-                started_at = ?,
-                completed_at = NULL,
-                error_text = NULL
-            WHERE id = ?
-              AND status = 'queued'
-            """,
-            (started_at, job_id),
-        )
-        if claimed <= 0:
-            return
-        job_row = fetch_one(conn, "SELECT * FROM reel_generation_jobs WHERE id = ?", (job_id,))
-        if not job_row:
-            return
-
-        source_generation_id = str(job_row.get("source_generation_id") or "")
-        source_generation = _fetch_generation_row(conn, source_generation_id)
-        if not source_generation:
-            upsert(
-                conn,
-                "reel_generation_jobs",
-                {
-                    **job_row,
-                    "status": "failed",
-                    "completed_at": now_iso(),
-                    "error_text": "source_generation_missing",
-                },
-            )
-            return
-
-        result_generation_id = _create_generation_row(
-            conn,
-            material_id=str(job_row.get("material_id") or ""),
-            concept_id=str(job_row.get("concept_id") or "") or None,
-            request_key=str(job_row.get("request_key") or ""),
-            generation_mode=str(source_generation.get("generation_mode") or "slow"),  # type: ignore[arg-type]
-            retrieval_profile="deep",
-            source_generation_id=source_generation_id,
-        )
-
-        try:
-            try:
-                request_params = json.loads(str(job_row.get("request_params_json") or "{}"))
-            except json.JSONDecodeError:
-                request_params = {}
-            if not isinstance(request_params, dict):
-                request_params = {}
-            fast_mode = str(source_generation.get("generation_mode") or "slow") == "fast"
-            generation_mode: Literal["slow", "fast"] = "fast" if fast_mode else "slow"
-            safe_video_pool_mode = _normalize_video_pool_mode(str(request_params.get("video_pool_mode") or "short-first"))
-            safe_video_duration_pref = _normalize_preferred_video_duration(
-                str(request_params.get("preferred_video_duration") or "any")
-            )
-            safe_target_clip_duration_sec = int(request_params.get("target_clip_duration_sec") or DEFAULT_TARGET_CLIP_DURATION_SEC)
-            safe_target_clip_min_sec = (
-                int(request_params["target_clip_duration_min_sec"])
-                if request_params.get("target_clip_duration_min_sec") is not None
-                else MIN_TARGET_CLIP_DURATION_SEC
-            )
-            safe_target_clip_max_sec = (
-                int(request_params["target_clip_duration_max_sec"])
-                if request_params.get("target_clip_duration_max_sec") is not None
-                else MAX_TARGET_CLIP_DURATION_SEC
-            )
-            safe_min_relevance = float(request_params.get("min_relevance_threshold") or 0.0)
-            safe_page_hint = max(1, int(request_params.get("page_hint") or 1))
-            safe_page_size_hint = max(1, int(request_params.get("page_size_hint") or 5))
-            safe_target_page = max(safe_page_hint, int(request_params.get("target_page") or safe_page_hint))
-            normalized_stage_exhausted = _normalize_stage_exhausted(request_params.get("stage_exhausted"))
-            safe_recovery_stage = max(
-                0,
-                int(
-                    request_params.get("recovery_stage")
-                    if request_params.get("recovery_stage") is not None
-                    else _first_unexhausted_recovery_stage(normalized_stage_exhausted)
-                ),
-            )
-            safe_refill_pass = max(0, int(request_params.get("refill_pass") or 0))
-            safe_no_new_sources_passes = max(0, int(request_params.get("no_new_sources_passes") or 0))
-            safe_no_new_windows_passes = max(0, int(request_params.get("no_new_windows_passes") or 0))
-            safe_no_new_visible_reels_passes = max(0, int(request_params.get("no_new_visible_reels_passes") or 0))
-            safe_multi_platform_search = bool(request_params.get("multi_platform_search", False))
-            knowledge_level_override = str(
-                request_params.get("knowledge_level_override") or ""
-            ).strip() or None
-            learner_id = str(
-                request_params.get("learner_id") or LEGACY_LEARNER_ID
-            ).strip() or LEGACY_LEARNER_ID
-            safe_required_reel_count = max(1, int(request_params.get("required_reel_count") or request_params.get("target_reel_count") or 1))
-            source_reel_count = int(source_generation.get("reel_count") or 0)
-            inventory_target_count = max(
-                safe_required_reel_count,
-                int(request_params.get("inventory_target_count") or 0),
-                _refinement_inventory_target_count(
-                    required_count=safe_required_reel_count,
-                    generation_mode=generation_mode,
-                    target_page=safe_target_page,
-                    page_size_hint=safe_page_size_hint,
-                    existing_source_count=source_reel_count,
-                ),
-            )
-            target_reel_count = _refinement_target_reel_count(
-                required_count=safe_required_reel_count,
-                generation_mode=generation_mode,
-                target_page=safe_target_page,
-                page_size_hint=safe_page_size_hint,
-                existing_source_count=source_reel_count,
-            )
-            source_visible_reels = _ranked_request_reels(
-                conn,
-                material_id=str(job_row.get("material_id") or ""),
-                fast_mode=fast_mode,
-                generation_id=source_generation_id,
-                min_relevance=safe_min_relevance,
-                preferred_video_duration=safe_video_duration_pref,
-                target_clip_duration_sec=safe_target_clip_duration_sec,
-                target_clip_duration_min_sec=safe_target_clip_min_sec,
-                target_clip_duration_max_sec=safe_target_clip_max_sec,
-                page=safe_target_page,
-                limit=safe_page_size_hint,
-                learner_id=learner_id,
-            )
-            source_visible_keys = _visible_reel_clip_keys(source_visible_reels)
-            _publish_progress_event(
-                "stage_start",
-                stage=f"refinement_stage_{safe_recovery_stage}",
-                recovery_stage=safe_recovery_stage,
-                target_reel_count=target_reel_count,
-                generation_id=result_generation_id,
-                generation_mode=generation_mode,
-            )
-            stage_started_mono = time.monotonic()
-            reel_service.generate_reels(
-                conn,
-                material_id=str(job_row.get("material_id") or ""),
-                concept_id=str(job_row.get("concept_id") or "") or None,
-                num_reels=target_reel_count,
-                creative_commons_only=bool(request_params.get("creative_commons_only", False)),
-                fast_mode=fast_mode,
-                video_pool_mode=safe_video_pool_mode,
-                preferred_video_duration=safe_video_duration_pref,
-                target_clip_duration_sec=safe_target_clip_duration_sec,
-                target_clip_duration_min_sec=safe_target_clip_min_sec,
-                target_clip_duration_max_sec=safe_target_clip_max_sec,
-                retrieval_profile="deep",
-                generation_id=result_generation_id,
-                exclude_generation_ids=_response_generation_ids(conn, source_generation_id) or [source_generation_id],
-                min_relevance_threshold=safe_min_relevance,
-                page_hint=safe_target_page,
-                recovery_stage=safe_recovery_stage,
-                multi_platform_search=safe_multi_platform_search,
-                knowledge_level_override=knowledge_level_override,
-                learner_id=learner_id,
-            )
-            _publish_progress_event(
-                "stage_end",
-                stage=f"refinement_stage_{safe_recovery_stage}",
-                recovery_stage=safe_recovery_stage,
-                duration_ms=int((time.monotonic() - stage_started_mono) * 1000),
-                outcome="ok",
-            )
-        except Exception as exc:
-            _publish_progress_event(
-                "stage_end",
-                stage=f"refinement_stage_{safe_recovery_stage}",
-                recovery_stage=safe_recovery_stage,
-                outcome="error",
-                error_class=type(exc).__name__,
-                detail=str(exc)[:240],
-            )
-            _complete_generation(
-                conn,
-                generation_id=result_generation_id,
-                retrieval_profile="deep",
-                status="failed",
-                error_text=str(exc),
-            )
-            upsert(
-                conn,
-                "reel_generation_jobs",
-                {
-                    **job_row,
-                    "result_generation_id": result_generation_id,
-                    "status": "failed",
-                    "started_at": started_at,
-                    "completed_at": now_iso(),
-                    "error_text": str(exc),
-                },
-            )
-            return
-
-        result_count = _count_generation_reels(conn, result_generation_id)
-        current_active = _fetch_active_generation_row(
-            conn,
-            material_id=str(job_row.get("material_id") or ""),
-            request_key=str(job_row.get("request_key") or ""),
-        )
-        current_active_id = str((current_active or {}).get("id") or "")
-        next_state = _advance_refinement_state(
-            recovery_stage=safe_recovery_stage,
-            stage_exhausted=normalized_stage_exhausted,
-            no_new_sources_passes=safe_no_new_sources_passes,
-            no_new_windows_passes=safe_no_new_windows_passes,
-            no_new_visible_reels_passes=safe_no_new_visible_reels_passes,
-            new_unique_videos=_count_generation_unique_videos(conn, result_generation_id) if result_count > 0 else 0,
-            new_unique_clip_windows=result_count,
-            new_unique_visible_reels=0,
-        )
-
-        if result_count <= 0:
-            _complete_generation(
-                conn,
-                generation_id=result_generation_id,
-                retrieval_profile="deep",
-                status="failed",
-                error_text="all_stages_exhausted" if next_state["all_stages_exhausted"] else "no_reels_generated",
-            )
-            upsert(
-                conn,
-                "reel_generation_jobs",
-                {
-                    **job_row,
-                    "result_generation_id": result_generation_id,
-                    "status": "failed",
-                    "started_at": started_at,
-                    "completed_at": now_iso(),
-                    "error_text": "all_stages_exhausted" if next_state["all_stages_exhausted"] else "no_reels_generated",
-                },
-            )
-            return
-
-        if current_active_id != source_generation_id:
-            _complete_generation(
-                conn,
-                generation_id=result_generation_id,
-                retrieval_profile="deep",
-                status="completed",
-            )
-            upsert(
-                conn,
-                "reel_generation_jobs",
-                {
-                    **job_row,
-                    "result_generation_id": result_generation_id,
-                    "status": "superseded",
-                    "started_at": started_at,
-                    "completed_at": now_iso(),
-                    "error_text": None,
-                },
-            )
-            return
-
-        _activate_generation(
-            conn,
-            material_id=str(job_row.get("material_id") or ""),
-            request_key=str(job_row.get("request_key") or ""),
-            generation_id=result_generation_id,
-            retrieval_profile="deep",
-        )
-        upsert(
-            conn,
-            "reel_generation_jobs",
-            {
-                **job_row,
-                "result_generation_id": result_generation_id,
-                "status": "completed",
-                "started_at": started_at,
-                "completed_at": now_iso(),
-                "error_text": None,
+            job_id=job_id,
+            provider=record.provider,
+            operation=record.operation,
+            model=record.model_used or None,
+            billable_requests=record.billable_requests,
+            input_tokens=record.input_tokens,
+            output_tokens=record.output_tokens,
+            total_tokens=record.total_tokens,
+            metadata={
+                **record.metadata,
+                "attempt": record.attempt,
+                "status_code": record.status_code,
+                "quality_degraded": record.quality_degraded,
+                "error_code": record.error_code,
+                "timestamp": record.timestamp,
             },
         )
-        merged_reels = _ranked_request_reels(
-            conn,
-            material_id=str(job_row.get("material_id") or ""),
-            fast_mode=fast_mode,
-            generation_id=result_generation_id,
-            min_relevance=safe_min_relevance,
-            preferred_video_duration=safe_video_duration_pref,
-            target_clip_duration_sec=safe_target_clip_duration_sec,
-            target_clip_duration_min_sec=safe_target_clip_min_sec,
-            target_clip_duration_max_sec=safe_target_clip_max_sec,
-            page=safe_target_page,
-            limit=safe_page_size_hint,
-            learner_id=learner_id,
-        )
-        merged_visible_keys = _visible_reel_clip_keys(merged_reels)
-        new_visible_reels: list[dict[str, Any]] = []
-        for reel in merged_reels:
-            _reel_id, clip_key = _reel_identity_key(reel)
-            if clip_key and clip_key not in source_visible_keys:
-                new_visible_reels.append(reel)
-        _update_frontier_visible_growth(
-            conn,
-            material_id=str(job_row.get("material_id") or ""),
-            request_key=str(job_row.get("request_key") or ""),
-            reels=new_visible_reels,
-        )
-        next_state = _advance_refinement_state(
-            recovery_stage=safe_recovery_stage,
-            stage_exhausted=normalized_stage_exhausted,
-            no_new_sources_passes=safe_no_new_sources_passes,
-            no_new_windows_passes=safe_no_new_windows_passes,
-            no_new_visible_reels_passes=safe_no_new_visible_reels_passes,
-            new_unique_videos=_count_generation_unique_videos(conn, result_generation_id),
-            new_unique_clip_windows=result_count,
-            new_unique_visible_reels=len(new_visible_reels),
-        )
-        _publish_progress_event(
-            "reels_completed",
-            result_generation_id=result_generation_id,
-            total_clip_windows=result_count,
-            new_visible_reels=len(new_visible_reels),
-            recovery_stage=safe_recovery_stage,
-            all_stages_exhausted=bool(next_state.get("all_stages_exhausted")),
-        )
-        # Keep refinement client-driven. A single queued job may finish after the
-        # user leaves the page, but it should not recursively schedule more work
-        # on its own. If the client is still active and needs more inventory, the
-        # next /api/feed or /api/reels/generate request will enqueue another pass.
 
 
-def _ensure_generation_for_request(
-    conn,
-    *,
-    material_id: str,
-    concept_id: str | None,
-    required_count: int,
-    sync_deep_fallback: Literal["always", "if_empty", "never"] = "always",
-    creative_commons_only: bool,
-    generation_mode: Literal["slow", "fast"],
-    min_relevance: float | None,
-    video_pool_mode: Literal["short-first", "balanced", "long-form"],
-    preferred_video_duration: Literal["any", "short", "medium", "long"],
-    target_clip_duration_sec: int,
-    target_clip_duration_min_sec: int | None,
-    target_clip_duration_max_sec: int | None,
-    exclude_video_ids: list[str] | None = None,
-    page_hint: int = 1,
-    page_size_hint: int = 5,
-    on_reel_created: Callable[[dict[str, Any]], None] | None = None,
-    emit_existing_reels: bool = False,
-    should_cancel: Callable[[], bool] | None = None,
-    multi_platform_search: bool = False,
-    knowledge_level_override: str | None = None,
-    learner_id: str = LEGACY_LEARNER_ID,
-) -> dict[str, Any]:
-    if should_cancel is not None and should_cancel():
-        raise GenerationCancelledError("Generation cancelled.")
-    request_key = _build_generation_request_key(
-        material_id=material_id,
-        concept_id=concept_id,
-        creative_commons_only=creative_commons_only,
-        generation_mode=generation_mode,
-        video_pool_mode=video_pool_mode,
-        preferred_video_duration=preferred_video_duration,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-        multi_platform_search=multi_platform_search,
+def _job_request_params(job_row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        payload = json.loads(str(job_row.get("request_params_json") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _generation_job_reels(conn, job_row: dict[str, Any]) -> list[dict[str, Any]]:
+    generation_id = str(job_row.get("result_generation_id") or "").strip()
+    if not generation_id:
+        return []
+    params = _job_request_params(job_row)
+    requested = max(1, min(60, int(params.get("num_reels") or 8)))
+    return _ranked_request_reels(
+        conn,
+        material_id=str(job_row.get("material_id") or ""),
+        fast_mode=str(params.get("generation_mode") or "slow") == "fast",
+        generation_id=generation_id,
+        min_relevance=_normalize_min_relevance(params.get("min_relevance")),
+        preferred_video_duration=_normalize_preferred_video_duration(
+            str(params.get("preferred_video_duration") or "any")
+        ),
+        target_clip_duration_sec=int(params.get("target_clip_duration_sec") or 55),
+        target_clip_duration_min_sec=(
+            int(params["target_clip_duration_min_sec"])
+            if params.get("target_clip_duration_min_sec") is not None
+            else None
+        ),
+        target_clip_duration_max_sec=(
+            int(params["target_clip_duration_max_sec"])
+            if params.get("target_clip_duration_max_sec") is not None
+            else None
+        ),
+        exclude_video_ids=list(params.get("exclude_video_ids") or []),
+        page=1,
+        limit=requested,
+        learner_id=str(job_row.get("learner_id") or LEGACY_LEARNER_ID),
+    )[:requested]
+
+
+def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, Any]:
+    try:
+        usage = json.loads(str(job_row.get("usage_json") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        usage = {}
+    error_code = str(job_row.get("terminal_error_code") or "").strip()
+    error_message = str(job_row.get("terminal_error_message") or "").strip()
+    error: dict[str, Any] | None = None
+    if error_code or error_message:
+        error = {"code": error_code or "generation_failed", "message": error_message}
+        try:
+            detail = json.loads(str(job_row.get("terminal_error_json") or "null"))
+        except (TypeError, json.JSONDecodeError):
+            detail = None
+        if detail is not None:
+            error["detail"] = detail
+    terminal = str(job_row.get("status") or "") in GENERATION_TERMINAL_STATUSES
+    return {
+        "job_id": str(job_row.get("id") or ""),
+        "status": str(job_row.get("status") or "queued"),
+        "phase": str(job_row.get("phase") or ""),
+        "progress": float(job_row.get("progress") or 0.0),
+        "attempt_count": int(job_row.get("attempt_count") or 0),
+        "max_attempts": int(job_row.get("max_attempts") or 2),
+        "lease_expires_at": _normalize_datetime_for_api(job_row.get("lease_expires_at")),
+        "heartbeat_at": _normalize_datetime_for_api(job_row.get("heartbeat_at")),
+        "deadline_at": _normalize_datetime_for_api(job_row.get("deadline_at")),
+        "material_id": str(job_row.get("material_id") or ""),
+        "request_key": str(job_row.get("request_key") or ""),
+        "result_generation_id": str(job_row.get("result_generation_id") or "") or None,
+        "model_used": str(job_row.get("model_used") or "") or None,
+        "quality_degraded": bool(job_row.get("quality_degraded")),
+        "usage": usage if isinstance(usage, dict) else {},
+        "error": error,
+        "reels": _generation_job_reels(conn, job_row) if terminal else [],
+        "created_at": _normalize_datetime_for_api(job_row.get("created_at")),
+        "started_at": _normalize_datetime_for_api(job_row.get("started_at")),
+        "completed_at": _normalize_datetime_for_api(job_row.get("completed_at")),
+    }
+
+
+def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
+    job_id = str(job_row.get("id") or "")
+    lease_owner = str(job_row.get("lease_owner") or "")
+    params = _job_request_params(job_row)
+    mode: Literal["fast", "slow"] = "fast" if params.get("generation_mode") == "fast" else "slow"
+    requested_count = max(1, min(60, int(params.get("num_reels") or 8)))
+    material_id = str(job_row.get("material_id") or "")
+    concept_id = str(job_row.get("concept_id") or "") or None
+    learner_id = str(job_row.get("learner_id") or LEGACY_LEARNER_ID)
+    local_stop = threading.Event()
+
+    def heartbeat_loop() -> None:
+        while not local_stop.wait(GENERATION_HEARTBEAT_SEC):
+            try:
+                with get_conn(transactional=True) as heartbeat_conn:
+                    alive = heartbeat_generation_job(
+                        heartbeat_conn,
+                        job_id=job_id,
+                        lease_owner=lease_owner,
+                        lease_seconds=GENERATION_LEASE_SEC,
+                    )
+                if not alive:
+                    local_stop.set()
+                    return
+            except Exception:
+                logger.exception("generation heartbeat failed job_id=%s", job_id)
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat_loop,
+        name=f"generation-heartbeat-{job_id[:8]}",
+        daemon=True,
     )
-    fast_mode = generation_mode == "fast"
-    normalized_excluded_video_ids = _normalize_excluded_video_ids(exclude_video_ids)
-    bootstrap_target = _initial_response_reel_target(
-        required_count=required_count,
-        generation_mode=generation_mode,
-        sync_deep_fallback=sync_deep_fallback,
+    heartbeat_thread.start()
+
+    last_cancel_check = 0.0
+    cached_cancelled = False
+
+    def should_cancel() -> bool:
+        nonlocal last_cancel_check, cached_cancelled
+        if local_stop.is_set() or _generation_worker_stop.is_set():
+            return True
+        now_mono = time.monotonic()
+        if now_mono - last_cancel_check >= 0.5:
+            last_cancel_check = now_mono
+            with get_conn() as check_conn:
+                cached_cancelled = generation_cancellation_requested(check_conn, job_id)
+                current = get_generation_job(check_conn, job_id) or {}
+                deadline = _normalize_datetime_for_api(current.get("deadline_at"))
+                if deadline:
+                    try:
+                        parsed = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+                        cached_cancelled = cached_cancelled or datetime.now(timezone.utc) >= parsed
+                    except ValueError:
+                        pass
+        return cached_cancelled
+
+    context = GenerationContext(
+        mode,
+        generation_id=job_id,
+        usage_sink=lambda record: _persist_generation_provider_usage(job_id, record),
+        cache_store=DatabaseProviderCache(),
     )
-    minimum_initial_response_reels = _minimum_initial_response_reels(
-        required_count=required_count,
-        generation_mode=generation_mode,
-        sync_deep_fallback=sync_deep_fallback,
-    )
-    active_generation = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
-    if active_generation:
-        active_generation_id = str(active_generation.get("id") or "")
-        active_response_profile = str(active_generation.get("retrieval_profile") or "") or None
-        active_reels = _ranked_request_reels(
-            conn,
-            material_id=material_id,
-            fast_mode=fast_mode,
-            generation_id=active_generation_id,
-            min_relevance=min_relevance,
-            preferred_video_duration=preferred_video_duration,
-            target_clip_duration_sec=target_clip_duration_sec,
-            target_clip_duration_min_sec=target_clip_duration_min_sec,
-            target_clip_duration_max_sec=target_clip_duration_max_sec,
-            exclude_video_ids=normalized_excluded_video_ids,
-            page=page_hint,
-            limit=max(page_size_hint, min(25, required_count)),
-            learner_id=learner_id,
-        )
-        active_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
-        if should_cancel is not None and should_cancel():
-            raise GenerationCancelledError("Generation cancelled.")
-        active_job = _queue_refinement_if_needed(
-            conn,
-            material_id=material_id,
-            concept_id=concept_id,
-            request_key=request_key,
-            generation_id=active_generation_id,
-            current_reels=active_reels,
-            required_count=required_count,
-            generation_mode=generation_mode,
-            creative_commons_only=creative_commons_only,
-            preferred_video_duration=preferred_video_duration,
-            video_pool_mode=video_pool_mode,
-            target_clip_duration_sec=target_clip_duration_sec,
-            target_clip_duration_min_sec=target_clip_duration_min_sec,
-            target_clip_duration_max_sec=target_clip_duration_max_sec,
-            min_relevance=min_relevance,
-            page_hint=page_hint,
-            page_size_hint=max(1, int(page_size_hint or 1)),
-            multi_platform_search=multi_platform_search,
-            knowledge_level_override=knowledge_level_override,
-            learner_id=learner_id,
-        )
-        if emit_existing_reels and on_reel_created is not None:
-            for reel in active_reels[: max(1, required_count)]:
-                if should_cancel is not None and should_cancel():
-                    raise GenerationCancelledError("Generation cancelled.")
-                try:
-                    on_reel_created(reel)
-                except Exception:
-                    pass
-        if len(active_reels) < required_count:
-            should_extend_active_generation = active_response_profile != "bootstrap" or (
-                sync_deep_fallback != "never" and len(active_reels) < minimum_initial_response_reels
+    generation_id = ""
+    try:
+        with get_conn() as conn:
+            update_generation_progress(
+                conn,
+                job_id=job_id,
+                lease_owner=lease_owner,
+                phase="retrieval",
+                progress=0.05,
             )
-            if should_extend_active_generation:
-                return _extend_active_generation(
+            generation_id = _create_generation_row(
+                conn,
+                material_id=material_id,
+                concept_id=concept_id,
+                request_key=str(job_row.get("request_key") or ""),
+                generation_mode=mode,
+                retrieval_profile="unified",
+                source_generation_id=None,
+            )
+
+            emitted: set[tuple[str, str]] = set()
+
+            def on_candidate(reel: dict[str, Any]) -> None:
+                if should_cancel():
+                    raise GenerationCancelledError("Generation cancelled.")
+                identity = _reel_identity_key(reel)
+                if identity in emitted:
+                    return
+                emitted.add(identity)
+                append_generation_event(
+                    conn,
+                    job_id=job_id,
+                    event_type="candidate",
+                    payload={"reel": reel, "provisional": True},
+                    lease_owner=lease_owner,
+                )
+
+            previous_count = 0
+            last_growth: int | None = None
+            for pass_index in range(context.budget.max_passes):
+                if pass_index > 0 and any(
+                    context.budget.remaining(operation) <= 0
+                    for operation in ("search", "transcript", "segmentation")
+                ):
+                    break
+                context.budget.reserve_pass(no_growth=last_growth == 0)
+                if should_cancel():
+                    raise GenerationCancelledError("Generation cancelled.")
+                if mode == "fast":
+                    pass_video_budget = 3
+                elif pass_index == 0:
+                    pass_video_budget = 5
+                else:
+                    pass_video_budget = max(
+                        1,
+                        min(
+                            3,
+                            context.budget.remaining("transcript"),
+                            context.budget.remaining("segmentation"),
+                        ),
+                    )
+                reel_service.generate_reels(
                     conn,
                     material_id=material_id,
                     concept_id=concept_id,
-                    request_key=request_key,
-                    required_count=required_count,
-                    active_generation_id=active_generation_id,
-                    active_response_profile=active_response_profile,
-                    generation_mode=generation_mode,
-                    creative_commons_only=creative_commons_only,
-                    min_relevance=min_relevance,
-                    video_pool_mode=video_pool_mode,
-                    preferred_video_duration=preferred_video_duration,
-                    target_clip_duration_sec=target_clip_duration_sec,
-                    target_clip_duration_min_sec=target_clip_duration_min_sec,
-                    target_clip_duration_max_sec=target_clip_duration_max_sec,
-                    exclude_video_ids=normalized_excluded_video_ids,
-                    page_hint=page_hint,
-                    on_reel_created=on_reel_created,
+                    num_reels=requested_count,
+                    creative_commons_only=bool(params.get("creative_commons_only")),
+                    exclude_video_ids=list(params.get("exclude_video_ids") or []),
+                    fast_mode=mode == "fast",
+                    preferred_video_duration=_normalize_preferred_video_duration(
+                        str(params.get("preferred_video_duration") or "any")
+                    ),
+                    target_clip_duration_sec=int(params.get("target_clip_duration_sec") or 55),
+                    target_clip_duration_min_sec=params.get("target_clip_duration_min_sec"),
+                    target_clip_duration_max_sec=params.get("target_clip_duration_max_sec"),
+                    retrieval_profile="deep",
+                    generation_id=generation_id,
+                    min_relevance_threshold=float(params.get("min_relevance") or 0.0),
+                    page_hint=1,
+                    on_reel_created=on_candidate,
                     should_cancel=should_cancel,
-                    multi_platform_search=multi_platform_search,
-                    knowledge_level_override=knowledge_level_override,
+                    knowledge_level_override=str(params.get("knowledge_level") or "beginner"),
                     learner_id=learner_id,
+                    generation_context=context,
+                    max_generation_videos=pass_video_budget,
+                    acquisition_concept_offset=pass_index,
                 )
-        if (
-            len(active_reels) >= required_count
-            or (
-                active_reels
-                and sync_deep_fallback != "always"
-                and active_response_profile == "bootstrap"
-                and len(active_reels) >= minimum_initial_response_reels
-            )
-        ):
-            response_payload = _build_generation_response_payload(
-                reels=active_reels,
-                generation_id=active_generation_id,
-                response_profile=active_response_profile,
-                job_row=active_job,
-            )
-            _log_generation_response_summary(
-                event="reuse_active_generation",
-                material_id=material_id,
-                request_key=request_key,
-                generation_mode=generation_mode,
-                required_count=required_count,
-                response_payload=response_payload,
-                page_hint=page_hint,
-            )
-            return {**response_payload, "request_key": request_key}
+                current_count = _count_generation_reels(conn, generation_id)
+                update_generation_progress(
+                    conn,
+                    job_id=job_id,
+                    lease_owner=lease_owner,
+                    phase="ranking",
+                    progress=min(0.85, 0.25 + 0.2 * (pass_index + 1)),
+                    usage=context.budget.snapshot(),
+                )
+                if current_count >= requested_count or mode == "fast":
+                    break
+                last_growth = max(0, current_count - previous_count)
+                previous_count = current_count
 
-    if should_cancel is not None and should_cancel():
-        raise GenerationCancelledError("Generation cancelled.")
-    generation_id = _create_generation_row(
-        conn,
-        material_id=material_id,
-        concept_id=concept_id,
-        request_key=request_key,
-        generation_mode=generation_mode,
-        retrieval_profile="bootstrap",
-        source_generation_id=str((active_generation or {}).get("id") or "") or None,
-    )
+            raw_count = _count_generation_reels(conn, generation_id)
+            if raw_count:
+                _activate_generation(
+                    conn,
+                    material_id=material_id,
+                    request_key=str(job_row.get("request_key") or ""),
+                    generation_id=generation_id,
+                    retrieval_profile="unified",
+                )
+                execute_modify(
+                    conn,
+                    "UPDATE reel_generation_jobs SET result_generation_id = ? WHERE id = ?",
+                    (generation_id, job_id),
+                )
+                refreshed_job = get_generation_job(conn, job_id) or {**job_row, "result_generation_id": generation_id}
+                final_reels = _generation_job_reels(conn, refreshed_job)
+            else:
+                _complete_generation(
+                    conn,
+                    generation_id=generation_id,
+                    retrieval_profile="unified",
+                    status="failed",
+                    error_text="inventory_exhausted",
+                )
+                final_reels = []
 
-    reel_service.generate_reels(
-        conn,
-        material_id=material_id,
-        concept_id=concept_id,
-        num_reels=bootstrap_target,
-        creative_commons_only=creative_commons_only,
-        exclude_video_ids=normalized_excluded_video_ids,
-        fast_mode=fast_mode,
-        video_pool_mode=video_pool_mode,
-        preferred_video_duration=preferred_video_duration,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-        retrieval_profile="bootstrap",
-        generation_id=generation_id,
-        min_relevance_threshold=float(min_relevance or 0.0),
-        page_hint=page_hint,
-        recovery_stage=0,
-        on_reel_created=on_reel_created,
-        should_cancel=should_cancel,
-        multi_platform_search=multi_platform_search,
-        knowledge_level_override=knowledge_level_override,
-        learner_id=learner_id,
-    )
-    filtered = _ranked_request_reels(
-        conn,
-        material_id=material_id,
-        fast_mode=fast_mode,
-        generation_id=generation_id,
-        min_relevance=min_relevance,
-        preferred_video_duration=preferred_video_duration,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-        exclude_video_ids=normalized_excluded_video_ids,
-        page=page_hint,
-        limit=max(page_size_hint, min(25, required_count)),
-        learner_id=learner_id,
-    )
-
-    response_profile = "bootstrap"
-    should_run_sync_deep = False
-    if not filtered:
-        should_run_sync_deep = sync_deep_fallback in {"always", "if_empty"}
-    elif len(filtered) < minimum_initial_response_reels:
-        should_run_sync_deep = sync_deep_fallback in {"always", "if_empty"}
-    elif len(filtered) < required_count:
-        should_run_sync_deep = sync_deep_fallback == "always"
-    if should_run_sync_deep:
-        shortfall = max(1, required_count - len(filtered))
-        reel_service.generate_reels(
-            conn,
-            material_id=material_id,
-            concept_id=concept_id,
-            num_reels=shortfall,
-            creative_commons_only=creative_commons_only,
-            exclude_video_ids=normalized_excluded_video_ids,
-            fast_mode=fast_mode,
-            video_pool_mode=video_pool_mode,
-            preferred_video_duration=preferred_video_duration,
-            target_clip_duration_sec=target_clip_duration_sec,
-            target_clip_duration_min_sec=target_clip_duration_min_sec,
-            target_clip_duration_max_sec=target_clip_duration_max_sec,
-            retrieval_profile="deep",
-            generation_id=generation_id,
-            min_relevance_threshold=float(min_relevance or 0.0),
-            page_hint=page_hint,
-            recovery_stage=_initial_recovery_stage(page_hint=page_hint),
-            on_reel_created=on_reel_created,
-            should_cancel=should_cancel,
-            multi_platform_search=multi_platform_search,
-            knowledge_level_override=knowledge_level_override,
-            learner_id=learner_id,
-        )
-        filtered = _ranked_request_reels(
-            conn,
-            material_id=material_id,
-            fast_mode=fast_mode,
-            generation_id=generation_id,
-            min_relevance=min_relevance,
-            preferred_video_duration=preferred_video_duration,
-            target_clip_duration_sec=target_clip_duration_sec,
-            target_clip_duration_min_sec=target_clip_duration_min_sec,
-            target_clip_duration_max_sec=target_clip_duration_max_sec,
-            exclude_video_ids=normalized_excluded_video_ids,
-            learner_id=learner_id,
-        )
-        if filtered:
-            response_profile = "bootstrap_then_deep"
-
-    if not filtered:
-        _complete_generation(
-            conn,
-            generation_id=generation_id,
-            retrieval_profile=response_profile,
-            status="failed",
-            error_text="no_reels_generated",
-        )
-        fallback_reels = []
-        if active_generation:
-            fallback_reels = _ranked_request_reels(
+            usage_records = context.usage()
+            model_records = [row for row in usage_records if row.get("operation") == "segmentation"]
+            model_used = str((model_records[-1] if model_records else {}).get("model_used") or "") or None
+            quality_degraded = any(bool(row.get("quality_degraded")) for row in model_records)
+            append_generation_event(
                 conn,
-                material_id=material_id,
-                fast_mode=fast_mode,
-                generation_id=str(active_generation.get("id") or ""),
-                min_relevance=min_relevance,
-                preferred_video_duration=preferred_video_duration,
-                target_clip_duration_sec=target_clip_duration_sec,
-                target_clip_duration_min_sec=target_clip_duration_min_sec,
-                target_clip_duration_max_sec=target_clip_duration_max_sec,
-                exclude_video_ids=normalized_excluded_video_ids,
-                learner_id=learner_id,
+                job_id=job_id,
+                event_type="final",
+                payload={
+                    "reels": final_reels,
+                    "generation_id": generation_id if final_reels else None,
+                    "authoritative": True,
+                },
+                lease_owner=lease_owner,
             )
-        active_job = _fetch_refinement_job_for_generation(conn, str((active_generation or {}).get("id") or ""))
-        response_payload = _build_generation_response_payload(
-            reels=fallback_reels,
-            generation_id=str((active_generation or {}).get("id") or "") or None,
-            response_profile=str((active_generation or {}).get("retrieval_profile") or "") or None,
-            job_row=active_job,
-        )
-        _log_generation_response_summary(
-            event="new_generation_empty",
-            material_id=material_id,
-            request_key=request_key,
-            generation_mode=generation_mode,
-            required_count=required_count,
-            response_payload=response_payload,
-            page_hint=page_hint,
-        )
-        return {**response_payload, "request_key": request_key}
+            terminal_status = (
+                "completed"
+                if len(final_reels) >= requested_count
+                else "partial"
+                if final_reels
+                else "exhausted"
+            )
+            transition_generation_terminal(
+                conn,
+                job_id=job_id,
+                status=terminal_status,
+                result_generation_id=generation_id if final_reels else None,
+                lease_owner=lease_owner,
+                model_used=model_used,
+                quality_degraded=quality_degraded,
+                usage={"budget": context.budget.snapshot(), "provider_calls": usage_records},
+                error_code="inventory_exhausted" if terminal_status == "exhausted" else None,
+                error_message=(
+                    "No eligible YouTube videos with native captions produced valid clips."
+                    if terminal_status == "exhausted"
+                    else None
+                ),
+            )
+    except GenerationCancelledError:
+        with get_conn(transactional=True) as conn:
+            if generation_cancellation_requested(conn, job_id):
+                request_generation_cancellation(conn, job_id=job_id)
+            else:
+                # Shutdown, deadline, or a lost lease is not a user
+                # cancellation. Leave the durable row for expiry/recovery.
+                logger.info("generation worker yielded lease job_id=%s", job_id)
+    except ClipEngineProviderError as exc:
+        with get_conn(transactional=True) as conn:
+            transition_generation_terminal(
+                conn,
+                job_id=job_id,
+                status="failed",
+                result_generation_id=generation_id or None,
+                lease_owner=lease_owner,
+                usage={"budget": context.budget.snapshot(), "provider_calls": context.usage()},
+                error_code=exc.code,
+                error_message=str(exc),
+                error_detail=exc.as_dict(),
+            )
+    except JobLeaseLostError:
+        logger.info("generation worker lost lease job_id=%s", job_id)
+    except Exception as exc:
+        logger.exception("generation job failed job_id=%s", job_id)
+        with get_conn(transactional=True) as conn:
+            transition_generation_terminal(
+                conn,
+                job_id=job_id,
+                status="failed",
+                result_generation_id=generation_id or None,
+                lease_owner=lease_owner,
+                usage={"budget": context.budget.snapshot(), "provider_calls": context.usage()},
+                error_code="generation_failed",
+                error_message=str(exc),
+            )
+    finally:
+        local_stop.set()
+        heartbeat_thread.join(timeout=1.0)
 
-    _activate_generation(
-        conn,
-        material_id=material_id,
-        request_key=request_key,
-        generation_id=generation_id,
-        retrieval_profile=response_profile,
-    )
-    job_row = _queue_refinement_if_needed(
-        conn,
-        material_id=material_id,
-        concept_id=concept_id,
-        request_key=request_key,
-        generation_id=generation_id,
-        current_reels=filtered,
-        required_count=required_count,
-        generation_mode=generation_mode,
-        creative_commons_only=creative_commons_only,
-        preferred_video_duration=preferred_video_duration,
-        video_pool_mode=video_pool_mode,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-        min_relevance=min_relevance,
-        page_hint=1,
-        page_size_hint=max(1, int(page_size_hint or 1)),
-        multi_platform_search=multi_platform_search,
-        knowledge_level_override=knowledge_level_override,
-        learner_id=learner_id,
-    )
-    response_payload = _build_generation_response_payload(
-        reels=filtered,
-        generation_id=generation_id,
-        response_profile=response_profile,
-        job_row=job_row,
-    )
-    _log_generation_response_summary(
-        event="new_generation_complete",
-        material_id=material_id,
-        request_key=request_key,
-        generation_mode=generation_mode,
-        required_count=required_count,
-        response_payload=response_payload,
-        page_hint=page_hint,
-    )
-    return {**response_payload, "request_key": request_key}
+
+def _generation_worker_loop() -> None:
+    while not _generation_worker_stop.is_set():
+        try:
+            with get_conn(transactional=True) as conn:
+                job_row = lease_next_job(
+                    conn,
+                    lease_owner=_generation_worker_id,
+                    lease_seconds=GENERATION_LEASE_SEC,
+                )
+            if job_row:
+                _run_leased_generation_job(job_row)
+                continue
+        except Exception:
+            logger.exception("generation worker poll failed")
+        _generation_worker_stop.wait(GENERATION_WORKER_POLL_SEC)
+
+
+def _start_generation_worker() -> None:
+    global _generation_worker_thread
+    with _generation_worker_lock:
+        if _generation_worker_thread is not None and _generation_worker_thread.is_alive():
+            return
+        _generation_worker_stop.clear()
+        _generation_worker_thread = threading.Thread(
+            target=_generation_worker_loop,
+            name="reel-generation-worker",
+            daemon=True,
+        )
+        _generation_worker_thread.start()
+
+
+def _stop_generation_worker() -> None:
+    global _generation_worker_thread
+    with _generation_worker_lock:
+        thread = _generation_worker_thread
+        _generation_worker_stop.set()
+    if thread is not None:
+        thread.join(timeout=5.0)
+    with _generation_worker_lock:
+        _generation_worker_thread = None
 
 
 def _normalize_datetime_for_api(value: object) -> str | None:
@@ -5173,25 +3721,14 @@ def health() -> dict:
 
 @app.get("/api/admin/health")
 def admin_health() -> dict:
-    punct_loaded = False
-    try:
-        punct_loaded = ReelService.punct_pipeline_loaded()
-    except Exception:
-        logger.exception("admin_health: punct_pipeline_loaded probe raised")
-    whisperx_available = False
-    try:
-        whisperx_available = whisperx_enabled() and _probe_whisperx_module() is not None
-    except Exception:
-        logger.exception("admin_health: whisperx probe raised")
-    ok = punct_loaded and whisperx_available
-    if not punct_loaded:
-        logger.warning("admin_health: punct pipeline not loaded")
-    if not whisperx_available:
-        logger.warning("admin_health: whisperx not available")
     return {
-        "ok": ok,
-        "punct_pipeline_loaded": punct_loaded,
-        "whisperx_available": whisperx_available,
+        "ok": True,
+        "generation_worker_alive": bool(
+            _generation_worker_thread is not None and _generation_worker_thread.is_alive()
+        ),
+        "supadata_configured": bool(os.getenv("SUPADATA_API_KEY", "").strip()),
+        "gemini_primary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+        "gemini_fallback_model": os.getenv("SEGMENT_FALLBACK_MODEL", "").strip() or None,
     }
 
 
@@ -5767,6 +4304,11 @@ async def create_material(
     knowledge_level: str | None = Form(default=None),
 ):
     _enforce_rate_limit(request, "material", limit=MATERIAL_RATE_LIMIT_PER_WINDOW)
+    if subject_tag is not None and not subject_tag.strip() and not file and not (text or "").strip():
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "blank_retrieval_topic", "message": "Topic must contain non-whitespace text."},
+        )
     if not file and not text and not subject_tag:
         raise HTTPException(status_code=400, detail="Provide at least one of: topic, text, or file")
     from .services.knowledge_level import normalize_knowledge_level
@@ -5914,12 +4456,16 @@ def update_material_level(material_id: str, request: Request, payload: MaterialL
     }
 
 
-@app.post("/api/reels/generate", response_model=ReelsGenerateResponse)
+@app.post(
+    "/api/reels/generate",
+    response_model=ReelsGenerateResponse,
+    responses={202: {"model": GenerationJobQueuedResponse}},
+)
 async def generate_reels(request: Request, payload: ReelsGenerateRequest):
     _require_community_client_identity(request)
     _enforce_rate_limit(request, "reels-generate", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
+    _reject_multi_platform_search(payload.multi_platform_search)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
-    safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
     safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
     safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
         target_clip_duration_sec=payload.target_clip_duration_sec,
@@ -5927,79 +4473,77 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
         target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
     )
     requested_num_reels = max(1, int(payload.num_reels))
-    if SERVERLESS_MODE:
-        # Keep hosted/serverless requests within function time limits.
-        requested_num_reels = min(requested_num_reels, 6)
-    with get_conn() as conn:
-        material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
+    with get_conn(transactional=True) as conn:
+        material = fetch_one(
+            conn,
+            "SELECT id FROM materials WHERE id = ?",
+            (payload.material_id,),
+        )
         if not material:
-            # Keep the string detail form so existing deployed clients that
-            # substring-match on "material_id not found" continue to work.
-            # iOS/web clients should prefer HTTP 404 + this marker over
-            # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
         learner_id = _resolve_learner_identity(conn, request)
         learner_progress = reel_service.learner_progress(conn, payload.material_id, learner_id)
         learner_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
-
-    effective_generation_mode: Literal["slow", "fast"] = "fast" if SERVERLESS_MODE else payload.generation_mode
-
-    def work(should_cancel: Callable[[], bool]):
-        with get_conn() as conn:
-            return _ensure_generation_for_request(
-                conn,
-                material_id=payload.material_id,
-                concept_id=payload.concept_id,
-                required_count=requested_num_reels,
-                sync_deep_fallback="if_empty",
-                creative_commons_only=payload.creative_commons_only,
-                generation_mode=effective_generation_mode,
-                min_relevance=min_relevance,
-                video_pool_mode=safe_video_pool_mode,
-                preferred_video_duration=safe_video_duration_pref,
-                target_clip_duration_sec=safe_target_clip_duration_sec,
-                target_clip_duration_min_sec=safe_target_clip_min_sec,
-                target_clip_duration_max_sec=safe_target_clip_max_sec,
-                exclude_video_ids=payload.exclude_video_ids,
-                page_hint=1,
-                multi_platform_search=payload.multi_platform_search,
-                knowledge_level_override=learner_knowledge_level,
-                learner_id=learner_id,
-                should_cancel=should_cancel,
-            )
-
-    try:
-        generation_result = await _run_disconnect_cancellable(request, work)
-    except GenerationCancelledError as exc:
-        raise HTTPException(status_code=499, detail=str(exc)) from exc
-    except IngestRateLimitedError as e:
-        # Clip-engine per-platform rate limiter tripped → 429 + Retry-After.
-        raise _ingest_error_to_http(e) from e
-    except ClipEngineError as e:
-        # Clip-engine config/search/transcript failure → upstream dependency error.
-        logger.warning("Reels generate clip-engine failure: %s", e)
-        raise HTTPException(status_code=502, detail=str(e)) from e
-    except YouTubeApiRequestError as e:
-        logger.warning(
-            "Reels generate request failed: %s",
-            json.dumps(
-                {
-                    "material_id": payload.material_id,
-                    "generation_mode": effective_generation_mode,
-                    "requested_num_reels": requested_num_reels,
-                    "error": str(e),
-                },
-                sort_keys=True,
-            ),
+        content_fingerprint = material_content_fingerprint(
+            conn,
+            payload.material_id,
+            payload.concept_id,
         )
-        raise HTTPException(status_code=502, detail=str(e)) from e
-    return {
-        "reels": list(generation_result.get("reels") or [])[:requested_num_reels],
-        "generation_id": generation_result.get("generation_id"),
-        "response_profile": generation_result.get("response_profile"),
-        "refinement_job_id": generation_result.get("refinement_job_id"),
-        "refinement_status": generation_result.get("refinement_status"),
-    }
+        request_key = build_durable_request_key(
+            material_id=payload.material_id,
+            concept_id=payload.concept_id,
+            content_fingerprint=content_fingerprint,
+            knowledge_level=learner_knowledge_level,
+            generation_mode=payload.generation_mode,
+            creative_commons_only=payload.creative_commons_only,
+            source_duration=safe_video_duration_pref,
+            target_clip_duration_sec=safe_target_clip_duration_sec,
+            target_clip_duration_min_sec=safe_target_clip_min_sec,
+            target_clip_duration_max_sec=safe_target_clip_max_sec,
+        )
+        completed_job = find_completed_generation_job(conn, request_key)
+        if completed_job:
+            cached_reels = _generation_job_reels(conn, completed_job)
+            if len(cached_reels) >= requested_num_reels:
+                return {
+                    "reels": cached_reels[:requested_num_reels],
+                    "generation_id": str(completed_job.get("result_generation_id") or "") or None,
+                    "response_profile": "unified",
+                }
+        request_params = {
+            "material_id": payload.material_id,
+            "concept_id": payload.concept_id,
+            "num_reels": requested_num_reels,
+            "exclude_video_ids": _normalize_excluded_video_ids(payload.exclude_video_ids),
+            "creative_commons_only": payload.creative_commons_only,
+            "generation_mode": payload.generation_mode,
+            "min_relevance": min_relevance,
+            "preferred_video_duration": safe_video_duration_pref,
+            "target_clip_duration_sec": safe_target_clip_duration_sec,
+            "target_clip_duration_min_sec": safe_target_clip_min_sec,
+            "target_clip_duration_max_sec": safe_target_clip_max_sec,
+            "knowledge_level": learner_knowledge_level,
+        }
+        job_row, _created = submit_generation_job(
+            conn,
+            material_id=payload.material_id,
+            concept_id=payload.concept_id,
+            request_key=request_key,
+            content_fingerprint=content_fingerprint,
+            learner_id=learner_id,
+            request_params=request_params,
+        )
+    job_id = str(job_row.get("id") or "")
+    status = str(job_row.get("status") or "queued")
+    return JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job_id,
+            "status": status,
+            "status_url": f"/api/reels/generation-status/{job_id}",
+            "stream_url": f"/api/reels/generation-stream/{job_id}",
+        },
+    )
 
 
 def _ingest_error_to_http(exc: IngestError) -> HTTPException:
@@ -6021,6 +4565,90 @@ def _ingest_error_to_http(exc: IngestError) -> HTTPException:
     return http_exc
 
 
+@app.get(
+    "/api/reels/generation-status/{job_id}",
+    response_model=GenerationJobStatusResponse,
+)
+def generation_status(request: Request, job_id: str):
+    _require_community_client_identity(request)
+    _enforce_rate_limit(
+        request,
+        "reels-generation-status",
+        limit=GENERATION_JOB_STATUS_RATE_LIMIT_PER_WINDOW,
+    )
+    with get_conn() as conn:
+        job_row = get_generation_job(conn, str(job_id or "").strip())
+        if not job_row:
+            raise HTTPException(status_code=404, detail="job_id not found")
+        return _generation_job_status_payload(conn, job_row)
+
+
+@app.get("/api/reels/generation-stream/{job_id}")
+async def generation_stream(request: Request, job_id: str, after_seq: int = 0):
+    _require_community_client_identity(request)
+    _enforce_rate_limit(
+        request,
+        "reels-generation-stream",
+        limit=GENERATION_JOB_STATUS_RATE_LIMIT_PER_WINDOW,
+    )
+    clean_job_id = str(job_id or "").strip()
+    with get_conn() as conn:
+        if not get_generation_job(conn, clean_job_id):
+            raise HTTPException(status_code=404, detail="job_id not found")
+
+    async def ndjson_events():
+        cursor = max(0, int(after_seq or 0))
+        while True:
+            with get_conn() as conn:
+                events = replay_generation_events(
+                    conn,
+                    job_id=clean_job_id,
+                    after_seq=cursor,
+                )
+                job_row = get_generation_job(conn, clean_job_id)
+            for event in events:
+                cursor = max(cursor, int(event.get("seq") or 0))
+                yield f"{json.dumps(event, default=str, separators=(',', ':'))}\n"
+            if any(str(event.get("type") or "") == "terminal" for event in events):
+                return
+            if not job_row or (
+                str(job_row.get("status") or "") in GENERATION_TERMINAL_STATUSES
+                and not events
+            ):
+                return
+            if await request.is_disconnected():
+                # Disconnects only unsubscribe. The leased worker keeps running.
+                return
+            await asyncio.sleep(0.25)
+
+    return StreamingResponse(
+        ndjson_events(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post(
+    "/api/reels/generation-jobs/{job_id}/cancel",
+    response_model=GenerationJobStatusResponse,
+)
+def cancel_generation_job(request: Request, job_id: str):
+    _require_community_client_identity(request)
+    _enforce_rate_limit(
+        request,
+        "reels-generation-cancel",
+        limit=GENERATION_JOB_STATUS_RATE_LIMIT_PER_WINDOW,
+    )
+    with get_conn(transactional=True) as conn:
+        job_row = request_generation_cancellation(
+            conn,
+            job_id=str(job_id or "").strip(),
+        )
+        if not job_row:
+            raise HTTPException(status_code=404, detail="job_id not found")
+        return _generation_job_status_payload(conn, job_row)
+
+
 async def _run_disconnect_cancellable(
     request: Request,
     work: Callable[[Callable[[], bool]], Any],
@@ -6040,14 +4668,49 @@ async def _run_disconnect_cancellable(
         raise
 
 
+def _canonical_youtube_source_or_422(
+    source_url: str,
+    *,
+    allowed_kinds: set[str],
+) -> str:
+    canonical = canonicalize_youtube_url(source_url, allowed_kinds=allowed_kinds)
+    if canonical is None:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_youtube_url",
+                "message": (
+                    "A canonical YouTube "
+                    + "/".join(sorted(allowed_kinds))
+                    + " URL is required. Instagram and TikTok are unsupported."
+                ),
+            },
+        )
+    return str(canonical["canonical_url"])
+
+
+def _reject_multi_platform_search(enabled: bool) -> None:
+    if enabled:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "unsupported_retrieval_platform",
+                "message": "multi_platform_search=true is unsupported; retrieval is YouTube-only.",
+            },
+        )
+
+
 @app.post("/api/ingest/url", response_model=IngestResult)
 async def ingest_url_endpoint(request: Request, payload: IngestRequest) -> IngestResult:
     """
-    Download + process a single reel URL (YouTube / Instagram / TikTok) and persist a
-    ReelOut-compatible record. See `app/ingestion/__init__.py` for the full design notes
-    and legal posture.
+    Process one canonical YouTube video URL with native captions.
     """
     _enforce_rate_limit(request, "ingest-url", limit=INGEST_URL_RATE_LIMIT_PER_WINDOW)
+    _reject_multi_platform_search(payload.multi_platform_search)
+    canonical_source_url = _canonical_youtube_source_or_422(
+        payload.source_url,
+        allowed_kinds={"video"},
+    )
     if SERVERLESS_MODE and os.getenv("ALLOW_OPENAI_IN_SERVERLESS") != "1":
         raise HTTPException(
             status_code=503,
@@ -6061,7 +4724,7 @@ async def ingest_url_endpoint(request: Request, payload: IngestRequest) -> Inges
         result = await _run_disconnect_cancellable(
             request,
             lambda should_cancel: ingestion_pipeline.ingest_url(
-                source_url=payload.source_url,
+                source_url=canonical_source_url,
                 material_id=payload.material_id,
                 concept_id=payload.concept_id,
                 target_clip_duration_sec=payload.target_clip_duration_sec,
@@ -6111,6 +4774,11 @@ async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutReq
     existing decoder — no client schema changes are required.
     """
     _enforce_rate_limit(request, "ingest-topic-cut", limit=INGEST_TOPIC_CUT_RATE_LIMIT_PER_WINDOW)
+    _reject_multi_platform_search(payload.multi_platform_search)
+    canonical_source_url = _canonical_youtube_source_or_422(
+        payload.source_url,
+        allowed_kinds={"video"},
+    )
     if SERVERLESS_MODE and os.getenv("ALLOW_OPENAI_IN_SERVERLESS") != "1":
         raise HTTPException(
             status_code=503,
@@ -6124,7 +4792,7 @@ async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutReq
         result = await _run_disconnect_cancellable(
             request,
             lambda should_cancel: ingestion_pipeline.ingest_topic_cut(
-                source_url=payload.source_url,
+                source_url=canonical_source_url,
                 material_id=payload.material_id,
                 concept_id=payload.concept_id,
                 language=payload.language,
@@ -6164,14 +4832,10 @@ async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutReq
 @app.post("/api/ingest/search", response_model=IngestSearchResult)
 async def ingest_search_endpoint(request: Request, payload: IngestSearchRequest) -> IngestSearchResult:
     """
-    Topic-based multi-platform search. Resolves YouTube + Instagram + TikTok search
-    results via yt-dlp's native extractors, dedups against `exclude_video_ids` for
-    infinite-scroll pagination, and ingests each resolved URL through the full pipeline
-    (Whisper fallback, silence-aware cuts, full metadata). Per-platform failures are
-    non-fatal — the response carries `per_platform_errors` so the client can surface
-    which platform went down.
+    YouTube-only discovery with native-caption ingestion.
     """
     _enforce_rate_limit(request, "ingest-search", limit=INGEST_SEARCH_RATE_LIMIT_PER_WINDOW)
+    _reject_multi_platform_search(payload.multi_platform_search)
     if SERVERLESS_MODE and os.getenv("ALLOW_OPENAI_IN_SERVERLESS") != "1":
         raise HTTPException(
             status_code=503,
@@ -6233,6 +4897,11 @@ async def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> 
     (`items[*].status == "error"`) rather than aborting the whole call.
     """
     _enforce_rate_limit(request, "ingest-feed", limit=INGEST_FEED_RATE_LIMIT_PER_WINDOW)
+    _reject_multi_platform_search(payload.multi_platform_search)
+    canonical_feed_url = _canonical_youtube_source_or_422(
+        payload.feed_url,
+        allowed_kinds={"video", "playlist", "channel"},
+    )
     if SERVERLESS_MODE and os.getenv("ALLOW_OPENAI_IN_SERVERLESS") != "1":
         raise HTTPException(
             status_code=503,
@@ -6246,7 +4915,7 @@ async def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> 
         result = await _run_disconnect_cancellable(
             request,
             lambda should_cancel: ingestion_pipeline.ingest_feed(
-                feed_url=payload.feed_url,
+                feed_url=canonical_feed_url,
                 max_items=payload.max_items,
                 material_id=payload.material_id,
                 concept_id=payload.concept_id,
@@ -6283,643 +4952,222 @@ async def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> 
     return result
 
 
-@app.post("/api/reels/generate-stream")
-async def generate_reels_stream(request: Request, payload: ReelsGenerateRequest):
-    _require_community_client_identity(request)
-    _enforce_rate_limit(request, "reels-generate", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
-    min_relevance = _normalize_min_relevance(payload.min_relevance)
-    safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
-    safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
-    safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
-        target_clip_duration_sec=payload.target_clip_duration_sec,
-        target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
-        target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+def _material_preflight_query(conn, material_id: str, concept_id: str | None = None) -> str:
+    material = fetch_one(
+        conn,
+        "SELECT subject_tag, raw_text FROM materials WHERE id = ?",
+        (material_id,),
     )
-    requested_num_reels = max(1, int(payload.num_reels))
-    if SERVERLESS_MODE:
-        requested_num_reels = min(requested_num_reels, 6)
-
-    with get_conn() as conn:
-        material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
-        if not material:
-            # Keep the string detail form so existing deployed clients that
-            # substring-match on "material_id not found" continue to work.
-            # iOS/web clients should prefer HTTP 404 + this marker over
-            # localised messages when routing to recovery.
-            raise HTTPException(status_code=404, detail="material_id not found")
-        learner_id = _resolve_learner_identity(conn, request)
-        learner_progress = reel_service.learner_progress(conn, payload.material_id, learner_id)
-        learner_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
-
-    effective_generation_mode: Literal["slow", "fast"] = "fast" if SERVERLESS_MODE else payload.generation_mode
-
-    async def event_stream():
-        # Bounded queue so a slow client back-pressures into the worker instead of
-        # letting it allocate unbounded memory ahead of the network drain.
-        event_queue: Queue[dict[str, Any] | None] = Queue(maxsize=256)
-        emitted_reels: set[tuple[str, str]] = set()
-        cancel_event = threading.Event()
-        # Long but finite wall-clock deadline. Quality-oriented retrieval can
-        # spend several minutes on transcript/topic-boundary work; disconnected
-        # clients still cancel through `request.is_disconnected()`.
-        STREAM_DEADLINE_SEC = _reels_generate_stream_deadline_sec()
-        deadline = time.monotonic() + STREAM_DEADLINE_SEC
-
-        def emit_event(event: dict[str, Any]) -> None:
-            try:
-                event_queue.put(event, timeout=STREAM_DEADLINE_SEC)
-            except Exception:
-                # If the queue is still full after the deadline the client has
-                # almost certainly gone away. Signal cancel and drop the event
-                # rather than blocking the worker thread indefinitely.
-                cancel_event.set()
-
-        def emit_reel(reel: dict[str, Any]) -> None:
-            reel_id, clip_key = _reel_identity_key(reel)
-            identity = (reel_id, clip_key)
-            if identity in emitted_reels:
-                return
-            emitted_reels.add(identity)
-            emit_event({"type": "reel", "reel": reel})
-
-        def should_cancel_or_deadline() -> bool:
-            if cancel_event.is_set():
-                return True
-            if time.monotonic() >= deadline:
-                cancel_event.set()
-                return True
-            return False
-
-        def run_generation() -> None:
-            try:
-                with get_conn() as conn:
-                    generation_result = _ensure_generation_for_request(
-                        conn,
-                        material_id=payload.material_id,
-                        concept_id=payload.concept_id,
-                        required_count=requested_num_reels,
-                        sync_deep_fallback="if_empty",
-                        creative_commons_only=payload.creative_commons_only,
-                        generation_mode=effective_generation_mode,
-                        min_relevance=min_relevance,
-                        video_pool_mode=safe_video_pool_mode,
-                        preferred_video_duration=safe_video_duration_pref,
-                        target_clip_duration_sec=safe_target_clip_duration_sec,
-                        target_clip_duration_min_sec=safe_target_clip_min_sec,
-                        target_clip_duration_max_sec=safe_target_clip_max_sec,
-                        exclude_video_ids=payload.exclude_video_ids,
-                        page_hint=1,
-                        on_reel_created=emit_reel,
-                        emit_existing_reels=True,
-                        should_cancel=should_cancel_or_deadline,
-                        multi_platform_search=payload.multi_platform_search,
-                        knowledge_level_override=learner_knowledge_level,
-                        learner_id=learner_id,
-                    )
-                emit_event(
-                    {
-                        "type": "done",
-                        "response": {
-                            "reels": list(generation_result.get("reels") or [])[:requested_num_reels],
-                            "generation_id": generation_result.get("generation_id"),
-                            "response_profile": generation_result.get("response_profile"),
-                            "refinement_job_id": generation_result.get("refinement_job_id"),
-                            "refinement_status": generation_result.get("refinement_status"),
-                        },
-                    }
-                )
-            except GenerationCancelledError:
-                pass
-            except YouTubeApiRequestError as exc:
-                logger.warning(
-                    "Reels generate-stream request failed: %s",
-                    json.dumps(
-                        {
-                            "material_id": payload.material_id,
-                            "generation_mode": effective_generation_mode,
-                            "requested_num_reels": requested_num_reels,
-                            "error": str(exc),
-                        },
-                        sort_keys=True,
-                    ),
-                )
-                emit_event({"type": "error", "detail": str(exc)})
-            except HTTPException as exc:
-                emit_event({"type": "error", "detail": str(exc.detail), "status_code": exc.status_code})
-            except Exception as exc:
-                logger.exception(
-                    "Reels generate-stream unexpected failure material_id=%s mode=%s requested=%s",
-                    payload.material_id,
-                    effective_generation_mode,
-                    requested_num_reels,
-                )
-                emit_event({"type": "error", "detail": str(exc)})
-            finally:
-                event_queue.put(None)
-
-        worker = threading.Thread(target=run_generation, daemon=True)
-        worker.start()
-
-        try:
-            while True:
-                if await request.is_disconnected():
-                    cancel_event.set()
-                    break
-                try:
-                    event = event_queue.get(timeout=0.25)
-                except Empty:
-                    if cancel_event.is_set() or (not worker.is_alive() and event_queue.empty()):
-                        break
-                    continue
-                if event is None:
-                    break
-                yield f"{json.dumps(event)}\n"
-        finally:
-            cancel_event.set()
-
-    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
-
-
-@app.get("/api/reels/refinement-stream/{job_id}")
-async def refinement_stream(request: Request, job_id: str, replay_from_ms: int = 0):
-    """
-    NDJSON progress stream for a refinement job (Phase D.1).
-
-    Emits one JSON line per progress event (stage_start, stage_end, reels_completed,
-    job_start, job_end, job_terminal, and any custom events published by the worker).
-    The response continues until the worker emits a `job_terminal` event (clean EOF)
-    or the subscriber's idle timeout elapses.
-
-    Late subscribers can pass `?replay_from_ms=` to skip events they already saw on
-    reconnect. When `replay_from_ms=0` (default) the client gets the full buffered
-    history (up to `progress_bus.BUFFER_SIZE` events).
-
-    Both iOS (APIClient.swift:589) and the webapp (api.ts:925) already handle
-    line-buffered NDJSON for /api/reels/generate-stream — this endpoint reuses that
-    client-side plumbing.
-    """
-    _require_community_client_identity(request)
-    _enforce_rate_limit(
-        request,
-        "reels-refinement-stream",
-        limit=REELS_REFINEMENT_STATUS_RATE_LIMIT_PER_WINDOW,
-    )
-
-    clean_job_id = str(job_id or "").strip()
-    if not clean_job_id:
-        raise HTTPException(status_code=400, detail="job_id required")
-
-    with get_conn() as conn:
-        job_row = fetch_one(
-            conn, "SELECT id FROM reel_generation_jobs WHERE id = ? LIMIT 1", (clean_job_id,)
-        )
-    if not job_row:
-        raise HTTPException(status_code=404, detail="job_id not found")
-
-    async def ndjson_events():
-        try:
-            async for event in progress_bus.subscribe(
-                clean_job_id,
-                replay_from_ms=int(replay_from_ms or 0),
-                idle_timeout_sec=90.0,
-            ):
-                if await request.is_disconnected():
-                    break
-                yield f"{json.dumps(event, default=str)}\n"
-        except Exception as exc:  # pragma: no cover - defensive
-            yield f"{json.dumps({'event': 'stream_error', 'detail': str(exc)})}\n"
-
-    return StreamingResponse(ndjson_events(), media_type="application/x-ndjson")
-
-
-@app.get("/api/reels/refinement-status/{job_id}", response_model=RefinementStatusResponse)
-def refinement_status(request: Request, job_id: str):
-    _require_community_client_identity(request)
-    _enforce_rate_limit(
-        request,
-        "reels-refinement-status",
-        limit=REELS_REFINEMENT_STATUS_RATE_LIMIT_PER_WINDOW,
-    )
-    with get_conn() as conn:
-        job_row = fetch_one(conn, "SELECT * FROM reel_generation_jobs WHERE id = ? LIMIT 1", (job_id,))
-        if not job_row:
-            raise HTTPException(status_code=404, detail="job_id not found")
-        if str(job_row.get("status") or "").strip().lower() == "queued":
-            resumed = _resume_queued_refinement_job(conn, job_row)
-            if resumed is not None:
-                job_row = resumed
-            else:
-                refreshed = fetch_one(conn, "SELECT * FROM reel_generation_jobs WHERE id = ? LIMIT 1", (job_id,))
-                if refreshed:
-                    job_row = refreshed
-        active_generation = _fetch_active_generation_row(
+    if not material:
+        raise HTTPException(status_code=404, detail="material_id not found")
+    concept = None
+    if concept_id:
+        concept = fetch_one(
             conn,
-            material_id=str(job_row.get("material_id") or ""),
-            request_key=str(job_row.get("request_key") or ""),
+            "SELECT title, summary FROM concepts WHERE id = ? AND material_id = ?",
+            (concept_id, material_id),
         )
-        return {
-            "job_id": str(job_row.get("id") or ""),
-            "status": str(job_row.get("status") or ""),
-            "material_id": str(job_row.get("material_id") or ""),
-            "request_key": str(job_row.get("request_key") or ""),
-            "source_generation_id": str(job_row.get("source_generation_id") or ""),
-            "result_generation_id": str(job_row.get("result_generation_id") or "") or None,
-            "active_generation_id": str((active_generation or {}).get("id") or "") or None,
-            "completed_at": str(job_row.get("completed_at") or "") or None,
-            "error": str(job_row.get("error_text") or "") or None,
-        }
-
-
-@dataclass
-class ProbeResult:
-    can_generate: bool = False
-    blocked_by_settings: bool = False
-    total_probed: int = 0
-    passed_relevance: int = 0
-    passed_duration_pref: int = 0
-    passed_clip_range: int = 0
-    passed_all: int = 0
-
-
-def _filter_reels_by_relevance_only(reels: list[dict], min_relevance: float | None) -> list[dict]:
-    if min_relevance is None:
-        return list(reels)
-    return [
-        r for r in reels
-        if not (isinstance(r.get("relevance_score"), (int, float)) and float(r["relevance_score"]) < min_relevance)
+        if not concept:
+            raise HTTPException(status_code=404, detail="concept_id not found for material")
+    else:
+        concept = fetch_one(
+            conn,
+            "SELECT title, summary FROM concepts WHERE material_id = ? ORDER BY created_at, id LIMIT 1",
+            (material_id,),
+        )
+    candidates = [
+        (concept or {}).get("title"),
+        material.get("subject_tag"),
+        (concept or {}).get("summary"),
+        str(material.get("raw_text") or "")[:240],
     ]
-
-
-def _filter_reels_by_duration_pref_only(
-    reels: list[dict],
-    preferred_video_duration: Literal["any", "short", "medium", "long"],
-) -> list[dict]:
-    safe_pref = _normalize_preferred_video_duration(preferred_video_duration)
-    if safe_pref == "any":
-        return list(reels)
-    return [
-        r for r in reels
-        if _video_duration_bucket(r.get("video_duration_sec")) == safe_pref
-    ]
-
-
-def _filter_reels_by_clip_range_only(
-    reels: list[dict],
-    target_clip_duration_sec: int,
-    target_clip_duration_min_sec: int | None,
-    target_clip_duration_max_sec: int | None,
-) -> list[dict]:
-    _, clip_min, clip_max = _resolve_target_clip_duration_bounds(
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    query = " ".join(
+        " ".join(str(value or "").split())
+        for value in candidates
+        if str(value or "").strip()
     )
-    filtered: list[dict] = []
-    for reel in reels:
-        clip_duration = reel.get("clip_duration_sec")
-        if not isinstance(clip_duration, (int, float)):
-            try:
-                clip_duration = float(reel.get("t_end") or 0) - float(reel.get("t_start") or 0)
-            except (TypeError, ValueError):
-                clip_duration = 0.0
-        val = float(clip_duration or 0.0)
-        if val > 0 and (val < clip_min or val > clip_max):
-            continue
-        filtered.append(reel)
-    return filtered
+    if not query.strip():
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "blank_retrieval_topic", "message": "Material has no non-blank retrieval topic."},
+        )
+    return query[:500]
 
 
-def _determine_primary_bottleneck(
-    total: int,
-    passed_relevance: int,
-    passed_duration_pref: int,
-    passed_clip_range: int,
-) -> str:
-    if total == 0:
-        return "no_source"
-    dropped_by_relevance = total - passed_relevance
-    dropped_by_duration = total - passed_duration_pref
-    dropped_by_clip = total - passed_clip_range
-    if dropped_by_relevance == 0 and dropped_by_duration == 0 and dropped_by_clip == 0:
-        return ""
-    worst = max(dropped_by_relevance, dropped_by_duration, dropped_by_clip)
-    if worst == 0:
-        return ""
-    if dropped_by_relevance == worst:
-        return "relevance"
-    if dropped_by_duration == worst:
-        return "video_duration"
-    return "clip_range"
+def _provider_error_to_http(exc: ClipEngineProviderError) -> HTTPException:
+    status_by_code = {
+        "provider_quota_exhausted": 402,
+        "provider_rate_limited": 429,
+        "provider_configuration": 503,
+        "provider_authentication": 503,
+    }
+    status = status_by_code.get(exc.code, 502)
+    headers = None
+    if exc.retry_after_sec is not None:
+        headers = {"Retry-After": str(max(1, int(math.ceil(exc.retry_after_sec))))}
+    return HTTPException(status_code=status, detail=exc.as_dict(), headers=headers)
 
 
-def _probe_material_viability(
-    conn,
+def _preflight_evidence(
     *,
-    material_id: str,
-    concept_id: str | None,
-    creative_commons_only: bool,
-    fast_mode: bool,
-    min_relevance: float | None,
-    video_pool_mode: Literal["short-first", "balanced", "long-form"],
-    preferred_video_duration: Literal["any", "short", "medium", "long"],
-    target_clip_duration_sec: int,
-    target_clip_duration_min_sec: int | None,
-    target_clip_duration_max_sec: int | None,
-) -> ProbeResult:
-    probe: list[dict] = []
-    batch = reel_service.generate_reels(
-        conn,
-        material_id=material_id,
-        concept_id=concept_id,
-        num_reels=4,
-        creative_commons_only=creative_commons_only,
-        fast_mode=fast_mode,
-        video_pool_mode=video_pool_mode,
-        preferred_video_duration=preferred_video_duration,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-        dry_run=True,
-        retrieval_profile="bootstrap",
+    query: str,
+    filters: dict[str, Any],
+    allow_provider: bool,
+) -> dict[str, Any]:
+    normalized = normalize_provider_filters(filters)
+    key = search_cache_key(
+        query=query,
+        filters=normalized,
+        language="en",
+        page_token=None,
     )
-    if batch:
-        probe.extend(batch)
-
-    total_probed = len(probe)
-
-    # Apply each filter independently to measure per-filter pass rates
-    after_relevance = _filter_reels_by_relevance_only(probe, min_relevance)
-    after_duration = _filter_reels_by_duration_pref_only(probe, preferred_video_duration)
-    after_clip = _filter_reels_by_clip_range_only(
-        probe,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-    )
-
-    # Apply all filters combined
-    all_filtered = _filter_reels_by_min_relevance(probe, min_relevance)
-    all_filtered = _filter_reels_by_video_preferences(
-        all_filtered,
-        preferred_video_duration=preferred_video_duration,
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-    )
-
-    passed_relevance = len(after_relevance)
-    passed_duration = len(after_duration)
-    passed_clip = len(after_clip)
-    passed_all = len(all_filtered)
-
-    if passed_all > 0:
-        return ProbeResult(
-            can_generate=True,
-            blocked_by_settings=False,
-            total_probed=total_probed,
-            passed_relevance=passed_relevance,
-            passed_duration_pref=passed_duration,
-            passed_clip_range=passed_clip,
-            passed_all=passed_all,
-        )
-
-    # Relaxed probe to determine if settings are the blocker
-    relaxed_probe = reel_service.generate_reels(
-        conn,
-        material_id=material_id,
-        concept_id=concept_id,
-        num_reels=1,
-        creative_commons_only=creative_commons_only,
-        fast_mode=fast_mode,
-        video_pool_mode="balanced",
-        preferred_video_duration="any",
-        target_clip_duration_sec=DEFAULT_TARGET_CLIP_DURATION_SEC,
-        target_clip_duration_min_sec=MIN_TARGET_CLIP_DURATION_SEC,
-        target_clip_duration_max_sec=MAX_TARGET_CLIP_DURATION_SEC,
-        dry_run=True,
-        retrieval_profile="bootstrap",
-    )
-
-    blocked = bool(relaxed_probe)
-    return ProbeResult(
-        can_generate=False,
-        blocked_by_settings=blocked,
-        total_probed=total_probed,
-        passed_relevance=passed_relevance,
-        passed_duration_pref=passed_duration,
-        passed_clip_range=passed_clip,
-        passed_all=0,
-    )
+    cached = DatabaseProviderCache().get_search(key)
+    if cached is not None:
+        videos = cached.payload.get("videos") or []
+        return {
+            "availability": "available" if videos else "unavailable",
+            "evidence_source": "cache",
+            "evidence_age_sec": round(float(cached.age_sec), 3),
+            "candidate_count": len(videos),
+            "filters_applied": normalized,
+            "provider_called": False,
+        }
+    if not allow_provider:
+        return {
+            "availability": "unknown",
+            "evidence_source": "none",
+            "evidence_age_sec": None,
+            "candidate_count": 0,
+            "filters_applied": normalized,
+            "provider_called": False,
+        }
+    result = supadata_search_one(query, filters, language="en")
+    videos = result.get("videos") or []
+    return {
+        "availability": "available" if videos else "unavailable",
+        "evidence_source": "cache" if result.get("cache_hit") else "provider",
+        "evidence_age_sec": round(float(result.get("evidence_age_sec") or 0.0), 3),
+        "candidate_count": len(videos),
+        "filters_applied": result.get("filters_applied") or normalized,
+        "provider_called": not bool(result.get("cache_hit")),
+    }
 
 
 @app.post("/api/reels/can-generate", response_model=ReelsCanGenerateResponse)
 def can_generate_reels(request: Request, payload: ReelsGenerateRequest):
     _require_community_client_identity(request)
     _enforce_rate_limit(request, "reels-can-generate", limit=REELS_RATE_LIMIT_PER_WINDOW)
-    min_relevance = _normalize_min_relevance(payload.min_relevance)
-    safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
-    safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
-    safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
-        target_clip_duration_sec=payload.target_clip_duration_sec,
-        target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
-        target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
-    )
-
-    with get_conn() as conn:
-        material = fetch_all(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,))
-        if not material:
-            # Keep the string detail form so existing deployed clients that
-            # substring-match on "material_id not found" continue to work.
-            # iOS/web clients should prefer HTTP 404 + this marker over
-            # localised messages when routing to recovery.
-            raise HTTPException(status_code=404, detail="material_id not found")
-
-        try:
-            result = _probe_material_viability(
-                conn,
-                material_id=payload.material_id,
-                concept_id=payload.concept_id,
-                creative_commons_only=payload.creative_commons_only,
-                fast_mode=payload.generation_mode == "fast",
-                min_relevance=min_relevance,
-                video_pool_mode=safe_video_pool_mode,
-                preferred_video_duration=safe_video_duration_pref,
-                target_clip_duration_sec=safe_target_clip_duration_sec,
-                target_clip_duration_min_sec=safe_target_clip_min_sec,
-                target_clip_duration_max_sec=safe_target_clip_max_sec,
-            )
-        except IngestRateLimitedError as e:
-            raise _ingest_error_to_http(e) from e
-        except ClipEngineError as e:
-            logger.warning("can-generate clip-engine failure: %s", e)
-            raise HTTPException(status_code=502, detail=str(e)) from e
-        except YouTubeApiRequestError as e:
-            raise HTTPException(status_code=502, detail=str(e)) from e
-
-    success_rate = result.passed_all / result.total_probed if result.total_probed > 0 else 0.0
-    bottleneck = _determine_primary_bottleneck(
-        result.total_probed, result.passed_relevance, result.passed_duration_pref, result.passed_clip_range,
-    )
-    base = {
-        "estimated_success_rate": round(success_rate, 4),
-        "total_probed": result.total_probed,
-        "passed_all_filters": result.passed_all,
-        "primary_bottleneck": bottleneck,
+    _reject_multi_platform_search(payload.multi_platform_search)
+    filters = {
+        "creative_commons_only": payload.creative_commons_only,
+        "duration": payload.preferred_video_duration,
     }
-
-    if result.can_generate:
-        return {
-            **base,
-            "can_generate": True,
-            "blocked_by_settings": False,
-            "message": "Current settings can generate reels for this material.",
-        }
-
-    if result.blocked_by_settings:
-        return {
-            **base,
-            "can_generate": False,
-            "blocked_by_settings": True,
-            "message": "This configuration is too strict for the current material.",
-        }
-
-    return {
-        **base,
-        "can_generate": False,
-        "blocked_by_settings": False,
-        "message": "No matching source videos were found for this material right now.",
-    }
-
+    try:
+        with get_conn() as conn:
+            query = _material_preflight_query(conn, payload.material_id, payload.concept_id)
+        evidence = _preflight_evidence(query=query, filters=filters, allow_provider=True)
+    except ClipEngineProviderError as exc:
+        raise _provider_error_to_http(exc) from exc
+    evidence["message"] = (
+        "YouTube search found caption-bearing candidates."
+        if evidence["availability"] == "available"
+        else "No matching caption-bearing YouTube candidates were found."
+    )
+    evidence.pop("provider_called", None)
+    return evidence
 
 @app.post("/api/reels/can-generate-any", response_model=ReelsCanGenerateAnyResponse)
 def can_generate_reels_any(request: Request, payload: ReelsCanGenerateAnyRequest):
     _require_community_client_identity(request)
     _enforce_rate_limit(request, "reels-can-generate-any", limit=REELS_RATE_LIMIT_PER_WINDOW)
-    min_relevance = _normalize_min_relevance(payload.min_relevance)
-    safe_video_pool_mode = _normalize_video_pool_mode(payload.video_pool_mode)
-    safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
-    safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
-        target_clip_duration_sec=payload.target_clip_duration_sec,
-        target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
-        target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
-    )
-
+    _reject_multi_platform_search(payload.multi_platform_search)
+    filters = {
+        "creative_commons_only": payload.creative_commons_only,
+        "duration": payload.preferred_video_duration,
+    }
     with get_conn() as conn:
         requested_ids: list[str] = []
-        seen_requested: set[str] = set()
-        for raw in payload.material_ids:
-            material_id = str(raw or "").strip()
-            if not material_id or material_id in seen_requested:
-                continue
-            seen_requested.add(material_id)
-            requested_ids.append(material_id)
-
+        for raw_id in payload.material_ids:
+            clean_id = str(raw_id or "").strip()
+            if clean_id and clean_id not in requested_ids:
+                requested_ids.append(clean_id)
         if requested_ids:
-            placeholders = ",".join(["?"] * len(requested_ids))
-            rows = fetch_all(
-                conn,
-                f"SELECT id FROM materials WHERE id IN ({placeholders})",
-                tuple(requested_ids),
-            )
-            existing = {str(row.get("id") or "").strip() for row in rows if str(row.get("id") or "").strip()}
-            material_ids = [material_id for material_id in requested_ids if material_id in existing]
+            material_ids = requested_ids[:5]
         else:
-            rows = fetch_all(conn, "SELECT id FROM materials ORDER BY created_at DESC LIMIT 5", tuple())
-            material_ids = [str(row.get("id") or "").strip() for row in rows if str(row.get("id") or "").strip()]
-
-        # Cap to avoid timeout from too many external API calls per probe
-        material_ids = material_ids[:5]
-
-        if not material_ids:
-            return {
-                "can_generate_any": False,
-                "topics_checked": 0,
-                "topics_can_generate": 0,
-                "blocked_by_settings_topics": 0,
-                "no_source_topics": 0,
-                "estimated_success_rate": 0.0,
-                "total_probed": 0,
-                "passed_all_filters": 0,
-                "primary_bottleneck": "",
-                "message": "No study topics are available to validate.",
-            }
-
-        can_count = 0
-        blocked_count = 0
-        none_count = 0
-        agg_total_probed = 0
-        agg_passed_relevance = 0
-        agg_passed_duration = 0
-        agg_passed_clip = 0
-        agg_passed_all = 0
+            material_ids = [
+                str(row.get("id") or "")
+                for row in fetch_all(conn, "SELECT id FROM materials ORDER BY created_at DESC LIMIT 5")
+            ]
+        queries: list[tuple[str, str]] = []
         for material_id in material_ids:
             try:
-                result = _probe_material_viability(
-                    conn,
-                    material_id=material_id,
-                    concept_id=None,
-                    creative_commons_only=payload.creative_commons_only,
-                    fast_mode=payload.generation_mode == "fast",
-                    min_relevance=min_relevance,
-                    video_pool_mode=safe_video_pool_mode,
-                    preferred_video_duration=safe_video_duration_pref,
-                    target_clip_duration_sec=safe_target_clip_duration_sec,
-                    target_clip_duration_min_sec=safe_target_clip_min_sec,
-                    target_clip_duration_max_sec=safe_target_clip_max_sec,
-                )
-            except YouTubeApiRequestError as e:
-                raise HTTPException(status_code=502, detail=str(e)) from e
-            agg_total_probed += result.total_probed
-            agg_passed_relevance += result.passed_relevance
-            agg_passed_duration += result.passed_duration_pref
-            agg_passed_clip += result.passed_clip_range
-            agg_passed_all += result.passed_all
-            if result.can_generate:
-                can_count += 1
-            elif result.blocked_by_settings:
-                blocked_count += 1
-            else:
-                none_count += 1
+                queries.append((material_id, _material_preflight_query(conn, material_id)))
+            except HTTPException as exc:
+                if exc.status_code != 404:
+                    raise
 
-    checked_count = len(material_ids)
-    estimated_rate = round(agg_passed_all / agg_total_probed, 4) if agg_total_probed > 0 else 0.0
-    bottleneck = _determine_primary_bottleneck(
-        agg_total_probed, agg_passed_relevance, agg_passed_duration, agg_passed_clip,
+    if not queries:
+        return {
+            "availability": "unknown",
+            "evidence_source": "none",
+            "evidence_age_sec": None,
+            "candidate_count": 0,
+            "filters_applied": normalize_provider_filters(filters),
+            "materials_checked": 0,
+            "message": "No study materials are available to inspect.",
+        }
+
+    cached_results = [
+        _preflight_evidence(query=query, filters=filters, allow_provider=False)
+        for _material_id, query in queries
+    ]
+    for result in cached_results:
+        if result["availability"] == "available":
+            result["materials_checked"] = len(queries)
+            result["message"] = "Cached YouTube evidence contains caption-bearing candidates."
+            result.pop("provider_called", None)
+            return result
+
+    provider_result: dict[str, Any] | None = None
+    first_missing = next(
+        (index for index, result in enumerate(cached_results) if result["availability"] == "unknown"),
+        None,
     )
-    base = {
-        "topics_checked": checked_count,
-        "topics_can_generate": can_count,
-        "blocked_by_settings_topics": blocked_count,
-        "no_source_topics": none_count,
-        "estimated_success_rate": estimated_rate,
-        "total_probed": agg_total_probed,
-        "passed_all_filters": agg_passed_all,
-        "primary_bottleneck": bottleneck,
-    }
+    if first_missing is not None:
+        try:
+            provider_result = _preflight_evidence(
+                query=queries[first_missing][1],
+                filters=filters,
+                allow_provider=True,
+            )
+        except ClipEngineProviderError as exc:
+            raise _provider_error_to_http(exc) from exc
+        cached_results[first_missing] = provider_result
+        if provider_result["availability"] == "available":
+            provider_result["materials_checked"] = len(queries)
+            provider_result["message"] = "YouTube search found caption-bearing candidates."
+            provider_result.pop("provider_called", None)
+            return provider_result
 
-    rate_pct = round(estimated_rate * 100)
-    if can_count > 0:
-        bottleneck_hint = f" Bottleneck: {bottleneck}." if bottleneck and bottleneck != "no_source" and can_count < checked_count else ""
-        return {
-            **base,
-            "can_generate_any": True,
-            "message": f"Estimated success rate: {rate_pct}% ({agg_passed_all}/{agg_total_probed} probed reels pass). {can_count}/{checked_count} topics can generate.{bottleneck_hint}",
-        }
-
-    if blocked_count > 0:
-        bottleneck_hint = f" Primary bottleneck: {bottleneck}." if bottleneck and bottleneck != "no_source" else ""
-        return {
-            **base,
-            "can_generate_any": False,
-            "message": f"Estimated success rate: 0% (0/{agg_total_probed} probed reels pass). Settings too strict for {blocked_count}/{checked_count} topics.{bottleneck_hint}",
-        }
-
+    known = [result for result in cached_results if result["availability"] != "unknown"]
+    all_known = len(known) == len(cached_results)
+    evidence_source = "provider" if provider_result and provider_result.get("provider_called") else (
+        "cache" if known else "none"
+    )
+    ages = [float(result["evidence_age_sec"]) for result in known if result.get("evidence_age_sec") is not None]
     return {
-        **base,
-        "can_generate_any": False,
-        "message": f"Estimated success rate: 0%. No matching source videos found across {checked_count} topics.",
+        "availability": "unavailable" if all_known else "unknown",
+        "evidence_source": evidence_source,
+        "evidence_age_sec": max(ages) if ages else None,
+        "candidate_count": max((int(result.get("candidate_count") or 0) for result in known), default=0),
+        "filters_applied": normalize_provider_filters(filters),
+        "materials_checked": len(queries),
+        "message": (
+            "Cached and provider evidence found no matching caption-bearing candidates."
+            if all_known
+            else "Some materials have no fresh search evidence; no more than one provider search was issued."
+        ),
     }
-
 
 @app.get("/api/feed", response_model=FeedResponse)
 def feed(
@@ -6932,17 +5180,18 @@ def feed(
     creative_commons_only: bool = False,
     generation_mode: Literal["slow", "fast"] = "slow",
     min_relevance: float | None = None,
-    video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first",
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any",
     target_clip_duration_sec: int = DEFAULT_TARGET_CLIP_DURATION_SEC,
     target_clip_duration_min_sec: int | None = None,
     target_clip_duration_max_sec: int | None = None,
     exclude_video_ids: str = "",
     exclude_reel_ids: str = "",
+    multi_platform_search: bool = False,
 ):
     from .services.knowledge_level import effective_level_target as _effective_level_target
 
     _enforce_rate_limit(request, "feed", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
+    _reject_multi_platform_search(multi_platform_search)
     if page < 1:
         page = 1
     # Cap page to bound _ranked_request_reels's cumulative-page loop (O(page))
@@ -6958,166 +5207,130 @@ def feed(
     if prefetch > 30:
         prefetch = 30
 
-    with get_conn() as conn:
+    safe_duration = _normalize_preferred_video_duration(preferred_video_duration)
+    safe_clip_target, safe_clip_min, safe_clip_max = _resolve_target_clip_duration_bounds(
+        target_clip_duration_sec=target_clip_duration_sec,
+        target_clip_duration_min_sec=target_clip_duration_min_sec,
+        target_clip_duration_max_sec=target_clip_duration_max_sec,
+    )
+    safe_relevance = _normalize_min_relevance(min_relevance)
+    excluded_videos = _parse_excluded_video_ids_param(exclude_video_ids)
+    excluded_reels = _parse_excluded_reel_ids_param(exclude_reel_ids)
+    with get_conn(transactional=True) as conn:
         material = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
         if not material:
-            # Keep the string detail form so existing deployed clients that
-            # substring-match on "material_id not found" continue to work.
-            # iOS/web clients should prefer HTTP 404 + this marker over
-            # localised messages when routing to recovery.
             raise HTTPException(status_code=404, detail="material_id not found")
-
         learner_id = _resolve_learner_identity(conn, request)
-        learner_progress = reel_service.learner_progress(conn, material_id, learner_id)
+        progress = reel_service.learner_progress(conn, material_id, learner_id)
+        knowledge_level = str(progress.get("selected_level") or "beginner")
         try:
-            _mat_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
-            _mat_effective_level = _effective_level_target(
-                _mat_knowledge_level, float(learner_progress.get("global_adjustment") or 0.0)
+            effective_level = _effective_level_target(
+                knowledge_level,
+                float(progress.get("global_adjustment") or 0.0),
             )
         except ValueError:
-            # Corrupt stored level: report beginner semantics instead of a 500,
-            # and keep the raw stored string out of the response.
-            _mat_knowledge_level = "beginner"
-            _mat_effective_level = _effective_level_target("beginner", 0.0)
-
-        fast_mode = generation_mode == "fast"
-        client_requested_slow = generation_mode == "slow"
-        generation_mode_overridden = False
-        if SERVERLESS_MODE:
-            # Hosted/serverless: force fast retrieval profile to avoid request timeouts.
-            if client_requested_slow:
-                generation_mode_overridden = True
-            fast_mode = True
-            prefetch = min(prefetch, 6)
-        effective_generation_mode = "fast" if fast_mode else "slow"
-        safe_min_relevance = _normalize_min_relevance(min_relevance)
-        normalized_excluded_video_ids = _parse_excluded_video_ids_param(exclude_video_ids)
-        normalized_excluded_reel_ids = _parse_excluded_reel_ids_param(exclude_reel_ids)
-        safe_video_pool_mode = _normalize_video_pool_mode(video_pool_mode)
-        safe_video_duration_pref = _normalize_preferred_video_duration(preferred_video_duration)
-        safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
-            target_clip_duration_sec=target_clip_duration_sec,
-            target_clip_duration_min_sec=target_clip_duration_min_sec,
-            target_clip_duration_max_sec=target_clip_duration_max_sec,
-        )
-        if SERVERLESS_MODE:
-            target_total = page * limit + prefetch + 2
-            sync_target_total = max(page * limit, min(target_total, page * limit + 1))
-        else:
-            target_total = page * limit + prefetch + (10 if fast_mode else 6)
-            sync_target_total = max(page * limit, min(target_total, page * limit + (4 if fast_mode else 3)))
-        request_key = _build_generation_request_key(
+            knowledge_level = "beginner"
+            effective_level = _effective_level_target("beginner", 0.0)
+        content_fingerprint = material_content_fingerprint(conn, material_id)
+        request_key = build_durable_request_key(
             material_id=material_id,
             concept_id=None,
+            content_fingerprint=content_fingerprint,
+            knowledge_level=knowledge_level,
+            generation_mode=generation_mode,
             creative_commons_only=creative_commons_only,
-            generation_mode="fast" if fast_mode else "slow",
-            video_pool_mode=safe_video_pool_mode,
-            preferred_video_duration=safe_video_duration_pref,
-            target_clip_duration_sec=safe_target_clip_duration_sec,
-            target_clip_duration_min_sec=safe_target_clip_min_sec,
-            target_clip_duration_max_sec=safe_target_clip_max_sec,
+            source_duration=safe_duration,
+            target_clip_duration_sec=safe_clip_target,
+            target_clip_duration_min_sec=safe_clip_min,
+            target_clip_duration_max_sec=safe_clip_max,
         )
-        active_generation = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
-        active_generation_id = str((active_generation or {}).get("id") or "") or None
-        filtered_ranked = _ranked_request_reels(
+        completed_job = find_completed_generation_job(conn, request_key)
+        active_job = fetch_one(
+            conn,
+            """
+            SELECT * FROM reel_generation_jobs
+            WHERE request_key = ? AND status IN ('queued', 'running')
+            ORDER BY created_at LIMIT 1
+            """,
+            (request_key,),
+        )
+        generation_id = str((completed_job or {}).get("result_generation_id") or "") or None
+        if generation_id is None:
+            head = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
+            generation_id = str((head or {}).get("id") or "") or None
+        ranked = _ranked_request_reels(
             conn,
             material_id=material_id,
-            fast_mode=fast_mode,
-            generation_id=active_generation_id,
-            min_relevance=safe_min_relevance,
-            preferred_video_duration=safe_video_duration_pref,
-            target_clip_duration_sec=safe_target_clip_duration_sec,
-            target_clip_duration_min_sec=safe_target_clip_min_sec,
-            target_clip_duration_max_sec=safe_target_clip_max_sec,
-            exclude_video_ids=normalized_excluded_video_ids,
+            fast_mode=generation_mode == "fast",
+            generation_id=generation_id,
+            min_relevance=safe_relevance,
+            preferred_video_duration=safe_duration,
+            target_clip_duration_sec=safe_clip_target,
+            target_clip_duration_min_sec=safe_clip_min,
+            target_clip_duration_max_sec=safe_clip_max,
+            exclude_video_ids=excluded_videos,
             page=page,
             limit=limit,
             learner_id=learner_id,
-            exclude_reel_ids=normalized_excluded_reel_ids,
+            exclude_reel_ids=excluded_reels,
         )
-        response_profile = str((active_generation or {}).get("retrieval_profile") or "") or None
-        refinement_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
-        has_visible_reels_for_page = len(filtered_ranked) > (page - 1) * limit
-        if has_visible_reels_for_page:
-            total = len(filtered_ranked)
-            start = (page - 1) * limit
-            end = start + limit
-            reels = filtered_ranked[start:end]
-            return {
-                "page": page,
-                "limit": limit,
-                "total": total,
-                "reels": reels,
-                "generation_id": active_generation_id,
-                "response_profile": response_profile,
-                "refinement_job_id": str((refinement_job or {}).get("id") or "") or None,
-                "refinement_status": str((refinement_job or {}).get("status") or "") or None,
-                "effective_generation_mode": effective_generation_mode,
-                "generation_mode_overridden": generation_mode_overridden,
-                "knowledge_level": _mat_knowledge_level,
-                "effective_level_target": _mat_effective_level,
-            }
-        # Cumulative cap: if this material already has MAX_REELS_PER_MATERIAL
-        # reels on disk, don't queue another refinement. Stops unbounded
-        # background generation on clients that page indefinitely. Bypassed
-        # when the client isn't even asking for autofill (they're page-picking,
-        # not paginating) because those requests don't produce new generations.
-        material_reel_count_row = fetch_one(
-            conn,
-            "SELECT COUNT(*) AS reel_count FROM reels WHERE material_id = ?",
-            (material_id,),
+        page_start = (page - 1) * limit
+        page_end = page_start + limit
+        sparse = len(ranked) < page_end
+        material_count = int(
+            (
+                fetch_one(
+                    conn,
+                    "SELECT COUNT(*) AS reel_count FROM reels WHERE material_id = ?",
+                    (material_id,),
+                )
+                or {}
+            ).get("reel_count")
+            or 0
         )
-        material_reel_count = int((material_reel_count_row or {}).get("reel_count") or 0)
-        if autofill and material_reel_count >= MAX_REELS_PER_MATERIAL:
-            logger.info(
-                "feed: per-material cap reached (material_id=%s count=%d cap=%d); skipping refinement queue",
-                material_id,
-                material_reel_count,
-                MAX_REELS_PER_MATERIAL,
+        if autofill and sparse and material_count < MAX_REELS_PER_MATERIAL:
+            target_total = min(
+                MAX_REELS_PER_MATERIAL - material_count,
+                max(limit, page_end + prefetch),
             )
-            refinement_job = None
-        else:
-            refinement_job = _queue_refinement_if_needed(
+            active_job, _created = submit_generation_job(
                 conn,
                 material_id=material_id,
                 concept_id=None,
                 request_key=request_key,
-                generation_id=active_generation_id,
-                current_reels=filtered_ranked,
-                required_count=target_total if autofill else page * limit,
-                generation_mode="fast" if fast_mode else "slow",
-                creative_commons_only=creative_commons_only,
-                preferred_video_duration=safe_video_duration_pref,
-                video_pool_mode=safe_video_pool_mode,
-                target_clip_duration_sec=safe_target_clip_duration_sec,
-                target_clip_duration_min_sec=safe_target_clip_min_sec,
-                target_clip_duration_max_sec=safe_target_clip_max_sec,
-                min_relevance=safe_min_relevance,
-                page_hint=page,
-                page_size_hint=limit,
-                knowledge_level_override=_mat_knowledge_level,
+                content_fingerprint=content_fingerprint,
                 learner_id=learner_id,
+                request_params={
+                    "material_id": material_id,
+                    "concept_id": None,
+                    "num_reels": target_total,
+                    "exclude_video_ids": excluded_videos,
+                    "creative_commons_only": creative_commons_only,
+                    "generation_mode": generation_mode,
+                    "min_relevance": safe_relevance,
+                    "preferred_video_duration": safe_duration,
+                    "target_clip_duration_sec": safe_clip_target,
+                    "target_clip_duration_min_sec": safe_clip_min,
+                    "target_clip_duration_max_sec": safe_clip_max,
+                    "knowledge_level": knowledge_level,
+                },
+                source_generation_id=generation_id,
             )
-    total = len(filtered_ranked)
-    start = (page - 1) * limit
-    end = start + limit
-    reels = filtered_ranked[start:end]
-
-    return {
-        "page": page,
-        "limit": limit,
-        "total": total,
-        "reels": reels,
-        "generation_id": active_generation_id,
-        "response_profile": response_profile,
-        "refinement_job_id": str((refinement_job or {}).get("id") or "") or None,
-        "refinement_status": str((refinement_job or {}).get("status") or "") or None,
-        "effective_generation_mode": effective_generation_mode,
-        "generation_mode_overridden": generation_mode_overridden,
-        "knowledge_level": _mat_knowledge_level,
-        "effective_level_target": _mat_effective_level,
-    }
-
+        reels = ranked[page_start:page_end]
+        return {
+            "page": page,
+            "limit": limit,
+            "total": len(ranked),
+            "reels": reels,
+            "generation_id": generation_id,
+            "response_profile": "unified" if generation_id else None,
+            "generation_job_id": str((active_job or {}).get("id") or "") or None,
+            "generation_job_status": str((active_job or {}).get("status") or "") or None,
+            "effective_generation_mode": generation_mode,
+            "generation_mode_overridden": False,
+            "knowledge_level": knowledge_level,
+            "effective_level_target": effective_level,
+        }
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: Request, payload: ChatRequest):
@@ -7496,7 +5709,7 @@ def get_community_settings(request: Request):
                 default_input_mode,
                 min_relevance_threshold,
                 start_muted,
-                video_pool_mode,
+                creative_commons_only,
                 preferred_video_duration,
                 target_clip_duration_sec,
                 target_clip_duration_min_sec,
@@ -7525,7 +5738,7 @@ def replace_community_settings(request: Request, payload: CommunitySettingsPaylo
                 "default_input_mode": normalized.default_input_mode,
                 "min_relevance_threshold": normalized.min_relevance_threshold,
                 "start_muted": 1 if normalized.start_muted else 0,
-                "video_pool_mode": normalized.video_pool_mode,
+                "creative_commons_only": 1 if normalized.creative_commons_only else 0,
                 "preferred_video_duration": normalized.preferred_video_duration,
                 "target_clip_duration_sec": normalized.target_clip_duration_sec,
                 "target_clip_duration_min_sec": normalized.target_clip_duration_min_sec,
@@ -8175,564 +6388,6 @@ def replace_community_material_groups(request: Request, payload: CommunityMateri
 # ---------------------------------------------------------------------------
 # Admin: server-side simulation test
 # ---------------------------------------------------------------------------
-
-_SIMULATION_DEFAULT_TOPICS = [
-    {"subject": "Krebs Cycle", "text": "The Krebs cycle, also known as the citric acid cycle, is a series of chemical reactions in the mitochondrial matrix that oxidizes acetyl-CoA to CO2 and generates NADH, FADH2, and GTP.", "tier": "ultra-niche"},
-    {"subject": "Taylor Series Convergence", "text": "A Taylor series is an infinite sum of terms calculated from the values of a function's derivatives at a single point. The radius of convergence determines where the series converges.", "tier": "ultra-niche"},
-    {"subject": "CRISPR Gene Editing", "text": "CRISPR-Cas9 is a genome editing tool that uses a guide RNA to direct the Cas9 enzyme to a specific DNA sequence. It creates a double-strand break allowing for gene knockout, insertion, or correction.", "tier": "niche"},
-    {"subject": "Fourier Transform", "text": "The Fourier transform decomposes a function of time into the frequencies that make it up. It transforms a signal from the time domain to the frequency domain.", "tier": "niche"},
-    {"subject": "Mitosis", "text": "Mitosis is a type of cell division that produces two genetically identical daughter cells from a single parent cell. The stages are prophase, metaphase, anaphase, and telophase.", "tier": "moderate"},
-    {"subject": "Quantum Entanglement", "text": "Quantum entanglement is a phenomenon where two particles become correlated such that the quantum state of one instantly influences the other, regardless of distance.", "tier": "moderate"},
-    {"subject": "Game Theory", "text": "Game theory is the study of mathematical models of strategic interaction among rational agents. Key concepts include Nash equilibrium, dominant strategies, and the prisoner's dilemma.", "tier": "moderate"},
-    {"subject": "World War 2", "text": "World War 2 was a global conflict from 1939 to 1945 involving the Allied and Axis powers. Key events include the invasion of Poland, D-Day, and the atomic bombings.", "tier": "broad"},
-    {"subject": "Climate Change", "text": "Climate change refers to long-term shifts in global temperatures and weather patterns. Human activities, especially burning fossil fuels, have been the main driver since the industrial revolution.", "tier": "broad"},
-    {"subject": "Machine Learning", "text": "Machine learning is a subset of artificial intelligence where systems learn from data to improve performance on tasks without being explicitly programmed.", "tier": "broad"},
-    {"subject": "Biology", "text": "Biology is the scientific study of life and living organisms. It covers topics from molecular biology and genetics to ecology and evolution.", "tier": "ultra-broad"},
-    {"subject": "Mathematics", "text": "Mathematics is the abstract science of number, quantity, and space. Major branches include algebra, calculus, geometry, and statistics.", "tier": "ultra-broad"},
-]
-
-_SIMULATION_KNOWN_EDU_CHANNELS: set[str] = {
-    # Math
-    '3blue1brown', 'blackpenredpen', 'dr. trefor bazett', 'eddie woo',
-    'mathologer', 'mindyourdecisions', 'nancypi', 'numberphile', 'patrickjmt',
-    'pbs infinite series', 'professor leonard', 'stand-up maths', 'think twice',
-    'tibees', 'tipping point math', 'vihart', 'zach star',
-    # Physics
-    'fermilab', 'minutephysics', 'physics explained', 'physics girl',
-    'physics videos by eugene', 'scienceclic english', 'sixty symbols',
-    'the science asylum',
-    # Chemistry
-    'nilered', 'nileblue', 'nurdrage', 'organic chemistry tutor',
-    'periodic videos', 'the organic chemistry tutor', 'tmp chem',
-    # Biology
-    'amoeba sisters', 'animalogic', 'atlas pro', 'bbc earth',
-    'deep look', 'journey to the microcosmos', 'mbari',
-    'national geographic', 'nature on pbs', 'nick zentner', 'pbs eons',
-    'stated clearly', 'tierzoo',
-    # Medicine
-    'chubbyemu', 'institute of human anatomy', 'ninja nerd',
-    # General Science
-    'alpha phoenix', 'be smart', 'domain of science', 'kyle hill',
-    'minute earth', 'real science', 'sci show', 'scishow', 'scishow space',
-    'smarter every day', 'smartereveryday', 'steve mould', 'the action lab',
-    'up and atom', 'veritasium',
-    # Space
-    'anton petrov', 'astrum', 'cool worlds', 'dr. becky',
-    'everyday astronaut', 'pbs space time', 'sabine hossenfelder', 'scott manley',
-    # Engineering
-    'engineerguy', 'engineering explained', 'practical engineering',
-    'real engineering', 'the engineering mindset',
-    # Electronics
-    'bigclivedotcom', 'curiousmarc', 'eevblog', 'electroboom',
-    'technology connections',
-    # Computer Science
-    'ben eater', 'computerphile', 'deepmind', 'fireship',
-    'liveoverflow', 'neso academy', 'sebastian lague', 'the coding train',
-    'two minute papers', 'welch labs',
-    # Coding
-    'freecodecamp', 'kevin powell', 'programming with mosh',
-    'the net ninja', 'web dev simplified',
-    # Lectures
-    'bozeman science', 'crash course', 'khan academy', 'lumen learning',
-    'mit opencourseware', 'professor dave explains', 'yalecourses',
-    # General Explanation
-    'cgp grey', 'half as interesting', 'kurzgesagt', 'lemmino',
-    'reallifelore', 'ted-ed', 'tom scott', 'vox', 'vsauce', 'vsauce2',
-    'wendover productions',
-    # Experiments & Building
-    'applied science', 'mark rober', 'stuffmadehere', 'tech ingredients',
-    # History
-    'extra credits', 'fall of civilizations', 'historia civilis',
-    'kings and generals', 'knowledgia', 'oversimplified',
-    "sam o'nella academy", 'the great war', 'the history guy',
-    'timeghost history',
-    # Other
-    'bright side of mathematics', 'brilliant', 'captain disillusion',
-    'jbstatistics', 'not just bikes', 'the royal institution',
-    'simplilearn', 'dw documentary', 'frontline pbs',
-    # Short aliases
-    'mit', 'ted', 'pbs',
-}
-
-_SIMULATION_RED_FLAGS = frozenset([
-    'reaction', 'vlog', 'unboxing', 'prank', 'challenge', 'asmr',
-    'gameplay', 'lets play', 'mukbang', 'haul', 'grwm', 'top 10',
-    'ranking every', 'tier list',
-])
-
-
-def _simulation_assess_educational(reel: dict[str, Any]) -> tuple[bool, str]:
-    """Server-side educational quality scorer for simulation endpoint."""
-    title = str(reel.get("video_title") or "")
-    description = str(reel.get("video_description") or "")
-    channel_name = str(reel.get("channel_name") or "")
-    ai_summary = str(reel.get("ai_summary") or "")
-    duration = int(reel.get("video_duration_sec") or 0)
-    title_lower = title.lower()
-    desc_lower = description.lower()
-    combined = f"{title_lower} {desc_lower}"
-
-    for flag in _SIMULATION_RED_FLAGS:
-        if flag in title_lower:
-            return False, f"Red flag: '{flag}' in title"
-
-    signals = 0.0
-    reasons: list[str] = []
-
-    # Channel name (most authoritative)
-    ch_lower = channel_name.lower().strip()
-    if ch_lower and any(ch in ch_lower for ch in _SIMULATION_KNOWN_EDU_CHANNELS):
-        signals += 1.5
-        reasons.append(f"known educational channel: {channel_name}")
-    elif any(ch in combined for ch in _SIMULATION_KNOWN_EDU_CHANNELS):
-        signals += 1.0
-        reasons.append("known educational channel (in metadata)")
-
-    # Channel name contains educational keywords (e.g., "Physics Videos", "Geo History")
-    if ch_lower and not any(ch in ch_lower for ch in _SIMULATION_KNOWN_EDU_CHANNELS):
-        _edu_ch_words = ['science', 'physics', 'history', 'biology', 'chemistry',
-                         'math', 'education', 'professor', 'academy', 'lecture',
-                         'engineering', 'medical', 'learning', 'tutorial',
-                         'university', 'institute', 'geographic']
-        ch_edu_hits = sum(1 for w in _edu_ch_words if w in ch_lower)
-        if ch_edu_hits >= 1:
-            signals += 0.5
-            reasons.append(f"edu channel name ({channel_name})")
-
-    # Title keywords
-    title_edu = ['explained', 'tutorial', 'lecture', 'lesson', 'course', 'learn',
-                 'introduction', 'intro', 'how', 'what is', 'guide', 'basics',
-                 'chapter', 'part', 'fundamentals', 'overview', 'crash course',
-                 'made simple', 'made easy', 'for beginners', '101', 'documentary',
-                 'science', 'history', 'math', 'biology', 'chemistry', 'physics',
-                 'calculus', 'algebra', 'proof', 'theorem', 'derivation']
-    hits = sum(1 for w in title_edu if w in title_lower)
-    if hits >= 1:
-        signals += 0.5 + 0.2 * min(3, hits)
-        reasons.append(f"title keywords ({hits})")
-
-    # Description keywords
-    desc_edu = ['learn', 'education', 'course', 'academy', 'university', 'professor',
-                'khan', 'mit', 'ted', 'lecture', 'patreon', 'practice', 'textbook',
-                'curriculum', 'syllabus', 'exam', 'student', 'teaching']
-    d_hits = sum(1 for w in desc_edu if w in desc_lower)
-    if d_hits >= 1:
-        signals += 0.3 + 0.15 * min(3, d_hits)
-        reasons.append(f"desc keywords ({d_hits})")
-
-    # Description structure
-    if re.search(r'\d{1,2}:\d{2}', description):
-        signals += 0.5
-        reasons.append("timestamps")
-    if len(description) > 500:
-        signals += 0.6
-        reasons.append("very detailed description")
-    elif len(description) > 200:
-        signals += 0.4
-        reasons.append("detailed description")
-    if 'http' in desc_lower:
-        signals += 0.2
-        reasons.append("links")
-
-    # Title structure
-    if re.search(r'\b(part|chapter|lecture|episode|module|unit)\s+\d', title_lower):
-        signals += 0.5
-        reasons.append("series structure")
-
-    # Duration band
-    if 300 <= duration <= 1800:
-        signals += 0.3
-        reasons.append(f"edu duration ({duration}s)")
-
-    # AI summary
-    if ai_summary and len(ai_summary) > 40:
-        signals += 0.3
-        reasons.append("has AI summary")
-
-    # Transcript vocabulary from captions
-    captions = reel.get("captions") or []
-    snippet = str(reel.get("transcript_snippet") or "")
-    text = " ".join(str(c.get("text", "")) for c in captions) if captions else snippet
-    if text:
-        words = text.split()
-        if len(words) > 50:
-            unique_ratio = len(set(w.lower() for w in words)) / max(1, len(words))
-            if unique_ratio > 0.35:
-                signals += 0.5
-                reasons.append(f"vocab diversity {unique_ratio:.2f}")
-            signals += 0.3
-            reasons.append(f"transcript ({len(words)} words)")
-
-    is_edu = signals >= 1.0
-    return is_edu, "; ".join(reasons) if reasons else "no educational signals"
-
-
-def _simulation_is_sentence_start(text: str) -> bool:
-    if not text.strip():
-        return False
-    return text.strip()[0].isupper() or text.strip()[0].isdigit() or text.strip()[0] in '"\'('
-
-
-_SENTENCE_END_RE = re.compile(r"[.!?…][\"'\)\]]*\s*$")
-
-
-def _simulation_is_sentence_end(text: str) -> bool:
-    stripped = text.rstrip()
-    if not stripped:
-        return False
-    # Accept .!?… optionally followed by closing quotes/parens (matches what
-    # _refine_clip_window_from_transcript produces).  Also strip trailing
-    # caption markers like [Music], (laughter), etc. before checking.
-    cleaned = re.sub(r"\s*[\[\(][^\]\)]+[\]\)]\s*$", "", stripped).rstrip()
-    if not cleaned:
-        return False
-    return bool(_SENTENCE_END_RE.search(cleaned))
-
-
-@app.post("/api/admin/run-simulation", response_model=SimulationResponse)
-def admin_run_simulation(request: Request, payload: AdminSimulationRequest | None = None):
-    _require_community_client_identity(request)
-    _enforce_rate_limit(request, "admin-simulation", limit=ADMIN_SIMULATION_RATE_LIMIT_PER_WINDOW)
-
-    topics = (payload.topics if payload and payload.topics else None) or _SIMULATION_DEFAULT_TOPICS
-    num_reels = min(max(1, payload.num_reels if payload else 3), 5)
-
-    results: list[SimulationTopicResult] = []
-    total_clips = 0
-    total_edu = 0
-    total_on_topic = 0
-    total_clean_start = 0
-    total_clean_end = 0
-
-    for topic in topics:
-        subject = str(topic.get("subject", ""))
-        text = str(topic.get("text", ""))
-        tier = str(topic.get("tier", ""))
-        topic_result = SimulationTopicResult(subject=subject, tier=tier)
-
-        try:
-            with get_conn() as conn:
-                # Step 1: Create material
-                concept_limit = 6
-                concepts, objectives = material_intelligence_service.extract_concepts_and_objectives(
-                    conn, text, subject_tag=subject, max_concepts=concept_limit,
-                )
-                material_id = str(uuid.uuid4())
-                upsert(conn, "materials", {
-                    "id": material_id,
-                    "subject_tag": subject,
-                    "raw_text": text,
-                    "source_type": "text",
-                    "source_path": None,
-                    "created_at": now_iso(),
-                })
-                concept_id = ""
-                subject_lower = subject.lower()
-                if concepts:
-                    best = concepts[0]
-                    for c in concepts:
-                        if subject_lower in c.get("title", "").lower():
-                            best = c
-                            break
-                    concept_id = best.get("id", "")
-
-                    for concept in concepts:
-                        concept_text = f"{concept['title']}. Keywords: {' '.join(concept['keywords'])}. Summary: {concept['summary']}"
-                        emb = embedding_service.embed_texts(conn, [concept_text])[0]
-                        upsert(conn, "concepts", {
-                            "id": concept["id"],
-                            "material_id": material_id,
-                            "title": concept["title"],
-                            "keywords_json": dumps_json(concept["keywords"]),
-                            "summary": concept["summary"],
-                            "embedding_json": dumps_json(emb.tolist()),
-                            "created_at": now_iso(),
-                        })
-
-                if not concept_id:
-                    topic_result.error = "no concepts extracted"
-                    results.append(topic_result)
-                    continue
-
-                # Step 2: Generate reels
-                generation_result = _ensure_generation_for_request(
-                    conn,
-                    material_id=material_id,
-                    concept_id=concept_id,
-                    required_count=num_reels,
-                    sync_deep_fallback="if_empty",
-                    creative_commons_only=False,
-                    generation_mode="fast",
-                    min_relevance=None,
-                    video_pool_mode="balanced",
-                    preferred_video_duration="any",
-                    target_clip_duration_sec=60,
-                    target_clip_duration_min_sec=15,
-                    target_clip_duration_max_sec=120,
-                    page_hint=1,
-                )
-
-            reels = list(generation_result.get("reels") or [])[:num_reels]
-            topic_result.reels_count = len(reels)
-
-            if not reels:
-                topic_result.error = "no reels generated"
-                results.append(topic_result)
-                continue
-
-            # Step 3: Evaluate each reel
-            keywords = text.lower().split()[:20]
-            for reel in reels:
-                total_clips += 1
-                clip_info: dict[str, Any] = {
-                    "video_title": reel.get("video_title", ""),
-                    "channel_name": reel.get("channel_name", ""),
-                    "t_start": reel.get("t_start", 0),
-                    "t_end": reel.get("t_end", 0),
-                    "video_duration_sec": reel.get("video_duration_sec", 0),
-                }
-
-                # Educational check
-                is_edu, edu_notes = _simulation_assess_educational(reel)
-                clip_info["educational"] = is_edu
-                clip_info["edu_notes"] = edu_notes
-                if is_edu:
-                    total_edu += 1
-                    topic_result.educational_count += 1
-
-                # On-topic check (from captions/snippet)
-                captions = reel.get("captions") or []
-                snippet = str(reel.get("transcript_snippet") or "")
-                clip_text = " ".join(str(c.get("text", "")) for c in captions) if captions else snippet
-                if clip_text:
-                    subject_words = subject.lower().split()
-                    subject_hits = sum(1 for w in subject_words if w in clip_text.lower())
-                    subject_cov = subject_hits / max(1, len(subject_words))
-                    kw_hits = sum(1 for kw in keywords if kw in clip_text.lower())
-                    kw_cov = kw_hits / max(1, len(keywords))
-                    is_on_topic = subject_cov >= 0.5 or kw_cov >= 0.3
-                else:
-                    is_on_topic = False
-                clip_info["on_topic"] = is_on_topic
-                if is_on_topic:
-                    total_on_topic += 1
-                    topic_result.on_topic_count += 1
-
-                # Boundary checks
-                starts_clean = _simulation_is_sentence_start(clip_text) if clip_text else False
-                ends_clean = _simulation_is_sentence_end(clip_text) if clip_text else False
-                clip_info["starts_clean"] = starts_clean
-                clip_info["ends_clean"] = ends_clean
-                if starts_clean:
-                    total_clean_start += 1
-                    topic_result.clean_start_count += 1
-                if ends_clean:
-                    total_clean_end += 1
-                    topic_result.clean_end_count += 1
-
-                topic_result.clips.append(clip_info)
-
-        except Exception as exc:
-            topic_result.error = str(exc)[:300]
-
-        results.append(topic_result)
-
-    n = max(1, total_clips)
-    return SimulationResponse(
-        topics_tested=len(results),
-        total_clips=total_clips,
-        educational_pct=round(100.0 * total_edu / n, 1),
-        on_topic_pct=round(100.0 * total_on_topic / n, 1),
-        clean_start_pct=round(100.0 * total_clean_start / n, 1),
-        clean_end_pct=round(100.0 * total_clean_end / n, 1),
-        per_topic=results,
-    )
-
-
-@app.post("/api/admin/diagnose-topic", response_model=DiagnoseTopicResponse)
-def admin_diagnose_topic(request: Request, payload: AdminDiagnoseTopicRequest):
-    """Diagnose why a topic generates 0 reels.
-
-    Runs the full pipeline and returns a diagnostic report showing where
-    candidates are lost at each stage: search, duration filter, relevance
-    gate, transcript availability.
-    """
-    _require_community_client_identity(request)
-    _enforce_rate_limit(request, "admin-diagnose", limit=ADMIN_SIMULATION_RATE_LIMIT_PER_WINDOW)
-
-    subject = payload.subject.strip()
-    if not subject:
-        return DiagnoseTopicResponse(subject=subject, error="empty subject")
-
-    num_reels = min(max(1, payload.num_reels), 5)
-    response = DiagnoseTopicResponse(subject=subject)
-
-    try:
-        with get_conn() as conn:
-            # Step 1: Create material + extract concepts
-            text = subject
-            concepts, objectives = material_intelligence_service.extract_concepts_and_objectives(
-                conn, text, subject_tag=subject, max_concepts=6,
-            )
-            material_id = str(uuid.uuid4())
-            upsert(conn, "materials", {
-                "id": material_id,
-                "subject_tag": subject,
-                "raw_text": text,
-                "source_type": "text",
-                "source_path": None,
-                "created_at": now_iso(),
-            })
-
-            if not concepts:
-                response.error = "no concepts extracted"
-                return response
-
-            concept = concepts[0]
-            subject_lower = subject.lower()
-            for c in concepts:
-                if subject_lower in c.get("title", "").lower():
-                    concept = c
-                    break
-
-            concept_id = concept.get("id", "")
-            concept_text = f"{concept['title']}. Keywords: {' '.join(concept['keywords'])}. Summary: {concept['summary']}"
-            emb = embedding_service.embed_texts(conn, [concept_text])[0]
-            upsert(conn, "concepts", {
-                "id": concept_id,
-                "material_id": material_id,
-                "title": concept["title"],
-                "keywords_json": dumps_json(concept["keywords"]),
-                "summary": concept["summary"],
-                "embedding_json": dumps_json(emb.tolist()),
-                "created_at": now_iso(),
-            })
-
-            # Step 2: Generate reels with diagnostic tracking
-            generation_result = _ensure_generation_for_request(
-                conn,
-                material_id=material_id,
-                concept_id=concept_id,
-                required_count=num_reels,
-                sync_deep_fallback="if_empty",
-                creative_commons_only=False,
-                generation_mode="fast",
-                min_relevance=None,
-                video_pool_mode="balanced",
-                preferred_video_duration="any",
-                target_clip_duration_sec=60,
-                target_clip_duration_min_sec=15,
-                target_clip_duration_max_sec=120,
-                page_hint=1,
-            )
-
-            reels = list(generation_result.get("reels") or [])[:num_reels]
-            response.final_reel_count = len(reels)
-
-            # Step 3: Collect diagnostic data from DB
-            # Search queries used (search_cache may not exist on all schemas — fail open)
-            try:
-                search_rows = fetch_all(
-                    conn,
-                    "SELECT query FROM search_cache WHERE query LIKE ? ORDER BY created_at DESC LIMIT 20",
-                    (f"%{subject_lower[:20]}%",),
-                )
-                response.queries_generated = [str(r.get("query", "")) for r in search_rows]
-            except Exception:
-                response.queries_generated = []
-
-            reel_stage = DiagnosticStageResult(
-                stage="reels_created",
-                candidate_count=len(reels),
-                details=[
-                    {
-                        "video_title": r.get("video_title", ""),
-                        "channel_name": r.get("channel_name", ""),
-                        "t_start": r.get("t_start", 0),
-                        "t_end": r.get("t_end", 0),
-                        "score": r.get("score", 0),
-                        "source_surface": r.get("source_surface", ""),
-                        "relevance_score": r.get("relevance_score", 0),
-                    }
-                    for r in reels
-                ],
-            )
-            response.stages.append(reel_stage)
-
-            # Transcript availability
-            transcript_stage = DiagnosticStageResult(stage="transcript_availability")
-            for reel in reels:
-                vid = reel.get("video_id", "")
-                if vid:
-                    tq = youtube_service.get_transcript_quality(conn, vid)
-                    transcript_stage.details.append({
-                        "video_id": vid,
-                        "has_transcript": tq is not None,
-                        "source_kind": tq.get("source_kind") if tq else None,
-                        "quality_score": tq.get("quality_score") if tq else None,
-                        "quality_status": tq.get("quality_status") if tq else None,
-                    })
-            transcript_stage.candidate_count = sum(1 for d in transcript_stage.details if d.get("has_transcript"))
-            response.stages.append(transcript_stage)
-
-            # Surface retrieval_metrics + per-segment branch counts from the
-            # most recent retrieval_runs entries for this material. These rows
-            # are written by `_persist_retrieval_debug_run` when
-            # retrieval_debug_logging is on (default true). Aggregating across
-            # all concept runs for this material gives visibility into WHERE
-            # in the segment loop candidates drop off.
-            try:
-                run_rows = fetch_all(
-                    conn,
-                    "SELECT id, concept_id, concept_title, selected_video_id, "
-                    "failure_reason, debug_json, created_at "
-                    "FROM retrieval_runs WHERE material_id = ? "
-                    "ORDER BY created_at DESC LIMIT 10",
-                    (material_id,),
-                )
-                aggregated: dict[str, Any] = {}
-                run_summaries: list[dict] = []
-                for row in run_rows:
-                    debug_json_raw = row.get("debug_json") or "{}"
-                    try:
-                        if isinstance(debug_json_raw, (bytes, bytearray)):
-                            debug_json_raw = debug_json_raw.decode("utf-8", errors="ignore")
-                        parsed = (
-                            debug_json_raw
-                            if isinstance(debug_json_raw, dict)
-                            else json.loads(str(debug_json_raw))
-                        )
-                    except Exception:
-                        parsed = {}
-                    metrics = parsed.get("metrics") or {}
-                    run_summaries.append({
-                        "run_id": str(row.get("id") or ""),
-                        "concept_id": str(row.get("concept_id") or ""),
-                        "concept_title": str(row.get("concept_title") or ""),
-                        "selected_video_id": str(row.get("selected_video_id") or ""),
-                        "failure_reason": str(row.get("failure_reason") or ""),
-                        "candidate_count": int(parsed.get("candidate_count") or 0),
-                        "query_count": int(parsed.get("query_count") or 0),
-                        "metrics": metrics,
-                    })
-                    for key, value in metrics.items():
-                        try:
-                            aggregated[key] = int(aggregated.get(key, 0)) + int(value or 0)
-                        except (TypeError, ValueError):
-                            aggregated[key] = value
-                response.retrieval_metrics = aggregated
-                response.retrieval_runs = run_summaries
-            except Exception:
-                logger.exception("diagnose-topic: failed to load retrieval_runs for %s", material_id)
-
-            if not reels:
-                response.error = f"0 reels generated for '{subject}' — check stages for where candidates were lost"
-
-    except Exception as exc:
-        response.error = str(exc)[:500]
-
-    return response
-
 
 def _register_non_api_route_aliases() -> None:
     # Some deployments mount this ASGI app under `/api` already. Registering

@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -34,9 +35,12 @@ from ..ingestion.segment import normalize_clip_window as _normalize_clip_window_
 from ..clip_engine import expand as _clip_engine_expand
 from ..clip_engine.cancellation import raise_if_cancelled as _raise_if_clip_cancelled
 from ..clip_engine.errors import CancellationError as _ClipEngineCancellationError
+from ..clip_engine.errors import ProviderError as _ClipEngineProviderError
 from ..clip_engine.config import SEGMENT_MAX_CLIP_S as _SEGMENT_MAX_CLIP_S
 from ..clip_engine.metadata import extract_video_id as _extract_embed_video_id
-from .provider_registry import ProviderRegistry
+from ..clip_engine.metadata import normalize_youtube_video_id
+from ..clip_engine.provider_cache import validate_transcript_payload
+from ..clip_engine.provider_runtime import GenerationContext
 from .segmenter import (
     SegmentMatch,
     TranscriptChunk,
@@ -85,7 +89,7 @@ STRICT_WORD_BOUNDARY_POST_ROLL_SEC = 0.08
 # Latency/cost guardrail for the clip-engine material->reels path: bound the
 # number of paid discover / run.clip (Gemini) calls per generation so a single
 # request can't fan out into an unbounded number of engine invocations.
-MATERIAL_MAX_VIDEOS_PER_CONCEPT = 3   # discover cap per concept
+MATERIAL_MAX_VIDEOS_PER_CONCEPT = 5   # Supadata candidate cap per acquisition pass
 MATERIAL_GEN_MAX_VIDEOS = 12          # hard ceiling on run.clip calls per generation
 
 
@@ -127,85 +131,6 @@ class QueryCandidate:
     anchor_mode: str = ""
     seed_video_id: str = ""
     seed_channel_id: str = ""
-
-
-@dataclass
-class RetrievalStagePlan:
-    name: str
-    queries: list[QueryCandidate]
-    budget: int
-    min_good_results: int
-    max_budget: int | None = None
-
-
-@dataclass
-class TranscriptPrefetchTask:
-    video_ids: tuple[str, ...]
-    executor: ThreadPoolExecutor | None
-    future_by_video_id: dict[str, Any] = field(default_factory=dict)
-    cached_transcripts: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class PlannedQuery:
-    text: str
-    strategy: str
-    stage: str
-    confidence: float
-    source_terms: tuple[str, ...] = ()
-    weight: float = 1.0
-    source_surface: str = "youtube_html"
-    disambiguator: str | None = None
-    normalization_key: str = ""
-    cluster_key: str = ""
-    rationale: str = ""
-    family_key: str = ""
-    source_family: str = ""
-    anchor_mode: str = ""
-    seed_video_id: str = ""
-    seed_channel_id: str = ""
-
-
-@dataclass(frozen=True)
-class ConceptIntentPlan:
-    strategy: str
-    suffix: str
-    rationale: str
-
-
-@dataclass(frozen=True)
-class ConceptSelectionDecision:
-    concept_id: str
-    concept_text: str
-    concept_rank: int
-    selected: bool
-    reason: str
-
-
-@dataclass(frozen=True)
-class ConceptQueryPlan:
-    concept_id: str
-    concept_text: str
-    concept_rank: int
-    reason_selected: str
-    literal_query: PlannedQuery
-    intent_query: PlannedQuery
-    selected_intent_strategy: str
-    disambiguator: str | None
-    normalization_key: str
-    recovery_queries: tuple[PlannedQuery, ...] = ()
-    expansion_queries: tuple[PlannedQuery, ...] = ()
-
-
-@dataclass(frozen=True)
-class QueryPlanningResult:
-    selected_concepts: tuple[ConceptQueryPlan, ...]
-    skipped_concepts: tuple[ConceptSelectionDecision, ...]
-    global_queries: tuple[PlannedQuery, ...]
-    total_selected_concepts: int
-    total_first_pass_queries: int
-    total_recovery_queries_allowed: int
-    query_budget_exhausted: bool
 
 
 RetrievalProfile = Literal["bootstrap", "deep"]
@@ -266,16 +191,8 @@ class _ChainBufferingEmitter:
 
 
 class ReelService:
-    FRONTIER_ROOT_EXACT = "root_exact"
-    FRONTIER_ROOT_COMPANION = "root_companion"
-    FRONTIER_ANCHORED_ADJACENT = "anchored_adjacent"
-    FRONTIER_RECOVERY_GRAPH = "recovery_graph"
-    MINING_STATE_UNMINED = "unmined"
-    MINING_STATE_PARTIALLY_MINED = "partially_mined"
-    MINING_STATE_HIGH_YIELD = "high_yield"
-    MINING_STATE_LOW_YIELD = "low_yield"
-    MINING_STATE_EXHAUSTED = "exhausted"
-    VALID_VIDEO_POOL_MODES = {"short-first", "balanced", "long-form"}
+    _SUBJECT_CORRECTION_CACHE: dict[str, tuple[float, str]] = {}
+    _SUBJECT_CORRECTION_CACHE_TTL_SEC = 24 * 60 * 60
     VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
     DEFAULT_TARGET_CLIP_DURATION_SEC = 55
     MIN_TARGET_CLIP_DURATION_SEC = 15
@@ -284,9 +201,6 @@ class ReelService:
     DEFAULT_RETRIEVAL_PROFILE: RetrievalProfile = "bootstrap"
     BOOTSTRAP_CONCEPT_LIMIT = 4
     BOOTSTRAP_PRIMARY_QUERY_COUNT = 3
-    BOOTSTRAP_RECOVERY_QUERY_COUNT = 2
-    BOOTSTRAP_TRANSCRIPT_CANDIDATES = 6
-    BOOTSTRAP_TRANSCRIPT_CANDIDATES_SERVERLESS = 4
     BOOTSTRAP_WEAK_POOL_MIN_KEPT = 3
     BOOTSTRAP_WEAK_POOL_MIN_TOP_SCORE = 0.24
     BOOTSTRAP_WEAK_POOL_MIN_UNIQUE_CHANNELS = 2
@@ -1272,21 +1186,6 @@ class ReelService:
         "compilation",
         "reaction",
     }
-    # ---- retrieval & transcript parallelism ----
-    # Bumped from 6 to 10. The biggest single wall-clock cost in reel
-    # generation is fetching transcripts from YouTube — each call takes a
-    # few seconds and is almost entirely spent waiting on the network.
-    # With 10 workers instead of 6 we can fetch 60% more transcripts in
-    # the same wall-clock time, and the underlying HTTP session pool
-    # (`SESSION_POOL_SIZE = 48`) is now large enough to support it.
-    #
-    # Bigger numbers (20+) were tested but started hitting intermittent
-    # 429 rate-limit responses from YouTube — 10 is the sweet spot we
-    # landed on.
-    QUERY_RETRIEVAL_WORKERS_FAST = 10
-    QUERY_RETRIEVAL_WORKERS_SLOW = 10
-    TRANSCRIPT_FETCH_WORKERS_FAST = 10
-    TRANSCRIPT_FETCH_WORKERS_SLOW = 10
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
@@ -1296,14 +1195,6 @@ class ReelService:
     NEED_HELP_CONCEPT_STEP = 0.15
     GLOBAL_FEEDBACK_WINDOW = 12
     GLOBAL_FEEDBACK_MIN_ROWS = 3
-    REFILL_STAGE_EXACT_ROOT = 0
-    REFILL_STAGE_ROOT_COMPANION = 1
-    REFILL_STAGE_MULTI_CLIP_STRICT = 2
-    REFILL_STAGE_ANCHORED_ADJACENT = 3
-    REFILL_STAGE_MULTI_CLIP_EXPANDED = 4
-    REFILL_STAGE_RECOVERY_GRAPH = 5
-    MAX_REFILL_STAGE = REFILL_STAGE_RECOVERY_GRAPH
-
     def __init__(self, embedding_service, youtube_service, ingestion_pipeline=None) -> None:
         settings = get_settings()
         self.embedding_service = embedding_service
@@ -1322,12 +1213,8 @@ class ReelService:
         self._strategy_history_cache_max_size = 10_000
         self.llm_available = llm_router.gemini_or_groq_available()
         self.topic_expansion_service = TopicExpansionService()
-        self._provider_registry = ProviderRegistry()
-        # Cache of video_id → provider so bare-id transcript fetches route
-        # correctly once a non-YouTube row has been seen. Populated by
-        # `_register_video_provider` (called from search wiring in
-        # youtube.py:_search_external_fallbacks) and consulted by
-        # `_get_transcript` when the caller only has a video_id string.
+        # Kept only for compatibility with the legacy YouTube planner. The active
+        # clipping pipeline is YouTube-only and never routes to another provider.
         self._provider_by_video_id: dict[str, str] = {}
 
     def learner_progress(self, conn, material_id: str, learner_id: str) -> dict[str, Any]:
@@ -1415,6 +1302,9 @@ class ReelService:
         level_target: float = 0.5,
         learner_id: str = LEGACY_LEARNER_ID,
         feedback_revision: int = 0,
+        page_hint: int = 1,
+        exclusions_fingerprint: str = "",
+        content_fingerprint: str = "",
     ) -> str:
         # Include subject_tag + strict_topic_only in the key because ranked_feed's
         # relevance gates (`_passes_relevance_gate`, strict topic filter, hard-
@@ -1431,6 +1321,9 @@ class ReelService:
             "level_target": round(float(level_target), 3),
             "learner_id": str(learner_id),
             "feedback_revision": int(feedback_revision),
+            "page_hint": max(1, int(page_hint)),
+            "exclusions_fingerprint": str(exclusions_fingerprint),
+            "content_fingerprint": str(content_fingerprint),
             "version": self.RANKED_FEED_CACHE_VERSION,
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -1446,6 +1339,7 @@ class ReelService:
         subject_tag: str | None,
         reel_where: str,
         reel_params: tuple[Any, ...],
+        learner_id: str,
     ) -> str:
         relevant_reels_cte = f"""
             WITH relevant_reels AS (
@@ -1468,9 +1362,11 @@ class ReelService:
                 COALESCE(MAX(COALESCE(NULLIF(f.updated_at, ''), f.created_at)), '') AS feedback_updated_at
             FROM relevant_reels
             LEFT JOIN videos v ON v.id = relevant_reels.video_id
-            LEFT JOIN reel_feedback f ON f.reel_id = relevant_reels.id
+            LEFT JOIN reel_feedback f
+              ON f.reel_id = relevant_reels.id
+             AND f.learner_id = ?
             """,
-            reel_params,
+            (*reel_params, learner_id),
         ) or {}
         transcript_stats = fetch_one(
             conn,
@@ -1479,8 +1375,14 @@ class ReelService:
             SELECT
                 COUNT(*) AS transcript_count,
                 COALESCE(MAX(tc.created_at), '') AS transcript_updated_at
-            FROM transcript_cache tc
-            WHERE tc.video_id IN (SELECT DISTINCT video_id FROM relevant_reels)
+            FROM transcript_artifacts tc
+            WHERE tc.video_id IN (
+                SELECT DISTINCT CASE
+                    WHEN video_id LIKE 'yt:%' THEN SUBSTR(video_id, 4)
+                    ELSE video_id
+                END
+                FROM relevant_reels
+            )
             """,
             reel_params,
         ) or {}
@@ -1529,6 +1431,9 @@ class ReelService:
         level_target: float = 0.5,
         learner_id: str = LEGACY_LEARNER_ID,
         feedback_revision: int = 0,
+        page_hint: int = 1,
+        exclusions_fingerprint: str = "",
+        content_fingerprint: str = "",
     ) -> list[dict[str, Any]] | None:
         cache_key = self._ranked_feed_cache_key(
             material_id=material_id,
@@ -1539,6 +1444,9 @@ class ReelService:
             level_target=level_target,
             learner_id=learner_id,
             feedback_revision=feedback_revision,
+            page_hint=page_hint,
+            exclusions_fingerprint=exclusions_fingerprint,
+            content_fingerprint=content_fingerprint,
         )
         cached = fetch_one(
             conn,
@@ -1569,6 +1477,9 @@ class ReelService:
         level_target: float = 0.5,
         learner_id: str = LEGACY_LEARNER_ID,
         feedback_revision: int = 0,
+        page_hint: int = 1,
+        exclusions_fingerprint: str = "",
+        content_fingerprint: str = "",
     ) -> None:
         timestamp = now_iso()
         upsert(
@@ -1584,6 +1495,9 @@ class ReelService:
                     level_target=level_target,
                     learner_id=learner_id,
                     feedback_revision=feedback_revision,
+                    page_hint=page_hint,
+                    exclusions_fingerprint=exclusions_fingerprint,
+                    content_fingerprint=content_fingerprint,
                 ),
                 "material_id": material_id,
                 "generation_id": generation_id or "",
@@ -1605,7 +1519,6 @@ class ReelService:
         creative_commons_only: bool,
         exclude_video_ids: list[str] | None = None,
         fast_mode: bool = False,
-        video_pool_mode: str = "short-first",
         preferred_video_duration: str = "any",
         target_clip_duration_sec: int = DEFAULT_TARGET_CLIP_DURATION_SEC,
         target_clip_duration_min_sec: int | None = None,
@@ -1616,12 +1529,13 @@ class ReelService:
         exclude_generation_ids: list[str] | None = None,
         min_relevance_threshold: float = 0.0,
         page_hint: int = 1,
-        recovery_stage: int = 0,
         on_reel_created: Callable[[dict[str, Any]], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
-        multi_platform_search: bool = False,
         knowledge_level_override: str | None = None,
         learner_id: str = LEGACY_LEARNER_ID,
+        generation_context: GenerationContext | None = None,
+        max_generation_videos: int | None = None,
+        acquisition_concept_offset: int = 0,
     ) -> list[dict[str, Any]]:
         def raise_if_cancelled() -> None:
             if should_cancel is None:
@@ -1644,11 +1558,6 @@ class ReelService:
         chain_emitter = _ChainBufferingEmitter(on_reel_created) if on_reel_created is not None else None
         self._min_relevance_threshold = max(0.0, min(1.0, float(min_relevance_threshold)))
         safe_page_hint = max(1, int(page_hint or 1))
-        safe_recovery_stage = max(0, int(recovery_stage or 0))
-        allow_adjacent_recovery = self._allow_adjacent_recovery(
-            page_hint=safe_page_hint,
-            recovery_stage=safe_recovery_stage,
-        )
         safe_retrieval_profile = self._normalize_retrieval_profile(retrieval_profile)
         params: tuple[Any, ...] = (material_id,)
         concept_where = "WHERE material_id = ?"
@@ -1679,21 +1588,13 @@ class ReelService:
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
         strict_topic_only = str((material or {}).get("source_type") or "").strip().lower() == "topic"
         if strict_topic_only and subject_tag:
-            # Spellcheck ONCE so the wiki concept expansion and every downstream
-            # search seed off a clean topic ('pychology' → junk concepts like
-            # 'Contemporary Jewry' poisoned whole generations). Persisted so the
-            # read side (ranked_feed anchors, cache fingerprints, concept sync)
-            # sees the same subject the reels were generated for.
+            # Spellcheck once for retrieval, but keep the learner-authored material
+            # and concept records immutable. Corrected forms are persisted as search
+            # terms by `_sync_topic_expansion_concepts` below.
             _corrected = run_pre_ingestion(
                 lambda: self._corrected_subject_tag(subject_tag, should_cancel=should_cancel)
             )
             if _corrected != subject_tag:
-                raise_if_cancelled()
-                execute_modify(
-                    conn,
-                    "UPDATE materials SET subject_tag = ? WHERE id = ?",
-                    (_corrected, material_id),
-                )
                 subject_tag = _corrected
         if not concepts and strict_topic_only and subject_tag:
             concepts = run_pre_ingestion(
@@ -1745,7 +1646,11 @@ class ReelService:
                     )
                 )
         concepts = self._order_concepts(conn, material_id, concepts, learner_id)
-        safe_video_pool_mode = self._normalize_video_pool_mode(video_pool_mode)
+        if generation_context is not None and concepts:
+            # One concept/query family per durable acquisition pass keeps the
+            # fast (3-search) and slow (6-search) initial budgets truthful.
+            concept_index = max(0, int(acquisition_concept_offset)) % len(concepts)
+            concepts = [concepts[concept_index]]
         safe_video_duration_pref = self._normalize_preferred_video_duration(preferred_video_duration)
         clip_min_len, clip_max_len, safe_target_clip_duration = self._resolve_clip_duration_bounds(
             target_clip_duration_sec=target_clip_duration_sec,
@@ -1863,7 +1768,7 @@ class ReelService:
                 )
         generated: list[dict[str, Any]] = []
         if strict_topic_only and subject_tag:
-            if safe_retrieval_profile == "deep":
+            if safe_retrieval_profile == "deep" and generation_context is None:
                 topic_expansion = run_pre_ingestion(
                     lambda: self._deep_topic_expansion(
                         conn,
@@ -1917,6 +1822,13 @@ class ReelService:
             if _root_idx > 0:
                 concepts.insert(0, concepts.pop(_root_idx))
         videos_processed = 0
+        generation_video_limit = max(
+            1,
+            min(
+                MATERIAL_GEN_MAX_VIDEOS,
+                int(max_generation_videos or MATERIAL_GEN_MAX_VIDEOS),
+            ),
+        )
         total_concepts = len(concepts)
 
         for idx, concept in enumerate(concepts):
@@ -1924,14 +1836,14 @@ class ReelService:
             # RAW-PRACTICE: no `len(generated) >= num_reels` break — persistence
             # of engine clips is no longer truncated by num_reels; only the COST
             # guardrail below (MATERIAL_GEN_MAX_VIDEOS) bounds the paid work.
-            if videos_processed >= MATERIAL_GEN_MAX_VIDEOS:
+            if videos_processed >= generation_video_limit:
                 break
             topic = self._concept_topic_query(concept)
             if not topic:
                 continue
             video_budget = min(
                 MATERIAL_MAX_VIDEOS_PER_CONCEPT,
-                MATERIAL_GEN_MAX_VIDEOS - videos_processed,
+                generation_video_limit - videos_processed,
             )
             if video_budget <= 0:
                 break
@@ -1960,12 +1872,17 @@ class ReelService:
                     on_reel_created=(None if dry_run else _stream),
                     dry_run=dry_run,
                     should_cancel=should_cancel,
+                    creative_commons_only=creative_commons_only,
+                    preferred_video_duration=safe_video_duration_pref,
+                    generation_context=generation_context,
                 )
             except _ClipEngineCancellationError as exc:
                 raise GenerationCancelledError("Generation cancelled.") from exc
             except _IngestRateLimitedError:
                 # Process-wide rate limit tripped: subsequent concepts would hit it
                 # too. Stop and surface it so the endpoint maps it to HTTP 429.
+                raise
+            except _ClipEngineProviderError:
                 raise
             except Exception:
                 # One concept's engine failure must not abort the whole generation —
@@ -2008,11 +1925,6 @@ class ReelService:
             preferred_video_duration=safe_video_duration_pref,
         )
 
-    def _normalize_video_pool_mode(self, value: str | None) -> str:
-        if value in self.VALID_VIDEO_POOL_MODES:
-            return str(value)
-        return "short-first"
-
     def _normalize_preferred_video_duration(self, value: str | None) -> str:
         if value in self.VALID_VIDEO_DURATION_PREFS:
             return str(value)
@@ -2031,20 +1943,6 @@ class ReelService:
         except (TypeError, ValueError):
             return self.DEFAULT_TARGET_CLIP_DURATION_SEC
         return max(self.MIN_TARGET_CLIP_DURATION_SEC, min(self.MAX_TARGET_CLIP_DURATION_SEC, parsed))
-
-    def _duration_plan(self, video_pool_mode: str, preferred_video_duration: str) -> tuple[str | None, ...]:
-        if preferred_video_duration == "short":
-            return ("short", "medium", "long", None)
-        if preferred_video_duration == "medium":
-            return ("medium", "long", "short", None)
-        if preferred_video_duration == "long":
-            return ("long", "medium", "short", None)
-        if video_pool_mode == "long-form":
-            return ("long", "medium", "short", None)
-        if video_pool_mode == "balanced":
-            return ("short", "long", "medium", None)
-        return ("short", "long", "medium", None)
-
 
     def _bootstrap_pool_is_weak(
         self,
@@ -2259,33 +2157,6 @@ class ReelService:
             "same_video_similarity": float(same_video),
         }
 
-    def _recovery_stage_allows_related(self, *, page_hint: int, recovery_stage: int) -> bool:
-        return max(1, int(page_hint or 1)) >= 3 and int(recovery_stage or 0) >= self.REFILL_STAGE_ANCHORED_ADJACENT
-
-    def _recovery_stage_allows_channel(self, *, page_hint: int, recovery_stage: int) -> bool:
-        return max(1, int(page_hint or 1)) >= 3 and int(recovery_stage or 0) >= self.REFILL_STAGE_ANCHORED_ADJACENT
-
-    def _recovery_stage_allows_adjacent(self, *, page_hint: int, recovery_stage: int) -> bool:
-        return max(1, int(page_hint or 1)) >= 4 and int(recovery_stage or 0) >= self.REFILL_STAGE_RECOVERY_GRAPH
-
-    def _recovery_stage_allows_source_surface(
-        self,
-        *,
-        source_surface: str,
-        page_hint: int,
-        recovery_stage: int,
-    ) -> bool:
-        surface = str(source_surface or "").strip().lower()
-        if surface in {"", "youtube_api", "youtube_html"}:
-            return True
-        if surface == "youtube_related":
-            return self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage)
-        if surface == "youtube_channel":
-            return self._recovery_stage_allows_channel(page_hint=page_hint, recovery_stage=recovery_stage)
-        if surface in {"local_cache", "duckduckgo_site", "bing_site", "duckduckgo_quoted", "bing_quoted"}:
-            return self._recovery_stage_allows_adjacent(page_hint=page_hint, recovery_stage=recovery_stage)
-        return True
-
     def _video_segment_cap(
         self,
         *,
@@ -2324,9 +2195,6 @@ class ReelService:
         if duration_value > 20 * 60:
             return 10
         return 8
-
-    def _allow_adjacent_recovery(self, *, page_hint: int, recovery_stage: int) -> bool:
-        return self._recovery_stage_allows_adjacent(page_hint=page_hint, recovery_stage=recovery_stage)
 
     def _generation_result_score(self, reel: dict[str, Any]) -> float:
         relevance = reel.get("relevance_score")
@@ -2559,655 +2427,6 @@ class ReelService:
         tokens = re.findall(r"[a-z0-9\+#]+", cleaned)
         return " ".join(tokens)
 
-    def _strategy_from_suffix(self, suffix: str) -> str:
-        mapping = {
-            "animation": "animation",
-            "demo": "demo",
-            "documentary": "documentary",
-            "explained": "explained",
-            "lecture": "lecture",
-            "tutorial": "tutorial",
-            "worked example": "worked_example",
-        }
-        return mapping.get(self._clean_query_text(suffix).lower(), "explained")
-
-    def _source_family_from_strategy(self, strategy: str, query_text: str = "") -> str:
-        normalized_strategy = self._clean_query_text(strategy).lower().replace(" ", "_")
-        normalized_query = self._clean_query_text(query_text).lower()
-        if normalized_strategy in {"lecture", "conference_talk"} or "lecture" in normalized_query:
-            return "lecture"
-        if normalized_strategy == "documentary" or "documentary" in normalized_query:
-            return "documentary"
-        if normalized_strategy in {"tutorial", "worked_example", "demo"}:
-            return "tutorial"
-        if normalized_strategy in {"explained", "animation", "broadened_parent"}:
-            return "explainer"
-        if "conference" in normalized_query or "symposium" in normalized_query:
-            return "conference"
-        if "podcast" in normalized_query or "episode" in normalized_query:
-            return "podcast"
-        if "course" in normalized_query or "lesson" in normalized_query:
-            return "course"
-        if "interview" in normalized_query:
-            return "interview"
-        if "field" in normalized_query or "footage" in normalized_query:
-            return "field_footage"
-        return "other"
-
-    def _frontier_family_for_query(self, *, stage: str, strategy: str, source_surface: str) -> str:
-        normalized_stage = str(stage or "").strip().lower()
-        normalized_strategy = self._clean_query_text(strategy).lower().replace(" ", "_")
-        normalized_surface = str(source_surface or "").strip().lower()
-        if normalized_stage == "high_precision" and normalized_strategy == "literal":
-            return self.FRONTIER_ROOT_EXACT
-        if normalized_stage == "recovery" and normalized_surface in {
-            "youtube_related",
-            "youtube_channel",
-            "local_cache",
-            "duckduckgo_site",
-            "duckduckgo_quoted",
-            "bing_site",
-            "bing_quoted",
-        }:
-            return self.FRONTIER_RECOVERY_GRAPH
-        if normalized_stage == "recovery":
-            return self.FRONTIER_ANCHORED_ADJACENT
-        return self.FRONTIER_ROOT_COMPANION
-
-    def _frontier_anchor_mode(self, family: str) -> str:
-        if family == self.FRONTIER_ROOT_EXACT:
-            return "root_exact"
-        if family == self.FRONTIER_ROOT_COMPANION:
-            return "root_companion"
-        if family == self.FRONTIER_ANCHORED_ADJACENT:
-            return "anchored_adjacent"
-        return "recovery_graph"
-
-    def _frontier_family_key(self, family: str, query_text: str) -> str:
-        normalized_query = self._normalize_query_key(query_text)
-        return f"{family}:{normalized_query}" if normalized_query else family
-
-    def _allowed_frontier_families(self, *, page_hint: int, recovery_stage: int) -> set[str]:
-        allowed = {self.FRONTIER_ROOT_EXACT}
-        if max(1, int(page_hint or 1)) <= 2 or int(recovery_stage or 0) >= self.REFILL_STAGE_ROOT_COMPANION:
-            allowed.add(self.FRONTIER_ROOT_COMPANION)
-        if max(1, int(page_hint or 1)) >= 3 and int(recovery_stage or 0) >= self.REFILL_STAGE_ANCHORED_ADJACENT:
-            allowed.add(self.FRONTIER_ANCHORED_ADJACENT)
-        if max(1, int(page_hint or 1)) >= 4 and int(recovery_stage or 0) >= self.REFILL_STAGE_RECOVERY_GRAPH:
-            allowed.add(self.FRONTIER_RECOVERY_GRAPH)
-        return allowed
-
-    def _request_frontier_entry_id(self, *, material_id: str, request_key: str, family_key: str) -> str:
-        payload = f"{material_id}|{request_key}|{family_key}"
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    def _load_request_frontier_entries(
-        self,
-        conn,
-        *,
-        material_id: str,
-        request_key: str,
-    ) -> dict[str, dict[str, Any]]:
-        if not material_id or not request_key:
-            return {}
-        rows = fetch_all(
-            conn,
-            """
-            SELECT *
-            FROM request_frontier_entries
-            WHERE material_id = ?
-              AND request_key = ?
-            """,
-            (material_id, request_key),
-        )
-        entries: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            family_key = str(row.get("family_key") or "").strip()
-            if family_key:
-                entries[family_key] = dict(row)
-        return entries
-
-    def _upsert_request_frontier_entry(
-        self,
-        conn,
-        *,
-        material_id: str,
-        request_key: str,
-        family_key: str,
-        stage: str,
-        query_text: str,
-        source_family: str,
-        anchor_mode: str,
-        seed_video_id: str = "",
-        seed_channel_id: str = "",
-        stat_deltas: dict[str, float | int] | None = None,
-        exhausted: bool | None = None,
-    ) -> dict[str, Any]:
-        existing = fetch_one(
-            conn,
-            """
-            SELECT *
-            FROM request_frontier_entries
-            WHERE material_id = ?
-              AND request_key = ?
-              AND family_key = ?
-            """,
-            (material_id, request_key, family_key),
-        )
-        now = now_iso()
-        row = {
-            "id": str((existing or {}).get("id") or self._request_frontier_entry_id(
-                material_id=material_id,
-                request_key=request_key,
-                family_key=family_key,
-            )),
-            "material_id": material_id,
-            "request_key": request_key,
-            "family_key": family_key,
-            "stage": stage,
-            "query_text": query_text,
-            "source_family": source_family,
-            "seed_video_id": seed_video_id,
-            "seed_channel_id": seed_channel_id,
-            "anchor_mode": anchor_mode,
-            "runs": int((existing or {}).get("runs") or 0),
-            "new_good_videos": int((existing or {}).get("new_good_videos") or 0),
-            "new_accepted_reels": int((existing or {}).get("new_accepted_reels") or 0),
-            "new_visible_reels": int((existing or {}).get("new_visible_reels") or 0),
-            "duplicate_rate": float((existing or {}).get("duplicate_rate") or 0.0),
-            "off_topic_rate": float((existing or {}).get("off_topic_rate") or 0.0),
-            "last_run_at": (existing or {}).get("last_run_at"),
-            "cooldown_until": (existing or {}).get("cooldown_until"),
-            "exhausted": 1 if bool((existing or {}).get("exhausted")) else 0,
-            "created_at": str((existing or {}).get("created_at") or now),
-            "updated_at": now,
-        }
-        deltas = stat_deltas or {}
-        if deltas:
-            row["runs"] = int(row["runs"]) + int(deltas.get("runs") or 0)
-            row["new_good_videos"] = int(row["new_good_videos"]) + int(deltas.get("new_good_videos") or 0)
-            row["new_accepted_reels"] = int(row["new_accepted_reels"]) + int(deltas.get("new_accepted_reels") or 0)
-            row["new_visible_reels"] = int(row["new_visible_reels"]) + int(deltas.get("new_visible_reels") or 0)
-            if "duplicate_rate" in deltas:
-                row["duplicate_rate"] = float(deltas.get("duplicate_rate") or 0.0)
-            if "off_topic_rate" in deltas:
-                row["off_topic_rate"] = float(deltas.get("off_topic_rate") or 0.0)
-            if int(deltas.get("runs") or 0) > 0:
-                row["last_run_at"] = now
-        if exhausted is not None:
-            row["exhausted"] = 1 if exhausted else 0
-        if (
-            int(row["runs"]) >= 3
-            and int(row["new_visible_reels"]) <= 0
-            and (
-                float(row["duplicate_rate"]) >= 0.7
-                or float(row["off_topic_rate"]) >= 0.4
-            )
-        ):
-            row["exhausted"] = 1
-        upsert(conn, "request_frontier_entries", row)
-        return row
-
-    def _apply_frontier_scheduler(
-        self,
-        conn,
-        *,
-        material_id: str,
-        request_key: str | None,
-        query_candidates: list[QueryCandidate],
-        page_hint: int,
-        recovery_stage: int,
-    ) -> list[QueryCandidate]:
-        if not request_key:
-            return query_candidates
-        frontier_entries = self._load_request_frontier_entries(
-            conn,
-            material_id=material_id,
-            request_key=request_key,
-        )
-        allowed_families = self._allowed_frontier_families(
-            page_hint=page_hint,
-            recovery_stage=recovery_stage,
-        )
-        family_priority = {
-            self.FRONTIER_ROOT_EXACT: 0,
-            self.FRONTIER_ROOT_COMPANION: 1,
-            self.FRONTIER_ANCHORED_ADJACENT: 2,
-            self.FRONTIER_RECOVERY_GRAPH: 3,
-        }
-
-        scheduled: list[QueryCandidate] = []
-        for candidate in query_candidates:
-            family_key = candidate.family_key or self._frontier_family_key(
-                self._frontier_family_for_query(
-                    stage=candidate.stage,
-                    strategy=candidate.strategy,
-                    source_surface=candidate.source_surface,
-                ),
-                candidate.text,
-            )
-            family = family_key.split(":", 1)[0]
-            if family not in allowed_families:
-                continue
-            entry = frontier_entries.get(family_key) or {}
-            if bool(int(entry.get("exhausted") or 0)):
-                continue
-            scheduled.append(
-                QueryCandidate(
-                    text=candidate.text,
-                    strategy=candidate.strategy,
-                    confidence=candidate.confidence,
-                    source_terms=list(candidate.source_terms),
-                    weight=candidate.weight,
-                    stage=candidate.stage,
-                    source_surface=candidate.source_surface,
-                    family_key=family_key,
-                    source_family=candidate.source_family or self._source_family_from_strategy(candidate.strategy, candidate.text),
-                    anchor_mode=candidate.anchor_mode or self._frontier_anchor_mode(family),
-                    seed_video_id=candidate.seed_video_id,
-                    seed_channel_id=candidate.seed_channel_id,
-                )
-            )
-
-        def sort_key(candidate: QueryCandidate) -> tuple[Any, ...]:
-            family_key = candidate.family_key
-            family = family_key.split(":", 1)[0] if family_key else self.FRONTIER_ROOT_COMPANION
-            entry = frontier_entries.get(family_key) or {}
-            runs = int(entry.get("runs") or 0)
-            visible_yield = float(entry.get("new_visible_reels") or 0.0) / max(1, runs)
-            good_video_yield = float(entry.get("new_good_videos") or 0.0) / max(1, runs)
-            duplicate_rate = float(entry.get("duplicate_rate") or 0.0)
-            off_topic_rate = float(entry.get("off_topic_rate") or 0.0)
-            return (
-                family_priority.get(family, 9),
-                0 if runs <= 0 else 1,
-                -visible_yield,
-                -good_video_yield,
-                duplicate_rate,
-                off_topic_rate,
-                -float(candidate.confidence * candidate.weight),
-            )
-
-        scheduled.sort(key=sort_key)
-        return scheduled
-
-
-    def _build_planned_query(
-        self,
-        *,
-        text: str,
-        strategy: str,
-        stage: str,
-        confidence: float,
-        source_terms: list[str],
-        concept_title: str,
-        weight: float = 1.0,
-        source_surface: str = "youtube_html",
-        disambiguator: str | None = None,
-        rationale: str = "",
-        family: str | None = None,
-        source_family: str | None = None,
-        anchor_mode: str | None = None,
-        seed_video_id: str = "",
-        seed_channel_id: str = "",
-    ) -> PlannedQuery:
-        cleaned = self._clean_query_text(text)
-        normalization_key = self._normalize_query_key(cleaned)
-        concept_key = self._normalize_query_key(concept_title)
-        cluster_key = f"{stage}:{strategy}:{concept_key}"
-        if stage == "recovery":
-            cluster_key = f"recovery:{concept_key}:{normalization_key}"
-        elif stage == "broad":
-            cluster_key = f"broad:{strategy}:{concept_key}:{normalization_key}"
-        resolved_family = family or self._frontier_family_for_query(
-            stage=stage,
-            strategy=strategy,
-            source_surface=source_surface,
-        )
-        return PlannedQuery(
-            text=cleaned,
-            strategy=self._clean_query_text(strategy).lower().replace(" ", "_"),
-            stage=stage,
-            confidence=max(0.0, min(1.0, confidence)),
-            source_terms=tuple(self._clean_query_text(term) for term in source_terms if self._clean_query_text(term))[:8],
-            weight=max(0.05, float(weight)),
-            source_surface=source_surface or "youtube_html",
-            disambiguator=self._clean_query_text(disambiguator or "") or None,
-            normalization_key=normalization_key,
-            cluster_key=cluster_key,
-            rationale=self._clean_query_text(rationale),
-            family_key=self._frontier_family_key(resolved_family, cleaned),
-            source_family=source_family or self._source_family_from_strategy(strategy, cleaned),
-            anchor_mode=anchor_mode or self._frontier_anchor_mode(resolved_family),
-            seed_video_id=str(seed_video_id or "").strip(),
-            seed_channel_id=str(seed_channel_id or "").strip(),
-        )
-
-    def _select_concepts(
-        self,
-        concepts: list[dict[str, Any]],
-        *,
-        retrieval_profile: RetrievalProfile,
-        request_need: int,
-        fast_mode: bool,
-        targeted_concept_id: str | None,
-        subject_tag: str | None = None,
-        conn: Any = None,
-        should_cancel: Callable[[], bool] | None = None,
-    ) -> tuple[tuple[dict[str, Any], ...], tuple[ConceptSelectionDecision, ...], bool]:
-        _raise_if_clip_cancelled(should_cancel)
-        if not concepts:
-            return (), (), False
-
-        if targeted_concept_id:
-            concept_limit = 1
-            budget_reason = "targeted concept request"
-        elif self.serverless_mode:
-            concept_limit = min(2, len(concepts))
-            budget_reason = "serverless concept budget"
-        elif retrieval_profile == "bootstrap":
-            bootstrap_cap = self.BOOTSTRAP_CONCEPT_LIMIT
-            if self._topic_breadth_class(
-                subject_tag, conn=conn, should_cancel=should_cancel
-            ) == "curated_broad":
-                bootstrap_cap = max(bootstrap_cap, 6)
-            concept_limit = max(1, min(bootstrap_cap, request_need + (1 if request_need <= 2 else 0)))
-            budget_reason = f"bootstrap concept budget {concept_limit} for request need {request_need}"
-        else:
-            deep_cap = 4 if fast_mode else 8
-            concept_limit = max(2, min(deep_cap, request_need + (1 if fast_mode else 3)))
-            budget_reason = f"deep concept budget {concept_limit} for request need {request_need}"
-
-        selected: list[dict[str, Any]] = []
-        decisions: list[ConceptSelectionDecision] = []
-        for rank, concept in enumerate(concepts, start=1):
-            concept_id = str(concept.get("id") or "")
-            concept_title = self._clean_query_text(str(concept.get("title") or ""))
-            is_selected = rank <= concept_limit
-            reason = (
-                f"ordered concept rank {rank}; selected within {budget_reason}"
-                if is_selected
-                else f"ordered concept rank {rank}; skipped because {budget_reason} was exhausted"
-            )
-            decisions.append(
-                ConceptSelectionDecision(
-                    concept_id=concept_id,
-                    concept_text=concept_title,
-                    concept_rank=rank,
-                    selected=is_selected,
-                    reason=reason,
-                )
-            )
-            if is_selected:
-                selected.append(concept)
-
-        return tuple(selected), tuple(decisions), len(concepts) > concept_limit
-
-    def _extract_programming_language_hint(self, terms: list[str]) -> str | None:
-        for raw in terms:
-            cleaned = self._clean_query_text(raw)
-            lowered = cleaned.lower()
-            if lowered in self.PROGRAMMING_LANGUAGE_HINTS:
-                return cleaned
-            for token in re.findall(r"[A-Za-z0-9\+#]+", lowered):
-                if token in self.PROGRAMMING_LANGUAGE_HINTS:
-                    return token.upper() if token == "sql" else token
-        return None
-
-    def _choose_disambiguator(
-        self,
-        *,
-        title: str,
-        keywords: list[str],
-        context_terms: list[str],
-        subject_tag: str | None,
-    ) -> str | None:
-        title_key = self._normalize_query_key(title)
-        title_tokens = normalize_terms([title])
-        language_hint = self._extract_programming_language_hint([*keywords, *context_terms, str(subject_tag or "")])
-        subject = self._clean_query_text(subject_tag or "")
-        subject_key = self._normalize_query_key(subject)
-        opaque_root_topic = bool(
-            subject_key
-            and subject_key == title_key
-            and self.topic_expansion_service._is_opaque_single_token_topic(
-                subject,
-                canonical_topic=subject,
-                likely_language=self.topic_expansion_service._looks_like_language_topic(subject),
-            )
-        )
-
-        # Exact multi-word subject roots should keep their literal phrase intact.
-        # Over-disambiguating these produces malformed queries like
-        # "python Python Programming" or "d day World War Ii".
-        if subject_key and subject_key == title_key:
-            if len(title_tokens) >= 2:
-                return None
-            if (
-                not opaque_root_topic
-                and language_hint is None
-                and not title_tokens.intersection(self.AMBIGUOUS_CONCEPT_TOKENS)
-            ):
-                return None
-
-        candidates: list[tuple[float, str]] = []
-        if language_hint:
-            candidates.append((3.6, language_hint))
-        if subject and self._normalize_query_key(subject) != title_key:
-            candidates.append((3.1, subject))
-        for term in [*keywords[:4], *context_terms[:4]]:
-            cleaned = self._clean_query_text(term)
-            if not cleaned:
-                continue
-            normalized = self._normalize_query_key(cleaned)
-            if not normalized or normalized == title_key:
-                continue
-            if len(title_tokens) > 1 and set(normalized.split()).issubset(title_tokens):
-                continue
-            score = 2.2 if " " in cleaned else 1.7
-            if normalized in self.PROGRAMMING_LANGUAGE_HINTS:
-                score += 1.0
-            if len(title_tokens) == 1:
-                if title_key in normalized:
-                    score -= 0.7
-                elif self.topic_expansion_service._allows_unanchored_opaque_search_term(cleaned):
-                    score += 0.6
-            candidates.append((score, cleaned))
-
-        if not candidates:
-            return None
-
-        needs_disambiguation = (
-            len(title_tokens) <= 3
-            or bool(title_tokens.intersection(self.AMBIGUOUS_CONCEPT_TOKENS))
-            or language_hint is not None
-        )
-        if not needs_disambiguation:
-            return None
-
-        candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1].lower()))
-        return candidates[0][1]
-
-    def _classify_concept_intent(
-        self,
-        *,
-        title: str,
-        keywords: list[str],
-        summary: str,
-        subject_tag: str | None,
-        context_terms: list[str],
-        video_pool_mode: str,
-        fast_mode: bool = True,
-        should_cancel: Callable[[], bool] | None = None,
-    ) -> ConceptIntentPlan:
-        _raise_if_clip_cancelled(should_cancel)
-        # Fix H: Use LLM for intent classification in slow mode
-        if not fast_mode and not self.serverless_mode:
-            llm_plan = self._classify_intent_via_llm(
-                title=title, keywords=keywords, summary=summary,
-                subject_tag=subject_tag, video_pool_mode=video_pool_mode,
-                should_cancel=should_cancel,
-            )
-            if llm_plan is not None:
-                return llm_plan
-
-        tokens = normalize_terms([title, summary, subject_tag or "", *keywords, *context_terms])
-        has_problem_solving = bool(tokens.intersection(self.PROBLEM_SOLVING_TOKENS))
-        has_programming = bool(tokens.intersection(self.PROGRAMMING_TOKENS))
-        has_process_visual = bool(tokens.intersection(self.PROCESS_VISUAL_TOKENS))
-        has_history = bool(tokens.intersection(self.HISTORY_HUMANITIES_TOKENS))
-        has_math_physics = bool(tokens.intersection(self.MATH_PHYSICS_TOKENS))
-
-        if has_programming:
-            family = "programming"
-            suffixes = ("tutorial", "demo", "explained") if video_pool_mode != "long-form" else ("tutorial", "lecture", "demo")
-            rationale = "programming concepts retrieve best with tutorial-led phrasing"
-        elif has_problem_solving or has_math_physics:
-            family = "problem_solving"
-            suffixes = (
-                ("worked example", "tutorial", "lecture")
-                if video_pool_mode != "long-form"
-                else ("tutorial", "worked example", "lecture")
-            )
-            rationale = "math and problem-solving concepts favor worked examples or tutorial walkthroughs"
-        elif has_process_visual:
-            family = "process_visual"
-            suffixes = (
-                ("animation", "explained", "tutorial")
-                if video_pool_mode != "long-form"
-                else ("explained", "animation", "lecture")
-            )
-            rationale = "process-heavy science concepts benefit from animation or explanation phrasing"
-        elif has_history:
-            family = "history_humanities"
-            suffixes = (
-                ("explained", "documentary", "lecture")
-                if video_pool_mode != "long-form"
-                else ("documentary", "lecture", "explained")
-            )
-            rationale = "history and humanities concepts need explanatory or documentary framing"
-        else:
-            family = "long_form_general" if video_pool_mode == "long-form" else "general"
-            suffixes = self.INTENT_SUFFIX_PRIORITY[family]
-            rationale = "default to a single explanatory query when domain cues are limited"
-
-        suffix = suffixes[0]
-        return ConceptIntentPlan(
-            strategy=self._strategy_from_suffix(suffix),
-            suffix=suffix,
-            rationale=f"{family}: {rationale}",
-        )
-
-    def _classify_intent_via_llm(
-        self,
-        *,
-        title: str,
-        keywords: list[str],
-        summary: str,
-        subject_tag: str | None,
-        video_pool_mode: str,
-        should_cancel: Callable[[], bool] | None = None,
-    ) -> ConceptIntentPlan | None:
-        """Fix H: LLM-powered intent classification for slow mode."""
-        _raise_if_clip_cancelled(should_cancel)
-        cache_key = f"llm_intent:{title}|{subject_tag or ''}|{video_pool_mode}"
-        with self._strategy_history_cache_lock:
-            cached = self._strategy_history_cache.get(cache_key)
-        if cached is not None:
-            return cached if cached != "_none_" else None
-        if not self.llm_available:
-            return None
-        try:
-            valid_types = ["tutorial", "explained", "lecture", "worked example", "animation", "documentary", "demo"]
-            prompt = (
-                f"Given the study concept '{title}' (keywords: {', '.join(keywords[:5])}, "
-                f"subject: {subject_tag or 'general'}, mode: {video_pool_mode}), "
-                f"what type of YouTube video would best teach this? "
-                f"Choose exactly one: {', '.join(valid_types)}. "
-                f"Reply with just the type name."
-            )
-            answer = (llm_router.chat_completion(
-                system="You pick the best YouTube content format for a study concept.",
-                user=prompt,
-                temperature=0.2,
-                max_tokens=20,
-                should_cancel=should_cancel,
-            ) or "").strip().lower()
-            _raise_if_clip_cancelled(should_cancel)
-            for vt in valid_types:
-                if vt in answer:
-                    result = ConceptIntentPlan(
-                        strategy=self._strategy_from_suffix(vt),
-                        suffix=vt,
-                        rationale=f"llm_intent: LLM selected '{vt}' for concept '{title}'",
-                    )
-                    with self._strategy_history_cache_lock:
-                        _raise_if_clip_cancelled(should_cancel)
-                        self._evict_strategy_cache_if_full()
-                        self._strategy_history_cache[cache_key] = result
-                    return result
-        except _ClipEngineCancellationError:
-            raise
-        except Exception:
-            pass
-        with self._strategy_history_cache_lock:
-            _raise_if_clip_cancelled(should_cancel)
-            self._evict_strategy_cache_if_full()
-            self._strategy_history_cache[cache_key] = "_none_"
-        return None
-
-    def _evict_strategy_cache_if_full(self) -> None:
-        """Evict oldest half of cache entries when max size is reached. Must be called under lock."""
-        if len(self._strategy_history_cache) >= self._strategy_history_cache_max_size:
-            keys = list(self._strategy_history_cache.keys())
-            for key in keys[: len(keys) // 2]:
-                del self._strategy_history_cache[key]
-
-    def _build_literal_query(
-        self,
-        *,
-        title: str,
-        keywords: list[str],
-        disambiguator: str | None,
-        subject_tag: str | None = None,
-    ) -> str:
-        clean_title = self._clean_query_text(title)
-        if not clean_title:
-            return ""
-        parts: list[str] = []
-        clean_disambiguator = self._clean_query_text(disambiguator or "")
-        clean_title_tokens = set(self._normalize_query_key(clean_title).split())
-        clean_disambiguator_tokens = set(self._normalize_query_key(clean_disambiguator).split())
-        if (
-            clean_disambiguator
-            and self._normalize_query_key(clean_disambiguator) != self._normalize_query_key(clean_title)
-            and not (
-                len(clean_title_tokens) > 1
-                and clean_disambiguator_tokens
-                and clean_disambiguator_tokens.issubset(clean_title_tokens)
-            )
-        ):
-            parts.append(clean_disambiguator)
-        parts.append(clean_title)
-        exact_subject_root = (
-            self._normalize_query_key(clean_title)
-            and self._normalize_query_key(clean_title) == self._normalize_query_key(subject_tag or "")
-        )
-        if not clean_disambiguator and len(normalize_terms([clean_title])) <= 1 and not exact_subject_root:
-            for term in keywords[:2]:
-                cleaned = self._clean_query_text(term)
-                if not cleaned:
-                    continue
-                if self._normalize_query_key(cleaned) == self._normalize_query_key(clean_title):
-                    continue
-                parts.append(cleaned)
-                break
-        return self._clean_query_text(" ".join(parts))
-
-    # Process-wide correction cache: can-generate probes and refinements re-run
-    # generate_reels for the same subject many times; correct each subject once.
-    _SUBJECT_CORRECTION_CACHE: dict[str, str] = {}
-
     def _corrected_subject_tag(
         self,
         subject_tag: str,
@@ -3226,7 +2445,10 @@ class ReelService:
         _raise_if_clip_cancelled(should_cancel)
         cached = self._SUBJECT_CORRECTION_CACHE.get(cache_key)
         if cached is not None:
-            return cached
+            cached_at, cached_value = cached
+            if time.time() - cached_at <= self._SUBJECT_CORRECTION_CACHE_TTL_SEC:
+                return cached_value
+            self._SUBJECT_CORRECTION_CACHE.pop(cache_key, None)
         try:
             expansion = (
                 _clip_engine_expand.expand_query(
@@ -3253,7 +2475,7 @@ class ReelService:
                 result = corrected
         _raise_if_clip_cancelled(should_cancel)
         if len(self._SUBJECT_CORRECTION_CACHE) < 512:
-            self._SUBJECT_CORRECTION_CACHE[cache_key] = result
+            self._SUBJECT_CORRECTION_CACHE[cache_key] = (time.time(), result)
         return result
 
     def _concept_topic_query(self, concept_row: dict) -> str:
@@ -3264,49 +2486,14 @@ class ReelService:
         disambiguation now, and appended `keywords_json` terms polluted the
         seed query with unrelated wiki noise.
         """
-        title = str(concept_row.get("title") or "")
-        return self._clean_query_text(title)
-
-    def _build_intent_query(
-        self,
-        *,
-        literal_query: str,
-        intent_plan: ConceptIntentPlan,
-    ) -> str:
-        base = self._clean_query_text(literal_query)
-        suffix = self._clean_query_text(intent_plan.suffix)
-        if not base:
-            return ""
-        if suffix and self._normalize_query_key(base).endswith(self._normalize_query_key(suffix)):
-            return base
-        return self._clean_query_text(f"{base} {suffix}")
-
-    def _dedupe_queries(
-        self,
-        queries: list[PlannedQuery],
-        *,
-        limit: int | None = None,
-    ) -> list[PlannedQuery]:
-        ordered = sorted(
-            queries,
-            key=lambda item: (item.stage != "high_precision", -(item.confidence * item.weight), len(item.text)),
-        )
-        seen_normalized: set[str] = set()
-        seen_clusters: set[str] = set()
-        deduped: list[PlannedQuery] = []
-        for item in ordered:
-            if not item.text:
-                continue
-            normalization_key = item.normalization_key or self._normalize_query_key(item.text)
-            cluster_key = item.cluster_key or normalization_key
-            if normalization_key in seen_normalized or cluster_key in seen_clusters:
-                continue
-            seen_normalized.add(normalization_key)
-            seen_clusters.add(cluster_key)
-            deduped.append(item)
-            if limit and len(deduped) >= limit:
-                break
-        return deduped
+        title = self._clean_query_text(str(concept_row.get("title") or ""))
+        search_terms = concept_row.get("_search_terms")
+        if isinstance(search_terms, list):
+            for raw_term in search_terms:
+                term = self._clean_query_text(str(raw_term or ""))
+                if term:
+                    return term
+        return title
 
     def _deep_query_expansion_limit(self, *, fast_mode: bool, request_need: int) -> int:
         safe_need = max(1, int(request_need))
@@ -3626,1098 +2813,6 @@ class ReelService:
                 continue
             return cleaned
         return None
-
-    def _maybe_expand_queries(
-        self,
-        *,
-        concept_title: str,
-        keywords: list[str],
-        summary: str,
-        context_terms: list[str],
-        literal_query: str,
-        intent_plan: ConceptIntentPlan,
-        retrieval_profile: RetrievalProfile,
-        fast_mode: bool,
-        subject_tag: str | None,
-        disambiguator: str | None,
-        request_need: int,
-        allow_bootstrap_subtopic_expansion: bool,
-        should_cancel: Callable[[], bool] | None = None,
-    ) -> tuple[PlannedQuery, ...]:
-        _raise_if_clip_cancelled(should_cancel)
-        if retrieval_profile == "bootstrap":
-            bootstrap_expansions: list[PlannedQuery] = []
-            broad_topic_seed = self._normalize_query_key(concept_title) in {
-                self._normalize_query_key(topic) for topic in self.BROAD_TOPIC_SUBTOPICS
-            }
-            prefer_subtopic_bootstrap = self._is_vague_concept(
-                title=concept_title,
-                keywords=keywords,
-                summary=summary,
-            ) or broad_topic_seed
-            if prefer_subtopic_bootstrap and allow_bootstrap_subtopic_expansion:
-                related_terms = self._related_query_terms(
-                    concept_title=concept_title,
-                    keywords=keywords,
-                    summary=summary,
-                    context_terms=context_terms,
-                    fast_mode=fast_mode,
-                    request_need=max(3, request_need),
-                    subject_tag=subject_tag,
-                    should_cancel=should_cancel,
-                )
-                for index, related_term in enumerate(related_terms[:1]):
-                    bootstrap_expansions.append(
-                        self._build_planned_query(
-                            text=f"{literal_query} {related_term}",
-                            strategy="literal",
-                            stage="broad",
-                            confidence=max(0.8, 0.88 - index * 0.04),
-                            source_terms=[concept_title, related_term],
-                            concept_title=concept_title,
-                            weight=max(0.78, 0.9 - index * 0.05),
-                            rationale="bootstrap uses one anchored subtopic or synonym expansion before deeper refinement",
-                        )
-                    )
-            elif subject_tag:
-                standalone_alias = self._bootstrap_standalone_alias_term(
-                    concept_title=concept_title,
-                    keywords=keywords,
-                )
-                if standalone_alias:
-                    bootstrap_expansions.append(
-                        self._build_planned_query(
-                            text=f"{standalone_alias} {intent_plan.suffix}",
-                            strategy=intent_plan.strategy,
-                            stage="high_precision",
-                            confidence=0.84,
-                            source_terms=[concept_title, standalone_alias, intent_plan.suffix],
-                            concept_title=concept_title,
-                            weight=0.84,
-                            rationale="bootstrap uses one standalone alias query when the topic name itself is too niche",
-                        )
-                    )
-
-            alternate_suffixes = ("explained", "tutorial")
-            if intent_plan.strategy == "tutorial":
-                alternate_suffixes = ("explained",)
-            elif intent_plan.strategy == "explained":
-                alternate_suffixes = ("tutorial",)
-            for suffix in alternate_suffixes[:1]:
-                strategy = self._strategy_from_suffix(suffix)
-                if strategy == intent_plan.strategy:
-                    continue
-                bootstrap_expansions.append(
-                    self._build_planned_query(
-                        text=f"{literal_query} {suffix}",
-                        strategy=strategy,
-                        stage="broad",
-                        confidence=0.76,
-                        source_terms=[concept_title, suffix],
-                        concept_title=concept_title,
-                        weight=0.78,
-                        rationale="bootstrap allows one alternate pedagogical angle for broader coverage",
-                    )
-                )
-
-            # Niche concept broadening: if the concept is NOT vague and NOT a broad topic,
-            # use LLM to find a broader parent topic and add it as an hp-stage query
-            # (broad_budget=0 in bootstrap, so only hp-stage queries execute).
-            if not prefer_subtopic_bootstrap and not self.serverless_mode:
-                broadened = self._broaden_concept_queries_via_llm(
-                    concept_title=concept_title,
-                    keywords=keywords,
-                    summary=summary,
-                    subject_tag=subject_tag,
-                    should_cancel=should_cancel,
-                )
-                if broadened:
-                    best_parent = broadened[0]
-                    bootstrap_expansions.append(
-                        self._build_planned_query(
-                            text=best_parent,
-                            strategy="broadened_parent",
-                            stage="high_precision",
-                            confidence=0.82,
-                            source_terms=[concept_title, best_parent],
-                            concept_title=concept_title,
-                            weight=0.80,
-                            rationale="niche concept broadened via LLM to a parent topic likely to have YouTube coverage",
-                        )
-                    )
-
-            return tuple(self._dedupe_queries(bootstrap_expansions, limit=2))
-
-        expansions: list[PlannedQuery] = []
-        literal_key = self._normalize_query_key(literal_query)
-        literal_tokens = set(literal_key.split())
-        related_terms = self._related_query_terms(
-            concept_title=concept_title,
-            keywords=keywords,
-            summary=summary,
-            context_terms=context_terms,
-            fast_mode=fast_mode,
-            request_need=request_need,
-            subject_tag=subject_tag,
-            should_cancel=should_cancel,
-        )
-        for index, related_term in enumerate(related_terms):
-            if set(self._normalize_query_key(related_term).split()).issubset(literal_tokens):
-                continue
-            expansions.append(
-                self._build_planned_query(
-                    text=f"{literal_query} {related_term}",
-                    strategy="literal",
-                    stage="broad",
-                    confidence=max(0.72, 0.9 - index * 0.04),
-                    source_terms=[concept_title, related_term],
-                    concept_title=concept_title,
-                    weight=max(0.66, 0.92 - index * 0.05),
-                    rationale="deep profile broadens with anchored keyword and subtopic terms from concept metadata",
-                )
-            )
-
-        alias_prefix_parts: list[str] = []
-        for part in [disambiguator or "", subject_tag or ""]:
-            cleaned = self._clean_query_text(part)
-            if not cleaned or cleaned in alias_prefix_parts:
-                continue
-            alias_prefix_parts.append(cleaned)
-        alias_prefix = self._clean_query_text(" ".join(alias_prefix_parts))
-        alias_terms = self._expand_controlled_synonyms(
-            [concept_title, *keywords],
-            fast_mode=fast_mode,
-            should_cancel=should_cancel,
-        )
-        for index, alias_term in enumerate(alias_terms[:2]):
-            alias_key = self._normalize_query_key(alias_term)
-            if not alias_key or set(alias_key.split()).issubset(literal_tokens):
-                continue
-            alias_base = self._clean_query_text(" ".join(part for part in [alias_prefix, alias_term] if part))
-            if not alias_base:
-                continue
-            expansions.append(
-                self._build_planned_query(
-                    text=f"{alias_base} {intent_plan.suffix}",
-                    strategy=intent_plan.strategy,
-                    stage="broad",
-                    confidence=max(0.7, 0.82 - index * 0.05),
-                    source_terms=[concept_title, alias_term, intent_plan.suffix],
-                    concept_title=concept_title,
-                    weight=max(0.62, 0.8 - index * 0.06),
-                    disambiguator=disambiguator,
-                    rationale="deep profile uses controlled aliases only after exact concept queries are exhausted",
-                )
-            )
-
-        alternate_suffixes = self.INTENT_SUFFIX_PRIORITY.get("general", ())
-        if intent_plan.strategy == "tutorial":
-            alternate_suffixes = ("explained", "lecture")
-        elif intent_plan.strategy == "worked_example":
-            alternate_suffixes = ("tutorial", "explained")
-        elif intent_plan.strategy == "animation":
-            alternate_suffixes = ("explained", "tutorial")
-        elif intent_plan.strategy == "documentary":
-            alternate_suffixes = ("explained", "lecture")
-        elif intent_plan.strategy == "lecture":
-            alternate_suffixes = ("tutorial", "explained")
-
-        for suffix in alternate_suffixes:
-            strategy = self._strategy_from_suffix(suffix)
-            if strategy == intent_plan.strategy:
-                continue
-            expansions.append(
-                self._build_planned_query(
-                    text=f"{literal_query} {suffix}",
-                    strategy=strategy,
-                    stage="broad",
-                    confidence=0.8 if not fast_mode else 0.76,
-                    source_terms=[concept_title, suffix],
-                    concept_title=concept_title,
-                    weight=0.82,
-                    rationale="deep profile allows one alternate pedagogical angle after the primary intent query",
-                )
-            )
-            if len(expansions) >= self._deep_query_expansion_limit(fast_mode=fast_mode, request_need=request_need):
-                break
-
-        capped = self._deep_query_expansion_limit(fast_mode=fast_mode, request_need=request_need)
-        return tuple(self._dedupe_queries(expansions, limit=capped))
-
-    def _plan_recovery_queries(
-        self,
-        *,
-        concept_title: str,
-        keywords: list[str],
-        summary: str,
-        subject_tag: str | None,
-        context_terms: list[str],
-        retrieval_profile: RetrievalProfile,
-    ) -> list[PlannedQuery]:
-        disambiguator = self._choose_disambiguator(
-            title=concept_title,
-            keywords=keywords,
-            context_terms=context_terms,
-            subject_tag=subject_tag,
-        )
-        recovery_terms = self._decompose_concept_for_recovery(concept_title, summary, keywords)
-        queries: list[PlannedQuery] = []
-        limit = self.BOOTSTRAP_RECOVERY_QUERY_COUNT if retrieval_profile == "bootstrap" else 2
-        for recovery_term in recovery_terms:
-            cleaned_term = self._clean_query_text(recovery_term)
-            if not cleaned_term:
-                continue
-            base = self._clean_query_text(" ".join(part for part in [disambiguator or "", cleaned_term] if part))
-            if not base:
-                continue
-            if self._normalize_query_key(base) == self._normalize_query_key(concept_title):
-                base = self._clean_query_text(f"{base} explained")
-            queries.append(
-                self._build_planned_query(
-                    text=base,
-                    strategy="recovery_adjacent",
-                    stage="recovery",
-                    confidence=0.64,
-                    source_terms=[concept_title, cleaned_term],
-                    concept_title=concept_title,
-                    weight=0.68,
-                    disambiguator=disambiguator,
-                    rationale="recovery broadens carefully with one adjacent term only after a weak primary pool",
-                )
-            )
-            if len(queries) >= limit:
-                break
-        return self._dedupe_queries(queries, limit=limit)
-
-
-    def _plan_query_set_for_concepts(
-        self,
-        *,
-        concepts: list[dict[str, Any]],
-        subject_tag: str | None,
-        material_context_terms: list[str],
-        retrieval_profile: RetrievalProfile,
-        fast_mode: bool,
-        video_pool_mode: str,
-        preferred_video_duration: str,
-        request_need: int,
-        targeted_concept_id: str | None,
-        allow_bootstrap_subtopic_expansion: bool = True,
-        conn: Any = None,
-        should_cancel: Callable[[], bool] | None = None,
-    ) -> QueryPlanningResult:
-        _raise_if_clip_cancelled(should_cancel)
-        # preferred_video_duration is now used below for pool-mode query hints.
-        selected_concepts, selection_decisions, exhausted = self._select_concepts(
-            concepts,
-            retrieval_profile=retrieval_profile,
-            request_need=max(1, request_need),
-            fast_mode=fast_mode,
-            targeted_concept_id=targeted_concept_id,
-            subject_tag=subject_tag,
-            conn=conn,
-            should_cancel=should_cancel,
-        )
-        selected_ids = {str(concept.get("id") or "") for concept in selected_concepts}
-        selected_plans: list[ConceptQueryPlan] = []
-        global_queries: list[PlannedQuery] = []
-
-        for decision in selection_decisions:
-            _raise_if_clip_cancelled(should_cancel)
-            if not decision.selected:
-                continue
-            concept = next((item for item in selected_concepts if str(item.get("id") or "") == decision.concept_id), None)
-            if concept is None:
-                continue
-            concept_title = self._clean_query_text(str(concept.get("title") or ""))
-            concept_keywords = self._parse_keywords_json(concept.get("keywords_json"))
-            concept_summary = str(concept.get("summary") or "")
-            concept_terms = [concept_title, *concept_keywords, concept_summary]
-            context_terms = self._context_terms_for_concept(concept_terms, material_context_terms)
-            disambiguator = self._choose_disambiguator(
-                title=concept_title,
-                keywords=concept_keywords,
-                context_terms=context_terms,
-                subject_tag=subject_tag,
-            )
-            intent_plan = self._classify_concept_intent(
-                title=concept_title,
-                keywords=concept_keywords,
-                summary=concept_summary,
-                subject_tag=subject_tag,
-                context_terms=context_terms,
-                video_pool_mode=video_pool_mode,
-                fast_mode=fast_mode,
-                should_cancel=should_cancel,
-            )
-            literal_query_text = self._build_literal_query(
-                title=concept_title,
-                keywords=concept_keywords,
-                disambiguator=disambiguator,
-                subject_tag=subject_tag,
-            )
-            literal_query = self._build_planned_query(
-                text=literal_query_text,
-                strategy="literal",
-                stage="high_precision",
-                confidence=0.96,
-                source_terms=[concept_title, disambiguator or ""],
-                concept_title=concept_title,
-                weight=1.0,
-                disambiguator=disambiguator,
-                rationale="literal query anchors the exact concept with at most one high-value disambiguator",
-            )
-            intent_query_text = self._build_intent_query(
-                literal_query=literal_query.text,
-                intent_plan=intent_plan,
-            )
-            # Fix S: videoPoolMode influences query phrasing
-            if video_pool_mode == "long-form" and "lecture" not in intent_query_text.lower():
-                intent_query_text = self._clean_query_text(f"{intent_query_text} full lecture")
-            elif video_pool_mode == "short-first" and preferred_video_duration == "short":
-                intent_query_text = self._clean_query_text(f"{intent_query_text} shorts")
-            intent_query = self._build_planned_query(
-                text=intent_query_text,
-                strategy=intent_plan.strategy,
-                stage="high_precision",
-                confidence=0.9,
-                source_terms=[concept_title, intent_plan.suffix, disambiguator or ""],
-                concept_title=concept_title,
-                weight=0.96,
-                disambiguator=disambiguator,
-                rationale=intent_plan.rationale,
-            )
-            expansion_queries = self._maybe_expand_queries(
-                concept_title=concept_title,
-                keywords=concept_keywords,
-                summary=concept_summary,
-                context_terms=context_terms,
-                literal_query=literal_query.text,
-                intent_plan=intent_plan,
-                retrieval_profile=retrieval_profile,
-                fast_mode=fast_mode,
-                subject_tag=subject_tag,
-                disambiguator=disambiguator,
-                request_need=request_need,
-                allow_bootstrap_subtopic_expansion=allow_bootstrap_subtopic_expansion,
-                should_cancel=should_cancel,
-            )
-            recovery_queries = self._plan_recovery_queries(
-                concept_title=concept_title,
-                keywords=concept_keywords,
-                summary=concept_summary,
-                subject_tag=subject_tag,
-                context_terms=context_terms,
-                retrieval_profile=retrieval_profile,
-            )
-
-            first_pass_queries = self._dedupe_queries(
-                [literal_query, intent_query, *expansion_queries],
-                limit=self.BOOTSTRAP_PRIMARY_QUERY_COUNT if retrieval_profile == "bootstrap" else None,
-            )
-            literal_query = first_pass_queries[0]
-            intent_query = first_pass_queries[1] if len(first_pass_queries) > 1 else intent_query
-            expansion_queries = tuple(query for query in first_pass_queries[2:])
-
-            concept_plan = ConceptQueryPlan(
-                concept_id=decision.concept_id,
-                concept_text=concept_title,
-                concept_rank=decision.concept_rank,
-                reason_selected=decision.reason,
-                literal_query=literal_query,
-                intent_query=intent_query,
-                selected_intent_strategy=intent_plan.strategy,
-                disambiguator=disambiguator,
-                normalization_key=self._normalize_query_key(concept_title),
-                recovery_queries=tuple(recovery_queries),
-                expansion_queries=expansion_queries,
-            )
-            selected_plans.append(concept_plan)
-            global_queries.extend(first_pass_queries)
-
-        skipped = tuple(decision for decision in selection_decisions if not decision.selected and decision.concept_id not in selected_ids)
-        deduped_global = tuple(self._dedupe_queries(global_queries))
-        return QueryPlanningResult(
-            selected_concepts=tuple(selected_plans),
-            skipped_concepts=skipped,
-            global_queries=deduped_global,
-            total_selected_concepts=len(selected_plans),
-            total_first_pass_queries=len(deduped_global),
-            total_recovery_queries_allowed=sum(len(plan.recovery_queries) for plan in selected_plans),
-            query_budget_exhausted=exhausted,
-        )
-
-    def _build_query_candidates(
-        self,
-        title: str,
-        keywords: list[str],
-        summary: str,
-        subject_tag: str | None,
-        context_terms: list[str],
-        visual_spec: dict[str, list[str]],
-        fast_mode: bool,
-        retrieval_profile: RetrievalProfile,
-        should_cancel: Callable[[], bool] | None = None,
-    ) -> list[QueryCandidate]:
-        del visual_spec  # Query planning is now concept- and settings-driven rather than visual-template-driven.
-        clean_title = self._clean_query_text(title)
-        if not clean_title:
-            return []
-
-        concept = {
-            "id": "single-concept",
-            "title": clean_title,
-            "keywords_json": dumps_json([self._clean_query_text(item) for item in keywords if self._clean_query_text(item)]),
-            "summary": summary,
-        }
-        plan = self._plan_query_set_for_concepts(
-            concepts=[concept],
-            subject_tag=subject_tag,
-            material_context_terms=[self._clean_query_text(item) for item in context_terms if self._clean_query_text(item)],
-            retrieval_profile=retrieval_profile,
-            fast_mode=fast_mode,
-            video_pool_mode="short-first",
-            preferred_video_duration="any",
-            request_need=1,
-            targeted_concept_id="single-concept",
-            should_cancel=should_cancel,
-        )
-        if not plan.selected_concepts:
-            return []
-        concept_plan = plan.selected_concepts[0]
-        queries = [concept_plan.literal_query, concept_plan.intent_query, *concept_plan.expansion_queries]
-        return [
-            QueryCandidate(
-                text=query.text,
-                strategy=query.strategy,
-                confidence=query.confidence,
-                source_terms=list(query.source_terms),
-                weight=query.weight,
-                stage=query.stage,
-                source_surface=query.source_surface,
-                family_key=query.family_key,
-                source_family=query.source_family,
-                anchor_mode=query.anchor_mode,
-                seed_video_id=query.seed_video_id,
-                seed_channel_id=query.seed_channel_id,
-            )
-            for query in queries
-        ]
-
-    def _build_bootstrap_primary_query(
-        self,
-        *,
-        title: str,
-        keywords: list[str],
-        context_terms: list[str],
-        subject_tag: str | None,
-    ) -> str:
-        return self._build_literal_query(
-            title=title,
-            keywords=keywords or context_terms,
-            disambiguator=self._choose_disambiguator(
-                title=title,
-                keywords=keywords,
-                context_terms=context_terms,
-                subject_tag=subject_tag,
-            ),
-            subject_tag=subject_tag,
-        )
-
-    def _build_retrieval_stage_plan(
-        self,
-        query_candidates: list[QueryCandidate],
-        fast_mode: bool,
-        retrieval_profile: RetrievalProfile,
-        request_need: int,
-        subject_tag: str | None = None,
-        page_hint: int = 1,
-        recovery_stage: int = 0,
-        conn: Any = None,
-    ) -> list[RetrievalStagePlan]:
-        stage_map: dict[str, list[QueryCandidate]] = {"high_precision": [], "broad": [], "recovery": []}
-        allowed_families = self._allowed_frontier_families(
-            page_hint=page_hint,
-            recovery_stage=recovery_stage,
-        )
-        for item in query_candidates:
-            family = item.family_key.split(":", 1)[0] if item.family_key else self._frontier_family_for_query(
-                stage=item.stage,
-                strategy=item.strategy,
-                source_surface=item.source_surface,
-            )
-            if retrieval_profile == "bootstrap" and family != self.FRONTIER_ROOT_EXACT:
-                continue
-            if retrieval_profile != "bootstrap" and family not in allowed_families:
-                continue
-            stage = item.stage if item.stage in stage_map else "broad"
-            stage_map[stage].append(item)
-
-        if retrieval_profile == "bootstrap":
-            high_precision_budget = max(1, min(len(stage_map["high_precision"]), 2 if fast_mode else 3))
-            high_precision_min = min(2, high_precision_budget)
-            broad_budget = 0
-            broad_max = 0
-            broad_min = 0
-            recovery_budget = 0
-            recovery_min = 0
-        elif self.serverless_mode:
-            high_precision_budget = 1 if int(recovery_stage or 0) <= self.REFILL_STAGE_EXACT_ROOT else 2
-            high_precision_min = 2
-            if int(recovery_stage or 0) < self.REFILL_STAGE_ROOT_COMPANION:
-                broad_budget = 0
-                broad_max = 0
-            elif int(recovery_stage or 0) < self.REFILL_STAGE_ANCHORED_ADJACENT:
-                broad_budget = min(len(stage_map["broad"]), 1)
-                broad_max = broad_budget
-            else:
-                broad_budget = min(len(stage_map["broad"]), 2)
-                broad_max = min(len(stage_map["broad"]), 3)
-            broad_min = 1 if broad_budget > 0 else 0
-            recovery_budget = (
-                min(len(stage_map["recovery"]), 1 if int(recovery_stage or 0) >= self.REFILL_STAGE_RECOVERY_GRAPH else 0)
-                if self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage)
-                else 0
-            )
-            recovery_min = 0
-        else:
-            if int(recovery_stage or 0) <= self.REFILL_STAGE_ROOT_COMPANION:
-                high_precision_budget = 1 if fast_mode else 2
-                high_precision_min = 1 if fast_mode else 2
-            else:
-                high_precision_budget = 2 if fast_mode else 3
-                high_precision_min = 2 if fast_mode else 3
-            breadth_class = self._topic_breadth_class(subject_tag, conn=conn)
-            if breadth_class == "opaque_niche":
-                slow_base_broad_budget = 2
-                slow_max_broad_budget = 4
-            elif breadth_class == "curated_broad":
-                slow_base_broad_budget = 6
-                slow_max_broad_budget = 8
-            else:
-                slow_base_broad_budget = 4
-                slow_max_broad_budget = 6
-            if fast_mode:
-                base_broad_budget = max(1, (slow_base_broad_budget + 1) // 2)
-                max_broad_budget = max(base_broad_budget, (slow_max_broad_budget + 1) // 2)
-            else:
-                base_broad_budget = slow_base_broad_budget
-                max_broad_budget = slow_max_broad_budget
-            if int(recovery_stage or 0) < self.REFILL_STAGE_ROOT_COMPANION:
-                broad_budget = 0
-                broad_max = 0
-            elif int(recovery_stage or 0) < self.REFILL_STAGE_ANCHORED_ADJACENT:
-                broad_budget = min(len(stage_map["broad"]), max(1, base_broad_budget // 2))
-                broad_max = min(len(stage_map["broad"]), max(1, max_broad_budget // 2))
-            else:
-                broad_budget = min(len(stage_map["broad"]), base_broad_budget)
-                broad_max = min(len(stage_map["broad"]), max_broad_budget)
-            if fast_mode:
-                broad_min = 1 if broad_budget > 0 else 0
-                recovery_budget = (
-                    min(len(stage_map["recovery"]), 1 if int(recovery_stage or 0) >= self.REFILL_STAGE_ANCHORED_ADJACENT else 0)
-                    if self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage)
-                    else 0
-                )
-                recovery_min = 1 if recovery_budget > 0 else 0
-            else:
-                broad_min = min(2, broad_budget)
-                recovery_budget = (
-                    min(
-                        len(stage_map["recovery"]),
-                        1 if int(recovery_stage or 0) < self.REFILL_STAGE_RECOVERY_GRAPH else 2 + max(0, int(request_need) - 6) // 6,
-                    )
-                    if self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage)
-                    else 0
-                )
-                recovery_min = min(1, recovery_budget)
-
-        plans = [
-            RetrievalStagePlan(
-                name="high_precision",
-                queries=sorted(stage_map["high_precision"], key=lambda q: -(q.confidence * q.weight)),
-                budget=high_precision_budget,
-                min_good_results=high_precision_min,
-            ),
-            RetrievalStagePlan(
-                name="broad",
-                queries=sorted(stage_map["broad"], key=lambda q: -(q.confidence * q.weight)),
-                budget=broad_budget,
-                min_good_results=broad_min,
-                max_budget=broad_max,
-            ),
-            RetrievalStagePlan(
-                name="recovery",
-                queries=sorted(stage_map["recovery"], key=lambda q: -(q.confidence * q.weight)),
-                budget=recovery_budget,
-                min_good_results=recovery_min,
-            ),
-        ]
-        return [plan for plan in plans if plan.queries and plan.budget > 0]
-
-
-    def _graph_profile_for_stage(
-        self,
-        *,
-        fast_mode: bool,
-        retrieval_profile: RetrievalProfile,
-        page_hint: int,
-        recovery_stage: int,
-        subject_tag: str | None = None,
-        conn: Any = None,
-    ) -> Literal["off", "light", "deep"]:
-        if retrieval_profile == "bootstrap":
-            if subject_tag and self._topic_breadth_class(subject_tag, conn=conn) == "opaque_niche":
-                return "light"
-            return "off"
-        if not self._recovery_stage_allows_related(page_hint=page_hint, recovery_stage=recovery_stage):
-            return "off"
-        if int(recovery_stage or 0) < self.REFILL_STAGE_RECOVERY_GRAPH:
-            return "light"
-        if self.serverless_mode:
-            return "light"
-        return "light" if fast_mode else "deep"
-
-
-
-    def _get_transcript(self, video: Any) -> list[dict[str, Any]]:
-        """Route transcript fetch by provider. Returns a list of
-        `{"start": float, "duration": float, "text": str}` cues in
-        YouTube-compatible format (empty list on any failure).
-
-        Accepts:
-          * a dict video_row (reads `provider` + `video_id`/`id`)
-          * a `(video_id, provider)` tuple
-          * a bare video_id string (provider inferred from
-            `_provider_by_video_id`, else 'youtube')
-        """
-        provider_name = "youtube"
-        video_id = ""
-        if isinstance(video, dict):
-            video_id = str(video.get("video_id") or video.get("id") or "").strip()
-            provider_name = str(video.get("provider") or "youtube").strip().lower() or "youtube"
-        elif isinstance(video, tuple) and len(video) == 2:
-            raw_id, raw_provider = video
-            video_id = str(raw_id or "").strip()
-            provider_name = str(raw_provider or "youtube").strip().lower() or "youtube"
-        else:
-            video_id = str(video or "").strip()
-            provider_name = self._provider_by_video_id.get(video_id, "youtube")
-        if not video_id:
-            return []
-        if provider_name == "youtube":
-            try:
-                return list(self.youtube_service.get_transcript(None, video_id) or [])
-            except Exception:
-                return []
-        try:
-            transcript = self._provider_registry.fetch_transcript(provider_name, video_id)
-        except Exception:
-            return []
-        if transcript is None:
-            return []
-        return [
-            {
-                "start": float(cue.start),
-                "duration": max(0.0, float(cue.end) - float(cue.start)),
-                "text": str(cue.text or ""),
-            }
-            for cue in transcript.cues
-        ]
-
-
-    def _transcript_prefetch_worker_count(self, *, fast_mode: bool, requested_count: int) -> int:
-        workers_limit = self.TRANSCRIPT_FETCH_WORKERS_FAST if fast_mode else self.TRANSCRIPT_FETCH_WORKERS_SLOW
-        if self.serverless_mode:
-            workers_limit = min(workers_limit, 2)
-        return max(1, min(workers_limit, max(1, int(requested_count))))
-
-    def _launch_transcript_prefetch_task(
-        self,
-        video_ids: list[str],
-        *,
-        fast_mode: bool,
-        cached_transcripts: dict[str, list[dict[str, Any]]] | None = None,
-    ) -> TranscriptPrefetchTask | None:
-        ordered_ids = [
-            str(video_id).strip()
-            for video_id in dict.fromkeys(video_ids)
-            if str(video_id).strip()
-        ]
-        if not ordered_ids:
-            return None
-        executor = ThreadPoolExecutor(
-            max_workers=self._transcript_prefetch_worker_count(
-                fast_mode=fast_mode,
-                requested_count=len(ordered_ids),
-            )
-        )
-        future_by_video_id = {
-            video_id: executor.submit(self._get_transcript, video_id)
-            for video_id in ordered_ids
-        }
-        return TranscriptPrefetchTask(
-            video_ids=tuple(ordered_ids),
-            executor=executor,
-            future_by_video_id=future_by_video_id,
-            cached_transcripts=dict(cached_transcripts or {}),
-        )
-
-    def _submit_transcript_prefetch_ids(
-        self,
-        *,
-        prefetch_task: TranscriptPrefetchTask,
-        video_ids: list[str],
-        fast_mode: bool,
-    ) -> TranscriptPrefetchTask:
-        ordered_ids = [
-            str(video_id).strip()
-            for video_id in dict.fromkeys(video_ids)
-            if str(video_id).strip()
-        ]
-        if not ordered_ids:
-            return prefetch_task
-        pending_ids = [
-            video_id
-            for video_id in ordered_ids
-            if video_id not in prefetch_task.cached_transcripts and video_id not in prefetch_task.future_by_video_id
-        ]
-        if not pending_ids:
-            return prefetch_task
-        if prefetch_task.executor is None:
-            prefetch_task.executor = ThreadPoolExecutor(
-                max_workers=self._transcript_prefetch_worker_count(
-                    fast_mode=fast_mode,
-                    requested_count=len(pending_ids),
-                )
-            )
-        for video_id in pending_ids:
-            prefetch_task.future_by_video_id[video_id] = prefetch_task.executor.submit(
-                self._get_transcript,
-                video_id,
-            )
-        prefetch_task.video_ids = tuple(
-            dict.fromkeys([*prefetch_task.video_ids, *pending_ids])
-        )
-        return prefetch_task
-
-    def _shutdown_transcript_prefetch_task(
-        self,
-        prefetch_task: TranscriptPrefetchTask | None,
-        *,
-        wait: bool,
-        cancel_futures: bool = False,
-    ) -> None:
-        if prefetch_task is None:
-            return
-        executor = prefetch_task.executor
-        prefetch_task.executor = None
-        if cancel_futures:
-            for future in list(prefetch_task.future_by_video_id.values()):
-                if future is not None and not future.done():
-                    future.cancel()
-        if executor is not None:
-            try:
-                executor.shutdown(wait=wait, cancel_futures=cancel_futures)
-            except TypeError:
-                executor.shutdown(wait=wait)
-        prefetch_task.future_by_video_id = {}
-        prefetch_task.video_ids = ()
-
-    def _resolve_transcript_prefetch(
-        self,
-        *,
-        prefetch_task: TranscriptPrefetchTask,
-        video_id: str,
-        timeout: float | None,
-        fast_mode: bool,
-    ) -> dict[str, list[dict[str, Any]]]:
-        clean_video_id = str(video_id).strip()
-        if not clean_video_id:
-            return {}
-        if clean_video_id in prefetch_task.cached_transcripts:
-            return {
-                clean_video_id: list(prefetch_task.cached_transcripts.get(clean_video_id) or []),
-            }
-        future = prefetch_task.future_by_video_id.get(clean_video_id)
-        transcript: list[dict[str, Any]] = []
-        try:
-            if future is not None:
-                transcript = list(future.result(timeout=timeout) or [])
-            else:
-                transcript = list(self._get_transcript(clean_video_id) or [])
-        except FutureTimeoutError:
-            logger.warning(
-                "Transcript prefetch timed out after %.1fs for video=%s",
-                float(timeout or 0.0),
-                clean_video_id,
-            )
-            try:
-                transcript = list(self._get_transcript(clean_video_id) or [])
-            except Exception:
-                transcript = []
-        except Exception:
-            logger.exception("Transcript prefetch failed for video=%s", clean_video_id)
-        prefetch_task.cached_transcripts[clean_video_id] = transcript
-        prefetch_task.future_by_video_id.pop(clean_video_id, None)
-        prefetch_task.video_ids = tuple(
-            video
-            for video in prefetch_task.video_ids
-            if video != clean_video_id and video not in prefetch_task.cached_transcripts
-        )
-        return {clean_video_id: transcript}
-
-    def _seed_transcript_prefetch_ids(
-        self,
-        *,
-        candidates: list[dict[str, Any]],
-        transcript_budget: int,
-        clip_min_len: int,
-        clip_max_len: int,
-    ) -> list[str]:
-        if transcript_budget <= 0 or not candidates:
-            return []
-        ranked = sorted(
-            candidates,
-            key=lambda row: float((row.get("ranking") or {}).get("final_score") or 0.0),
-            reverse=True,
-        )
-        selected_ids: list[str] = []
-        seen_ids: set[str] = set()
-        for candidate in ranked:
-            video_id = str(candidate.get("video_id") or "").strip()
-            if not video_id or video_id in seen_ids:
-                continue
-            video_duration_val = int(candidate.get("video_duration") or 0)
-            use_full_short_clip = self._should_use_full_short_clip(
-                prefer_short_query=self._video_duration_bucket(video_duration_val) == "short",
-                video_duration_sec=video_duration_val,
-                clip_min_len=clip_min_len,
-                clip_max_len=clip_max_len,
-            )
-            if use_full_short_clip:
-                continue
-            seen_ids.add(video_id)
-            selected_ids.append(video_id)
-            if len(selected_ids) >= transcript_budget:
-                break
-        return selected_ids
-
-    def _maybe_launch_transcript_prefetch(
-        self,
-        *,
-        prefetch_task: TranscriptPrefetchTask | None,
-        stage_candidates: list[dict[str, Any]],
-        transcript_budget: int,
-        clip_min_len: int,
-        clip_max_len: int,
-        fast_mode: bool,
-    ) -> TranscriptPrefetchTask | None:
-        if not stage_candidates or transcript_budget <= 0:
-            return prefetch_task
-        seed_ids = self._seed_transcript_prefetch_ids(
-            candidates=stage_candidates,
-            transcript_budget=transcript_budget,
-            clip_min_len=clip_min_len,
-            clip_max_len=clip_max_len,
-        )
-        min_seed_count = 1 if transcript_budget <= 1 else min(3, transcript_budget)
-        if len(seed_ids) < min_seed_count:
-            return prefetch_task
-        if prefetch_task is None:
-            return self._launch_transcript_prefetch_task(seed_ids, fast_mode=fast_mode)
-        return self._submit_transcript_prefetch_ids(
-            prefetch_task=prefetch_task,
-            video_ids=seed_ids,
-            fast_mode=fast_mode,
-        )
-
-
-    def _transcript_for_candidate(
-        self,
-        *,
-        prefetch_task: TranscriptPrefetchTask | None,
-        transcript_cache: dict[str, list[dict[str, Any]]],
-        video_id: str,
-        fast_mode: bool,
-    ) -> list[dict[str, Any]]:
-        clean_video_id = str(video_id).strip()
-        if not clean_video_id:
-            return []
-        cached = transcript_cache.get(clean_video_id)
-        if cached is not None:
-            return list(cached)
-        if prefetch_task is not None:
-            transcript = list(
-                self._resolve_transcript_prefetch(
-                    prefetch_task=prefetch_task,
-                    video_id=clean_video_id,
-                    timeout=30.0,
-                    fast_mode=fast_mode,
-                ).get(clean_video_id)
-                or []
-            )
-        else:
-            try:
-                transcript = list(self._get_transcript(clean_video_id) or [])
-            except Exception:
-                transcript = []
-        transcript_cache[clean_video_id] = transcript
-        return transcript
-
-
-
-
-    def _dense_transcript_windows(
-        self,
-        conn,
-        *,
-        transcript: list[dict[str, Any]],
-        concept_terms: list[str],
-        root_topic_terms: list[str],
-        target_clip_duration_sec: int,
-        prior_contexts: list[dict[str, Any]],
-        fast_mode: bool,
-        max_windows: int,
-    ) -> list[SegmentMatch]:
-        entries = [entry for entry in transcript if str(entry.get("text") or "").strip()]
-        if not entries:
-            return []
-        safe_target = max(20, int(target_clip_duration_sec or DEFAULT_TARGET_CLIP_DURATION_SEC))
-        window_len = max(75, 2 * safe_target)
-        stride = max(20, safe_target // 2)
-        first_start = max(0, int(float(entries[0].get("start") or 0.0)))
-        last_entry = entries[-1]
-        total_end = int(float(last_entry.get("start") or 0.0) + float(last_entry.get("duration") or 0.0))
-        if total_end <= first_start:
-            return []
-
-        anchor_terms = root_topic_terms or concept_terms[:4]
-        cue_pattern = re.compile(
-            r"\b(explains?|because|therefore|for example|for instance|means|refers to|"
-            r"defined as|in practice|lets|let's|suppose|imagine|proof|derive|application)\b"
-        )
-        candidates: list[SegmentMatch] = []
-        for window_start in range(first_start, max(first_start + 1, total_end), stride):
-            window_end = min(total_end, window_start + window_len)
-            if window_end - window_start < 35:
-                continue
-            window_entries = [
-                entry
-                for entry in entries
-                if float(entry.get("start") or 0.0) < window_end
-                and (float(entry.get("start") or 0.0) + float(entry.get("duration") or 0.0)) > window_start
-            ]
-            if not window_entries:
-                continue
-            text = " ".join(str(entry.get("text") or "").strip() for entry in window_entries).strip()
-            if len(text) < 120:
-                continue
-            concept_support = lexical_overlap_score(text, concept_terms)
-            root_support = lexical_overlap_score(text, anchor_terms)
-            if root_support <= 0.0 and concept_support < 0.08:
-                continue
-            clip_duration = float(max(0, window_end - window_start))
-            clip_context = self._build_clip_context(text=text, clip_duration_sec=clip_duration)
-            clipability = self._clip_self_containment_score(text=text, clip_duration_sec=clip_duration)
-            cue_hits = len(cue_pattern.findall(text.lower()))
-            teaching_density = min(1.0, 0.18 + 0.12 * cue_hits + 0.01 * len(normalize_terms([text])))
-            novelty_penalty = 0.0
-            for prior in prior_contexts[:8]:
-                prior_text = str(prior.get("text") or "").strip()
-                if not prior_text:
-                    continue
-                lexical = lexical_overlap_score(text, [prior_text])
-                similarity = lexical
-                if lexical >= 0.32:
-                    similarity = max(
-                        similarity,
-                        self._text_pair_similarity(
-                            conn,
-                            left_text=text,
-                            right_text=prior_text,
-                            fast_mode=fast_mode,
-                        ),
-                    )
-                novelty_penalty = max(novelty_penalty, similarity)
-            duration_fit = max(0.0, 1.0 - abs(clip_duration - safe_target) / max(30.0, float(safe_target * 2)))
-            score = (
-                0.28 * root_support
-                + 0.26 * concept_support
-                + 0.16 * teaching_density
-                + 0.16 * clipability
-                + 0.08 * duration_fit
-                + 0.06 * float(clip_context.get("function_confidence") or 0.0)
-                - 0.14 * novelty_penalty
-            )
-            candidates.append(
-                SegmentMatch(
-                    chunk_index=len(candidates),
-                    t_start=float(window_start),
-                    t_end=float(window_end),
-                    text=text[:1200],
-                    score=float(score),
-                )
-            )
-
-        candidates.sort(key=lambda item: item.score, reverse=True)
-        selected: list[SegmentMatch] = []
-        for candidate in candidates:
-            duplicate = False
-            for prior in selected:
-                lexical = lexical_overlap_score(candidate.text, [prior.text])
-                if lexical >= 0.7:
-                    duplicate = True
-                    break
-                if lexical >= 0.35:
-                    similarity = self._text_pair_similarity(
-                        conn,
-                        left_text=candidate.text,
-                        right_text=prior.text,
-                        fast_mode=fast_mode,
-                    )
-                    if similarity >= 0.82:
-                        duplicate = True
-                        break
-            if duplicate:
-                continue
-            selected.append(candidate)
-            if len(selected) >= max(1, int(max_windows or 1)):
-                break
-        return selected
-
-
-    def _stage_duration_plan(
-        self,
-        stage_name: str,
-        preferred_video_duration: str,
-        video_pool_mode: str,
-        fast_mode: bool,
-        retrieval_profile: RetrievalProfile,
-    ) -> tuple[str | None, ...]:
-        if retrieval_profile == "bootstrap":
-            if preferred_video_duration in {"short", "medium", "long"}:
-                return (preferred_video_duration, None)
-            return (None,)
-        if stage_name == "high_precision":
-            if preferred_video_duration in {"short", "medium", "long"}:
-                return (preferred_video_duration,)
-            return ("short", None)
-        if stage_name == "broad":
-            if fast_mode:
-                if preferred_video_duration in {"short", "medium", "long"}:
-                    return (preferred_video_duration, None)
-                if video_pool_mode == "long-form":
-                    return ("long", None)
-                if video_pool_mode == "balanced":
-                    return ("short", "long")
-                return ("short", None)
-            return self._duration_plan(video_pool_mode, preferred_video_duration)
-        if fast_mode:
-            if preferred_video_duration in {"short", "medium", "long"}:
-                return (preferred_video_duration, None)
-            return (None, "short")
-        return (None, "short", "medium", "long")
 
     def _score_video_candidate(
         self,
@@ -6609,205 +4704,108 @@ class ReelService:
         expansion: dict[str, Any],
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
+        """Attach expansion context without rewriting learner concept records.
+
+        Earlier versions recycled concept IDs by changing their titles to whichever
+        static/LLM expansion happened to win that run. Besides corrupting progress,
+        that made a concept mean different things across generations. Expansion is
+        retrieval metadata now: IDs, titles, summaries, and embeddings stay untouched.
+        """
         _raise_if_clip_cancelled(should_cancel)
         working = [dict(concept) for concept in concepts]
-        root_topic_terms = self._topic_root_anchor_terms(
-            subject_tag=subject_tag,
-            expansion=expansion,
-            concepts=working,
-        )
-        expansion_terms = self._topic_expansion_terms(
-            expansion=expansion,
-            subject_tag=subject_tag,
-            limit=max(8, len(working) + 2),
-        )
-        keyword_expansion_terms = list(expansion_terms)
-        expansion_terms = [
-            term for term in expansion_terms if self._term_has_root_topic_anchor(term, root_topic_terms=root_topic_terms)
-        ]
+        if not working:
+            return working
 
+        canonical = self._clean_query_text(
+            str(expansion.get("canonical_topic") or subject_tag)
+        ) or self._clean_query_text(subject_tag)
         subject_key = self._normalize_query_key(subject_tag)
-        represented: set[str] = set()
-        for concept in working:
-            normalized = self._normalize_query_key(str(concept.get("title") or ""))
-            if normalized:
-                represented.add(normalized)
         root_index = next(
             (
                 index
                 for index, concept in enumerate(working)
-                if self._normalize_query_key(str(concept.get("title") or "")) == subject_key
+                if self._normalize_query_key(str(concept.get("title") or ""))
+                == subject_key
             ),
-            -1,
+            0,
         )
-        subject_title = self._title_case_phrase(subject_tag)
 
-        if root_index < 0:
-            root_concept = dict(working[0]) if working else {"id": str(uuid.uuid4()), "created_at": now_iso()}
-            root_concept["title"] = subject_title
-            root_concept["keywords_json"] = dumps_json(
-                self._topic_concept_keywords(
-                    subject_tag=subject_tag,
-                    primary_term=subject_tag,
-                    expansion_terms=keyword_expansion_terms,
-                )[:8]
+        typed_terms: list[tuple[str, str]] = [(canonical, "corrected_topic")]
+        for key, kind in (
+            ("aliases", "alias"),
+            ("subtopics", "expansion"),
+            ("related_terms", "related"),
+        ):
+            for raw_term in expansion.get(key) or []:
+                typed_terms.append((self._clean_query_text(str(raw_term or "")), kind))
+
+        seen_global: set[tuple[str, str]] = set()
+        normalized_terms: list[tuple[str, str]] = []
+        for term, kind in typed_terms:
+            normalized = self._normalize_query_key(term)
+            identity = (normalized, kind)
+            if not term or not normalized or identity in seen_global:
+                continue
+            seen_global.add(identity)
+            normalized_terms.append((term, kind))
+
+        try:
+            execute_modify(
+                conn,
+                "DELETE FROM concept_search_terms WHERE material_id = ?",
+                (material_id,),
             )
-            root_concept["summary"] = f"Core ideas, terminology, and intuition for {subject_title}."
-            root_concept["embedding_json"] = None
-            root_concept["material_id"] = str(root_concept.get("material_id") or material_id)
+        except Exception as exc:
+            # Hand-built legacy test schemas may omit this rollout table. Real
+            # databases are migrated by init_db before generation begins.
+            if "concept_search_terms" not in str(exc).lower():
+                raise
+
+        for index, concept in enumerate(working):
             _raise_if_clip_cancelled(should_cancel)
-            upsert(conn, "concepts", root_concept)
-            if working:
-                working[0] = root_concept
-                root_index = 0
-            else:
-                working.append(root_concept)
-                root_index = 0
-            represented.add(subject_key)
+            concept_id = str(concept.get("id") or "").strip()
+            title = self._clean_query_text(str(concept.get("title") or ""))
+            if not concept_id or not title:
+                continue
 
-        if root_index >= 0 and working:
-            root_concept = dict(working[root_index])
-            root_keywords = self._topic_concept_keywords(
-                subject_tag=subject_tag,
-                primary_term=subject_tag,
-                expansion_terms=keyword_expansion_terms,
-            )
-            root_concept["keywords_json"] = dumps_json(root_keywords[:8])
-            root_summary = str(root_concept.get("summary") or "").strip()
-            if not root_summary or self._is_low_signal_topic_concept(root_summary, subject_tag=subject_tag):
-                root_concept["summary"] = f"Core ideas, terminology, and intuition for {self._title_case_phrase(subject_tag)}."
-            root_concept["material_id"] = str(root_concept.get("material_id") or material_id)
-            root_concept["title"] = subject_title
-            root_concept["embedding_json"] = None
-            _raise_if_clip_cancelled(should_cancel)
-            upsert(conn, "concepts", root_concept)
-            working[root_index] = root_concept
+            contextual = title
+            title_tokens = set(self._normalize_query_key(title).split())
+            context_tokens = set(self._normalize_query_key(canonical).split())
+            if canonical and not context_tokens.issubset(title_tokens):
+                contextual = self._clean_query_text(f"{title} {canonical}")
 
-        curated_terms = self._curated_topic_subtopic_terms(subject_tag)
-        if curated_terms and root_index >= 0 and working:
-            desired_terms = curated_terms[: max(1, min(7, len(curated_terms)))]
-            curated_working = [dict(working[root_index])]
-            exact_match_by_key = {
-                self._normalize_query_key(str(concept.get("title") or "")): dict(concept)
-                for index, concept in enumerate(working)
-                if index != root_index and self._normalize_query_key(str(concept.get("title") or ""))
-            }
-            reusable_pool = [
-                dict(concept)
-                for index, concept in enumerate(working)
-                if index != root_index
-            ]
-            used_ids: set[str] = set()
+            persisted_terms: list[tuple[str, str]] = [(contextual, "material_context")]
+            if index == root_index:
+                persisted_terms.extend(normalized_terms)
 
-            for term in desired_terms:
-                _raise_if_clip_cancelled(should_cancel)
-                term_key = self._normalize_query_key(term)
-                concept = dict(exact_match_by_key.get(term_key) or {})
-                if concept and str(concept.get("id") or "") in used_ids:
-                    concept = {}
-                if not concept:
-                    while reusable_pool:
-                        candidate = dict(reusable_pool.pop(0))
-                        candidate_id = str(candidate.get("id") or "")
-                        if candidate_id and candidate_id in used_ids:
-                            continue
-                        concept = candidate
-                        break
-                if not concept:
-                    concept = {"id": str(uuid.uuid4()), "created_at": now_iso()}
-                concept["title"] = self._title_case_phrase(term)
-                concept["keywords_json"] = dumps_json(
-                    self._topic_concept_keywords(
-                        subject_tag=subject_tag,
-                        primary_term=term,
-                        expansion_terms=desired_terms,
-                    )[:8]
-                )
-                concept["summary"] = f"Key subtopic within {subject_title}: {term}."
-                concept["embedding_json"] = None
-                concept["material_id"] = str(concept.get("material_id") or material_id)
-                _raise_if_clip_cancelled(should_cancel)
-                upsert(conn, "concepts", concept)
-                curated_working.append(concept)
-                concept_id = str(concept.get("id") or "")
-                if concept_id:
-                    used_ids.add(concept_id)
-            return curated_working
+            seen_concept_terms: set[str] = set()
+            concept["_search_terms"] = []
+            for term, kind in persisted_terms:
+                normalized = self._normalize_query_key(term)
+                if not term or not normalized or normalized in seen_concept_terms:
+                    continue
+                seen_concept_terms.add(normalized)
+                concept["_search_terms"].append(term)
+                row_id = hashlib.sha256(
+                    f"{concept_id}|{kind}|{normalized}".encode("utf-8")
+                ).hexdigest()
+                try:
+                    upsert(
+                        conn,
+                        "concept_search_terms",
+                        {
+                            "id": row_id,
+                            "concept_id": concept_id,
+                            "material_id": material_id,
+                            "term": term,
+                            "term_kind": kind,
+                            "created_at": now_iso(),
+                        },
+                    )
+                except Exception as exc:
+                    if "concept_search_terms" not in str(exc).lower():
+                        raise
 
-        replacement_terms = [term for term in expansion_terms if self._normalize_query_key(term) not in represented]
-        filler_indexes = [
-            index
-            for index, concept in enumerate(working)
-            if index != root_index
-            and (
-                self._is_low_signal_topic_concept(str(concept.get("title") or ""), subject_tag=subject_tag)
-                or not self._term_has_root_topic_anchor(
-                    str(concept.get("title") or ""),
-                    root_topic_terms=root_topic_terms,
-                )
-            )
-        ]
-
-        for index in filler_indexes:
-            _raise_if_clip_cancelled(should_cancel)
-            if not replacement_terms:
-                break
-            term = replacement_terms.pop(0)
-            concept = dict(working[index])
-            concept["title"] = self._title_case_phrase(term)
-            concept["keywords_json"] = dumps_json(
-                self._topic_concept_keywords(
-                    subject_tag=subject_tag,
-                    primary_term=term,
-                    expansion_terms=keyword_expansion_terms,
-                )[:8]
-            )
-            concept["summary"] = f"Key subtopic within {subject_title}: {term}."
-            concept["embedding_json"] = None
-            concept["material_id"] = str(concept.get("material_id") or material_id)
-            _raise_if_clip_cancelled(should_cancel)
-            upsert(conn, "concepts", concept)
-            working[index] = concept
-            represented.add(self._normalize_query_key(term))
-
-        while replacement_terms and len(working) < max(4, min(8, len(expansion_terms) + 1)):
-            _raise_if_clip_cancelled(should_cancel)
-            term = replacement_terms.pop(0)
-            concept = {
-                "id": str(uuid.uuid4()),
-                "material_id": material_id,
-                "title": self._title_case_phrase(term),
-                "keywords_json": dumps_json(
-                    self._topic_concept_keywords(
-                        subject_tag=subject_tag,
-                        primary_term=term,
-                        expansion_terms=keyword_expansion_terms,
-                    )[:8]
-                ),
-                "summary": f"Key subtopic within {subject_title}: {term}.",
-                "embedding_json": None,
-                "created_at": now_iso(),
-            }
-            _raise_if_clip_cancelled(should_cancel)
-            upsert(conn, "concepts", concept)
-            working.append(concept)
-            represented.add(self._normalize_query_key(term))
-
-        filtered_working = [
-            concept
-            for index, concept in enumerate(working)
-            if index == root_index
-            or self._term_has_root_topic_anchor(
-                str(concept.get("title") or ""),
-                root_topic_terms=root_topic_terms,
-            )
-            and not self._is_low_signal_topic_concept(
-                str(concept.get("title") or ""),
-                subject_tag=subject_tag,
-            )
-        ]
-        if filtered_working:
-            return filtered_working
         return working
 
     def _topic_expansion_terms(
@@ -8624,6 +6622,8 @@ class ReelService:
         generation_id: str | None = None,
         page_hint: int = 1,
         learner_id: str = LEGACY_LEARNER_ID,
+        exclusions_fingerprint: str = "",
+        content_fingerprint: str = "",
     ) -> list[dict[str, Any]]:
         material = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
@@ -8648,6 +6648,7 @@ class ReelService:
             subject_tag=subject_tag,
             reel_where=reel_where,
             reel_params=reel_params,
+            learner_id=learner_id,
         )
         cached = self._load_ranked_feed_cache(
             conn,
@@ -8660,6 +6661,9 @@ class ReelService:
             level_target=level_target,
             learner_id=learner_id,
             feedback_revision=feedback_revision,
+            page_hint=page_hint,
+            exclusions_fingerprint=exclusions_fingerprint,
+            content_fingerprint=content_fingerprint,
         )
         if cached is not None:
             return cached
@@ -8689,6 +6693,9 @@ class ReelService:
                 r.informativeness,
                 r.base_score,
                 r.difficulty,
+                r.model_used,
+                r.quality_degraded,
+                r.selected_cue_ids_json,
                 COALESCE(SUM(f.helpful), 0) AS helpful_votes,
                 COALESCE(SUM(f.confusing), 0) AS confusing_votes,
                 COALESCE(AVG(f.rating), 3.0) AS avg_rating,
@@ -8697,7 +6704,9 @@ class ReelService:
             FROM reels r
             JOIN concepts c ON c.id = r.concept_id
             JOIN videos v ON v.id = r.video_id
-            LEFT JOIN reel_feedback f ON f.reel_id = r.id
+            LEFT JOIN reel_feedback f
+              ON f.reel_id = r.id
+             AND f.learner_id = ?
             WHERE {reel_where}
               AND (r.t_end - r.t_start) >= 1
               AND (r.t_end - r.t_start) <= {_SERVING_MAX_CLIP_SEC}
@@ -8723,9 +6732,12 @@ class ReelService:
                 r.informativeness,
                 r.base_score,
                 r.difficulty,
+                r.model_used,
+                r.quality_degraded,
+                r.selected_cue_ids_json,
                 r.created_at
             """,
-            reel_params,
+            (learner_id, *reel_params),
         )
 
         if self.youtube_service:
@@ -8826,6 +6838,13 @@ class ReelService:
                 takeaways = []
             if not isinstance(takeaways, list):
                 takeaways = []
+            try:
+                selected_cue_ids = json.loads(str(row.get("selected_cue_ids_json") or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                selected_cue_ids = []
+            if not isinstance(selected_cue_ids, list):
+                selected_cue_ids = []
+            selected_cue_ids = [str(cue_id) for cue_id in selected_cue_ids if str(cue_id).strip()]
             video_title = str(row.get("video_title") or "").strip()
             video_description = self._clean_video_description(str(row.get("video_description") or ""))
             transcript_snippet = str(row.get("transcript_snippet") or "")
@@ -8968,6 +6987,9 @@ class ReelService:
                     "video_duration_sec": int(row.get("video_duration_sec") or 0),
                     "clip_duration_sec": round(max(0.0, float(row["t_end"]) - float(row["t_start"])), 2),
                     "difficulty": self._difficulty(row),
+                    "model_used": str(row.get("model_used") or "").strip() or None,
+                    "quality_degraded": bool(row.get("quality_degraded")),
+                    "selected_cue_ids": selected_cue_ids,
                     "created_at": row["created_at"],
                 }
             )
@@ -8998,17 +7020,32 @@ class ReelService:
         deduped_video_ids = sorted({str(item.get("video_id") or "") for item in deduped if item.get("video_id")})
         transcript_by_video: dict[str, list[dict[str, Any]]] = {}
         if deduped_video_ids:
-            placeholders = ", ".join(["?"] * len(deduped_video_ids))
-            transcript_rows = fetch_all(
-                conn,
-                f"SELECT video_id, transcript_json FROM transcript_cache WHERE video_id IN ({placeholders})",
-                tuple(deduped_video_ids),
-            )
+            bare_to_response_ids: dict[str, list[str]] = defaultdict(list)
+            for response_video_id in deduped_video_ids:
+                bare_id = normalize_youtube_video_id(response_video_id)
+                if bare_id:
+                    bare_to_response_ids[bare_id].append(response_video_id)
+            bare_video_ids = sorted(bare_to_response_ids)
+            transcript_rows = []
+            if bare_video_ids:
+                placeholders = ", ".join(["?"] * len(bare_video_ids))
+                transcript_rows = fetch_all(
+                    conn,
+                    "SELECT video_id, artifact_json FROM transcript_artifacts "
+                    f"WHERE video_id IN ({placeholders}) "
+                    "ORDER BY created_at DESC",
+                    tuple(bare_video_ids),
+                )
             for trow in transcript_rows:
                 try:
-                    transcript_by_video[str(trow["video_id"])] = json.loads(trow["transcript_json"])
+                    payload = json.loads(str(trow.get("artifact_json") or "{}"))
                 except (TypeError, json.JSONDecodeError):
-                    transcript_by_video[str(trow["video_id"])] = []
+                    continue
+                artifact = validate_transcript_payload(payload)
+                if artifact is None:
+                    continue
+                for response_video_id in bare_to_response_ids.get(artifact.video_id, []):
+                    transcript_by_video.setdefault(response_video_id, artifact.segments)
 
         response_rows: list[dict[str, Any]] = []
         for item in deduped:
@@ -9038,5 +7075,8 @@ class ReelService:
             level_target=level_target,
             learner_id=learner_id,
             feedback_revision=feedback_revision,
+            page_hint=page_hint,
+            exclusions_fingerprint=exclusions_fingerprint,
+            content_fingerprint=content_fingerprint,
         )
         return response_rows

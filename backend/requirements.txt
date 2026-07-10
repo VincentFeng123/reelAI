@@ -38,14 +38,9 @@ yt-dlp==2026.3.17
 # `brainicism/bgutil-ytdlp-pot-provider` as a sidecar and setting
 # YTDLP_POT_PROVIDER_URL (see config.py).
 bgutil-ytdlp-pot-provider>=0.7.0
-faster-whisper==1.1.1
 # Semantic text embeddings for clip-relevance scoring. Loaded lazily on
 # first use; the module auto-falls-back to the hash embedder if the model
-# can't load (missing pytorch, Vercel serverless, no internet on first
-# call, etc). The Vercel top-level requirements.txt intentionally does
-# NOT include this — the function size limit plus cold-start latency
-# make MiniLM impractical in serverless, and the hash fallback keeps
-# Vercel paths functional.
+# cannot load.
 sentence-transformers>=3.0.0
 google-genai>=1.0.0
 tiktoken==0.8.0
@@ -59,24 +54,3 @@ cerebras-cloud-sdk>=1.35.0
 # regex fallback mis-splits on. If this import ever fails, services/sentences.py
 # degrades to the regex splitter automatically.
 pysbd==0.3.4
-# pyannote.audio pinned explicitly because whisperx 3.1.1 officially
-# pairs with pyannote.audio 3.1.1, but whisperx's own install_requires
-# isn't strict enough — on fresh Railway builds pip sometimes resolves
-# pyannote.audio 2.x instead. pyannote 2.x calls
-# `torchaudio.set_audio_backend("soundfile")` at module-init time, and
-# torchaudio>=2.0 (which the rest of the stack wants) REMOVED that
-# method. Result: `import whisperx` raises AttributeError at boot,
-# WhisperX word-level boundary refinement silently disables, logs spam
-# with tracebacks on every clip. Pinning to 3.1.1 drops the removed
-# call. The defensive guard in whisperx_transcribe.py stays as
-# belt-and-suspenders for any future torchaudio / pyannote regressions.
-pyannote.audio==3.1.1
-# WhisperX — Phase 4 selective wav2vec2 forced alignment. Used ONLY when:
-#   (a) Phase-1 faster-whisper alignment falls below match-rate threshold, OR
-#   (b) top-k clip refinement wants ≤50ms boundary precision.
-# Never runs on the default ingest path. Version pinned because whisperx
-# alignment quality regressed across 3.2.x and 3.3.x releases; the kill-switch
-# is `WHISPERX_ENABLED=false`. Lazy-imported from
-# `app/ingestion/whisperx_transcribe.py` so Vercel/test environments without
-# the wheel still run.
-whisperx==3.1.1

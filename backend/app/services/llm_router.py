@@ -1,13 +1,7 @@
-"""Central LLM router: Gemini primary, Groq fallback, Cerebras final fallback.
+"""Central text-LLM router: Gemini primary, Groq fallback, Cerebras final fallback.
 
-Replaces the previous OpenAI-based clients across the backend. Two public
-surfaces:
-
-- ``chat_completion(...)`` — text completion with optional JSON mode and
-  ``llm_cache`` integration.
-- ``transcribe_audio(...)`` — Groq-hosted ``whisper-large-v3`` ASR. Returns
-  a list of ``IngestTranscriptCue`` with word-level timestamps when the API
-  provides them.
+The public ``chat_completion(...)`` surface supports optional JSON mode and
+``llm_cache`` integration.
 
 The Gemini key rotation / builder helpers are copied from
 ``services.topic_cut`` so this module has no runtime dependency on that
@@ -21,7 +15,6 @@ import json
 import logging
 import os
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -42,10 +35,6 @@ GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
 CEREBRAS_DEFAULT_MODEL = os.environ.get("CEREBRAS_MODEL", "llama3.1-8b").strip() or "llama3.1-8b"
 OLLAMA_DEFAULT_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:7b-instruct").strip() or "qwen2.5:7b-instruct"
 OLLAMA_DEFAULT_TIMEOUT = float(os.environ.get("OLLAMA_TIMEOUT", "180") or "180")
-GROQ_WHISPER_MODEL = "whisper-large-v3"
-GROQ_AUDIO_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
-# Groq currently caps audio uploads at 25 MB.
-GROQ_WHISPER_MAX_BYTES = 25 * 1024 * 1024
 
 
 _gemini_key_offset: int = 0
@@ -502,75 +491,3 @@ def chat_completion(
             logger.warning("llm_router.chat_completion: Cerebras failed", exc_info=True)
 
     return None
-
-
-def transcribe_audio(
-    audio_path: Path,
-    *,
-    language: str | None = None,
-    timeout: float = 120.0,
-) -> dict[str, Any] | None:
-    """Transcribe a local audio file via Groq's hosted Whisper endpoint.
-
-    Returns a dict shaped like OpenAI's ``verbose_json`` response:
-    ``{"segments": [...], "words": [...], "text": "..."}``. Returns ``None``
-    if no ``GROQ_API_KEY`` is configured (caller should fall back).
-
-    Raises ``RuntimeError`` on HTTP/transport failures so the caller can
-    wrap with its domain-specific error (e.g. ``TranscriptionError``).
-    """
-    # PR 4: API blackout — Groq Whisper disabled; caller must use local
-    # faster-whisper / WhisperX path (ingestion.whisperx_transcribe).
-    return None
-    api_key = os.environ.get("GROQ_API_KEY") or ""
-    if not api_key:
-        return None
-
-    try:
-        size = audio_path.stat().st_size
-    except OSError as exc:
-        raise RuntimeError(f"audio file is missing: {exc}") from exc
-    if size == 0:
-        raise RuntimeError("audio file is empty")
-    if size > GROQ_WHISPER_MAX_BYTES:
-        raise RuntimeError(
-            f"audio file too large for Groq Whisper (size={size}, max={GROQ_WHISPER_MAX_BYTES})"
-        )
-
-    # Groq accepts repeated "timestamp_granularities[]" form fields. With
-    # files= (multipart/form-data), current httpx versions choke on a
-    # list-of-tuples `data=` — the fix is dict values, using a list for the
-    # duplicate key, which httpx emits as two multipart parts.
-    data: dict[str, Any] = {
-        "model": GROQ_WHISPER_MODEL,
-        "response_format": "verbose_json",
-        "timestamp_granularities[]": ["segment", "word"],
-    }
-    if language:
-        data["language"] = language
-
-    headers = {"Authorization": f"Bearer {api_key}"}
-    try:
-        with open(audio_path, "rb") as fh:
-            files = {"file": (audio_path.name, fh, "audio/wav")}
-            with httpx.Client(timeout=timeout) as client:
-                resp = client.post(
-                    GROQ_AUDIO_ENDPOINT,
-                    headers=headers,
-                    data=data,
-                    files=files,
-                )
-    except httpx.HTTPError as exc:
-        raise RuntimeError(f"Groq Whisper request failed: {exc}") from exc
-
-    if resp.status_code >= 400:
-        raise RuntimeError(
-            f"Groq Whisper returned {resp.status_code}: {resp.text[:400]}"
-        )
-    try:
-        payload = resp.json()
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Groq Whisper returned non-JSON response: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise RuntimeError("Groq Whisper response was not a JSON object")
-    return payload

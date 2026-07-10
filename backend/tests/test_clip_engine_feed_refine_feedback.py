@@ -278,12 +278,86 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
             "confusing+rating=1 feedback must lower reel_b's score",
         )
 
+    def test_feedback_ranking_is_private_to_each_learner(self) -> None:
+        self._patched_engine(_two_clip_engine_out())
+        with db_module.get_conn() as conn:
+            main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=None,
+                num_reels=5,
+                creative_commons_only=False,
+                generation_id="gen-private-feedback",
+            )
+
+        with db_module.get_conn() as conn:
+            baseline_b = main_module.reel_service.ranked_feed(
+                conn,
+                material_id=MATERIAL_ID,
+                generation_id="gen-private-feedback",
+                learner_id="learner-b",
+            )
+        self.assertGreaterEqual(len(baseline_b), 2)
+        target_reel_id = baseline_b[0]["reel_id"]
+        baseline_b_scores = {item["reel_id"]: item["score"] for item in baseline_b}
+
+        with db_module.get_conn(transactional=True) as conn:
+            main_module.reel_service.record_feedback(
+                conn,
+                reel_id=target_reel_id,
+                helpful=False,
+                confusing=True,
+                rating=1,
+                saved=False,
+                learner_id="learner-a",
+            )
+
+        with db_module.get_conn() as conn:
+            after_a = main_module.reel_service.ranked_feed(
+                conn,
+                material_id=MATERIAL_ID,
+                generation_id="gen-private-feedback",
+                learner_id="learner-a",
+            )
+            after_b = main_module.reel_service.ranked_feed(
+                conn,
+                material_id=MATERIAL_ID,
+                generation_id="gen-private-feedback",
+                learner_id="learner-b",
+            )
+
+        after_a_scores = {item["reel_id"]: item["score"] for item in after_a}
+        after_b_scores = {item["reel_id"]: item["score"] for item in after_b}
+        self.assertLess(after_a_scores[target_reel_id], baseline_b_scores[target_reel_id])
+        self.assertEqual(after_b_scores, baseline_b_scores)
+
     # ------------------------------------------------------------------ #
     # T5-3: refinement generation swap
     # ------------------------------------------------------------------ #
     def test_refinement_generation_swap_isolates_generations(self) -> None:
         """_activate_generation updates the head; gen-1 and gen-2 feeds don't bleed."""
         self._patched_engine(_two_clip_engine_out())
+        with db_module.get_conn(transactional=True) as conn:
+            for generation_id in ("gen-refine-1", "gen-refine-2"):
+                db_module.insert(
+                    conn,
+                    "reel_generations",
+                    {
+                        "id": generation_id,
+                        "material_id": MATERIAL_ID,
+                        "concept_id": None,
+                        "request_key": "req-test",
+                        "generation_mode": "slow",
+                        "retrieval_profile": "bootstrap",
+                        "status": "pending",
+                        "source_generation_id": None,
+                        "reel_count": 0,
+                        "created_at": db_module.now_iso(),
+                        "completed_at": None,
+                        "activated_at": None,
+                        "error_text": None,
+                    },
+                )
 
         # --- gen-1 ---
         with db_module.get_conn() as conn:

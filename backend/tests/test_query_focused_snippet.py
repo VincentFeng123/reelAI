@@ -18,7 +18,7 @@ def _cue(start: float, end: float, text: str) -> IngestTranscriptCue:
         end=end,
         text=text,
         words=[],
-        word_source="proportional",
+        word_source="native_caption",
     )
 
 

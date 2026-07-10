@@ -7,6 +7,8 @@ from __future__ import annotations
 import math
 import re
 
+from .metadata import normalize_youtube_video_id
+
 # -- Educational ranking signal ---------------------------------------------- #
 # +1.0 per distinct boost hit, -1.5 per distinct penalty hit, clamped to ±3.0.
 
@@ -93,30 +95,105 @@ def _channel_name(v: dict) -> str:
     return ch or ""
 
 
+def _video_id(value: object) -> str:
+    normalized = normalize_youtube_video_id(value)
+    if normalized:
+        return normalized
+    raw = str(value or "").strip()
+    return raw[3:].strip() if raw.casefold().startswith("yt:") else raw
+
+
+def _integer(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _duration(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _first_nonblank(*values: object) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict]:
     by_id: dict[str, dict] = {}
     for res in per_query or []:
+        seen_in_query: set[str] = set()
         for rank, v in enumerate(res.get("videos") or []):
-            vid = v.get("id")
-            if not vid:
+            vid = _video_id(v.get("id") or v.get("videoId") or v.get("url"))
+            if not vid or vid in seen_in_query:
                 continue
+            seen_in_query.add(vid)
             entry = by_id.get(vid)
+            channel = v.get("channel") if isinstance(v.get("channel"), dict) else {}
+            channel_name = _first_nonblank(
+                _channel_name(v), v.get("channelTitle"), v.get("author_name")
+            )
+            channel_id = _first_nonblank(
+                v.get("channelId"), v.get("channel_id"), channel.get("id")
+            )
+            channel_url = _first_nonblank(
+                v.get("channelUrl"), v.get("channel_url"), channel.get("url")
+            )
+            title = _first_nonblank(v.get("title"))
+            thumbnail = _first_nonblank(
+                v.get("thumbnail"), v.get("thumbnailUrl"), v.get("thumbnail_url")
+            )
+            description = _first_nonblank(v.get("description"))
+            published_at = _first_nonblank(
+                v.get("publishedAt"), v.get("published_at"), v.get("uploadDate"), v.get("upload_date")
+            )
+            duration = _duration(v.get("duration", v.get("duration_sec")))
+            view_count = _integer(v.get("viewCount", v.get("view_count")))
             if entry is None:
-                vc = v.get("viewCount")
                 entry = {
                     "id": vid,
-                    "title": v.get("title") or "(untitled)",
-                    "channel": _channel_name(v),
-                    "thumbnail": v.get("thumbnail") or "",
-                    "duration": v.get("duration") if isinstance(v.get("duration"), (int, float)) else None,
-                    "view_count": vc if isinstance(vc, (int, float)) else (int(vc) if str(vc or "").isdigit() else 0),
-                    "upload_date": v.get("uploadDate") or "",
+                    "title": title or "(untitled)",
+                    "description": description,
+                    "channel": channel_name,
+                    "channel_id": channel_id,
+                    "channel_url": channel_url,
+                    "thumbnail": thumbnail,
+                    "duration": duration,
+                    "view_count": view_count,
+                    "upload_date": published_at,
+                    "published_at": published_at,
                     "url": f"https://www.youtube.com/watch?v={vid}",
                     "match_count": 0,
                     "best_rank": rank,
                     "matched_queries": [],
                 }
                 by_id[vid] = entry
+            else:
+                if entry["title"] == "(untitled)" and title:
+                    entry["title"] = title
+                for field, value in (
+                    ("description", description),
+                    ("channel", channel_name),
+                    ("channel_id", channel_id),
+                    ("channel_url", channel_url),
+                    ("thumbnail", thumbnail),
+                    ("upload_date", published_at),
+                    ("published_at", published_at),
+                ):
+                    if not entry.get(field) and value:
+                        entry[field] = value
+                if entry.get("duration") is None and duration is not None:
+                    entry["duration"] = duration
+                entry["view_count"] = max(int(entry.get("view_count") or 0), view_count)
             entry["match_count"] += 1
             entry["best_rank"] = min(entry["best_rank"], rank)
             q = res.get("query")

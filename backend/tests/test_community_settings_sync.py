@@ -105,11 +105,11 @@ class CommunitySettingsSyncTests(unittest.TestCase):
         self.assertEqual(
             response.json(),
             {
-                "generation_mode": "fast",
+                "generation_mode": "slow",
                 "default_input_mode": "source",
                 "min_relevance_threshold": 0.3,
                 "start_muted": True,
-                "video_pool_mode": "short-first",
+                "creative_commons_only": False,
                 "preferred_video_duration": "any",
                 "target_clip_duration_sec": 55,
                 "target_clip_duration_min_sec": 20,
@@ -136,7 +136,7 @@ class CommunitySettingsSyncTests(unittest.TestCase):
                 "default_input_mode": "topic",
                 "min_relevance_threshold": 0.18,
                 "start_muted": False,
-                "video_pool_mode": "balanced",
+                "creative_commons_only": True,
                 "preferred_video_duration": "medium",
                 "target_clip_duration_sec": 72,
                 "target_clip_duration_min_sec": 45,
@@ -170,7 +170,7 @@ class CommunitySettingsSyncTests(unittest.TestCase):
                 "default_input_mode": "file",
                 "min_relevance_threshold": 0.42,
                 "start_muted": True,
-                "video_pool_mode": "long-form",
+                "creative_commons_only": False,
                 "preferred_video_duration": "long",
                 "target_clip_duration_sec": 120,
                 "target_clip_duration_min_sec": 80,
@@ -185,7 +185,7 @@ class CommunitySettingsSyncTests(unittest.TestCase):
         )
         self.assertEqual(refreshed_response.status_code, 200, refreshed_response.text)
         self.assertEqual(refreshed_response.json()["default_input_mode"], "file")
-        self.assertEqual(refreshed_response.json()["video_pool_mode"], "long-form")
+        self.assertFalse(refreshed_response.json()["creative_commons_only"])
         self.assertEqual(refreshed_response.json()["target_clip_duration_sec"], 120)
 
     def test_settings_are_isolated_per_account(self) -> None:
@@ -210,7 +210,7 @@ class CommunitySettingsSyncTests(unittest.TestCase):
                 "default_input_mode": "topic",
                 "min_relevance_threshold": 0.16,
                 "start_muted": False,
-                "video_pool_mode": "balanced",
+                "creative_commons_only": True,
                 "preferred_video_duration": "medium",
                 "target_clip_duration_sec": 70,
                 "target_clip_duration_min_sec": 40,
@@ -224,7 +224,7 @@ class CommunitySettingsSyncTests(unittest.TestCase):
             headers={COMMUNITY_SESSION_HEADER: secondary_session},
         )
         self.assertEqual(secondary_response.status_code, 200, secondary_response.text)
-        self.assertEqual(secondary_response.json()["generation_mode"], "fast")
+        self.assertEqual(secondary_response.json()["generation_mode"], "slow")
         self.assertEqual(secondary_response.json()["default_input_mode"], "source")
         self.assertEqual(secondary_response.json()["target_clip_duration_sec"], 55)
 

@@ -44,7 +44,6 @@ class ReelsGenerateRequest(BaseModel):
     creative_commons_only: bool = False
     generation_mode: Literal["slow", "fast"] = "slow"
     min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
-    video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first"
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
     target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
     target_clip_duration_min_sec: int | None = Field(default=None, ge=15, le=180)
@@ -101,71 +100,55 @@ class ReelOut(BaseModel):
     clip_duration_sec: float | None = None
     difficulty: float = 0.5
     informativeness: float = 0.6
+    duration_preference_met: bool = True
+    duration_fit: Literal["in_range", "shorter", "longer"] = "in_range"
+    model_used: str | None = None
+    quality_degraded: bool = False
+    selected_cue_ids: list[str] = Field(default_factory=list)
 
 
 class ReelsGenerateResponse(BaseModel):
     reels: list[ReelOut]
     generation_id: str | None = None
     response_profile: str | None = None
-    refinement_job_id: str | None = None
-    refinement_status: str | None = None
 
 
-class AdminSimulationRequest(BaseModel):
-    topics: list[dict] | None = None
-    num_reels: int = 3
+class GenerationJobQueuedResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "running"]
+    status_url: str
+    stream_url: str
 
 
-class SimulationTopicResult(BaseModel):
-    subject: str = ""
-    tier: str = ""
-    reels_count: int = 0
-    educational_count: int = 0
-    on_topic_count: int = 0
-    clean_start_count: int = 0
-    clean_end_count: int = 0
-    error: str = ""
-    clips: list[dict] = Field(default_factory=list)
-
-
-class SimulationResponse(BaseModel):
-    topics_tested: int = 0
-    total_clips: int = 0
-    educational_pct: float = 0.0
-    on_topic_pct: float = 0.0
-    clean_start_pct: float = 0.0
-    clean_end_pct: float = 0.0
-    per_topic: list[SimulationTopicResult] = Field(default_factory=list)
-
-
-class AdminDiagnoseTopicRequest(BaseModel):
-    subject: str
-    num_reels: int = 3
-
-
-class DiagnosticStageResult(BaseModel):
-    stage: str = ""
-    candidate_count: int = 0
-    details: list[dict] = Field(default_factory=list)
-
-
-class DiagnoseTopicResponse(BaseModel):
-    subject: str = ""
-    queries_generated: list[str] = Field(default_factory=list)
-    stages: list[DiagnosticStageResult] = Field(default_factory=list)
-    final_reel_count: int = 0
-    error: str = ""
-    retrieval_metrics: dict = Field(default_factory=dict)
-    retrieval_runs: list[dict] = Field(default_factory=list)
+class GenerationJobStatusResponse(BaseModel):
+    job_id: str
+    status: Literal["queued", "running", "completed", "partial", "exhausted", "failed", "cancelled"]
+    phase: str = ""
+    progress: float = 0.0
+    attempt_count: int = 0
+    max_attempts: int = 2
+    lease_expires_at: str | None = None
+    heartbeat_at: str | None = None
+    deadline_at: str | None = None
+    material_id: str
+    request_key: str
+    result_generation_id: str | None = None
+    model_used: str | None = None
+    quality_degraded: bool = False
+    usage: dict = Field(default_factory=dict)
+    error: dict | None = None
+    reels: list[ReelOut] = Field(default_factory=list)
+    created_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
 
 
 class ReelsCanGenerateResponse(BaseModel):
-    can_generate: bool
-    blocked_by_settings: bool = False
-    estimated_success_rate: float = 0.0
-    total_probed: int = 0
-    passed_all_filters: int = 0
-    primary_bottleneck: str = ""
+    availability: Literal["available", "unavailable", "unknown"]
+    evidence_source: Literal["cache", "provider", "none"]
+    evidence_age_sec: float | None = None
+    candidate_count: int = 0
+    filters_applied: dict = Field(default_factory=dict)
     message: str = ""
 
 
@@ -174,11 +157,11 @@ class ReelsCanGenerateAnyRequest(BaseModel):
     creative_commons_only: bool = False
     generation_mode: Literal["slow", "fast"] = "slow"
     min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
-    video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first"
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
     target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
     target_clip_duration_min_sec: int | None = Field(default=None, ge=15, le=180)
     target_clip_duration_max_sec: int | None = Field(default=None, ge=15, le=180)
+    multi_platform_search: bool = False
 
     @model_validator(mode="after")
     def _validate_clip_bounds(self) -> "ReelsCanGenerateAnyRequest":
@@ -194,15 +177,12 @@ class ReelsCanGenerateAnyRequest(BaseModel):
 
 
 class ReelsCanGenerateAnyResponse(BaseModel):
-    can_generate_any: bool
-    topics_checked: int = 0
-    topics_can_generate: int = 0
-    blocked_by_settings_topics: int = 0
-    no_source_topics: int = 0
-    estimated_success_rate: float = 0.0
-    total_probed: int = 0
-    passed_all_filters: int = 0
-    primary_bottleneck: str = ""
+    availability: Literal["available", "unavailable", "unknown"]
+    evidence_source: Literal["cache", "provider", "none"]
+    evidence_age_sec: float | None = None
+    candidate_count: int = 0
+    filters_applied: dict = Field(default_factory=dict)
+    materials_checked: int = 0
     message: str = ""
 
 
@@ -217,30 +197,14 @@ class FeedResponse(BaseModel):
     reels: list[ReelOut]
     generation_id: str | None = None
     response_profile: str | None = None
-    refinement_job_id: str | None = None
-    refinement_status: str | None = None
-    # The generation_mode the server actually used. When the client requested
-    # "slow" but the server was running in serverless mode (no long-running
-    # workers available), the server forces "fast" and reports it here so the
-    # UI can indicate the downgrade.
+    generation_job_id: str | None = None
+    generation_job_status: str | None = None
+    # The durable worker profile used for this request.
     effective_generation_mode: str | None = None
-    # True when the server downgraded the client's requested mode. Clients
-    # can show an advisory; clients that don't care can ignore it.
+    # Retained for response compatibility; Railway workers do not override it.
     generation_mode_overridden: bool = False
     knowledge_level: str | None = None
     effective_level_target: float | None = None
-
-
-class RefinementStatusResponse(BaseModel):
-    job_id: str
-    status: str
-    material_id: str
-    request_key: str
-    source_generation_id: str
-    result_generation_id: str | None = None
-    active_generation_id: str | None = None
-    completed_at: str | None = None
-    error: str | None = None
 
 
 class FeedbackRequest(BaseModel):
@@ -570,7 +534,7 @@ class CommunitySettingsPayload(BaseModel):
     default_input_mode: Literal["topic", "source", "file"] = "source"
     min_relevance_threshold: float = Field(default=0.3, ge=0.0, le=0.6)
     start_muted: bool = True
-    video_pool_mode: Literal["short-first", "balanced", "long-form"] = "short-first"
+    creative_commons_only: bool = False
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
     target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
     target_clip_duration_min_sec: int = Field(default=20, ge=15, le=180)

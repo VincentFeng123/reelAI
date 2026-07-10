@@ -1,76 +1,380 @@
-"""Supadata transcript API client.
-
-GET https://api.supadata.ai/v1/transcript?url=...&mode=auto  (header x-api-key)
-Returns chunks [{text, offset(ms), duration(ms), lang}]. Long videos may return
-HTTP 202 {jobId}; we poll /v1/transcript/{jobId} until it completes.
-
-NOTE: uses httpx, not urllib — urllib.request capitalizes header names
-("x-api-key" → "X-api-key"), which Supadata's auth rejects as missing.
-"""
+"""Supadata native-caption client backed by validated transcript artifacts."""
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timezone
+from typing import Any
 
 import httpx
 
 from . import config
-from .errors import PipelineError
-from ..cancellation import run_cancellable, wait_with_probe
+from ..cancellation import raise_if_cancelled, run_cancellable, sleep_with_probe
+from ..errors import (
+    CaptionsUnavailableError,
+    ProviderAuthenticationError,
+    ProviderError,
+    ProviderQuotaError,
+    ProviderRateLimitError,
+    ProviderRequestError,
+    ProviderTransientError,
+)
+from ..metadata import normalize_youtube_video_id
+from ..provider_cache import (
+    DEFAULT_PROVIDER_CACHE,
+    TRANSCRIPT_SCHEMA_VERSION,
+    ProviderCacheStore,
+    TranscriptArtifact,
+    normalize_language,
+    transcript_artifact_key,
+    validate_transcript_payload,
+)
+from ..provider_runtime import (
+    GenerationContext,
+    MAX_PROVIDER_RETRIES,
+    bounded_retry_after,
+)
 
 
-async def _get_async(
-    path: str,
-    params: dict | None = None,
-    should_cancel: Callable[[], bool] | None = None,
-) -> tuple[int, dict]:
-    if not config.SUPADATA_API_KEY:
-        raise PipelineError(
-            "SUPADATA_API_KEY is not set. Add it to .env (get a key at https://supadata.ai)."
-        )
-    headers = {"x-api-key": config.SUPADATA_API_KEY, "Accept": "application/json"}
+def _error_detail(response: httpx.Response) -> str:
     try:
-        async with httpx.AsyncClient(timeout=90.0) as client:
-            r = await client.get(
-                f"{config.SUPADATA_BASE}{path}", params=params, headers=headers
-            )
-    except httpx.RequestError as e:
-        raise PipelineError(f"Could not reach Supadata: {e}")
-
-    if r.status_code in (401, 403):
-        raise PipelineError("Supadata API key is missing or invalid.")
-    if r.status_code == 404:
-        raise PipelineError("No transcript available for this video (Supadata 404).")
-    if r.status_code == 429:
-        raise PipelineError("Supadata rate limit/quota hit — try again shortly.")
-    if r.status_code >= 400:
-        raise PipelineError(f"Supadata error {r.status_code}: {r.text[:300]}")
-    try:
-        return r.status_code, r.json()
+        value = response.json()
     except Exception:
-        raise PipelineError("Supadata returned a non-JSON response.")
+        return str(getattr(response, "text", "") or "")[:300]
+    if isinstance(value, dict):
+        return str(value.get("message") or value.get("error") or "")[:300]
+    return ""
 
 
-def _get(
-    path: str,
-    params: dict | None = None,
-    should_cancel: Callable[[], bool] | None = None,
-) -> tuple[int, dict]:
-    return run_cancellable(
-        lambda: _get_async(path, params=params, should_cancel=should_cancel),
-        should_cancel,
+def _failure(
+    response: httpx.Response,
+    *,
+    retry_after: float | None = None,
+) -> ProviderError:
+    status = int(response.status_code)
+    kwargs = dict(
+        provider="supadata",
+        operation="transcript",
+        status_code=status,
+        detail=_error_detail(response) or None,
     )
+    if status in (401, 403):
+        return ProviderAuthenticationError("Supadata authentication failed.", **kwargs)
+    if status == 402:
+        return ProviderQuotaError("Supadata quota is exhausted.", **kwargs)
+    if status == 404:
+        return CaptionsUnavailableError("Native captions are unavailable for this video.", **kwargs)
+    if status == 429:
+        return ProviderRateLimitError(
+            "Supadata transcript retrieval is rate limited.",
+            retry_after_sec=retry_after,
+            **kwargs,
+        )
+    if 500 <= status <= 599:
+        return ProviderTransientError("Supadata transcript retrieval is unavailable.", **kwargs)
+    return ProviderRequestError(f"Supadata rejected the transcript request ({status}).", **kwargs)
 
 
-def _normalize(content) -> list[dict]:
-    chunks: list[dict] = []
-    for c in content or []:
-        offset = float(c.get("offset", 0)) / 1000.0
-        dur = float(c.get("duration", 0)) / 1000.0
-        text = (c.get("text") or "").strip()
+async def _request(
+    client: httpx.AsyncClient,
+    path: str,
+    *,
+    params: dict[str, Any] | None,
+    api_key: str,
+    should_cancel: Callable[[], bool] | None,
+    context: GenerationContext | None,
+    reserve_budget: bool,
+) -> tuple[int, dict[str, Any]]:
+    for retry_index in range(MAX_PROVIDER_RETRIES + 1):
+        raise_if_cancelled(should_cancel)
+        attempt = retry_index + 1
+        if reserve_budget and context is not None:
+            context.reserve("transcript")
+        try:
+            response = await client.get(
+                f"{config.SUPADATA_BASE}{path}",
+                params=params,
+                headers={"x-api-key": api_key, "Accept": "application/json"},
+            )
+        except httpx.RequestError as exc:
+            if context is not None:
+                context.record_http(
+                    provider="supadata",
+                    operation="transcript",
+                    attempt=attempt,
+                    status_code=None,
+                    error_code="provider_transient",
+                    metadata={"poll": not reserve_budget},
+                )
+            if retry_index < MAX_PROVIDER_RETRIES:
+                await sleep_with_probe(min(30.0, 1.2 * attempt), should_cancel)
+                continue
+            raise ProviderTransientError(
+                "Could not reach Supadata transcript retrieval.",
+                provider="supadata",
+                operation="transcript",
+                detail=str(exc),
+            ) from exc
+
+        status = int(response.status_code)
+        error_code = ""
+        if status == 429:
+            error_code = "provider_rate_limited"
+        elif status >= 500:
+            error_code = "provider_transient"
+        elif status >= 400:
+            error_code = _failure(response).code
+        if context is not None:
+            context.record_http(
+                provider="supadata",
+                operation="transcript",
+                attempt=attempt,
+                status_code=status,
+                headers=response.headers,
+                error_code=error_code,
+                metadata={"poll": not reserve_budget},
+            )
+        if status == 429 or 500 <= status <= 599:
+            retry_after = bounded_retry_after(response.headers)
+            if retry_index < MAX_PROVIDER_RETRIES:
+                await sleep_with_probe(
+                    retry_after if retry_after is not None else min(30.0, 1.2 * attempt),
+                    should_cancel,
+                )
+                continue
+            raise _failure(response, retry_after=retry_after)
+        if status >= 400:
+            raise _failure(response)
+        try:
+            data = response.json()
+        except Exception as exc:
+            raise ProviderRequestError(
+                "Supadata returned invalid transcript JSON.",
+                provider="supadata",
+                operation="transcript",
+                status_code=status,
+            ) from exc
+        if not isinstance(data, dict):
+            raise ProviderRequestError(
+                "Supadata returned an invalid transcript payload.",
+                provider="supadata",
+                operation="transcript",
+                status_code=status,
+            )
+        return status, data
+    raise AssertionError("unreachable")
+
+
+def _normalize_content(
+    content: Any,
+    *,
+    video_id: str,
+    returned_language: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(content, list):
+        return []
+    cues: list[dict[str, Any]] = []
+    for index, raw in enumerate(content):
+        if not isinstance(raw, dict):
+            return []
+        try:
+            offset_ms = float(raw.get("offset"))
+            duration_ms = float(raw.get("duration"))
+        except (TypeError, ValueError):
+            return []
+        text = " ".join(str(raw.get("text") or "").split()).strip()
         if not text:
             continue
-        chunks.append({"text": text, "start": offset, "end": offset + dur})
-    return chunks
+        cues.append(
+            {
+                "cue_id": str(raw.get("id") or f"{video_id}:cue:{index}"),
+                "text": text,
+                "start": offset_ms / 1000.0,
+                "end": (offset_ms + duration_ms) / 1000.0,
+                "lang": normalize_language(str(raw.get("lang") or returned_language))
+                or returned_language,
+            }
+        )
+    return cues
+
+
+async def _fetch_transcript_artifact_async(
+    url: str,
+    lang: str,
+    should_cancel: Callable[[], bool] | None,
+    *,
+    context: GenerationContext | None,
+    cache_store: ProviderCacheStore | None,
+) -> TranscriptArtifact:
+    video_id = normalize_youtube_video_id(url)
+    if video_id is None:
+        raise ProviderRequestError(
+            "A canonical YouTube video URL or id is required for transcript retrieval.",
+            provider="supadata",
+            operation="transcript",
+        )
+    store = cache_store or (context.cache_store if context is not None else None) or DEFAULT_PROVIDER_CACHE
+    if store.is_video_tombstoned(video_id):
+        raise ProviderRequestError(
+            "This YouTube video is blocked and cannot be retrieved.",
+            provider="supadata",
+            operation="transcript",
+        )
+    requested_language = normalize_language(lang) or "en"
+    cached = store.get_transcript(
+        video_id=video_id,
+        provider="supadata",
+        requested_language=requested_language,
+        native_mode=True,
+        schema_version=TRANSCRIPT_SCHEMA_VERSION,
+    )
+    if cached is not None:
+        return cached
+    api_key = str(config.SUPADATA_API_KEY or "").strip()
+    if not api_key:
+        from ..config import require_supadata_key
+
+        api_key = require_supadata_key()
+
+    params = {
+        "url": f"https://www.youtube.com/watch?v={video_id}",
+        "text": "false",
+        "mode": "native",
+        "lang": requested_language,
+    }
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        status, data = await _request(
+            client,
+            "/transcript",
+            params=params,
+            api_key=api_key,
+            should_cancel=should_cancel,
+            context=context,
+            reserve_budget=True,
+        )
+        if status == 202 or (data.get("jobId") and "content" not in data):
+            job_id = str(data.get("jobId") or "").strip()
+            if not job_id:
+                raise ProviderRequestError(
+                    "Supadata returned a transcript job without an id.",
+                    provider="supadata",
+                    operation="transcript",
+                )
+            for _ in range(60):
+                await sleep_with_probe(3.0, should_cancel)
+                _, polled = await _request(
+                    client,
+                    f"/transcript/{job_id}",
+                    params=None,
+                    api_key=api_key,
+                    should_cancel=should_cancel,
+                    context=context,
+                    reserve_budget=False,
+                )
+                state = str(polled.get("status") or polled.get("state") or "").lower()
+                if polled.get("content") is not None or state in {"completed", "succeeded", "done"}:
+                    data = polled
+                    break
+                if state in {"failed", "error", "cancelled"}:
+                    raise CaptionsUnavailableError(
+                        "Supadata could not retrieve native captions for this video.",
+                        provider="supadata",
+                        operation="transcript",
+                        detail=str(polled.get("error") or state),
+                    )
+            else:
+                raise ProviderTransientError(
+                    "Supadata transcript retrieval timed out.",
+                    provider="supadata",
+                    operation="transcript",
+                )
+
+    content = data.get("content")
+    if isinstance(content, str):
+        raise CaptionsUnavailableError(
+            "Supadata native captions did not include cue timestamps.",
+            provider="supadata",
+            operation="transcript",
+        )
+    returned_language = normalize_language(
+        str(data.get("lang") or data.get("language") or "")
+    )
+    if not returned_language and isinstance(content, list):
+        returned_language = next(
+            (
+                normalize_language(str(cue.get("lang") or ""))
+                for cue in content
+                if isinstance(cue, dict) and cue.get("lang")
+            ),
+            "",
+        )
+    returned_language = returned_language or requested_language
+    cues = _normalize_content(
+        content,
+        video_id=video_id,
+        returned_language=returned_language,
+    )
+    if not cues:
+        raise CaptionsUnavailableError(
+            "Supadata returned no usable native caption cues.",
+            provider="supadata",
+            operation="transcript",
+        )
+    duration_sec = float(cues[-1]["end"])
+    created_at = datetime.now(timezone.utc).isoformat()
+    artifact = validate_transcript_payload(
+        {
+            "artifact_key": transcript_artifact_key(
+                video_id=video_id,
+                provider="supadata",
+                requested_language=requested_language,
+                returned_language=returned_language,
+                native_mode=True,
+            ),
+            "video_id": video_id,
+            "provider": "supadata",
+            "requested_language": requested_language,
+            "returned_language": returned_language,
+            "native_mode": True,
+            "schema_version": TRANSCRIPT_SCHEMA_VERSION,
+            "segments": cues,
+            "duration_sec": duration_sec,
+            "created_at": created_at,
+        }
+    )
+    if artifact is None:
+        raise ProviderRequestError(
+            "Supadata returned malformed or non-monotonic native caption cues.",
+            provider="supadata",
+            operation="transcript",
+        )
+    if store.is_video_tombstoned(video_id):
+        raise ProviderRequestError(
+            "This YouTube video was blocked during retrieval.",
+            provider="supadata",
+            operation="transcript",
+        )
+    store.put_transcript(artifact)
+    return artifact
+
+
+def fetch_transcript_artifact(
+    url: str,
+    lang: str = "en",
+    should_cancel: Callable[[], bool] | None = None,
+    *,
+    context: GenerationContext | None = None,
+    cache_store: ProviderCacheStore | None = None,
+) -> TranscriptArtifact:
+    return run_cancellable(
+        lambda: _fetch_transcript_artifact_async(
+            url,
+            lang,
+            should_cancel,
+            context=context,
+            cache_store=cache_store,
+        ),
+        should_cancel,
+    )
 
 
 def fetch_transcript(
@@ -78,35 +382,16 @@ def fetch_transcript(
     lang: str = "en",
     chunk_size: int | None = None,
     should_cancel: Callable[[], bool] | None = None,
-) -> list[dict]:
-    """Return [{text, start(sec), end(sec)}] ordered by time."""
-    params = {"url": url, "text": "false", "mode": "auto"}
-    if lang:
-        params["lang"] = lang
-    if chunk_size:
-        params["chunkSize"] = str(chunk_size)
-
-    status, data = _get("/transcript", params, should_cancel)
-
-    # Async job → poll
-    if status == 202 or (isinstance(data, dict) and data.get("jobId") and "content" not in data):
-        job_id = data["jobId"]
-        for _ in range(60):  # up to ~3 min
-            wait_with_probe(3, should_cancel)
-            _, jd = _get(f"/transcript/{job_id}", should_cancel=should_cancel)
-            state = (jd.get("status") or jd.get("state") or "").lower()
-            if jd.get("content") is not None or state in ("completed", "succeeded", "done"):
-                data = jd
-                break
-            if state in ("failed", "error", "cancelled"):
-                raise PipelineError(f"Supadata transcript job failed: {jd.get('error', state)}")
-        else:
-            raise PipelineError("Supadata transcript timed out.")
-
-    content = data.get("content") if isinstance(data, dict) else None
-    if isinstance(content, str):
-        raise PipelineError("Supadata returned plain text without timestamps.")
-    chunks = _normalize(content)
-    if not chunks:
-        raise PipelineError("Supadata returned an empty transcript for this video.")
-    return chunks
+    *,
+    context: GenerationContext | None = None,
+    cache_store: ProviderCacheStore | None = None,
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper returning native cue dictionaries."""
+    del chunk_size  # Native caption timing must not be provider-rechunked.
+    return fetch_transcript_artifact(
+        url,
+        lang,
+        should_cancel,
+        context=context,
+        cache_store=cache_store,
+    ).segments

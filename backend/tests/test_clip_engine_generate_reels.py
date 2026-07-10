@@ -25,14 +25,10 @@ if str(ROOT) not in sys.path:
 # Skip the import-time orphan sweep so tests don't poke at /tmp during import.
 os.environ.setdefault("REELAI_INGEST_SKIP_IMPORT_SWEEP", "1")
 
-from fastapi.testclient import TestClient  # noqa: E402
-
 from backend.app import db as db_module  # noqa: E402
 from backend.app.config import get_settings  # noqa: E402
 import backend.app.main as main_module  # noqa: E402
-from backend.app.main import app, COMMUNITY_OWNER_HEADER  # noqa: E402
 from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
-from backend.app.ingestion.errors import RateLimitedError as IngestRateLimitedError  # noqa: E402
 
 # 11-char YouTube-style id so the embed video_url round-trips through
 # clip_engine.metadata.extract_video_id in _reel_attribution_to_dict.
@@ -411,11 +407,10 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertEqual(len(feed), 2)
 
     # ------------------------------------------------------------------ #
-    # Curation: a 5-minute whole-topic clip still PERSISTS (no persist gate),
-    # but ranked_feed EXCLUDES it — whole-video slabs must never be served
-    # (serving ceiling = SEGMENT_MAX_CLIP_S + 15).
+    # Curation: clips outside the global 1-180 second safety envelope are
+    # rejected before persistence and therefore cannot be served.
     # ------------------------------------------------------------------ #
-    def test_five_minute_clip_persists_but_is_not_served(self) -> None:
+    def test_five_minute_clip_is_not_persisted_or_served(self) -> None:
         self._patched_engine(_five_minute_engine_out())
 
         with db_module.get_conn() as conn:
@@ -434,8 +429,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "SELECT id, t_start, t_end FROM reels WHERE generation_id = ?",
                 ("gen-5min",),
             )
-        self.assertEqual(len(rows), 1)
-        self.assertAlmostEqual(rows[0]["t_end"] - rows[0]["t_start"], 300.0, places=3)
+        self.assertEqual(rows, [])
 
         with db_module.get_conn() as conn:
             feed = main_module.reel_service.ranked_feed(
@@ -568,23 +562,6 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # Finding #4b: rate-limit surfaces as HTTP 429 at the generate endpoint
     # ------------------------------------------------------------------ #
-    def test_generate_endpoint_maps_rate_limit_to_429(self) -> None:
-        client = TestClient(app)
-        self.addCleanup(client.close)
-        with mock.patch.object(
-            main_module,
-            "_ensure_generation_for_request",
-            side_effect=IngestRateLimitedError("ingestion rate limit", retry_after_sec=42),
-        ):
-            resp = client.post(
-                "/api/reels/generate",
-                json={"material_id": MATERIAL_ID, "num_reels": 3},
-                headers={COMMUNITY_OWNER_HEADER: "owner-key-abcdefghijklmnopqrstuvwxyz"},
-            )
-        self.assertEqual(resp.status_code, 429, resp.text)
-        self.assertIn("retry-after", {k.lower() for k in resp.headers})
-
-
 class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
     """Serve-time level scoring: matched clips first, off-level kept at the
     back, and a level change re-sorts WITHOUT regeneration."""

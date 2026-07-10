@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 
-from .errors import SearchError, ClipError
+from .errors import ProviderConfigurationError
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -25,6 +25,7 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 # SEGMENT_MODEL falls back to TOPIC_MODEL, NOT to the cheaper GEMINI_MODEL.
 TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 SEGMENT_MODEL = os.environ.get("SEGMENT_MODEL", TOPIC_MODEL)
+SEGMENT_FALLBACK_MODEL = os.environ.get("SEGMENT_FALLBACK_MODEL", "").strip()
 # Query-expansion uses the cheaper lite tier; segmentation keeps its own model.
 EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "gemini-2.5-flash-lite")
 
@@ -39,6 +40,9 @@ SEGMENT_INFORMATIVENESS_MIN = float(os.environ.get("SEGMENT_INFORMATIVENESS_MIN"
 SEGMENT_TOPIC_RELEVANCE_MIN = float(os.environ.get("SEGMENT_TOPIC_RELEVANCE_MIN", "0.6"))
 SEGMENT_MAX_CLIPS = int(os.environ.get("SEGMENT_MAX_CLIPS", "40"))
 SEGMENT_MAX_OUTPUT_TOKENS = int(os.environ.get("SEGMENT_MAX_OUTPUT_TOKENS", "24576"))
+SEGMENT_MAX_INPUT_TOKENS = int(os.environ.get("SEGMENT_MAX_INPUT_TOKENS", "12000"))
+SEGMENT_BATCH_MAX_CUES = int(os.environ.get("SEGMENT_BATCH_MAX_CUES", "160"))
+SEGMENT_BATCH_OVERLAP_CUES = int(os.environ.get("SEGMENT_BATCH_OVERLAP_CUES", "4"))
 
 CLIP_SEARCH_MAX_VIDEOS = int(os.environ.get("CLIP_SEARCH_MAX_VIDEOS", "5"))
 SEARCH_BREADTH = int(os.environ.get("CLIP_SEARCH_BREADTH", "6"))
@@ -46,11 +50,17 @@ SEARCH_BREADTH = int(os.environ.get("CLIP_SEARCH_BREADTH", "6"))
 
 def require_supadata_key() -> str:
     if not SUPADATA_API_KEY:
-        raise SearchError("SUPADATA_API_KEY is not set.")
+        raise ProviderConfigurationError(
+            "SUPADATA_API_KEY is not set.", provider="supadata", operation="search"
+        )
     return SUPADATA_API_KEY
 
 
 def require_gemini_key() -> str:
     if not GEMINI_API_KEY:
-        raise ClipError("GEMINI_API_KEY (or GOOGLE_API_KEY) is not set.")
+        raise ProviderConfigurationError(
+            "GEMINI_API_KEY (or GOOGLE_API_KEY) is not set.",
+            provider="gemini",
+            operation="segmentation",
+        )
     return GEMINI_API_KEY

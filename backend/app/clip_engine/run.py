@@ -8,7 +8,13 @@ from . import config
 from .cancellation import raise_if_cancelled
 from .clipper import embed
 from .clipper.pipeline import gemini_segment
-from .errors import CancellationError, ClipError, TranscriptError, UnsupportedURLError
+from .errors import (
+    CancellationError,
+    ClipError,
+    ProviderError,
+    TranscriptError,
+    UnsupportedURLError,
+)
 from .metadata import extract_video_id
 
 
@@ -18,6 +24,8 @@ def _transcribe(url: str, video_id: str, settings: dict) -> dict:
     try:
         return transcribe_supadata(url, video_id, settings)
     except CancellationError:
+        raise
+    except ProviderError:
         raise
     except Exception as exc:  # normalize to engine error
         raise TranscriptError(f"Supadata transcript failed for {video_id}: {exc}") from exc
@@ -34,7 +42,8 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     settings.setdefault("segment_min_clip_s", config.SEGMENT_MIN_CLIP_S)
     settings["should_cancel"] = should_cancel
 
-    transcript = _transcribe(url, video_id, settings)
+    canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+    transcript = _transcribe(canonical_url, video_id, settings)
     raise_if_cancelled(should_cancel)
     if not (transcript.get("segments")):
         raise TranscriptError(f"Empty transcript for {video_id}")
@@ -42,6 +51,8 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     try:
         clips, notes = gemini_segment.segment_clips(transcript, settings, topic=topic or "")
     except CancellationError:
+        raise
+    except ProviderError:
         raise
     except Exception as exc:
         raise ClipError(f"Gemini segmentation failed for {video_id}: {exc}") from exc

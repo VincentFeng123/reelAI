@@ -1,34 +1,32 @@
-"""ReelAI's one-pass Gemini educational clip selector.
-
-A single Gemini pass reads the timestamped supadata transcript and returns every
-substantive teaching topic as a clip {title, start, end}. No punctuation restoration,
-no structure understanding, no local-Whisper refine, no multimodal — the whole
-``understand → assemble → refine`` chain is replaced by one comprehension call.
-
-Boundaries: the model picks a start/end transcript LINE (a real caption-chunk with a
-real timestamp) plus a short opening/closing QUOTE. Quote matching supplies the
-semantic boundary; nearby caption gaps provide a cheap, audio-free pause boundary.
-"""
+"""Gemini educational segmentation over exact native-caption cue boundaries."""
 from __future__ import annotations
 
 import re
+import unicodedata
+from collections.abc import Iterable
 from typing import Callable, Optional
 
 from pydantic import BaseModel, Field
 
 from .. import config
-from ..llm import llm_json
+from ..llm import llm_json_result
 
 ProgressCb = Optional[Callable[[float, str], None]]
+_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 
-_WORD_RE = re.compile(r"[a-z0-9']+", re.IGNORECASE)
+
+class _Assessment(BaseModel):
+    prompt: str = ""
+    options: list[str] = Field(default_factory=list)
+    correct_index: int | float | bool | str | None = None
+    explanation: str = ""
+    cue_ids: list[str] = Field(default_factory=list)
 
 
-# ── LLM schema ───────────────────────────────────────────────────────────────
 class _Topic(BaseModel):
     title: str
-    start_line: int
-    end_line: int
+    start_line: int = Field(strict=True)
+    end_line: int = Field(strict=True)
     start_quote: str
     end_quote: str
     reason: str = ""
@@ -37,152 +35,101 @@ class _Topic(BaseModel):
     informativeness: Optional[float] = None
     topic_relevance: Optional[float] = None
     self_contained: Optional[bool] = None
-    difficulty: float = 0.5   # 0 = assumes no prior knowledge, 1 = expert-level
+    difficulty: float = 0.5
     summary: str = ""
+    summary_cue_ids: list[str] = Field(default_factory=list)
     takeaways: list[str] = Field(default_factory=list)
+    takeaway_cue_ids: list[list[str]] = Field(default_factory=list)
     match_reason: str = ""
-    # Keep this deliberately loose. A malformed assessment must be discarded
-    # without making Pydantic reject the otherwise usable clip proposal.
-    assessment: dict | None = None
-
-
-# Only explicitly educational kinds ship; missing and novel labels fail closed.
-_ACCEPT_KINDS = {"content", "educational"}
-
-
-def _norm_informativeness(value: float) -> float:
-    """Clamp to [0, 1], tolerating models that answer on a 0-10 or 0-100 scale
-    (7 → 0.7, 85 → 0.85) instead of saturating every mis-scaled score to 1.0."""
-    v = float(value)
-    if v > 10.0:
-        v = v / 100.0
-    elif v > 1.0:
-        v = v / 10.0
-    return max(0.0, min(1.0, v))
-
-
-def _norm_optional_confidence(value: Optional[float]) -> Optional[float]:
-    if value is None:
-        return None
-    return _norm_informativeness(value)
+    match_reason_cue_ids: list[str] = Field(default_factory=list)
+    assessment: _Assessment | None = None
 
 
 class _Plan(BaseModel):
     topics: list[_Topic]
 
 
-def _mmss(s: float) -> str:
-    s = max(0.0, float(s))
-    return f"{int(s // 60):02d}:{int(s % 60):02d}"
+_ACCEPT_KINDS = {"content", "educational"}
 
 
-def _prompts(lines: str, n: int, topic: str = "") -> "tuple[str, str]":
+def _norm_informativeness(value: float) -> float:
+    value = float(value)
+    if value > 10.0:
+        value /= 100.0
+    elif value > 1.0:
+        value /= 10.0
+    return max(0.0, min(1.0, value))
+
+
+def _norm_optional_confidence(value: Optional[float]) -> Optional[float]:
+    return None if value is None else _norm_informativeness(value)
+
+
+def _mmss(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+
+
+def _tokens(value: object) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return [match.group(0) for match in _TOKEN_RE.finditer(normalized)]
+
+
+def _contains_tokens(text: str, quote: str) -> bool:
+    source = _tokens(text)
+    target = _tokens(quote)
+    if not source or not target or len(target) > len(source):
+        return False
+    width = len(target)
+    return any(source[index:index + width] == target for index in range(len(source) - width + 1))
+
+
+def _cue_id(segment: dict, index: int) -> str:
+    return str(segment.get("cue_id") or f"cue-{index}").strip()
+
+
+def _with_cue_ids(segments: Iterable[dict], *, offset: int = 0) -> list[dict]:
+    result: list[dict] = []
+    for local_index, segment in enumerate(segments):
+        copied = dict(segment)
+        copied["cue_id"] = _cue_id(copied, offset + local_index)
+        result.append(copied)
+    return result
+
+
+def _prompts(lines: str, n: int, topic: str = "") -> tuple[str, str]:
     topic_rule = ""
     if topic.strip():
         topic_rule = (
-            f"The viewer is studying: {topic.strip()!r}. Only return clips that TEACH "
-            "material relevant to that topic; skip unrelated sections entirely.\n"
+            f"The viewer is studying {topic.strip()!r}. Return only clips that teach "
+            "material relevant to that context.\n"
         )
     system = (
-        "You select self-contained CLIPS from a lecture/talk transcript for a short-form "
-        "learning feed. First read and understand the WHOLE transcript. Then pick the "
-        "SUBSTANTIVE teaching moments — one coherent idea, concept, worked example, or "
-        "section, taught from its introduction through to its natural conclusion. Skip pure "
-        "filler (greetings, admin, 'like and subscribe', tangents), course-logistics intros, "
-        "and wrap-up outros.\n" + topic_rule +
-        "For every clip return: title; start_line (the line where the idea is INTRODUCED); "
-        "end_line (the line where it CLOSES); start_quote (the first ~6 words spoken at the "
-        "start, copied verbatim from that line); end_quote (the last ~6 words, verbatim); a "
-        "short reason; kind — one of content|educational|intro|outro|admin|promo; "
-        "informativeness — 0.0 to 1.0, how much a motivated student learns from this clip "
-        "ALONE; topic_relevance — 0.0 to 1.0, how directly it teaches the viewer's topic; "
-        "self_contained — true only when it makes sense without omitted context; "
-        "difficulty — 0.0 to 1.0, the prior knowledge the clip ASSUMES (0.1: no background, "
-        "first exposure; 0.5: comfortable with the basics; 0.9: graduate/expert material); "
-        "summary — a grounded 1-2 sentence explanation of what this exact clip teaches; "
-        "takeaways — 2-4 concise, non-overlapping facts or ideas from this exact clip; "
-        "match_reason — one topic-specific sentence explaining why this clip helps this viewer "
-        "(name the idea taught; never write a generic recommendation); assessment — exactly one "
-        "object with prompt, options (exactly four distinct strings), correct_index (0-3), and a "
-        "grounded explanation that states why the correct option follows from the clip. Ask about "
-        "the central idea, make exactly one option correct, and do not use 'all of the above'. "
-        "Rules: (1) a clip must START at the beginning of the idea and END at its end — "
-        "never mid-thought; (2) contextual overlap is allowed when two complete ideas share "
-        "setup; (3) go in chronological order; (4) prefer complete clips of 20-90 seconds. "
-        "Split longer sections into complete subtopics. A complete clip may be up to 180 "
-        "seconds, but never force or truncate a longer section; (5) line indices range from 0 to "
-        f"{n - 1} — never exceed {n - 1}."
+        "Select self-contained educational clips from native caption cues. "
+        "Each transcript line has a local line index and an immutable cue_id. "
+        "Use only the supplied lines. Do not repair, clamp, or invent indices. "
+        "start_quote must occur verbatim in start_line after Unicode/case normalization; "
+        "end_quote must occur in end_line. Clips begin at start_line's cue start and end "
+        "at end_line's cue end.\n" + topic_rule +
+        "Acceptable kind values are content or educational; label intros, admin, promos, "
+        "and outros truthfully so they can be removed. Return informativeness, "
+        "topic_relevance, self_contained, and difficulty on a 0..1 scale. Prefer complete "
+        "20-90 second ideas, but complete clips may be 1-180 seconds. "
+        "Every non-empty summary must include summary_cue_ids; every takeaway must have "
+        "a same-position takeaway_cue_ids list; every match_reason must include "
+        "match_reason_cue_ids; assessment must include cue_ids alongside prompt, exactly "
+        "four distinct options, correct_index, and explanation. Grounding IDs must all be "
+        "selected by that clip. Unsupported metadata will be discarded. "
+        f"Line indices are strict integers from 0 through {n - 1}."
     )
     user = (
-        f"Transcript ({n} lines, each formatted `[index] MM:SS text`):\n\n" + lines +
-        "\n\nReturn every substantive teaching clip as {title, start_line, end_line, "
-        "start_quote, end_quote, reason, facet, kind, informativeness, topic_relevance, "
-        "self_contained, difficulty, summary, takeaways, match_reason, assessment: "
-        "{prompt, options, correct_index, explanation}}."
+        f"Transcript batch ({n} cues, `[line|cue_id] MM:SS text`):\n\n{lines}\n\n"
+        "Return {topics:[{title,start_line,end_line,start_quote,end_quote,reason,facet,kind,"
+        "informativeness,topic_relevance,self_contained,difficulty,summary,summary_cue_ids,"
+        "takeaways,takeaway_cue_ids,match_reason,match_reason_cue_ids,assessment:{prompt,"
+        "options,correct_index,explanation,cue_ids}}]}."
     )
     return system, user
-
-
-# ── fine-snap (interpolated word times) ──────────────────────────────────────
-def _toks(s: str) -> list[str]:
-    return [m.group(0).lower() for m in _WORD_RE.finditer(s or "")]
-
-
-def _locate_quote(words: list[dict], quote: str, lo_t: float, hi_t: float,
-                  want: str) -> Optional[float]:
-    """Find ``quote`` among ``words`` whose times fall in [lo_t, hi_t] and return the
-    boundary time: the matched window's first-word start (want="start") or last-word end
-    (want="end"). Uses rapidfuzz over a sliding token window; None if no good match."""
-    q = _toks(quote)
-    if not q or not words:
-        return None
-    try:
-        from rapidfuzz import fuzz
-    except Exception:
-        return None
-    qn = min(len(q), 6)
-    target = " ".join(q[:qn] if want == "start" else q[-qn:])
-    # one aligned list of (token, start, end) for words inside the time window
-    toks: list[tuple[str, float, float]] = []
-    for w in words:
-        t0 = float(w.get("start", 0.0))
-        if not (lo_t - 1e-6 <= t0 <= hi_t + 1e-6):
-            continue
-        wt = _toks(w.get("word", ""))
-        if wt:
-            toks.append((wt[0], t0, float(w.get("end", t0))))
-    if len(toks) < qn:
-        return None
-    best_score, best_t = 0.0, None
-    for i in range(len(toks) - qn + 1):
-        window = " ".join(tok for tok, _, _ in toks[i:i + qn])
-        score = fuzz.ratio(target, window)
-        if score > best_score:
-            best_score = score
-            best_t = toks[i][1] if want == "start" else toks[i + qn - 1][2]
-    return best_t if best_score >= 70 else None
-
-
-def _caption_gap_boundary(
-    segs: list[dict], semantic_time: float, *, direction: str,
-    min_gap_s: float = 0.25, max_move_s: float = 2.0,
-) -> float:
-    """Move outward to the nearest qualifying caption-gap midpoint."""
-    candidates: list[float] = []
-    for left, right in zip(segs, segs[1:]):
-        gap_start = float(left.get("end", 0.0))
-        gap_end = float(right.get("start", gap_start))
-        if gap_end - gap_start < min_gap_s:
-            continue
-        midpoint = (gap_start + gap_end) / 2.0
-        delta = semantic_time - midpoint if direction == "start" else midpoint - semantic_time
-        if -1e-9 <= delta <= max_move_s + 1e-9:
-            candidates.append(midpoint)
-    if not candidates:
-        return semantic_time
-    if direction == "start":
-        return max(candidates)
-    return min(candidates)
 
 
 def _near_duplicate(a: dict, b: dict, threshold: float = 0.8) -> bool:
@@ -193,13 +140,25 @@ def _near_duplicate(a: dict, b: dict, threshold: float = 0.8) -> bool:
     return shorter > 0 and overlap / shorter >= threshold
 
 
-def _clean_list(value: object, *, minimum: int, maximum: int) -> list[str]:
+def _clean_text(value: object) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _grounding_ids(value: object, selected: set[str]) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    ids = [_clean_text(item) for item in value]
+    ids = list(dict.fromkeys(item for item in ids if item))
+    return ids if ids and set(ids) <= selected else []
+
+
+def _clean_list(value: object, *, maximum: int) -> list[str]:
     if not isinstance(value, list):
         return []
     cleaned: list[str] = []
     seen: set[str] = set()
     for item in value:
-        text = " ".join(str(item or "").split()).strip()
+        text = _clean_text(item)
         key = text.casefold()
         if not text or key in seen:
             continue
@@ -207,162 +166,278 @@ def _clean_list(value: object, *, minimum: int, maximum: int) -> list[str]:
         cleaned.append(text)
         if len(cleaned) >= maximum:
             break
-    return cleaned if len(cleaned) >= minimum else []
+    return cleaned
 
 
-def _validated_assessment(value: object, *, grounding_text: str) -> dict | None:
-    """Return a privacy-ready stored question or None.
+def _grounded_takeaways(topic: _Topic, selected: set[str]) -> tuple[list[str], list[list[str]]]:
+    values = topic.takeaways if isinstance(topic.takeaways, list) else []
+    refs = topic.takeaway_cue_ids if isinstance(topic.takeaway_cue_ids, list) else []
+    kept_values: list[str] = []
+    kept_refs: list[list[str]] = []
+    seen: set[str] = set()
+    for index, raw in enumerate(values):
+        text = _clean_text(raw)
+        ids = _grounding_ids(refs[index] if index < len(refs) else None, selected)
+        key = text.casefold()
+        if not text or not ids or key in seen:
+            continue
+        seen.add(key)
+        kept_values.append(text)
+        kept_refs.append(ids)
+        if len(kept_values) >= 4:
+            break
+    return kept_values, kept_refs
 
-    Validation happens after the clip proposal is accepted so a bad question
-    never rejects useful educational content.
-    """
+
+def _validated_assessment(value: object, *, selected: set[str], grounding_text: str) -> dict | None:
+    if isinstance(value, _Assessment):
+        value = value.model_dump()
     if not isinstance(value, dict):
         return None
-    prompt = " ".join(str(value.get("prompt") or "").split()).strip()
-    explanation = " ".join(str(value.get("explanation") or "").split()).strip()
-    raw_options = value.get("options")
-    if not isinstance(raw_options, list) or len(raw_options) != 4:
+    cue_ids = _grounding_ids(value.get("cue_ids"), selected)
+    prompt = _clean_text(value.get("prompt"))
+    explanation = _clean_text(value.get("explanation"))
+    options = _clean_list(value.get("options"), maximum=4)
+    correct_index = value.get("correct_index")
+    if (
+        not cue_ids
+        or not prompt
+        or not explanation
+        or len(options) != 4
+        or isinstance(correct_index, bool)
+        or not isinstance(correct_index, int)
+        or not 0 <= correct_index < 4
+    ):
         return None
-    options = _clean_list(raw_options, minimum=4, maximum=4)
-    raw_correct_index = value.get("correct_index")
-    if isinstance(raw_correct_index, bool) or not isinstance(raw_correct_index, int):
-        return None
-    correct_index = raw_correct_index
-    if not prompt or not explanation or len(options) != 4 or not 0 <= correct_index < 4:
-        return None
-
-    # Require a concrete lexical anchor to the clip or its generated details.
-    # This is intentionally modest: it blocks generic praise/rationales without
-    # rejecting concise explanations that use ordinary connective words.
-    source_tokens = {t for t in _toks(grounding_text) if len(t) >= 4}
-    explanation_tokens = {t for t in _toks(explanation) if len(t) >= 4}
-    if source_tokens and not (source_tokens & explanation_tokens):
+    source_tokens = {token for token in _tokens(grounding_text) if len(token) >= 4}
+    explanation_tokens = {token for token in _tokens(explanation) if len(token) >= 4}
+    if source_tokens and not source_tokens & explanation_tokens:
         return None
     return {
         "prompt": prompt,
         "options": options,
         "correct_index": correct_index,
         "explanation": explanation,
+        "cue_ids": cue_ids,
     }
 
 
-# ── plan → clips ─────────────────────────────────────────────────────────────
-def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
-                   settings: dict) -> list[dict]:
-    n = len(segs)
-    fine = settings.get("segment_fine_snap")
-    fine = config.SEGMENT_FINE_SNAP if fine is None else bool(fine)
-    min_s = 1.0
-    max_s = 180.0
-    info_min = settings.get("segment_informativeness_min")
-    info_min = max(0.6, config.SEGMENT_INFORMATIVENESS_MIN if info_min is None else float(info_min))
-    relevance_min = settings.get("segment_topic_relevance_min")
-    relevance_min = max(0.6, config.SEGMENT_TOPIC_RELEVANCE_MIN if relevance_min is None else float(relevance_min))
-
-    raw: list[dict] = []
-    for tp in plan.topics:
-        kind = (tp.kind or "").strip().lower()
-        info = _norm_optional_confidence(tp.informativeness)
-        relevance = _norm_optional_confidence(tp.topic_relevance)
-        contained = tp.self_contained
-        if kind not in _ACCEPT_KINDS:
-            continue
-        if not tp.start_quote.strip() or not tp.end_quote.strip():
-            continue
-        if info is None or relevance is None or contained is not True:
-            continue
-        if info < info_min or relevance < relevance_min:
-            continue
-        a = max(0, min(int(tp.start_line), n - 1))
-        b = max(a, min(int(tp.end_line), n - 1))
-        start = float(segs[a]["start"])
-        end = float(segs[b]["end"])
-        if fine and words:
-            # snap start within [chunk a start-2s, chunk a end]; end within [chunk b start, chunk b end+2s]
-            st = _locate_quote(words, tp.start_quote, start - 2.0, float(segs[a]["end"]), "start")
-            en = _locate_quote(words, tp.end_quote, float(segs[b]["start"]), end + 2.0, "end")
-            if st is not None and st < end:
-                start = st
-            if en is not None and en > start:
-                end = en
-        start = _caption_gap_boundary(segs, start, direction="start")
-        end = _caption_gap_boundary(segs, end, direction="end")
-        clip_text = " ".join(
-            str(seg.get("text") or "").strip() for seg in segs[a:b + 1]
-        )
-        summary = " ".join((tp.summary or "").split()).strip()
-        takeaways = _clean_list(tp.takeaways, minimum=2, maximum=4)
-        match_reason = " ".join((tp.match_reason or "").split()).strip()
-        assessment = _validated_assessment(
-            tp.assessment,
-            grounding_text=" ".join(
-                part for part in (clip_text, tp.title, summary, " ".join(takeaways)) if part
-            ),
-        )
-        raw.append({"start": round(start, 3), "end": round(end, 3),
-                    "title": (tp.title or "").strip(),
-                    "facet": (tp.facet or "other").strip() or "other",
-                    "reason": (tp.reason or "").strip(),
-                    "kind": kind,
-                    "informativeness": info,
-                    "topic_relevance": relevance,
-                    "self_contained": True,
-                    "difficulty": _norm_informativeness(tp.difficulty),
-                    "summary": summary,
-                    "takeaways": takeaways,
-                    "match_reason": match_reason,
-                    "assessment": assessment})
-
-    eligible = [c for c in raw if min_s <= c["end"] - c["start"] <= max_s]
-    # Highest-quality member of a near-duplicate cluster wins; contextual
-    # overlap below the threshold remains untouched.
-    quality_order = sorted(
-        eligible,
-        key=lambda c: (
-            c["informativeness"] + c["topic_relevance"],
-            -(c["end"] - c["start"]),
+def _quality_order(clips: list[dict], *, max_clips: int) -> list[dict]:
+    ordered = sorted(
+        clips,
+        key=lambda clip: (
+            float(clip["informativeness"]) + float(clip["topic_relevance"]),
+            -(float(clip["end"]) - float(clip["start"])),
+            -float(clip["start"]),
         ),
         reverse=True,
     )
-    clips: list[dict] = []
-    for candidate in quality_order:
-        if any(_near_duplicate(candidate, kept) for kept in clips):
+    kept: list[dict] = []
+    for candidate in ordered:
+        if any(_near_duplicate(candidate, other) for other in kept):
             continue
-        clips.append(candidate)
-    clips.sort(key=lambda c: (c["start"], c["end"]))
+        kept.append(candidate)
+        if len(kept) >= max_clips:
+            break
+    kept.sort(key=lambda clip: (clip["start"], clip["end"]))
+    for index, clip in enumerate(kept, 1):
+        clip["sequence_index"] = index
+    return kept
 
-    max_clips = min(40, int(settings.get("max_clips") or config.SEGMENT_MAX_CLIPS))
-    clips = clips[:max_clips]
-    for i, c in enumerate(clips):
-        c["sequence_index"] = i + 1
-    return clips
+
+def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict], settings: dict) -> list[dict]:
+    del words  # Native captions intentionally provide no synthetic word times.
+    segments = _with_cue_ids(segs)
+    count = len(segments)
+    if not count:
+        return []
+    info_min = max(
+        0.6,
+        float(settings.get("segment_informativeness_min", config.SEGMENT_INFORMATIVENESS_MIN)),
+    )
+    relevance_min = max(
+        0.6,
+        float(settings.get("segment_topic_relevance_min", config.SEGMENT_TOPIC_RELEVANCE_MIN)),
+    )
+    raw: list[dict] = []
+    for topic in plan.topics:
+        kind = _clean_text(topic.kind).lower()
+        info = _norm_optional_confidence(topic.informativeness)
+        relevance = _norm_optional_confidence(topic.topic_relevance)
+        if (
+            kind not in _ACCEPT_KINDS
+            or info is None
+            or relevance is None
+            or topic.self_contained is not True
+            or info < info_min
+            or relevance < relevance_min
+        ):
+            continue
+        start_index = topic.start_line
+        end_index = topic.end_line
+        if (
+            isinstance(start_index, bool)
+            or isinstance(end_index, bool)
+            or start_index < 0
+            or end_index < start_index
+            or end_index >= count
+        ):
+            continue
+        start_cue = segments[start_index]
+        end_cue = segments[end_index]
+        if not _contains_tokens(str(start_cue.get("text") or ""), topic.start_quote):
+            continue
+        if not _contains_tokens(str(end_cue.get("text") or ""), topic.end_quote):
+            continue
+        start = round(float(start_cue["start"]), 3)
+        end = round(float(end_cue["end"]), 3)
+        if not 1.0 <= end - start <= 180.0:
+            continue
+        selected_cues = segments[start_index:end_index + 1]
+        cue_ids = [_cue_id(cue, start_index + offset) for offset, cue in enumerate(selected_cues)]
+        selected = set(cue_ids)
+        clip_text = " ".join(_clean_text(cue.get("text")) for cue in selected_cues).strip()
+        summary_ids = _grounding_ids(topic.summary_cue_ids, selected)
+        summary = _clean_text(topic.summary) if summary_ids else ""
+        takeaways, takeaway_ids = _grounded_takeaways(topic, selected)
+        match_reason_ids = _grounding_ids(topic.match_reason_cue_ids, selected)
+        match_reason = _clean_text(topic.match_reason) if match_reason_ids else ""
+        assessment = _validated_assessment(
+            topic.assessment,
+            selected=selected,
+            grounding_text=" ".join([clip_text, summary, *takeaways]),
+        )
+        raw.append(
+            {
+                "start": start,
+                "end": end,
+                "title": _clean_text(topic.title),
+                "facet": _clean_text(topic.facet) or "other",
+                "reason": _clean_text(topic.reason),
+                "kind": kind,
+                "informativeness": info,
+                "topic_relevance": relevance,
+                "self_contained": True,
+                "difficulty": _norm_informativeness(topic.difficulty),
+                "summary": summary,
+                "summary_cue_ids": summary_ids if summary else [],
+                "takeaways": takeaways,
+                "takeaway_cue_ids": takeaway_ids,
+                "match_reason": match_reason,
+                "match_reason_cue_ids": match_reason_ids if match_reason else [],
+                "assessment": assessment,
+                "cue_ids": cue_ids,
+                "start_cue_id": cue_ids[0],
+                "end_cue_id": cue_ids[-1],
+                "transcript_text": clip_text,
+                "model_used": _clean_text(settings.get("_model_used")),
+                "quality_degraded": bool(settings.get("_quality_degraded", False)),
+            }
+        )
+    max_clips = min(40, max(0, int(settings.get("max_clips") or config.SEGMENT_MAX_CLIPS)))
+    return _quality_order(raw, max_clips=max_clips)
 
 
-# ── public entry point ───────────────────────────────────────────────────────
-def segment_clips(transcript: dict, settings: dict,
-                  progress: ProgressCb = None, topic: str = "") -> "tuple[list[dict], str]":
-    """One Gemini comprehension pass → curated teaching clips (topic-relevant when
-    ``topic`` is given; intro/outro/low-informativeness/over-length segments dropped).
-    Returns (clips_spec, notes)."""
-    segs = transcript.get("segments") or []
-    words = transcript.get("words") or []
-    if not segs:
+def _estimate_tokens(value: str) -> int:
+    return max(1, (len(value) + max(1, config.CHARS_PER_TOKEN) - 1) // max(1, config.CHARS_PER_TOKEN))
+
+
+def _cue_batches(
+    segments: list[dict],
+    *,
+    max_cues: int,
+    max_input_tokens: int,
+    overlap_cues: int,
+) -> list[tuple[int, list[dict]]]:
+    if not segments:
+        return []
+    max_cues = max(1, int(max_cues))
+    overlap_cues = max(0, min(int(overlap_cues), max_cues - 1))
+    token_budget = max(256, int(max_input_tokens) - 1800)
+    batches: list[tuple[int, list[dict]]] = []
+    start = 0
+    while start < len(segments):
+        end = start
+        tokens = 0
+        while end < len(segments) and end - start < max_cues:
+            cue = segments[end]
+            cost = _estimate_tokens(str(cue.get("text") or "")) + 12
+            if end > start and tokens + cost > token_budget:
+                break
+            tokens += cost
+            end += 1
+        if end == start:
+            end += 1
+        batches.append((start, segments[start:end]))
+        if end >= len(segments):
+            break
+        start = max(start + 1, end - overlap_cues)
+    return batches
+
+
+def segment_clips(
+    transcript: dict,
+    settings: dict,
+    progress: ProgressCb = None,
+    topic: str = "",
+) -> tuple[list[dict], str]:
+    segments = _with_cue_ids(transcript.get("segments") or [])
+    if not segments:
         return [], "No transcript segments to segment."
-    n = len(segs)
-    lines = "\n".join(f"[{i}] {_mmss(s.get('start', 0.0))} {(s.get('text') or '').strip()}"
-                      for i, s in enumerate(segs))
-    system, user = _prompts(lines, n, topic)
+    batches = _cue_batches(
+        segments,
+        max_cues=int(settings.get("segment_batch_max_cues") or config.SEGMENT_BATCH_MAX_CUES),
+        max_input_tokens=int(settings.get("segment_max_input_tokens") or config.SEGMENT_MAX_INPUT_TOKENS),
+        overlap_cues=int(settings.get("segment_batch_overlap_cues") or config.SEGMENT_BATCH_OVERLAP_CUES),
+    )
+    context = settings.get("generation_context") or settings.get("provider_context")
     model = settings.get("segment_model") or config.SEGMENT_MODEL
-
+    fallback_model = settings.get("segment_fallback_model")
+    if fallback_model is None:
+        fallback_model = config.SEGMENT_FALLBACK_MODEL
+    candidates: list[dict] = []
+    attempted_batches = 0
+    for batch_index, (offset, raw_batch) in enumerate(batches):
+        if context is not None and context.budget.remaining("segmentation") <= 0:
+            break
+        batch = _with_cue_ids(raw_batch, offset=offset)
+        lines = "\n".join(
+            f"[{index}|{cue['cue_id']}] {_mmss(cue.get('start', 0.0))} {_clean_text(cue.get('text'))}"
+            for index, cue in enumerate(batch)
+        )
+        system, user = _prompts(lines, len(batch), topic)
+        if progress:
+            progress(
+                min(0.8, 0.05 + 0.7 * batch_index / max(1, len(batches))),
+                f"Understanding transcript batch {batch_index + 1} of {len(batches)}…",
+            )
+        result = llm_json_result(
+            system,
+            user,
+            _Plan,
+            temperature=0.2,
+            model=model,
+            fallback_model=fallback_model or None,
+            max_output_tokens=config.SEGMENT_MAX_OUTPUT_TOKENS,
+            should_cancel=settings.get("should_cancel"),
+            context=context,
+        )
+        attempted_batches += 1
+        batch_settings = {
+            **settings,
+            "max_clips": 40,
+            "_model_used": result.model_used,
+            "_quality_degraded": result.quality_degraded,
+        }
+        candidates.extend(_plan_to_clips(result.value, batch, [], batch_settings))
     if progress:
-        progress(0.1, "Understanding the transcript…")
-    plan = llm_json(system, user, _Plan, temperature=0.2, model=model,
-                    max_output_tokens=config.SEGMENT_MAX_OUTPUT_TOKENS,
-                    should_cancel=settings.get("should_cancel"))
-    if progress:
-        progress(0.85, "Placing clip boundaries…")
-    clips = _plan_to_clips(plan, segs, words, settings)
+        progress(0.85, "Selecting the strongest grounded clips…")
+    max_clips = min(40, max(0, int(settings.get("max_clips") or config.SEGMENT_MAX_CLIPS)))
+    clips = _quality_order(candidates, max_clips=max_clips)
     if progress:
         progress(1.0, f"{len(clips)} clip(s) ready")
-    notes = f"{len(clips)} topic clip(s) from {n} transcript segments (Gemini-segment engine)."
-    return clips, notes
+    return (
+        clips,
+        f"{len(clips)} grounded topic clip(s) from {len(segments)} native cues "
+        f"across {attempted_batches} Gemini batch(es).",
+    )

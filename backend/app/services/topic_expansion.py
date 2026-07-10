@@ -4,7 +4,9 @@ import json
 import logging
 import os
 import re
+import unicodedata
 from collections.abc import Callable
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -19,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 class TopicExpansionService:
     CACHE_VERSION = 9
+    CACHE_TTL_SEC = 24 * 60 * 60
     WIKIPEDIA_API_URL = "https://en.wikipedia.org/w/api.php"
     WIKIDATA_API_URL = "https://www.wikidata.org/w/api.php"
     DATAMUSE_API_URL = "https://api.datamuse.com/words"
@@ -565,8 +568,12 @@ class TopicExpansionService:
             max_related_terms=max_related_terms,
         )
         if conn is not None:
-            cached = fetch_one(conn, "SELECT response_json FROM llm_cache WHERE cache_key = ?", (cache_key,))
-            if cached:
+            cached = fetch_one(
+                conn,
+                "SELECT response_json, created_at FROM llm_cache WHERE cache_key = ?",
+                (cache_key,),
+            )
+            if cached and self._cache_row_is_fresh(cached):
                 try:
                     payload = json.loads(str(cached.get("response_json") or "{}"))
                     if isinstance(payload, dict):
@@ -583,7 +590,7 @@ class TopicExpansionService:
             should_cancel=should_cancel,
         )
         raise_if_cancelled(should_cancel)
-        if conn is not None:
+        if conn is not None and self._expansion_is_cacheable(clean_topic, payload):
             upsert(
                 conn,
                 "llm_cache",
@@ -595,6 +602,42 @@ class TopicExpansionService:
                 pk="cache_key",
             )
         return payload
+
+    def _cache_row_is_fresh(self, row: dict[str, Any]) -> bool:
+        raw_created_at = str(row.get("created_at") or "").strip()
+        if not raw_created_at:
+            return False
+        try:
+            created_at = datetime.fromisoformat(raw_created_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created_at).total_seconds() <= self.CACHE_TTL_SEC
+
+    def _expansion_is_cacheable(self, topic: str, payload: dict[str, Any]) -> bool:
+        """Do not turn a transient all-provider fallback into a 24-hour result."""
+        canonical = self._normalize_key(str(payload.get("canonical_topic") or ""))
+        topic_key = self._normalize_key(topic)
+        if canonical and canonical != topic_key:
+            return True
+        if payload.get("aliases") or payload.get("related_terms"):
+            return True
+        if self._static_topic_subtopics(topic):
+            return True
+        generic = {
+            self._normalize_key(term)
+            for term in self._generic_family_subtopics(
+                topic,
+                likely_language=self._looks_like_language_topic(topic),
+            )
+        }
+        subtopics = {
+            self._normalize_key(str(term or ""))
+            for term in payload.get("subtopics") or []
+            if self._normalize_key(str(term or ""))
+        }
+        return bool(subtopics - generic)
 
     def _expand_topic_uncached(
         self,
@@ -1088,11 +1131,23 @@ class TopicExpansionService:
             normalized_raw = self._normalize_key(raw_topic)
             if (
                 normalized_topic == normalized_raw
-                or normalized_topic in normalized_raw
-                or normalized_raw in normalized_topic
+                or self._contains_token_sequence(normalized_topic, normalized_raw)
+                or self._contains_token_sequence(normalized_raw, normalized_topic)
             ):
                 return [normalize_whitespace(item).strip() for item in subtopics if normalize_whitespace(item).strip()]
         return []
+
+    @staticmethod
+    def _contains_token_sequence(haystack: str, needle: str) -> bool:
+        haystack_tokens = haystack.split()
+        needle_tokens = needle.split()
+        if not haystack_tokens or not needle_tokens or len(needle_tokens) > len(haystack_tokens):
+            return False
+        width = len(needle_tokens)
+        return any(
+            haystack_tokens[index : index + width] == needle_tokens
+            for index in range(len(haystack_tokens) - width + 1)
+        )
 
     def _collect_subtopics(
         self,
@@ -1658,8 +1713,9 @@ class TopicExpansionService:
         return normalize_whitespace(text)
 
     def _normalize_key(self, value: str) -> str:
-        cleaned = normalize_whitespace(value or "").strip().lower()
-        cleaned = re.sub(r"[^a-z0-9\+# ]+", " ", cleaned)
+        cleaned = unicodedata.normalize("NFKC", normalize_whitespace(value or ""))
+        cleaned = cleaned.strip().casefold().replace("_", " ")
+        cleaned = re.sub(r"[^\w\+# ]+", " ", cleaned, flags=re.UNICODE)
         return re.sub(r"\s+", " ", cleaned).strip()
 
     def _request_json(

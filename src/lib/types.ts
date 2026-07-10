@@ -17,6 +17,9 @@ export type Reel = {
   concept_title: string;
   video_title?: string;
   video_description?: string;
+  channel_name?: string;
+  published_at?: string | null;
+  view_count?: number | null;
   video_description_truncated?: boolean;
   ai_summary?: string;
   ai_summary_truncated?: boolean;
@@ -37,6 +40,12 @@ export type Reel = {
   total_concepts?: number;
   video_duration_sec?: number;
   clip_duration_sec?: number;
+  difficulty?: number;
+  model_used?: string | null;
+  quality_degraded?: boolean;
+  duration_preference_met?: boolean;
+  duration_fit?: "in_range" | "shorter" | "longer";
+  selected_cue_ids?: string[];
   community_has_explicit_end?: boolean;
   // Optional attribution line populated by POST /api/ingest/url. Older responses
   // (from /api/feed, /api/reels/generate) do not include this field.
@@ -44,6 +53,7 @@ export type Reel = {
 };
 
 export type CaptionCue = {
+  cue_id?: string | number;
   start: number;
   end: number;
   text: string;
@@ -53,46 +63,105 @@ export type ReelsGenerateResponse = {
   reels: Reel[];
   generation_id?: string | null;
   response_profile?: string | null;
-  refinement_job_id?: string | null;
-  refinement_status?: string | null;
+  model_used?: string | null;
+  quality_degraded?: boolean;
 };
 
-export type ReelsGenerateStreamEvent =
-  | {
-      type: "reel";
-      reel: Reel;
-    }
-  | {
-      type: "done";
-      response: ReelsGenerateResponse;
-    }
-  | {
-      type: "error";
-      detail: string;
-      status_code?: number;
-    };
+export type GenerationJobStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "partial"
+  | "exhausted"
+  | "failed"
+  | "cancelled";
 
-export type ReelsCanGenerateResponse = {
-  can_generate: boolean;
-  blocked_by_settings: boolean;
-  estimated_success_rate: number;
-  total_probed: number;
-  passed_all_filters: number;
-  primary_bottleneck: string;
+export type GenerationTerminalStatus = Exclude<GenerationJobStatus, "queued" | "running">;
+
+export type TypedApiError = {
+  code: string;
   message: string;
+  provider?: string | null;
+  retry_after_sec?: number | null;
+  details?: Record<string, unknown> | null;
 };
 
-export type ReelsCanGenerateAnyResponse = {
-  can_generate_any: boolean;
-  topics_checked: number;
-  topics_can_generate: number;
-  blocked_by_settings_topics: number;
-  no_source_topics: number;
-  estimated_success_rate: number;
-  total_probed: number;
-  passed_all_filters: number;
-  primary_bottleneck: string;
-  message: string;
+export type GenerationQueuedResponse = {
+  job_id: string;
+  status: "queued" | "running";
+  status_url: string;
+  stream_url: string;
+};
+
+export type ReelsGenerateSubmission = ReelsGenerateResponse | GenerationQueuedResponse;
+
+type GenerationStreamEventBase = {
+  job_id: string;
+  seq: number;
+  timestamp: string;
+};
+
+export type ReelsGenerateStreamEvent = GenerationStreamEventBase & (
+  | {
+      type: "candidate";
+      payload: { reel: Reel; provisional: true };
+    }
+  | {
+      type: "final";
+      payload: {
+        reels: Reel[];
+        generation_id?: string | null;
+        authoritative: true;
+      };
+    }
+  | {
+      type: "terminal";
+      payload: {
+        status: GenerationTerminalStatus;
+        result_generation_id?: string | null;
+        error?: TypedApiError | null;
+      };
+    }
+);
+
+export type GenerationJobStatusResponse = {
+  job_id: string;
+  status: GenerationJobStatus;
+  phase?: string | null;
+  progress?: number | null;
+  attempt_count?: number | null;
+  max_attempts?: number | null;
+  lease_expires_at?: string | null;
+  heartbeat_at?: string | null;
+  deadline_at?: string | null;
+  material_id: string;
+  request_key: string;
+  result_generation_id?: string | null;
+  model_used?: string | null;
+  quality_degraded?: boolean;
+  usage?: Record<string, unknown> | null;
+  error?: TypedApiError | null;
+  reels?: Reel[];
+};
+
+export type GenerationJobCancelResponse = GenerationJobStatusResponse;
+
+export type AvailabilityEvidence = {
+  availability: "available" | "unavailable" | "unknown";
+  evidence_source: "cache" | "provider" | "none" | string;
+  evidence_age_sec: number | null;
+  candidate_count: number;
+  filters_applied: Record<string, unknown> | string[];
+  message?: string;
+};
+
+export type ReelsCanGenerateResponse = AvailabilityEvidence & {
+  can_generate?: boolean;
+};
+
+export type ReelsCanGenerateAnyResponse = AvailabilityEvidence & {
+  can_generate_any?: boolean;
+  materials_checked: number;
 };
 
 export type FeedResponse = {
@@ -102,22 +171,10 @@ export type FeedResponse = {
   reels: Reel[];
   generation_id?: string | null;
   response_profile?: string | null;
-  refinement_job_id?: string | null;
-  refinement_status?: string | null;
+  generation_job_id?: string | null;
+  generation_job_status?: GenerationJobStatus | null;
   knowledge_level?: string | null;
   effective_level_target?: number | null;
-};
-
-export type RefinementStatusResponse = {
-  job_id: string;
-  status: string;
-  material_id: string;
-  request_key: string;
-  source_generation_id: string;
-  result_generation_id?: string | null;
-  active_generation_id?: string | null;
-  completed_at?: string | null;
-  error?: string | null;
 };
 
 export type ChatMessage = {
@@ -182,7 +239,7 @@ export type AssessmentSnoozeResponse = {
   assessment_ready: false;
 };
 
-// POST /api/ingest/url — backend reel ingestion pipeline (YouTube / Instagram / TikTok).
+// POST /api/ingest/url — native-caption YouTube ingestion.
 
 export type IngestUrlRequest = {
   source_url: string;
@@ -196,7 +253,7 @@ export type IngestUrlRequest = {
 
 /** Mirror of `backend/app/ingestion/models.py:IngestMetadata`. All fields optional. */
 export type IngestMetadata = {
-  platform: "yt" | "ig" | "tt";
+  platform: "yt";
   source_id: string;
   source_url: string;
   playback_url: string;
@@ -229,11 +286,10 @@ export type IngestResult = {
   trace_id: string;
 };
 
-// POST /api/ingest/search — topic-based multi-platform discovery.
+// POST /api/ingest/search — topic-based YouTube discovery.
 
 export type IngestSearchRequest = {
   query: string;
-  platforms?: Array<"yt" | "ig" | "tt">;
   max_per_platform?: number;
   material_id?: string | null;
   concept_id?: string | null;
@@ -246,7 +302,7 @@ export type IngestSearchRequest = {
 };
 
 export type IngestSearchItem = {
-  platform: "yt" | "ig" | "tt";
+  platform: "yt";
   source_url: string;
   status: "ok" | "error" | "skipped" | "rate_limited";
   reel?: Reel | null;
@@ -257,7 +313,7 @@ export type IngestSearchItem = {
 export type IngestSearchResult = {
   query: string;
   material_id: string;
-  platforms: Array<"yt" | "ig" | "tt">;
+  platforms: ["yt"] | "yt"[];
   per_platform_resolved: Record<string, number>;
   per_platform_succeeded: Record<string, number>;
   per_platform_failed: Record<string, number>;

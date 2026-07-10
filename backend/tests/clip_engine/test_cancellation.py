@@ -9,6 +9,7 @@ from backend.app.clip_engine.cancellation import run_cancellable
 from backend.app.clip_engine.errors import CancellationError
 from backend.app.clip_engine import supadata_search
 from backend.app.clip_engine.clipper import gemini_client
+from backend.app.clip_engine.provider_cache import MemoryProviderCache
 from backend.app.services import llm_router
 
 
@@ -62,7 +63,9 @@ def test_supadata_active_socket_receives_cancellation_and_does_not_retry(monkeyp
     _cancel_shortly(cancel)
     started = time.monotonic()
     with pytest.raises(CancellationError):
-        supadata_search.search_one("vectors", should_cancel=cancel.is_set)
+        supadata_search.search_one(
+            "vectors", should_cancel=cancel.is_set, cache_store=MemoryProviderCache()
+        )
     assert time.monotonic() - started < 0.3
     assert request_cancelled.wait(0.1)
     assert calls == 1

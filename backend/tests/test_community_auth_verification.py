@@ -539,7 +539,7 @@ class CommunityDeleteAccountTests(_VerificationTestBase):
                     "default_input_mode": "source",
                     "min_relevance_threshold": 0.3,
                     "start_muted": 1,
-                    "video_pool_mode": "short-first",
+                    "creative_commons_only": 0,
                     "preferred_video_duration": "any",
                     "target_clip_duration_sec": 55,
                     "target_clip_duration_min_sec": 20,

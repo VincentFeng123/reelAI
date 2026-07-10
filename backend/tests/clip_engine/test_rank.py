@@ -99,3 +99,39 @@ def test_merge_and_rank_level_reorders_within_match_band():
     # and both edu_score 0, but "adv" sits at list index 0 so its best_rank
     # gives rank_score 1.0 (vs 0.5) -> score ~14.04 vs ~13.04.
     assert ranked_none[0]["id"] == "adv"
+
+
+def test_normalizes_prefixed_ids_and_merges_nonblank_metadata() -> None:
+    video_id = "dQw4w9WgXcQ"
+    per_query = [
+        {"query": "first", "videos": [{
+            "id": f"yt:{video_id}", "title": "", "channel": {"id": "UC1"},
+            "viewCount": "40", "duration": "12.5",
+        }]},
+        {"query": "second", "videos": [{
+            "url": f"https://youtu.be/{video_id}", "title": "Useful lecture",
+            "description": "Description", "channelTitle": "Teacher",
+            "channelUrl": "https://youtube.com/channel/UC1",
+            "publishedAt": "2026-07-10", "thumbnailUrl": "thumb",
+            "view_count": 42,
+        }]},
+    ]
+    [result] = merge_and_rank(per_query)
+    assert result["id"] == video_id
+    assert result["url"] == f"https://www.youtube.com/watch?v={video_id}"
+    assert result["title"] == "Useful lecture"
+    assert result["description"] == "Description"
+    assert result["channel"] == "Teacher"
+    assert result["channel_id"] == "UC1"
+    assert result["channel_url"].endswith("/UC1")
+    assert result["duration"] == 12.5
+    assert result["view_count"] == 42
+    assert result["published_at"] == "2026-07-10"
+
+
+def test_duplicate_video_within_one_query_counts_once() -> None:
+    ranked = merge_and_rank([{
+        "query": "same",
+        "videos": [{"id": "x"}, {"id": "x", "title": "duplicate"}],
+    }])
+    assert ranked[0]["match_count"] == 1

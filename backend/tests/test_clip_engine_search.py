@@ -106,6 +106,19 @@ class ClipEngineSearchTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        with db_module.get_conn(transactional=True) as conn:
+            db_module.insert(
+                conn,
+                "materials",
+                {
+                    "id": "m1",
+                    "subject_tag": "test",
+                    "raw_text": "test",
+                    "source_type": "topic",
+                    "source_path": None,
+                    "created_at": db_module.now_iso(),
+                },
+            )
 
     def _restore_environment(self) -> None:
         if self.previous_data_dir is None:
@@ -188,7 +201,13 @@ class ClipEngineSearchTests(unittest.TestCase):
 
         # discover called with correct args
         mock_search.discover.assert_called_once_with(
-            "calc", limit=5, exclude_video_ids=[]
+            "calc",
+            limit=5,
+            exclude_video_ids=[],
+            filters={"creative_commons_only": False, "duration": "any"},
+            language="en",
+            context=None,
+            cache_store=None,
         )
 
     # --------------------------------------------------------------------- #

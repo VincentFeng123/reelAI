@@ -5,7 +5,6 @@ import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRe
 import {
   type PreferredVideoDuration,
   type StudyReelsSettings,
-  type VideoPoolMode,
   DEFAULT_STUDY_REELS_SETTINGS,
   MAX_RELEVANCE,
   MIN_RELEVANCE,
@@ -58,12 +57,6 @@ const CLIP_ENDPOINT_LABEL_MIN_DISTANCE_PX = 34;
 const CLIP_ENDPOINT_LABEL_MAX_PUSH_PX = 24;
 const RELEVANCE_ENDPOINT_LABEL_X_OFFSET_PX = -20;
 
-const VIDEO_POOL_OPTIONS: Array<{ value: VideoPoolMode; label: string }> = [
-  { value: "short-first", label: "Short" },
-  { value: "balanced", label: "Balanced" },
-  { value: "long-form", label: "Long" },
-];
-
 const DURATION_OPTIONS: Array<{ value: PreferredVideoDuration; label: string }> = [
   { value: "any", label: "Any" },
   { value: "short", label: "Short" },
@@ -76,12 +69,6 @@ const durationSummaryLabel: Record<PreferredVideoDuration, string> = {
   short: "Short",
   medium: "Medium",
   long: "Long",
-};
-
-const poolSummaryLabel: Record<VideoPoolMode, string> = {
-  "short-first": "Short",
-  balanced: "Balanced",
-  "long-form": "Long",
 };
 
 export type SettingsAvailabilityState = {
@@ -165,55 +152,7 @@ function pushPointAwayFromPoint(
 }
 
 function buildHeuristicAvailabilityState(settings: StudyReelsSettings): SettingsAvailabilityState {
-  const relevanceRatio = Math.max(0, Math.min(1, settings.minRelevanceThreshold / MAX_RELEVANCE));
   const clipWidth = settings.targetClipDurationMaxSec - settings.targetClipDurationMinSec;
-  const midpoint = (settings.targetClipDurationMinSec + settings.targetClipDurationMaxSec) / 2;
-  let score = 78;
-
-  score -= relevanceRatio * 34;
-  if (settings.videoPoolMode === "short-first") {
-    score += 8;
-  } else if (settings.videoPoolMode === "balanced") {
-    score += 3;
-  } else {
-    score -= 8;
-  }
-
-  if (settings.preferredVideoDuration === "any") {
-    score += 9;
-  } else if (settings.preferredVideoDuration === "medium") {
-    score += 1;
-  } else if (settings.preferredVideoDuration === "short") {
-    score -= 3;
-  } else {
-    score -= 11;
-  }
-
-  if (clipWidth < 10) {
-    score -= 20;
-  } else if (clipWidth < 20) {
-    score -= 12;
-  } else if (clipWidth < 35) {
-    score -= 6;
-  } else {
-    score += 4;
-  }
-
-  if (midpoint < 25) {
-    score -= 7;
-  } else if (midpoint > 115) {
-    score -= 8;
-  } else {
-    score += 2;
-  }
-
-  if (settings.generationMode === "fast") {
-    score -= 5;
-  } else {
-    score += 2;
-  }
-
-  const ratePct = Math.max(5, Math.min(96, Math.round(score)));
   const limitingFactors: string[] = [];
   if (settings.minRelevanceThreshold >= 0.45) {
     limitingFactors.push("high similarity threshold");
@@ -224,30 +163,15 @@ function buildHeuristicAvailabilityState(settings: StudyReelsSettings): Settings
   if (settings.preferredVideoDuration === "long") {
     limitingFactors.push("long source preference");
   }
-  if (settings.videoPoolMode === "long-form") {
-    limitingFactors.push("long pool mode");
+  if (settings.creativeCommonsOnly) {
+    limitingFactors.push("Creative Commons licensing filter");
   }
   if (settings.generationMode === "fast") {
-    limitingFactors.push("fast generation mode");
-  }
-
-  if (ratePct >= 78) {
-    return {
-      status: "ok",
-      message: `Heuristic success estimate: ${ratePct}%.`,
-      limitingFactors,
-    };
-  }
-  if (ratePct >= 52) {
-    return {
-      status: "partial",
-      message: `Heuristic success estimate: ${ratePct}%.`,
-      limitingFactors,
-    };
+    limitingFactors.push("fast provider budget");
   }
   return {
-    status: "blocked",
-    message: `Heuristic success estimate: ${ratePct}%.`,
+    status: limitingFactors.length > 0 ? "partial" : "ok",
+    message: "Preferences saved. Source availability is checked from cached or live YouTube evidence for each material.",
     limitingFactors,
   };
 }
@@ -266,8 +190,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   const [minRelevanceThreshold, setMinRelevanceThreshold] = useState(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
   const [startMuted, setStartMuted] = useState(DEFAULT_STUDY_REELS_SETTINGS.startMuted);
   const [autoplayNextReel, setAutoplayNextReel] = useState(DEFAULT_STUDY_REELS_SETTINGS.autoplayNextReel);
-  const [multiPlatformSearch, setMultiPlatformSearch] = useState(DEFAULT_STUDY_REELS_SETTINGS.multiPlatformSearch);
-  const [videoPoolMode, setVideoPoolMode] = useState<VideoPoolMode>(DEFAULT_STUDY_REELS_SETTINGS.videoPoolMode);
+  const [creativeCommonsOnly, setCreativeCommonsOnly] = useState(DEFAULT_STUDY_REELS_SETTINGS.creativeCommonsOnly);
   const [preferredVideoDuration, setPreferredVideoDuration] = useState<PreferredVideoDuration>(
     DEFAULT_STUDY_REELS_SETTINGS.preferredVideoDuration,
   );
@@ -285,7 +208,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   const [showLowRelevanceWarning, setShowLowRelevanceWarning] = useState(false);
   const [availabilityState, setAvailabilityState] = useState<SettingsAvailabilityState>({
     status: "idle",
-    message: "Save settings to estimate success rate from configuration heuristics.",
+    message: "Save settings to apply them to YouTube availability checks.",
     limitingFactors: [],
   });
   const availabilityRequestRef = useRef(0);
@@ -663,8 +586,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     setMinRelevanceThreshold(saved.minRelevanceThreshold);
     setStartMuted(saved.startMuted);
     setAutoplayNextReel(saved.autoplayNextReel);
-    setMultiPlatformSearch(saved.multiPlatformSearch);
-    setVideoPoolMode(saved.videoPoolMode);
+    setCreativeCommonsOnly(saved.creativeCommonsOnly);
     setPreferredVideoDuration(saved.preferredVideoDuration);
     setTargetClipDurationMinSec(saved.targetClipDurationMinSec);
     setTargetClipDurationMaxSec(saved.targetClipDurationMaxSec);
@@ -702,7 +624,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     }
     setAvailabilityState({
       status: "checking",
-      message: "Estimating success rate from configuration heuristics...",
+      message: "Applying settings to YouTube availability checks...",
       limitingFactors: [],
     });
     setShowLowRelevanceWarning(settings.minRelevanceThreshold <= LOW_RELEVANCE_WARNING_THRESHOLD);
@@ -798,8 +720,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     setMinRelevanceThreshold(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
     setStartMuted(DEFAULT_STUDY_REELS_SETTINGS.startMuted);
     setAutoplayNextReel(DEFAULT_STUDY_REELS_SETTINGS.autoplayNextReel);
-    setMultiPlatformSearch(DEFAULT_STUDY_REELS_SETTINGS.multiPlatformSearch);
-    setVideoPoolMode(DEFAULT_STUDY_REELS_SETTINGS.videoPoolMode);
+    setCreativeCommonsOnly(DEFAULT_STUDY_REELS_SETTINGS.creativeCommonsOnly);
     setPreferredVideoDuration(DEFAULT_STUDY_REELS_SETTINGS.preferredVideoDuration);
     setTargetClipDurationMinSec(DEFAULT_STUDY_REELS_SETTINGS.targetClipDurationMinSec);
     setTargetClipDurationMaxSec(DEFAULT_STUDY_REELS_SETTINGS.targetClipDurationMaxSec);
@@ -814,8 +735,8 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   };
 
   const settingsSummary = useMemo(() => {
-    return `Match ${minRelevanceThreshold.toFixed(2)}+ · ${poolSummaryLabel[videoPoolMode]} feed · ${durationSummaryLabel[preferredVideoDuration]} source videos · ${targetClipDurationMinSec}-${targetClipDurationMaxSec}s clips · ${startMuted ? "Muted" : "Sound on"} · ${autoplayNextReel ? "Auto-next on" : "Auto-next off"}`;
-  }, [autoplayNextReel, minRelevanceThreshold, preferredVideoDuration, startMuted, targetClipDurationMaxSec, targetClipDurationMinSec, videoPoolMode]);
+    return `Match ${minRelevanceThreshold.toFixed(2)}+ · ${durationSummaryLabel[preferredVideoDuration]} source videos · prefer ${targetClipDurationMinSec}-${targetClipDurationMaxSec}s clips · ${creativeCommonsOnly ? "Creative Commons" : "Any license"} · ${startMuted ? "Muted" : "Sound on"} · ${autoplayNextReel ? "Auto-next on" : "Auto-next off"}`;
+  }, [autoplayNextReel, creativeCommonsOnly, minRelevanceThreshold, preferredVideoDuration, startMuted, targetClipDurationMaxSec, targetClipDurationMinSec]);
 
   const hasUnsavedChanges = useMemo(() => {
     if (!savedPreferences) {
@@ -826,8 +747,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
       savedPreferences.minRelevanceThreshold !== currentMinRelevance
       || savedPreferences.startMuted !== startMuted
       || savedPreferences.autoplayNextReel !== autoplayNextReel
-      || savedPreferences.multiPlatformSearch !== multiPlatformSearch
-      || savedPreferences.videoPoolMode !== videoPoolMode
+      || savedPreferences.creativeCommonsOnly !== creativeCommonsOnly
       || savedPreferences.preferredVideoDuration !== preferredVideoDuration
       || savedPreferences.targetClipDurationMinSec !== targetClipDurationMinSec
       || savedPreferences.targetClipDurationMaxSec !== targetClipDurationMaxSec
@@ -835,13 +755,12 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   }, [
     autoplayNextReel,
     minRelevanceThreshold,
-    multiPlatformSearch,
+    creativeCommonsOnly,
     preferredVideoDuration,
     savedPreferences,
     startMuted,
     targetClipDurationMaxSec,
     targetClipDurationMinSec,
-    videoPoolMode,
   ]);
 
   const savePreferences = useCallback(() => {
@@ -854,12 +773,11 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
       minRelevanceThreshold,
       startMuted,
       autoplayNextReel,
-      videoPoolMode,
+      creativeCommonsOnly,
       preferredVideoDuration,
       targetClipDurationSec,
       targetClipDurationMinSec,
       targetClipDurationMaxSec,
-      multiPlatformSearch,
     });
     setSavedPreferences(saved);
     showNotice("Settings saved and applied.");
@@ -871,7 +789,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     generationModeForChecks,
     onSettingsSaved,
     minRelevanceThreshold,
-    multiPlatformSearch,
+    creativeCommonsOnly,
     preferredVideoDuration,
     runAvailabilityCheck,
     settingsHydrated,
@@ -880,15 +798,13 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     targetClipDurationMaxSec,
     targetClipDurationMinSec,
     targetClipDurationSec,
-    videoPoolMode,
   ]);
   const discardUnsavedChanges = useCallback(() => {
     const saved = savedPreferences ?? readStudyReelsSettings();
     setMinRelevanceThreshold(saved.minRelevanceThreshold);
     setStartMuted(saved.startMuted);
     setAutoplayNextReel(saved.autoplayNextReel);
-    setMultiPlatformSearch(saved.multiPlatformSearch);
-    setVideoPoolMode(saved.videoPoolMode);
+    setCreativeCommonsOnly(saved.creativeCommonsOnly);
     setPreferredVideoDuration(saved.preferredVideoDuration);
     setTargetClipDurationMinSec(saved.targetClipDurationMinSec);
     setTargetClipDurationMaxSec(saved.targetClipDurationMaxSec);
@@ -1071,38 +987,37 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
 
           <div className="mt-4 grid gap-4 md:grid-cols-2">
             <div className="rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
-              <div className="flex items-center gap-1.5">
-                <p className="text-sm font-semibold text-white/95">Video pool mode</p>
-                <SettingsInfoTooltip text="Control how aggressively long sources are included." />
-              </div>
-              <div className="relative mt-3 grid h-11 grid-cols-3 items-center rounded-2xl border border-white/20 bg-white/[0.08] p-1">
-                <span
-                  aria-hidden="true"
-                  className="pointer-events-none absolute bottom-1 left-1 top-1 w-[calc((100%-8px)/3)] rounded-xl bg-white transition-transform duration-300 ease-out"
-                  style={{
-                    transform: `translateX(${VIDEO_POOL_OPTIONS.findIndex((option) => option.value === videoPoolMode) * 100}%)`,
-                  }}
-                />
-                {VIDEO_POOL_OPTIONS.map((option) => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    onClick={() => setVideoPoolMode(option.value)}
-                    className={`relative z-10 rounded-xl px-1.5 py-2 text-[10px] font-semibold uppercase tracking-[0.04em] transition-colors duration-200 ${
-                      videoPoolMode === option.value ? "text-black" : "text-white/75 hover:text-white"
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-sm font-semibold text-white/95">Creative Commons only</p>
+                    <SettingsInfoTooltip text="Ask Supadata for Creative Commons YouTube sources in addition to requiring native captions." />
+                  </div>
+                  <p className="mt-1 text-[11px] text-white/58">
+                    {creativeCommonsOnly ? "Licensed sources only" : "Any YouTube license"}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setCreativeCommonsOnly((prev) => !prev)}
+                  aria-pressed={creativeCommonsOnly}
+                  className={`relative mt-0.5 inline-flex h-7 w-12 shrink-0 rounded-full border transition-colors duration-200 ${
+                    creativeCommonsOnly ? "border-white bg-white" : "border-white/32 bg-black/50"
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 h-[22px] w-[22px] rounded-full transition-transform duration-200 ${
+                      creativeCommonsOnly ? "translate-x-[24px] bg-black" : "translate-x-[2px] bg-white"
                     }`}
-                    aria-pressed={videoPoolMode === option.value}
-                  >
-                    {option.label}
-                  </button>
-                ))}
+                  />
+                </button>
               </div>
             </div>
 
             <div className="rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
               <div className="flex items-center gap-1.5">
                 <p className="text-sm font-semibold text-white/95">Source video length</p>
-                <SettingsInfoTooltip text="Prefer short clips, medium lessons, long lectures, or any." />
+                <SettingsInfoTooltip text="Prefer short, medium, or long source videos. This is a retrieval filter, separate from clip-length preferences." />
               </div>
               <div className="relative mt-3 grid h-11 grid-cols-4 items-center rounded-2xl border border-white/20 bg-white/[0.08] p-1">
                 <span
@@ -1173,27 +1088,13 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
             <div className="mt-4 flex items-start justify-between gap-4 border-t border-white/10 pt-4">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-1.5">
-                  <p className="text-sm font-semibold text-white/95">Search all platforms</p>
-                  <SettingsInfoTooltip text="When on, topic / text / file submits augment YouTube search with provider APIs such as Dailymotion, Bilibili, Vimeo, TikTok, and Twitch. When off, searches use the YouTube-only pipeline." />
+                  <p className="text-sm font-semibold text-white/95">Caption source</p>
+                  <SettingsInfoTooltip text="Study discovery is YouTube-only and requires native captions. Videos without native captions are skipped." />
                 </div>
                 <p className="mt-1 text-[11px] text-white/58">
-                  {multiPlatformSearch ? "YouTube + provider APIs" : "YouTube only (faster)"}
+                  YouTube native captions only
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setMultiPlatformSearch((prev) => !prev)}
-                aria-pressed={multiPlatformSearch}
-                className={`relative mt-0.5 inline-flex h-7 w-12 shrink-0 rounded-full border transition-colors duration-200 ${
-                  multiPlatformSearch ? "border-white bg-white" : "border-white/32 bg-black/50"
-                }`}
-              >
-                <span
-                  className={`absolute top-0.5 h-[22px] w-[22px] rounded-full transition-transform duration-200 ${
-                    multiPlatformSearch ? "translate-x-[24px] bg-black" : "translate-x-[2px] bg-white"
-                  }`}
-                />
-              </button>
             </div>
           </div>
 

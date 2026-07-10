@@ -58,6 +58,7 @@ def test_extract_video_id_accepts_v_param_anywhere():
 def test_require_supadata_key_raises_when_missing(monkeypatch):
     monkeypatch.delenv("SUPADATA_API_KEY", raising=False)
     cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
-    from backend.app.clip_engine.errors import SearchError
-    with pytest.raises(SearchError):
+    from backend.app.clip_engine.errors import ProviderConfigurationError
+    with pytest.raises(ProviderConfigurationError) as exc_info:
         cfg.require_supadata_key()
+    assert exc_info.value.as_dict()["code"] == "provider_configuration"

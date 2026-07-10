@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -153,14 +154,18 @@ class IngestionUrlTests(unittest.TestCase):
         """Running the same search twice must land both batches under the same material_id."""
         self._install_high_rate_limits()
 
-        first = self.client.post(
-            "/api/ingest/search",
-            json={"query": "  Linear Algebra  ", "platforms": ["yt"], "max_per_platform": 1},
-        )
-        second = self.client.post(
-            "/api/ingest/search",
-            json={"query": "linear algebra", "platforms": ["yt"], "max_per_platform": 1},
-        )
+        with mock.patch(
+            "backend.app.ingestion.pipeline.clip_engine_search.discover",
+            return_value={"corrected": "linear algebra", "videos": [], "credits_used": 0, "warning": None},
+        ):
+            first = self.client.post(
+                "/api/ingest/search",
+                json={"query": "  Linear Algebra  ", "platforms": ["yt"], "max_per_platform": 1},
+            )
+            second = self.client.post(
+                "/api/ingest/search",
+                json={"query": "linear algebra", "platforms": ["yt"], "max_per_platform": 1},
+            )
 
         self.assertEqual(first.status_code, 200, first.text)
         self.assertEqual(second.status_code, 200, second.text)

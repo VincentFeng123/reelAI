@@ -148,6 +148,39 @@ class IngestTopicTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        identity_suffixes = [
+            "1", "2", "3", "4", "5", "6", "7", "8", "9",
+            "all", "ceil", "diff", "nodiff", "lvl",
+        ]
+        with db_module.get_conn(transactional=True) as conn:
+            for suffix in identity_suffixes:
+                material_id = f"mat-{suffix}"
+                concept_id = f"con-{suffix}"
+                db_module.insert(
+                    conn,
+                    "materials",
+                    {
+                        "id": material_id,
+                        "subject_tag": TOPIC,
+                        "raw_text": TOPIC,
+                        "source_type": "topic",
+                        "source_path": None,
+                        "created_at": db_module.now_iso(),
+                    },
+                )
+                db_module.insert(
+                    conn,
+                    "concepts",
+                    {
+                        "id": concept_id,
+                        "material_id": material_id,
+                        "title": TOPIC,
+                        "keywords_json": "[]",
+                        "summary": "",
+                        "embedding_json": None,
+                        "created_at": db_module.now_iso(),
+                    },
+                )
 
     def _restore_environment(self) -> None:
         if self.previous_data_dir is None:

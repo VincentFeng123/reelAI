@@ -7,10 +7,12 @@ All functions are pure (no I/O, no DB) so they can be unit-tested in isolation.
 from __future__ import annotations
 
 import re
-from pathlib import Path
+import unicodedata
 
-from ..ingestion.models import IngestTranscriptCue, IngestMetadata, IngestSegment
-from ..ingestion.adapters.base import AdapterResult
+from ..ingestion.models import IngestTranscriptCue, IngestMetadata, IngestSegment, YouTubeSourceRef
+from .metadata import normalize_youtube_video_id
+
+_TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 
 
 # ── Transcript helpers ────────────────────────────────────────────────────────
@@ -43,12 +45,26 @@ def window_text(transcript: dict, t0: float, t1: float) -> str:
     return " ".join(parts)
 
 
+def cue_text(transcript: dict, cue_ids: object) -> str:
+    """Return text from exactly the requested immutable cue ids, in cue order."""
+    if not isinstance(cue_ids, list) or not cue_ids:
+        return ""
+    selected = {str(cue_id) for cue_id in cue_ids}
+    parts: list[str] = []
+    for index, segment in enumerate(transcript.get("segments", [])):
+        cue_id = str(segment.get("cue_id") or f"cue-{index}")
+        text = str(segment.get("text") or "").strip()
+        if cue_id in selected and text:
+            parts.append(text)
+    return " ".join(parts)
+
+
 # ── Model constructors ────────────────────────────────────────────────────────
 
 
 def to_metadata(video_id: str, meta: dict, source_url: str) -> IngestMetadata:
     """Build IngestMetadata from a raw meta dict (Supadata / yt-dlp info_dict)."""
-    raw_vc = meta.get("view_count")
+    raw_vc = meta.get("view_count", meta.get("viewCount"))
     if isinstance(raw_vc, int):
         view_count = raw_vc
     elif isinstance(raw_vc, str) and raw_vc.strip().isdigit():
@@ -56,36 +72,43 @@ def to_metadata(video_id: str, meta: dict, source_url: str) -> IngestMetadata:
     else:
         view_count = None
 
+    source_id = normalize_youtube_video_id(video_id) or str(video_id).strip()
+    duration = meta.get("duration_sec", meta.get("duration"))
+    try:
+        duration_sec = float(duration) if duration not in (None, "") else None
+    except (TypeError, ValueError, OverflowError):
+        duration_sec = None
     return IngestMetadata(
         platform="yt",
-        source_id=video_id,
+        source_id=source_id,
         source_url=source_url,
-        playback_url=f"https://www.youtube.com/embed/{video_id}",
-        title=meta.get("title", ""),
-        description=meta.get("description", ""),
-        author_name=meta.get("author_name", ""),
-        duration_sec=meta.get("duration_sec"),
-        thumbnail_url=meta.get("thumbnail_url", ""),
+        playback_url=f"https://www.youtube.com/embed/{source_id}",
+        title=meta.get("title") or "",
+        description=meta.get("description") or "",
+        author_name=meta.get("author_name") or meta.get("channel") or meta.get("channelTitle") or "",
+        author_url=meta.get("author_url") or meta.get("channel_url") or "",
+        channel_id=meta.get("channel_id") or meta.get("channelId") or "",
+        duration_sec=duration_sec,
+        thumbnail_url=meta.get("thumbnail_url") or meta.get("thumbnail") or "",
+        upload_date_iso=meta.get("upload_date_iso") or meta.get("published_at") or meta.get("uploadDate") or None,
         view_count=view_count,
     )
 
 
-def synth_adapter_result(video_id: str, source_url: str) -> AdapterResult:
-    """Construct a minimal AdapterResult satisfying _persist_ingest's contract."""
-    return AdapterResult(
-        platform="yt",
+def synth_adapter_result(video_id: str, source_url: str) -> YouTubeSourceRef:
+    """Construct the canonical YouTube source reference used by persistence."""
+    return YouTubeSourceRef(
         source_id=video_id,
         source_url=source_url,
         playback_url=f"https://www.youtube.com/embed/{video_id}",
-        video_path=Path("."),
-        info_dict={},
     )
 
 
 def to_segment(clip: dict, transcript: dict) -> IngestSegment:
     """Build IngestSegment from a clip dict; text is in-window transcript or clip title."""
     t0, t1 = round(float(clip["start"]), 3), round(float(clip["end"]), 3)
-    text = window_text(transcript, t0, t1) or clip.get("title", "")
+    text = cue_text(transcript, clip.get("cue_ids")) or window_text(transcript, t0, t1)
+    text = text or clip.get("title", "")
     return IngestSegment(
         t_start=t0,
         t_end=t1,
@@ -98,7 +121,8 @@ def to_segment(clip: dict, transcript: dict) -> IngestSegment:
 
 
 def _tokens(text: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9']+", text.lower()))
+    normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return {match.group(0) for match in _TOKEN_RE.finditer(normalized)}
 
 
 def relevance_score(clip: dict, transcript: dict, query: str | None) -> float:
@@ -117,7 +141,8 @@ def relevance_score(clip: dict, transcript: dict, query: str | None) -> float:
         return 1.0
 
     t0, t1 = clip["start"], clip["end"]
-    clip_text = clip.get("title", "") + " " + window_text(transcript, t0, t1)
+    exact = cue_text(transcript, clip.get("cue_ids"))
+    clip_text = clip.get("title", "") + " " + (exact or window_text(transcript, t0, t1))
     clip_tokens = _tokens(clip_text)
 
     overlap = len(query_tokens & clip_tokens)
@@ -168,6 +193,7 @@ def pick_best_clip(clips: list[dict], target_sec: float, max_sec: float) -> dict
 __all__ = [
     "to_cues",
     "window_text",
+    "cue_text",
     "to_metadata",
     "synth_adapter_result",
     "to_segment",

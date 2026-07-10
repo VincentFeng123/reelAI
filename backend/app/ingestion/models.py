@@ -10,6 +10,7 @@ is forward-compatible.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -17,7 +18,15 @@ from pydantic import BaseModel, Field, model_validator
 from ..models import ReelOut
 
 
-PlatformLiteral = Literal["yt", "ig", "tt"]
+PlatformLiteral = Literal["yt"]
+
+
+@dataclass(frozen=True)
+class YouTubeSourceRef:
+    source_id: str
+    source_url: str
+    playback_url: str
+    platform: PlatformLiteral = "yt"
 
 
 class IngestRequest(BaseModel):
@@ -28,6 +37,7 @@ class IngestRequest(BaseModel):
     target_clip_duration_min_sec: int = Field(default=15, ge=15, le=180)
     target_clip_duration_max_sec: int = Field(default=60, ge=15, le=180)
     language: str = Field(default="en", min_length=2, max_length=8)
+    multi_platform_search: bool = False
 
     @model_validator(mode="after")
     def validate_duration_bounds(self) -> "IngestRequest":
@@ -51,29 +61,21 @@ class IngestFeedRequest(BaseModel):
     target_clip_duration_min_sec: int = Field(default=15, ge=15, le=180)
     target_clip_duration_max_sec: int = Field(default=60, ge=15, le=180)
     language: str = Field(default="en", min_length=2, max_length=8)
+    multi_platform_search: bool = False
 
 
 WordSourceLiteral = Literal[
-    "whisper",          # faster-whisper native (local)
-    "whisper_aligned",  # caption text + faster-whisper word timings (Phase 1)
-    "whisperx",         # WhisperX forced alignment (Phase 4, selective)
-    "youtube_vtt",      # YouTube auto-caption VTT <c>-tag word timings (captions-first path)
-    "groq",
-    "proportional",
+    "native_caption",
     "legacy",
 ]
 
 
 class IngestTranscriptWord(BaseModel):
     """
-    Word-level timestamp (Phase A.1).
+    Legacy word-level timestamp retained only for stored-payload compatibility.
 
-    Populated by the Whisper transcription paths when `word_timestamps=True` /
-    `timestamp_granularities=["word"]` are in use. For non-Whisper transcript
-    sources (youtube-transcript-api, yt-dlp VTT) the ingestion code fills this
-    by proportional-character fallback, and the containing cue's `word_source`
-    is marked `"proportional"` so the boundary engine can degrade accuracy
-    claims appropriately.
+    The active clipping path cuts directly on native caption cue boundaries and
+    does not synthesize word timestamps.
     """
 
     start: float = Field(ge=0.0)
@@ -101,7 +103,7 @@ class IngestTranscriptCue(BaseModel):
     @model_validator(mode="after")
     def validate_time_order(self) -> "IngestTranscriptCue":
         if self.end < self.start:
-            # Whisper occasionally emits a 0-duration cue; pad it by 10ms so downstream math doesn't divide by zero.
+            # Pad malformed legacy cues so downstream compatibility reads remain safe.
             object.__setattr__(self, "end", self.start + 0.01)
         return self
 
@@ -136,6 +138,7 @@ class IngestMetadata(BaseModel):
     author_handle: str = ""
     author_name: str = ""
     author_url: str = ""
+    channel_id: str = ""
     duration_sec: float | None = None
     thumbnail_url: str = ""
     upload_date_iso: str | None = None
@@ -197,16 +200,7 @@ class IngestSearchRequest(BaseModel):
     """
     Topic-based search, currently YouTube-only.
 
-    The adapter still supports Instagram + TikTok but the default is YouTube
-    because IG/TT robots.txt explicitly disallows bots (User-Agent: ReelAIBot
-    in the good-faith crawler config at ingestion/__init__.py) so those
-    platforms would bounce at the robots.txt check anyway. Callers who want
-    IG/TT can still opt in by passing `platforms` explicitly and accepting
-    the legal/ToS posture.
-
-    Each resolved URL is processed through the same ingest_url pipeline, so
-    search results get Whisper fallback, silence-aware cuts, and full metadata
-    just like a manually pasted URL.
+    Discovery and ingestion are YouTube-only and require native captions.
     """
 
     query: str = Field(min_length=1, max_length=500)
@@ -222,6 +216,16 @@ class IngestSearchRequest(BaseModel):
     # skips any resolved URL whose extracted source_id is in this set. This is the
     # pagination/infinite-scroll mechanism — pass every reel you've already seen.
     exclude_video_ids: list[str] = Field(default_factory=list)
+    multi_platform_search: bool = False
+
+    @model_validator(mode="after")
+    def validate_youtube_search(self) -> "IngestSearchRequest":
+        self.query = " ".join(self.query.split())
+        if not self.query:
+            raise ValueError("query must contain non-whitespace text.")
+        if set(self.platforms) != {"yt"}:
+            raise ValueError("Only YouTube search is supported; platforms must be ['yt'].")
+        return self
 
 
 class IngestSearchItem(BaseModel):
@@ -272,6 +276,7 @@ class IngestTopicCutRequest(BaseModel):
     material_id: str | None = Field(default=None, max_length=240)
     concept_id: str | None = Field(default=None, max_length=240)
     language: str = Field(default="en", min_length=2, max_length=8)
+    multi_platform_search: bool = False
     use_llm: bool = Field(
         default=True,
         description=(
@@ -288,6 +293,16 @@ class IngestTopicCutRequest(BaseModel):
             "and transcript text."
         ),
     )
+
+    @model_validator(mode="after")
+    def validate_supported_mode(self) -> "IngestTopicCutRequest":
+        if not self.use_llm:
+            raise ValueError("use_llm=false is unsupported; native-cue Gemini segmentation is required.")
+        if self.query is not None:
+            self.query = " ".join(self.query.split())
+            if not self.query:
+                raise ValueError("query must contain non-whitespace text when provided.")
+        return self
 
 
 class IngestTopicCutResult(BaseModel):
@@ -316,6 +331,7 @@ class IngestTopicCutResult(BaseModel):
 
 __all__ = [
     "PlatformLiteral",
+    "YouTubeSourceRef",
     "IngestRequest",
     "IngestFeedRequest",
     "IngestSearchRequest",

@@ -4,7 +4,7 @@ export type SearchFeedQuerySettings = Pick<
   StudyReelsSettings,
   | "minRelevanceThreshold"
   | "startMuted"
-  | "videoPoolMode"
+  | "creativeCommonsOnly"
   | "preferredVideoDuration"
   | "targetClipDurationSec"
   | "targetClipDurationMinSec"
@@ -34,8 +34,11 @@ export function applySearchFeedSettingsToParams(
   settings: SearchFeedQuerySettings,
 ): URLSearchParams {
   params.set("min_relevance", String(Number(settings.minRelevanceThreshold.toFixed(2))));
-  params.set("video_pool_mode", settings.videoPoolMode);
+  params.set("creative_commons_only", settings.creativeCommonsOnly ? "1" : "0");
   params.set("preferred_video_duration", settings.preferredVideoDuration);
+  params.set("target_clip_duration_sec", String(settings.targetClipDurationSec));
+  params.set("target_clip_duration_min_sec", String(settings.targetClipDurationMinSec));
+  params.set("target_clip_duration_max_sec", String(settings.targetClipDurationMaxSec));
   params.set("start_muted", settings.startMuted ? "1" : "0");
   return params;
 }
@@ -64,7 +67,7 @@ export function readSearchFeedQuerySettings(getParam: (key: string) => string | 
   const settings: SearchFeedQuerySettingsOverride = {
     minRelevanceThreshold: parseQueryNumber(getParam("min_relevance")),
     startMuted: parseQueryBoolean(getParam("start_muted")),
-    videoPoolMode: (getParam("video_pool_mode") || undefined) as SearchFeedQuerySettings["videoPoolMode"] | undefined,
+    creativeCommonsOnly: parseQueryBoolean(getParam("creative_commons_only")),
     preferredVideoDuration: (
       getParam("preferred_video_duration") || undefined
     ) as SearchFeedQuerySettings["preferredVideoDuration"] | undefined,
@@ -88,7 +91,7 @@ export function mergeSearchFeedQuerySettings(
     minRelevanceThreshold: override.minRelevanceThreshold ?? base.minRelevanceThreshold,
     startMuted: override.startMuted ?? base.startMuted,
     autoplayNextReel: base.autoplayNextReel,
-    videoPoolMode: override.videoPoolMode ?? base.videoPoolMode,
+    creativeCommonsOnly: override.creativeCommonsOnly ?? base.creativeCommonsOnly,
     preferredVideoDuration: override.preferredVideoDuration ?? base.preferredVideoDuration,
     targetClipDurationSec: override.targetClipDurationSec ?? base.targetClipDurationSec,
     targetClipDurationMinSec: override.targetClipDurationMinSec ?? base.targetClipDurationMinSec,

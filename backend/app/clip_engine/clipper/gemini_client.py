@@ -11,6 +11,7 @@ import random
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Optional
 
 from google import genai
@@ -18,6 +19,18 @@ from google.genai import types
 
 from . import config
 from ..cancellation import raise_if_cancelled, run_cancellable, sleep_with_probe
+from ..errors import (
+    CancellationError,
+    ModelUnavailableError,
+    ProviderAuthenticationError,
+    ProviderConfigurationError,
+    ProviderError,
+    ProviderQuotaError,
+    ProviderRateLimitError,
+    ProviderRequestError,
+    ProviderTransientError,
+)
+from ..provider_runtime import GenerationContext, MAX_PROVIDER_RETRIES, bounded_retry_after
 
 _client: Optional[genai.Client] = None
 _lock = threading.Lock()
@@ -29,9 +42,10 @@ def get_client() -> genai.Client:
         with _lock:
             if _client is None:
                 if not config.GEMINI_API_KEY:
-                    raise RuntimeError(
-                        "GEMINI_API_KEY is not set. Add it to .env "
-                        "(get a free key at https://aistudio.google.com/apikey)."
+                    raise ProviderConfigurationError(
+                        "GEMINI_API_KEY (or GOOGLE_API_KEY) is not set.",
+                        provider="gemini",
+                        operation="segmentation",
                     )
                 _client = genai.Client(
                     api_key=config.GEMINI_API_KEY,
@@ -55,10 +69,12 @@ def _is_retryable(e: Exception) -> bool:
     # bad model name) must fail fast, not burn 6 backoff rounds.
     code = _error_code(e)
     if code is not None:
-        return code in (429, 500, 503)
+        return code == 429 or 500 <= code <= 599
+    if isinstance(e, (ConnectionError, TimeoutError, OSError)):
+        return True
     s = str(e).lower()
     return (
-        "429" in s or "resource_exhausted" in s or "rate" in s
+        "429" in s or "resource_exhausted" in s or "rate limit" in s or "rate_limit" in s
         or "503" in s or "500" in s or "unavailable" in s or "overloaded" in s
     )
 
@@ -66,14 +82,73 @@ def _is_retryable(e: Exception) -> bool:
 def is_model_unavailable(e: Exception) -> bool:
     """A non-transient model-access failure (bad name / no access): callers may
     fall back to the default model instead of failing the whole video."""
+    if isinstance(e, ModelUnavailableError):
+        return True
     code = _error_code(e)
-    if code in (403, 404):
+    if code == 404:
         return True
     s = str(e).lower()
     return (
         "not_found" in s or "not found" in s
-        or "permission_denied" in s or "permission denied" in s
     )
+
+
+def _exception_headers(exc: Exception):
+    headers = getattr(exc, "headers", None)
+    if headers is not None:
+        return headers
+    response = getattr(exc, "response", None)
+    return getattr(response, "headers", None)
+
+
+def _typed_failure(exc: Exception) -> ProviderError:
+    if isinstance(exc, ProviderError):
+        return exc
+    code = _error_code(exc)
+    detail = str(exc)[:500]
+    kwargs = dict(
+        provider="gemini",
+        operation="segmentation",
+        status_code=code,
+        detail=detail or None,
+    )
+    if code in (401, 403):
+        return ProviderAuthenticationError("Gemini authentication failed.", **kwargs)
+    if code == 402:
+        return ProviderQuotaError("Gemini quota is exhausted.", **kwargs)
+    if code == 404:
+        return ModelUnavailableError("The configured Gemini model is unavailable.", **kwargs)
+    if code == 429:
+        return ProviderRateLimitError(
+            "Gemini is rate limited.",
+            retry_after_sec=bounded_retry_after(_exception_headers(exc)),
+            **kwargs,
+        )
+    lowered = detail.lower()
+    if code is None and (
+        "429" in lowered
+        or "resource_exhausted" in lowered
+        or "rate limit" in lowered
+        or "rate_limit" in lowered
+    ):
+        return ProviderRateLimitError(
+            "Gemini is rate limited.",
+            retry_after_sec=bounded_retry_after(_exception_headers(exc)),
+            **kwargs,
+        )
+    if code is not None and 500 <= code <= 599:
+        return ProviderTransientError("Gemini is temporarily unavailable.", **kwargs)
+    if code is None and _is_retryable(exc):
+        return ProviderTransientError("Could not reach Gemini.", **kwargs)
+    return ProviderRequestError("Gemini rejected the segmentation request.", **kwargs)
+
+
+@dataclass(frozen=True)
+class GeminiResponse:
+    text: str
+    model_used: str
+    quality_degraded: bool
+    usage: object | None = None
 
 
 def _retry(call) -> str:
@@ -94,30 +169,71 @@ def _retry(call) -> str:
     raise RuntimeError(f"Gemini call failed: {last}")
 
 
-async def _retry_async(call, should_cancel: Callable[[], bool] | None = None) -> str:
+async def _retry_async(
+    call,
+    should_cancel: Callable[[], bool] | None = None,
+    *,
+    context: GenerationContext | None = None,
+    model_used: str,
+    quality_degraded: bool,
+) -> GeminiResponse:
     """Async retry loop whose request and backoff both observe cancellation."""
     last: Optional[Exception] = None
-    for attempt in range(config.BACKOFF_MAX_RETRIES + 1):
+    for retry_index in range(MAX_PROVIDER_RETRIES + 1):
         raise_if_cancelled(should_cancel)
+        attempt = retry_index + 1
+        if context is not None:
+            context.reserve("segmentation")
         try:
-            text = await call()
-            if text:
-                return text
-            last = RuntimeError("empty response from Gemini")
+            response = await call()
+            text = str(getattr(response, "text", "") or "")
+            if not text:
+                raise ProviderRequestError(
+                    "Gemini returned an empty segmentation response.",
+                    provider="gemini",
+                    operation="segmentation",
+                )
+            actual_model = str(getattr(response, "model_version", "") or model_used)
+            usage = getattr(response, "usage_metadata", None)
+            if context is not None:
+                context.record_gemini(
+                    attempt=attempt,
+                    model_used=actual_model,
+                    quality_degraded=quality_degraded,
+                    usage=usage,
+                )
+            return GeminiResponse(text, actual_model, quality_degraded, usage)
         except asyncio.CancelledError:
+            raise
+        except CancellationError:
             raise
         except Exception as exc:  # noqa: BLE001
             last = exc
-            if not _is_retryable(exc) or attempt == config.BACKOFF_MAX_RETRIES:
-                raise
-        wait = min(config.BACKOFF_CAP, config.BACKOFF_BASE * 2 ** attempt)
-        await sleep_with_probe(wait + random.uniform(0, 0.5 * wait), should_cancel)
-    raise RuntimeError(f"Gemini call failed: {last}")
+            typed = _typed_failure(exc)
+            if context is not None:
+                context.record_gemini(
+                    attempt=attempt,
+                    model_used=model_used,
+                    quality_degraded=quality_degraded,
+                    status_code=typed.status_code,
+                    error_code=typed.code,
+                )
+            if not typed.retryable or retry_index >= MAX_PROVIDER_RETRIES:
+                raise typed from exc
+        wait = bounded_retry_after(_exception_headers(last))
+        if wait is None:
+            wait = min(config.BACKOFF_CAP, config.BACKOFF_BASE * 2 ** retry_index)
+        await sleep_with_probe(wait, should_cancel)
+    raise ProviderTransientError(
+        f"Gemini call failed: {last}", provider="gemini", operation="segmentation"
+    )
 
 
-def generate_json(system: str, user: str, schema, temperature: float = 0.2,
-                  model: Optional[str] = None, max_output_tokens: int = 8192,
-                  should_cancel: Callable[[], bool] | None = None) -> str:
+def generate_json_result(system: str, user: str, schema, temperature: float = 0.2,
+                         model: Optional[str] = None, max_output_tokens: int = 8192,
+                         should_cancel: Callable[[], bool] | None = None,
+                         *, context: GenerationContext | None = None,
+                         quality_degraded: bool = False) -> GeminiResponse:
     """Return a JSON string conforming to `schema` (a Pydantic model class).
 
     ``max_output_tokens`` bounds the response; raise it for calls whose JSON is large
@@ -126,34 +242,49 @@ def generate_json(system: str, user: str, schema, temperature: float = 0.2,
     client = get_client()
     mdl = model or config.GEMINI_MODEL
 
-    def _make_config(thinking: bool):
-        kwargs = dict(
+    def _make_config():
+        return types.GenerateContentConfig(
             system_instruction=system,
             response_mime_type="application/json",
             response_schema=schema,
             temperature=temperature,
             max_output_tokens=max_output_tokens,
         )
-        if not thinking:
-            # Disable 2.5-flash "thinking" → much faster for structured extraction.
-            kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        return types.GenerateContentConfig(**kwargs)
 
     async def _call():
         raise_if_cancelled(should_cancel)
-        try:
-            resp = await client.aio.models.generate_content(
-                model=mdl, contents=user, config=_make_config(thinking=False)
-            )
-        except Exception:
-            # some models reject thinking_budget=0 → retry with thinking on
-            raise_if_cancelled(should_cancel)
-            resp = await client.aio.models.generate_content(
-                model=mdl, contents=user, config=_make_config(thinking=True)
-            )
-        return resp.text
+        return await client.aio.models.generate_content(
+            model=mdl, contents=user, config=_make_config()
+        )
 
-    return run_cancellable(lambda: _retry_async(_call, should_cancel), should_cancel)
+    return run_cancellable(
+        lambda: _retry_async(
+            _call,
+            should_cancel,
+            context=context,
+            model_used=mdl,
+            quality_degraded=quality_degraded,
+        ),
+        should_cancel,
+    )
+
+
+def generate_json(system: str, user: str, schema, temperature: float = 0.2,
+                  model: Optional[str] = None, max_output_tokens: int = 8192,
+                  should_cancel: Callable[[], bool] | None = None,
+                  *, context: GenerationContext | None = None,
+                  quality_degraded: bool = False) -> str:
+    return generate_json_result(
+        system,
+        user,
+        schema,
+        temperature=temperature,
+        model=model,
+        max_output_tokens=max_output_tokens,
+        should_cancel=should_cancel,
+        context=context,
+        quality_degraded=quality_degraded,
+    ).text
 
 
 # ── multimodal (Phase 2 vision) ──────────────────────────────────────────────

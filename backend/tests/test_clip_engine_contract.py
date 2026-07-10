@@ -83,6 +83,19 @@ class ClipEngineContractTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        with db_module.get_conn(transactional=True) as conn:
+            db_module.insert(
+                conn,
+                "materials",
+                {
+                    "id": "m1",
+                    "subject_tag": "test",
+                    "raw_text": "test",
+                    "source_type": "topic",
+                    "source_path": None,
+                    "created_at": db_module.now_iso(),
+                },
+            )
 
         self.client = TestClient(app)
         self.addCleanup(self.client.close)

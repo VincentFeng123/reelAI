@@ -89,6 +89,19 @@ class ClipEngineFeedTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        with db_module.get_conn(transactional=True) as conn:
+            db_module.insert(
+                conn,
+                "materials",
+                {
+                    "id": "m1",
+                    "subject_tag": "test",
+                    "raw_text": "test",
+                    "source_type": "topic",
+                    "source_path": None,
+                    "created_at": db_module.now_iso(),
+                },
+            )
 
     def _restore_environment(self) -> None:
         if self.previous_data_dir is None:
@@ -266,7 +279,7 @@ class ResolveFeedUrlsUnitTests(unittest.TestCase):
         """resolve_feed_urls truncates to max_items."""
         from backend.app.clip_engine.metadata import resolve_feed_urls
 
-        fake_entries = [{"id": f"vid{i:011d}"} for i in range(10)]
+        fake_entries = [{"id": f"vid{i:08d}"} for i in range(10)]
         fake_info = {"entries": fake_entries}
 
         fake_ydl = mock.MagicMock()

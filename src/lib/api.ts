@@ -9,18 +9,22 @@ import type {
   CommunitySet,
   CommunityReelPlatform,
   FeedResponse,
+  GenerationJobCancelResponse,
+  GenerationJobStatusResponse,
+  GenerationQueuedResponse,
   IngestResult,
   IngestSearchRequest,
   IngestSearchResult,
   IngestUrlRequest,
   MaterialResponse,
   Reel,
-  RefinementStatusResponse,
   ReelProgressResponse,
   ReelsCanGenerateAnyResponse,
   ReelsCanGenerateResponse,
   ReelsGenerateResponse,
+  ReelsGenerateSubmission,
   ReelsGenerateStreamEvent,
+  TypedApiError,
 } from "@/lib/types";
 import type { StoredHistoryItem } from "@/lib/historyStorage";
 import {
@@ -29,7 +33,6 @@ import {
   setActiveStudyReelsSettingsScope,
   type PreferredVideoDuration,
   type StudyReelsSettings,
-  type VideoPoolMode,
 } from "@/lib/settings";
 
 const RAW_API_BASE = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
@@ -760,12 +763,11 @@ type GenerateReelsParams = {
   excludeVideoIds?: string[];
   generationMode?: "slow" | "fast";
   minRelevance?: number;
-  videoPoolMode?: VideoPoolMode;
+  creativeCommonsOnly?: boolean;
   preferredVideoDuration?: PreferredVideoDuration;
   targetClipDurationSec?: number;
   targetClipDurationMinSec?: number;
   targetClipDurationMaxSec?: number;
-  multiPlatformSearch?: boolean;
 };
 
 // Max number of IDs we send on any request. After a long session the client's
@@ -826,29 +828,30 @@ function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<stri
     concept_id: params.conceptId,
     num_reels: params.numReels ?? 7,
     exclude_video_ids: normalizeVideoIdList(params.excludeVideoIds),
-    creative_commons_only: false,
+    creative_commons_only: params.creativeCommonsOnly === true,
     generation_mode: params.generationMode ?? "slow",
     min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
-    video_pool_mode: params.videoPoolMode ?? "short-first",
     preferred_video_duration: params.preferredVideoDuration ?? "any",
-    multi_platform_search: params.multiPlatformSearch === true,
+    target_clip_duration_sec: params.targetClipDurationSec,
+    target_clip_duration_min_sec: params.targetClipDurationMinSec,
+    target_clip_duration_max_sec: params.targetClipDurationMaxSec,
   };
 }
 
-export async function generateReels(params: GenerateReelsParams): Promise<ReelsGenerateResponse> {
+export async function generateReels(params: GenerateReelsParams): Promise<ReelsGenerateSubmission> {
   const res = await safeFetch(apiUrl("/reels/generate"), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       // Backend requires an owner-key identity header on reels endpoints to
       // rate-limit per-device and block anonymous API scraping.
-      ...communityOwnerHeaders(),
+      ...communityRequestHeaders(),
     },
     body: JSON.stringify(buildGenerateReelsRequestBody(params)),
     timeoutMs: 900_000,
   });
 
-  return parseJsonResponse<ReelsGenerateResponse>(res);
+  return parseJsonResponse<ReelsGenerateSubmission>(res);
 }
 
 // Maps the web app's settings-friendly camelCase to the snake_case the backend expects.
@@ -864,17 +867,12 @@ type IngestUrlParams = {
 };
 
 /**
- * POST /api/ingest/url — downloads the reel server-side, runs the full ingestion
- * pipeline (yt-dlp → ffmpeg → transcript with Whisper fallback → silence-aware clip
- * window → metadata extraction), and persists a ReelOut-compatible record under
- * the `ingest-scratch` sentinel material when no material_id is supplied.
- *
- * Uses a 180-second timeout because the Whisper fallback path can take 20-60s for
- * longer reels (the backend uploads the audio to OpenAI).
+ * POST /api/ingest/url — ingests a canonical YouTube video, playlist, or channel
+ * URL using native caption timing. Sources without native captions are rejected;
+ * no media download or generated-transcript fallback is used.
  */
 type IngestSearchParams = {
   query: string;
-  platforms?: Array<"yt" | "ig" | "tt">;
   maxPerPlatform?: number;
   materialId?: string | null;
   conceptId?: string | null;
@@ -887,22 +885,13 @@ type IngestSearchParams = {
 };
 
 /**
- * POST /api/ingest/search — topic-based multi-platform search across YouTube,
- * Instagram, and TikTok. For each platform, yt-dlp resolves reel URLs via its
- * native search extractors; each URL then flows through the same ingest_url
- * pipeline (Whisper fallback, smart cuts, full metadata).
- *
- * Uses a 300s timeout because a 3-platform search of 4 reels each can take
- * 1-3 minutes when Whisper is hit on every item. For infinite-scroll pagination,
- * pass every already-seen reel's bare `source_id` in `excludeVideoIds`.
- *
- * Per-platform failures are non-fatal — the response carries `per_platform_errors`
- * so the client can surface which platform went down.
+ * POST /api/ingest/search — YouTube-only discovery using native captions.
+ * Videos without native captions are skipped; the backend never falls back to
+ * local or generated transcription.
  */
 export async function ingestSearch(params: IngestSearchParams): Promise<IngestSearchResult> {
   const body: IngestSearchRequest = {
     query: params.query,
-    platforms: params.platforms,
     max_per_platform: Number.isFinite(params.maxPerPlatform)
       ? Math.round(params.maxPerPlatform as number)
       : undefined,
@@ -930,6 +919,9 @@ export async function ingestUrl(params: IngestUrlParams): Promise<IngestResult> 
     source_url: params.sourceUrl,
     material_id: params.materialId ?? undefined,
     concept_id: params.conceptId ?? undefined,
+    target_clip_duration_sec: params.targetClipDurationSec,
+    target_clip_duration_min_sec: params.targetClipDurationMinSec,
+    target_clip_duration_max_sec: params.targetClipDurationMaxSec,
     language: params.language,
   };
 
@@ -946,87 +938,197 @@ export async function ingestUrl(params: IngestUrlParams): Promise<IngestResult> 
   return parseJsonResponse<IngestResult>(res);
 }
 
+function isQueuedGeneration(value: ReelsGenerateSubmission): value is GenerationQueuedResponse {
+  return "job_id" in value && typeof value.job_id === "string" && value.job_id.trim().length > 0;
+}
+
+function finalResponseFromEvent(event: Extract<ReelsGenerateStreamEvent, { type: "final" }>): ReelsGenerateResponse {
+  return {
+    reels: Array.isArray(event.payload.reels) ? event.payload.reels : [],
+    generation_id: event.payload.generation_id,
+    response_profile: "unified",
+  };
+}
+
+function terminalResponseFromStatus(status: GenerationJobStatusResponse): ReelsGenerateResponse | null {
+  if (!Array.isArray(status.reels)) {
+    return null;
+  }
+  return {
+    reels: status.reels,
+    generation_id: status.result_generation_id,
+    response_profile: "unified",
+    model_used: status.model_used,
+    quality_degraded: status.quality_degraded,
+  };
+}
+
+function throwTerminalGenerationError(error: TypedApiError | null | undefined, status: string): never {
+  const fallbackMessage = status === "cancelled" ? "Generation was cancelled." : `Generation ended with status ${status}.`;
+  throw new ApiError(error?.message || fallbackMessage, 409, error?.code || `generation_${status}`, error ?? null);
+}
+
+async function waitForReconnect(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) {
+    throw new Error("Request was interrupted.");
+  }
+  await new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(resolve, 400);
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      reject(new Error("Request was interrupted."));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    window.setTimeout(() => signal?.removeEventListener("abort", onAbort), 401);
+  });
+}
+
+export async function fetchGenerationStatus(
+  jobId: string,
+  options?: { signal?: AbortSignal },
+): Promise<GenerationJobStatusResponse> {
+  const res = await safeFetch(apiUrl(`/reels/generation-status/${encodeURIComponent(jobId)}`), {
+    cache: "no-store",
+    headers: { ...communityRequestHeaders() },
+    signal: options?.signal,
+  });
+  return parseJsonResponse<GenerationJobStatusResponse>(res);
+}
+
+export async function cancelGenerationJob(
+  jobId: string,
+  options?: { signal?: AbortSignal },
+): Promise<GenerationJobCancelResponse> {
+  const res = await safeFetch(apiUrl(`/reels/generation-jobs/${encodeURIComponent(jobId)}/cancel`), {
+    method: "POST",
+    headers: { ...communityRequestHeaders() },
+    signal: options?.signal,
+  });
+  return parseJsonResponse<GenerationJobCancelResponse>(res);
+}
+
+async function consumeGenerationJob(
+  job: GenerationQueuedResponse,
+  options: { signal?: AbortSignal; onCandidate?: (reel: Reel) => void },
+): Promise<ReelsGenerateResponse> {
+  let afterSeq = 0;
+  let finalResponse: ReelsGenerateResponse | null = null;
+  const deadline = Date.now() + 9 * 60_000;
+
+  while (Date.now() < deadline) {
+    let terminalStatus: string | null = null;
+    let terminalError: TypedApiError | null | undefined;
+    try {
+      const query = new URLSearchParams({ after_seq: String(afterSeq) });
+      const res = await safeFetch(
+        `${apiUrl(`/reels/generation-stream/${encodeURIComponent(job.job_id)}`)}?${query.toString()}`,
+        {
+          cache: "no-store",
+          headers: {
+            Accept: "application/x-ndjson",
+            ...communityRequestHeaders(),
+          },
+          signal: options.signal,
+          timeoutMs: 540_000,
+        },
+      );
+      if (!res.body) {
+        throw new TransportError("Generation stream returned no response body.");
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const processLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          return;
+        }
+        const event = JSON.parse(trimmed) as ReelsGenerateStreamEvent;
+        if (event.job_id !== job.job_id || !Number.isInteger(event.seq) || event.seq <= afterSeq) {
+          return;
+        }
+        afterSeq = event.seq;
+        if (event.type === "candidate") {
+          options.onCandidate?.(event.payload.reel);
+        } else if (event.type === "final") {
+          finalResponse = finalResponseFromEvent(event);
+        } else {
+          terminalStatus = event.payload.status;
+          terminalError = event.payload.error;
+        }
+      };
+
+      try {
+        while (!terminalStatus) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          buffer += decoder.decode(value, { stream: true });
+          let newlineIndex = buffer.indexOf("\n");
+          while (newlineIndex >= 0) {
+            processLine(buffer.slice(0, newlineIndex));
+            buffer = buffer.slice(newlineIndex + 1);
+            newlineIndex = buffer.indexOf("\n");
+          }
+        }
+        buffer += decoder.decode();
+        if (buffer.trim()) {
+          processLine(buffer);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+    } catch (error) {
+      if (isRequestInterruptedError(error) || options.signal?.aborted) {
+        throw error;
+      }
+      if (!isTransportError(error)) {
+        throw error;
+      }
+    }
+
+    if (terminalStatus) {
+      if (terminalStatus === "failed" || terminalStatus === "cancelled") {
+        throwTerminalGenerationError(terminalError, terminalStatus);
+      }
+      if (finalResponse) {
+        return finalResponse;
+      }
+    }
+
+    const status = await fetchGenerationStatus(job.job_id, { signal: options.signal });
+    if (status.status === "failed" || status.status === "cancelled") {
+      throwTerminalGenerationError(status.error, status.status);
+    }
+    if (status.status === "completed" || status.status === "partial" || status.status === "exhausted") {
+      const response = finalResponse ?? terminalResponseFromStatus(status);
+      if (response) {
+        return response;
+      }
+      throw new ApiError("Generation completed without a final inventory.", 502, "generation_missing_final");
+    }
+    await waitForReconnect(options.signal);
+  }
+
+  throw new TransportError("Generation did not finish before the job deadline.");
+}
+
 export async function generateReelsStream(
   params: GenerateReelsParams & {
     signal?: AbortSignal;
-    onReel?: (reel: Reel) => void;
+    onCandidate?: (reel: Reel) => void;
   },
 ): Promise<ReelsGenerateResponse> {
-  const res = await safeFetch(apiUrl("/reels/generate-stream"), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/x-ndjson",
-      ...communityOwnerHeaders(),
-    },
-    body: JSON.stringify(buildGenerateReelsRequestBody(params)),
+  const submission = await generateReels(params);
+  if (!isQueuedGeneration(submission)) {
+    return submission;
+  }
+  return consumeGenerationJob(submission, {
     signal: params.signal,
-    timeoutMs: 900_000,
+    onCandidate: params.onCandidate,
   });
-
-  const contentType = (res.headers.get("content-type") || "").toLowerCase();
-  if (!res.body || contentType.includes("application/json")) {
-    return parseJsonResponse<ReelsGenerateResponse>(res);
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let finalResponse: ReelsGenerateResponse | null = null;
-
-  const processLine = (line: string) => {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      return;
-    }
-
-    let event: ReelsGenerateStreamEvent;
-    try {
-      event = JSON.parse(trimmed) as ReelsGenerateStreamEvent;
-    } catch {
-      return;
-    }
-
-    if (event.type === "reel") {
-      params.onReel?.(event.reel);
-      return;
-    }
-    if (event.type === "done") {
-      finalResponse = event.response;
-      return;
-    }
-    if (event.type === "error") {
-      throw new Error(event.detail || "Generation stream failed.");
-    }
-  };
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) {
-        break;
-      }
-      buffer += decoder.decode(value, { stream: true });
-      let newlineIndex = buffer.indexOf("\n");
-      while (newlineIndex >= 0) {
-        const line = buffer.slice(0, newlineIndex);
-        buffer = buffer.slice(newlineIndex + 1);
-        processLine(line);
-        newlineIndex = buffer.indexOf("\n");
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim()) {
-      processLine(buffer);
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  if (!finalResponse) {
-    throw new Error("Generation stream ended before completion.");
-  }
-  return finalResponse;
 }
 
 export async function checkReelsCanGenerate(params: {
@@ -1034,7 +1136,7 @@ export async function checkReelsCanGenerate(params: {
   conceptId?: string;
   generationMode?: "slow" | "fast";
   minRelevance?: number;
-  videoPoolMode?: VideoPoolMode;
+  creativeCommonsOnly?: boolean;
   preferredVideoDuration?: PreferredVideoDuration;
   targetClipDurationSec?: number;
   targetClipDurationMinSec?: number;
@@ -1044,17 +1146,19 @@ export async function checkReelsCanGenerate(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...communityOwnerHeaders(),
+      ...communityRequestHeaders(),
     },
     body: JSON.stringify({
       material_id: params.materialId,
       concept_id: params.conceptId,
       num_reels: 1,
-      creative_commons_only: false,
+      creative_commons_only: params.creativeCommonsOnly === true,
       generation_mode: params.generationMode ?? "slow",
       min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
-      video_pool_mode: params.videoPoolMode ?? "short-first",
       preferred_video_duration: params.preferredVideoDuration ?? "any",
+      target_clip_duration_sec: params.targetClipDurationSec,
+      target_clip_duration_min_sec: params.targetClipDurationMinSec,
+      target_clip_duration_max_sec: params.targetClipDurationMaxSec,
     }),
   });
   return parseJsonResponse<ReelsCanGenerateResponse>(res);
@@ -1064,7 +1168,7 @@ export async function checkReelsCanGenerateAny(params: {
   materialIds?: string[];
   generationMode?: "slow" | "fast";
   minRelevance?: number;
-  videoPoolMode?: VideoPoolMode;
+  creativeCommonsOnly?: boolean;
   preferredVideoDuration?: PreferredVideoDuration;
   targetClipDurationSec?: number;
   targetClipDurationMinSec?: number;
@@ -1077,15 +1181,17 @@ export async function checkReelsCanGenerateAny(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...communityOwnerHeaders(),
+      ...communityRequestHeaders(),
     },
     body: JSON.stringify({
       material_ids: materialIds,
-      creative_commons_only: false,
+      creative_commons_only: params.creativeCommonsOnly === true,
       generation_mode: params.generationMode ?? "slow",
       min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
-      video_pool_mode: params.videoPoolMode ?? "short-first",
       preferred_video_duration: params.preferredVideoDuration ?? "any",
+      target_clip_duration_sec: params.targetClipDurationSec,
+      target_clip_duration_min_sec: params.targetClipDurationMinSec,
+      target_clip_duration_max_sec: params.targetClipDurationMaxSec,
     }),
   });
   return parseJsonResponse<ReelsCanGenerateAnyResponse>(res);
@@ -1101,7 +1207,7 @@ export async function fetchFeed(params: {
   autofill?: boolean;
   generationMode?: "slow" | "fast";
   minRelevance?: number;
-  videoPoolMode?: VideoPoolMode;
+  creativeCommonsOnly?: boolean;
   preferredVideoDuration?: PreferredVideoDuration;
   targetClipDurationSec?: number;
   targetClipDurationMinSec?: number;
@@ -1114,10 +1220,12 @@ export async function fetchFeed(params: {
     limit: String(params.limit),
     autofill: String(params.autofill ?? true),
     prefetch: String(params.prefetch ?? 7),
-    creative_commons_only: "false",
+    creative_commons_only: String(params.creativeCommonsOnly === true),
     generation_mode: params.generationMode ?? "slow",
-    video_pool_mode: params.videoPoolMode ?? "short-first",
     preferred_video_duration: params.preferredVideoDuration ?? "any",
+    target_clip_duration_sec: String(params.targetClipDurationSec ?? 55),
+    target_clip_duration_min_sec: String(params.targetClipDurationMinSec ?? 20),
+    target_clip_duration_max_sec: String(params.targetClipDurationMaxSec ?? 55),
   });
   if (Number.isFinite(params.minRelevance)) {
     query.set("min_relevance", String(params.minRelevance));
@@ -1141,17 +1249,6 @@ export async function fetchFeed(params: {
   });
 
   return parseJsonResponse<FeedResponse>(res);
-}
-
-export async function fetchRefinementStatus(jobId: string, options?: { signal?: AbortSignal }): Promise<RefinementStatusResponse> {
-  const res = await safeFetch(apiUrl(`/reels/refinement-status/${encodeURIComponent(jobId)}`), {
-    cache: "no-store",
-    headers: {
-      ...communityRequestHeaders(),
-    },
-    signal: options?.signal,
-  });
-  return parseJsonResponse<RefinementStatusResponse>(res);
 }
 
 export async function sendFeedback(params: {
@@ -1552,8 +1649,6 @@ function normalizeCommunitySettings(raw: unknown): StudyReelsSettings {
     return normalizeStudyReelsSettings({});
   }
   const row = raw as Record<string, unknown>;
-  // `multiPlatformSearch` is local-only (server doesn't store it), so we preserve
-  // whatever the client already has. Same pattern as `autoplayNextReel`.
   const localSettings = readStudyReelsSettings();
   return normalizeStudyReelsSettings({
     generationMode: row.generation_mode as string | null | undefined,
@@ -1563,12 +1658,11 @@ function normalizeCommunitySettings(raw: unknown): StudyReelsSettings {
     autoplayNextReel: (row.autoplay_next_reel as string | boolean | null | undefined)
       ?? (row.autoplayNextReel as string | boolean | null | undefined)
       ?? localSettings.autoplayNextReel,
-    videoPoolMode: row.video_pool_mode as string | null | undefined,
+    creativeCommonsOnly: row.creative_commons_only as string | boolean | null | undefined,
     preferredVideoDuration: row.preferred_video_duration as string | null | undefined,
     targetClipDurationSec: row.target_clip_duration_sec as string | number | null | undefined,
     targetClipDurationMinSec: row.target_clip_duration_min_sec as string | number | null | undefined,
     targetClipDurationMaxSec: row.target_clip_duration_max_sec as string | number | null | undefined,
-    multiPlatformSearch: localSettings.multiPlatformSearch,
   });
 }
 
@@ -1674,7 +1768,7 @@ export async function replaceCommunitySettings(settings: StudyReelsSettings): Pr
       default_input_mode: settings.defaultInputMode,
       min_relevance_threshold: settings.minRelevanceThreshold,
       start_muted: settings.startMuted,
-      video_pool_mode: settings.videoPoolMode,
+      creative_commons_only: settings.creativeCommonsOnly,
       preferred_video_duration: settings.preferredVideoDuration,
       target_clip_duration_sec: settings.targetClipDurationSec,
       target_clip_duration_min_sec: settings.targetClipDurationMinSec,
@@ -1935,24 +2029,51 @@ export function isTransportError(error: unknown): boolean {
   return error instanceof TransportError;
 }
 
-class ApiError extends Error {
+export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  code: string | null;
+  payload: TypedApiError | null;
+  constructor(message: string, status: number, code: string | null = null, payload: TypedApiError | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.code = code;
+    this.payload = payload;
   }
 }
 
 async function buildApiError(response: Response): Promise<ApiError> {
-  let message: string;
+  let message = `Request failed (${response.status})`;
+  let typedError: TypedApiError | null = null;
   try {
     const json = await response.json();
-    message = json?.detail || json?.message || `Request failed (${response.status})`;
+    const detail = json?.detail ?? json?.error ?? json;
+    if (typeof detail === "string") {
+      message = detail;
+    } else if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+      const row = detail as Record<string, unknown>;
+      const code = typeof row.code === "string" ? row.code.trim() : "";
+      const typedMessage = typeof row.message === "string" ? row.message.trim() : "";
+      if (code && typedMessage) {
+        const retryAfter = Number(row.retry_after_sec);
+        typedError = {
+          code,
+          message: typedMessage,
+          provider: typeof row.provider === "string" ? row.provider : null,
+          retry_after_sec: Number.isFinite(retryAfter) ? retryAfter : null,
+          details: row.details && typeof row.details === "object" && !Array.isArray(row.details)
+            ? row.details as Record<string, unknown>
+            : null,
+        };
+        message = typedMessage;
+      } else if (typeof json?.message === "string" && json.message.trim()) {
+        message = json.message.trim();
+      }
+    }
   } catch {
-    message = `Request failed (${response.status})`;
+    // Keep the generic status message when the body is absent or malformed.
   }
-  return new ApiError(message, response.status);
+  return new ApiError(message, response.status, typedError?.code ?? null, typedError);
 }
 
 export function isSessionExpiredError(error: unknown): boolean {

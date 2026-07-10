@@ -2,7 +2,7 @@
 Tests for generation_id threading through the ingest persistence layer (Task T1).
 
 Uses init_db() schema directly so the UNIQUE index on
-(material_id, COALESCE(generation_id, ''), video_id, t_start, t_end) is present.
+(material_id, COALESCE(generation_id, ''), concept_id, video_id, t_start, t_end) is present.
 Tests run against real SQLite in a temp directory — no mocks needed here.
 """
 
@@ -33,6 +33,54 @@ class GenerationIdPersistenceTests(unittest.TestCase):
         db_module._db_ready = False
         get_settings.cache_clear()
         db_module.init_db()
+        with db_module.get_conn(transactional=True) as conn:
+            db_module.insert(
+                conn,
+                "materials",
+                {
+                    "id": "mat-t1",
+                    "subject_tag": "test",
+                    "raw_text": "test",
+                    "source_type": "topic",
+                    "source_path": None,
+                    "created_at": db_module.now_iso(),
+                },
+            )
+            db_module.insert(
+                conn,
+                "concepts",
+                {
+                    "id": "con-t1",
+                    "material_id": "mat-t1",
+                    "title": "Test concept",
+                    "keywords_json": "[]",
+                    "summary": "",
+                    "embedding_json": None,
+                    "created_at": db_module.now_iso(),
+                },
+            )
+            db_module.insert(
+                conn,
+                "concepts",
+                {
+                    "id": "con-t2",
+                    "material_id": "mat-t1",
+                    "title": "Second concept",
+                    "keywords_json": "[]",
+                    "summary": "",
+                    "embedding_json": None,
+                    "created_at": db_module.now_iso(),
+                },
+            )
+            db_module.insert(
+                conn,
+                "videos",
+                {
+                    "id": "yt:abcdefg",
+                    "title": "Test video",
+                    "created_at": db_module.now_iso(),
+                },
+            )
 
     def _restore_environment(self) -> None:
         if self.previous_data_dir is None:
@@ -89,6 +137,7 @@ class GenerationIdPersistenceTests(unittest.TestCase):
             found = load_existing_reel(
                 conn,
                 material_id="mat-t1",
+                concept_id="con-t1",
                 video_id="yt:abcdefg",
                 t_start=10.0,
                 t_end=50.0,
@@ -101,6 +150,7 @@ class GenerationIdPersistenceTests(unittest.TestCase):
             not_found = load_existing_reel(
                 conn,
                 material_id="mat-t1",
+                concept_id="con-t1",
                 video_id="yt:abcdefg",
                 t_start=10.0,
                 t_end=50.0,
@@ -139,6 +189,7 @@ class GenerationIdPersistenceTests(unittest.TestCase):
             found = load_existing_reel(
                 conn,
                 material_id="mat-t1",
+                concept_id="con-t1",
                 video_id="yt:abcdefg",
                 t_start=10.0,
                 t_end=50.0,
@@ -176,6 +227,44 @@ class GenerationIdPersistenceTests(unittest.TestCase):
                 ("yt:abcdefg", 10.0, 50.0),
             )
         self.assertEqual(count_row["cnt"], 2, "Two distinct generation rows must exist")
+
+    def test_same_clip_in_two_concepts_creates_two_rows(self) -> None:
+        with db_module.get_conn(transactional=True) as conn:
+            first = upsert_reel_row(
+                conn,
+                **self._base_kwargs(reel_id="reel-concept-1", concept_id="con-t1"),
+                generation_id="gen-shared",
+            )
+            second = upsert_reel_row(
+                conn,
+                **self._base_kwargs(reel_id="reel-concept-2", concept_id="con-t2"),
+                generation_id="gen-shared",
+            )
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        with db_module.get_conn() as conn:
+            found_first = load_existing_reel(
+                conn,
+                material_id="mat-t1",
+                concept_id="con-t1",
+                video_id="yt:abcdefg",
+                t_start=10.0,
+                t_end=50.0,
+                generation_id="gen-shared",
+            )
+            found_second = load_existing_reel(
+                conn,
+                material_id="mat-t1",
+                concept_id="con-t2",
+                video_id="yt:abcdefg",
+                t_start=10.0,
+                t_end=50.0,
+                generation_id="gen-shared",
+            )
+
+        self.assertEqual(found_first["id"], "reel-concept-1")
+        self.assertEqual(found_second["id"], "reel-concept-2")
 
 
 if __name__ == "__main__":

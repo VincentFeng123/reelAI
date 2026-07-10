@@ -34,7 +34,7 @@ def test_discover_threads_level_to_expand_and_rank(monkeypatch):
 
     monkeypatch.setattr(s.expand, "expand_query", _fake_expand)
     monkeypatch.setattr(s.supadata_search, "search_all",
-                        lambda qs, **kwargs: {"per_query": [], "credits_used": 0, "warning": None})
+                        lambda qs, filters=None, **kwargs: {"per_query": [], "credits_used": 0, "warning": None})
     monkeypatch.setattr(s.rank, "merge_and_rank", _fake_rank)
     s.discover("physics", limit=3, level="advanced")
     assert seen["expand_level"] == "advanced"
@@ -46,7 +46,7 @@ def _run_discover(monkeypatch, videos_by_query, *, limit=1, excluded=None):
     monkeypatch.setattr(search.expand, "expand_query", lambda *a, **k: _expansion())
     calls = []
 
-    def fake_one(query, filters=None):
+    def fake_one(query, filters=None, *args, **kwargs):
         calls.append(query)
         return {"query": query, "videos": videos_by_query.get(query, []), "billed": 1}
 
@@ -92,19 +92,83 @@ def test_excluded_consensus_does_not_stop_expansion(monkeypatch):
     assert calls == ["q1", "q2", "q3", "q4"]
 
 
-def test_partial_error_still_stops_when_three_query_consensus_is_enough(monkeypatch):
+def test_provider_error_is_not_converted_to_empty_success(monkeypatch):
     monkeypatch.setattr(search.expand, "expand_query", lambda *a, **k: _expansion())
     calls = []
 
-    def fake_one(query, filters=None):
+    def fake_one(query, filters=None, *args, **kwargs):
         calls.append(query)
-        if query == "q1":
-            raise search.supadata_search.SearchError("temporary")
-        return {"query": query, "videos": [{"id": "a"}], "billed": 1}
+        raise search.supadata_search.ProviderTransientError(
+            "temporary", provider="supadata", operation="search"
+        )
 
     monkeypatch.setattr(search.supadata_search, "search_one", fake_one)
     monkeypatch.setattr(search.supadata_search.time, "sleep", lambda *_: None)
-    out = search.discover("calc", limit=1)
-    assert calls == ["q1", "q2", "q3"]
-    assert [video["id"] for video in out["videos"]] == ["a"]
-    assert "1 of 3 searches failed" in out["warning"]
+    import pytest
+    with pytest.raises(search.supadata_search.ProviderTransientError):
+        search.discover("calc", limit=1)
+    assert calls == ["q1"]
+
+
+def test_fast_context_limits_initial_expansion_to_three_queries(monkeypatch):
+    from backend.app.clip_engine.provider_runtime import GenerationContext
+
+    seen = {}
+    monkeypatch.setattr(search.expand, "expand_query", lambda *a, **k: _expansion())
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        seen["queries"] = queries
+        return {"per_query": [], "credits_used": 0, "warning": None}
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    search.discover("calc", limit=1, context=GenerationContext("fast"))
+    assert seen["queries"] == ["q1", "q2", "q3"]
+
+
+def test_slow_context_requires_all_six_initial_queries(monkeypatch):
+    from backend.app.clip_engine.provider_runtime import GenerationContext
+
+    seen = {}
+    monkeypatch.setattr(search.expand, "expand_query", lambda *a, **k: _expansion())
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        seen.update(queries=queries, minimum_queries=kwargs["minimum_queries"])
+        return {"per_query": [], "credits_used": 0, "warning": None}
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    search.discover("calc", limit=1, context=GenerationContext("slow"))
+    assert seen == {"queries": ["q1", "q2", "q3", "q4", "q5", "q6"], "minimum_queries": 6}
+
+
+def test_slow_context_uses_three_queries_for_each_continuation(monkeypatch):
+    from backend.app.clip_engine.provider_runtime import GenerationContext
+
+    context = GenerationContext("slow")
+    context.budget.reserve_pass()
+    context.budget.reserve_pass(no_growth=True)
+    seen = {}
+    monkeypatch.setattr(search.expand, "expand_query", lambda *a, **k: _expansion())
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        seen.update(queries=queries, minimum_queries=kwargs["minimum_queries"])
+        return {"per_query": [], "credits_used": 0, "warning": None}
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    search.discover("calc", limit=1, context=context)
+    assert seen == {"queries": ["q1", "q2", "q3"], "minimum_queries": 3}
+
+
+def test_whitespace_topic_is_rejected_before_expansion(monkeypatch):
+    import pytest
+
+    called = False
+
+    def expansion(*args, **kwargs):
+        nonlocal called
+        called = True
+        return _expansion()
+
+    monkeypatch.setattr(search.expand, "expand_query", expansion)
+    with pytest.raises(search.SearchError):
+        search.discover(" \t\n ", limit=1)
+    assert called is False

@@ -117,12 +117,6 @@ def test_synth_adapter_result_source_url_preserved():
     assert ar.source_url == url
 
 
-def test_synth_adapter_result_video_path_is_path():
-    from pathlib import Path
-    ar = bridge.synth_adapter_result("v", "https://www.youtube.com/watch?v=v")
-    assert isinstance(ar.video_path, Path)
-
-
 # ── window_text ───────────────────────────────────────────────────────────────
 
 
@@ -276,3 +270,25 @@ def test_pick_best_clip_fallback_when_none_in_bounds():
     clips = [_make_clip(0, 90), _make_clip(100, 300)]
     result = bridge.pick_best_clip(clips, target_sec=45.0, max_sec=60.0)
     assert float(result["end"]) - float(result["start"]) == 90.0
+
+
+def test_to_segment_uses_exact_cue_ids_instead_of_time_overlap():
+    transcript = {"segments": [
+        {"cue_id": "a", "start": 0.0, "end": 2.0, "text": "first"},
+        {"cue_id": "b", "start": 1.5, "end": 3.0, "text": "selected"},
+        {"cue_id": "c", "start": 2.5, "end": 4.0, "text": "third"},
+    ]}
+    segment = bridge.to_segment(
+        {"start": 1.5, "end": 3.0, "cue_ids": ["b"], "title": "fallback"},
+        transcript,
+    )
+    assert segment.text == "selected"
+
+
+def test_unicode_relevance_tokens_are_not_ascii_only():
+    transcript = {"segments": [
+        {"cue_id": "c0", "start": 0.0, "end": 2.0, "text": "量子力学 expliqué"},
+    ]}
+    clip = {"start": 0.0, "end": 2.0, "cue_ids": ["c0"], "title": ""}
+    assert bridge.relevance_score(clip, transcript, "量子力学") == 1.0
+    assert bridge.relevance_score(clip, transcript, "EXPLIQUÉ") == 1.0

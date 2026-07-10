@@ -2,7 +2,6 @@
 
 export type GenerationMode = "slow" | "fast";
 export type SearchInputMode = "topic" | "source" | "file" | "url";
-export type VideoPoolMode = "short-first" | "balanced" | "long-form";
 export type PreferredVideoDuration = "any" | "short" | "medium" | "long";
 
 export type StudyReelsSettings = {
@@ -11,24 +10,19 @@ export type StudyReelsSettings = {
   minRelevanceThreshold: number;
   startMuted: boolean;
   autoplayNextReel: boolean;
-  videoPoolMode: VideoPoolMode;
+  creativeCommonsOnly: boolean;
   preferredVideoDuration: PreferredVideoDuration;
   targetClipDurationSec: number;
   targetClipDurationMinSec: number;
   targetClipDurationMaxSec: number;
-  /**
-   * When true, topic/text/file submits go through /api/ingest/search (real scraping
-   * of YouTube + Instagram + TikTok). When false, they fall back to the legacy
-   * /api/material → YouTube-only pipeline. Local-only, persisted client-side.
-   */
-  multiPlatformSearch: boolean;
 };
 
 export const GENERATION_MODE_STORAGE_KEY = "studyreels-generation-mode";
 export const SEARCH_INPUT_MODE_STORAGE_KEY = "studyreels-search-input-mode";
 export const MIN_RELEVANCE_STORAGE_KEY = "studyreels-min-relevance-threshold";
 export const MUTED_STORAGE_KEY = "studyreels-muted";
-export const VIDEO_POOL_MODE_STORAGE_KEY = "studyreels-video-pool-mode";
+export const CREATIVE_COMMONS_ONLY_STORAGE_KEY = "studyreels-creative-commons-only";
+const LEGACY_VIDEO_POOL_MODE_STORAGE_KEY = "studyreels-video-pool-mode";
 export const PREFERRED_VIDEO_DURATION_STORAGE_KEY = "studyreels-preferred-video-duration";
 export const TARGET_CLIP_DURATION_STORAGE_KEY = "studyreels-target-clip-duration-sec";
 export const TARGET_CLIP_DURATION_MIN_STORAGE_KEY = "studyreels-target-clip-duration-min-sec";
@@ -52,14 +46,11 @@ export const DEFAULT_STUDY_REELS_SETTINGS: StudyReelsSettings = {
   minRelevanceThreshold: 0.3,
   startMuted: true,
   autoplayNextReel: false,
-  videoPoolMode: "short-first",
+  creativeCommonsOnly: false,
   preferredVideoDuration: "any",
   targetClipDurationSec: 55,
   targetClipDurationMinSec: 20,
   targetClipDurationMaxSec: 55,
-  // Off by default because provider APIs add network fan-out; when enabled,
-  // the backend augments the /api/reels/generate-stream search path.
-  multiPlatformSearch: false,
 };
 
 type StudyReelsSettingsInput = {
@@ -68,12 +59,11 @@ type StudyReelsSettingsInput = {
   minRelevanceThreshold?: number | string | null;
   startMuted?: boolean | string | null;
   autoplayNextReel?: boolean | string | null;
-  videoPoolMode?: VideoPoolMode | string | null;
+  creativeCommonsOnly?: boolean | string | null;
   preferredVideoDuration?: PreferredVideoDuration | string | null;
   targetClipDurationSec?: number | string | null;
   targetClipDurationMinSec?: number | string | null;
   targetClipDurationMaxSec?: number | string | null;
-  multiPlatformSearch?: boolean | string | null;
 };
 
 let activeSettingsScopeMemoryFallback: string | null = null;
@@ -89,13 +79,6 @@ function toInputMode(value: string | null | undefined): SearchInputMode {
     return value;
   }
   return "source";
-}
-
-function toVideoPoolMode(value: string | null | undefined): VideoPoolMode {
-  if (value === "balanced" || value === "long-form") {
-    return value;
-  }
-  return "short-first";
 }
 
 function toPreferredVideoDuration(value: string | null | undefined): PreferredVideoDuration {
@@ -159,7 +142,8 @@ function hasLegacySettingsSnapshot(): boolean {
     SEARCH_INPUT_MODE_STORAGE_KEY,
     MIN_RELEVANCE_STORAGE_KEY,
     MUTED_STORAGE_KEY,
-    VIDEO_POOL_MODE_STORAGE_KEY,
+    CREATIVE_COMMONS_ONLY_STORAGE_KEY,
+    LEGACY_VIDEO_POOL_MODE_STORAGE_KEY,
     PREFERRED_VIDEO_DURATION_STORAGE_KEY,
     TARGET_CLIP_DURATION_STORAGE_KEY,
     TARGET_CLIP_DURATION_MIN_STORAGE_KEY,
@@ -176,7 +160,7 @@ function readLegacyStudyReelsSettings(): StudyReelsSettings {
     defaultInputMode: (window.localStorage.getItem(SEARCH_INPUT_MODE_STORAGE_KEY) || undefined) as SearchInputMode | undefined,
     minRelevanceThreshold: window.localStorage.getItem(MIN_RELEVANCE_STORAGE_KEY),
     startMuted: window.localStorage.getItem(MUTED_STORAGE_KEY) !== "0",
-    videoPoolMode: (window.localStorage.getItem(VIDEO_POOL_MODE_STORAGE_KEY) || undefined) as VideoPoolMode | undefined,
+    creativeCommonsOnly: window.localStorage.getItem(CREATIVE_COMMONS_ONLY_STORAGE_KEY),
     preferredVideoDuration: (window.localStorage.getItem(PREFERRED_VIDEO_DURATION_STORAGE_KEY) || undefined) as PreferredVideoDuration | undefined,
     targetClipDurationSec: window.localStorage.getItem(TARGET_CLIP_DURATION_STORAGE_KEY),
     targetClipDurationMinSec: window.localStorage.getItem(TARGET_CLIP_DURATION_MIN_STORAGE_KEY),
@@ -200,12 +184,11 @@ function parseScopedStudyReelsSettingsSnapshot(raw: string | null): StudyReelsSe
       minRelevanceThreshold: row.minRelevanceThreshold as string | number | null | undefined,
       startMuted: row.startMuted as string | boolean | null | undefined,
       autoplayNextReel: row.autoplayNextReel as string | boolean | null | undefined,
-      videoPoolMode: row.videoPoolMode as string | null | undefined,
+      creativeCommonsOnly: row.creativeCommonsOnly as string | boolean | null | undefined,
       preferredVideoDuration: row.preferredVideoDuration as string | null | undefined,
       targetClipDurationSec: row.targetClipDurationSec as string | number | null | undefined,
       targetClipDurationMinSec: row.targetClipDurationMinSec as string | number | null | undefined,
       targetClipDurationMaxSec: row.targetClipDurationMaxSec as string | number | null | undefined,
-      multiPlatformSearch: row.multiPlatformSearch as string | boolean | null | undefined,
     });
   } catch {
     return null;
@@ -287,20 +270,17 @@ export function normalizeStudyReelsSettings(raw: StudyReelsSettingsInput): Study
     ? Math.round(clampNumber(targetClipDurationSec, targetClipDurationMinSec, targetClipDurationMaxSec, midpointTarget))
     : midpointTarget;
 
-  const multiPlatformSearch = raw.multiPlatformSearch === true || raw.multiPlatformSearch === "1" || raw.multiPlatformSearch === "true";
-
   return {
     generationMode: toGenerationMode(raw.generationMode),
     defaultInputMode: toInputMode(raw.defaultInputMode),
     minRelevanceThreshold: Number(minRelevanceThreshold.toFixed(2)),
     startMuted: raw.startMuted !== false && raw.startMuted !== "0" && raw.startMuted !== "false",
     autoplayNextReel: raw.autoplayNextReel === true || raw.autoplayNextReel === "1" || raw.autoplayNextReel === "true",
-    videoPoolMode: toVideoPoolMode(raw.videoPoolMode),
+    creativeCommonsOnly: raw.creativeCommonsOnly === true || raw.creativeCommonsOnly === "1" || raw.creativeCommonsOnly === "true",
     preferredVideoDuration: toPreferredVideoDuration(raw.preferredVideoDuration),
     targetClipDurationSec: normalizedTarget,
     targetClipDurationMinSec,
     targetClipDurationMaxSec,
-    multiPlatformSearch,
   };
 }
 

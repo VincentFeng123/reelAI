@@ -319,7 +319,6 @@ function buildHistoryInfoSections(item: HistoryItem): HistoryInfoSection[] {
     "Clip length range",
     formatHistoryInfoClipRange(params?.get("target_clip_duration_min_sec") || null, params?.get("target_clip_duration_max_sec") || null),
   );
-  pushHistoryInfoField(searchFields, "Video pool", formatHistoryInfoToken(params?.get("video_pool_mode")));
   pushHistoryInfoField(searchFields, "Preferred duration", formatHistoryInfoToken(params?.get("preferred_video_duration")));
   pushHistoryInfoField(searchFields, "Start muted", formatHistoryInfoBooleanQuery(params?.get("start_muted") || null));
   pushHistoryInfoField(searchFields, "Creative Commons only", formatHistoryInfoBooleanQuery(params?.get("creative_commons_only") || null));

@@ -86,6 +86,19 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        with db_module.get_conn(transactional=True) as conn:
+            db_module.insert(
+                conn,
+                "materials",
+                {
+                    "id": "mat-dedup-test",
+                    "subject_tag": "test",
+                    "raw_text": "test",
+                    "source_type": "topic",
+                    "source_path": None,
+                    "created_at": db_module.now_iso(),
+                },
+            )
 
     def _restore_environment(self) -> None:
         if self.previous_data_dir is None:

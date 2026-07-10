@@ -1,13 +1,8 @@
 # syntax=docker/dockerfile:1
 # Railway deploy image for the FastAPI backend.
 #
-# We use an explicit Dockerfile rather than Railpack because the reel ingestion
-# pipeline in `backend/app/ingestion/` needs ffmpeg + ffprobe on PATH for
-# silencedetect / audio extraction / Whisper preprocessing, and Railpack's
-# package declaration syntax is not reliable for system binaries. Every time
-# someone has tried to "fix" this with railpack.toml / railpack.json, the
-# result has been a silent no-op and ingest_search started bouncing with a
-# DownloadError. Do not revert this to Railpack without a working test.
+# The backend is a durable Railway process. It uses Supadata native captions,
+# so no audio download, ffmpeg, or local Whisper runtime is installed.
 #
 # The `# syntax=docker/dockerfile:1` header tells BuildKit to use the latest
 # stable Dockerfile frontend (features like heredoc, RUN --mount=, etc).
@@ -16,20 +11,15 @@
 FROM python:3.12-slim
 
 # System deps:
-# - ffmpeg: required by backend/app/ingestion/ffmpeg_tools.py
 # - ca-certificates, curl: TLS + debugging
-# - git: yt-dlp sometimes needs it for extractor fallbacks
 # Slim image keeps build context small; `--no-install-recommends` avoids pulling
 # in X11 / doc packages we don't need.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        ffmpeg \
         ca-certificates \
         curl \
-        git \
     && rm -rf /var/lib/apt/lists/* \
-    && ffmpeg -version \
-    && ffprobe -version
+    && curl --version
 
 WORKDIR /app
 

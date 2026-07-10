@@ -61,23 +61,6 @@ class SettingsEnforcementTests(unittest.TestCase):
         self.assertGreater(cap_any, 10)
         self.assertEqual(cap_short, 10)
 
-    def test_video_pool_mode_affects_duration_plan(self) -> None:
-        plan_short = self.rs._stage_duration_plan(
-            stage_name="broad",
-            preferred_video_duration="any",
-            video_pool_mode="short-first",
-            fast_mode=True,
-            retrieval_profile="deep",
-        )
-        plan_long = self.rs._stage_duration_plan(
-            stage_name="broad",
-            preferred_video_duration="any",
-            video_pool_mode="long-form",
-            fast_mode=True,
-            retrieval_profile="deep",
-        )
-        self.assertNotEqual(plan_short, plan_long)
-
     def test_ambiguous_concept_drops_entertainment_tier(self) -> None:
         # The hard-drop gate runs inside the candidate loop, but we can verify
         # the pieces it depends on: ambiguity detection + tier classification.

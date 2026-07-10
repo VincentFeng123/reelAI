@@ -33,6 +33,11 @@ class _PostgresCursor:
         rows = self._cursor.fetchall()
         return [dict(row) for row in rows] if self._dict_rows else rows
 
+    def fetchone(self):
+        assert self._cursor is not None
+        row = self._cursor.fetchone()
+        return dict(row) if row is not None and self._dict_rows else row
+
     @property
     def rowcount(self) -> int:
         return int(self._cursor.rowcount if self._cursor is not None else 0)
@@ -67,17 +72,18 @@ def _seed_takedown_graph(conn: sqlite3.Connection, *, source_url: str, direct: b
         "VALUES ('c1', 'm1', 'Concept', '[]', '', ?)",
         (timestamp,),
     )
-    conn.execute("INSERT INTO videos (id, title, created_at) VALUES ('v1', 'Video', ?)", (timestamp,))
-    for reel_id, video_url in (
-        ("target", source_url if direct else "https://cdn.example/target"),
-        ("survivor", "https://example.test/survivor"),
+    conn.execute("INSERT INTO videos (id, title, created_at) VALUES ('yt:dQw4w9WgXcQ', 'Target', ?)", (timestamp,))
+    conn.execute("INSERT INTO videos (id, title, created_at) VALUES ('yt:M7lc1UVf-VE', 'Survivor', ?)", (timestamp,))
+    for reel_id, video_id, video_url in (
+        ("target", "yt:dQw4w9WgXcQ", source_url if direct else "https://www.youtube.com/embed/dQw4w9WgXcQ"),
+        ("survivor", "yt:M7lc1UVf-VE", "https://www.youtube.com/watch?v=M7lc1UVf-VE"),
     ):
         conn.execute(
             "INSERT INTO reels "
             "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
             "transcript_snippet, takeaways_json, base_score, created_at) "
-            "VALUES (?, 'm1', 'c1', 'v1', ?, 0, 60, 'Transcript', '[]', 1, ?)",
-            (reel_id, video_url, timestamp),
+            "VALUES (?, 'm1', 'c1', ?, ?, 0, 60, 'Transcript', '[]', 1, ?)",
+            (reel_id, video_id, video_url, timestamp),
         )
         conn.execute(
             "INSERT INTO learner_reel_progress "
@@ -139,8 +145,9 @@ def test_takedown_cleans_assessment_dependencies_portably(
     database.row_factory = sqlite3.Row
     database.executescript(db_module.SCHEMA)
     database.execute("PRAGMA foreign_keys = ON")
-    source_url = "https://example.test/source?x=1&y=2"
-    _seed_takedown_graph(database, source_url=source_url, direct=direct)
+    stored_source_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ&feature=share"
+    takedown_url = "https://youtu.be/dQw4w9WgXcQ?t=12"
+    _seed_takedown_graph(database, source_url=stored_source_url, direct=direct)
 
     connection: Any = database
     if dialect == "postgres":
@@ -152,7 +159,7 @@ def test_takedown_cleans_assessment_dependencies_portably(
         )
 
     try:
-        assert takedown_by_source_url(connection, source_url) == 1
+        assert takedown_by_source_url(connection, takedown_url) == 1
 
         assert database.execute("SELECT COUNT(*) FROM reels WHERE id = 'target'").fetchone()[0] == 0
         assert database.execute("SELECT COUNT(*) FROM reels WHERE id = 'survivor'").fetchone()[0] == 1
@@ -180,6 +187,12 @@ def test_takedown_cleans_assessment_dependencies_portably(
         ).fetchone()[0] == 0
         assert database.execute(
             "SELECT COUNT(*) FROM llm_cache WHERE cache_key = 'ingest_meta:survivor'"
+        ).fetchone()[0] == 1
+        assert database.execute(
+            "SELECT COUNT(*) FROM blocked_video_tombstones WHERE video_id = 'dQw4w9WgXcQ'"
+        ).fetchone()[0] == 1
+        assert database.execute(
+            "SELECT COUNT(*) FROM videos WHERE id = 'yt:M7lc1UVf-VE'"
         ).fetchone()[0] == 1
     finally:
         database.close()

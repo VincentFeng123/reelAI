@@ -1,10 +1,7 @@
 """
 Map yt-dlp info_dict → unified IngestMetadata, plus summary helpers.
 
-yt-dlp emits wildly different keys per extractor. For Instagram you get `like_count`,
-`comment_count`, `uploader`; for TikTok you additionally get `repost_count` and `track`;
-for YouTube you get `tags`, `categories`, `view_count`, etc. This mapper normalizes them
-into a single shape the rest of the pipeline can consume.
+The mapper normalizes YouTube metadata into the shape consumed by persistence.
 
 The `fallback_ai_summary` body is copied verbatim from `app/services/reels.py:9171-9197` —
 it's a pure function already, and copying avoids importing the 9,921-line ReelService.
@@ -136,7 +133,6 @@ def map_info_dict_to_metadata(
     categories_raw = info.get("categories")
     categories = [str(c) for c in categories_raw if isinstance(c, str)] if isinstance(categories_raw, list) else []
 
-    # TikTok: music track metadata.
     audio_title = ""
     audio_artist = ""
     track = info.get("track")
@@ -145,12 +141,6 @@ def map_info_dict_to_metadata(
         audio_title = track
     if isinstance(artist, str):
         audio_artist = artist
-    # Instagram: music info is occasionally under `music_info`
-    music_info = info.get("music_info")
-    if isinstance(music_info, dict):
-        audio_title = audio_title or _as_str(music_info.get("song_name"))
-        audio_artist = audio_artist or _as_str(music_info.get("artist_name"))
-
     language = _as_str(info.get("language") or info.get("subtitles_language") or "")
 
     location = ""
@@ -194,9 +184,9 @@ def map_info_dict_to_metadata(
 def format_attribution(metadata: IngestMetadata) -> str:
     """
     Build a short attribution line the iOS UI can render.
-    Example: `"@nasa on Instagram"` or `"NASA on YouTube"` or `"tiktok.com"` fallback.
+    Example: `"@nasa on YouTube"` or `"NASA on YouTube"`.
     """
-    platform_name = {"yt": "YouTube", "ig": "Instagram", "tt": "TikTok"}.get(metadata.platform, metadata.platform)
+    platform_name = "YouTube"
     if metadata.author_handle:
         return f"@{metadata.author_handle} on {platform_name}"
     if metadata.author_name:

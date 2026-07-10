@@ -8,7 +8,7 @@ is transparent. No raw `conn.execute(...)` SQL here.
 Layout on disk:
   * `materials`: holds an `ingest-scratch` sentinel row (for anonymous ingests).
   * `concepts`: holds an `ingest-scratch-concept` sentinel row under that material.
-  * `videos`: one row per unique `(platform, source_id)`, key prefixed e.g. `yt:abc`, `ig:xyz`.
+  * `videos`: one row per YouTube source ID, stored with an internal `yt:` prefix.
   * `reels`: one row per generated clip — the existing table, no migration.
   * `llm_cache` key `ingest_meta:{reel_id}`: JSON blob with the extended metadata
     (author_handle, hashtags, likes, location, audio_info, thumbnail_url, ...) that
@@ -43,6 +43,7 @@ from ..db import (
     upsert,
 )
 from . import INGEST_SENTINEL_CONCEPT_ID, INGEST_SENTINEL_MATERIAL_ID
+from .errors import InvalidReferenceError
 from .logging_config import get_ingest_logger
 from .models import IngestMetadata
 
@@ -86,21 +87,51 @@ def ensure_sentinel_material(conn: Any) -> str:
     return INGEST_SENTINEL_MATERIAL_ID
 
 
+def _scoped_sentinel_concept_id(material_id: str) -> str:
+    suffix = uuid.uuid5(uuid.NAMESPACE_URL, f"reelai:ingest-scratch:{material_id}").hex
+    return f"ingest-scratch-concept:{suffix}"
+
+
 def ensure_sentinel_concept(conn: Any, material_id: str) -> str:
-    """Idempotently insert the sentinel concept row under a material."""
-    try:
-        existing = fetch_one(conn, "SELECT id FROM concepts WHERE id = ?", (INGEST_SENTINEL_CONCEPT_ID,))
+    """Idempotently insert a deterministic scratch concept owned by ``material_id``."""
+    material = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
+    if not material:
+        raise InvalidReferenceError("The supplied material does not exist.")
+
+    concept_id = (
+        INGEST_SENTINEL_CONCEPT_ID
+        if material_id == INGEST_SENTINEL_MATERIAL_ID
+        else _scoped_sentinel_concept_id(material_id)
+    )
+    existing = fetch_one(
+        conn,
+        "SELECT id, material_id FROM concepts WHERE id = ?",
+        (concept_id,),
+    )
+    if existing and existing["material_id"] == material_id:
+        return concept_id
+    if existing:
+        # Old versions could attach the global sentinel ID to an arbitrary material.
+        # Leave that historical row untouched and use a scoped ID for the real global
+        # sentinel material instead.
+        if concept_id == INGEST_SENTINEL_CONCEPT_ID:
+            concept_id = _scoped_sentinel_concept_id(material_id)
+            existing = fetch_one(
+                conn,
+                "SELECT id, material_id FROM concepts WHERE id = ?",
+                (concept_id,),
+            )
+            if existing and existing["material_id"] == material_id:
+                return concept_id
         if existing:
-            return INGEST_SENTINEL_CONCEPT_ID
-    except Exception:
-        logger.exception("ensure_sentinel_concept: lookup failed")
+            raise DatabaseIntegrityError("Scratch concept ID belongs to another material.")
 
     try:
-        upsert(
+        insert(
             conn,
             "concepts",
             {
-                "id": INGEST_SENTINEL_CONCEPT_ID,
+                "id": concept_id,
                 "material_id": material_id,
                 "title": "Ingested reel",
                 "keywords_json": dumps_json([]),
@@ -108,11 +139,54 @@ def ensure_sentinel_concept(conn: Any, material_id: str) -> str:
                 "embedding_json": None,
                 "created_at": now_iso(),
             },
-            pk="id",
         )
     except DatabaseIntegrityError:
-        pass
-    return INGEST_SENTINEL_CONCEPT_ID
+        # Another worker may have inserted the same deterministic row.
+        existing = fetch_one(
+            conn,
+            "SELECT id, material_id FROM concepts WHERE id = ?",
+            (concept_id,),
+        )
+        if not existing or existing["material_id"] != material_id:
+            raise
+    return concept_id
+
+
+def resolve_material_concept(
+    conn: Any,
+    *,
+    material_id: str | None,
+    concept_id: str | None,
+) -> tuple[str, str]:
+    """Resolve and validate caller-supplied material/concept references before writes."""
+    concept = None
+    if concept_id is not None:
+        concept = fetch_one(
+            conn,
+            "SELECT id, material_id FROM concepts WHERE id = ?",
+            (concept_id,),
+        )
+        if not concept:
+            raise InvalidReferenceError("The supplied concept does not exist.")
+
+    if material_id is not None:
+        material = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
+        if not material:
+            raise InvalidReferenceError("The supplied material does not exist.")
+    elif concept:
+        material_id = str(concept["material_id"])
+        material = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
+        if not material:
+            raise InvalidReferenceError("The supplied concept has no valid material.")
+    else:
+        material_id = ensure_sentinel_material(conn)
+
+    if concept:
+        if concept["material_id"] != material_id:
+            raise InvalidReferenceError("The supplied concept does not belong to the material.")
+        return material_id, str(concept["id"])
+
+    return material_id, ensure_sentinel_concept(conn, material_id)
 
 
 # --------------------------------------------------------------------- #
@@ -127,16 +201,42 @@ def build_video_id(platform: str, source_id: str) -> str:
 
 def upsert_video(conn: Any, *, platform: str, source_id: str, metadata: IngestMetadata) -> str:
     video_id = build_video_id(platform, source_id)
-    duration_int = int(metadata.duration_sec) if metadata.duration_sec else 0
+    existing = fetch_one(conn, "SELECT * FROM videos WHERE id = ?", (video_id,)) or {}
+
+    def nonblank(value: object, fallback: object = "") -> object:
+        if isinstance(value, str):
+            return value.strip() or fallback
+        return value if value is not None else fallback
+
+    duration_int = (
+        int(metadata.duration_sec)
+        if metadata.duration_sec is not None and metadata.duration_sec > 0
+        else int(existing.get("duration_sec") or 0)
+    )
+    raw_view_count = metadata.view_count
+    view_count = (
+        int(raw_view_count)
+        if isinstance(raw_view_count, int) and not isinstance(raw_view_count, bool)
+        else int(existing.get("view_count") or 0)
+    )
     payload = {
         "id": video_id,
-        "title": metadata.title or f"{platform} reel {source_id}",
-        "channel_title": metadata.author_name or metadata.author_handle,
-        "description": metadata.description,
+        "title": nonblank(metadata.title, existing.get("title") or f"{platform} reel {source_id}"),
+        "channel_title": nonblank(
+            metadata.author_name or metadata.author_handle,
+            existing.get("channel_title") or "",
+        ),
+        "channel_id": nonblank(metadata.channel_id, existing.get("channel_id") or ""),
+        "description": nonblank(metadata.description, existing.get("description") or ""),
         "duration_sec": duration_int,
-        "view_count": metadata.view_count or 0,
-        "is_creative_commons": 0,
-        "created_at": now_iso(),
+        "view_count": view_count,
+        "is_creative_commons": int(existing.get("is_creative_commons") or 0),
+        "provider": "youtube" if platform == "yt" else platform,
+        "playback_url": nonblank(metadata.playback_url, existing.get("playback_url") or ""),
+        "published_at": nonblank(metadata.upload_date_iso, existing.get("published_at") or ""),
+        "source_url": nonblank(metadata.source_url, existing.get("source_url") or ""),
+        "metadata_json": dumps_json(metadata.model_dump()),
+        "created_at": str(existing.get("created_at") or now_iso()),
     }
     try:
         upsert(conn, "videos", payload, pk="id")
@@ -155,6 +255,7 @@ def load_existing_reel(
     conn: Any,
     *,
     material_id: str,
+    concept_id: str,
     video_id: str,
     t_start: float,
     t_end: float,
@@ -162,7 +263,7 @@ def load_existing_reel(
 ) -> dict[str, Any] | None:
     """
     Look up a reel row by the fields in the unique index
-    `(material_id, generation_id, video_id, t_start, t_end)`.
+    `(material_id, generation_id, concept_id, video_id, t_start, t_end)`.
     Passing `generation_id=None` (the default) matches anonymous (NULL-or-empty) rows,
     preserving backward-compatible behavior.
     """
@@ -172,9 +273,12 @@ def load_existing_reel(
             """
             SELECT id, material_id, concept_id, video_id, video_url, t_start, t_end,
                    transcript_snippet, takeaways_json, base_score, difficulty,
-                   ai_summary, match_reason, informativeness, created_at
+                   ai_summary, match_reason, informativeness, model_used,
+                   quality_degraded, selected_cue_ids_json, search_context_json,
+                   created_at
               FROM reels
              WHERE material_id = ?
+               AND concept_id = ?
                AND video_id = ?
                AND t_start = ?
                AND t_end = ?
@@ -182,7 +286,7 @@ def load_existing_reel(
              ORDER BY created_at DESC
              LIMIT 1
             """,
-            (material_id, video_id, float(t_start), float(t_end), generation_id),
+            (material_id, concept_id, video_id, float(t_start), float(t_end), generation_id),
         )
     except Exception:
         logger.exception(
@@ -212,6 +316,10 @@ def upsert_reel_row(
     ai_summary: str = "",
     match_reason: str = "",
     informativeness: float | None = None,
+    model_used: str = "",
+    quality_degraded: bool = False,
+    selected_cue_ids: list[str] | None = None,
+    search_context: dict[str, Any] | None = None,
 ) -> bool:
     """
     Insert a reel row. Returns True on success, False if the unique index rejected a
@@ -233,15 +341,16 @@ def upsert_reel_row(
         "ai_summary": str(ai_summary or "")[:700],
         "match_reason": str(match_reason or "")[:700],
         "informativeness": informativeness,
+        "model_used": str(model_used or "")[:160],
+        "quality_degraded": 1 if quality_degraded else 0,
+        "selected_cue_ids_json": dumps_json(list(selected_cue_ids or [])),
+        "search_context_json": dumps_json(dict(search_context or {})),
         "created_at": now_iso(),
     }
     try:
         insert(conn, "reels", row)
         return True
     except DatabaseIntegrityError:
-        return False
-    except Exception:
-        logger.exception("upsert_reel_row: insert failed for reel_id=%s", reel_id)
         return False
 
 
@@ -252,7 +361,9 @@ def load_reel_row_by_id(conn: Any, reel_id: str) -> dict[str, Any] | None:
             """
             SELECT id, material_id, concept_id, video_id, video_url, t_start, t_end,
                    transcript_snippet, takeaways_json, base_score, difficulty,
-                   ai_summary, match_reason, informativeness, created_at
+                   ai_summary, match_reason, informativeness, model_used,
+                   quality_degraded, selected_cue_ids_json, search_context_json,
+                   created_at
               FROM reels
              WHERE id = ?
             """,
@@ -311,56 +422,77 @@ def load_ingest_metadata_blob(conn: Any, *, reel_id: str) -> dict[str, Any] | No
 
 
 def takedown_by_source_url(conn: Any, source_url: str) -> int:
+    """Transactionally tombstone and purge every artifact for a YouTube video.
+
+    The caller owns the transaction. Any failure propagates so an API/CLI cannot
+    report success before the surrounding context manager commits.
     """
-    Delete every reel whose stored `video_url` matches `source_url` OR whose ingest
-    metadata blob's `source_url` matches. Returns the number of rows removed.
+    from ..clip_engine.metadata import extract_video_id
 
-    Also removes the associated metadata blobs in `llm_cache` and the cached transcript.
-    """
-    if not source_url:
-        return 0
+    clean_source_url = str(source_url or "").strip()
+    bare_video_id = extract_video_id(clean_source_url)
+    if not bare_video_id:
+        raise ValueError("A valid YouTube video URL is required for takedown.")
 
-    removed = 0
-    try:
-        # 1. Direct video_url match
-        rows = fetch_all(conn, "SELECT id FROM reels WHERE video_url = ?", (source_url,))
-        direct_ids = [str(row.get("id") or "") for row in rows if row.get("id")]
+    canonical_url = f"https://www.youtube.com/watch?v={bare_video_id}"
+    prefixed_video_id = build_video_id("yt", bare_video_id)
+    timestamp = now_iso()
+    existing_tombstone = fetch_one(
+        conn,
+        "SELECT created_at FROM blocked_video_tombstones WHERE video_id = ?",
+        (bare_video_id,),
+    ) or {}
+    upsert(
+        conn,
+        "blocked_video_tombstones",
+        {
+            "video_id": bare_video_id,
+            "canonical_url": canonical_url,
+            "source_url": clean_source_url,
+            "reason": "takedown",
+            "created_at": str(existing_tombstone.get("created_at") or timestamp),
+            "updated_at": timestamp,
+        },
+        pk="video_id",
+    )
 
-        # 2. Metadata blob match. Parse JSON so whitespace and escaped URL content do
-        # not make the match dialect- or serializer-dependent.
-        blob_rows = fetch_all(
-            conn,
-            "SELECT cache_key, response_json FROM llm_cache WHERE cache_key LIKE ?",
-            (f"{_INGEST_META_PREFIX}%",),
-        )
-        blob_reel_ids: list[str] = []
-        for blob in blob_rows:
-            key = blob.get("cache_key")
-            if not isinstance(key, str) or not key.startswith(_INGEST_META_PREFIX):
-                continue
-            metadata = loads_json(blob.get("response_json"), default={})
-            if not isinstance(metadata, dict) or metadata.get("source_url") != source_url:
-                continue
-            blob_reel_ids.append(key[len(_INGEST_META_PREFIX):])
+    reel_rows = fetch_all(
+        conn,
+        "SELECT id, material_id, generation_id FROM reels WHERE video_id IN (?, ?)",
+        (prefixed_video_id, bare_video_id),
+    )
+    direct_ids = {str(row.get("id") or "") for row in reel_rows if row.get("id")}
 
-        to_remove = sorted(set(direct_ids) | set(blob_reel_ids))
-        if not to_remove:
-            return 0
+    # Include legacy rows whose only reliable source identity lives in metadata.
+    blob_rows = fetch_all(
+        conn,
+        "SELECT cache_key, response_json FROM llm_cache WHERE cache_key LIKE ?",
+        (f"{_INGEST_META_PREFIX}%",),
+    )
+    for blob in blob_rows:
+        key = str(blob.get("cache_key") or "")
+        metadata = loads_json(blob.get("response_json"), default={})
+        if not key.startswith(_INGEST_META_PREFIX) or not isinstance(metadata, dict):
+            continue
+        if extract_video_id(str(metadata.get("source_url") or "")) == bare_video_id:
+            direct_ids.add(key[len(_INGEST_META_PREFIX) :])
 
+    to_remove = sorted(reel_id for reel_id in direct_ids if reel_id)
+    affected_material_ids = {
+        str(row.get("material_id") or "") for row in reel_rows if row.get("material_id")
+    }
+    affected_generation_ids = {
+        str(row.get("generation_id") or "") for row in reel_rows if row.get("generation_id")
+    }
+
+    if to_remove:
         placeholders = ", ".join(["?"] * len(to_remove))
-
-        # A recall session becomes internally inconsistent if only one of its
-        # questions disappears, so remove any session that references a question
-        # owned by a takedown reel. Delete children first for both SQLite and PG.
         question_rows = fetch_all(
             conn,
             f"SELECT id FROM reel_assessment_questions WHERE reel_id IN ({placeholders})",
             to_remove,
         )
-        question_ids = [
-            str(row.get("id") or "") for row in question_rows if row.get("id")
-        ]
-        session_ids: list[str] = []
+        question_ids = [str(row.get("id") or "") for row in question_rows if row.get("id")]
         if question_ids:
             question_placeholders = ", ".join(["?"] * len(question_ids))
             session_rows = fetch_all(
@@ -412,50 +544,99 @@ def takedown_by_source_url(conn: Any, source_url: str) -> int:
                 question_ids,
             )
 
-        execute_modify(
-            conn,
-            f"DELETE FROM assessment_concept_outcomes WHERE source_reel_id IN ({placeholders})",
-            to_remove,
-        )
-        execute_modify(
-            conn,
-            f"DELETE FROM learner_reel_progress WHERE reel_id IN ({placeholders})",
-            to_remove,
-        )
-        execute_modify(
-            conn,
-            f"DELETE FROM reel_feedback WHERE reel_id IN ({placeholders})",
-            to_remove,
-        )
+        for table, column in (
+            ("assessment_concept_outcomes", "source_reel_id"),
+            ("learner_reel_progress", "reel_id"),
+            ("reel_feedback", "reel_id"),
+        ):
+            execute_modify(
+                conn,
+                f"DELETE FROM {table} WHERE {column} IN ({placeholders})",
+                to_remove,
+            )
         removed = execute_modify(
             conn,
             f"DELETE FROM reels WHERE id IN ({placeholders})",
             to_remove,
         )
-
-        # Clean up metadata blobs
-        meta_keys = [f"{_INGEST_META_PREFIX}{rid}" for rid in to_remove]
-        if meta_keys:
-            key_placeholders = ", ".join(["?"] * len(meta_keys))
-            execute_modify(
-                conn,
-                f"DELETE FROM llm_cache WHERE cache_key IN ({key_placeholders})",
-                meta_keys,
-            )
-
-        conn.commit()
-        logger.info(
-            "takedown_by_source_url: removed %d reels + %d metadata blobs for %s",
-            removed,
-            len(meta_keys),
-            source_url,
+        meta_keys = [f"{_INGEST_META_PREFIX}{reel_id}" for reel_id in to_remove]
+        meta_placeholders = ", ".join(["?"] * len(meta_keys))
+        execute_modify(
+            conn,
+            f"DELETE FROM llm_cache WHERE cache_key IN ({meta_placeholders})",
+            meta_keys,
         )
-    except Exception:
-        logger.exception("takedown_by_source_url failed for %s", source_url)
-        try:
-            conn.rollback()
-        except Exception:
-            pass
+    else:
+        removed = 0
+
+    # Remove source and retrieval artifacts before the video row (FK-safe).
+    for table in (
+        "retrieval_outcomes",
+        "retrieval_candidates",
+        "transcript_chunks",
+    ):
+        execute_modify(
+            conn,
+            f"DELETE FROM {table} WHERE video_id IN (?, ?)",
+            (prefixed_video_id, bare_video_id),
+        )
+    execute_modify(
+        conn,
+        "DELETE FROM transcript_artifacts WHERE video_id IN (?, ?)",
+        (prefixed_video_id, bare_video_id),
+    )
+    execute_modify(
+        conn,
+        "DELETE FROM transcript_cache WHERE video_id IN (?, ?)",
+        (prefixed_video_id, bare_video_id),
+    )
+    execute_modify(
+        conn,
+        "DELETE FROM video_liveness_cache WHERE video_id IN (?, ?)",
+        (prefixed_video_id, bare_video_id),
+    )
+    execute_modify(
+        conn,
+        "DELETE FROM videos WHERE id IN (?, ?)",
+        (prefixed_video_id, bare_video_id),
+    )
+
+    # A tombstoned ID must not be rediscovered from any pre-takedown provider
+    # page. Takedowns are rare, so clearing the small search caches is safer and
+    # simpler than dialect-specific JSON inspection.
+    execute_modify(conn, "DELETE FROM supadata_search_cache")
+    execute_modify(conn, "DELETE FROM search_cache")
+
+    if affected_material_ids:
+        material_placeholders = ", ".join(["?"] * len(affected_material_ids))
+        execute_modify(
+            conn,
+            f"DELETE FROM ranked_feed_cache WHERE material_id IN ({material_placeholders})",
+            sorted(affected_material_ids),
+        )
+        execute_modify(
+            conn,
+            "UPDATE reel_generation_jobs SET cancel_requested = 1, updated_at = ? "
+            f"WHERE material_id IN ({material_placeholders}) AND status IN ('queued', 'running')",
+            (timestamp, *sorted(affected_material_ids)),
+        )
+    for generation_id in affected_generation_ids:
+        count_row = fetch_one(
+            conn,
+            "SELECT COUNT(*) AS reel_count FROM reels WHERE generation_id = ?",
+            (generation_id,),
+        ) or {}
+        execute_modify(
+            conn,
+            "UPDATE reel_generations SET reel_count = ? WHERE id = ?",
+            (int(count_row.get("reel_count") or 0), generation_id),
+        )
+
+    logger.info(
+        "takedown_by_source_url: tombstoned %s and removed %d reels",
+        bare_video_id,
+        removed,
+    )
     return removed
 
 
@@ -503,6 +684,7 @@ __all__ = [
     "build_video_id",
     "ensure_sentinel_material",
     "ensure_sentinel_concept",
+    "resolve_material_concept",
     "upsert_video",
     "upsert_reel_row",
     "load_existing_reel",

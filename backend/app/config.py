@@ -1,4 +1,5 @@
 import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -18,10 +19,9 @@ if not os.environ.get("REELAI_SKIP_DOTENV"):
 
 
 def _default_data_dir() -> str:
-    # Vercel serverless functions can only write under /tmp.
-    if os.getenv("VERCEL"):
-        return "/tmp/studyreels-data"
-    return "./data"
+    # Runtime artifacts must never be written into the source tree. Railway
+    # deployments should set DATA_DIR to a mounted volume (for example /data).
+    return str(Path(tempfile.gettempdir()) / "reelai-data")
 
 
 class Settings(BaseSettings):
@@ -87,31 +87,6 @@ class Settings(BaseSettings):
     # (e.g. "http://bgutil-provider.railway.internal:4416"). yt_dlp_adapter
     # reads this and wires it into extractor_args automatically.
     ytdlp_pot_provider_url: str = ""
-
-    # Per-clip Whisper refinement for ≤50ms boundary precision. When set
-    # to truthy, clip_whisper_refine downloads the clip's audio window
-    # via yt-dlp and re-transcribes it with Groq Whisper large-v3 +
-    # word-level timestamp granularity. Results are cached in
-    # `llm_cache` keyed by (video_id, t_start, t_end). Off by default
-    # because each refinement costs a ~3-10s yt-dlp download + a Groq
-    # API call, so activation is a quality/latency trade-off.
-    whisper_clip_refine_enabled: bool = False
-
-    # Multi-platform provider registry (Vimeo / Dailymotion / Bilibili /
-    # TikTok / Twitch). When false the registry is dormant and callers
-    # (youtube._search_external_fallbacks, reels._get_transcript) bypass it.
-    # Enable per-provider via their own keys below.
-    provider_registry_enabled: bool = False
-    # Vimeo personal access token (https://developer.vimeo.com/). Keyless
-    # oEmbed covers public metadata, but the API is required for search
-    # and captions.
-    vimeo_access_token: str = ""
-    # Twitch app-access (Helix) credentials. Both required to hit
-    # /helix/clips. Token is fetched at runtime via client-credentials.
-    twitch_client_id: str = ""
-    twitch_client_secret: str = ""
-    # Dailymotion + Bilibili + TikTok are keyless in the current scaffolding
-    # (public APIs / yt-dlp). If those APIs later require keys, add them here.
 
     # Clip engine configuration (Phase 2).
     clip_engine: str = "gemini"

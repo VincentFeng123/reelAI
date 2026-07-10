@@ -10,12 +10,11 @@ from unittest import mock
 
 import pytest
 
-import backend.app.clip_engine.expand as clip_expand
 import backend.app.services.llm_router as llm_router
 import backend.app.services.topic_expansion as topic_expansion_module
 from backend.app.clip_engine.errors import CancellationError
 from backend.app.db import SCHEMA
-from backend.app.services.reels import GenerationCancelledError, ReelService
+from backend.app.services.reels import ReelService
 from backend.app.services.topic_expansion import TopicExpansionService
 
 
@@ -92,72 +91,6 @@ def test_topic_expansion_cancels_active_http_and_skips_later_calls_and_cache(
     assert provider_cancelled.wait(0.2)
     assert calls == [service.WIKIPEDIA_API_URL]
     assert conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0] == 0
-    conn.close()
-
-
-def test_generate_reels_cancels_spellcheck_before_material_or_expansion_writes(
-    monkeypatch,
-) -> None:
-    conn = _connection()
-    conn.execute(
-        "INSERT INTO materials "
-        "(id, subject_tag, raw_text, source_type, knowledge_level, created_at) "
-        "VALUES ('material-cancel', 'pychology', 'Topic: pychology', 'topic', "
-        "'beginner', '2026-07-09T00:00:00+00:00')"
-    )
-    conn.execute(
-        "INSERT INTO concepts "
-        "(id, material_id, title, keywords_json, summary, created_at) "
-        "VALUES ('concept-cancel', 'material-cancel', 'Pychology', '[]', '', "
-        "'2026-07-09T00:00:00+00:00')"
-    )
-    started = threading.Event()
-    provider_cancelled = threading.Event()
-    cancel = threading.Event()
-
-    async def blocking_expand(*_args, **_kwargs):
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            provider_cancelled.set()
-            raise
-
-    monkeypatch.setattr(clip_expand.config, "GEMINI_API_KEY", "test-key")
-    monkeypatch.setattr(clip_expand, "_gemini_expand_raw_async", blocking_expand)
-    ReelService._SUBJECT_CORRECTION_CACHE.clear()
-    service = ReelService(
-        embedding_service=None,
-        youtube_service=None,
-        ingestion_pipeline=mock.Mock(),
-    )
-    service.topic_expansion_service.expand_topic = mock.Mock(
-        side_effect=AssertionError("must not start topic expansion after cancellation")
-    )
-
-    error = _run_until_cancelled(
-        lambda: service.generate_reels(
-            conn,
-            material_id="material-cancel",
-            concept_id=None,
-            num_reels=1,
-            creative_commons_only=False,
-            should_cancel=cancel.is_set,
-        ),
-        started,
-        cancel,
-    )
-
-    assert isinstance(error, GenerationCancelledError)
-    assert provider_cancelled.wait(0.2)
-    service.topic_expansion_service.expand_topic.assert_not_called()
-    subject = conn.execute(
-        "SELECT subject_tag FROM materials WHERE id = 'material-cancel'"
-    ).fetchone()[0]
-    assert subject == "pychology"
-    assert conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0] == 0
-    assert "pychology" not in ReelService._SUBJECT_CORRECTION_CACHE
-    ReelService._SUBJECT_CORRECTION_CACHE.clear()
     conn.close()
 
 

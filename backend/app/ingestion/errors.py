@@ -42,7 +42,7 @@ class DownloadError(IngestError):
 
 
 class TranscriptionError(IngestError):
-    """All transcript strategies (platform captions / yt-dlp subs / Whisper) failed."""
+    """The source has no usable native captions."""
 
     status_code = 502
 
@@ -75,6 +75,18 @@ class RateLimitedError(IngestError):
         self.retry_after_sec = retry_after_sec
 
 
+class InvalidReferenceError(IngestError):
+    """A supplied material or concept does not exist or the pair is inconsistent."""
+
+    status_code = 400
+
+
+class BlockedVideoError(IngestError):
+    """The canonical YouTube ID has an active takedown tombstone."""
+
+    status_code = 410
+
+
 __all__ = [
     "IngestError",
     "UnsupportedSourceError",
@@ -84,4 +96,6 @@ __all__ = [
     "MetadataError",
     "ServerlessUnavailable",
     "RateLimitedError",
+    "InvalidReferenceError",
+    "BlockedVideoError",
 ]

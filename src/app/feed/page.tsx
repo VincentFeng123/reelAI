@@ -15,7 +15,6 @@ import {
   fetchCommunitySettings,
   fetchFeed,
   fetchPendingAssessment,
-  fetchRefinementStatus,
   generateReelsStream,
   isRequestInterruptedError,
   isSessionExpiredError,
@@ -42,7 +41,6 @@ import {
   type GenerationMode,
   type PreferredVideoDuration,
   type StudyReelsSettings,
-  type VideoPoolMode,
   readStudyReelsSettings,
   setActiveStudyReelsSettingsScope,
 } from "@/lib/settings";
@@ -72,9 +70,6 @@ const MAX_HISTORY_ITEMS = 120;
 const MAX_REELS_PER_FEED_SESSION = 80;
 const COMPACT_REELS_PER_FEED_SESSION = 48;
 const MINIMAL_REELS_PER_FEED_SESSION = 20;
-const REFINEMENT_POLL_INTERVAL_MS = 3000;
-const REFINEMENT_STALE_AFTER_MS = 18_000;
-const REFINEMENT_MAX_POLL_FAILURES = 3;
 const RECOVERY_RETRY_BASE_MS = 1_200;
 const RECOVERY_RETRY_MAX_MS = 12_000;
 const RECOVERY_ACTIVE_REQUEST_DELAY_MS = 900;
@@ -83,16 +78,15 @@ const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
 const DESCRIPTION_PREVIEW_CHAR_LIMIT = 180;
 const FEED_PLAYBACK_RATE_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 type FeedbackAction = "helpful" | "confusing" | "save";
-type FeedRecoveryPhase = "idle" | "fetching-page" | "generating" | "waiting-refinement" | "retry-scheduled" | "recovering";
+type FeedRecoveryPhase = "idle" | "fetching-page" | "generating" | "retry-scheduled" | "recovering";
 
 type FeedTuningSettings = {
   minRelevance: number;
-  videoPoolMode: VideoPoolMode;
+  creativeCommonsOnly: boolean;
   preferredVideoDuration: PreferredVideoDuration;
   targetClipDurationSec: number;
   targetClipDurationMinSec: number;
   targetClipDurationMaxSec: number;
-  multiPlatformSearch: boolean;
 };
 
 type ReelFeedbackState = {
@@ -155,13 +149,6 @@ type FeedSearchScope = {
   key: string;
   seq: number;
   controller: AbortController;
-};
-
-type PendingRefinementJob = {
-  jobId: string;
-  registeredAt: number;
-  lastPollAt: number;
-  consecutivePollFailures: number;
 };
 
 type ActiveRecoveryRequest = {
@@ -902,12 +889,10 @@ function FeedPageInner() {
   const router = useRouter();
   const feedRouteKey = params.toString();
   const materialId = params.get("material_id") || "";
-  // Materials created by the new ingestion pipeline cannot be served by the legacy
-  // /api/reels/generate-stream or /api/feed paths — their reels are persisted via
-  // /api/ingest/search or /api/ingest/url and primed into the feed session snapshot
-  // in `UploadPanel.primeFeedSessionSnapshot`. We short-circuit every bootstrap /
-  // load-more / generate path for these materials so the feed renders the primed
-  // reels and never calls the broken legacy APIs.
+  // Ingest-only sentinel materials have reels persisted by /api/ingest/search or
+  // /api/ingest/url and primed into the feed session snapshot in
+  // `UploadPanel.primeFeedSessionSnapshot`. They do not have an independently
+  // searchable material record, so bootstrap and load-more stay disabled.
   const isIngestMaterial = useMemo(() => {
     const id = (materialId || "").trim();
     return id.startsWith("ingest-search:") || id === "ingest-scratch";
@@ -1032,9 +1017,8 @@ function FeedPageInner() {
   const hydratedMaterialIdRef = useRef<string | null>(null);
   const materialIdsForFeedRef = useRef<string[]>([]);
   const settingsLoadSequenceRef = useRef(0);
-  const pendingRefinementJobsRef = useRef<Map<string, PendingRefinementJob>>(new Map());
   const adaptiveExcludeReelIdsRef = useRef<string[]>([]);
-  const isRefreshingRefinementRef = useRef(false);
+  const isRefreshingFeedRef = useRef(false);
   const pendingHistorySyncRef = useRef<StoredHistoryItem[] | null>(null);
   const historySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recoveryRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1070,10 +1054,9 @@ function FeedPageInner() {
     isFetchingRef.current = false;
     isGeneratingRef.current = false;
     isFastTopUpRef.current = false;
-    isRefreshingRefinementRef.current = false;
+    isRefreshingFeedRef.current = false;
     isRecoveringMissingMaterialRef.current = false;
     resumeLoadingRef.current = false;
-    pendingRefinementJobsRef.current.clear();
     activeRecoveryRequestRef.current = null;
     if (recoveryRequestIdleTimerRef.current) {
       clearTimeout(recoveryRequestIdleTimerRef.current);
@@ -1287,12 +1270,11 @@ function FeedPageInner() {
     const settings = mergeFeedSettingsSnapshot(readStudyReelsSettings());
     return {
       minRelevance: settings.minRelevanceThreshold,
-      videoPoolMode: settings.videoPoolMode,
+      creativeCommonsOnly: settings.creativeCommonsOnly,
       preferredVideoDuration: settings.preferredVideoDuration,
       targetClipDurationSec: settings.targetClipDurationSec,
       targetClipDurationMinSec: settings.targetClipDurationMinSec,
       targetClipDurationMaxSec: settings.targetClipDurationMaxSec,
-      multiPlatformSearch: settings.multiPlatformSearch,
     };
   }, [mergeFeedSettingsSnapshot]);
 
@@ -1401,61 +1383,6 @@ function FeedPageInner() {
     markRecoveryProgress,
     renewActiveSearchScope,
   ]);
-
-  const registerRefinementJob = useCallback(
-    (materialIdValue: string, payload?: { refinement_job_id?: string | null; refinement_status?: string | null }) => {
-      const materialIdKey = String(materialIdValue || "").trim();
-      if (!materialIdKey) {
-        return;
-      }
-      const jobId = String(payload?.refinement_job_id || "").trim();
-      const status = String(payload?.refinement_status || "").trim().toLowerCase();
-      if (!jobId || status === "failed" || status === "completed" || status === "superseded") {
-        pendingRefinementJobsRef.current.delete(materialIdKey);
-        return;
-      }
-      const now = Date.now();
-      const existing = pendingRefinementJobsRef.current.get(materialIdKey);
-      pendingRefinementJobsRef.current.set(materialIdKey, {
-        jobId,
-        registeredAt: existing?.jobId === jobId ? existing.registeredAt : now,
-        lastPollAt: existing?.lastPollAt ?? 0,
-        consecutivePollFailures: 0,
-      });
-    },
-    [],
-  );
-
-  const hasPendingRefinementForFeed = useCallback((): boolean => {
-    const feedMaterialIds = getFeedMaterialIds();
-    if (feedMaterialIds.length === 0) {
-      return false;
-    }
-    return feedMaterialIds.some((id) => pendingRefinementJobsRef.current.has(String(id || "").trim()));
-  }, [getFeedMaterialIds]);
-
-  const clearStalePendingRefinements = useCallback((): boolean => {
-    const now = Date.now();
-    const staleMaterialIds = Array.from(pendingRefinementJobsRef.current.entries())
-      .filter(([, metadata]) => {
-        const jobLifetimeMs = now - metadata.registeredAt;
-        const pollSilenceMs = now - (metadata.lastPollAt || metadata.registeredAt);
-        return metadata.consecutivePollFailures >= REFINEMENT_MAX_POLL_FAILURES
-          || jobLifetimeMs >= REFINEMENT_STALE_AFTER_MS
-          || pollSilenceMs >= REFINEMENT_STALE_AFTER_MS;
-      })
-      .map(([materialIdKey]) => materialIdKey);
-    if (staleMaterialIds.length === 0) {
-      return false;
-    }
-    renewActiveSearchScope();
-    for (const materialIdKey of staleMaterialIds) {
-      pendingRefinementJobsRef.current.delete(materialIdKey);
-    }
-    setFeedPagesExhausted(false);
-    zeroProgressAttemptCountRef.current = 0;
-    return true;
-  }, [renewActiveSearchScope]);
 
   const hasMore = !feedPagesExhausted && reels.length < total;
   const hasExplicitGenerationModeParam = generationModeParam === "fast" || generationModeParam === "slow";
@@ -1786,10 +1713,6 @@ function FeedPageInner() {
     return feedMaterialIds.some((id) => countReelsForMaterial(id) < minimumPerTopic);
   }, [countReelsForMaterial, generationMode, getFeedMaterialIds]);
 
-  const shouldBlockOnPendingRefinement = useCallback((): boolean => {
-    return hasPendingRefinementForFeed() && !feedNeedsBootstrapTopUp();
-  }, [feedNeedsBootstrapTopUp, hasPendingRefinementForFeed]);
-
   const appendGeneratedReels = useCallback(
     (generated: Reel[]): SessionMergeResult => {
       if (!generated.length) {
@@ -1808,6 +1731,22 @@ function FeedPageInner() {
       return merged;
     },
     [mergeSessionReels, updateSessionReels],
+  );
+
+  const reconcileGeneratedReels = useCallback(
+    (provisional: Reel[], finalInventory: Reel[]): SessionMergeResult => {
+      const provisionalIds = new Set(provisional.map((reel) => String(reel.reel_id || "").trim()).filter(Boolean));
+      const provisionalClipKeys = new Set(provisional.map(reelClipKey));
+      const stableRows = reelsRef.current.filter((reel) => {
+        const reelId = String(reel.reel_id || "").trim();
+        return !(reelId && provisionalIds.has(reelId)) && !provisionalClipKeys.has(reelClipKey(reel));
+      });
+      const merged = mergeSessionReels(finalInventory, stableRows);
+      updateSessionReels(merged.reels);
+      setTotal((prevTotal) => Math.max(prevTotal, merged.reels.length));
+      return merged;
+    },
+    [mergeSessionReels, reelClipKey, updateSessionReels],
   );
 
   const loadPage = useCallback(
@@ -1836,7 +1775,7 @@ function FeedPageInner() {
                 prefetch: INITIAL_SLOW_PREFETCH,
                 generationMode,
                 minRelevance: tuning.minRelevance,
-                videoPoolMode: tuning.videoPoolMode,
+                creativeCommonsOnly: tuning.creativeCommonsOnly,
                 preferredVideoDuration: tuning.preferredVideoDuration,
                 targetClipDurationSec: tuning.targetClipDurationSec,
                 targetClipDurationMinSec: tuning.targetClipDurationMinSec,
@@ -1854,7 +1793,6 @@ function FeedPageInner() {
         }
 
         const successful = rows.filter((row) => row.data);
-        successful.forEach((row) => registerRefinementJob(row.materialId, row.data ?? undefined));
         if (successful.length === 0) {
           markRecoveryProgress(0);
           if (targetPage > 1 && reelsRef.current.length > 0) {
@@ -1888,7 +1826,7 @@ function FeedPageInner() {
               noteFeedFailure(firstError ?? message);
             }
           }
-          setRecoveryPhase(hasPendingRefinementForFeed() ? "waiting-refinement" : "idle");
+          setRecoveryPhase("idle");
           return { addedCount: 0, exhausted: feedPagesExhausted };
         }
 
@@ -1929,7 +1867,7 @@ function FeedPageInner() {
           const failedIds = rows.filter((row) => !row.data).map((row) => row.materialId);
           console.warn("Some topic feeds failed to load:", failedIds);
         }
-        setRecoveryPhase(hasPendingRefinementForFeed() ? "waiting-refinement" : "idle");
+        setRecoveryPhase("idle");
         return { addedCount: merged.addedCount, exhausted };
       } catch (e) {
         if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
@@ -1946,7 +1884,7 @@ function FeedPageInner() {
         } else if (targetPage === 1) {
           noteFeedFailure(e);
         }
-        setRecoveryPhase(hasPendingRefinementForFeed() ? "waiting-refinement" : "idle");
+        setRecoveryPhase("idle");
         return { addedCount: 0, exhausted: feedPagesExhausted };
       } finally {
         if (isSearchScopeActive(searchScope)) {
@@ -1964,7 +1902,6 @@ function FeedPageInner() {
       generationMode,
       getFeedMaterialIds,
       getFeedTuningSettings,
-      hasPendingRefinementForFeed,
       interleaveReelBatches,
       isSearchScopeActive,
       markRecoveryProgress,
@@ -1974,7 +1911,6 @@ function FeedPageInner() {
       noteFeedFailure,
       noteFeedTransportFailure,
       recoverMissingMaterial,
-      registerRefinementJob,
       settingsScopeReady,
       updateSessionReels,
       finishActiveRecoveryRequest,
@@ -1986,10 +1922,8 @@ function FeedPageInner() {
     if (!settingsScopeReady || feedMaterialIds.length === 0 || isGeneratingRef.current || !canRequestMore) {
       return [];
     }
-    // Ingest-search / ingest-scratch materials cannot be served by the legacy
-    // /api/reels/generate-stream. Their reels come from /api/ingest/* and are
-    // already primed into the feed session via `primeFeedSessionSnapshot` in
-    // UploadPanel.tsx. Bail out before making any request.
+    // Ingest-search / ingest-scratch reels are already primed into the feed
+    // session by UploadPanel.tsx. Bail out before submitting a generation job.
     if (isIngestMaterial) {
       setCanRequestMore(false);
       setFeedPagesExhausted(true);
@@ -2023,14 +1957,13 @@ function FeedPageInner() {
               numReels: targetTotal,
               generationMode,
               minRelevance: tuning.minRelevance,
-              videoPoolMode: tuning.videoPoolMode,
+              creativeCommonsOnly: tuning.creativeCommonsOnly,
               preferredVideoDuration: tuning.preferredVideoDuration,
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
-              multiPlatformSearch: tuning.multiPlatformSearch,
               signal: searchScope.controller.signal,
-              onReel: (reel) => {
+              onCandidate: (reel) => {
                 if (!isSearchScopeActive(searchScope)) {
                   return;
                 }
@@ -2042,12 +1975,9 @@ function FeedPageInner() {
                 }
               },
             });
-            const finalAppend = appendGeneratedReels(data.reels);
-            if (finalAppend.addedCount > 0) {
-              streamedReels.push(...finalAppend.addedReels);
-              armActiveRecoveryRequest(searchScope, "generating");
-            }
-            return { materialId: id, data, streamedReels: dedupeByIdentity(streamedReels), error: null };
+            reconcileGeneratedReels(streamedReels, data.reels);
+            armActiveRecoveryRequest(searchScope, "generating");
+            return { materialId: id, data, streamedReels: dedupeByIdentity(data.reels), error: null };
           } catch (e) {
             if (!isRequestInterruptedError(e)) {
               console.warn(`Background reel generation failed for topic material ${id}:`, e);
@@ -2080,11 +2010,6 @@ function FeedPageInner() {
         }
         return [];
       }
-      generatedRows.forEach((row) => {
-        if (row?.data) {
-          registerRefinementJob(row.materialId, row.data);
-        }
-      });
       const generated = dedupeByIdentity(
         interleaveReelBatches(generatedRows.map((row) => row.streamedReels ?? [])),
       );
@@ -2099,13 +2024,13 @@ function FeedPageInner() {
             noteFeedFailure("Still searching for fresh reels. No new source videos yet.");
           }
         }
-        setRecoveryPhase(hasPendingRefinementForFeed() ? "waiting-refinement" : "idle");
+        setRecoveryPhase("idle");
         return [];
       }
       markRecoveryProgress(generated.length);
       setFeedPagesExhausted(false);
       clearRecoveredTransportError();
-      setRecoveryPhase(hasPendingRefinementForFeed() ? "waiting-refinement" : "idle");
+      setRecoveryPhase("idle");
       return generated;
     } catch (e) {
       if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
@@ -2119,7 +2044,7 @@ function FeedPageInner() {
       } else if (options?.surfaceError) {
         noteFeedFailure(e instanceof Error ? e.message : "Could not generate reels right now.");
       }
-      setRecoveryPhase(hasPendingRefinementForFeed() ? "waiting-refinement" : "idle");
+      setRecoveryPhase("idle");
       return [];
     } finally {
       if (isSearchScopeActive(searchScope)) {
@@ -2149,7 +2074,6 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    hasPendingRefinementForFeed,
     interleaveReelBatches,
     isIngestMaterial,
     isSearchScopeActive,
@@ -2158,7 +2082,7 @@ function FeedPageInner() {
     noteFeedFailure,
     noteFeedTransportFailure,
     recoverMissingMaterial,
-    registerRefinementJob,
+    reconcileGeneratedReels,
     settingsScopeReady,
     finishActiveRecoveryRequest,
   ]);
@@ -2225,7 +2149,6 @@ function FeedPageInner() {
       zeroProgressAttemptCountRef.current = 0;
       bootstrapAttemptedRef.current = false;
       pendingAutoplayAdvanceRef.current = false;
-      pendingRefinementJobsRef.current.clear();
       setRecoveryPhase("idle");
       setLoading(false);
       return;
@@ -2289,7 +2212,6 @@ function FeedPageInner() {
     setBootstrappingFirstReels(false);
     zeroProgressAttemptCountRef.current = 0;
     bootstrapAttemptedRef.current = false;
-    pendingRefinementJobsRef.current.clear();
     if (restoredSession) {
       const allowedMaterialIds = new Set(feedMaterialIds.map((id) => String(id || "").trim()).filter(Boolean));
       const singleFeedMaterialId = feedMaterialIds.length === 1 ? feedMaterialIds[0] : "";
@@ -2425,16 +2347,16 @@ function FeedPageInner() {
     };
   }, [getFeedMaterialIds, isSearchScopeActive, materialId, sessionHydrated, settingsScopeReady]);
 
-  const refreshRefinedFeed = useCallback(async () => {
+  const refreshFeedInventory = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
-    if (!settingsScopeReady || feedMaterialIds.length === 0 || isRefreshingRefinementRef.current) {
+    if (!settingsScopeReady || feedMaterialIds.length === 0 || isRefreshingFeedRef.current) {
       return;
     }
     if (adaptiveExcludeReelIdsRef.current.length > 0) {
       return;
     }
     const searchScope = activeSearchScopeRef.current;
-    isRefreshingRefinementRef.current = true;
+    isRefreshingFeedRef.current = true;
     setRecoveryPhase("fetching-page");
     armActiveRecoveryRequest(searchScope, "fetching-page");
     try {
@@ -2460,7 +2382,7 @@ function FeedPageInner() {
                 prefetch: 0,
                 generationMode,
                 minRelevance: tuning.minRelevance,
-                videoPoolMode: tuning.videoPoolMode,
+                creativeCommonsOnly: tuning.creativeCommonsOnly,
                 preferredVideoDuration: tuning.preferredVideoDuration,
                 targetClipDurationSec: tuning.targetClipDurationSec,
                 targetClipDurationMinSec: tuning.targetClipDurationMinSec,
@@ -2495,7 +2417,7 @@ function FeedPageInner() {
             };
           } catch (error) {
             if (!isRequestInterruptedError(error)) {
-              console.warn(`Refined feed refresh failed for topic material ${id}:`, error);
+              console.warn(`Feed refresh failed for topic material ${id}:`, error);
             }
             return null;
           }
@@ -2507,10 +2429,9 @@ function FeedPageInner() {
       const successful = rows.filter((row): row is { materialId: string; data: Awaited<ReturnType<typeof fetchFeed>> } => Boolean(row?.data));
       if (successful.length === 0) {
         markRecoveryProgress(0);
-        setRecoveryPhase(hasPendingRefinementForFeed() ? "waiting-refinement" : "idle");
+        setRecoveryPhase("idle");
         return;
       }
-      successful.forEach((row) => registerRefinementJob(row.materialId, row.data));
       const refreshedReels = dedupeByIdentity(interleaveReelBatches(successful.map((row) => row.data.reels)));
       const refreshedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data.total) || 0), 0);
       const currentReels = reelsRef.current;
@@ -2532,7 +2453,7 @@ function FeedPageInner() {
       } else {
         setActiveIndex(Math.min(activeIndexRef.current, mergedReels.length - 1));
       }
-      setRecoveryPhase(hasPendingRefinementForFeed() ? "waiting-refinement" : "idle");
+      setRecoveryPhase("idle");
     } catch (error) {
       if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(error)) {
         return;
@@ -2541,11 +2462,11 @@ function FeedPageInner() {
       if (isTransportError(error)) {
         noteFeedTransportFailure(error);
       }
-      setRecoveryPhase(hasPendingRefinementForFeed() ? "waiting-refinement" : "idle");
+      setRecoveryPhase("idle");
     } finally {
       if (isSearchScopeActive(searchScope)) {
         finishActiveRecoveryRequest(searchScope);
-        isRefreshingRefinementRef.current = false;
+        isRefreshingFeedRef.current = false;
       }
     }
   }, [
@@ -2555,13 +2476,11 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    hasPendingRefinementForFeed,
     interleaveReelBatches,
     isSearchScopeActive,
     markRecoveryProgress,
     mergeSessionReels,
     noteFeedTransportFailure,
-    registerRefinementJob,
     settingsScopeReady,
     updateSessionReels,
     finishActiveRecoveryRequest,
@@ -2576,7 +2495,6 @@ function FeedPageInner() {
       || !canRequestMore
       || isFastTopUpRef.current
       || isGeneratingRef.current
-      || shouldBlockOnPendingRefinement()
     ) {
       return;
     }
@@ -2596,14 +2514,13 @@ function FeedPageInner() {
               numReels: targetTotal,
               generationMode,
               minRelevance: tuning.minRelevance,
-              videoPoolMode: tuning.videoPoolMode,
+              creativeCommonsOnly: tuning.creativeCommonsOnly,
               preferredVideoDuration: tuning.preferredVideoDuration,
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
-              multiPlatformSearch: tuning.multiPlatformSearch,
               signal: searchScope.controller.signal,
-              onReel: (reel) => {
+              onCandidate: (reel) => {
                 if (!isSearchScopeActive(searchScope)) {
                   return;
                 }
@@ -2613,11 +2530,8 @@ function FeedPageInner() {
                 }
               },
             });
-            const finalAppend = appendGeneratedReels(data.reels);
-            if (finalAppend.addedCount > 0) {
-              streamedReels.push(...finalAppend.addedReels);
-            }
-            return { materialId: id, data, streamedReels: dedupeByIdentity(streamedReels) };
+            reconcileGeneratedReels(streamedReels, data.reels);
+            return { materialId: id, data, streamedReels: dedupeByIdentity(data.reels) };
           } catch (e) {
             if (!isRequestInterruptedError(e)) {
               console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
@@ -2629,11 +2543,6 @@ function FeedPageInner() {
       if (!isSearchScopeActive(searchScope)) {
         return;
       }
-      generatedRows.forEach((row) => {
-        if (row?.data) {
-          registerRefinementJob(row.materialId, row.data);
-        }
-      });
       const generated = dedupeByIdentity(
         interleaveReelBatches(generatedRows.map((row) => row?.streamedReels ?? [])),
       );
@@ -2662,80 +2571,9 @@ function FeedPageInner() {
     interleaveReelBatches,
     isSearchScopeActive,
     markRecoveryProgress,
-    registerRefinementJob,
+    reconcileGeneratedReels,
     settingsScopeReady,
-    shouldBlockOnPendingRefinement,
   ]);
-
-  useEffect(() => {
-    if (!settingsScopeReady || getFeedMaterialIds().length === 0) {
-      return;
-    }
-    let cancelled = false;
-    const pollRefinements = async () => {
-      const searchScope = activeSearchScopeRef.current;
-      const pendingEntries = Array.from(pendingRefinementJobsRef.current.entries());
-      if (pendingEntries.length === 0 || isRefreshingRefinementRef.current) {
-        return;
-      }
-      setRecoveryPhase("waiting-refinement");
-      let shouldRefresh = false;
-      await Promise.all(
-        pendingEntries.map(async ([materialIdKey, metadata]) => {
-          try {
-            const status = await fetchRefinementStatus(metadata.jobId, { signal: searchScope.controller.signal });
-            if (!isSearchScopeActive(searchScope)) {
-              return;
-            }
-            pendingRefinementJobsRef.current.set(materialIdKey, {
-              ...metadata,
-              lastPollAt: Date.now(),
-              consecutivePollFailures: 0,
-            });
-            if (status.status === "failed" || status.status === "superseded" || status.status === "completed") {
-              pendingRefinementJobsRef.current.delete(materialIdKey);
-            }
-            if (
-              status.status === "completed"
-              && status.result_generation_id
-              && status.result_generation_id === status.active_generation_id
-            ) {
-              shouldRefresh = true;
-            }
-          } catch (error) {
-            if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(error)) {
-              return;
-            }
-            console.warn(`Refinement status polling failed for material ${materialIdKey}:`, error);
-            const current = pendingRefinementJobsRef.current.get(materialIdKey);
-            if (current) {
-              pendingRefinementJobsRef.current.set(materialIdKey, {
-                ...current,
-                lastPollAt: Date.now(),
-                consecutivePollFailures: current.consecutivePollFailures + 1,
-              });
-            }
-          }
-        }),
-      );
-      if (!cancelled && clearStalePendingRefinements()) {
-        setRecoveryPhase("recovering");
-        return;
-      }
-      if (!cancelled && shouldRefresh && isSearchScopeActive(searchScope)) {
-        await refreshRefinedFeed();
-      }
-    };
-
-    void pollRefinements();
-    const timer = window.setInterval(() => {
-      void pollRefinements();
-    }, REFINEMENT_POLL_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      window.clearInterval(timer);
-    };
-  }, [clearStalePendingRefinements, getFeedMaterialIds, isSearchScopeActive, refreshRefinedFeed, settingsScopeReady]);
 
   const bootstrapFirstReels = useCallback(
     async (manual = false) => {
@@ -2773,7 +2611,6 @@ function FeedPageInner() {
       || loading
       || bootstrappingFirstReels
       || bootstrapAttemptedRef.current
-      || shouldBlockOnPendingRefinement()
       || !feedNeedsBootstrapTopUp()
     ) {
       return;
@@ -2785,19 +2622,15 @@ function FeedPageInner() {
     }
     bootstrapAttemptedRef.current = true;
     void bootstrapFirstReels(false);
-  }, [bootstrapFirstReels, bootstrappingFirstReels, feedNeedsBootstrapTopUp, isIngestMaterial, loading, materialId, shouldBlockOnPendingRefinement]);
+  }, [bootstrapFirstReels, bootstrappingFirstReels, feedNeedsBootstrapTopUp, isIngestMaterial, loading, materialId]);
 
   const maybeLoadMore = useCallback(() => {
-    // Ingest materials: the primed session snapshot IS the whole feed. Don't call
-    // requestMore or loadPage — both hit the legacy /api/reels/generate-stream or
-    // /api/feed paths that cannot service an ingest-search sentinel.
+    // For ingest-only sentinels, the primed session snapshot is the whole feed;
+    // no durable generation or paginated feed request is valid.
     if (isIngestMaterial) {
       return;
     }
     if (canRequestMore && !isGeneratingRef.current && feedNeedsBootstrapTopUp()) {
-      if (shouldBlockOnPendingRefinement()) {
-        return;
-      }
       void (async () => {
         const generated = await requestMore();
         if (generationMode === "fast" && generated.length > 0) {
@@ -2814,9 +2647,6 @@ function FeedPageInner() {
       return;
     }
     if (canRequestMore && !isGeneratingRef.current) {
-      if (shouldBlockOnPendingRefinement()) {
-        return;
-      }
       void (async () => {
         const generated = await requestMore();
         if (generationMode === "fast" && generated.length > 0) {
@@ -2824,7 +2654,7 @@ function FeedPageInner() {
         }
       })();
     }
-  }, [canRequestMore, feedNeedsBootstrapTopUp, generationMode, hasMore, isIngestMaterial, loadPage, page, requestMore, runFastTopUp, shouldBlockOnPendingRefinement]);
+  }, [canRequestMore, feedNeedsBootstrapTopUp, generationMode, hasMore, isIngestMaterial, loadPage, page, requestMore, runFastTopUp]);
 
   const runBackgroundRecovery = useCallback(async () => {
     if (
@@ -2845,18 +2675,11 @@ function FeedPageInner() {
     isBackgroundRecoveryRunningRef.current = true;
     setRecoveryPhase("recovering");
     try {
-      if (clearStalePendingRefinements()) {
-        return;
-      }
       if (feedNeedsBootstrapTopUp()) {
         const generated = await requestMore();
         if (generationMode === "fast" && generated.length > 0) {
           void runFastTopUp();
         }
-        return;
-      }
-      if (hasPendingRefinementForFeed()) {
-        setRecoveryPhase("waiting-refinement");
         return;
       }
       if (hasMore) {
@@ -2872,12 +2695,10 @@ function FeedPageInner() {
     }
   }, [
     canRequestMore,
-    clearStalePendingRefinements,
     feedNeedsBootstrapTopUp,
     generationMode,
     getFeedMaterialIds,
     hasMore,
-    hasPendingRefinementForFeed,
     isIngestMaterial,
     loadPage,
     materialId,
@@ -2903,12 +2724,6 @@ function FeedPageInner() {
     if (recoveryPhase === "fetching-page" || recoveryPhase === "generating" || recoveryPhase === "recovering") {
       return;
     }
-    if (hasPendingRefinementForFeed()) {
-      if (recoveryPhase !== "waiting-refinement") {
-        setRecoveryPhase("waiting-refinement");
-      }
-      return;
-    }
     const delayMs = computeRecoveryRetryDelay(zeroProgressAttemptCountRef.current, hasMore || !feedPagesExhausted);
     if (recoveryPhase !== "retry-scheduled") {
       setRecoveryPhase("retry-scheduled");
@@ -2926,7 +2741,6 @@ function FeedPageInner() {
     clearRecoveryRetryTimer,
     feedPagesExhausted,
     hasMore,
-    hasPendingRefinementForFeed,
     loading,
     materialId,
     recoveryPhase,
@@ -2994,9 +2808,6 @@ function FeedPageInner() {
     }
 
     if (canRequestMore) {
-      if (shouldBlockOnPendingRefinement()) {
-        return;
-      }
       resumeLoadingRef.current = true;
       void (async () => {
         const generated = await requestMore();
@@ -3011,7 +2822,7 @@ function FeedPageInner() {
 
     setActiveIndex((prev) => (reels.length > 0 ? Math.min(prev, reels.length - 1) : 0));
     resumeAppliedRef.current = true;
-  }, [canRequestMore, generationMode, hasMore, loadPage, materialId, page, reels, requestMore, runFastTopUp, shouldBlockOnPendingRefinement]);
+  }, [canRequestMore, generationMode, hasMore, loadPage, materialId, page, reels, requestMore, runFastTopUp]);
 
   useEffect(() => {
     maybeResumeProgress();
@@ -3467,7 +3278,7 @@ function FeedPageInner() {
   const atEndOfVisibleReels = reels.length > 0 && activeIndex >= reels.length - 1;
   const activeRecoveryRequest = recoveryPhase === "fetching-page" || recoveryPhase === "generating";
   const passiveBackgroundSearch =
-    recoveryPhase === "waiting-refinement" || recoveryPhase === "retry-scheduled" || recoveryPhase === "recovering";
+    recoveryPhase === "retry-scheduled" || recoveryPhase === "recovering";
   const noMoreReelsAvailable =
     reels.length > 0 &&
     !hasMore &&
@@ -3517,13 +3328,13 @@ function FeedPageInner() {
     if (!descriptionExpanded && activeVideoDescription.compacted) {
       setDescriptionHydrating(true);
       try {
-        await refreshRefinedFeed();
+        await refreshFeedInventory();
       } finally {
         setDescriptionHydrating(false);
       }
     }
     setDescriptionExpanded((prev) => !prev);
-  }, [activeVideoDescription.compacted, descriptionExpanded, refreshRefinedFeed]);
+  }, [activeVideoDescription.compacted, descriptionExpanded, refreshFeedInventory]);
 
   const activeReelDetails = useMemo(
     () => (activeReel ? buildReelDetailContent(activeReel) : { summary: "", takeaways: [], reason: "" }),
@@ -3664,7 +3475,7 @@ function FeedPageInner() {
               prefetch: 0,
               generationMode,
               minRelevance: tuning.minRelevance,
-              videoPoolMode: tuning.videoPoolMode,
+              creativeCommonsOnly: tuning.creativeCommonsOnly,
               preferredVideoDuration: tuning.preferredVideoDuration,
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,

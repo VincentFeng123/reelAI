@@ -103,9 +103,13 @@ CREATE TABLE IF NOT EXISTS videos (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     channel_title TEXT,
+    channel_id TEXT,
     description TEXT,
     duration_sec INTEGER,
     view_count INTEGER DEFAULT 0,
+    published_at TEXT,
+    source_url TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
     is_creative_commons INTEGER DEFAULT 0,
     provider TEXT DEFAULT 'youtube',
     playback_url TEXT,
@@ -152,6 +156,7 @@ CREATE TABLE IF NOT EXISTS reel_generation_heads (
     material_id TEXT NOT NULL,
     request_key TEXT NOT NULL,
     active_generation_id TEXT NOT NULL,
+    refinement_state_json TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL,
     FOREIGN KEY(material_id) REFERENCES materials(id)
 );
@@ -166,12 +171,32 @@ CREATE TABLE IF NOT EXISTS reel_generation_jobs (
     material_id TEXT NOT NULL,
     concept_id TEXT,
     request_key TEXT NOT NULL,
-    source_generation_id TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL DEFAULT '',
+    learner_id TEXT NOT NULL DEFAULT 'legacy',
+    source_generation_id TEXT NOT NULL DEFAULT '',
     result_generation_id TEXT,
     target_profile TEXT NOT NULL DEFAULT 'deep',
     request_params_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL DEFAULT 'queued',
+    phase TEXT NOT NULL DEFAULT 'queued',
+    progress REAL NOT NULL DEFAULT 0.0,
+    lease_owner TEXT,
+    lease_expires_at TEXT,
+    heartbeat_at TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 2,
+    deadline_at TEXT,
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    cancel_requested_at TEXT,
+    model_used TEXT,
+    quality_degraded INTEGER NOT NULL DEFAULT 0,
+    usage_json TEXT NOT NULL DEFAULT '{}',
+    terminal_error_code TEXT,
+    terminal_error_message TEXT,
+    terminal_error_json TEXT,
+    next_event_seq INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
     started_at TEXT,
     completed_at TEXT,
     error_text TEXT,
@@ -181,6 +206,19 @@ CREATE TABLE IF NOT EXISTS reel_generation_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_reel_generation_jobs_material_request_status
 ON reel_generation_jobs(material_id, request_key, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS generation_job_events (
+    job_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(job_id, seq),
+    FOREIGN KEY(job_id) REFERENCES reel_generation_jobs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_job_events_job_seq
+ON generation_job_events(job_id, seq);
 
 CREATE TABLE IF NOT EXISTS reels (
     id TEXT PRIMARY KEY,
@@ -198,6 +236,12 @@ CREATE TABLE IF NOT EXISTS reels (
     informativeness REAL,
     base_score REAL NOT NULL,
     difficulty REAL,
+    model_used TEXT,
+    quality_degraded INTEGER NOT NULL DEFAULT 0,
+    duration_preference_met INTEGER,
+    duration_fit TEXT,
+    selected_cue_ids_json TEXT NOT NULL DEFAULT '[]',
+    search_context_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     FOREIGN KEY(material_id) REFERENCES materials(id),
     FOREIGN KEY(concept_id) REFERENCES concepts(id),
@@ -416,64 +460,6 @@ CREATE TABLE IF NOT EXISTS retrieval_outcomes (
 
 CREATE INDEX IF NOT EXISTS idx_retrieval_outcomes_run ON retrieval_outcomes(run_id, created_at DESC);
 
-CREATE TABLE IF NOT EXISTS request_frontier_entries (
-    id TEXT PRIMARY KEY,
-    material_id TEXT NOT NULL,
-    request_key TEXT NOT NULL,
-    family_key TEXT NOT NULL,
-    stage TEXT NOT NULL DEFAULT '',
-    query_text TEXT NOT NULL DEFAULT '',
-    source_family TEXT NOT NULL DEFAULT '',
-    seed_video_id TEXT NOT NULL DEFAULT '',
-    seed_channel_id TEXT NOT NULL DEFAULT '',
-    anchor_mode TEXT NOT NULL DEFAULT '',
-    runs INTEGER NOT NULL DEFAULT 0,
-    new_good_videos INTEGER NOT NULL DEFAULT 0,
-    new_accepted_reels INTEGER NOT NULL DEFAULT 0,
-    new_visible_reels INTEGER NOT NULL DEFAULT 0,
-    duplicate_rate REAL NOT NULL DEFAULT 0.0,
-    off_topic_rate REAL NOT NULL DEFAULT 0.0,
-    last_run_at TEXT,
-    cooldown_until TEXT,
-    exhausted INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY(material_id) REFERENCES materials(id)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_request_frontier_entries_material_request_family
-ON request_frontier_entries(material_id, request_key, family_key);
-
-CREATE INDEX IF NOT EXISTS idx_request_frontier_entries_request_stage
-ON request_frontier_entries(material_id, request_key, stage, exhausted, updated_at DESC);
-
-CREATE TABLE IF NOT EXISTS request_video_mining_state (
-    id TEXT PRIMARY KEY,
-    material_id TEXT NOT NULL,
-    request_key TEXT NOT NULL,
-    video_id TEXT NOT NULL,
-    mining_state TEXT NOT NULL DEFAULT 'unmined',
-    quality_tier TEXT NOT NULL DEFAULT '',
-    transcript_fetched INTEGER NOT NULL DEFAULT 0,
-    windows_scanned INTEGER NOT NULL DEFAULT 0,
-    clusters_mined INTEGER NOT NULL DEFAULT 0,
-    accepted_clip_count INTEGER NOT NULL DEFAULT 0,
-    visible_clip_count INTEGER NOT NULL DEFAULT 0,
-    remaining_spans_json TEXT NOT NULL DEFAULT '[]',
-    last_mined_at TEXT,
-    exhausted INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY(material_id) REFERENCES materials(id),
-    FOREIGN KEY(video_id) REFERENCES videos(id)
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_request_video_mining_state_material_request_video
-ON request_video_mining_state(material_id, request_key, video_id);
-
-CREATE INDEX IF NOT EXISTS idx_request_video_mining_state_request_status
-ON request_video_mining_state(material_id, request_key, mining_state, exhausted, updated_at DESC);
-
 CREATE TABLE IF NOT EXISTS community_accounts (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL,
@@ -584,7 +570,7 @@ CREATE TABLE IF NOT EXISTS community_account_settings (
     default_input_mode TEXT NOT NULL DEFAULT 'source',
     min_relevance_threshold REAL NOT NULL DEFAULT 0.3,
     start_muted INTEGER NOT NULL DEFAULT 1,
-    video_pool_mode TEXT NOT NULL DEFAULT 'short-first',
+    creative_commons_only INTEGER NOT NULL DEFAULT 0,
     preferred_video_duration TEXT NOT NULL DEFAULT 'any',
     target_clip_duration_sec INTEGER NOT NULL DEFAULT 55,
     target_clip_duration_min_sec INTEGER NOT NULL DEFAULT 20,
@@ -610,10 +596,88 @@ CREATE TABLE IF NOT EXISTS search_cache (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS supadata_search_cache (
+    cache_key TEXT PRIMARY KEY,
+    normalized_query TEXT NOT NULL,
+    filters_json TEXT NOT NULL DEFAULT '{}',
+    language TEXT NOT NULL DEFAULT 'en',
+    page_token TEXT NOT NULL DEFAULT '',
+    provider TEXT NOT NULL DEFAULT 'supadata',
+    schema_version TEXT NOT NULL,
+    response_json TEXT NOT NULL,
+    result_count INTEGER NOT NULL DEFAULT 0,
+    is_empty INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_supadata_search_cache_expires
+ON supadata_search_cache(expires_at);
+
 CREATE TABLE IF NOT EXISTS transcript_cache (
     video_id TEXT PRIMARY KEY,
     transcript_json TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS transcript_artifacts (
+    cache_key TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    requested_language TEXT NOT NULL DEFAULT 'en',
+    returned_language TEXT NOT NULL DEFAULT '',
+    native_mode INTEGER NOT NULL DEFAULT 1,
+    schema_version TEXT NOT NULL,
+    artifact_json TEXT NOT NULL,
+    duration_sec REAL NOT NULL DEFAULT 0.0,
+    cue_count INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_transcript_artifacts_video_lookup
+ON transcript_artifacts(video_id, provider, requested_language, native_mode, schema_version, expires_at);
+
+CREATE TABLE IF NOT EXISTS generation_provider_usage (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    model TEXT,
+    billable_requests INTEGER NOT NULL DEFAULT 0,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(job_id) REFERENCES reel_generation_jobs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_generation_provider_usage_job_created
+ON generation_provider_usage(job_id, created_at);
+
+CREATE TABLE IF NOT EXISTS concept_search_terms (
+    id TEXT PRIMARY KEY,
+    concept_id TEXT NOT NULL,
+    material_id TEXT NOT NULL,
+    term TEXT NOT NULL,
+    term_kind TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(concept_id, term, term_kind),
+    FOREIGN KEY(concept_id) REFERENCES concepts(id),
+    FOREIGN KEY(material_id) REFERENCES materials(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_concept_search_terms_material_concept
+ON concept_search_terms(material_id, concept_id, created_at);
+
+CREATE TABLE IF NOT EXISTS blocked_video_tombstones (
+    video_id TEXT PRIMARY KEY,
+    canonical_url TEXT NOT NULL,
+    source_url TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ranked_feed_cache (
@@ -910,7 +974,7 @@ def _migrate_reels_unique_clip_index_sqlite(conn: sqlite3.Connection) -> None:
         WHERE rowid NOT IN (
             SELECT MIN(rowid)
             FROM reels
-            GROUP BY material_id, COALESCE(generation_id, ''), video_id, t_start, t_end
+            GROUP BY material_id, COALESCE(generation_id, ''), concept_id, video_id, t_start, t_end
         )
         """
     )
@@ -919,7 +983,7 @@ def _migrate_reels_unique_clip_index_sqlite(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique
-        ON reels(material_id, COALESCE(generation_id, ''), video_id, t_start, t_end)
+        ON reels(material_id, COALESCE(generation_id, ''), concept_id, video_id, t_start, t_end)
         """
     )
 
@@ -932,6 +996,7 @@ def _migrate_reels_unique_clip_index_postgres(conn: Any) -> None:
             USING reels AS newer
             WHERE older.material_id = newer.material_id
               AND COALESCE(older.generation_id, '') = COALESCE(newer.generation_id, '')
+              AND older.concept_id = newer.concept_id
               AND older.video_id = newer.video_id
               AND older.t_start = newer.t_start
               AND older.t_end = newer.t_end
@@ -943,7 +1008,7 @@ def _migrate_reels_unique_clip_index_postgres(conn: Any) -> None:
         cur.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS idx_reels_material_video_clip_unique
-            ON reels(material_id, COALESCE(generation_id, ''), video_id, t_start, t_end)
+            ON reels(material_id, COALESCE(generation_id, ''), concept_id, video_id, t_start, t_end)
             """
         )
 
@@ -974,6 +1039,204 @@ def _migrate_reel_learning_content_sqlite(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reels ADD COLUMN match_reason TEXT NOT NULL DEFAULT ''")
     if "informativeness" not in reel_cols:
         conn.execute("ALTER TABLE reels ADD COLUMN informativeness REAL")
+
+
+_DURABLE_JOB_SQLITE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("content_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+    ("learner_id", f"TEXT NOT NULL DEFAULT '{LEGACY_LEARNER_ID}'"),
+    ("phase", "TEXT NOT NULL DEFAULT 'queued'"),
+    ("progress", "REAL NOT NULL DEFAULT 0.0"),
+    ("lease_owner", "TEXT"),
+    ("lease_expires_at", "TEXT"),
+    ("heartbeat_at", "TEXT"),
+    ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("max_attempts", "INTEGER NOT NULL DEFAULT 2"),
+    ("deadline_at", "TEXT"),
+    ("cancel_requested", "INTEGER NOT NULL DEFAULT 0"),
+    ("cancel_requested_at", "TEXT"),
+    ("model_used", "TEXT"),
+    ("quality_degraded", "INTEGER NOT NULL DEFAULT 0"),
+    ("usage_json", "TEXT NOT NULL DEFAULT '{}'"),
+    ("terminal_error_code", "TEXT"),
+    ("terminal_error_message", "TEXT"),
+    ("terminal_error_json", "TEXT"),
+    ("next_event_seq", "INTEGER NOT NULL DEFAULT 0"),
+    ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+)
+
+_DURABLE_VIDEO_SQLITE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("channel_id", "TEXT"),
+    ("published_at", "TEXT"),
+    ("source_url", "TEXT"),
+    ("metadata_json", "TEXT NOT NULL DEFAULT '{}'"),
+)
+
+_DURABLE_REEL_SQLITE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("model_used", "TEXT"),
+    ("quality_degraded", "INTEGER NOT NULL DEFAULT 0"),
+    ("duration_preference_met", "INTEGER"),
+    ("duration_fit", "TEXT"),
+    ("selected_cue_ids_json", "TEXT NOT NULL DEFAULT '[]'"),
+    ("search_context_json", "TEXT NOT NULL DEFAULT '{}'"),
+)
+
+
+def _sqlite_add_missing_columns(
+    conn: sqlite3.Connection,
+    table: str,
+    columns: tuple[tuple[str, str], ...],
+) -> None:
+    existing = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    for name, declaration in columns:
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
+def _migrate_durable_generation_foundation_sqlite(conn: sqlite3.Connection) -> None:
+    """Idempotently upgrade legacy SQLite tables for durable generation work."""
+    _sqlite_add_missing_columns(conn, "reel_generation_jobs", _DURABLE_JOB_SQLITE_COLUMNS)
+    _sqlite_add_missing_columns(conn, "videos", _DURABLE_VIDEO_SQLITE_COLUMNS)
+    _sqlite_add_missing_columns(conn, "reels", _DURABLE_REEL_SQLITE_COLUMNS)
+
+    timestamp = now_iso()
+    conn.execute(
+        """
+        UPDATE reel_generation_jobs
+        SET status = 'cancelled',
+            completed_at = COALESCE(completed_at, ?),
+            updated_at = ?,
+            terminal_error_code = 'legacy_job_contract',
+            terminal_error_message = 'Legacy refinement work was replaced by durable generation jobs.'
+        WHERE status IN ('queued', 'running')
+          AND TRIM(COALESCE(content_fingerprint, '')) = ''
+        """,
+        (timestamp, timestamp),
+    )
+    conn.execute(
+        """
+        UPDATE reel_generation_jobs
+        SET status = 'cancelled',
+            completed_at = COALESCE(completed_at, ?),
+            updated_at = CASE WHEN TRIM(COALESCE(updated_at, '')) = '' THEN ? ELSE updated_at END,
+            terminal_error_code = COALESCE(terminal_error_code, 'superseded')
+        WHERE status = 'superseded'
+        """,
+        (timestamp, timestamp),
+    )
+    active_rows = conn.execute(
+        """
+        SELECT id, request_key
+        FROM reel_generation_jobs
+        WHERE status IN ('queued', 'running')
+        ORDER BY request_key,
+                 CASE status WHEN 'running' THEN 0 ELSE 1 END,
+                 created_at,
+                 id
+        """
+    ).fetchall()
+    seen_request_keys: set[str] = set()
+    duplicate_ids: list[str] = []
+    for job_id, request_key in active_rows:
+        clean_key = str(request_key or "")
+        if clean_key in seen_request_keys:
+            duplicate_ids.append(str(job_id))
+        else:
+            seen_request_keys.add(clean_key)
+    for job_id in duplicate_ids:
+        conn.execute(
+            """
+            UPDATE reel_generation_jobs
+            SET status = 'cancelled',
+                completed_at = COALESCE(completed_at, ?),
+                updated_at = ?,
+                terminal_error_code = 'duplicate_active_request',
+                terminal_error_message = 'Superseded while enforcing one active job per request key.'
+            WHERE id = ? AND status IN ('queued', 'running')
+            """,
+            (timestamp, timestamp, job_id),
+        )
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_generation_jobs_active_request
+        ON reel_generation_jobs(request_key)
+        WHERE status IN ('queued', 'running')
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_reel_generation_jobs_lease
+        ON reel_generation_jobs(status, lease_expires_at, created_at)
+        """
+    )
+
+
+def _migrate_durable_generation_foundation_postgres(conn: Any) -> None:
+    """Idempotently upgrade legacy PostgreSQL tables for durable generation work."""
+    with conn.cursor() as cur:
+        for name, declaration in _DURABLE_JOB_SQLITE_COLUMNS:
+            cur.execute(
+                f"ALTER TABLE reel_generation_jobs ADD COLUMN IF NOT EXISTS {name} {declaration}"
+            )
+        for name, declaration in _DURABLE_VIDEO_SQLITE_COLUMNS:
+            cur.execute(f"ALTER TABLE videos ADD COLUMN IF NOT EXISTS {name} {declaration}")
+        for name, declaration in _DURABLE_REEL_SQLITE_COLUMNS:
+            cur.execute(f"ALTER TABLE reels ADD COLUMN IF NOT EXISTS {name} {declaration}")
+        cur.execute("ALTER TABLE reel_generation_jobs ALTER COLUMN source_generation_id SET DEFAULT ''")
+        cur.execute(
+            """
+            UPDATE reel_generation_jobs
+            SET status = 'cancelled',
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP::text),
+                updated_at = CURRENT_TIMESTAMP::text,
+                terminal_error_code = 'legacy_job_contract',
+                terminal_error_message = 'Legacy refinement work was replaced by durable generation jobs.'
+            WHERE status IN ('queued', 'running')
+              AND BTRIM(COALESCE(content_fingerprint, '')) = ''
+            """
+        )
+        cur.execute(
+            """
+            UPDATE reel_generation_jobs
+            SET status = 'cancelled',
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP::text),
+                updated_at = CASE WHEN BTRIM(COALESCE(updated_at, '')) = '' THEN CURRENT_TIMESTAMP::text ELSE updated_at END,
+                terminal_error_code = COALESCE(terminal_error_code, 'superseded')
+            WHERE status = 'superseded'
+            """
+        )
+        cur.execute(
+            """
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY request_key
+                           ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, created_at, id
+                       ) AS active_rank
+                FROM reel_generation_jobs
+                WHERE status IN ('queued', 'running')
+            )
+            UPDATE reel_generation_jobs
+            SET status = 'cancelled',
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP::text),
+                updated_at = CURRENT_TIMESTAMP::text,
+                terminal_error_code = 'duplicate_active_request',
+                terminal_error_message = 'Superseded while enforcing one active job per request key.'
+            WHERE id IN (SELECT id FROM ranked WHERE active_rank > 1)
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_generation_jobs_active_request
+            ON reel_generation_jobs(request_key)
+            WHERE status IN ('queued', 'running')
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_reel_generation_jobs_lease
+            ON reel_generation_jobs(status, lease_expires_at, created_at)
+            """
+        )
 
 
 def _ensure_reels_generation_index_sqlite(conn: sqlite3.Connection) -> None:
@@ -1032,6 +1295,7 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE community_accounts ADD COLUMN IF NOT EXISTS legacy_claim_owner_key_hash TEXT")
                 cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS generation_id TEXT")
                 cur.execute("ALTER TABLE reel_generation_jobs ADD COLUMN IF NOT EXISTS request_params_json TEXT NOT NULL DEFAULT '{}'")
+                cur.execute("ALTER TABLE reel_generation_heads ADD COLUMN IF NOT EXISTS refinement_state_json TEXT NOT NULL DEFAULT '{}'")
                 _ensure_reels_generation_index_postgres(conn)
                 cur.execute(
                     "UPDATE community_accounts SET email = NULL WHERE email IS NOT NULL AND BTRIM(email) = ''"
@@ -1059,6 +1323,7 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS active_reel_id TEXT")
                 cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS recall_json TEXT NOT NULL DEFAULT '{}'")
                 cur.execute("ALTER TABLE community_account_settings ADD COLUMN IF NOT EXISTS autoplay_next_reel INTEGER NOT NULL DEFAULT 0")
+                cur.execute("ALTER TABLE community_account_settings ADD COLUMN IF NOT EXISTS creative_commons_only INTEGER NOT NULL DEFAULT 0")
                 cur.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR BTRIM(updated_at) = ''")
                 cur.execute(
                     """
@@ -1116,6 +1381,7 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS ai_summary TEXT NOT NULL DEFAULT ''")
                 cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS match_reason TEXT NOT NULL DEFAULT ''")
                 cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS informativeness REAL")
+            _migrate_durable_generation_foundation_postgres(conn)
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             conn.commit()
@@ -1169,6 +1435,10 @@ def init_db() -> None:
         _ensure_reels_generation_index_sqlite(conn)
         try:
             conn.execute("ALTER TABLE reel_generation_jobs ADD COLUMN request_params_json TEXT NOT NULL DEFAULT '{}'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE reel_generation_heads ADD COLUMN refinement_state_json TEXT NOT NULL DEFAULT '{}'")
         except sqlite3.OperationalError:
             pass
         try:
@@ -1226,6 +1496,10 @@ def init_db() -> None:
             pass
         try:
             conn.execute("ALTER TABLE community_account_settings ADD COLUMN autoplay_next_reel INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE community_account_settings ADD COLUMN creative_commons_only INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
         try:
@@ -1304,6 +1578,7 @@ def init_db() -> None:
                 conn.execute(_col_sql)
             except sqlite3.OperationalError:
                 pass
+        _migrate_durable_generation_foundation_sqlite(conn)
         _migrate_reels_unique_clip_index_sqlite(conn)
         _migrate_knowledge_level_sqlite(conn)
         _migrate_reel_learning_content_sqlite(conn)
@@ -1405,6 +1680,7 @@ def get_conn(*, transactional: bool = False):
     )
     conn.row_factory = sqlite3.Row
     conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms};")
+    conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     try:
@@ -1440,13 +1716,24 @@ def insert(conn: Any, table: str, data: dict[str, Any]) -> None:
     try:
         if is_pg:
             with conn.cursor() as cur:
-                cur.execute(query, values)
+                if getattr(conn, "autocommit", False):
+                    cur.execute(query, values)
+                else:
+                    cur.execute("SAVEPOINT studyreels_insert")
+                    try:
+                        cur.execute(query, values)
+                    except Exception:
+                        cur.execute("ROLLBACK TO SAVEPOINT studyreels_insert")
+                        cur.execute("RELEASE SAVEPOINT studyreels_insert")
+                        raise
+                    else:
+                        cur.execute("RELEASE SAVEPOINT studyreels_insert")
         else:
             conn.execute(query, values)
     except Exception as exc:
         if is_pg and _is_unique_violation(exc):
             raise DatabaseIntegrityError(str(exc)) from exc
-        if isinstance(exc, sqlite3.IntegrityError):
+        if isinstance(exc, sqlite3.IntegrityError) and _is_sqlite_unique_violation(exc):
             raise DatabaseIntegrityError(str(exc)) from exc
         raise
 
@@ -1455,6 +1742,18 @@ def _is_unique_violation(exc: Exception) -> bool:
     if pg_errors is not None and isinstance(exc, pg_errors.UniqueViolation):
         return True
     return getattr(exc, "sqlstate", "") == "23505"
+
+
+def _is_sqlite_unique_violation(exc: sqlite3.IntegrityError) -> bool:
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    unique_codes = {
+        getattr(sqlite3, "SQLITE_CONSTRAINT_PRIMARYKEY", -1),
+        getattr(sqlite3, "SQLITE_CONSTRAINT_UNIQUE", -1),
+    }
+    if error_code in unique_codes:
+        return True
+    message = str(exc).lower()
+    return "unique constraint failed" in message or "is not unique" in message
 
 
 def upsert(conn: Any, table: str, data: dict[str, Any], pk: str | list[str] = "id") -> None:

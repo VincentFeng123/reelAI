@@ -4,19 +4,18 @@ IngestionPipeline — the orchestrator.
 One class, two public methods:
 
   * `ingest_url(source_url, ...) -> IngestResult`
-      Download → transcribe → segment → persist one reel for a single URL.
+      Native captions → Gemini cue segmentation → persistence for one YouTube URL.
 
   * `ingest_feed(feed_url, max_items=6, ...) -> IngestFeedResult`
-      Resolve a profile / hashtag / playlist URL to a list of individual reel URLs
+      Resolve a YouTube channel or playlist URL to individual video URLs
       and call `ingest_url` for each with bounded concurrency.
 
 The pipeline owns:
-  * A `ThreadPoolExecutor(max_workers=2)` for `ingest_feed` (kept small because each item
-    is disk+network+CPU heavy and we have per-platform rate limits on top).
-  * A process-wide sliding-window rate limiter keyed by platform (`yt`/`ig`/`tt`).
+  * A bounded `ThreadPoolExecutor` for caption and segmentation work in `ingest_feed`.
+  * A process-wide YouTube provider rate limiter.
 
 The pipeline is stateless beyond those two things. It does NOT cache results itself —
-transcripts and summaries cache inside their respective modules via `llm_cache`.
+search evidence and transcript artifacts are cached in versioned DB tables.
 """
 
 from __future__ import annotations
@@ -33,10 +32,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
-from ..db import DatabaseIntegrityError, dumps_json, get_conn, now_iso, upsert
+from ..db import DatabaseIntegrityError, dumps_json, fetch_one, get_conn, now_iso, upsert
 from . import TERMS_NOTICE
-from .adapters.base import AdapterResult
 from .errors import (
+    BlockedVideoError,
     DownloadError,
     IngestError,
     RateLimitedError,
@@ -63,20 +62,23 @@ from .models import (
     IngestTranscriptCue,
     PlatformLiteral,
     ReelOutWithAttribution,
+    YouTubeSourceRef,
 )
 from .persistence import (
-    ensure_sentinel_concept,
-    ensure_sentinel_material,
     load_existing_reel,
+    resolve_material_concept,
     store_ingest_metadata_blob,
     upsert_reel_row,
     upsert_video,
 )
 from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta, config as clip_engine_config  # noqa: F401
 from ..clip_engine.cancellation import raise_if_cancelled
+from ..clip_engine.provider_runtime import GenerationContext
 from ..clip_engine.errors import (
+    CaptionsUnavailableError as _CaptionsUnavailableError,
     CancellationError as _ClipCancellationError,
     ClipError as _ClipError,
+    ProviderError as _ClipProviderError,
     TranscriptError as _ClipTranscriptError,
     UnsupportedURLError as _ClipUnsupportedURLError,
 )
@@ -95,8 +97,16 @@ def _run_clip(
     topic: str,
     language: str,
     should_cancel: Callable[[], bool] | None,
+    generation_context: GenerationContext | None = None,
 ) -> dict[str, Any]:
-    kwargs = {"topic": topic, "settings": {"language": language}}
+    kwargs = {
+        "topic": topic,
+        "settings": {
+            "language": language,
+            "generation_context": generation_context,
+            "provider_cache": generation_context.cache_store if generation_context is not None else None,
+        },
+    }
     if should_cancel is None:
         return clip_engine_run.clip(url, **kwargs)
     return clip_engine_run.clip(url, **kwargs, should_cancel=should_cancel)
@@ -109,10 +119,21 @@ def _discover(
     exclude_video_ids: list[str],
     level: str | None,
     should_cancel: Callable[[], bool] | None,
+    creative_commons_only: bool = False,
+    preferred_video_duration: str = "any",
+    language: str = "en",
+    generation_context: GenerationContext | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "limit": limit,
         "exclude_video_ids": exclude_video_ids,
+        "filters": {
+            "creative_commons_only": bool(creative_commons_only),
+            "duration": preferred_video_duration,
+        },
+        "language": language,
+        "context": generation_context,
+        "cache_store": generation_context.cache_store if generation_context is not None else None,
     }
     if level is not None:
         kwargs["level"] = level
@@ -401,7 +422,7 @@ class IngestionPipeline:
                     material_id=material_id,
                     concept_id=concept_id,
                     clip_window=(chosen.t_start, chosen.t_end),
-                    target_max=720,  # MAX_TOPIC_REEL_SEC = 12 * 60
+                    target_max=180,
                     clip_details=clip,
                     should_cancel=should_cancel,
                 )
@@ -455,7 +476,11 @@ class IngestionPipeline:
         log_event(logger, logging.INFO, "ingest_feed_start", feed_url=feed_url)
         self._rate_limiter.acquire("yt")
 
-        urls = clip_engine_meta.resolve_feed_urls(feed_url, max_items)
+        urls = (
+            [feed_url]
+            if clip_engine_meta.extract_video_id(feed_url)
+            else clip_engine_meta.resolve_feed_urls(feed_url, max_items)
+        )
         raise_if_cancelled(should_cancel)
 
         items: list[IngestFeedItem] = []
@@ -674,6 +699,9 @@ class IngestionPipeline:
         on_reel_created: Callable[[ReelOutWithAttribution], None] | None = None,
         dry_run: bool = False,
         should_cancel: Callable[[], bool] | None = None,
+        creative_commons_only: bool = False,
+        preferred_video_duration: str = "any",
+        generation_context: GenerationContext | None = None,
     ) -> tuple[list[ReelOutWithAttribution], list[str]]:
         """
         Route ONE study concept through the clip engine and persist EVERY
@@ -691,6 +719,9 @@ class IngestionPipeline:
         `on_reel_created` + the `max_reels` early-stop run SEQUENTIALLY in
         discover order so ordering and the global cap stay deterministic.
         """
+        topic = " ".join(str(topic or "").split())
+        if not topic:
+            raise UnsupportedSourceError("A non-blank YouTube search topic is required.")
         raise_if_cancelled(should_cancel)
         limit = min(int(max_videos), clip_engine_config.CLIP_SEARCH_MAX_VIDEOS)
 
@@ -708,12 +739,25 @@ class IngestionPipeline:
         disc = _discover(
             topic, limit=limit, exclude_video_ids=bare_exclusions, level=knowledge_level,
             should_cancel=should_cancel,
+            creative_commons_only=creative_commons_only,
+            preferred_video_duration=preferred_video_duration,
+            language=language,
+            generation_context=generation_context,
         )
 
         warning = disc.get("warning")
         if warning:
             log_event(logger, logging.WARNING, "ingest_topic_warning", warning=warning)
 
+        corrected_topic = " ".join(str(disc.get("corrected") or topic).split()) or topic
+        search_context = {
+            "requested_topic": topic,
+            "corrected_topic": corrected_topic,
+            "creative_commons_only": bool(creative_commons_only),
+            "source_duration": preferred_video_duration,
+        }
+        for discovered_video in disc["videos"]:
+            discovered_video["_search_context"] = search_context
         resolved_video_ids = [v["id"] for v in disc["videos"]]
 
         # dry_run: discover-only viability probe — no run.clip, no DB writes.
@@ -731,7 +775,14 @@ class IngestionPipeline:
             executor = ThreadPoolExecutor(max_workers=min(4, len(videos)))
             try:
                 futures = [
-                    executor.submit(self._clip_and_filter, v, topic, language, should_cancel)
+                    executor.submit(
+                        self._clip_and_filter,
+                        v,
+                        corrected_topic,
+                        language,
+                        should_cancel,
+                        generation_context,
+                    )
                     for v in videos
                 ]
                 for v, future in zip(videos, futures):
@@ -739,6 +790,16 @@ class IngestionPipeline:
                     try:
                         fetched.append(future.result(timeout=INGEST_TOPIC_VIDEO_TIMEOUT_SEC))
                     except _ClipCancellationError:
+                        raise
+                    except _CaptionsUnavailableError as exc:
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "ingest_topic_native_captions_unavailable",
+                            video_id=v.get("id"),
+                            error=str(exc),
+                        )
+                    except _ClipProviderError:
                         raise
                     except Exception as exc:
                         log_event(
@@ -780,6 +841,7 @@ class IngestionPipeline:
     def _clip_and_filter(
         self, v: dict[str, Any], topic: str, language: str,
         should_cancel: Callable[[], bool] | None = None,
+        generation_context: GenerationContext | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         """Fetch ONE discovered video's clips, score each (query relevance
         blended with the engine's informativeness so one-word topics still get
@@ -789,6 +851,7 @@ class IngestionPipeline:
         engine_out = _run_clip(
             v["url"], topic=topic, language=language,
             should_cancel=should_cancel,
+            generation_context=generation_context,
         )
         if not engine_out["clips"]:
             return v, [], engine_out
@@ -801,6 +864,7 @@ class IngestionPipeline:
                 0.5 if raw_info is None else max(0.0, min(1.0, float(raw_info)))
             )
             clip["score"] = relevance * (0.5 + 0.5 * informativeness)
+            clip["search_context"] = dict(v.get("_search_context") or {})
         kept = sorted(engine_out["clips"], key=lambda c: c["score"], reverse=True)
         return v, kept, engine_out
 
@@ -923,7 +987,7 @@ class IngestionPipeline:
     def _persist_ingest(
         self,
         *,
-        adapter_result: AdapterResult,
+        adapter_result: YouTubeSourceRef,
         metadata: IngestMetadata,
         cues: list[IngestTranscriptCue],
         chosen: IngestSegment,
@@ -941,23 +1005,23 @@ class IngestionPipeline:
         raise_if_cancelled(should_cancel)
         clip_start = round(float(clip_window[0]), 3)
         clip_end = round(float(clip_window[1]), 3)
+        clip_duration = clip_end - clip_start
+        if clip_duration < 1.0 or clip_duration > 180.0:
+            raise SegmentationError("Clip must stay within the 1-180 second safety envelope.")
         from .persistence import build_video_id  # local import to avoid cycle surprises
 
         video_id = build_video_id(adapter_result.platform, adapter_result.source_id)
 
-        # Build the client-facing video_url: YouTube honors start/end params; IG/TT don't.
-        # floor(start)/ceil(end) with a >=1s guard, matching the engine's embed_url —
+        # Build the client-facing YouTube embed URL. floor(start)/ceil(end) with
+        # a >=1s guard matches the engine's embed_url —
         # int()-truncating the end cut up to ~1s off every reel's final word.
-        if adapter_result.platform == "yt":
-            embed_start = int(clip_start)
-            embed_end = max(embed_start + 1, math.ceil(clip_end))
-            video_url = (
-                f"https://www.youtube.com/embed/{adapter_result.source_id}"
-                f"?start={embed_start}&end={embed_end}"
-                "&modestbranding=1&rel=0&playsinline=1"
-            )
-        else:
-            video_url = adapter_result.playback_url
+        embed_start = int(clip_start)
+        embed_end = max(embed_start + 1, math.ceil(clip_end))
+        video_url = (
+            f"https://www.youtube.com/embed/{adapter_result.source_id}"
+            f"?start={embed_start}&end={embed_end}"
+            "&modestbranding=1&rel=0&playsinline=1"
+        )
 
         details = clip_details if isinstance(clip_details, dict) else {}
         generated_takeaways = details.get("takeaways")
@@ -1006,9 +1070,24 @@ class IngestionPipeline:
 
         with get_conn(transactional=True) as conn:
             raise_if_cancelled(should_cancel)
-            effective_material_id = material_id or ensure_sentinel_material(conn)
-            raise_if_cancelled(should_cancel)
-            effective_concept_id = concept_id or ensure_sentinel_concept(conn, effective_material_id)
+            effective_material_id, effective_concept_id = resolve_material_concept(
+                conn,
+                material_id=material_id,
+                concept_id=concept_id,
+            )
+
+            tombstone = None
+            try:
+                tombstone = fetch_one(
+                    conn,
+                    "SELECT video_id FROM blocked_video_tombstones WHERE video_id = ?",
+                    (str(adapter_result.source_id or "").strip(),),
+                )
+            except Exception as exc:
+                if "blocked_video_tombstones" not in str(exc).lower():
+                    raise
+            if tombstone:
+                raise BlockedVideoError("This YouTube video has been removed by takedown.")
 
             raise_if_cancelled(should_cancel)
             upsert_video(conn, platform=adapter_result.platform, source_id=adapter_result.source_id, metadata=metadata)
@@ -1032,6 +1111,18 @@ class IngestionPipeline:
                 ai_summary=ai_summary,
                 match_reason=match_reason,
                 informativeness=informativeness,
+                model_used=str(details.get("model_used") or ""),
+                quality_degraded=bool(details.get("quality_degraded", False)),
+                selected_cue_ids=[
+                    str(cue_id)
+                    for cue_id in (details.get("cue_ids") or [])
+                    if str(cue_id or "").strip()
+                ],
+                search_context=(
+                    dict(details.get("search_context") or {})
+                    if isinstance(details.get("search_context"), dict)
+                    else {}
+                ),
             )
 
             if not inserted:
@@ -1039,6 +1130,7 @@ class IngestionPipeline:
                 existing = load_existing_reel(
                     conn,
                     material_id=effective_material_id,
+                    concept_id=effective_concept_id,
                     video_id=video_id,
                     t_start=clip_start,
                     t_end=clip_end,
@@ -1047,6 +1139,10 @@ class IngestionPipeline:
                 if existing:
                     reel_id = existing["id"]
                     # Still store metadata blob (may have changed since prior ingest).
+                else:
+                    raise DatabaseIntegrityError(
+                        "Reel insert reported a unique collision but no matching row exists."
+                    )
             raise_if_cancelled(should_cancel)
             if isinstance(assessment, dict):
                 store_reel_assessment_question(
@@ -1112,6 +1208,13 @@ class IngestionPipeline:
             total_concepts=None,
             video_duration_sec=int(metadata.duration_sec) if metadata.duration_sec else None,
             clip_duration_sec=float(clip_duration),
+            model_used=str(details.get("model_used") or ""),
+            quality_degraded=bool(details.get("quality_degraded", False)),
+            selected_cue_ids=[
+                str(cue_id)
+                for cue_id in (details.get("cue_ids") or [])
+                if str(cue_id or "").strip()
+            ],
             source_attribution=attribution,
         )
 

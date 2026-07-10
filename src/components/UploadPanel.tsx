@@ -17,9 +17,9 @@ const MAX_SEED_TEXT_CHARS = 16000;
 const INGEST_SENTINEL_MATERIAL_ID = "ingest-scratch";
 // Must stay in sync with FEED_SESSION_STORAGE_KEY in src/app/feed/page.tsx — both
 // read/write the same localStorage key. Priming the session snapshot here lets the
-// feed page hydrate with ingested reels on mount instead of calling the legacy
-// /api/reels/generate-stream path on an ingest-search/ingest-scratch sentinel
-// material (which cannot be served by the old pipeline and returns "not found").
+// feed page hydrate with ingested reels on mount instead of submitting a durable
+// generation job for an ingest-search/ingest-scratch sentinel material, which has
+// no independently searchable material record.
 const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 type InputMode = SearchInputMode;
 
@@ -27,7 +27,7 @@ const INPUT_MODE_OPTIONS: Array<{ value: InputMode; label: string }> = [
   { value: "topic", label: "Topic" },
   { value: "source", label: "Text" },
   { value: "file", label: "File Upload" },
-  { value: "url", label: "Reel URL" },
+  { value: "url", label: "YouTube URL" },
 ];
 
 const INGEST_URL_HOST_ALLOWLIST = new Set([
@@ -36,13 +36,8 @@ const INGEST_URL_HOST_ALLOWLIST = new Set([
   "m.youtube.com",
   "youtu.be",
   "music.youtube.com",
-  "instagram.com",
-  "www.instagram.com",
-  "tiktok.com",
-  "www.tiktok.com",
-  "vm.tiktok.com",
-  "m.tiktok.com",
 ]);
+const YOUTUBE_VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
 /**
  * Lightweight client-side sanity check so we don't POST every keystroke to the backend.
@@ -56,7 +51,27 @@ function isLikelyIngestUrl(raw: string): boolean {
   const candidate = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
   try {
     const parsed = new URL(candidate);
-    return INGEST_URL_HOST_ALLOWLIST.has(parsed.hostname.toLowerCase());
+    const host = parsed.hostname.toLowerCase();
+    if (!INGEST_URL_HOST_ALLOWLIST.has(host)) {
+      return false;
+    }
+    if (host === "youtu.be") {
+      return YOUTUBE_VIDEO_ID_RE.test(parsed.pathname.split("/").filter(Boolean)[0] || "");
+    }
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    if (parsed.pathname === "/watch") {
+      return YOUTUBE_VIDEO_ID_RE.test(parsed.searchParams.get("v") || "");
+    }
+    if (parsed.pathname === "/playlist") {
+      return Boolean(parsed.searchParams.get("list")?.trim());
+    }
+    if (["shorts", "embed", "live"].includes(parts[0] || "")) {
+      return YOUTUBE_VIDEO_ID_RE.test(parts[1] || "");
+    }
+    if (parts[0]?.startsWith("@")) {
+      return parts[0].length > 1;
+    }
+    return ["channel", "c", "user"].includes(parts[0] || "") && Boolean(parts[1]?.trim());
   } catch {
     return false;
   }
@@ -341,10 +356,8 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
       const activeSettings = readStudyReelsSettings();
       const generationModeForSearch = activeSettings.generationMode;
 
-      // Topic / text / file submits stay on the fast /api/material +
-      // /api/reels/generate-stream path. When enabled, `multiPlatformSearch`
-      // augments that backend search with provider APIs; it does not route
-      // through the slower /api/ingest/search yt-dlp download pipeline.
+      // Topic / text / file submits create material records; uncached reel
+      // generation is owned by the durable backend job lifecycle.
 
       // URL ingest path diverges completely from the material-upload path: we call
       // /api/ingest/url instead of /api/material, then land on the feed scoped to
@@ -797,7 +810,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
 
         {inputMode === "url" ? (
           <>
-            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">Reel URL</label>
+            <label className="mb-2 block text-xs font-semibold uppercase tracking-[0.12em] text-white/70">YouTube URL</label>
             <div className="h-full flex flex-col gap-3">
               <div className="rounded-2xl border border-white/15 bg-white/[0.08] backdrop-blur-[18px] backdrop-saturate-150 transition-colors duration-200 focus-within:bg-white/[0.12]">
                 <input
@@ -807,7 +820,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
                   autoCapitalize="off"
                   spellCheck={false}
                   className="h-12 w-full rounded-2xl border-0 bg-transparent px-4 text-sm text-white outline-none placeholder:text-white/40"
-                  placeholder="Paste an Instagram, TikTok, or YouTube URL"
+                  placeholder="Paste a YouTube video, playlist, or channel URL"
                   value={reelUrl}
                   onChange={(e) => setReelUrl(e.target.value)}
                 />

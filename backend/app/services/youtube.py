@@ -35,7 +35,6 @@ from youtube_transcript_api._errors import (
 
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
-from .provider_registry import ProviderCandidate, ProviderRegistry
 
 
 # ---------------------------------------------------------------------------
@@ -470,11 +469,6 @@ class YouTubeService:
         else:
             self.transcript_api = YouTubeTranscriptApi()
 
-        # ---- Multi-platform fallback providers -----------------------------
-        # Dormant when `provider_registry_enabled` is False; consulted inside
-        # `_search_external_fallbacks` alongside DuckDuckGo / Bing scraping.
-        self._provider_registry = ProviderRegistry()
-
         # ---- HTTP session with Chrome impersonation + stealth headers ------
         # `impersonate=` locks in the TLS + HTTP/2 + header-set fingerprint of
         # a specific Chrome build for the lifetime of this session. Picked once
@@ -638,7 +632,6 @@ class YouTubeService:
         variant_limit: int | None = None,
         graph_profile: GraphProfile = "off",
         root_terms: list[str] | None = None,
-        multi_platform_search: bool = False,
     ) -> list[dict[str, Any]]:
         if conn is None:
             with get_conn() as local_conn:
@@ -656,7 +649,6 @@ class YouTubeService:
                     variant_limit=variant_limit,
                     graph_profile=graph_profile,
                     root_terms=root_terms,
-                    multi_platform_search=multi_platform_search,
                 )
         return self._search_videos_with_conn(
             conn,
@@ -672,7 +664,6 @@ class YouTubeService:
             variant_limit=variant_limit,
             graph_profile=graph_profile,
             root_terms=root_terms,
-            multi_platform_search=multi_platform_search,
         )
 
     def _search_videos_with_conn(
@@ -690,7 +681,6 @@ class YouTubeService:
         variant_limit: int | None,
         graph_profile: GraphProfile = "off",
         root_terms: list[str] | None = None,
-        multi_platform_search: bool = False,
     ) -> list[dict[str, Any]]:
         duration_key = video_duration or "any"
         normalized_root_terms = self._normalized_root_terms(query=query, root_terms=root_terms)
@@ -708,7 +698,6 @@ class YouTubeService:
             str(variant_limit or 0),
             graph_profile,
             "||".join(normalized_root_terms),
-            str(bool(multi_platform_search)),
         )
         cached = fetch_one(conn, "SELECT response_json, created_at FROM search_cache WHERE cache_key = ?", (key,))
         if cached:
@@ -801,15 +790,6 @@ class YouTubeService:
                         variant_limit=variant_limit,
                     )
                     videos = self._merge_unique_videos(videos, external_rows, None)
-            videos = self._merge_provider_registry_candidates(
-                videos,
-                query=query,
-                max_results=max_results,
-                retrieval_strategy=retrieval_strategy,
-                retrieval_stage=retrieval_stage,
-                source_surface=source_surface,
-                force_enabled=multi_platform_search,
-            )
             videos = self._finalize_search_rows(
                 videos,
                 query=query,
@@ -975,15 +955,6 @@ class YouTubeService:
                 deadline=deadline,
                 root_terms=normalized_root_terms,
             )
-        videos = self._merge_provider_registry_candidates(
-            videos,
-            query=query,
-            max_results=max_results,
-            retrieval_strategy=retrieval_strategy,
-            retrieval_stage=retrieval_stage,
-            source_surface=source_surface,
-            force_enabled=multi_platform_search,
-        )
         videos = self._finalize_search_rows(
             videos,
             query=query,
@@ -2571,87 +2542,6 @@ class YouTubeService:
             "crawl_depth": 0,
         }
 
-    def _merge_provider_registry_candidates(
-        self,
-        videos: list[dict[str, Any]],
-        *,
-        query: str,
-        max_results: int,
-        retrieval_strategy: str,
-        retrieval_stage: str,
-        source_surface: str,
-        force_enabled: bool = False,
-    ) -> list[dict[str, Any]]:
-        """Fan out to every provider in ProviderRegistry and merge their
-        candidates into `videos`. Dormant (no-op) when the master flag
-        PROVIDER_REGISTRY_ENABLED is off. Runs on **every** search so
-        cross-platform results are visible without waiting for YouTube
-        to run out — this is the "always mix" behavior, not "fallback
-        only". Providers run in parallel inside `search_all`; this method
-        is effectively one bounded-latency step in the overall search
-        pipeline.
-        """
-        if not self._provider_registry.enabled and not force_enabled:
-            logger.warning(
-                "provider_registry: skip (flag off); YouTube-only results q=%r",
-                query[:60],
-            )
-            return videos
-        # Each provider returns up to ~max_results/3 candidates. Floor at 3
-        # so niche providers still contribute something even when the user
-        # asked for very few results.
-        per_provider = max(3, int(max_results or 1) // 3)
-        before = len(videos)
-        try:
-            provider_candidates = self._provider_registry.search_all(
-                query,
-                per_provider,
-                force_enabled=force_enabled,
-            )
-        except Exception as exc:
-            logger.warning("provider_registry.search_all raised: %s: %s", type(exc).__name__, exc)
-            return videos
-        if not provider_candidates:
-            logger.warning("provider_registry: no candidates returned q=%r", query[:60])
-            return videos
-        provider_rows = [self._candidate_to_row(c) for c in provider_candidates]
-        self._annotate_search_rows(
-            provider_rows,
-            search_source=f"provider_registry_{source_surface or 'mix'}",
-            retrieval_strategy=retrieval_strategy,
-            retrieval_stage=retrieval_stage,
-            search_query=query,
-        )
-        merged = self._merge_unique_videos(videos, provider_rows, None)
-        logger.warning(
-            "provider_registry: merged %d non-YouTube candidates (pool %d->%d) q=%r",
-            len(provider_rows), before, len(merged), query[:60],
-        )
-        return merged
-
-    @staticmethod
-    def _candidate_to_row(candidate: ProviderCandidate) -> dict[str, Any]:
-        """Map a ProviderCandidate (non-YouTube) onto the row dict shape
-        that flows through ranking + persistence. The `provider` field
-        is what `reels._get_transcript` later dispatches on.
-        """
-        return {
-            "id": candidate.video_id,
-            "title": candidate.title or f"{candidate.provider.title()} Video {candidate.video_id}",
-            "channel_id": "",
-            "channel_title": candidate.channel,
-            "description": candidate.description,
-            "duration_sec": int(candidate.duration_sec or 0),
-            "view_count": int(candidate.view_count or 0),
-            "published_at": candidate.published_at or "",
-            "is_creative_commons": False,
-            "search_source": f"{candidate.provider}_api",
-            "provider": candidate.provider,
-            "playback_url": candidate.playback_url,
-            "thumbnail_url": candidate.thumbnail_url,
-            "video_url": candidate.video_url,
-        }
-
     def _build_fallback_rows(
         self,
         video_ids: list[str],
@@ -4154,7 +4044,6 @@ class YouTubeService:
             self._circuit_is_open("web_caption_track")
             and self._circuit_is_open("innertube")
             and self._circuit_is_open("yt_dlp_subtitle")
-            and self._circuit_is_open("whisper")
         )
         if all_circuits_open and not fallback_transcript:
             logger.info(
@@ -4252,28 +4141,6 @@ class YouTubeService:
             except Exception as exc:
                 logger.debug("yt-dlp subtitle fallback failed for %s: %s", video_id, exc)
                 self._circuit_record_failure("yt_dlp_subtitle")
-
-        # Stage 4: Whisper audio fallback (ASR — most expensive)
-        if not transcript and not self._circuit_is_open("whisper"):
-            try:
-                transcript, whisper_source = self._whisper_audio_fallback(video_id)
-                if transcript:
-                    self._circuit_record_success("whisper")
-                    source_kind = whisper_source  # "asr_local" or "asr_api"
-                    extractor_version = "whisper_v1"
-                    model_version = (
-                        os.environ.get("FASTER_WHISPER_MODEL", "base.en")
-                        if whisper_source == "asr_local" else "whisper-large-v3"
-                    )
-                    passes, quality_obj, rejection_reason = self._transcript_passes_quality_gate(
-                        transcript, video_duration_sec, source_kind,
-                    )
-                    if not passes:
-                        logger.warning("Quality gate failed for %s (source=%s): %s", video_id, source_kind, rejection_reason)
-                        transcript = []
-            except Exception as exc:
-                logger.debug("Whisper audio fallback failed for %s: %s", video_id, exc)
-                self._circuit_record_failure("whisper")
 
         # ------------------------------------------------------------------
         # Determine final status and compute quality metadata
@@ -4628,7 +4495,7 @@ class YouTubeService:
         return cues
 
     # ------------------------------------------------------------------
-    # Whisper audio fallback — download audio, transcribe locally or via API
+    # Caption-only yt-dlp subtitle fallback (no media download or ASR)
     # ------------------------------------------------------------------
 
     def _ytdlp_pot_extractor_args(self) -> dict[str, dict[str, list[str]]]:
@@ -4724,160 +4591,6 @@ class YouTubeService:
             if clean_text and end > start:
                 cues.append({"text": clean_text, "start": start, "duration": round(end - start, 3)})
         return cues
-
-    def _whisper_audio_fallback(self, video_id: str) -> tuple[list[dict[str, Any]], str]:
-        """Download audio via yt-dlp, transcribe with faster-whisper or Groq Whisper.
-
-        Completely bypasses YouTube's caption/timedtext system.
-        Returns ``(transcript, source_kind)`` where source_kind is
-        ``"asr_local"`` or ``"asr_api"``, or ``([], "")`` on failure.
-        """
-        import shutil
-        import tempfile
-
-        tmpdir = tempfile.mkdtemp(prefix="reelai_whisper_")
-        try:
-            # Step 1: Download audio with yt-dlp
-            audio_path = os.path.join(tmpdir, f"{video_id}.wav")
-            try:
-                import yt_dlp
-            except ImportError:
-                logger.debug("yt-dlp not installed, skipping Whisper audio fallback")
-                return [], ""
-
-            ydl_opts: dict[str, Any] = {
-                "format": "bestaudio/best",
-                "outtmpl": os.path.join(tmpdir, f"{video_id}.%(ext)s"),
-                "quiet": True,
-                "no_warnings": True,
-                "socket_timeout": 15,
-                "retries": 2,
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "wav",
-                }],
-                "postprocessor_args": ["-ac", "1", "-ar", "16000"],
-                **self._ytdlp_cookie_opts(),
-            }
-            pot_args = self._ytdlp_pot_extractor_args()
-            if pot_args:
-                ydl_opts["extractor_args"] = pot_args
-            proxy = self._proxy_rotator.next() if self._proxy_rotator.available else None
-            if proxy:
-                proxy_url = proxy.get("https") or proxy.get("http") or ""
-                if proxy_url:
-                    ydl_opts["proxy"] = proxy_url
-
-            logger.info("Whisper fallback: downloading audio for %s", video_id)
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([f"https://www.youtube.com/watch?v={video_id}"])
-
-            # Find the output WAV file
-            wav_files = [f for f in os.listdir(tmpdir) if f.endswith(".wav")]
-            if not wav_files:
-                logger.debug("No WAV file produced for %s", video_id)
-                return [], ""
-            audio_path = os.path.join(tmpdir, wav_files[0])
-            audio_size = os.path.getsize(audio_path)
-            logger.info("Whisper fallback: audio downloaded for %s (%d bytes)", video_id, audio_size)
-
-            # Step 2: Try faster-whisper (free, local)
-            cues = self._transcribe_with_faster_whisper(audio_path, video_id)
-            if cues:
-                return cues, "asr_local"
-
-            # Step 3: Try Groq Whisper API (via llm_router, whisper-large-v3)
-            cues = self._transcribe_with_groq_whisper(audio_path, video_id)
-            if cues:
-                return cues, "asr_api"
-
-            logger.debug("All Whisper strategies failed for %s", video_id)
-            return [], ""
-        finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    def _transcribe_with_faster_whisper(
-        self, audio_path: str, video_id: str,
-    ) -> list[dict[str, Any]]:
-        """Transcribe audio with faster-whisper (local CPU, free)."""
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            logger.debug("faster-whisper not installed, skipping local transcription")
-            return []
-
-        model_name = os.environ.get("FASTER_WHISPER_MODEL", "base.en")
-        device = os.environ.get("FASTER_WHISPER_DEVICE", "cpu")
-        compute_type = os.environ.get("FASTER_WHISPER_COMPUTE_TYPE", "int8")
-
-        try:
-            logger.info("Whisper fallback: transcribing %s with faster-whisper (%s)", video_id, model_name)
-            model = WhisperModel(model_name, device=device, compute_type=compute_type)
-            segments_iter, _info = model.transcribe(
-                audio_path,
-                language="en",
-                beam_size=1,
-                vad_filter=True,
-            )
-            cues: list[dict[str, Any]] = []
-            for seg in segments_iter:
-                text = seg.text.strip()
-                if text:
-                    cues.append({
-                        "text": text,
-                        "start": seg.start,
-                        "duration": seg.end - seg.start,
-                    })
-            if cues:
-                logger.info("faster-whisper success for %s: %d cues", video_id, len(cues))
-            return cues
-        except Exception as exc:
-            logger.warning("faster-whisper failed for %s: %s", video_id, exc)
-            return []
-
-    def _transcribe_with_groq_whisper(
-        self, audio_path: str, video_id: str,
-    ) -> list[dict[str, Any]]:
-        """Transcribe audio via Groq Whisper (whisper-large-v3) through llm_router."""
-        # Groq's Whisper file limit is 25 MiB (same as OpenAI-compatible endpoint).
-        max_size = 24 * 1024 * 1024
-        if os.path.getsize(audio_path) > max_size:
-            logger.debug("Audio too large for Whisper API (%d bytes), skipping", os.path.getsize(audio_path))
-            return []
-
-        try:
-            from . import llm_router
-        except ImportError:
-            return []
-
-        try:
-            logger.info("Whisper fallback: transcribing %s with Groq Whisper API", video_id)
-            payload = llm_router.transcribe_audio(audio_path, language="en")
-            if not payload:
-                return []
-            segments = payload.get("segments") if isinstance(payload, dict) else None
-            if not isinstance(segments, list):
-                return []
-
-            cues: list[dict[str, Any]] = []
-            for seg in segments:
-                if not isinstance(seg, dict):
-                    continue
-                text = str(seg.get("text") or "").strip()
-                start = float(seg.get("start") or 0.0)
-                end = float(seg.get("end") or 0.0)
-                if text:
-                    cues.append({
-                        "text": text,
-                        "start": start,
-                        "duration": max(0.0, end - start),
-                    })
-            if cues:
-                logger.info("Groq Whisper success for %s: %d cues", video_id, len(cues))
-            return cues
-        except Exception as exc:
-            logger.warning("Groq Whisper failed for %s: %s", video_id, exc)
-            return []
 
     def _fallback_any_transcript(self, video_id: str) -> list[dict[str, Any]]:
         try:

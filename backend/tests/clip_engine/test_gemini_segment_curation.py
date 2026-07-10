@@ -3,6 +3,8 @@
 
 Covers the shared one-pass quality/duration/boundary contract.
 """
+import json
+
 import pytest
 
 from backend.app.clip_engine.clipper.pipeline import gemini_segment
@@ -10,10 +12,17 @@ from backend.app.clip_engine.clipper.pipeline.gemini_segment import (
     _norm_informativeness,
     _Plan,
     _Topic,
+    _cue_batches,
     _plan_to_clips,
     _prompts,
     segment_clips,
 )
+from backend.app.clip_engine.clipper.llm import StructuredResult
+
+
+def test_developer_api_schema_omits_unsupported_additional_properties():
+    schema_json = json.dumps(_Plan.model_json_schema(), sort_keys=True)
+    assert "additionalProperties" not in schema_json
 
 
 def _segs(n: int, sec: float = 30.0) -> list[dict]:
@@ -26,7 +35,7 @@ def _segs(n: int, sec: float = 30.0) -> list[dict]:
 def _topic(start_line: int, end_line: int, **kw) -> _Topic:
     base = dict(
         title="T", start_line=start_line, end_line=end_line,
-        start_quote="start", end_quote="end", kind="content",
+        start_quote=f"line {start_line}", end_quote="text", kind="content",
         informativeness=0.9, topic_relevance=0.9, self_contained=True,
     )
     base.update(kw)
@@ -147,16 +156,19 @@ class TestDurationContract:
         assert "cut_end" not in clip and "low_confidence" not in clip
 
 
-class TestCaptionGapSnapping:
-    def test_boundaries_move_outward_to_nearest_gap_midpoints(self):
+class TestExactCueBoundaries:
+    def test_boundaries_are_cited_cue_start_and_end(self):
         segs = [
             {"start": 0.0, "end": 9.0, "text": "before"},
             {"start": 10.0, "end": 20.0, "text": "teaching"},
             {"start": 21.0, "end": 30.0, "text": "after"},
         ]
-        clips = _plan_to_clips(_Plan(topics=[_topic(1, 1)]), segs, [], {})
-        assert clips[0]["start"] == 9.5
-        assert clips[0]["end"] == 20.5
+        clips = _plan_to_clips(
+            _Plan(topics=[_topic(1, 1, start_quote="teaching", end_quote="teaching")]),
+            segs, [], {},
+        )
+        assert clips[0]["start"] == 10.0
+        assert clips[0]["end"] == 20.0
 
     def test_small_or_distant_gaps_do_not_move_semantic_boundary(self):
         segs = [
@@ -164,7 +176,10 @@ class TestCaptionGapSnapping:
             {"start": 10.0, "end": 20.0, "text": "teaching"},
             {"start": 20.2, "end": 30.0, "text": "after"},
         ]
-        clips = _plan_to_clips(_Plan(topics=[_topic(1, 1)]), segs, [], {})
+        clips = _plan_to_clips(
+            _Plan(topics=[_topic(1, 1, start_quote="teaching", end_quote="teaching")]),
+            segs, [], {},
+        )
         assert clips[0]["start"] == 10.0
         assert clips[0]["end"] == 20.0
 
@@ -191,7 +206,10 @@ class TestOverlapHandling:
 
     def test_timestamps_round_to_milliseconds(self):
         segs = [{"start": 1.23456, "end": 4.56789, "text": "complete idea"}]
-        clips = _plan_to_clips(_Plan(topics=[_topic(0, 0)]), segs, [], {})
+        clips = _plan_to_clips(
+            _Plan(topics=[_topic(0, 0, start_quote="complete", end_quote="idea")]),
+            segs, [], {},
+        )
         assert clips[0]["start"] == 1.235
         assert clips[0]["end"] == 4.568
 
@@ -226,9 +244,9 @@ class TestTopicThreading:
 
         def fake_llm_json(system, user, schema, **kw):
             seen["system"] = system
-            return _Plan(topics=[])
+            return StructuredResult(_Plan(topics=[]), "gemini-test", False)
 
-        monkeypatch.setattr(gemini_segment, "llm_json", fake_llm_json)
+        monkeypatch.setattr(gemini_segment, "llm_json_result", fake_llm_json)
         tx = {"segments": _segs(2), "words": [], "duration": 60.0}
         segment_clips(tx, {}, topic="linear algebra")
         assert "linear algebra" in seen["system"]
@@ -241,14 +259,18 @@ class TestLearningDetailsContract:
             "options": ["Line zero", "A tangent", "An outro", "A sponsor"],
             "correct_index": 0,
             "explanation": "Line zero introduces the idea taught in the clip.",
+            "cue_ids": ["cue-0"],
         }
         clip = _run([
             _topic(
                 0,
                 1,
                 summary="The clip explains the central idea in two steps.",
+                summary_cue_ids=["cue-0", "cue-1"],
                 takeaways=["First idea", "Second idea"],
+                takeaway_cue_ids=[["cue-0"], ["cue-1"]],
                 match_reason="It directly explains the line used by this topic.",
+                match_reason_cue_ids=["cue-0"],
                 assessment=question,
             )
         ])[0]
@@ -256,6 +278,19 @@ class TestLearningDetailsContract:
         assert clip["takeaways"] == ["First idea", "Second idea"]
         assert clip["match_reason"].startswith("It directly")
         assert clip["assessment"] == question
+
+    def test_ungrounded_metadata_is_discarded_without_rejecting_clip(self):
+        clip = _run([_topic(
+            0, 1, summary="Unsupported", takeaways=["Unsupported"],
+            match_reason="Unsupported", assessment={
+                "prompt": "Q", "options": ["a", "b", "c", "d"],
+                "correct_index": 0, "explanation": "line zero",
+            },
+        )])[0]
+        assert clip["summary"] == ""
+        assert clip["takeaways"] == []
+        assert clip["match_reason"] == ""
+        assert clip["assessment"] is None
 
     @pytest.mark.parametrize(
         "question",
@@ -279,3 +314,53 @@ class TestLearningDetailsContract:
         prompt = system + user
         for field in ("summary", "takeaways", "match_reason", "assessment", "correct_index", "explanation"):
             assert field in prompt
+
+
+class TestProposalEvidence:
+    def test_out_of_range_indices_are_rejected_instead_of_clamped(self):
+        assert _run([_topic(-1, 1)]) == []
+        assert _run([_topic(0, 10)], n_segs=2) == []
+
+    def test_quote_must_appear_inside_its_cited_cue(self):
+        assert _run([_topic(0, 1, start_quote="hallucinated phrase")]) == []
+        assert _run([_topic(0, 1, end_quote="line 0")]) == []
+
+    def test_global_quality_selection_happens_before_chronological_order(self):
+        topics = [
+            _topic(index, index, title=f"T{index}", informativeness=0.6)
+            for index in range(40)
+        ]
+        topics.append(_topic(40, 40, title="best late clip", informativeness=1.0))
+        clips = _run(topics, n_segs=41, settings={"max_clips": 1}, sec=1.0)
+        assert [clip["title"] for clip in clips] == ["best late clip"]
+
+    def test_clip_carries_exact_cue_and_model_metadata(self):
+        [clip] = _run(
+            [_topic(0, 1)],
+            settings={"_model_used": "gemini-primary", "_quality_degraded": True},
+        )
+        assert clip["cue_ids"] == ["cue-0", "cue-1"]
+        assert clip["transcript_text"] == "line 0 text line 1 text"
+        assert clip["model_used"] == "gemini-primary"
+        assert clip["quality_degraded"] is True
+
+
+class TestCueBatching:
+    def test_batches_are_bounded_and_overlap_by_cue(self):
+        segments = _segs(8, sec=1.0)
+        batches = _cue_batches(
+            segments, max_cues=3, max_input_tokens=10_000, overlap_cues=1
+        )
+        assert [offset for offset, _ in batches] == [0, 2, 4, 6]
+        assert all(len(batch) <= 3 for _, batch in batches)
+        assert batches[0][1][-1]["text"] == batches[1][1][0]["text"]
+
+    def test_input_token_limit_splits_long_cues(self):
+        segments = [
+            {"start": i, "end": i + 1, "text": "word " * 400}
+            for i in range(3)
+        ]
+        batches = _cue_batches(
+            segments, max_cues=10, max_input_tokens=2200, overlap_cues=0
+        )
+        assert [len(batch) for _, batch in batches] == [1, 1, 1]
