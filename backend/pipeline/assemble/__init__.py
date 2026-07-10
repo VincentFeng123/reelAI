@@ -662,10 +662,13 @@ def assemble_clips(structure: Structure, topic: str, sentences: list[Sentence], 
 def _resolve_assemble_fn(settings: dict):
     """Return the assembly callable for the configured clip_engine.
 
-    Reads ``settings["clip_engine"]`` first; falls back to ``config.CLIP_ENGINE``
-    (default ``"topic"``).  Returns ``assemble_topic_clips`` for ``"topic"`` and
-    ``assemble_clips`` for ``"unit"`` (or any unrecognised value).
+    This helper handles only the two full-pipeline experiments. The orchestrator and
+    CLI dispatch the default one-pass Gemini engine before assembly.
     """
     from .topics import assemble_topic_clips  # local to avoid circular at module init
     engine = str(settings.get("clip_engine") or config.CLIP_ENGINE).lower()
-    return assemble_topic_clips if engine == "topic" else assemble_clips
+    if engine == "topic":
+        return assemble_topic_clips
+    if engine == "unit":
+        return assemble_clips
+    raise ValueError(f"{engine!r} is not a full-pipeline clip engine")

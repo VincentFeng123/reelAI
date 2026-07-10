@@ -64,23 +64,22 @@ export function SettingsDrawer({
             <p className="mt-1.5 text-xs text-white/40">Used only when you export a clip to .mp4.</p>
           </div>
 
-          <label className="flex items-center justify-between gap-3 cursor-pointer">
-            <span className="text-sm text-white/70">
-              ⚡ Fast Gemini segmentation
-              <span className="block text-xs text-white/40">
-                One Gemini pass picks topics & boundaries — much faster, skips punctuation &
-                precise-cut refinement. Experimental.
-              </span>
-            </span>
-            <input
-              type="checkbox"
-              className="h-5 w-5 accent-violet-500"
-              checked={settings.clip_engine === "gemini"}
-              onChange={(e) =>
-                onChange({ ...settings, clip_engine: e.target.checked ? "gemini" : undefined })
-              }
-            />
-          </label>
+          <div>
+            <label className="block text-xs font-medium text-white/60 mb-2">Clip engine</label>
+            <select
+              className="field"
+              value={settings.clip_engine ?? "gemini"}
+              onChange={(e) => onChange({ ...settings, clip_engine: e.target.value })}
+            >
+              <option value="gemini">Gemini one-pass (default)</option>
+              <option value="topic">Full/topic (experimental)</option>
+              <option value="unit">Full/unit (experimental)</option>
+            </select>
+            <p className="mt-1.5 text-xs text-white/40">
+              One-pass uses Supadata captions only. The experimental engines run the heavier
+              structure pipeline.
+            </p>
+          </div>
 
           <label className="flex items-center justify-between gap-3 cursor-pointer">
             <span className="text-sm text-white/70">

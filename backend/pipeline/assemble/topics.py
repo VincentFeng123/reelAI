@@ -27,6 +27,7 @@ class TopicJudgment(BaseModel):
     type: str = "teaching"          # teaching|intro|outro|transition|admin|promo|tangent
     informativeness: float = 0.0    # 0..1, standalone value
     self_contained: float = 0.0     # 0..1
+    topic_relevance: Optional[float] = None
     why: str = ""
 
 
@@ -74,18 +75,20 @@ SELECT_SYSTEM = (
     "video. type is one of: teaching (explains a concept / mechanism / definition-with-"
     "explanation / worked idea / self-contained argument or story), intro, outro, transition, "
     "admin, promo (subscribe / patreon / 'grab the packet'), tangent. informativeness and "
-    "self_contained are 0..1. A topic that only welcomes, thanks, recaps, or promotes is NOT "
-    "teaching. Return exactly one entry per topic id, using the ids given."
+    "self_contained and topic_relevance are 0..1. topic_relevance measures how directly the "
+    "outline topic teaches the requested target. A topic that only welcomes, thanks, recaps, "
+    "promotes, or is unrelated to the target is NOT teaching. Return exactly one entry per "
+    "topic id, using the ids given."
 )
 
 
-def _topic_prompt(topics: list[ContentNode], sentences: list[Sentence]) -> str:
+def _topic_prompt(topics: list[ContentNode], sentences: list[Sentence], topic: str = "") -> str:
     lines = []
     n = len(sentences)
     for node in topics:
         i0, i1 = node.sentence_range
         first = sentences[i0].text if 0 <= i0 < n else ""
-        last = sentences[i1 - 1].text if 0 < i1 <= n else ""
+        last = sentences[i1].text if 0 <= i1 < n else ""
         kw = ", ".join(node.keywords[:8])
         lines.append(
             f"[{node.node_id}] title={node.title!r}"
@@ -93,11 +96,12 @@ def _topic_prompt(topics: list[ContentNode], sentences: list[Sentence]) -> str:
             + (f"\n    summary: {node.summary}" if node.summary else "")
             + f"\n    opens: {first!r}\n    closes: {last!r}"
         )
-    return "TOPICS:\n" + "\n".join(lines)
+    target = f"TARGET TOPIC: {topic.strip()}\n" if topic.strip() else ""
+    return target + "TOPICS:\n" + "\n".join(lines)
 
 
 def select_topics(structure: Structure, sentences: list[Sentence],
-                  settings: dict) -> tuple[list[TopicPick], list[TopicPick]]:
+                  settings: dict, topic: str = "") -> tuple[list[TopicPick], list[TopicPick]]:
     """Keep substantive teaching topics; drop filler. Returns (kept, dropped).
 
     kept is chronological (by node.start) and capped at max_clips; dropped is every
@@ -110,7 +114,7 @@ def select_topics(structure: Structure, sentences: list[Sentence],
     cap = int(settings.get("max_clips") or config.TOPIC_MAX_CLIPS)
     by_id = {node.node_id: node for node in topics}
     try:
-        sel = llm_json(SELECT_SYSTEM, _topic_prompt(topics, sentences),
+        sel = llm_json(SELECT_SYSTEM, _topic_prompt(topics, sentences, topic),
                        TopicSelection, temperature=0.1, model=config.TOPIC_MODEL)
         judged = {j.node_id: j for j in sel.topics if j.node_id in by_id}
     except Exception:
@@ -126,13 +130,18 @@ def select_topics(structure: Structure, sentences: list[Sentence],
     for nid, node in by_id.items():
         j = judged.get(nid)
         if j is None:                       # unknown ⇒ neutral teaching (never silently lost)
-            picks.append(TopicPick(node, _TEACHING, neutral, neutral, ""))
+            kind = "off_topic" if topic.strip() else _TEACHING
+            picks.append(TopicPick(node, kind, neutral, neutral, ""))
         else:
-            picks.append(TopicPick(node, (j.type or _TEACHING).strip().lower(),
+            kind = (j.type or _TEACHING).strip().lower()
+            if topic.strip() and (j.topic_relevance is None
+                                  or float(j.topic_relevance) < config.SEGMENT_TOPIC_RELEVANCE_MIN):
+                kind = "off_topic"
+            picks.append(TopicPick(node, kind,
                                    float(j.informativeness), float(j.self_contained), j.why))
 
     kept = [p for p in picks if p.type == _TEACHING and p.informativeness >= thr]
-    if not kept:                            # never zero on a real teaching video
+    if not kept and not topic.strip():      # generic browsing retains the legacy outage fallback
         kept = sorted(picks, key=lambda p: p.informativeness, reverse=True)[:max(1, min(cap, len(picks)))]
         kept = [TopicPick(p.node, p.type, p.informativeness, p.self_contained, p.why,
                           ("low_confidence_selection",)) for p in kept]
@@ -203,10 +212,10 @@ def extract_best_window(pick: TopicPick, sentences: list[Sentence],
                         settings: dict) -> Optional[Window]:
     """Pick the best <=CLIP_MAX_S self-contained window inside (and just before) a topic."""
     node = pick.node
-    i0, i1 = node.sentence_range                     # half-open
+    i0, i1 = node.sentence_range                     # inclusive
     win = int(settings.get("boundary_window") or config.TOPIC_BOUNDARY_WINDOW)
     lo = max(0, i0 - win)                             # allow opening a little earlier
-    hi = min(len(sentences) - 1, i1 - 1)
+    hi = min(len(sentences) - 1, i1)
     if hi < lo:
         return None
     max_s = float(settings.get("clip_max_s") or config.CLIP_MAX_S)
@@ -245,7 +254,7 @@ def assemble_topic_clips(structure: Structure, topic: str, sentences: list[Sente
         return [], "This video couldn't be segmented into topics.", rejections
 
     emit(0.05, "Selecting substantive topics…")
-    kept, dropped = select_topics(structure, sentences, settings)
+    kept, dropped = select_topics(structure, sentences, settings, topic)
     stats["n_topics_total"] = len(topics)
     stats["n_topics_kept"] = len(kept)
     stats["n_topics_dropped"] = len(dropped)

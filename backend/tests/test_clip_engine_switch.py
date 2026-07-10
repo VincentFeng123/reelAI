@@ -1,7 +1,7 @@
 """Tests for CLIP_ENGINE routing (Task 6).
 
 Covers three things:
-1. test_engine_resolution  — the brief's spec: default→topic, explicit unit, None→default.
+1. test_engine_resolution  — default→gemini; topic and unit remain explicit experiments.
 2. test_orchestrator_imports_topic_engine  — the brief's import smoke-test.
 3. test_resolve_assemble_fn_dispatch  — REAL wiring: _resolve_assemble_fn (the shared
    helper used by BOTH orchestrator and cli) returns the correct callable object.
@@ -20,8 +20,9 @@ def _resolve(settings):
 
 
 def test_engine_resolution():
-    assert _resolve({}) == "topic"                       # inherits config default
-    assert _resolve({"clip_engine": "unit"}) == "unit"   # explicit override wins
+    assert _resolve({}) == "gemini"
+    assert _resolve({"clip_engine": "topic"}) == "topic"
+    assert _resolve({"clip_engine": "unit"}) == "unit"
     assert _resolve({"clip_engine": None}) == config.CLIP_ENGINE
 
 
@@ -33,9 +34,8 @@ def test_orchestrator_imports_topic_engine():
 
 # ── real-wiring test ───────────────────────────────────────────────────────────
 
-def test_resolve_assemble_fn_default_routes_to_topic():
-    """No clip_engine in settings → topic engine (the new default)."""
-    fn = _resolve_assemble_fn({})
+def test_resolve_assemble_fn_explicit_topic_routes_to_topic():
+    fn = _resolve_assemble_fn({"clip_engine": "topic"})
     assert fn is assemble_topic_clips
 
 
@@ -45,11 +45,13 @@ def test_resolve_assemble_fn_unit_routes_to_unit():
     assert fn is assemble_clips
 
 
-def test_resolve_assemble_fn_none_falls_back_to_config_default():
-    """clip_engine=None → inherit config.CLIP_ENGINE (currently 'topic')."""
-    fn = _resolve_assemble_fn({"clip_engine": None})
-    expected = assemble_topic_clips if config.CLIP_ENGINE == "topic" else assemble_clips
-    assert fn is expected
+def test_resolve_assemble_fn_rejects_gemini_because_it_dispatches_before_assembly():
+    import pytest
+
+    with pytest.raises(ValueError, match="not a full-pipeline"):
+        _resolve_assemble_fn({"clip_engine": "gemini"})
+    with pytest.raises(ValueError, match="not a full-pipeline"):
+        _resolve_assemble_fn({})
 
 
 def test_orchestrator_uses_resolve_assemble_fn():
@@ -60,6 +62,7 @@ def test_orchestrator_uses_resolve_assemble_fn():
     assert "_resolve_assemble_fn" in src, (
         "orchestrator._run_full must call _resolve_assemble_fn(settings) to route the engine"
     )
+    assert 'engine == "gemini"' in src and "_run_gemini_segment" in src
 
 
 def test_cli_uses_resolve_assemble_fn():
@@ -70,3 +73,4 @@ def test_cli_uses_resolve_assemble_fn():
     assert "_resolve_assemble_fn" in src, (
         "backend.cli must call _resolve_assemble_fn(settings) to route the engine"
     )
+    assert 'engine == "gemini"' in src and "segment_clips" in src

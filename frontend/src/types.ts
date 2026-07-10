@@ -40,8 +40,7 @@ export interface Settings {
   allow_question_exclaim_ends: boolean;
   mmr_lambda: number;
   export_resolution: number;
-  // Opt-in engine: "gemini" = one fast Gemini pass segments topics directly
-  // (no punctuation/understanding/refine). Undefined → server default ("topic").
+  // Undefined inherits the one-pass Gemini default; topic/unit are heavier experiments.
   clip_engine?: string;
 }
 

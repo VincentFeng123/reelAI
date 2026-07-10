@@ -49,9 +49,9 @@ def _build_embed_clips(clips_spec: list[dict], video_id: str) -> list[dict]:
             "video_id": video_id,
             "facet": c.get("facet", "other"),
             "reason": c.get("reason", ""),
-            "start": round(start, 2),
-            "end": round(end, 2),
-            "duration": round(end - start, 2),
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "duration": round(end - start, 3),
             "embed_url": embed_url(video_id, start, end),
             "path": None,
             # optional structure-first fields (frontends ignore unknown keys) --
@@ -69,6 +69,9 @@ def _build_embed_clips(clips_spec: list[dict], video_id: str) -> list[dict]:
             "warnings": list(c.get("warnings") or []),
             "ship_flagged": bool(c.get("ship_flagged", False)),
         }
+        for key in ("kind", "informativeness", "topic_relevance", "self_contained", "difficulty"):
+            if c.get(key) is not None:
+                clip[key] = c[key]
         # VID2 edge-probe outcomes — only present when the probe ran (default OFF ⇒ absent,
         # keeping the payload byte-identical). The warnings already ride in via 'warnings'.
         if c.get("starts_clean_audio") is not None:
@@ -151,7 +154,7 @@ async def run_pipeline(job: Job, executor: ThreadPoolExecutor) -> None:
             )
         transcript.setdefault("title", job.title or "")
 
-        # ── Gemini-segment engine (opt-in): one comprehension pass over the transcript →
+        # ── Gemini-segment engine (default): one comprehension pass over the transcript →
         # clips, skipping sentences/understanding/refine/multimodal entirely. ──────────
         if engine == "gemini":
             return await _run_gemini_segment(job, transcript, video_id, run, emit)
@@ -391,7 +394,7 @@ async def _run_fast(job: Job, transcript: dict, video_id: str, sentences, run, e
 
 
 async def _run_gemini_segment(job: Job, transcript: dict, video_id: str, run, emit) -> None:
-    """Opt-in Gemini-segment engine (``clip_engine="gemini"``): a single Gemini comprehension
+    """Default Gemini-segment engine: a single Gemini comprehension
     pass over the timestamped transcript returns substantive topic clips directly — skipping
     sentence indexing, structure understanding, Whisper refine, and multimodal perception.
     Renders mp4s only when ``output_mode="cut"`` (downloads the source video only then)."""
@@ -399,7 +402,8 @@ async def _run_gemini_segment(job: Job, transcript: dict, video_id: str, run, em
 
     settings = job.settings
     registry.publish(job, ProgressEvent("selecting", 20.0, "Reading the whole transcript…"))
-    clips_spec, notes = await run(segment_clips, transcript, settings, emit("selecting", 20, 90))
+    clips_spec, notes = await run(segment_clips, transcript, settings,
+                                  emit("selecting", 20, 90), job.topic or "")
     if not clips_spec:
         return registry.fail(job, notes or "No substantive topics found to clip.", notes=notes)
 

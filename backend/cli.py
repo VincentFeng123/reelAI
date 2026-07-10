@@ -3,10 +3,11 @@
 Usage:
     source .venv/bin/activate
     python -m backend.cli "https://youtu.be/VIDEO_ID" "the derivative"
-    python -m backend.cli "https://youtu.be/VIDEO_ID" "topic" fast     # legacy selector
+    CLIP_ENGINE=topic python -m backend.cli "https://youtu.be/VIDEO_ID" "topic"
+    CLIP_ENGINE=unit python -m backend.cli "https://youtu.be/VIDEO_ID" "topic"
 
-Runs the structure-first ("full") pipeline by default, printing each clip's role, context
-card, prerequisite hints, and verifying every clip ends on a period.
+Runs the one-pass Gemini selector by default. The heavier topic and unit pipelines remain
+available as explicit experiments through ``CLIP_ENGINE``.
 """
 from __future__ import annotations
 
@@ -50,10 +51,20 @@ async def run(url: str, topic: str, profile: str = "full") -> None:
         video_id = dl["video_id"]
         transcript = transcribe(dl["audio_path"], video_id, settings, _p("transcribe"))
     transcript.setdefault("title", "")
-    sents = build_sentences(transcript, video_id, settings, _p("punctuate"))
-    print(f"  video_id={video_id}  {len(sents)} sentences, {len(transcript.get('words', []))} words")
+    engine = str(settings.get("clip_engine") or config.CLIP_ENGINE).lower()
+    if engine == "gemini":
+        from .pipeline.gemini_segment import segment_clips
+        clips_spec, notes = segment_clips(transcript, settings, _p("select"), topic)
+        rejections = []
+        sents = []
+        print(f"  video_id={video_id}  {len(transcript.get('segments', []))} caption segments")
+    else:
+        sents = build_sentences(transcript, video_id, settings, _p("punctuate"))
+        print(f"  video_id={video_id}  {len(sents)} sentences, {len(transcript.get('words', []))} words")
 
-    if profile == "full":
+    if engine == "gemini":
+        pass
+    elif profile == "full":
         from .adapters import select_adapter
         from .pipeline.understand import build_structure
 
@@ -103,9 +114,10 @@ async def run(url: str, topic: str, profile: str = "full") -> None:
             print(f"       card: {c['context_card'][:100]}")
         if c.get("prerequisite_clips"):
             print(f"       watch first: {c['prerequisite_clips']}")
-        end_sentence = next((s for s in sents if abs(s.end - c["end"]) < 0.3), None)
-        ok = end_sentence and end_sentence.ends_with_period
-        print(f"       ends_on_period={bool(ok)}")
+        if sents:
+            end_sentence = next((s for s in sents if abs(s.end - c["end"]) < 0.3), None)
+            ok = end_sentence and end_sentence.ends_with_period
+            print(f"       ends_on_period={bool(ok)}")
 
 
 if __name__ == "__main__":

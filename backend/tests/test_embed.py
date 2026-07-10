@@ -34,3 +34,20 @@ def test_build_embed_clips_quality_defaults_never_keyerror():
     c = _build_embed_clips([{"start": 0.0, "end": 30.0}], "vid")[0]
     assert c["final_quality"] is None and c["warnings"] == [] and c["ship_flagged"] is False
     assert c["embed_url"] == "https://www.youtube.com/embed/vid?start=0&end=30&rel=0"
+
+
+def test_build_embed_clips_preserves_milliseconds_and_selector_fields():
+    spec = {
+        "start": 1.23456, "end": 4.56789, "kind": "educational",
+        "informativeness": 0.8, "topic_relevance": 0.9,
+        "self_contained": True, "difficulty": 0.4,
+    }
+    clip = _build_embed_clips([spec], "vid")[0]
+    assert (clip["start"], clip["end"], clip["duration"]) == (1.235, 4.568, 3.333)
+    assert {key: clip[key] for key in (
+        "kind", "informativeness", "topic_relevance", "self_contained", "difficulty"
+    )} == {
+        "kind": "educational", "informativeness": 0.8, "topic_relevance": 0.9,
+        "self_contained": True, "difficulty": 0.4,
+    }
+    assert clip["embed_url"] == "https://www.youtube.com/embed/vid?start=1&end=5&rel=0"

@@ -14,7 +14,7 @@ def _pick(i0, i1, start, end, title="Topic"):
     return T.TopicPick(node, "teaching", 0.9, 0.8, "")
 
 
-# 6 sentences, ~10s each. Topic node covers [1,6): first sentence (idx1) dangles.
+# 6 sentences, ~10s each. Topic node covers inclusive [1,5]; first sentence dangles.
 SENTS = [
     _sent(0, "A reflex arc lets you react without thinking.", 0, 10),
     _sent(1, "These neurons carry the signal.", 10, 20),       # dangling opener
@@ -28,7 +28,7 @@ SENTS = [
 def test_window_moves_start_off_dangling_opener(monkeypatch):
     # LLM chooses to open at the framing sentence (idx0), close at idx4
     monkeypatch.setattr(T, "llm_json", lambda *a, **k: T.WindowChoice(start_idx=0, end_idx=4, title="Reflex arc"))
-    w = T.extract_best_window(_pick(1, 6, 10.0, 60.0), SENTS, {})
+    w = T.extract_best_window(_pick(1, 5, 10.0, 60.0), SENTS, {})
     assert w.start_idx == 0 and w.end_idx == 4
     assert w.start_s == 0.0 and w.end_s == 50.0
 
@@ -36,7 +36,7 @@ def test_window_moves_start_off_dangling_opener(monkeypatch):
 def test_window_truncates_to_budget(monkeypatch):
     # LLM over-reaches (0..5 = 60s); CLIP_MAX_S small ⇒ walk end back to a terminator within budget
     monkeypatch.setattr(T, "llm_json", lambda *a, **k: T.WindowChoice(start_idx=0, end_idx=5))
-    w = T.extract_best_window(_pick(0, 6, 0.0, 60.0), SENTS, {"clip_max_s": 35.0})
+    w = T.extract_best_window(_pick(0, 5, 0.0, 60.0), SENTS, {"clip_max_s": 35.0})
     assert w.end_s - w.start_s <= 35.0
     assert SENTS[w.end_idx].ends_with_period
     assert "window_truncated_to_budget" in w.warnings
@@ -46,7 +46,7 @@ def test_window_snaps_end_to_terminator(monkeypatch):
     seq = [_sent(0, "First point.", 0, 10),
            _sent(1, "Second point that trails off", 10, 20, term=""),   # no terminator
            _sent(2, "Third point ends here.", 20, 30)]
-    node = ContentNode(node_id="t1", level="topic", title="X", start=0, end=30, sentence_range=(0, 3))
+    node = ContentNode(node_id="t1", level="topic", title="X", start=0, end=30, sentence_range=(0, 2))
     pick = T.TopicPick(node, "teaching", 0.9, 0.8, "")
     monkeypatch.setattr(T, "llm_json", lambda *a, **k: T.WindowChoice(start_idx=0, end_idx=1))
     w = T.extract_best_window(pick, seq, {})
@@ -55,7 +55,7 @@ def test_window_snaps_end_to_terminator(monkeypatch):
 
 def test_window_clamps_out_of_range(monkeypatch):
     monkeypatch.setattr(T, "llm_json", lambda *a, **k: T.WindowChoice(start_idx=99, end_idx=999))
-    w = T.extract_best_window(_pick(1, 6, 10.0, 60.0), SENTS, {})
+    w = T.extract_best_window(_pick(1, 5, 10.0, 60.0), SENTS, {})
     assert 0 <= w.start_idx <= w.end_idx <= len(SENTS) - 1
 
 
@@ -76,7 +76,7 @@ def test_fit_budget_terminator_only_at_window_start(monkeypatch):
         _sent(5, "End with period.", 50, 60, term="."),      # LLM endpoint
     ]
     node = ContentNode(node_id="t1", level="topic", title="X", start=10, end=60,
-                       sentence_range=(1, 6), keywords=[])
+                       sentence_range=(1, 5), keywords=[])
     pick = T.TopicPick(node, "teaching", 0.9, 0.8, "")
     monkeypatch.setattr(T, "llm_json", lambda *a, **k: T.WindowChoice(start_idx=1, end_idx=5))
     w = T.extract_best_window(pick, sents, {"clip_max_s": 25.0, "boundary_window": 0})
@@ -100,7 +100,7 @@ def test_fit_budget_no_terminator_in_budgeted_span(monkeypatch):
         _sent(5, "Terminal end.", 50, 60, term="."),         # LLM endpoint — outside budget
     ]
     node = ContentNode(node_id="t1", level="topic", title="X", start=0, end=60,
-                       sentence_range=(0, 6), keywords=[])
+                       sentence_range=(0, 5), keywords=[])
     pick = T.TopicPick(node, "teaching", 0.9, 0.8, "")
     monkeypatch.setattr(T, "llm_json", lambda *a, **k: T.WindowChoice(start_idx=0, end_idx=5))
     w = T.extract_best_window(pick, sents, {"clip_max_s": 35.0, "boundary_window": 0})
