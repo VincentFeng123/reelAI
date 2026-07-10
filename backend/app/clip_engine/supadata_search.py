@@ -96,10 +96,15 @@ async def _search_one_async(
     if page_token:
         params: dict[str, Any] = {"nextPageToken": str(page_token).strip()}
     else:
+        wire_features = list(normalized_filters["features"])
+        if len(wire_features) == 1:
+            # Supadata collapses a singleton query value to a string, then
+            # rejects it because `features` must remain an array.
+            wire_features.append(wire_features[0])
         params = {
             "query": " ".join(str(query or "").split()),
             "type": "video",
-            "features": normalized_filters["features"],
+            "features": wire_features,
         }
         if normalized_filters["sort_by"] != "relevance":
             params["sortBy"] = normalized_filters["sort_by"]

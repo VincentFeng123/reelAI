@@ -75,6 +75,20 @@ def test_search_one_sends_truthful_filters_and_caches(monkeypatch):
     assert len(calls) == 1
 
 
+def test_search_one_keeps_singleton_features_as_array_on_wire(monkeypatch):
+    calls = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls.append(params)
+        return _Resp(200, {"results": []})
+
+    monkeypatch.setattr(ss.httpx, "get", fake_get)
+    result = ss.search_one("Calculus", cache_store=MemoryProviderCache())
+
+    assert calls[0]["features"] == ["subtitles", "subtitles"]
+    assert result["filters_applied"]["features"] == ["subtitles"]
+
+
 def test_search_page_token_uses_documented_parameter_without_filters(monkeypatch):
     calls = []
 
