@@ -24,7 +24,6 @@ type YouTubePlayer = {
   playVideo: () => void;
   seekTo: (seconds: number, allowSeekAhead: boolean) => void;
   getCurrentTime: () => number;
-  getDuration?: () => number;
   getAvailablePlaybackRates?: () => number[];
   getPlayerState?: () => number;
   mute: () => void;
@@ -39,9 +38,6 @@ const RESUME_MASK_MS = 480;
 const AUTOPLAY_RETRY_DELAY_MS = 320;
 const AUTOPLAY_MAX_RETRIES = 5;
 const PLAYBACK_SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
-// Word timestamps are interpolated from caption cues (±hundreds of ms); starting slightly
-// early is the least-bad fix for mid-word clip entries without audio analysis.
-const CLIP_START_LEAD_IN_SEC = 0.4;
 
 function detectTouchLikeDevice(): boolean {
   if (typeof window === "undefined") {
@@ -167,12 +163,6 @@ export function ReelCard({
   const [isSurfaceVisible, setIsSurfaceVisible] = useState(false);
   const [isResumeMaskVisible, setIsResumeMaskVisible] = useState(false);
   const [currentSec, setCurrentSec] = useState(0);
-  const [detectedDurationSec, setDetectedDurationSec] = useState<number | null>(null);
-  // When duration detection via YT API never fires (stuck onReady, network
-  // stall), we fall back to a sensible clip end rather than leaving
-  // community-imported reels stuck at clipStart+1. Flips 5s after the
-  // player becomes ready if detection hasn't succeeded.
-  const [durationDetectionTimedOut, setDurationDetectionTimedOut] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [isTouchLikeDevice, setIsTouchLikeDevice] = useState(false);
   const [isMobilePhoneDevice, setIsMobilePhoneDevice] = useState(false);
@@ -185,61 +175,10 @@ export function ReelCard({
     if (isYouTubeVideo) return null;
     return normalizeExternalEmbedUrl(reel.video_url);
   }, [reel.video_url, isYouTubeVideo]);
-  const isCommunityImported = (reel.relevance_reason || "").trim() === "Opened from a community set.";
-  // Upper bound from the server-reported video duration (when present). This
-  // protects against malformed t_start / t_end (e.g. timestamps past the
-  // actual video length) that would otherwise leave the player stuck in
-  // BUFFERING forever.
-  const videoDurationCap =
-    Number.isFinite(reel.video_duration_sec) && Number(reel.video_duration_sec) > 0
-      ? Math.max(1, Number(reel.video_duration_sec) - 0.5)
-      : Number.POSITIVE_INFINITY;
   const clipStartRaw = Number(reel.t_start);
   const clipEndRaw = Number(reel.t_end);
-  const clipStart =
-    Number.isFinite(clipStartRaw) && clipStartRaw >= 0
-      ? Math.min(videoDurationCap, clipStartRaw)
-      : 0;
-  const seekStart = Math.max(0, clipStart - CLIP_START_LEAD_IN_SEC);
-  const configuredClipEnd =
-    Number.isFinite(clipEndRaw) && clipEndRaw > clipStart
-      ? Math.min(
-          Number.isFinite(videoDurationCap) ? videoDurationCap + 0.5 : clipEndRaw,
-          clipEndRaw,
-        )
-      : clipStart + 1;
-  const configuredClipDuration = Math.max(0, configuredClipEnd - clipStart);
-  const hasClipDurationMetadata = Number.isFinite(reel.clip_duration_sec) && Number(reel.clip_duration_sec) > 0;
-  const hasExplicitEndFlag = reel.community_has_explicit_end === true;
-  const looksLikeFallbackWindow = Math.abs(configuredClipDuration - 180) < 0.25;
-  const hasCreatorClipRange =
-    hasExplicitEndFlag ||
-    hasClipDurationMetadata ||
-    (isCommunityImported && configuredClipDuration > 0.5 && !looksLikeFallbackWindow);
-  const detectedClipEnd =
-    detectedDurationSec !== null && detectedDurationSec > clipStart
-      ? detectedDurationSec
-      : null;
-  const shouldUseDetectedDurationAsMax = isCommunityImported && !hasCreatorClipRange;
-  const shouldAutoExtendNearFullClip =
-    isCommunityImported &&
-    hasCreatorClipRange &&
-    detectedClipEnd !== null &&
-    clipStart <= 0.25 &&
-    configuredClipEnd < detectedClipEnd &&
-    configuredClipEnd >= detectedClipEnd * 0.93;
-  const clipEnd =
-    detectedClipEnd === null
-      ? shouldUseDetectedDurationAsMax
-        && durationDetectionTimedOut
-        && configuredClipEnd - clipStart < 15
-        // Detection timed out and the configured window is the 1s default —
-        // extend to a reasonable 30s so the reel is actually watchable.
-        ? clipStart + 30
-        : configuredClipEnd
-      : shouldUseDetectedDurationAsMax || shouldAutoExtendNearFullClip
-      ? detectedClipEnd
-      : Math.max(clipStart + 1, Math.min(configuredClipEnd, detectedClipEnd));
+  const clipStart = Number.isFinite(clipStartRaw) && clipStartRaw >= 0 ? clipStartRaw : 0;
+  const clipEnd = Number.isFinite(clipEndRaw) && clipEndRaw >= clipStart + 1 ? clipEndRaw : clipStart + 1;
   const clipDuration = Math.max(1, clipEnd - clipStart);
   const progressPercent = clipDuration > 0 ? clamp((currentSec / clipDuration) * 100, 0, 100) : 0;
   const reelProgressStyle = { width: `${progressPercent}%` } as CSSProperties;
@@ -267,23 +206,7 @@ export function ReelCard({
 
   useEffect(() => {
     didHandleClipEndRef.current = false;
-    setDetectedDurationSec(null);
-    setDurationDetectionTimedOut(false);
   }, [reel.reel_id]);
-
-  useEffect(() => {
-    if (
-      !isYouTubeVideo
-      || !shouldUseDetectedDurationAsMax
-      || detectedDurationSec !== null
-    ) {
-      return;
-    }
-    const timer = setTimeout(() => {
-      setDurationDetectionTimedOut(true);
-    }, 5000);
-    return () => clearTimeout(timer);
-  }, [isYouTubeVideo, shouldUseDetectedDurationAsMax, detectedDurationSec, reel.reel_id]);
 
   useEffect(() => {
     setCurrentSec((prev) => clamp(prev, 0, clipDuration));
@@ -368,27 +291,15 @@ export function ReelCard({
     }
   }, []);
 
-  const syncDetectedDurationFromPlayer = useCallback((player: YouTubePlayer | null) => {
-    if (!isYouTubeVideo || !shouldUseDetectedDurationAsMax || detectedDurationSec !== null || !player) {
-      return;
-    }
-    const raw = Number(player.getDuration?.());
-    if (!Number.isFinite(raw) || raw <= 0) {
-      return;
-    }
-    setDetectedDurationSec(raw);
-  }, [detectedDurationSec, isYouTubeVideo, shouldUseDetectedDurationAsMax]);
-
   const syncProgress = useCallback(() => {
     const player = playerRef.current;
     if (!player) {
       return;
     }
-    syncDetectedDurationFromPlayer(player);
     const now = clamp(player.getCurrentTime(), clipStart, clipEnd);
     const rel = clamp(now - clipStart, 0, clipDuration);
     setCurrentSec(rel);
-  }, [clipDuration, clipEnd, clipStart, syncDetectedDurationFromPlayer]);
+  }, [clipDuration, clipEnd, clipStart]);
 
   const applyPlaybackRateToPlayer = useCallback((player: YouTubePlayer | null, nextRate: number) => {
     if (!player?.setPlaybackRate) {
@@ -413,9 +324,8 @@ export function ReelCard({
       if (!player) {
         return;
       }
-      syncDetectedDurationFromPlayer(player);
       const now = clamp(player.getCurrentTime(), clipStart, clipEnd);
-      if (now >= clipEnd - 0.15) {
+      if (now >= clipEnd) {
         if (autoplayEnabledRef.current && isActive && onRequestNextReel && !didHandleClipEndRef.current) {
           didHandleClipEndRef.current = true;
           setIsPlaying(false);
@@ -425,7 +335,7 @@ export function ReelCard({
           onRequestNextReel();
           return;
         }
-        player.seekTo(seekStart, true);
+        player.seekTo(clipStart, true);
         if (isActive) {
           player.playVideo();
         }
@@ -433,7 +343,7 @@ export function ReelCard({
       const rel = clamp(now - clipStart, 0, clipDuration);
       setCurrentSec(rel);
     }, 160);
-  }, [clipDuration, clipEnd, clipStart, isActive, onRequestNextReel, seekStart, stopProgressTimer, syncDetectedDurationFromPlayer]);
+  }, [clipDuration, clipEnd, clipStart, isActive, onRequestNextReel, stopProgressTimer]);
 
   useEffect(() => {
     if (!isYouTubeVideo || !isActive || !isReady || !isPlaying) {
@@ -597,7 +507,8 @@ export function ReelCard({
             playsinline: 1,
             iv_load_policy: 3,
             modestbranding: 1,
-            start: Math.floor(seekStart),
+            start: Math.floor(clipStart),
+            end: Math.ceil(clipEnd),
             mute: 1,
             enablejsapi: 1,
             origin: window.location.origin,
@@ -608,7 +519,6 @@ export function ReelCard({
                 return;
               }
               applyPlaybackRateToPlayer(event.target as YouTubePlayer, playbackRateRef.current);
-              syncDetectedDurationFromPlayer(event.target as YouTubePlayer);
               const tryAutoplay = () => {
                 if (cancelled || !isActive || didUserInteractRef.current) {
                   return;
@@ -616,7 +526,7 @@ export function ReelCard({
                 event.target.mute();
                 isMutedRef.current = true;
                 setIsMuted(true);
-                event.target.seekTo(seekStart, true);
+                event.target.seekTo(clipStart, true);
                 event.target.playVideo();
               };
               const queueAutoplayRetry = () => {
@@ -656,7 +566,6 @@ export function ReelCard({
               if (cancelled) {
                 return;
               }
-              syncDetectedDurationFromPlayer(event.target as YouTubePlayer);
               const state = event.data;
               const playerState = yt.PlayerState;
               if (state === playerState.PLAYING) {
@@ -690,7 +599,7 @@ export function ReelCard({
                       event.target.unMute();
                       setIsMuted(false);
                     }
-                    event.target.seekTo(seekStart, true);
+                    event.target.seekTo(clipStart, true);
                     event.target.playVideo();
                   }, AUTOPLAY_RETRY_DELAY_MS);
                 }
@@ -706,7 +615,7 @@ export function ReelCard({
                   return;
                 }
                 manualPauseRequestedRef.current = false;
-                event.target.seekTo(seekStart, true);
+                event.target.seekTo(clipStart, true);
                 event.target.playVideo();
                 setIsPlaying(true);
                 setIsSurfaceVisible(true);
@@ -762,15 +671,14 @@ export function ReelCard({
     clearHostContainer,
     clearRevealTimer,
     clearResumeMaskTimer,
+    clipEnd,
     clipStart,
     isActive,
     scheduleSurfaceReveal,
-    seekStart,
     showResumeMask,
     startProgressTimer,
     stopProgressTimer,
     syncProgress,
-    syncDetectedDurationFromPlayer,
     videoId,
     isYouTubeVideo,
     destroyPlayerSafely,

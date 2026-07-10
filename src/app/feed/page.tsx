@@ -65,7 +65,6 @@ const MAX_HISTORY_ITEMS = 120;
 const MAX_REELS_PER_FEED_SESSION = 80;
 const COMPACT_REELS_PER_FEED_SESSION = 48;
 const MINIMAL_REELS_PER_FEED_SESSION = 20;
-const MIN_VISIBLE_REELS_BEFORE_SOURCE_LOCK = 3;
 const REFINEMENT_POLL_INTERVAL_MS = 3000;
 const REFINEMENT_STALE_AFTER_MS = 18_000;
 const REFINEMENT_MAX_POLL_FAILURES = 3;
@@ -117,6 +116,8 @@ type FeedProgressEntry = {
 
 type FeedSessionSnapshot = {
   reels: Reel[];
+  feedbackByReel: Record<string, ReelFeedbackState>;
+  adaptiveExcludeReelIds: string[];
   page: number;
   total: number;
   canRequestMore: boolean;
@@ -342,8 +343,31 @@ function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapsh
       const page = Math.max(1, Math.floor(Number(row.page) || 1));
       const total = Math.max(reels.length, Math.floor(Number(row.total) || reels.length));
       const activeIndex = Math.max(0, Math.floor(Number(row.activeIndex) || 0));
+      const feedbackByReel: Record<string, ReelFeedbackState> = {};
+      if (row.feedbackByReel && typeof row.feedbackByReel === "object" && !Array.isArray(row.feedbackByReel)) {
+        for (const [reelId, rawFeedback] of Object.entries(row.feedbackByReel as Record<string, unknown>)) {
+          if (!reelId || !rawFeedback || typeof rawFeedback !== "object" || Array.isArray(rawFeedback)) {
+            continue;
+          }
+          const feedback = rawFeedback as Record<string, unknown>;
+          feedbackByReel[reelId] = {
+            helpful: feedback.helpful === true,
+            confusing: feedback.confusing === true,
+            saved: feedback.saved === true,
+            rating: Number.isFinite(Number(feedback.rating)) ? Number(feedback.rating) : undefined,
+          };
+        }
+      }
+      const adaptiveExcludeReelIds = Array.isArray(row.adaptiveExcludeReelIds)
+        ? row.adaptiveExcludeReelIds
+            .map((value) => String(value || "").trim())
+            .filter(Boolean)
+            .slice(-200)
+        : [];
       result[materialId] = {
         reels,
+        feedbackByReel,
+        adaptiveExcludeReelIds,
         page,
         total,
         canRequestMore: row.canRequestMore !== false,
@@ -523,10 +547,15 @@ function compactFeedSessionSnapshot(snapshot: FeedSessionSnapshot, mode: "compac
     mode === "minimal" ? MINIMAL_REELS_PER_FEED_SESSION : COMPACT_REELS_PER_FEED_SESSION,
   );
   const compactedReels = reels.map((reel) => compactStoredReel(reel, mode));
+  const storedReelIds = new Set(compactedReels.map((reel) => reel.reel_id));
+  const feedbackByReel = Object.fromEntries(
+    Object.entries(snapshot.feedbackByReel).filter(([reelId]) => storedReelIds.has(reelId)),
+  );
   const nextActiveIndex = compactedReels.length > 0 ? clamp(activeIndex, 0, compactedReels.length - 1) : 0;
   return {
     ...snapshot,
     reels: compactedReels,
+    feedbackByReel,
     activeIndex: nextActiveIndex,
     activeReelId: compactedReels[nextActiveIndex]?.reel_id,
   };
@@ -909,13 +938,13 @@ function FeedPageInner() {
   const materialIdsForFeedRef = useRef<string[]>([]);
   const settingsLoadSequenceRef = useRef(0);
   const pendingRefinementJobsRef = useRef<Map<string, PendingRefinementJob>>(new Map());
+  const adaptiveExcludeReelIdsRef = useRef<string[]>([]);
   const isRefreshingRefinementRef = useRef(false);
   const pendingHistorySyncRef = useRef<StoredHistoryItem[] | null>(null);
   const historySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recoveryRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recoveryRequestIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const seenSourceVideoIdsRef = useRef<Set<string>>(new Set());
   const visibleTransportErrorRef = useRef(false);
   const transportFailureStreakRef = useRef(0);
   const isBackgroundRecoveryRunningRef = useRef(false);
@@ -1001,7 +1030,7 @@ function FeedPageInner() {
     if (!Number.isFinite(parsed)) {
       return "0.00";
     }
-    return (Math.round(parsed * 100) / 100).toFixed(2);
+    return (Math.round(parsed * 1000) / 1000).toFixed(3);
   }, []);
 
   const reelClipKey = useCallback((reel: Reel): string => {
@@ -1010,11 +1039,6 @@ function FeedPageInner() {
     const end = normalizeClipKeyTime(reel.t_end);
     return `${videoId}:${start}:${end}`;
   }, [normalizeClipKeyTime]);
-
-  const reelSourceVideoKey = useCallback((reel: Reel): string => {
-    const sourceKey = sourceVideoKeyFromUrl(reel.video_url);
-    return sourceKey || reelClipKey(reel);
-  }, [reelClipKey]);
 
   const dedupeByIdentity = useCallback(
     (rows: Reel[], existing: Reel[] = []): Reel[] => {
@@ -1054,17 +1078,12 @@ function FeedPageInner() {
       const nextRows = dedupeByIdentity(rows);
       const merged = existing.map((reel) => ({ ...reel }));
       const addedReels: Reel[] = [];
-      const sourceIndexByKey = new Map<string, number>();
       const clipIndexByKey = new Map<string, number>();
       const reelIndexById = new Map<string, number>();
 
       const registerReel = (reel: Reel, index: number) => {
-        const sourceKey = reelSourceVideoKey(reel);
         const clipKey = reelClipKey(reel);
         const reelId = String(reel.reel_id || "").trim();
-        if (sourceKey) {
-          sourceIndexByKey.set(sourceKey, index);
-        }
         clipIndexByKey.set(clipKey, index);
         if (reelId) {
           reelIndexById.set(reelId, index);
@@ -1075,28 +1094,17 @@ function FeedPageInner() {
 
       let updatedCount = 0;
       for (const reel of nextRows) {
-        const sourceKey = reelSourceVideoKey(reel);
         const clipKey = reelClipKey(reel);
         const reelId = String(reel.reel_id || "").trim();
-        const clipOrReelExistingIndex =
+        const existingIndex =
           clipIndexByKey.get(clipKey)
           ?? (reelId ? reelIndexById.get(reelId) : undefined);
-        const sourceExistingIndex = sourceKey ? sourceIndexByKey.get(sourceKey) : undefined;
-        const allowUnderfilledSourceDuplicate =
-          sourceExistingIndex != null
-          && clipOrReelExistingIndex == null
-          && sourceIndexByKey.size < MIN_VISIBLE_REELS_BEFORE_SOURCE_LOCK
-          && merged.length < MIN_VISIBLE_REELS_BEFORE_SOURCE_LOCK;
-        const existingIndex = clipOrReelExistingIndex ?? (allowUnderfilledSourceDuplicate ? undefined : sourceExistingIndex);
         if (existingIndex != null) {
           const current = merged[existingIndex];
-          const sameIdentity = reelClipKey(current) === clipKey || String(current.reel_id || "").trim() === reelId;
-          if (sameIdentity) {
-            const updated = mergeReelMetadata(current, reel);
-            merged[existingIndex] = updated;
-            registerReel(updated, existingIndex);
-            updatedCount += 1;
-          }
+          const updated = mergeReelMetadata(current, reel);
+          merged[existingIndex] = updated;
+          registerReel(updated, existingIndex);
+          updatedCount += 1;
           continue;
         }
         merged.push(reel);
@@ -1111,17 +1119,12 @@ function FeedPageInner() {
         updatedCount,
       };
     },
-    [dedupeByIdentity, reelClipKey, reelSourceVideoKey],
+    [dedupeByIdentity, reelClipKey],
   );
 
   const updateSessionReels = useCallback((nextReels: Reel[]) => {
     reelsRef.current = nextReels;
-    seenSourceVideoIdsRef.current = new Set(nextReels.map(reelSourceVideoKey).filter(Boolean));
     setReels(nextReels);
-  }, [reelSourceVideoKey]);
-
-  const getExcludedSourceVideoIds = useCallback((): string[] => {
-    return Array.from(seenSourceVideoIdsRef.current).filter(Boolean);
   }, []);
 
   const interleaveReelBatches = useCallback((batches: Reel[][]): Reel[] => {
@@ -1697,14 +1700,15 @@ function FeedPageInner() {
 
       try {
         const tuning = getFeedTuningSettings();
+        const requestLimit = adaptiveExcludeReelIdsRef.current.length > 0 ? 25 : PAGE_SIZE;
         const rows = await Promise.all(
           feedMaterialIds.map(async (id) => {
             try {
               const data = await fetchFeed({
                 materialId: id,
                 page: targetPage,
-                limit: PAGE_SIZE,
-                excludeVideoIds: getExcludedSourceVideoIds(),
+                limit: requestLimit,
+                excludeReelIds: adaptiveExcludeReelIdsRef.current,
                 autofill: options?.autofill ?? true,
                 prefetch: INITIAL_SLOW_PREFETCH,
                 generationMode,
@@ -1772,7 +1776,7 @@ function FeedPageInner() {
           : mergeSessionReels(fetchedReels, reelsRef.current);
         const exhausted = successful.every((row) => {
           const rowTotal = Math.max(0, Number(row.data!.total) || 0);
-          return row.data!.reels.length === 0 || targetPage * PAGE_SIZE >= rowTotal;
+          return row.data!.reels.length === 0 || targetPage * requestLimit >= rowTotal;
         });
 
         setPage(targetPage);
@@ -1837,7 +1841,6 @@ function FeedPageInner() {
       generationMode,
       getFeedMaterialIds,
       getFeedTuningSettings,
-      getExcludedSourceVideoIds,
       hasPendingRefinementForFeed,
       interleaveReelBatches,
       isSearchScopeActive,
@@ -1895,7 +1898,6 @@ function FeedPageInner() {
             const data = await generateReelsStream({
               materialId: id,
               numReels: targetTotal,
-              excludeVideoIds: getExcludedSourceVideoIds(),
               generationMode,
               minRelevance: tuning.minRelevance,
               videoPoolMode: tuning.videoPoolMode,
@@ -2024,7 +2026,6 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    getExcludedSourceVideoIds,
     hasPendingRefinementForFeed,
     interleaveReelBatches,
     isIngestMaterial,
@@ -2044,6 +2045,7 @@ function FeedPageInner() {
     autoplayRestoredFromSnapshotRef.current = false;
     if (!materialId) {
       materialIdsForFeedRef.current = [];
+      adaptiveExcludeReelIdsRef.current = [];
       hydratedMaterialIdRef.current = null;
       setSessionHydrated(false);
       pendingResumeRef.current = null;
@@ -2113,6 +2115,7 @@ function FeedPageInner() {
       return;
     }
     hydratedMaterialIdRef.current = materialId;
+    adaptiveExcludeReelIdsRef.current = [];
     setSessionHydrated(false);
     setKnowledgeLevel(null);
     let resumeTarget: FeedProgressEntry | null = null;
@@ -2179,6 +2182,8 @@ function FeedPageInner() {
         generationModeParam === "fast" || generationModeParam === "slow" ? generationModeParam : null;
       const restoredGenerationMode = modeFromQuery ?? restoredSession.generationMode;
       updateSessionReels(restoredReels);
+      setFeedbackByReel(restoredSession.feedbackByReel);
+      adaptiveExcludeReelIdsRef.current = restoredSession.adaptiveExcludeReelIds;
       setPage(restoredSession.page);
       setTotal(Math.max(restoredSession.total, restoredReels.length));
       setCanRequestMore(true);
@@ -2229,6 +2234,9 @@ function FeedPageInner() {
   const refreshRefinedFeed = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
     if (!settingsScopeReady || feedMaterialIds.length === 0 || isRefreshingRefinementRef.current) {
+      return;
+    }
+    if (adaptiveExcludeReelIdsRef.current.length > 0) {
       return;
     }
     const searchScope = activeSearchScopeRef.current;
@@ -2392,7 +2400,6 @@ function FeedPageInner() {
             const data = await generateReelsStream({
               materialId: id,
               numReels: targetTotal,
-              excludeVideoIds: getExcludedSourceVideoIds(),
               generationMode,
               minRelevance: tuning.minRelevance,
               videoPoolMode: tuning.videoPoolMode,
@@ -2458,7 +2465,6 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    getExcludedSourceVideoIds,
     interleaveReelBatches,
     isSearchScopeActive,
     markRecoveryProgress,
@@ -2832,8 +2838,7 @@ function FeedPageInner() {
 
   useEffect(() => {
     reelsRef.current = reels;
-    seenSourceVideoIdsRef.current = new Set(reels.map(reelSourceVideoKey).filter(Boolean));
-  }, [reelSourceVideoKey, reels]);
+  }, [reels]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !materialId || reels.length === 0) {
@@ -2920,6 +2925,8 @@ function FeedPageInner() {
     const activeReelId = dedupedReels[index]?.reel_id;
     persistFeedSessionSnapshot(materialId, {
       reels: dedupedReels,
+      feedbackByReel,
+      adaptiveExcludeReelIds: adaptiveExcludeReelIdsRef.current,
       page: Math.max(1, Math.floor(page || 1)),
       total: Math.max(total, dedupedReels.length),
       canRequestMore,
@@ -2935,6 +2942,7 @@ function FeedPageInner() {
     activeIndex,
     autoplayEnabled,
     canRequestMore,
+    feedbackByReel,
     generationMode,
     mergeSessionReels,
     materialId,
@@ -3408,6 +3416,87 @@ function FeedPageInner() {
     }
   }, [activeReel, chatByReel, chatInput, chatLoading]);
 
+  const rerankUnseenTail = useCallback(async () => {
+    const feedMaterialIds = getFeedMaterialIds();
+    const currentReels = reelsRef.current;
+    if (!settingsScopeReady || feedMaterialIds.length === 0 || currentReels.length === 0) {
+      return;
+    }
+
+    const currentIndex = clamp(activeIndexRef.current, 0, currentReels.length - 1);
+    const watchedPrefix = currentReels.slice(0, currentIndex + 1);
+    const excludeReelIds = watchedPrefix.map((reel) => String(reel.reel_id || "").trim()).filter(Boolean);
+    const tailCapacity = Math.max(0, MAX_REELS_PER_FEED_SESSION - watchedPrefix.length);
+    if (tailCapacity === 0) {
+      adaptiveExcludeReelIdsRef.current = excludeReelIds.slice(-200);
+      return;
+    }
+    const unseenCount = Math.max(0, currentReels.length - watchedPrefix.length);
+    const pagesToFetch = Math.max(1, Math.ceil(Math.min(tailCapacity, Math.max(25, unseenCount)) / 25));
+    const tuning = getFeedTuningSettings();
+    const responses = await Promise.all(
+      feedMaterialIds.map(async (id) => {
+        try {
+          const pages: Array<Awaited<ReturnType<typeof fetchFeed>>> = [];
+          for (let pageNumber = 1; pageNumber <= pagesToFetch; pageNumber += 1) {
+            pages.push(await fetchFeed({
+              materialId: id,
+              page: pageNumber,
+              limit: 25,
+              excludeReelIds,
+              autofill: false,
+              prefetch: 0,
+              generationMode,
+              minRelevance: tuning.minRelevance,
+              videoPoolMode: tuning.videoPoolMode,
+              preferredVideoDuration: tuning.preferredVideoDuration,
+              targetClipDurationSec: tuning.targetClipDurationSec,
+              targetClipDurationMinSec: tuning.targetClipDurationMinSec,
+              targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+            }));
+          }
+          return pages;
+        } catch {
+          return null;
+        }
+      }),
+    );
+    if (responses.some((response) => response === null)) {
+      return;
+    }
+    const successful = responses as Array<Array<Awaited<ReturnType<typeof fetchFeed>>>>;
+
+    const rankedTail = dedupeByIdentity(interleaveReelBatches(
+      successful.map((pages) => dedupeByIdentity(pages.flatMap((response) => response.reels))),
+    ));
+    const nextReels = dedupeByIdentity(rankedTail, watchedPrefix).slice(0, MAX_REELS_PER_FEED_SESSION);
+    adaptiveExcludeReelIdsRef.current = excludeReelIds.slice(-200);
+    updateSessionReels(nextReels);
+    setActiveIndex(watchedPrefix.length - 1);
+    setTotal(Math.max(
+      nextReels.length,
+      watchedPrefix.length + successful.reduce((sum, pages) => {
+        const lastResponse = pages[pages.length - 1];
+        return sum + Math.max(0, Number(lastResponse?.total) || 0);
+      }, 0),
+    ));
+    setPage(pagesToFetch);
+    setCanRequestMore(true);
+    setFeedPagesExhausted(false);
+    const nextLevel = successful[0]?.[0]?.knowledge_level;
+    if (nextLevel) {
+      setKnowledgeLevel(nextLevel);
+    }
+  }, [
+    dedupeByIdentity,
+    generationMode,
+    getFeedMaterialIds,
+    getFeedTuningSettings,
+    interleaveReelBatches,
+    settingsScopeReady,
+    updateSessionReels,
+  ]);
+
   const submitActiveFeedback = useCallback(
     async (action: FeedbackAction) => {
       if (!activeReel) {
@@ -3418,17 +3507,28 @@ function FeedPageInner() {
       let payload: ReelFeedbackState;
       if (action === "helpful") {
         const nextHelpful = !Boolean(current.helpful);
-        payload = nextHelpful
-          ? { helpful: true, confusing: false, rating: 5 }
-          : { helpful: false, confusing: false, rating: 3 };
+        payload = {
+          helpful: nextHelpful,
+          confusing: false,
+          rating: nextHelpful ? 5 : 3,
+          saved: Boolean(current.saved),
+        };
       } else if (action === "confusing") {
         const nextConfusing = !Boolean(current.confusing);
-        payload = nextConfusing
-          ? { helpful: false, confusing: true, rating: 2 }
-          : { helpful: false, confusing: false, rating: 3 };
+        payload = {
+          helpful: false,
+          confusing: nextConfusing,
+          rating: nextConfusing ? 2 : 3,
+          saved: Boolean(current.saved),
+        };
       } else {
         const nextSaved = !Boolean(current.saved);
-        payload = { saved: nextSaved };
+        payload = {
+          helpful: Boolean(current.helpful),
+          confusing: Boolean(current.confusing),
+          rating: current.helpful ? 5 : current.confusing ? 2 : 3,
+          saved: nextSaved,
+        };
       }
 
       setPendingAction(action);
@@ -3442,13 +3542,14 @@ function FeedPageInner() {
             ...payload,
           },
         }));
+        await rerankUnseenTail();
       } catch (e) {
         setError(e instanceof Error ? e.message : "Could not save feedback");
       } finally {
         setPendingAction(null);
       }
     },
-    [activeFeedback, activeReel],
+    [activeFeedback, activeReel, rerankUnseenTail],
   );
 
   const renderMobileFeedbackButton = (action: FeedbackAction, label: string, iconClass: string, active: boolean) => (
@@ -3605,8 +3706,8 @@ function FeedPageInner() {
         <section className="relative h-[100dvh] min-h-[100dvh] md:h-full md:min-h-0 lg:min-w-0 lg:flex-1">
           {activeReel && !mobileDetailsOpen ? (
             <div className="absolute right-3 top-1/2 z-30 flex -translate-y-1/2 flex-col gap-2">
-              {renderMobileFeedbackButton("helpful", "Helpful", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
-              {renderMobileFeedbackButton("confusing", "Confusing", "fa-circle-question", Boolean(activeFeedback.confusing))}
+              {renderMobileFeedbackButton("helpful", "Got it", "fa-thumbs-up", Boolean(activeFeedback.helpful))}
+              {renderMobileFeedbackButton("confusing", "Need help", "fa-circle-question", Boolean(activeFeedback.confusing))}
               {renderMobileFeedbackButton("save", "Save", "fa-bookmark", Boolean(activeFeedback.saved))}
             </div>
           ) : null}

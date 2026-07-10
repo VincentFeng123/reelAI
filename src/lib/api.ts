@@ -139,8 +139,8 @@ function persistCommunityOwnerKey(ownerKey: string): void {
     return;
   }
   try {
-    window.sessionStorage.setItem(COMMUNITY_OWNER_KEY_STORAGE_KEY, ownerKey);
-    window.localStorage.removeItem(COMMUNITY_OWNER_KEY_STORAGE_KEY);
+    window.localStorage.setItem(COMMUNITY_OWNER_KEY_STORAGE_KEY, ownerKey);
+    window.sessionStorage.removeItem(COMMUNITY_OWNER_KEY_STORAGE_KEY);
   } catch {
     // Ignore storage failures and keep the in-memory fallback.
   }
@@ -168,19 +168,19 @@ function getCommunityOwnerKey(): string | null {
     return communityOwnerKeyMemoryFallback;
   }
   try {
-    const existingSessionKey = normalizeStoredCommunityOwnerKey(
-      window.sessionStorage.getItem(COMMUNITY_OWNER_KEY_STORAGE_KEY),
-    );
-    if (existingSessionKey) {
-      communityOwnerKeyMemoryFallback = existingSessionKey;
-      return existingSessionKey;
-    }
-    const legacyLocalKey = normalizeStoredCommunityOwnerKey(
+    const existingLocalKey = normalizeStoredCommunityOwnerKey(
       window.localStorage.getItem(COMMUNITY_OWNER_KEY_STORAGE_KEY),
     );
-    if (legacyLocalKey) {
-      persistCommunityOwnerKey(legacyLocalKey);
-      return legacyLocalKey;
+    if (existingLocalKey) {
+      communityOwnerKeyMemoryFallback = existingLocalKey;
+      return existingLocalKey;
+    }
+    const legacySessionKey = normalizeStoredCommunityOwnerKey(
+      window.sessionStorage.getItem(COMMUNITY_OWNER_KEY_STORAGE_KEY),
+    );
+    if (legacySessionKey) {
+      persistCommunityOwnerKey(legacySessionKey);
+      return legacySessionKey;
     }
     const next = communityOwnerKeyMemoryFallback || createCommunityOwnerKey();
     persistCommunityOwnerKey(next);
@@ -725,6 +725,9 @@ export async function uploadMaterial(params: {
 
   const res = await safeFetch(apiUrl("/material"), {
     method: "POST",
+    headers: {
+      ...communityRequestHeaders(),
+    },
     body: form,
     signal: params.signal,
   });
@@ -739,7 +742,7 @@ export async function updateMaterialLevel(params: {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
-      ...communityOwnerHeaders(),
+      ...communityRequestHeaders(),
     },
     body: JSON.stringify({ knowledge_level: params.knowledgeLevel }),
   });
@@ -766,6 +769,7 @@ type GenerateReelsParams = {
 // comma-separated query string risks a Request-URI-Too-Large response from some
 // proxies. Keep the most recent ones (they're the likeliest duplicates).
 const MAX_EXCLUDED_VIDEO_IDS = 250;
+const MAX_EXCLUDED_REEL_IDS = 200;
 // Any "video_id" longer than this is almost certainly a full URL (non-YouTube
 // community reel). The backend can't match on URLs, so skip them.
 const VIDEO_ID_MAX_LEN = 32;
@@ -790,6 +794,25 @@ function normalizeVideoIdList(values: string[] | undefined): string[] {
   }
   return normalized.length > MAX_EXCLUDED_VIDEO_IDS
     ? normalized.slice(normalized.length - MAX_EXCLUDED_VIDEO_IDS)
+    : normalized;
+}
+
+function normalizeReelIdList(values: string[] | undefined): string[] {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  const seen = new Set<string>();
+  const normalized: string[] = [];
+  for (const rawValue of values) {
+    const clean = String(rawValue || "").trim();
+    if (!clean || clean.includes(",") || seen.has(clean)) {
+      continue;
+    }
+    seen.add(clean);
+    normalized.push(clean);
+  }
+  return normalized.length > MAX_EXCLUDED_REEL_IDS
+    ? normalized.slice(normalized.length - MAX_EXCLUDED_REEL_IDS)
     : normalized;
 }
 
@@ -1069,6 +1092,7 @@ export async function fetchFeed(params: {
   page: number;
   limit: number;
   excludeVideoIds?: string[];
+  excludeReelIds?: string[];
   prefetch?: number;
   autofill?: boolean;
   generationMode?: "slow" | "fast";
@@ -1098,11 +1122,15 @@ export async function fetchFeed(params: {
   if (excludeVideoIds.length > 0) {
     query.set("exclude_video_ids", excludeVideoIds.join(","));
   }
+  const excludeReelIds = normalizeReelIdList(params.excludeReelIds);
+  if (excludeReelIds.length > 0) {
+    query.set("exclude_reel_ids", excludeReelIds.join(","));
+  }
 
   const res = await safeFetch(`${apiUrl("/feed")}?${query}`, {
     cache: "no-store",
     headers: {
-      ...communityOwnerHeaders(),
+      ...communityRequestHeaders(),
     },
     signal: params.signal,
     timeoutMs: 300_000,
@@ -1115,7 +1143,7 @@ export async function fetchRefinementStatus(jobId: string, options?: { signal?: 
   const res = await safeFetch(apiUrl(`/reels/refinement-status/${encodeURIComponent(jobId)}`), {
     cache: "no-store",
     headers: {
-      ...communityOwnerHeaders(),
+      ...communityRequestHeaders(),
     },
     signal: options?.signal,
   });
@@ -1133,7 +1161,7 @@ export async function sendFeedback(params: {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...communityOwnerHeaders(),
+      ...communityRequestHeaders(),
     },
     body: JSON.stringify({
       reel_id: params.reelId,
