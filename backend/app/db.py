@@ -809,6 +809,19 @@ def _adapt_query_for_postgres(query: str) -> str:
         char = query[i]
         nxt = query[i + 1] if i + 1 < len(query) else ""
 
+        if char == "%":
+            if nxt == "%":
+                result.extend((char, nxt))
+                i += 2
+                continue
+            if nxt in {"s", "b", "t"}:
+                result.append(char)
+                i += 1
+                continue
+            result.append("%%")
+            i += 1
+            continue
+
         if in_line_comment:
             result.append(char)
             if char == "\n":

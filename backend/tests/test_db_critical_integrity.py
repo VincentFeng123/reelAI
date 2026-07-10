@@ -41,6 +41,14 @@ class _TransactionalPostgresConnection:
         return self.recording_cursor
 
 
+def test_postgres_query_adapter_escapes_literal_percent_signs() -> None:
+    query = "SELECT 1 WHERE video_id LIKE 'yt:%' AND id = ? AND owner_id = %s"
+
+    assert db._adapt_query_for_postgres(query) == (
+        "SELECT 1 WHERE video_id LIKE 'yt:%%' AND id = %s AND owner_id = %s"
+    )
+
+
 def test_insert_only_normalizes_unique_violations() -> None:
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys=ON")
