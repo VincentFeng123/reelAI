@@ -385,13 +385,12 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_8(self) -> None:
-        """RANKED_FEED_CACHE_VERSION must include learner-aware ranking inputs."""
+    def test_ranked_feed_cache_version_is_10(self) -> None:
+        """Cache rows must predate neither learner nor assessment adaptation."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            8,
-            "RANKED_FEED_CACHE_VERSION must be bumped to 8 so learner-scoped ranked feeds "
-            "cannot reuse stale pre-personalization cache entries.",
+            10,
+            "Assessment outcomes must not reuse stale pre-recall ranked-feed rows.",
         )
 
 

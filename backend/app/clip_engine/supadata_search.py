@@ -3,18 +3,23 @@ One query = one page (~20 results) = 1 credit. Sequential with 429 backoff.
 """
 from __future__ import annotations
 
-import time
+import time  # compatibility surface for existing callers/tests; sleeps are cancellation-aware below
 from typing import Callable
 
 import httpx
 
 from . import config
+from .cancellation import raise_if_cancelled, run_cancellable, sleep_with_probe, wait_with_probe
 from .errors import SearchError
 
 _MAX_RETRIES = 3
 
 
-def search_one(query: str, filters: dict | None = None) -> dict:
+async def _search_one_async(
+    query: str,
+    filters: dict | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict:
     key = config.require_supadata_key()
     filters = filters or {}
     params = {"query": query, "type": "video"}
@@ -27,12 +32,17 @@ def search_one(query: str, filters: dict | None = None) -> dict:
 
     attempt = 0
     while True:
-        r = httpx.get(config.SUPADATA_SEARCH_URL, headers={"x-api-key": key},
-                      params=params, timeout=30.0)
+        raise_if_cancelled(should_cancel)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(
+                config.SUPADATA_SEARCH_URL,
+                headers={"x-api-key": key},
+                params=params,
+            )
         billed = int(r.headers.get("x-billable-requests") or 0)
         if r.status_code == 429 and attempt < _MAX_RETRIES:
             retry_after = float(r.headers.get("retry-after") or 0) or 1.2 * (attempt + 1)
-            time.sleep(retry_after)
+            await sleep_with_probe(retry_after, should_cancel)
             attempt += 1
             continue
         if r.status_code >= 400:
@@ -52,19 +62,35 @@ def search_one(query: str, filters: dict | None = None) -> dict:
         return {"query": query, "videos": videos, "billed": billed or 1}
 
 
+def search_one(
+    query: str,
+    filters: dict | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict:
+    return run_cancellable(
+        lambda: _search_one_async(query, filters, should_cancel), should_cancel
+    )
+
+
 def search_all(
     queries: list[str],
     filters: dict | None = None,
     *,
     minimum_queries: int = 0,
     stop_when: Callable[[list[dict]], bool] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict:
     credits_used = 0
     per_query: list[dict] = []
     errors: list[dict] = []
     for i, q in enumerate(queries):
+        raise_if_cancelled(should_cancel)
         try:
-            res = search_one(q, filters)
+            res = (
+                search_one(q, filters)
+                if should_cancel is None
+                else search_one(q, filters, should_cancel)
+            )
             credits_used += res["billed"]
             per_query.append(res)
         except (SearchError, httpx.HTTPError) as e:
@@ -84,7 +110,7 @@ def search_all(
         if should_stop:
             break
         if i < len(queries) - 1:
-            time.sleep(0.25)
+            wait_with_probe(0.25, should_cancel)
 
     warning = None
     if errors:

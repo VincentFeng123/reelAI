@@ -12,6 +12,8 @@ This conftest runs before any test module imports the app:
 import os
 
 os.environ["REELAI_SKIP_DOTENV"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 for _key in (
     "SUPADATA_API_KEY",

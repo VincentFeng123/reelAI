@@ -94,11 +94,13 @@ class ReelOut(BaseModel):
     source_surface: str = ""
     matched_terms: list[str] = Field(default_factory=list)
     relevance_reason: str = ""
+    match_reason: str = ""
     concept_position: int | None = None
     total_concepts: int | None = None
     video_duration_sec: int | None = None
     clip_duration_sec: float | None = None
     difficulty: float = 0.5
+    informativeness: float = 0.6
 
 
 class ReelsGenerateResponse(BaseModel):
@@ -252,6 +254,72 @@ class FeedbackRequest(BaseModel):
 class FeedbackResponse(BaseModel):
     status: str
     reel_id: str
+
+
+class ReelProgressRequest(BaseModel):
+    max_fraction: float = Field(ge=0.0, le=1.0)
+
+
+class ReelProgressResponse(BaseModel):
+    reel_id: str
+    completed: bool
+    newly_completed: bool
+    assessment_ready: bool
+    information_units: float
+    readiness_threshold: float
+
+
+class AssessmentQuestionOut(BaseModel):
+    id: str
+    reel_id: str
+    concept_id: str
+    concept_title: str
+    prompt: str
+    options: list[str]
+
+
+class AssessmentSessionOut(BaseModel):
+    id: str
+    material_id: str
+    status: Literal["pending", "completed", "snoozed"]
+    current_index: int
+    question_count: int
+    answered_count: int
+    questions: list[AssessmentQuestionOut]
+    score: float | None = None
+    understood_concepts: list[str] = Field(default_factory=list)
+    revisit_concepts: list[str] = Field(default_factory=list)
+    recent_accuracy: float | None = None
+    rolling_accuracy: float | None = None
+
+
+class AssessmentWrapperResponse(BaseModel):
+    status: str
+    assessment_ready: bool
+    session: AssessmentSessionOut | None = None
+    recent_accuracy: float | None = None
+    rolling_accuracy: float | None = None
+
+
+class AssessmentNextRequest(BaseModel):
+    material_id: str = Field(min_length=1, max_length=240)
+
+
+class AssessmentAnswerRequest(BaseModel):
+    question_id: str = Field(min_length=1, max_length=160)
+    choice_index: int = Field(ge=0, le=3)
+
+
+class AssessmentAnswerResponse(BaseModel):
+    correct: bool
+    correct_index: int
+    explanation: str
+    session: AssessmentSessionOut
+
+
+class AssessmentSnoozeResponse(BaseModel):
+    status: str
+    assessment_ready: bool
 
 
 class ChatMessageIn(BaseModel):
@@ -449,6 +517,16 @@ class CommunityChangeEmailResponse(BaseModel):
     verification_code_debug: str | None = None
 
 
+class CommunityHistoryRecall(BaseModel):
+    recent_score: int | None = Field(default=None, ge=0)
+    recent_question_count: int | None = Field(default=None, ge=0)
+    recent_accuracy: float | None = Field(default=None, ge=0.0, le=1.0)
+    rolling_accuracy: float | None = Field(default=None, ge=0.0, le=1.0)
+    understood_concepts: list[str] = Field(default_factory=list)
+    revisit_concepts: list[str] = Field(default_factory=list)
+    completed_at: str | None = None
+
+
 class CommunityHistoryItemIn(BaseModel):
     material_id: str = Field(min_length=1, max_length=240)
     title: str = Field(min_length=1, max_length=200)
@@ -459,6 +537,9 @@ class CommunityHistoryItemIn(BaseModel):
     feed_query: str | None = Field(default=None, max_length=4000)
     active_index: int | None = Field(default=None, ge=0)
     active_reel_id: str | None = Field(default=None, max_length=400)
+    recall: CommunityHistoryRecall | None = None
+    recent_recall_accuracy: float | None = Field(default=None, ge=0.0, le=1.0)
+    rolling_recall_accuracy: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class CommunityHistoryItemOut(BaseModel):
@@ -471,6 +552,9 @@ class CommunityHistoryItemOut(BaseModel):
     feed_query: str | None = None
     active_index: int | None = None
     active_reel_id: str | None = None
+    recall: CommunityHistoryRecall | None = None
+    recent_recall_accuracy: float | None = None
+    rolling_recall_accuracy: float | None = None
 
 
 class CommunityHistoryReplaceRequest(BaseModel):

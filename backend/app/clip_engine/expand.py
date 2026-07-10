@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 
 from . import config
+from .cancellation import raise_if_cancelled, run_cancellable
+from .errors import CancellationError
 
 _SYSTEM = (
     "You expand a user's study topic into diverse YouTube search queries that surface "
@@ -78,15 +81,26 @@ def free_expand(topic: str, n: int) -> dict:
             "provider_used": "free"}
 
 
-def _gemini_expand_raw(system: str, user: str, model: str) -> str:
+async def _gemini_expand_raw_async(system: str, user: str, model: str) -> str:
     from google import genai  # lazy import
     client = genai.Client(api_key=config.require_gemini_key())
-    resp = client.models.generate_content(
+    resp = await client.aio.models.generate_content(
         model=model,
         contents=[{"role": "user", "parts": [{"text": system + "\n\n" + user}]}],
         config={"response_mime_type": "application/json", "temperature": 0.2},
     )
     return getattr(resp, "text", "") or ""
+
+
+def _gemini_expand_raw(
+    system: str,
+    user: str,
+    model: str,
+    should_cancel: Callable[[], bool] | None = None,
+) -> str:
+    return run_cancellable(
+        lambda: _gemini_expand_raw_async(system, user, model), should_cancel
+    )
 
 
 _LEVEL_LINES = {
@@ -103,13 +117,25 @@ _LEVEL_LINES = {
 }
 
 
-def expand_query(topic: str, n: int, level: str | None = None) -> dict:
+def expand_query(
+    topic: str,
+    n: int,
+    level: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> dict:
+    raise_if_cancelled(should_cancel)
     topic = topic.strip()
     system = _SYSTEM + _LEVEL_LINES.get((level or "").strip().lower(), "")
     if not config.GEMINI_API_KEY:
         return free_expand(topic, n)
     try:
-        raw = _gemini_expand_raw(system, _user(topic, n), config.EXPAND_MODEL)
+        raw = (
+            _gemini_expand_raw(system, _user(topic, n), config.EXPAND_MODEL)
+            if should_cancel is None
+            else _gemini_expand_raw(
+                system, _user(topic, n), config.EXPAND_MODEL, should_cancel
+            )
+        )
         parsed = _safe_json(raw)
         if parsed:
             corrected = parsed.get("corrected") or topic
@@ -117,6 +143,8 @@ def expand_query(topic: str, n: int, level: str | None = None) -> dict:
             if len(queries) < n:
                 queries = _normalize(corrected, [*queries, *free_expand(corrected, n)["queries"]], topic, n)
             return {"corrected": corrected, "queries": queries, "provider_used": "gemini"}
+    except CancellationError:
+        raise
     except Exception:
         pass
     return free_expand(topic, n)

@@ -32,6 +32,8 @@ from .concepts import build_takeaways
 from ..ingestion.errors import RateLimitedError as _IngestRateLimitedError
 from ..ingestion.segment import normalize_clip_window as _normalize_clip_window_fn
 from ..clip_engine import expand as _clip_engine_expand
+from ..clip_engine.cancellation import raise_if_cancelled as _raise_if_clip_cancelled
+from ..clip_engine.errors import CancellationError as _ClipEngineCancellationError
 from ..clip_engine.config import SEGMENT_MAX_CLIP_S as _SEGMENT_MAX_CLIP_S
 from ..clip_engine.metadata import extract_video_id as _extract_embed_video_id
 from .provider_registry import ProviderRegistry
@@ -1288,7 +1290,7 @@ class ReelService:
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
-    RANKED_FEED_CACHE_VERSION = 8
+    RANKED_FEED_CACHE_VERSION = 10
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.12
     NEED_HELP_CONCEPT_STEP = 0.15
@@ -1632,6 +1634,12 @@ class ReelService:
             except Exception:
                 return
 
+        def run_pre_ingestion(operation: Callable[[], Any]) -> Any:
+            try:
+                return operation()
+            except _ClipEngineCancellationError as exc:
+                raise GenerationCancelledError("Generation cancelled.") from exc
+
         raise_if_cancelled()
         chain_emitter = _ChainBufferingEmitter(on_reel_created) if on_reel_created is not None else None
         self._min_relevance_threshold = max(0.0, min(1.0, float(min_relevance_threshold)))
@@ -1676,8 +1684,11 @@ class ReelService:
             # 'Contemporary Jewry' poisoned whole generations). Persisted so the
             # read side (ranked_feed anchors, cache fingerprints, concept sync)
             # sees the same subject the reels were generated for.
-            _corrected = self._corrected_subject_tag(subject_tag)
+            _corrected = run_pre_ingestion(
+                lambda: self._corrected_subject_tag(subject_tag, should_cancel=should_cancel)
+            )
             if _corrected != subject_tag:
+                raise_if_cancelled()
                 execute_modify(
                     conn,
                     "UPDATE materials SET subject_tag = ? WHERE id = ?",
@@ -1685,29 +1696,38 @@ class ReelService:
                 )
                 subject_tag = _corrected
         if not concepts and strict_topic_only and subject_tag:
-            concepts = self._build_topic_only_concepts_from_expansion(
-                conn,
-                material_id=material_id,
-                subject_tag=subject_tag,
+            concepts = run_pre_ingestion(
+                lambda: self._build_topic_only_concepts_from_expansion(
+                    conn,
+                    material_id=material_id,
+                    subject_tag=subject_tag,
+                    should_cancel=should_cancel,
+                )
             )
         if not concepts:
             return []
         strict_topic_expansion: dict[str, Any] | None = None
         root_topic_terms: list[str] = []
         if strict_topic_only and subject_tag:
-            strict_topic_expansion = self.topic_expansion_service.expand_topic(
-                conn,
-                topic=subject_tag,
-                max_subtopics=10,
-                max_aliases=8,
-                max_related_terms=8,
+            strict_topic_expansion = run_pre_ingestion(
+                lambda: self.topic_expansion_service.expand_topic(
+                    conn,
+                    topic=subject_tag,
+                    max_subtopics=10,
+                    max_aliases=8,
+                    max_related_terms=8,
+                    should_cancel=should_cancel,
+                )
             )
-            concepts = self._sync_topic_expansion_concepts(
-                conn,
-                material_id=material_id,
-                concepts=concepts,
-                subject_tag=subject_tag,
-                expansion=strict_topic_expansion,
+            concepts = run_pre_ingestion(
+                lambda: self._sync_topic_expansion_concepts(
+                    conn,
+                    material_id=material_id,
+                    concepts=concepts,
+                    subject_tag=subject_tag,
+                    expansion=strict_topic_expansion,
+                    should_cancel=should_cancel,
+                )
             )
             root_topic_terms = self._topic_root_anchor_terms(
                 subject_tag=subject_tag,
@@ -1715,11 +1735,14 @@ class ReelService:
                 concepts=concepts,
             )
             if safe_retrieval_profile == "bootstrap":
-                concepts = self._bootstrap_topic_retrieval_concepts(
-                    conn=conn,
-                    concepts=concepts,
-                    subject_tag=subject_tag,
-                    material_id=material_id,
+                concepts = run_pre_ingestion(
+                    lambda: self._bootstrap_topic_retrieval_concepts(
+                        conn=conn,
+                        concepts=concepts,
+                        subject_tag=subject_tag,
+                        material_id=material_id,
+                        should_cancel=should_cancel,
+                    )
                 )
         concepts = self._order_concepts(conn, material_id, concepts, learner_id)
         safe_video_pool_mode = self._normalize_video_pool_mode(video_pool_mode)
@@ -1841,18 +1864,24 @@ class ReelService:
         generated: list[dict[str, Any]] = []
         if strict_topic_only and subject_tag:
             if safe_retrieval_profile == "deep":
-                topic_expansion = self._deep_topic_expansion(
-                    conn,
-                    material_id=material_id,
-                    subject_tag=subject_tag,
-                    generation_id=generation_id,
+                topic_expansion = run_pre_ingestion(
+                    lambda: self._deep_topic_expansion(
+                        conn,
+                        material_id=material_id,
+                        subject_tag=subject_tag,
+                        generation_id=generation_id,
+                        should_cancel=should_cancel,
+                    )
                 )
-                concepts = self._sync_topic_expansion_concepts(
-                    conn,
-                    material_id=material_id,
-                    concepts=concepts,
-                    subject_tag=subject_tag,
-                    expansion=topic_expansion,
+                concepts = run_pre_ingestion(
+                    lambda: self._sync_topic_expansion_concepts(
+                        conn,
+                        material_id=material_id,
+                        concepts=concepts,
+                        subject_tag=subject_tag,
+                        expansion=topic_expansion,
+                        should_cancel=should_cancel,
+                    )
                 )
                 root_topic_terms = self._topic_root_anchor_terms(
                     subject_tag=subject_tag,
@@ -1930,7 +1959,10 @@ class ReelService:
                     max_reels=None,
                     on_reel_created=(None if dry_run else _stream),
                     dry_run=dry_run,
+                    should_cancel=should_cancel,
                 )
+            except _ClipEngineCancellationError as exc:
+                raise GenerationCancelledError("Generation cancelled.") from exc
             except _IngestRateLimitedError:
                 # Process-wide rate limit tripped: subsequent concepts would hit it
                 # too. Stop and surface it so the endpoint maps it to HTTP 429.
@@ -2092,7 +2124,14 @@ class ReelService:
             return 6 if fast_mode else 9
         return 8 if fast_mode else 12
 
-    def _topic_breadth_class(self, subject_tag: str | None, *, conn: Any = None) -> str:
+    def _topic_breadth_class(
+        self,
+        subject_tag: str | None,
+        *,
+        conn: Any = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> str:
+        _raise_if_clip_cancelled(should_cancel)
         cleaned = self._clean_query_text(subject_tag or "")
         subject_key = self._normalize_query_key(cleaned)
         if not subject_key:
@@ -2127,6 +2166,7 @@ class ReelService:
             subject_key=subject_key,
             rules_class=rules_class,
             conn=conn,
+            should_cancel=should_cancel,
         )
 
     def _merge_breadth_class_with_llm(
@@ -2136,6 +2176,7 @@ class ReelService:
         subject_key: str,
         rules_class: str,
         conn: Any,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> str:
         if conn is None or not cleaned:
             return rules_class
@@ -2153,7 +2194,11 @@ class ReelService:
                 user=cleaned,
                 temperature=0.0,
                 json_mode=True,
+                should_cancel=should_cancel,
             )
+            _raise_if_clip_cancelled(should_cancel)
+        except _ClipEngineCancellationError:
+            raise
         except Exception:
             logger.exception("breadth_class LLM call failed for %s", subject_key)
             return rules_class
@@ -2341,6 +2386,8 @@ class ReelService:
             "video_description": getattr(reel_obj, "video_description", "") or "",
             "channel_name": getattr(reel_obj, "channel_name", "") or "",
             "ai_summary": getattr(reel_obj, "ai_summary", "") or "",
+            "match_reason": getattr(reel_obj, "match_reason", "") or "",
+            "informativeness": float(getattr(reel_obj, "informativeness", 0.6) or 0.6),
             "video_url": video_url,
             "t_start": t_start,
             "t_end": t_end,
@@ -2846,7 +2893,9 @@ class ReelService:
         targeted_concept_id: str | None,
         subject_tag: str | None = None,
         conn: Any = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> tuple[tuple[dict[str, Any], ...], tuple[ConceptSelectionDecision, ...], bool]:
+        _raise_if_clip_cancelled(should_cancel)
         if not concepts:
             return (), (), False
 
@@ -2858,7 +2907,9 @@ class ReelService:
             budget_reason = "serverless concept budget"
         elif retrieval_profile == "bootstrap":
             bootstrap_cap = self.BOOTSTRAP_CONCEPT_LIMIT
-            if self._topic_breadth_class(subject_tag, conn=conn) == "curated_broad":
+            if self._topic_breadth_class(
+                subject_tag, conn=conn, should_cancel=should_cancel
+            ) == "curated_broad":
                 bootstrap_cap = max(bootstrap_cap, 6)
             concept_limit = max(1, min(bootstrap_cap, request_need + (1 if request_need <= 2 else 0)))
             budget_reason = f"bootstrap concept budget {concept_limit} for request need {request_need}"
@@ -2987,12 +3038,15 @@ class ReelService:
         context_terms: list[str],
         video_pool_mode: str,
         fast_mode: bool = True,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ConceptIntentPlan:
+        _raise_if_clip_cancelled(should_cancel)
         # Fix H: Use LLM for intent classification in slow mode
         if not fast_mode and not self.serverless_mode:
             llm_plan = self._classify_intent_via_llm(
                 title=title, keywords=keywords, summary=summary,
                 subject_tag=subject_tag, video_pool_mode=video_pool_mode,
+                should_cancel=should_cancel,
             )
             if llm_plan is not None:
                 return llm_plan
@@ -3052,8 +3106,10 @@ class ReelService:
         summary: str,
         subject_tag: str | None,
         video_pool_mode: str,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> ConceptIntentPlan | None:
         """Fix H: LLM-powered intent classification for slow mode."""
+        _raise_if_clip_cancelled(should_cancel)
         cache_key = f"llm_intent:{title}|{subject_tag or ''}|{video_pool_mode}"
         with self._strategy_history_cache_lock:
             cached = self._strategy_history_cache.get(cache_key)
@@ -3075,7 +3131,9 @@ class ReelService:
                 user=prompt,
                 temperature=0.2,
                 max_tokens=20,
+                should_cancel=should_cancel,
             ) or "").strip().lower()
+            _raise_if_clip_cancelled(should_cancel)
             for vt in valid_types:
                 if vt in answer:
                     result = ConceptIntentPlan(
@@ -3084,12 +3142,16 @@ class ReelService:
                         rationale=f"llm_intent: LLM selected '{vt}' for concept '{title}'",
                     )
                     with self._strategy_history_cache_lock:
+                        _raise_if_clip_cancelled(should_cancel)
                         self._evict_strategy_cache_if_full()
                         self._strategy_history_cache[cache_key] = result
                     return result
+        except _ClipEngineCancellationError:
+            raise
         except Exception:
             pass
         with self._strategy_history_cache_lock:
+            _raise_if_clip_cancelled(should_cancel)
             self._evict_strategy_cache_if_full()
             self._strategy_history_cache[cache_key] = "_none_"
         return None
@@ -3146,7 +3208,12 @@ class ReelService:
     # generate_reels for the same subject many times; correct each subject once.
     _SUBJECT_CORRECTION_CACHE: dict[str, str] = {}
 
-    def _corrected_subject_tag(self, subject_tag: str) -> str:
+    def _corrected_subject_tag(
+        self,
+        subject_tag: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> str:
         """Spellcheck a topic-material subject via the clip engine's expansion
         pass (Gemini flash-lite when keyed; the keyless fallback returns it
         unchanged, so this never breaks offline paths).
@@ -3156,13 +3223,21 @@ class ReelService:
         biology') are rejected — discover()'s expansion applies those per-query
         without renaming the user's topic."""
         cache_key = subject_tag.strip().lower()
+        _raise_if_clip_cancelled(should_cancel)
         cached = self._SUBJECT_CORRECTION_CACHE.get(cache_key)
         if cached is not None:
             return cached
         try:
-            corrected = str(
-                _clip_engine_expand.expand_query(subject_tag, 1).get("corrected") or ""
-            ).strip()
+            expansion = (
+                _clip_engine_expand.expand_query(
+                    subject_tag, 1, should_cancel=should_cancel
+                )
+                if should_cancel is not None
+                else _clip_engine_expand.expand_query(subject_tag, 1)
+            )
+            corrected = str(expansion.get("corrected") or "").strip()
+        except _ClipEngineCancellationError:
+            raise
         except Exception:
             # Transient failure: fall back WITHOUT caching, so a later
             # generation can still pick up the real correction.
@@ -3176,6 +3251,7 @@ class ReelService:
             ).ratio()
             if same_word_count and similarity >= 0.75:
                 result = corrected
+        _raise_if_clip_cancelled(should_cancel)
         if len(self._SUBJECT_CORRECTION_CACHE) < 512:
             self._SUBJECT_CORRECTION_CACHE[cache_key] = result
         return result
@@ -3272,8 +3348,14 @@ class ReelService:
                     return phrases
         return phrases
 
-    def _expand_synonyms_via_llm(self, terms: list[str]) -> list[str] | None:
+    def _expand_synonyms_via_llm(
+        self,
+        terms: list[str],
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[str] | None:
         """Fix K: Use LLM to generate richer query synonyms in slow mode."""
+        _raise_if_clip_cancelled(should_cancel)
         if not self.llm_available:
             return None
         try:
@@ -3290,9 +3372,13 @@ class ReelService:
                 user=prompt,
                 temperature=0.4,
                 max_tokens=200,
+                should_cancel=should_cancel,
             ) or "").strip()
+            _raise_if_clip_cancelled(should_cancel)
             synonyms = [line.strip() for line in content.split("\n") if line.strip() and len(line.strip()) > 2]
             return synonyms[:8] if synonyms else None
+        except _ClipEngineCancellationError:
+            raise
         except Exception:
             return None
 
@@ -3303,8 +3389,10 @@ class ReelService:
         keywords: list[str],
         summary: str,
         subject_tag: str | None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[str] | None:
         """Generate broader parent topics for niche/specific concepts that lack hardcoded expansions."""
+        _raise_if_clip_cancelled(should_cancel)
         if not self.llm_available:
             return None
         try:
@@ -3324,18 +3412,31 @@ class ReelService:
                 user=prompt,
                 temperature=0.3,
                 max_tokens=250,
+                should_cancel=should_cancel,
             )
+            _raise_if_clip_cancelled(should_cancel)
             if not content:
                 return None
             terms = [line.strip() for line in content.split("\n") if line.strip() and len(line.strip()) > 2]
             return terms[:8] if terms else None
+        except _ClipEngineCancellationError:
+            raise
         except Exception:
             return None
 
-    def _expand_controlled_synonyms(self, terms: list[str], fast_mode: bool = True) -> list[str]:
+    def _expand_controlled_synonyms(
+        self,
+        terms: list[str],
+        fast_mode: bool = True,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[str]:
+        _raise_if_clip_cancelled(should_cancel)
         # Fix K: Use LLM for synonym expansion in slow mode
         if not fast_mode and not self.serverless_mode:
-            llm_synonyms = self._expand_synonyms_via_llm(terms)
+            llm_synonyms = self._expand_synonyms_via_llm(
+                terms, should_cancel=should_cancel
+            )
             if llm_synonyms:
                 return llm_synonyms
 
@@ -3427,7 +3528,9 @@ class ReelService:
         fast_mode: bool,
         request_need: int,
         subject_tag: str | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[str]:
+        _raise_if_clip_cancelled(should_cancel)
         title_key = self._normalize_query_key(concept_title)
         title_tokens = set(title_key.split())
         scored_terms: dict[str, tuple[float, str]] = {}
@@ -3471,7 +3574,13 @@ class ReelService:
         for index, term in enumerate(summary_focus_terms[:8]):
             add_term(term, 3.4 - index * 0.18)
 
-        for index, term in enumerate(self._expand_controlled_synonyms([concept_title, *keywords], fast_mode=fast_mode)[:10]):
+        for index, term in enumerate(
+            self._expand_controlled_synonyms(
+                [concept_title, *keywords],
+                fast_mode=fast_mode,
+                should_cancel=should_cancel,
+            )[:10]
+        ):
             alias_score = 3.15 - index * 0.16
             if len(self._normalize_query_key(term).split()) == 1 and len(term) <= 5:
                 alias_score += 0.3
@@ -3487,6 +3596,7 @@ class ReelService:
                 keywords=keywords,
                 summary=summary,
                 subject_tag=subject_tag,
+                should_cancel=should_cancel,
             )
             if broadened:
                 for index, term in enumerate(broadened[:6]):
@@ -3532,7 +3642,9 @@ class ReelService:
         disambiguator: str | None,
         request_need: int,
         allow_bootstrap_subtopic_expansion: bool,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> tuple[PlannedQuery, ...]:
+        _raise_if_clip_cancelled(should_cancel)
         if retrieval_profile == "bootstrap":
             bootstrap_expansions: list[PlannedQuery] = []
             broad_topic_seed = self._normalize_query_key(concept_title) in {
@@ -3552,6 +3664,7 @@ class ReelService:
                     fast_mode=fast_mode,
                     request_need=max(3, request_need),
                     subject_tag=subject_tag,
+                    should_cancel=should_cancel,
                 )
                 for index, related_term in enumerate(related_terms[:1]):
                     bootstrap_expansions.append(
@@ -3616,6 +3729,7 @@ class ReelService:
                     keywords=keywords,
                     summary=summary,
                     subject_tag=subject_tag,
+                    should_cancel=should_cancel,
                 )
                 if broadened:
                     best_parent = broadened[0]
@@ -3645,6 +3759,7 @@ class ReelService:
             fast_mode=fast_mode,
             request_need=request_need,
             subject_tag=subject_tag,
+            should_cancel=should_cancel,
         )
         for index, related_term in enumerate(related_terms):
             if set(self._normalize_query_key(related_term).split()).issubset(literal_tokens):
@@ -3669,7 +3784,11 @@ class ReelService:
                 continue
             alias_prefix_parts.append(cleaned)
         alias_prefix = self._clean_query_text(" ".join(alias_prefix_parts))
-        alias_terms = self._expand_controlled_synonyms([concept_title, *keywords], fast_mode=fast_mode)
+        alias_terms = self._expand_controlled_synonyms(
+            [concept_title, *keywords],
+            fast_mode=fast_mode,
+            should_cancel=should_cancel,
+        )
         for index, alias_term in enumerate(alias_terms[:2]):
             alias_key = self._normalize_query_key(alias_term)
             if not alias_key or set(alias_key.split()).issubset(literal_tokens):
@@ -3785,7 +3904,9 @@ class ReelService:
         targeted_concept_id: str | None,
         allow_bootstrap_subtopic_expansion: bool = True,
         conn: Any = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> QueryPlanningResult:
+        _raise_if_clip_cancelled(should_cancel)
         # preferred_video_duration is now used below for pool-mode query hints.
         selected_concepts, selection_decisions, exhausted = self._select_concepts(
             concepts,
@@ -3795,12 +3916,14 @@ class ReelService:
             targeted_concept_id=targeted_concept_id,
             subject_tag=subject_tag,
             conn=conn,
+            should_cancel=should_cancel,
         )
         selected_ids = {str(concept.get("id") or "") for concept in selected_concepts}
         selected_plans: list[ConceptQueryPlan] = []
         global_queries: list[PlannedQuery] = []
 
         for decision in selection_decisions:
+            _raise_if_clip_cancelled(should_cancel)
             if not decision.selected:
                 continue
             concept = next((item for item in selected_concepts if str(item.get("id") or "") == decision.concept_id), None)
@@ -3825,6 +3948,7 @@ class ReelService:
                 context_terms=context_terms,
                 video_pool_mode=video_pool_mode,
                 fast_mode=fast_mode,
+                should_cancel=should_cancel,
             )
             literal_query_text = self._build_literal_query(
                 title=concept_title,
@@ -3876,6 +4000,7 @@ class ReelService:
                 disambiguator=disambiguator,
                 request_need=request_need,
                 allow_bootstrap_subtopic_expansion=allow_bootstrap_subtopic_expansion,
+                should_cancel=should_cancel,
             )
             recovery_queries = self._plan_recovery_queries(
                 concept_title=concept_title,
@@ -3932,6 +4057,7 @@ class ReelService:
         visual_spec: dict[str, list[str]],
         fast_mode: bool,
         retrieval_profile: RetrievalProfile,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[QueryCandidate]:
         del visual_spec  # Query planning is now concept- and settings-driven rather than visual-template-driven.
         clean_title = self._clean_query_text(title)
@@ -3954,6 +4080,7 @@ class ReelService:
             preferred_video_duration="any",
             request_need=1,
             targeted_concept_id="single-concept",
+            should_cancel=should_cancel,
         )
         if not plan.selected_concepts:
             return []
@@ -6010,7 +6137,9 @@ class ReelService:
         concepts: list[dict[str, Any]],
         subject_tag: str,
         material_id: str,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
+        _raise_if_clip_cancelled(should_cancel)
         subject_key = self._normalize_query_key(subject_tag)
         root_concept = next(
             (
@@ -6031,18 +6160,32 @@ class ReelService:
                 "created_at": str(first.get("created_at") or now_iso()),
             }
         root_concept["keywords_json"] = dumps_json(
-            self._bootstrap_topic_keywords(root_concept, subject_tag=subject_tag, conn=conn)
+            self._bootstrap_topic_keywords(
+                root_concept,
+                subject_tag=subject_tag,
+                conn=conn,
+                should_cancel=should_cancel,
+            )
         )
         return [root_concept]
 
-    def _bootstrap_topic_keywords(self, concept: dict[str, Any], *, subject_tag: str, conn=None) -> list[str]:
+    def _bootstrap_topic_keywords(
+        self,
+        concept: dict[str, Any],
+        *,
+        subject_tag: str,
+        conn=None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[str]:
         expansion = self.topic_expansion_service.expand_topic(
             conn,
             topic=subject_tag,
             max_subtopics=4,
             max_aliases=4,
             max_related_terms=4,
+            should_cancel=should_cancel,
         )
+        _raise_if_clip_cancelled(should_cancel)
         search_terms = self.topic_expansion_service.build_topic_search_terms(
             topic=subject_tag,
             expansion=expansion,
@@ -6082,14 +6225,18 @@ class ReelService:
         material_id: str,
         subject_tag: str,
         generation_id: str | None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        _raise_if_clip_cancelled(should_cancel)
         base_expansion = self.topic_expansion_service.expand_topic(
             conn,
             topic=subject_tag,
             max_subtopics=12,
             max_aliases=8,
             max_related_terms=8,
+            should_cancel=should_cancel,
         )
+        _raise_if_clip_cancelled(should_cancel)
         observed_examples = self._topic_expansion_observed_examples(
             conn,
             material_id=material_id,
@@ -6101,7 +6248,9 @@ class ReelService:
             subject_tag=subject_tag,
             base_expansion=base_expansion,
             observed_examples=observed_examples,
+            should_cancel=should_cancel,
         )
+        _raise_if_clip_cancelled(should_cancel)
         return self._merge_topic_expansions(base_expansion, ai_expansion, subject_tag=subject_tag)
 
     def _topic_expansion_observed_examples(
@@ -6150,7 +6299,9 @@ class ReelService:
         subject_tag: str,
         base_expansion: dict[str, Any],
         observed_examples: list[dict[str, str]],
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        _raise_if_clip_cancelled(should_cancel)
         injected_client = getattr(self, "openai_client", None)
         if not self.llm_available and injected_client is None:
             return {}
@@ -6182,6 +6333,7 @@ class ReelService:
             try:
                 payload = json.loads(str(cached.get("response_json") or "{}"))
                 if isinstance(payload, dict):
+                    _raise_if_clip_cancelled(should_cancel)
                     return payload
             except json.JSONDecodeError:
                 pass
@@ -6224,11 +6376,14 @@ class ReelService:
                     user=user_prompt,
                     temperature=0.2,
                     json_mode=True,
+                    should_cancel=should_cancel,
                 ) or "{}"
+            _raise_if_clip_cancelled(should_cancel)
             payload = json.loads(raw)
             if not isinstance(payload, dict):
                 return {}
             sanitized = self._sanitize_topic_expansion_payload(payload, subject_tag=subject_tag)
+            _raise_if_clip_cancelled(should_cancel)
             upsert(
                 conn,
                 "llm_cache",
@@ -6240,6 +6395,8 @@ class ReelService:
                 pk="cache_key",
             )
             return sanitized
+        except _ClipEngineCancellationError:
+            raise
         except Exception:
             return {}
 
@@ -6378,13 +6535,16 @@ class ReelService:
         *,
         material_id: str,
         subject_tag: str,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
+        _raise_if_clip_cancelled(should_cancel)
         expansion = self.topic_expansion_service.expand_topic(
             conn,
             topic=subject_tag,
             max_subtopics=10,
             max_aliases=8,
             max_related_terms=8,
+            should_cancel=should_cancel,
         )
         root_topic_terms = self._topic_root_anchor_terms(subject_tag=subject_tag, expansion=expansion)
         expansion_terms = self._topic_expansion_terms(
@@ -6413,10 +6573,12 @@ class ReelService:
             "embedding_json": None,
             "created_at": now_iso(),
         }
+        _raise_if_clip_cancelled(should_cancel)
         upsert(conn, "concepts", root_row)
         created_concepts.append(root_row)
 
         for term in expansion_terms[:5]:
+            _raise_if_clip_cancelled(should_cancel)
             concept_row = {
                 "id": str(uuid.uuid4()),
                 "material_id": material_id,
@@ -6432,6 +6594,7 @@ class ReelService:
                 "embedding_json": None,
                 "created_at": now_iso(),
             }
+            _raise_if_clip_cancelled(should_cancel)
             upsert(conn, "concepts", concept_row)
             created_concepts.append(concept_row)
         return created_concepts
@@ -6444,7 +6607,9 @@ class ReelService:
         concepts: list[dict[str, Any]],
         subject_tag: str,
         expansion: dict[str, Any],
+        should_cancel: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
+        _raise_if_clip_cancelled(should_cancel)
         working = [dict(concept) for concept in concepts]
         root_topic_terms = self._topic_root_anchor_terms(
             subject_tag=subject_tag,
@@ -6490,6 +6655,7 @@ class ReelService:
             root_concept["summary"] = f"Core ideas, terminology, and intuition for {subject_title}."
             root_concept["embedding_json"] = None
             root_concept["material_id"] = str(root_concept.get("material_id") or material_id)
+            _raise_if_clip_cancelled(should_cancel)
             upsert(conn, "concepts", root_concept)
             if working:
                 working[0] = root_concept
@@ -6513,6 +6679,7 @@ class ReelService:
             root_concept["material_id"] = str(root_concept.get("material_id") or material_id)
             root_concept["title"] = subject_title
             root_concept["embedding_json"] = None
+            _raise_if_clip_cancelled(should_cancel)
             upsert(conn, "concepts", root_concept)
             working[root_index] = root_concept
 
@@ -6533,6 +6700,7 @@ class ReelService:
             used_ids: set[str] = set()
 
             for term in desired_terms:
+                _raise_if_clip_cancelled(should_cancel)
                 term_key = self._normalize_query_key(term)
                 concept = dict(exact_match_by_key.get(term_key) or {})
                 if concept and str(concept.get("id") or "") in used_ids:
@@ -6558,6 +6726,7 @@ class ReelService:
                 concept["summary"] = f"Key subtopic within {subject_title}: {term}."
                 concept["embedding_json"] = None
                 concept["material_id"] = str(concept.get("material_id") or material_id)
+                _raise_if_clip_cancelled(should_cancel)
                 upsert(conn, "concepts", concept)
                 curated_working.append(concept)
                 concept_id = str(concept.get("id") or "")
@@ -6580,6 +6749,7 @@ class ReelService:
         ]
 
         for index in filler_indexes:
+            _raise_if_clip_cancelled(should_cancel)
             if not replacement_terms:
                 break
             term = replacement_terms.pop(0)
@@ -6595,11 +6765,13 @@ class ReelService:
             concept["summary"] = f"Key subtopic within {subject_title}: {term}."
             concept["embedding_json"] = None
             concept["material_id"] = str(concept.get("material_id") or material_id)
+            _raise_if_clip_cancelled(should_cancel)
             upsert(conn, "concepts", concept)
             working[index] = concept
             represented.add(self._normalize_query_key(term))
 
         while replacement_terms and len(working) < max(4, min(8, len(expansion_terms) + 1)):
+            _raise_if_clip_cancelled(should_cancel)
             term = replacement_terms.pop(0)
             concept = {
                 "id": str(uuid.uuid4()),
@@ -6616,6 +6788,7 @@ class ReelService:
                 "embedding_json": None,
                 "created_at": now_iso(),
             }
+            _raise_if_clip_cancelled(should_cancel)
             upsert(conn, "concepts", concept)
             working.append(concept)
             represented.add(self._normalize_query_key(term))
@@ -7184,10 +7357,11 @@ class ReelService:
 
         progress = self.learner_progress(conn, material_id, learner_id)
         reset_at = str(progress.get("difficulty_reset_at") or "")
-        rows = fetch_all(
+        feedback_rows = fetch_all(
             conn,
             """
-            SELECT f.helpful, f.confusing, r.concept_id
+            SELECT f.helpful, f.confusing, r.concept_id,
+                   f.mastery_updated_at AS event_at
             FROM reel_feedback f
             JOIN reels r ON r.id = f.reel_id
             WHERE f.learner_id = ?
@@ -7200,6 +7374,36 @@ class ReelService:
             """,
             (learner_id, material_id, reset_at, self.GLOBAL_FEEDBACK_WINDOW),
         )
+        try:
+            assessment_rows = fetch_all(
+                conn,
+                """
+                SELECT concept_id, adjustment, created_at AS event_at
+                FROM assessment_concept_outcomes
+                WHERE learner_id = ?
+                  AND material_id = ?
+                  AND created_at > ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (learner_id, material_id, reset_at, self.GLOBAL_FEEDBACK_WINDOW),
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table: assessment_concept_outcomes" not in str(exc):
+                raise
+            assessment_rows = []
+        rows = list(feedback_rows)
+        for row in assessment_rows:
+            adjustment = float(row.get("adjustment") or 0.0)
+            rows.append(
+                {
+                    **row,
+                    "helpful": 1 if adjustment > 0 else 0,
+                    "confusing": 1 if adjustment < 0 else 0,
+                }
+            )
+        rows.sort(key=lambda row: str(row.get("event_at") or ""), reverse=True)
+        rows = rows[: self.GLOBAL_FEEDBACK_WINDOW]
         distinct_concepts = {str(row.get("concept_id") or "") for row in rows}
         if len(rows) < self.GLOBAL_FEEDBACK_MIN_ROWS or len(distinct_concepts) < 2:
             adjustment = 0.0
@@ -7236,9 +7440,28 @@ class ReelService:
             """,
             (learner_id, material_id),
         )
+        try:
+            assessment_rows = fetch_all(
+                conn,
+                """
+                SELECT session_id, concept_id, adjustment, source_reel_id AS reel_id,
+                       source_video_id AS video_id, source_difficulty AS difficulty,
+                       created_at AS mastery_updated_at
+                FROM assessment_concept_outcomes
+                WHERE learner_id = ? AND material_id = ?
+                """,
+                (learner_id, material_id),
+            )
+        except sqlite3.OperationalError as exc:
+            if "no such table: assessment_concept_outcomes" not in str(exc):
+                raise
+            assessment_rows = []
         coverage: dict[str, dict[str, float]] = {}
         post_reset: dict[str, list[float]] = {}
+        assessment_adjustments: dict[str, float] = {}
         mastery_rows: list[dict[str, Any]] = []
+        latest_manual_at = ""
+        post_reset_assessment_rows: list[dict[str, Any]] = []
         for row in rows:
             concept_id = str(row.get("concept_id") or "")
             if not concept_id:
@@ -7253,18 +7476,77 @@ class ReelService:
             values[0] += 1.0 if int(row.get("helpful") or 0) > 0 else 0.0
             values[1] += 1.0 if int(row.get("confusing") or 0) > 0 else 0.0
             if int(row.get("helpful") or 0) > 0 or int(row.get("confusing") or 0) > 0:
-                mastery_rows.append(row)
-        adjustments = {
-            concept_id: max(
+                mastery_rows.append({**row, "mastery_source": "manual"})
+                latest_manual_at = max(latest_manual_at, mastery_at)
+        for row in assessment_rows:
+            concept_id = str(row.get("concept_id") or "")
+            if not concept_id:
+                continue
+            adjustment = float(row.get("adjustment") or 0.0)
+            bucket = coverage.setdefault(concept_id, {"helpful": 0.0, "confusing": 0.0})
+            if adjustment > 0:
+                bucket["helpful"] += 1.0
+            elif adjustment < 0:
+                bucket["confusing"] += 1.0
+            mastery_at = str(row.get("mastery_updated_at") or "")
+            if not mastery_at or mastery_at <= reset_at:
+                continue
+            assessment_adjustments[concept_id] = (
+                assessment_adjustments.get(concept_id, 0.0) + adjustment
+            )
+            mastery_row = {
+                **row,
+                "helpful": 1 if adjustment > 0 else 0,
+                "confusing": 1 if adjustment < 0 else 0,
+                "mastery_source": "assessment",
+            }
+            mastery_rows.append(mastery_row)
+            post_reset_assessment_rows.append(mastery_row)
+        adjustments: dict[str, float] = {}
+        for concept_id in set(post_reset) | set(assessment_adjustments):
+            values = post_reset.get(concept_id, [0.0, 0.0])
+            combined = (
+                self.GOT_IT_CONCEPT_STEP * values[0]
+                - self.NEED_HELP_CONCEPT_STEP * values[1]
+                + assessment_adjustments.get(concept_id, 0.0)
+            )
+            adjustments[concept_id] = max(
                 -self.CONCEPT_ADJUSTMENT_BOUND,
-                min(
-                    self.CONCEPT_ADJUSTMENT_BOUND,
-                    self.GOT_IT_CONCEPT_STEP * values[0] - self.NEED_HELP_CONCEPT_STEP * values[1],
+                min(self.CONCEPT_ADJUSTMENT_BOUND, combined),
+            )
+        latest = max(
+            mastery_rows,
+            key=lambda row: (
+                str(row.get("mastery_updated_at") or ""),
+                int(row.get("confusing") or 0),
+                int(row.get("helpful") or 0),
+                str(row.get("concept_id") or ""),
+            ),
+            default=None,
+        )
+        assessment_remediations: list[dict[str, Any]] = []
+        if post_reset_assessment_rows:
+            newest_assessment = max(
+                post_reset_assessment_rows,
+                key=lambda row: (
+                    str(row.get("mastery_updated_at") or ""),
+                    str(row.get("session_id") or ""),
                 ),
             )
-            for concept_id, values in post_reset.items()
-        }
-        latest = max(mastery_rows, key=lambda row: str(row.get("mastery_updated_at") or ""), default=None)
+            newest_assessment_at = str(newest_assessment.get("mastery_updated_at") or "")
+            newest_session_id = str(newest_assessment.get("session_id") or "")
+            if newest_assessment_at >= latest_manual_at:
+                assessment_remediations = sorted(
+                    (
+                        row
+                        for row in post_reset_assessment_rows
+                        if str(row.get("session_id") or "") == newest_session_id
+                        and int(row.get("confusing") or 0) > 0
+                    ),
+                    key=lambda row: str(row.get("concept_id") or ""),
+                )
+        if latest is not None and assessment_remediations:
+            latest = {**latest, "assessment_remediations": assessment_remediations}
         level_target = effective_level_target(
             progress.get("selected_level"), progress.get("global_adjustment")
         )
@@ -7312,20 +7594,25 @@ class ReelService:
 
         heads = lambda: [(video_id, queue[0]) for video_id, queue in queues.items() if queue]
 
-        if latest and int(latest.get("confusing") or 0) > 0:
-            current_difficulty = self._difficulty(latest)
+        remediation_signals = list((latest or {}).get("assessment_remediations") or [])
+        if not remediation_signals and latest and int(latest.get("confusing") or 0) > 0:
+            remediation_signals = [latest]
+        for remediation_signal in remediation_signals:
+            remediation_concept = str(remediation_signal.get("concept_id") or "")
+            remediation_video = str(remediation_signal.get("video_id") or "")
+            current_difficulty = self._difficulty(remediation_signal)
             remediation = [
                 (video_id, row)
                 for video_id, row in heads()
-                if str(row.get("concept_id") or "") == latest_concept
+                if str(row.get("concept_id") or "") == remediation_concept
                 and self._difficulty(row) < current_difficulty
             ]
-            alternate = [pair for pair in remediation if pair[0] != latest_video]
+            alternate = [pair for pair in remediation if pair[0] != remediation_video]
             boundary_safe_alternate = [pair for pair in alternate if pair[0] != last_video]
             boundary_safe_fallback = [pair for pair in remediation if pair[0] != last_video]
             pool = boundary_safe_alternate or boundary_safe_fallback or alternate or remediation
             if pool:
-                concept_target = max(0.0, min(1.0, level_target + adjustments.get(latest_concept, 0.0)))
+                concept_target = max(0.0, min(1.0, level_target + adjustments.get(remediation_concept, 0.0)))
                 video_id, row = min(
                     pool,
                     key=lambda pair: (
@@ -7338,7 +7625,7 @@ class ReelService:
                     queues.pop(video_id, None)
                 ordered.append(row)
                 last_video = video_id
-                last_concept = latest_concept
+                last_concept = remediation_concept
 
         first_after_helpful = bool(latest and int(latest.get("helpful") or 0) > 0)
         while queues:
@@ -7751,15 +8038,12 @@ class ReelService:
         )
         video_title = str(video.get("title") or "").strip()
         video_description = self._clean_video_description(str(video.get("description") or ""))
-        ai_summary = self._brief_ai_summary(
-            conn,
-            video_id=video_id,
+        ai_summary = self._fallback_ai_summary(
             concept_title=str(concept.get("title") or ""),
             video_title=video_title,
             video_description=video_description,
             transcript_snippet=transcript_snippet,
             takeaways=takeaways,
-            fast_mode=fast_mode,
         )
         relevance_score = float((relevance_context or {}).get("score") or segment.score)
         matched_terms = [
@@ -7768,6 +8052,11 @@ class ReelService:
             if str(term).strip()
         ][:8]
         relevance_reason = str((relevance_context or {}).get("reason") or "").strip()
+        match_reason = relevance_reason or (
+            f"This clip directly develops {str(concept.get('title') or 'the selected topic')[:180]} "
+            "using the source transcript."
+        )
+        informativeness = 0.6
 
         try:
             upsert(
@@ -7784,6 +8073,9 @@ class ReelService:
                     "t_end": float(end_sec),
                     "transcript_snippet": transcript_snippet,
                     "takeaways_json": dumps_json(takeaways),
+                    "ai_summary": ai_summary,
+                    "match_reason": match_reason,
+                    "informativeness": informativeness,
                     "base_score": float(segment.score),
                     "created_at": now_iso(),
                 },
@@ -7801,6 +8093,8 @@ class ReelService:
             "video_description": video_description,
             "channel_name": str(video.get("channel_title") or "").strip(),
             "ai_summary": ai_summary,
+            "match_reason": match_reason,
+            "informativeness": informativeness,
             "video_url": url,
             "t_start": float(start_sec),
             "t_end": float(end_sec),
@@ -8390,6 +8684,9 @@ class ReelService:
                 r.t_end,
                 r.transcript_snippet,
                 r.takeaways_json,
+                r.ai_summary,
+                r.match_reason,
+                r.informativeness,
                 r.base_score,
                 r.difficulty,
                 COALESCE(SUM(f.helpful), 0) AS helpful_votes,
@@ -8421,6 +8718,9 @@ class ReelService:
                 r.t_end,
                 r.transcript_snippet,
                 r.takeaways_json,
+                r.ai_summary,
+                r.match_reason,
+                r.informativeness,
                 r.base_score,
                 r.difficulty,
                 r.created_at
@@ -8592,16 +8892,24 @@ class ReelService:
                 continue
             relevance_context = self._merge_relevance_context(relevance, relevance)
 
-            ai_summary = self._brief_ai_summary(
-                conn,
-                video_id=str(row.get("video_id") or ""),
-                concept_title=concept_title,
-                video_title=video_title,
-                video_description=video_description,
-                transcript_snippet=transcript_snippet,
-                takeaways=takeaways,
-                fast_mode=fast_mode,
-            )
+            ai_summary = str(row.get("ai_summary") or "").strip()
+            if not ai_summary:
+                ai_summary = self._fallback_ai_summary(
+                    concept_title=concept_title,
+                    video_title=video_title,
+                    video_description=video_description,
+                    transcript_snippet=transcript_snippet,
+                    takeaways=takeaways,
+                )
+            match_reason = str(row.get("match_reason") or "").strip()
+            if not match_reason:
+                matched_idea = concept_title or (takeaways[0] if takeaways else "") or "this topic"
+                match_reason = f"This clip directly develops {matched_idea[:180]} using the source transcript."
+            try:
+                informativeness = float(row.get("informativeness"))
+            except (TypeError, ValueError):
+                informativeness = 0.6
+            informativeness = max(0.6, min(1.0, informativeness))
             safe_page_hint = max(1, int(page_hint))
             _diff = self._difficulty(row)
             concept_target = max(
@@ -8636,6 +8944,8 @@ class ReelService:
                     "video_description": video_description,
                     "channel_name": str(row.get("video_channel_title") or "").strip(),
                     "ai_summary": ai_summary,
+                    "match_reason": match_reason,
+                    "informativeness": informativeness,
                     "video_url": row["video_url"],
                     "t_start": float(row["t_start"]),
                     "t_end": float(row["t_end"]),

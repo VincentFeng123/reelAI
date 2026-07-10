@@ -6,15 +6,18 @@ Includes a simple retry on rate-limit / transient errors.
 """
 from __future__ import annotations
 
+import asyncio
 import random
 import threading
 import time
+from collections.abc import Callable
 from typing import Optional
 
 from google import genai
 from google.genai import types
 
 from . import config
+from ..cancellation import raise_if_cancelled, run_cancellable, sleep_with_probe
 
 _client: Optional[genai.Client] = None
 _lock = threading.Lock()
@@ -91,8 +94,30 @@ def _retry(call) -> str:
     raise RuntimeError(f"Gemini call failed: {last}")
 
 
+async def _retry_async(call, should_cancel: Callable[[], bool] | None = None) -> str:
+    """Async retry loop whose request and backoff both observe cancellation."""
+    last: Optional[Exception] = None
+    for attempt in range(config.BACKOFF_MAX_RETRIES + 1):
+        raise_if_cancelled(should_cancel)
+        try:
+            text = await call()
+            if text:
+                return text
+            last = RuntimeError("empty response from Gemini")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if not _is_retryable(exc) or attempt == config.BACKOFF_MAX_RETRIES:
+                raise
+        wait = min(config.BACKOFF_CAP, config.BACKOFF_BASE * 2 ** attempt)
+        await sleep_with_probe(wait + random.uniform(0, 0.5 * wait), should_cancel)
+    raise RuntimeError(f"Gemini call failed: {last}")
+
+
 def generate_json(system: str, user: str, schema, temperature: float = 0.2,
-                  model: Optional[str] = None, max_output_tokens: int = 8192) -> str:
+                  model: Optional[str] = None, max_output_tokens: int = 8192,
+                  should_cancel: Callable[[], bool] | None = None) -> str:
     """Return a JSON string conforming to `schema` (a Pydantic model class).
 
     ``max_output_tokens`` bounds the response; raise it for calls whose JSON is large
@@ -114,19 +139,21 @@ def generate_json(system: str, user: str, schema, temperature: float = 0.2,
             kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
         return types.GenerateContentConfig(**kwargs)
 
-    def _call():
+    async def _call():
+        raise_if_cancelled(should_cancel)
         try:
-            resp = client.models.generate_content(
+            resp = await client.aio.models.generate_content(
                 model=mdl, contents=user, config=_make_config(thinking=False)
             )
         except Exception:
             # some models reject thinking_budget=0 → retry with thinking on
-            resp = client.models.generate_content(
+            raise_if_cancelled(should_cancel)
+            resp = await client.aio.models.generate_content(
                 model=mdl, contents=user, config=_make_config(thinking=True)
             )
         return resp.text
 
-    return _retry(_call)
+    return run_cancellable(lambda: _retry_async(_call, should_cancel), should_cancel)
 
 
 # ── multimodal (Phase 2 vision) ──────────────────────────────────────────────

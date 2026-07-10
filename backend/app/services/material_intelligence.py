@@ -2,8 +2,10 @@ import hashlib
 import json
 import logging
 import uuid
+from collections.abc import Callable
 from typing import Any
 
+from ..clip_engine.errors import CancellationError
 from ..config import get_settings
 from ..db import dumps_json, fetch_one, now_iso, upsert
 from . import llm_router
@@ -399,6 +401,7 @@ class MaterialIntelligenceService:
         video_description: str | None = None,
         transcript_snippet: str | None = None,
         gemini_api_key_override: str | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> str:
         question = normalize_whitespace(message or "").strip()
         if not question:
@@ -459,6 +462,7 @@ class MaterialIntelligenceService:
                 user=user_prompt,
                 temperature=0.25,
                 gemini_api_key_override=gemini_api_key_override,
+                should_cancel=should_cancel,
             )
             if answer:
                 return answer.strip()[:1200]
@@ -466,6 +470,8 @@ class MaterialIntelligenceService:
                 "chat_assistant: primary chat_completion returned no answer (override=%s, llm_available=%s)",
                 bool(gemini_api_key_override), self.llm_available,
             )
+        except CancellationError:
+            raise
         except Exception:
             logger.exception("chat_assistant: primary chat_completion raised")
 
@@ -475,10 +481,13 @@ class MaterialIntelligenceService:
                     system=system_prompt,
                     user=user_prompt,
                     temperature=0.25,
+                    should_cancel=should_cancel,
                 )
                 if answer:
                     return answer.strip()[:1200]
                 logger.warning("chat_assistant: fallback chat_completion returned no answer")
+            except CancellationError:
+                raise
             except Exception:
                 logger.exception("chat_assistant: fallback chat_completion raised")
 

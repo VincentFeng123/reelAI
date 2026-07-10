@@ -13,8 +13,11 @@ type Props = {
   autoplayEnabled: boolean;
   onAutoplayEnabledChange: (nextEnabled: boolean) => void;
   playbackRate: number;
+  playbackRestartToken?: number;
   onPlaybackRateChange: (nextRate: number) => void;
   onRequestNextReel?: () => void;
+  onPlaybackProgress?: (maxFraction: number, naturalEnd: boolean) => void;
+  onClipBoundary?: () => boolean;
   onOpenContent?: () => void;
 };
 
@@ -137,8 +140,11 @@ export function ReelCard({
   autoplayEnabled,
   onAutoplayEnabledChange,
   playbackRate,
+  playbackRestartToken = 0,
   onPlaybackRateChange,
   onRequestNextReel,
+  onPlaybackProgress,
+  onClipBoundary,
   onOpenContent,
 }: Props) {
   const hostContainerRef = useRef<HTMLDivElement | null>(null);
@@ -153,6 +159,7 @@ export function ReelCard({
   const playbackRateRef = useRef(playbackRate);
   const isActiveRef = useRef(isActive);
   const didHandleClipEndRef = useRef(false);
+  const didReportCompletionThresholdRef = useRef(false);
   const didUserInteractRef = useRef(false);
   const manualPauseRequestedRef = useRef(false);
   const isMutedRef = useRef(mutedPreference);
@@ -206,6 +213,7 @@ export function ReelCard({
 
   useEffect(() => {
     didHandleClipEndRef.current = false;
+    didReportCompletionThresholdRef.current = false;
   }, [reel.reel_id]);
 
   useEffect(() => {
@@ -325,7 +333,21 @@ export function ReelCard({
         return;
       }
       const now = clamp(player.getCurrentTime(), clipStart, clipEnd);
+      const fraction = clipDuration > 0 ? clamp((now - clipStart) / clipDuration, 0, 1) : 0;
+      if (fraction >= 0.8 && !didReportCompletionThresholdRef.current) {
+        didReportCompletionThresholdRef.current = true;
+        onPlaybackProgress?.(fraction, false);
+      }
       if (now >= clipEnd) {
+        onPlaybackProgress?.(1, true);
+        if (!didHandleClipEndRef.current && onClipBoundary?.()) {
+          didHandleClipEndRef.current = true;
+          setIsPlaying(false);
+          setIsResumeMaskVisible(false);
+          setCurrentSec(clipDuration);
+          stopProgressTimer();
+          return;
+        }
         if (autoplayEnabledRef.current && isActive && onRequestNextReel && !didHandleClipEndRef.current) {
           didHandleClipEndRef.current = true;
           setIsPlaying(false);
@@ -343,7 +365,7 @@ export function ReelCard({
       const rel = clamp(now - clipStart, 0, clipDuration);
       setCurrentSec(rel);
     }, 160);
-  }, [clipDuration, clipEnd, clipStart, isActive, onRequestNextReel, stopProgressTimer]);
+  }, [clipDuration, clipEnd, clipStart, isActive, onClipBoundary, onPlaybackProgress, onRequestNextReel, stopProgressTimer]);
 
   useEffect(() => {
     if (!isYouTubeVideo || !isActive || !isReady || !isPlaying) {
@@ -605,6 +627,15 @@ export function ReelCard({
                 }
               } else if (state === playerState.ENDED) {
                 clearAutoplayRetryTimer();
+                onPlaybackProgress?.(1, true);
+                if (!didHandleClipEndRef.current && onClipBoundary?.()) {
+                  didHandleClipEndRef.current = true;
+                  setIsPlaying(false);
+                  setIsResumeMaskVisible(false);
+                  setCurrentSec(clipDuration);
+                  stopProgressTimer();
+                  return;
+                }
                 if (autoplayEnabledRef.current && isActive && onRequestNextReel) {
                   didHandleClipEndRef.current = true;
                   setIsPlaying(false);
@@ -671,6 +702,7 @@ export function ReelCard({
     clearHostContainer,
     clearRevealTimer,
     clearResumeMaskTimer,
+    clipDuration,
     clipEnd,
     clipStart,
     isActive,
@@ -681,6 +713,10 @@ export function ReelCard({
     syncProgress,
     videoId,
     isYouTubeVideo,
+    onClipBoundary,
+    onPlaybackProgress,
+    onRequestNextReel,
+    playbackRestartToken,
     destroyPlayerSafely,
     clearAutoplayRetryTimer,
   ]);

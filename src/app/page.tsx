@@ -164,6 +164,7 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
         feedQuery: item.feedQuery ?? existing.feedQuery,
         activeIndex: item.activeIndex ?? existing.activeIndex,
         activeReelId: item.activeReelId ?? existing.activeReelId,
+        recall: item.recall ?? existing.recall,
       });
       continue;
     }
@@ -175,6 +176,7 @@ function mergeHistory(primary: HistoryItem[], secondary: HistoryItem[]): History
       feedQuery: existing.feedQuery ?? item.feedQuery,
       activeIndex: existing.activeIndex ?? item.activeIndex,
       activeReelId: existing.activeReelId ?? item.activeReelId,
+      recall: existing.recall ?? item.recall,
     });
   }
   return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, MAX_HISTORY_ITEMS);
@@ -235,6 +237,13 @@ function formatHistoryInfoDate(timestamp: number): string {
   }
 }
 
+function formatHistoryInfoAccuracy(value: number | undefined): string | null {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+  return `${Math.round(Math.max(0, Math.min(1, Number(value))) * 100)}%`;
+}
+
 function formatHistoryInfoSeconds(value: string | null | undefined): string | null {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
@@ -290,6 +299,7 @@ function buildHistoryInfoSections(item: HistoryItem): HistoryInfoSection[] {
   const summaryFields: HistoryInfoField[] = [];
   const searchFields: HistoryInfoField[] = [];
   const playbackFields: HistoryInfoField[] = [];
+  const recallFields: HistoryInfoField[] = [];
 
   pushHistoryInfoField(summaryFields, "Source", item.source === "community" ? "Community" : "Search");
   pushHistoryInfoField(summaryFields, "Generation mode", item.generationMode === "slow" ? "Slow" : "Fast");
@@ -323,8 +333,22 @@ function buildHistoryInfoSections(item: HistoryItem): HistoryInfoSection[] {
   pushHistoryInfoField(playbackFields, "Clip start", formatHistoryInfoSeconds(params?.get("community_t_start_sec")));
   pushHistoryInfoField(playbackFields, "Clip end", formatHistoryInfoSeconds(params?.get("community_t_end_sec")));
 
+  if (item.recall) {
+    if (Number.isFinite(item.recall.recentScore) && Number.isFinite(item.recall.recentQuestionCount)) {
+      pushHistoryInfoField(recallFields, "Latest score", `${item.recall.recentScore} of ${item.recall.recentQuestionCount}`);
+    }
+    pushHistoryInfoField(recallFields, "Recent accuracy", formatHistoryInfoAccuracy(item.recall.recentAccuracy));
+    pushHistoryInfoField(recallFields, "Rolling accuracy", formatHistoryInfoAccuracy(item.recall.rollingAccuracy));
+    pushHistoryInfoField(recallFields, "Concepts understood", item.recall.understoodConcepts.join(", "));
+    pushHistoryInfoField(recallFields, "Concepts to revisit", item.recall.revisitConcepts.join(", "));
+    if (item.recall.completedAt) {
+      pushHistoryInfoField(recallFields, "Last recall check", formatHistoryInfoDate(item.recall.completedAt));
+    }
+  }
+
   return [
     { title: "Session details", fields: summaryFields },
+    { title: "Recall", fields: recallFields },
     { title: "Search settings", fields: searchFields },
     { title: "Playback", fields: playbackFields },
   ].filter((section) => section.fields.length > 0);
@@ -681,6 +705,7 @@ function HomePageContent() {
       feedQuery?: string;
       activeIndex?: number;
       activeReelId?: string;
+      recall?: HistoryItem["recall"];
     }) => {
       const existing = historyRef.current.find((item) => item.materialId === entry.materialId);
       const merged: HistoryItem = {
@@ -693,6 +718,7 @@ function HomePageContent() {
         feedQuery: entry.feedQuery ?? existing?.feedQuery,
         activeIndex: entry.activeIndex ?? existing?.activeIndex,
         activeReelId: entry.activeReelId ?? existing?.activeReelId,
+        recall: entry.recall ?? existing?.recall,
       };
       const next = [merged, ...historyRef.current.filter((item) => item.materialId !== merged.materialId)].slice(0, MAX_HISTORY_ITEMS);
       persistHistory(next);
@@ -2182,6 +2208,7 @@ function HomePageContent() {
         >
           <div className={visibleSidebarTab === "search" ? "h-full min-h-0" : "hidden h-full min-h-0"}>
             <UploadPanel
+              active={visibleSidebarTab === "search"}
               onMaterialCreated={onUploadMaterialCreated}
               onScrollOffsetChange={onSearchPanelScrollOffsetChange}
               onScrollGesture={triggerTopChromeGesture}

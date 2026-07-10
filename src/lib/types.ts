@@ -31,6 +31,8 @@ export type Reel = {
   relevance_score?: number;
   matched_terms?: string[];
   relevance_reason?: string;
+  match_reason?: string;
+  informativeness?: number;
   concept_position?: number;
   total_concepts?: number;
   video_duration_sec?: number;
@@ -125,6 +127,59 @@ export type ChatMessage = {
 
 export type ChatResponse = {
   answer: string;
+};
+
+export type ReelProgressResponse = {
+  reel_id: string;
+  completed: boolean;
+  newly_completed: boolean;
+  assessment_ready: boolean;
+  information_units: number;
+  readiness_threshold: number;
+};
+
+export type AssessmentQuestion = {
+  id: string;
+  reel_id: string;
+  concept_id: string;
+  concept_title: string;
+  prompt: string;
+  options: string[];
+};
+
+export type AssessmentSession = {
+  id: string;
+  material_id: string;
+  status: string;
+  current_index: number;
+  question_count: number;
+  answered_count: number;
+  questions: AssessmentQuestion[];
+  score?: number | null;
+  understood_concepts: string[];
+  revisit_concepts: string[];
+  recent_accuracy?: number | null;
+  rolling_accuracy?: number | null;
+};
+
+export type AssessmentStatusResponse = {
+  status: string;
+  assessment_ready: boolean;
+  session?: AssessmentSession | null;
+  recent_accuracy?: number | null;
+  rolling_accuracy?: number | null;
+};
+
+export type AssessmentAnswerResponse = {
+  correct: boolean;
+  correct_index: number;
+  explanation: string;
+  session: AssessmentSession;
+};
+
+export type AssessmentSnoozeResponse = {
+  status: string;
+  assessment_ready: false;
 };
 
 // POST /api/ingest/url — backend reel ingestion pipeline (YouTube / Instagram / TikTok).

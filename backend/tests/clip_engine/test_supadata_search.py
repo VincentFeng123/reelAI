@@ -12,6 +12,25 @@ class _Resp:
         return self._payload
 
 
+@pytest.fixture(autouse=True)
+def _async_client_uses_the_test_get(monkeypatch):
+    """Keep provider tests offline after the production client became async."""
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, headers=None, params=None):
+            return ss.httpx.get(url, headers=headers, params=params, timeout=None)
+
+    monkeypatch.setattr(ss.httpx, "AsyncClient", FakeAsyncClient)
+
+
 def test_search_one_returns_videos(monkeypatch):
     monkeypatch.setattr(ss.config, "SUPADATA_API_KEY", "sd_test")
     calls = {}

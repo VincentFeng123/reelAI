@@ -11,6 +11,7 @@ test_ingestion_url.py).
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -27,6 +28,7 @@ from backend.app.config import get_settings  # noqa: E402
 import backend.app.main as main_module  # noqa: E402
 from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
 from backend.app.ingestion.errors import UnsupportedSourceError  # noqa: E402
+from backend.app.clip_engine.errors import CancellationError  # noqa: E402
 
 
 # --------------------------------------------------------------------- #
@@ -302,6 +304,54 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
                 (result1.reel.reel_id,),
             )
             self.assertEqual(row["cnt"], 1)
+
+    def test_cancellation_during_persistence_rolls_back_all_new_rows(self) -> None:
+        source_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        cancelled = threading.Event()
+        real_upsert_video = pipeline_module.upsert_video
+
+        def cancel_after_video_write(*args, **kwargs):
+            result = real_upsert_video(*args, **kwargs)
+            cancelled.set()
+            return result
+
+        with (
+            mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
+            mock.patch.object(pipeline_module, "clip_engine_meta") as mock_meta,
+            mock.patch.object(
+                pipeline_module,
+                "upsert_video",
+                side_effect=cancel_after_video_write,
+            ),
+        ):
+            mock_meta.extract_video_id.return_value = "dQw4w9WgXcQ"
+            mock_meta.youtube_metadata.return_value = {
+                "title": "Cancelled video",
+                "duration_sec": 300.0,
+            }
+            mock_run.clip.return_value = _fake_engine_out()
+
+            with self.assertRaises(CancellationError):
+                main_module.ingestion_pipeline.ingest_url(
+                    source_url=source_url,
+                    material_id=None,
+                    concept_id=None,
+                    target_clip_duration_sec=45,
+                    target_clip_duration_min_sec=15,
+                    target_clip_duration_max_sec=60,
+                    language="en",
+                    should_cancel=cancelled.is_set,
+                )
+
+        with db_module.get_conn() as conn:
+            self.assertEqual(
+                db_module.fetch_one(conn, "SELECT COUNT(*) AS cnt FROM reels")["cnt"],
+                0,
+            )
+            self.assertEqual(
+                db_module.fetch_one(conn, "SELECT COUNT(*) AS cnt FROM videos")["cnt"],
+                0,
+            )
 
 
 if __name__ == "__main__":

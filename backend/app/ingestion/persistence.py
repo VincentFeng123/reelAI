@@ -33,6 +33,8 @@ from .. import db as db_module
 from ..db import (
     DatabaseIntegrityError,
     dumps_json,
+    execute_modify,
+    fetch_all,
     fetch_one,
     get_conn,
     insert,
@@ -169,7 +171,8 @@ def load_existing_reel(
             conn,
             """
             SELECT id, material_id, concept_id, video_id, video_url, t_start, t_end,
-                   transcript_snippet, takeaways_json, base_score, created_at
+                   transcript_snippet, takeaways_json, base_score, difficulty,
+                   ai_summary, match_reason, informativeness, created_at
               FROM reels
              WHERE material_id = ?
                AND video_id = ?
@@ -206,6 +209,9 @@ def upsert_reel_row(
     base_score: float = 1.0,
     generation_id: str | None = None,
     difficulty: float | None = None,
+    ai_summary: str = "",
+    match_reason: str = "",
+    informativeness: float | None = None,
 ) -> bool:
     """
     Insert a reel row. Returns True on success, False if the unique index rejected a
@@ -224,6 +230,9 @@ def upsert_reel_row(
         "takeaways_json": dumps_json(list(takeaways or [])),
         "base_score": float(base_score),
         "difficulty": difficulty,
+        "ai_summary": str(ai_summary or "")[:700],
+        "match_reason": str(match_reason or "")[:700],
+        "informativeness": informativeness,
         "created_at": now_iso(),
     }
     try:
@@ -242,7 +251,8 @@ def load_reel_row_by_id(conn: Any, reel_id: str) -> dict[str, Any] | None:
             conn,
             """
             SELECT id, material_id, concept_id, video_id, video_url, t_start, t_end,
-                   transcript_snippet, takeaways_json, base_score, created_at
+                   transcript_snippet, takeaways_json, base_score, difficulty,
+                   ai_summary, match_reason, informativeness, created_at
               FROM reels
              WHERE id = ?
             """,
@@ -311,23 +321,25 @@ def takedown_by_source_url(conn: Any, source_url: str) -> int:
         return 0
 
     removed = 0
-    cursor = conn.cursor()
     try:
         # 1. Direct video_url match
-        cursor.execute("SELECT id FROM reels WHERE video_url = ?", (source_url,))
-        rows = cursor.fetchall()
-        direct_ids: list[str] = [r[0] if isinstance(r, tuple) else r["id"] for r in rows]
+        rows = fetch_all(conn, "SELECT id FROM reels WHERE video_url = ?", (source_url,))
+        direct_ids = [str(row.get("id") or "") for row in rows if row.get("id")]
 
-        # 2. Metadata blob match (JSON LIKE is cheap for small tables)
-        cursor.execute(
-            "SELECT cache_key, response_json FROM llm_cache WHERE cache_key LIKE ? AND response_json LIKE ?",
-            (f"{_INGEST_META_PREFIX}%", f'%"source_url": "{source_url}"%'),
+        # 2. Metadata blob match. Parse JSON so whitespace and escaped URL content do
+        # not make the match dialect- or serializer-dependent.
+        blob_rows = fetch_all(
+            conn,
+            "SELECT cache_key, response_json FROM llm_cache WHERE cache_key LIKE ?",
+            (f"{_INGEST_META_PREFIX}%",),
         )
-        blob_rows = cursor.fetchall()
         blob_reel_ids: list[str] = []
         for blob in blob_rows:
-            key = blob[0] if isinstance(blob, tuple) else blob["cache_key"]
+            key = blob.get("cache_key")
             if not isinstance(key, str) or not key.startswith(_INGEST_META_PREFIX):
+                continue
+            metadata = loads_json(blob.get("response_json"), default={})
+            if not isinstance(metadata, dict) or metadata.get("source_url") != source_url:
                 continue
             blob_reel_ids.append(key[len(_INGEST_META_PREFIX):])
 
@@ -335,15 +347,101 @@ def takedown_by_source_url(conn: Any, source_url: str) -> int:
         if not to_remove:
             return 0
 
-        placeholders = ",".join("?" * len(to_remove))
-        cursor.execute(f"DELETE FROM reels WHERE id IN ({placeholders})", to_remove)
-        removed = cursor.rowcount or 0
+        placeholders = ", ".join(["?"] * len(to_remove))
+
+        # A recall session becomes internally inconsistent if only one of its
+        # questions disappears, so remove any session that references a question
+        # owned by a takedown reel. Delete children first for both SQLite and PG.
+        question_rows = fetch_all(
+            conn,
+            f"SELECT id FROM reel_assessment_questions WHERE reel_id IN ({placeholders})",
+            to_remove,
+        )
+        question_ids = [
+            str(row.get("id") or "") for row in question_rows if row.get("id")
+        ]
+        session_ids: list[str] = []
+        if question_ids:
+            question_placeholders = ", ".join(["?"] * len(question_ids))
+            session_rows = fetch_all(
+                conn,
+                "SELECT DISTINCT session_id FROM assessment_session_questions "
+                f"WHERE question_id IN ({question_placeholders})",
+                question_ids,
+            )
+            session_ids = [
+                str(row.get("session_id") or "")
+                for row in session_rows
+                if row.get("session_id")
+            ]
+            if session_ids:
+                session_placeholders = ", ".join(["?"] * len(session_ids))
+                execute_modify(
+                    conn,
+                    f"DELETE FROM assessment_attempts WHERE session_id IN ({session_placeholders})",
+                    session_ids,
+                )
+                execute_modify(
+                    conn,
+                    f"DELETE FROM assessment_concept_outcomes WHERE session_id IN ({session_placeholders})",
+                    session_ids,
+                )
+                execute_modify(
+                    conn,
+                    f"DELETE FROM assessment_session_questions WHERE session_id IN ({session_placeholders})",
+                    session_ids,
+                )
+                execute_modify(
+                    conn,
+                    f"DELETE FROM assessment_sessions WHERE id IN ({session_placeholders})",
+                    session_ids,
+                )
+            execute_modify(
+                conn,
+                f"DELETE FROM assessment_attempts WHERE question_id IN ({question_placeholders})",
+                question_ids,
+            )
+            execute_modify(
+                conn,
+                f"DELETE FROM assessment_session_questions WHERE question_id IN ({question_placeholders})",
+                question_ids,
+            )
+            execute_modify(
+                conn,
+                f"DELETE FROM reel_assessment_questions WHERE id IN ({question_placeholders})",
+                question_ids,
+            )
+
+        execute_modify(
+            conn,
+            f"DELETE FROM assessment_concept_outcomes WHERE source_reel_id IN ({placeholders})",
+            to_remove,
+        )
+        execute_modify(
+            conn,
+            f"DELETE FROM learner_reel_progress WHERE reel_id IN ({placeholders})",
+            to_remove,
+        )
+        execute_modify(
+            conn,
+            f"DELETE FROM reel_feedback WHERE reel_id IN ({placeholders})",
+            to_remove,
+        )
+        removed = execute_modify(
+            conn,
+            f"DELETE FROM reels WHERE id IN ({placeholders})",
+            to_remove,
+        )
 
         # Clean up metadata blobs
         meta_keys = [f"{_INGEST_META_PREFIX}{rid}" for rid in to_remove]
         if meta_keys:
-            key_placeholders = ",".join("?" * len(meta_keys))
-            cursor.execute(f"DELETE FROM llm_cache WHERE cache_key IN ({key_placeholders})", meta_keys)
+            key_placeholders = ", ".join(["?"] * len(meta_keys))
+            execute_modify(
+                conn,
+                f"DELETE FROM llm_cache WHERE cache_key IN ({key_placeholders})",
+                meta_keys,
+            )
 
         conn.commit()
         logger.info(
@@ -356,11 +454,6 @@ def takedown_by_source_url(conn: Any, source_url: str) -> int:
         logger.exception("takedown_by_source_url failed for %s", source_url)
         try:
             conn.rollback()
-        except Exception:
-            pass
-    finally:
-        try:
-            cursor.close()
         except Exception:
             pass
     return removed

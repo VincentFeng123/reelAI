@@ -16,3 +16,7 @@ class ClipError(EngineError):
 
 class UnsupportedURLError(EngineError):
     pass
+
+
+class CancellationError(EngineError):
+    """The caller explicitly cancelled active provider work."""

@@ -75,6 +75,16 @@ def _multi_clip_engine_out() -> dict:
                 "title": "Cellular respiration overview",
                 "facet": "biology",
                 "reason": "core idea",
+                "summary": "Cellular respiration releases usable energy in the mitochondria.",
+                "takeaways": ["Mitochondria release usable energy", "Respiration transforms fuel"],
+                "match_reason": "It explains how cellular respiration releases energy.",
+                "informativeness": 0.92,
+                "assessment": {
+                    "prompt": "Where is usable energy released during cellular respiration?",
+                    "options": ["In the mitochondria", "In the nucleus", "In the membrane", "Outside the cell"],
+                    "correct_index": 0,
+                    "explanation": "The transcript states that mitochondria release energy.",
+                },
                 "sequence_index": 0,
                 "embed_url": "",
             },
@@ -214,10 +224,20 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         with db_module.get_conn() as conn:
             rows = db_module.fetch_all(
                 conn,
-                "SELECT id, video_id FROM reels WHERE generation_id = ?",
+                "SELECT id, video_id, ai_summary, match_reason, informativeness FROM reels WHERE generation_id = ?",
                 ("gen-1",),
             )
         self.assertGreaterEqual(len(rows), 2, "expected >=2 persisted reels under gen-1")
+        detailed = next(row for row in rows if row["ai_summary"])
+        self.assertIn("mitochondria", detailed["ai_summary"].lower())
+        self.assertTrue(str(detailed["match_reason"]).strip())
+        self.assertAlmostEqual(float(detailed["informativeness"]), 0.92)
+        with db_module.get_conn() as conn:
+            question_count = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM reel_assessment_questions",
+            )
+        self.assertEqual(int(question_count["count"]), 1)
 
         # 3. MULTIPLE clips per video kept (>=2 reels from the one mocked video).
         video_ids = {r["video_id"] for r in rows}
@@ -245,6 +265,35 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertEqual(first["concept_id"], CONCEPT_ID)
         self.assertEqual(first["video_id"], VIDEO_ID)
         self.assertTrue(first["video_url"].startswith(f"https://www.youtube.com/embed/{VIDEO_ID}"))
+        self.assertTrue(str(first.get("ai_summary") or "").strip())
+        self.assertTrue(str(first.get("match_reason") or "").strip())
+
+    def test_one_pass_clips_never_call_legacy_summary_model(self) -> None:
+        self._patched_engine(_multi_clip_engine_out())
+        with mock.patch.object(
+            main_module.reel_service,
+            "_brief_ai_summary",
+            side_effect=AssertionError("legacy summary model must not run"),
+        ):
+            with db_module.get_conn() as conn:
+                generated = main_module.reel_service.generate_reels(
+                    conn,
+                    material_id=MATERIAL_ID,
+                    concept_id=None,
+                    num_reels=5,
+                    creative_commons_only=False,
+                    generation_id="gen-one-pass-details",
+                )
+            with db_module.get_conn() as conn:
+                served = main_module.reel_service.ranked_feed(
+                    conn,
+                    material_id=MATERIAL_ID,
+                    generation_id="gen-one-pass-details",
+                )
+
+        self.assertTrue(generated)
+        self.assertTrue(served)
+        self.assertTrue(all(reel["ai_summary"] for reel in served))
 
     def test_learner_level_override_reaches_discovery(self) -> None:
         search, _run = self._patched_engine(_multi_clip_engine_out())
@@ -583,8 +632,8 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
             feed = main_module.reel_service.ranked_feed(conn, material_id=MATERIAL_ID, generation_id="gen-lvl")
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
-    def test_cache_version_is_8(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 8)
+    def test_cache_version_includes_recall_and_stored_details(self) -> None:
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 10)
 
 
 if __name__ == "__main__":

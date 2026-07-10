@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from typing import Callable, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .. import config
 from ..llm import llm_json
@@ -38,6 +38,12 @@ class _Topic(BaseModel):
     topic_relevance: Optional[float] = None
     self_contained: Optional[bool] = None
     difficulty: float = 0.5   # 0 = assumes no prior knowledge, 1 = expert-level
+    summary: str = ""
+    takeaways: list[str] = Field(default_factory=list)
+    match_reason: str = ""
+    # Keep this deliberately loose. A malformed assessment must be discarded
+    # without making Pydantic reject the otherwise usable clip proposal.
+    assessment: dict | None = None
 
 
 # Only explicitly educational kinds ship; missing and novel labels fail closed.
@@ -92,7 +98,14 @@ def _prompts(lines: str, n: int, topic: str = "") -> "tuple[str, str]":
         "ALONE; topic_relevance — 0.0 to 1.0, how directly it teaches the viewer's topic; "
         "self_contained — true only when it makes sense without omitted context; "
         "difficulty — 0.0 to 1.0, the prior knowledge the clip ASSUMES (0.1: no background, "
-        "first exposure; 0.5: comfortable with the basics; 0.9: graduate/expert material). "
+        "first exposure; 0.5: comfortable with the basics; 0.9: graduate/expert material); "
+        "summary — a grounded 1-2 sentence explanation of what this exact clip teaches; "
+        "takeaways — 2-4 concise, non-overlapping facts or ideas from this exact clip; "
+        "match_reason — one topic-specific sentence explaining why this clip helps this viewer "
+        "(name the idea taught; never write a generic recommendation); assessment — exactly one "
+        "object with prompt, options (exactly four distinct strings), correct_index (0-3), and a "
+        "grounded explanation that states why the correct option follows from the clip. Ask about "
+        "the central idea, make exactly one option correct, and do not use 'all of the above'. "
         "Rules: (1) a clip must START at the beginning of the idea and END at its end — "
         "never mid-thought; (2) contextual overlap is allowed when two complete ideas share "
         "setup; (3) go in chronological order; (4) prefer complete clips of 20-90 seconds. "
@@ -104,7 +117,8 @@ def _prompts(lines: str, n: int, topic: str = "") -> "tuple[str, str]":
         f"Transcript ({n} lines, each formatted `[index] MM:SS text`):\n\n" + lines +
         "\n\nReturn every substantive teaching clip as {title, start_line, end_line, "
         "start_quote, end_quote, reason, facet, kind, informativeness, topic_relevance, "
-        "self_contained, difficulty}."
+        "self_contained, difficulty, summary, takeaways, match_reason, assessment: "
+        "{prompt, options, correct_index, explanation}}."
     )
     return system, user
 
@@ -179,6 +193,59 @@ def _near_duplicate(a: dict, b: dict, threshold: float = 0.8) -> bool:
     return shorter > 0 and overlap / shorter >= threshold
 
 
+def _clean_list(value: object, *, minimum: int, maximum: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = " ".join(str(item or "").split()).strip()
+        key = text.casefold()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+        if len(cleaned) >= maximum:
+            break
+    return cleaned if len(cleaned) >= minimum else []
+
+
+def _validated_assessment(value: object, *, grounding_text: str) -> dict | None:
+    """Return a privacy-ready stored question or None.
+
+    Validation happens after the clip proposal is accepted so a bad question
+    never rejects useful educational content.
+    """
+    if not isinstance(value, dict):
+        return None
+    prompt = " ".join(str(value.get("prompt") or "").split()).strip()
+    explanation = " ".join(str(value.get("explanation") or "").split()).strip()
+    raw_options = value.get("options")
+    if not isinstance(raw_options, list) or len(raw_options) != 4:
+        return None
+    options = _clean_list(raw_options, minimum=4, maximum=4)
+    raw_correct_index = value.get("correct_index")
+    if isinstance(raw_correct_index, bool) or not isinstance(raw_correct_index, int):
+        return None
+    correct_index = raw_correct_index
+    if not prompt or not explanation or len(options) != 4 or not 0 <= correct_index < 4:
+        return None
+
+    # Require a concrete lexical anchor to the clip or its generated details.
+    # This is intentionally modest: it blocks generic praise/rationales without
+    # rejecting concise explanations that use ordinary connective words.
+    source_tokens = {t for t in _toks(grounding_text) if len(t) >= 4}
+    explanation_tokens = {t for t in _toks(explanation) if len(t) >= 4}
+    if source_tokens and not (source_tokens & explanation_tokens):
+        return None
+    return {
+        "prompt": prompt,
+        "options": options,
+        "correct_index": correct_index,
+        "explanation": explanation,
+    }
+
+
 # ── plan → clips ─────────────────────────────────────────────────────────────
 def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
                    settings: dict) -> list[dict]:
@@ -220,6 +287,18 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
                 end = en
         start = _caption_gap_boundary(segs, start, direction="start")
         end = _caption_gap_boundary(segs, end, direction="end")
+        clip_text = " ".join(
+            str(seg.get("text") or "").strip() for seg in segs[a:b + 1]
+        )
+        summary = " ".join((tp.summary or "").split()).strip()
+        takeaways = _clean_list(tp.takeaways, minimum=2, maximum=4)
+        match_reason = " ".join((tp.match_reason or "").split()).strip()
+        assessment = _validated_assessment(
+            tp.assessment,
+            grounding_text=" ".join(
+                part for part in (clip_text, tp.title, summary, " ".join(takeaways)) if part
+            ),
+        )
         raw.append({"start": round(start, 3), "end": round(end, 3),
                     "title": (tp.title or "").strip(),
                     "facet": (tp.facet or "other").strip() or "other",
@@ -228,7 +307,11 @@ def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict],
                     "informativeness": info,
                     "topic_relevance": relevance,
                     "self_contained": True,
-                    "difficulty": _norm_informativeness(tp.difficulty)})
+                    "difficulty": _norm_informativeness(tp.difficulty),
+                    "summary": summary,
+                    "takeaways": takeaways,
+                    "match_reason": match_reason,
+                    "assessment": assessment})
 
     eligible = [c for c in raw if min_s <= c["end"] - c["start"] <= max_s]
     # Highest-quality member of a near-duplicate cluster wins; contextual
@@ -274,7 +357,8 @@ def segment_clips(transcript: dict, settings: dict,
     if progress:
         progress(0.1, "Understanding the transcript…")
     plan = llm_json(system, user, _Plan, temperature=0.2, model=model,
-                    max_output_tokens=config.SEGMENT_MAX_OUTPUT_TOKENS)
+                    max_output_tokens=config.SEGMENT_MAX_OUTPUT_TOKENS,
+                    should_cancel=settings.get("should_cancel"))
     if progress:
         progress(0.85, "Placing clip boundaries…")
     clips = _plan_to_clips(plan, segs, words, settings)

@@ -1,4 +1,7 @@
 import type {
+  AssessmentAnswerResponse,
+  AssessmentSnoozeResponse,
+  AssessmentStatusResponse,
   ChatMessage,
   ChatResponse,
   CommunityAccount,
@@ -13,6 +16,7 @@ import type {
   MaterialResponse,
   Reel,
   RefinementStatusResponse,
+  ReelProgressResponse,
   ReelsCanGenerateAnyResponse,
   ReelsCanGenerateResponse,
   ReelsGenerateResponse,
@@ -1178,6 +1182,7 @@ export async function askStudyChat(params: {
   topic?: string;
   text?: string;
   history?: ChatMessage[];
+  signal?: AbortSignal;
 }): Promise<ChatResponse> {
   const res = await safeFetch(apiUrl("/chat"), {
     method: "POST",
@@ -1190,8 +1195,94 @@ export async function askStudyChat(params: {
       text: params.text,
       history: params.history ?? [],
     }),
+    signal: params.signal,
   });
   return parseJsonResponse<ChatResponse>(res);
+}
+
+export async function reportReelProgress(params: {
+  reelId: string;
+  maxFraction: number;
+  signal?: AbortSignal;
+}): Promise<ReelProgressResponse> {
+  const maxFraction = Math.max(0, Math.min(1, Number(params.maxFraction) || 0));
+  const res = await safeFetch(apiUrl(`/reels/${encodeURIComponent(params.reelId)}/progress`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityRequestHeaders(),
+    },
+    body: JSON.stringify({ max_fraction: maxFraction }),
+    signal: params.signal,
+  });
+  return parseJsonResponse<ReelProgressResponse>(res);
+}
+
+export async function fetchPendingAssessment(params: {
+  materialId: string;
+  signal?: AbortSignal;
+}): Promise<AssessmentStatusResponse> {
+  const query = new URLSearchParams({ material_id: params.materialId });
+  const res = await safeFetch(`${apiUrl("/assessments/pending")}?${query.toString()}`, {
+    cache: "no-store",
+    headers: {
+      ...communityRequestHeaders(),
+    },
+    signal: params.signal,
+  });
+  return parseJsonResponse<AssessmentStatusResponse>(res);
+}
+
+export async function startNextAssessment(params: {
+  materialId: string;
+  signal?: AbortSignal;
+}): Promise<AssessmentStatusResponse> {
+  const res = await safeFetch(apiUrl("/assessments/next"), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityRequestHeaders(),
+    },
+    body: JSON.stringify({ material_id: params.materialId }),
+    signal: params.signal,
+  });
+  return parseJsonResponse<AssessmentStatusResponse>(res);
+}
+
+export async function answerAssessmentQuestion(params: {
+  sessionId: string;
+  questionId: string;
+  choiceIndex: number;
+  signal?: AbortSignal;
+}): Promise<AssessmentAnswerResponse> {
+  const res = await safeFetch(apiUrl(`/assessments/${encodeURIComponent(params.sessionId)}/answer`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityRequestHeaders(),
+    },
+    body: JSON.stringify({
+      question_id: params.questionId,
+      choice_index: params.choiceIndex,
+    }),
+    signal: params.signal,
+  });
+  return parseJsonResponse<AssessmentAnswerResponse>(res);
+}
+
+export async function snoozeAssessment(params: {
+  sessionId: string;
+  signal?: AbortSignal;
+}): Promise<AssessmentSnoozeResponse> {
+  const res = await safeFetch(apiUrl(`/assessments/${encodeURIComponent(params.sessionId)}/snooze`), {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...communityRequestHeaders(),
+    },
+    signal: params.signal,
+  });
+  return parseJsonResponse<AssessmentSnoozeResponse>(res);
 }
 
 type CommunitySetApi = {
@@ -1228,6 +1319,15 @@ type CommunityHistoryItemApi = {
   feed_query?: string | null;
   active_index?: number | null;
   active_reel_id?: string | null;
+  recall?: {
+    recent_score?: number | null;
+    recent_question_count?: number | null;
+    recent_accuracy?: number | null;
+    rolling_accuracy?: number | null;
+    understood_concepts?: string[] | null;
+    revisit_concepts?: string[] | null;
+    completed_at?: string | null;
+  } | null;
 };
 
 let communityHistorySyncVersion = 0;
@@ -1413,6 +1513,12 @@ function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | null {
     return null;
   }
   const activeIndex = Number(row.active_index);
+  const recallRow = row.recall && typeof row.recall === "object" ? row.recall : null;
+  const recentScore = Number(recallRow?.recent_score);
+  const recentQuestionCount = Number(recallRow?.recent_question_count);
+  const recentAccuracy = Number(recallRow?.recent_accuracy);
+  const rollingAccuracy = Number(recallRow?.rolling_accuracy);
+  const completedAt = recallRow?.completed_at ? Date.parse(recallRow.completed_at) : Number.NaN;
   return {
     materialId,
     title,
@@ -1423,6 +1529,21 @@ function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | null {
     feedQuery: typeof row.feed_query === "string" && row.feed_query.trim() ? row.feed_query.trim() : undefined,
     activeIndex: Number.isFinite(activeIndex) && activeIndex >= 0 ? Math.floor(activeIndex) : undefined,
     activeReelId: typeof row.active_reel_id === "string" && row.active_reel_id.trim() ? row.active_reel_id.trim() : undefined,
+    recall: recallRow
+      ? {
+          recentScore: Number.isFinite(recentScore) ? Math.max(0, recentScore) : undefined,
+          recentQuestionCount: Number.isFinite(recentQuestionCount) ? Math.max(0, Math.floor(recentQuestionCount)) : undefined,
+          recentAccuracy: Number.isFinite(recentAccuracy) ? Math.max(0, Math.min(1, recentAccuracy)) : undefined,
+          rollingAccuracy: Number.isFinite(rollingAccuracy) ? Math.max(0, Math.min(1, rollingAccuracy)) : undefined,
+          understoodConcepts: Array.isArray(recallRow.understood_concepts)
+            ? recallRow.understood_concepts.map((value) => String(value || "").trim()).filter(Boolean).slice(0, 12)
+            : [],
+          revisitConcepts: Array.isArray(recallRow.revisit_concepts)
+            ? recallRow.revisit_concepts.map((value) => String(value || "").trim()).filter(Boolean).slice(0, 12)
+            : [],
+          completedAt: Number.isFinite(completedAt) && completedAt > 0 ? Math.floor(completedAt) : undefined,
+        }
+      : undefined,
   };
 }
 
@@ -1489,6 +1610,17 @@ export async function replaceCommunityHistory(items: StoredHistoryItem[]): Promi
           ? Math.max(0, Math.floor(item.activeIndex))
           : null,
         active_reel_id: item.activeReelId ?? null,
+        recall: item.recall
+          ? {
+              recent_score: item.recall.recentScore ?? null,
+              recent_question_count: item.recall.recentQuestionCount ?? null,
+              recent_accuracy: item.recall.recentAccuracy ?? null,
+              rolling_accuracy: item.recall.rollingAccuracy ?? null,
+              understood_concepts: item.recall.understoodConcepts,
+              revisit_concepts: item.recall.revisitConcepts,
+              completed_at: item.recall.completedAt ? new Date(item.recall.completedAt).toISOString() : null,
+            }
+          : null,
       })),
     }),
   });

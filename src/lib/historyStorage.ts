@@ -3,6 +3,16 @@
 export type StoredHistoryGenerationMode = "slow" | "fast";
 export type StoredHistorySource = "search" | "community";
 
+export type StoredRecallSummary = {
+  recentScore?: number;
+  recentQuestionCount?: number;
+  recentAccuracy?: number;
+  rollingAccuracy?: number;
+  understoodConcepts: string[];
+  revisitConcepts: string[];
+  completedAt?: number;
+};
+
 export type StoredHistoryItem = {
   materialId: string;
   title: string;
@@ -13,6 +23,7 @@ export type StoredHistoryItem = {
   feedQuery?: string;
   activeIndex?: number;
   activeReelId?: string;
+  recall?: StoredRecallSummary;
 };
 
 export const HISTORY_STORAGE_KEY = "studyreels-material-history";
@@ -58,6 +69,29 @@ export function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | nu
   const activeIndexRaw = Number(row.activeIndex);
   const activeIndex = Number.isFinite(activeIndexRaw) && activeIndexRaw >= 0 ? Math.floor(activeIndexRaw) : undefined;
   const activeReelId = typeof row.activeReelId === "string" && row.activeReelId.trim() ? row.activeReelId.trim() : undefined;
+  const recallRow = row.recall && typeof row.recall === "object" && !Array.isArray(row.recall)
+    ? row.recall as Record<string, unknown>
+    : null;
+  const recentScore = Number(recallRow?.recentScore);
+  const recentQuestionCount = Number(recallRow?.recentQuestionCount);
+  const recentAccuracy = Number(recallRow?.recentAccuracy);
+  const rollingAccuracy = Number(recallRow?.rollingAccuracy);
+  const completedAt = Number(recallRow?.completedAt);
+  const recall = recallRow
+    ? {
+        recentScore: Number.isFinite(recentScore) ? Math.max(0, recentScore) : undefined,
+        recentQuestionCount: Number.isFinite(recentQuestionCount) ? Math.max(0, Math.floor(recentQuestionCount)) : undefined,
+        recentAccuracy: Number.isFinite(recentAccuracy) ? Math.max(0, Math.min(1, recentAccuracy)) : undefined,
+        rollingAccuracy: Number.isFinite(rollingAccuracy) ? Math.max(0, Math.min(1, rollingAccuracy)) : undefined,
+        understoodConcepts: Array.isArray(recallRow.understoodConcepts)
+          ? recallRow.understoodConcepts.map((value) => String(value || "").trim()).filter(Boolean).slice(0, 12)
+          : [],
+        revisitConcepts: Array.isArray(recallRow.revisitConcepts)
+          ? recallRow.revisitConcepts.map((value) => String(value || "").trim()).filter(Boolean).slice(0, 12)
+          : [],
+        completedAt: Number.isFinite(completedAt) && completedAt > 0 ? Math.floor(completedAt) : undefined,
+      }
+    : undefined;
   return {
     materialId,
     title: title || "New Study Session",
@@ -68,6 +102,7 @@ export function normalizeStoredHistoryItem(raw: unknown): StoredHistoryItem | nu
     feedQuery: typeof row.feedQuery === "string" && row.feedQuery.trim() ? row.feedQuery.trim() : undefined,
     activeIndex,
     activeReelId,
+    recall,
   };
 }
 

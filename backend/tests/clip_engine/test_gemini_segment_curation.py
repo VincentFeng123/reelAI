@@ -232,3 +232,50 @@ class TestTopicThreading:
         tx = {"segments": _segs(2), "words": [], "duration": 60.0}
         segment_clips(tx, {}, topic="linear algebra")
         assert "linear algebra" in seen["system"]
+
+
+class TestLearningDetailsContract:
+    def test_summary_takeaways_match_reason_and_question_are_carried(self):
+        question = {
+            "prompt": "Which line states the central idea?",
+            "options": ["Line zero", "A tangent", "An outro", "A sponsor"],
+            "correct_index": 0,
+            "explanation": "Line zero introduces the idea taught in the clip.",
+        }
+        clip = _run([
+            _topic(
+                0,
+                1,
+                summary="The clip explains the central idea in two steps.",
+                takeaways=["First idea", "Second idea"],
+                match_reason="It directly explains the line used by this topic.",
+                assessment=question,
+            )
+        ])[0]
+        assert clip["summary"].startswith("The clip explains")
+        assert clip["takeaways"] == ["First idea", "Second idea"]
+        assert clip["match_reason"].startswith("It directly")
+        assert clip["assessment"] == question
+
+    @pytest.mark.parametrize(
+        "question",
+        [
+            {"prompt": "Q", "options": ["a", "a", "b", "c"], "correct_index": 0, "explanation": "line"},
+            {"prompt": "Q", "options": ["a", "b", "c", "d", "e"], "correct_index": 0, "explanation": "line"},
+            {"prompt": "Q", "options": ["a", "b", "c", "d"], "correct_index": 4, "explanation": "line"},
+            {"prompt": "Q", "options": ["a", "b", "c", "d"], "correct_index": True, "explanation": "line"},
+            {"prompt": "Q", "options": ["a", "b", "c", "d"], "correct_index": 1.5, "explanation": "line"},
+            {"prompt": "Q", "options": ["a", "b", "c", "d"], "correct_index": 0, "explanation": ""},
+            {"prompt": "Q", "options": ["a", "b", "c", "d"], "correct_index": 0, "explanation": "Unrelated generic praise"},
+        ],
+    )
+    def test_malformed_question_is_discarded_without_rejecting_clip(self, question):
+        clips = _run([_topic(0, 1, assessment=question)])
+        assert len(clips) == 1
+        assert clips[0]["assessment"] is None
+
+    def test_prompt_requests_complete_learning_detail_contract(self):
+        system, user = _prompts("[0] 00:00 line text", 1, topic="vectors")
+        prompt = system + user
+        for field in ("summary", "takeaways", "match_reason", "assessment", "correct_index", "explanation"):
+            assert field in prompt

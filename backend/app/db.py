@@ -193,6 +193,9 @@ CREATE TABLE IF NOT EXISTS reels (
     t_end REAL NOT NULL,
     transcript_snippet TEXT NOT NULL,
     takeaways_json TEXT NOT NULL,
+    ai_summary TEXT NOT NULL DEFAULT '',
+    match_reason TEXT NOT NULL DEFAULT '',
+    informativeness REAL,
     base_score REAL NOT NULL,
     difficulty REAL,
     created_at TEXT NOT NULL,
@@ -234,6 +237,116 @@ CREATE TABLE IF NOT EXISTS learner_material_progress (
 
 CREATE INDEX IF NOT EXISTS idx_learner_material_progress_material
 ON learner_material_progress(material_id);
+
+CREATE TABLE IF NOT EXISTS learner_reel_progress (
+    learner_id TEXT NOT NULL,
+    reel_id TEXT NOT NULL,
+    material_id TEXT NOT NULL,
+    max_fraction REAL NOT NULL DEFAULT 0.0,
+    completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (learner_id, reel_id),
+    FOREIGN KEY(reel_id) REFERENCES reels(id),
+    FOREIGN KEY(material_id) REFERENCES materials(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_learner_reel_progress_material_completed
+ON learner_reel_progress(learner_id, material_id, completed_at);
+
+CREATE TABLE IF NOT EXISTS reel_assessment_questions (
+    id TEXT PRIMARY KEY,
+    reel_id TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    correct_index INTEGER NOT NULL,
+    explanation TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(reel_id) REFERENCES reels(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reel_assessment_questions_reel_fingerprint
+ON reel_assessment_questions(reel_id, fingerprint);
+
+CREATE INDEX IF NOT EXISTS idx_reel_assessment_questions_reel
+ON reel_assessment_questions(reel_id);
+
+CREATE TABLE IF NOT EXISTS assessment_sessions (
+    id TEXT PRIMARY KEY,
+    learner_id TEXT NOT NULL,
+    material_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    current_index INTEGER NOT NULL DEFAULT 0,
+    question_count INTEGER NOT NULL DEFAULT 0,
+    correct_count INTEGER NOT NULL DEFAULT 0,
+    information_units REAL NOT NULL DEFAULT 0.0,
+    readiness_threshold REAL NOT NULL DEFAULT 3.5,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    snoozed_at TEXT,
+    FOREIGN KEY(material_id) REFERENCES materials(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assessment_sessions_one_pending
+ON assessment_sessions(learner_id, material_id)
+WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_assessment_sessions_history
+ON assessment_sessions(learner_id, material_id, status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS assessment_session_questions (
+    session_id TEXT NOT NULL,
+    question_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (session_id, question_id),
+    FOREIGN KEY(session_id) REFERENCES assessment_sessions(id),
+    FOREIGN KEY(question_id) REFERENCES reel_assessment_questions(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assessment_session_questions_position
+ON assessment_session_questions(session_id, position);
+
+CREATE TABLE IF NOT EXISTS assessment_attempts (
+    id TEXT PRIMARY KEY,
+    learner_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    question_id TEXT NOT NULL,
+    choice_index INTEGER NOT NULL,
+    is_correct INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(session_id) REFERENCES assessment_sessions(id),
+    FOREIGN KEY(question_id) REFERENCES reel_assessment_questions(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assessment_attempts_session_question
+ON assessment_attempts(session_id, question_id);
+
+CREATE INDEX IF NOT EXISTS idx_assessment_attempts_learner_question
+ON assessment_attempts(learner_id, question_id);
+
+CREATE TABLE IF NOT EXISTS assessment_concept_outcomes (
+    learner_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    material_id TEXT NOT NULL,
+    concept_id TEXT NOT NULL,
+    question_count INTEGER NOT NULL,
+    correct_count INTEGER NOT NULL,
+    accuracy REAL NOT NULL,
+    adjustment REAL NOT NULL DEFAULT 0.0,
+    source_reel_id TEXT,
+    source_video_id TEXT,
+    source_difficulty REAL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, concept_id),
+    FOREIGN KEY(session_id) REFERENCES assessment_sessions(id),
+    FOREIGN KEY(material_id) REFERENCES materials(id),
+    FOREIGN KEY(concept_id) REFERENCES concepts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_assessment_concept_outcomes_learner_material
+ON assessment_concept_outcomes(learner_id, material_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS retrieval_runs (
     id TEXT PRIMARY KEY,
@@ -457,6 +570,7 @@ CREATE TABLE IF NOT EXISTS community_material_history (
     feed_query TEXT,
     active_index INTEGER,
     active_reel_id TEXT,
+    recall_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(account_id, material_id),
     FOREIGN KEY(account_id) REFERENCES community_accounts(id)
 );
@@ -851,6 +965,17 @@ def _migrate_knowledge_level_sqlite(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reels ADD COLUMN difficulty REAL")
 
 
+def _migrate_reel_learning_content_sqlite(conn: sqlite3.Connection) -> None:
+    """Add one-pass learning-content columns to pre-existing reel tables."""
+    reel_cols = {r[1] for r in conn.execute("PRAGMA table_info(reels)").fetchall()}
+    if "ai_summary" not in reel_cols:
+        conn.execute("ALTER TABLE reels ADD COLUMN ai_summary TEXT NOT NULL DEFAULT ''")
+    if "match_reason" not in reel_cols:
+        conn.execute("ALTER TABLE reels ADD COLUMN match_reason TEXT NOT NULL DEFAULT ''")
+    if "informativeness" not in reel_cols:
+        conn.execute("ALTER TABLE reels ADD COLUMN informativeness REAL")
+
+
 def _ensure_reels_generation_index_sqlite(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_reels_generation_id ON reels(generation_id)")
 
@@ -932,6 +1057,7 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE community_sets ADD COLUMN IF NOT EXISTS dislikes INTEGER NOT NULL DEFAULT 0")
                 cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS active_index INTEGER")
                 cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS active_reel_id TEXT")
+                cur.execute("ALTER TABLE community_material_history ADD COLUMN IF NOT EXISTS recall_json TEXT NOT NULL DEFAULT '{}'")
                 cur.execute("ALTER TABLE community_account_settings ADD COLUMN IF NOT EXISTS autoplay_next_reel INTEGER NOT NULL DEFAULT 0")
                 cur.execute("UPDATE community_sets SET updated_at = created_at WHERE updated_at IS NULL OR BTRIM(updated_at) = ''")
                 cur.execute(
@@ -987,6 +1113,9 @@ def init_db() -> None:
                 cur.execute("ALTER TABLE materials ADD COLUMN IF NOT EXISTS knowledge_level TEXT NOT NULL DEFAULT 'beginner'")
                 cur.execute("ALTER TABLE materials ADD COLUMN IF NOT EXISTS level_adjustment REAL NOT NULL DEFAULT 0.0")
                 cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS difficulty REAL")
+                cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS ai_summary TEXT NOT NULL DEFAULT ''")
+                cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS match_reason TEXT NOT NULL DEFAULT ''")
+                cur.execute("ALTER TABLE reels ADD COLUMN IF NOT EXISTS informativeness REAL")
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
             conn.commit()
@@ -1092,6 +1221,10 @@ def init_db() -> None:
         except sqlite3.OperationalError:
             pass
         try:
+            conn.execute("ALTER TABLE community_material_history ADD COLUMN recall_json TEXT NOT NULL DEFAULT '{}'")
+        except sqlite3.OperationalError:
+            pass
+        try:
             conn.execute("ALTER TABLE community_account_settings ADD COLUMN autoplay_next_reel INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
@@ -1173,6 +1306,7 @@ def init_db() -> None:
                 pass
         _migrate_reels_unique_clip_index_sqlite(conn)
         _migrate_knowledge_level_sqlite(conn)
+        _migrate_reel_learning_content_sqlite(conn)
         _migrate_reel_feedback_uniqueness_sqlite(conn)
         conn.commit()
     finally:

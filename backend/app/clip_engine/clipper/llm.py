@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from typing import Optional, TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -59,6 +60,7 @@ def llm_json(
     provider: Optional[str] = None,
     model: Optional[str] = None,
     max_output_tokens: int = 8192,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> T:
     """Return a validated ``schema`` instance from Gemini.
 
@@ -70,7 +72,8 @@ def llm_json(
     from . import gemini_client
     try:
         raw = gemini_client.generate_json(system, user, schema, temperature=temperature,
-                                          model=model, max_output_tokens=max_output_tokens)
+                                          model=model, max_output_tokens=max_output_tokens,
+                                          should_cancel=should_cancel)
     except Exception as e:
         # One-shot fallback: an explicitly-requested model (e.g. the pro-preview
         # segmentation tier) that this key can't use must degrade to the default
@@ -82,12 +85,13 @@ def llm_json(
                        model, e, config.GEMINI_MODEL)
         model = config.GEMINI_MODEL
         raw = gemini_client.generate_json(system, user, schema, temperature=temperature,
-                                          model=model, max_output_tokens=max_output_tokens)
+                                          model=model, max_output_tokens=max_output_tokens,
+                                          should_cancel=should_cancel)
     try:
         return schema.model_validate_json(_strip_fences(raw))
     except (ValidationError, json.JSONDecodeError, ValueError):
         raw = gemini_client.generate_json(
             system, user + "\n\n" + _json_instruction(schema), schema, temperature=temperature,
-            model=model, max_output_tokens=max_output_tokens,
+            model=model, max_output_tokens=max_output_tokens, should_cancel=should_cancel,
         )
         return schema.model_validate_json(_strip_fences(raw))

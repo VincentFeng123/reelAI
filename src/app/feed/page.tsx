@@ -5,13 +5,16 @@ import { useRouter, useSearchParams } from "next/navigation";
 
 import { FullscreenLoadingScreen } from "@/components/FullscreenLoadingScreen";
 import { GenerationProgress } from "@/components/GenerationProgress";
+import { RecallCheck, type RecallAnswerReveal } from "@/components/RecallCheck";
 import { ReelCard } from "@/components/ReelCard";
 import {
   COMMUNITY_AUTH_CHANGED_EVENT,
+  answerAssessmentQuestion,
   askStudyChat,
   clearCommunityAuthSession,
   fetchCommunitySettings,
   fetchFeed,
+  fetchPendingAssessment,
   fetchRefinementStatus,
   generateReelsStream,
   isRequestInterruptedError,
@@ -19,7 +22,10 @@ import {
   isTransportError,
   queueCommunityHistorySync,
   readCommunityAuthSession,
+  reportReelProgress,
   sendFeedback,
+  snoozeAssessment,
+  startNextAssessment,
   updateMaterialLevel,
   uploadMaterial,
 } from "@/lib/api";
@@ -27,6 +33,7 @@ import { applySearchFeedSettingsToParams, mergeSearchFeedQuerySettings, readSear
 import {
   HISTORY_STORAGE_KEY,
   normalizeStoredHistoryItems as normalizeHistoryStorageItems,
+  type StoredRecallSummary,
   type StoredHistoryItem,
   writeScopedHistorySnapshot,
 } from "@/lib/historyStorage";
@@ -39,7 +46,7 @@ import {
   readStudyReelsSettings,
   setActiveStudyReelsSettingsScope,
 } from "@/lib/settings";
-import type { ChatMessage, Reel } from "@/lib/types";
+import type { AssessmentSession, AssessmentStatusResponse, ChatMessage, Reel } from "@/lib/types";
 
 const PAGE_SIZE = 5;
 const INITIAL_SLOW_PREFETCH = 4;
@@ -223,6 +230,79 @@ function ExpandableText({
       ) : null}
     </p>
   );
+}
+
+function detailSentences(value: string | undefined, limit = 4): string[] {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return [];
+  }
+  const chunks = normalized.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ?? [normalized];
+  const seen = new Set<string>();
+  const sentences: string[] = [];
+  for (const chunk of chunks) {
+    const sentence = chunk.trim();
+    const key = sentence.toLowerCase();
+    if (!sentence || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    sentences.push(sentence);
+    if (sentences.length >= limit) {
+      break;
+    }
+  }
+  return sentences;
+}
+
+function buildReelDetailContent(reel: Reel): { summary: string; takeaways: string[]; reason: string } {
+  const transcriptSentences = detailSentences(reel.transcript_snippet, 6);
+  const descriptionSentences = detailSentences(reel.video_description, 3);
+  const summary = reel.ai_summary?.trim()
+    || transcriptSentences.slice(0, 2).join(" ")
+    || descriptionSentences.slice(0, 2).join(" ")
+    || `This clip introduces ${reel.concept_title}.`;
+
+  const takeaways: string[] = [];
+  const seen = new Set<string>();
+  for (const item of [...(reel.takeaways ?? []), ...transcriptSentences]) {
+    const normalized = String(item || "").replace(/\s+/g, " ").trim();
+    const key = normalized.toLowerCase();
+    if (!normalized || seen.has(key) || normalized.toLowerCase() === summary.toLowerCase()) {
+      continue;
+    }
+    seen.add(key);
+    takeaways.push(normalized);
+    if (takeaways.length >= 4) {
+      break;
+    }
+  }
+  if (takeaways.length === 0) {
+    takeaways.push(summary);
+  }
+
+  const explicitReason = reel.match_reason?.trim() || reel.relevance_reason?.trim();
+  const terms = (reel.matched_terms ?? []).map((term) => term.trim()).filter(Boolean).slice(0, 5);
+  const transcriptEvidence = transcriptSentences[0]?.replace(/\s+/g, " ").trim();
+  const reason = explicitReason
+    || (terms.length > 0
+      ? `This clip connects to ${reel.concept_title} through ${terms.join(", ")}.`
+      : transcriptEvidence
+        ? `The transcript directly supports ${reel.concept_title}: ${transcriptEvidence.slice(0, 180)}`
+        : `This clip was selected because it explains ${reel.concept_title}, a concept in this study session.`);
+
+  return { summary, takeaways, reason };
+}
+
+function withAssessmentAccuracy(
+  session: AssessmentSession,
+  response: Pick<AssessmentStatusResponse, "recent_accuracy" | "rolling_accuracy">,
+): AssessmentSession {
+  return {
+    ...session,
+    recent_accuracy: session.recent_accuracy ?? response.recent_accuracy,
+    rolling_accuracy: session.rolling_accuracy ?? response.rolling_accuracy,
+  };
 }
 
 function parseMaterialSeeds(raw: string | null): Record<string, MaterialSeed> {
@@ -682,6 +762,7 @@ function mergeReelMetadata(current: Reel, next: Reel): Reel {
     ai_summary: preferNonEmptyString(next.ai_summary, current.ai_summary),
     transcript_snippet: preferNonEmptyString(next.transcript_snippet, current.transcript_snippet) ?? "",
     relevance_reason: preferNonEmptyString(next.relevance_reason, current.relevance_reason),
+    match_reason: preferNonEmptyString(next.match_reason, current.match_reason),
     takeaways: next.takeaways?.length ? next.takeaways : current.takeaways,
     matched_terms: next.matched_terms?.length ? next.matched_terms : current.matched_terms,
     captions: next.captions?.length ? next.captions : current.captions,
@@ -689,6 +770,7 @@ function mergeReelMetadata(current: Reel, next: Reel): Reel {
     ai_summary_truncated: next.ai_summary_truncated ?? current.ai_summary_truncated,
     transcript_snippet_truncated: next.transcript_snippet_truncated ?? current.transcript_snippet_truncated,
     relevance_score: Number.isFinite(next.relevance_score) ? next.relevance_score : current.relevance_score,
+    informativeness: Number.isFinite(next.informativeness) ? next.informativeness : current.informativeness,
     clip_duration_sec: Number.isFinite(next.clip_duration_sec) ? next.clip_duration_sec : current.clip_duration_sec,
     video_duration_sec: Number.isFinite(next.video_duration_sec) ? next.video_duration_sec : current.video_duration_sec,
   };
@@ -888,10 +970,23 @@ function FeedPageInner() {
   const [mutedPreference, setMutedPreference] = useState(true);
   const [autoplayEnabled, setAutoplayEnabled] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [playbackRestartToken, setPlaybackRestartToken] = useState(0);
   const [chatByReel, setChatByReel] = useState<Record<string, ChatMessage[]>>({});
   const [chatInput, setChatInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [chatPanelOpen, setChatPanelOpen] = useState(true);
+  const [assessmentSession, setAssessmentSession] = useState<AssessmentSession | null>(null);
+  const [assessmentQuestionIndex, setAssessmentQuestionIndex] = useState(0);
+  const [assessmentAnswerReveal, setAssessmentAnswerReveal] = useState<RecallAnswerReveal | null>(null);
+  const [assessmentAnswering, setAssessmentAnswering] = useState(false);
+  const [assessmentResultsVisible, setAssessmentResultsVisible] = useState(false);
+  const [assessmentPreparingFeed, setAssessmentPreparingFeed] = useState(false);
+  const [assessmentSnoozing, setAssessmentSnoozing] = useState(false);
+  const [assessmentError, setAssessmentError] = useState<string | null>(null);
+  const [assessmentBootstrapPending, setAssessmentBootstrapPending] = useState(true);
+  const [assessmentGatePending, setAssessmentGatePending] = useState(false);
+  const [assessmentAdvanceAfterClose, setAssessmentAdvanceAfterClose] = useState(false);
   const [rightPanelWidthPx, setRightPanelWidthPx] = useState(360);
   const [rightTopRatio, setRightTopRatio] = useState(0.62);
   const [generationMode, setGenerationMode] = useState<GenerationMode>("slow");
@@ -949,6 +1044,10 @@ function FeedPageInner() {
   const transportFailureStreakRef = useRef(0);
   const isBackgroundRecoveryRunningRef = useRef(false);
   const activeRecoveryRequestRef = useRef<ActiveRecoveryRequest | null>(null);
+  const chatAbortControllerRef = useRef<AbortController | null>(null);
+  const assessmentProgressMaxRef = useRef<Map<string, number>>(new Map());
+  const assessmentReadinessByReelRef = useRef<Map<string, boolean>>(new Map());
+  const assessmentBoundaryReelIdRef = useRef<string | null>(null);
   const activeSearchScopeRef = useRef<FeedSearchScope>({
     key: "",
     seq: 0,
@@ -960,6 +1059,11 @@ function FeedPageInner() {
     if (!scope.controller.signal.aborted) {
       scope.controller.abort();
     }
+  }, []);
+
+  const abortActiveChat = useCallback(() => {
+    chatAbortControllerRef.current?.abort();
+    chatAbortControllerRef.current = null;
   }, []);
 
   const resetActiveSearchRequestState = useCallback(() => {
@@ -1016,6 +1120,7 @@ function FeedPageInner() {
   useEffect(() => {
     renewActiveSearchScope();
     return () => {
+      abortActiveChat();
       clearRecoveryRetryTimer();
       clearRecoveryRequestIdleTimer();
       const current = activeSearchScopeRef.current;
@@ -1023,7 +1128,22 @@ function FeedPageInner() {
         current.controller.abort();
       }
     };
-  }, [clearRecoveryRequestIdleTimer, clearRecoveryRetryTimer, feedRouteKey, renewActiveSearchScope]);
+  }, [abortActiveChat, clearRecoveryRequestIdleTimer, clearRecoveryRetryTimer, feedRouteKey, renewActiveSearchScope]);
+
+  useEffect(() => {
+    const abortPageRequests = () => {
+      abortActiveChat();
+      abortActiveSearchScope();
+    };
+    window.addEventListener("beforeunload", abortPageRequests);
+    window.addEventListener("pagehide", abortPageRequests);
+    window.addEventListener("unload", abortPageRequests);
+    return () => {
+      window.removeEventListener("beforeunload", abortPageRequests);
+      window.removeEventListener("pagehide", abortPageRequests);
+      window.removeEventListener("unload", abortPageRequests);
+    };
+  }, [abortActiveChat, abortActiveSearchScope]);
 
   const normalizeClipKeyTime = useCallback((value: unknown): string => {
     const parsed = Number(value);
@@ -1483,6 +1603,7 @@ function FeedPageInner() {
     touchUpdatedAt?: boolean;
     reels?: Reel[];
     activeIndex?: number;
+    recall?: StoredRecallSummary;
   }) => {
     if (typeof window === "undefined" || !materialId) {
       return;
@@ -1507,6 +1628,7 @@ function FeedPageInner() {
         feedQuery: buildPersistedSearchFeedQuery() || existing?.feedQuery,
         activeIndex: currentIndex ?? existing?.activeIndex,
         activeReelId: currentReelId || existing?.activeReelId,
+        recall: options?.recall ?? existing?.recall,
       };
       const didChange =
         !existing
@@ -1517,7 +1639,8 @@ function FeedPageInner() {
         || existing.source !== nextEntry.source
         || existing.feedQuery !== nextEntry.feedQuery
         || existing.activeIndex !== nextEntry.activeIndex
-        || existing.activeReelId !== nextEntry.activeReelId;
+        || existing.activeReelId !== nextEntry.activeReelId
+        || JSON.stringify(existing.recall ?? null) !== JSON.stringify(nextEntry.recall ?? null);
       if (!didChange) {
         return;
       }
@@ -2231,6 +2354,77 @@ function FeedPageInner() {
     setSessionHydrated(true);
   }, [loading, materialId, sessionHydrated]);
 
+  useEffect(() => {
+    assessmentProgressMaxRef.current.clear();
+    assessmentReadinessByReelRef.current.clear();
+    assessmentBoundaryReelIdRef.current = null;
+    setAssessmentSession(null);
+    setAssessmentQuestionIndex(0);
+    setAssessmentAnswerReveal(null);
+    setAssessmentAnswering(false);
+    setAssessmentResultsVisible(false);
+    setAssessmentPreparingFeed(false);
+    setAssessmentSnoozing(false);
+    setAssessmentError(null);
+    setAssessmentGatePending(false);
+    setAssessmentAdvanceAfterClose(false);
+    setAssessmentBootstrapPending(Boolean(materialId));
+  }, [feedRouteKey, materialId]);
+
+  useEffect(() => {
+    if (!materialId) {
+      setAssessmentBootstrapPending(false);
+      return;
+    }
+    if (!settingsScopeReady || !sessionHydrated) {
+      return;
+    }
+    const searchScope = activeSearchScopeRef.current;
+    let cancelled = false;
+    setAssessmentBootstrapPending(true);
+
+    void (async () => {
+      try {
+        const materialIds = getFeedMaterialIds();
+        for (const pendingMaterialId of materialIds) {
+          const response = await fetchPendingAssessment({
+            materialId: pendingMaterialId,
+            signal: searchScope.controller.signal,
+          });
+          if (cancelled || !isSearchScopeActive(searchScope)) {
+            return;
+          }
+          const pendingSession = response.session;
+          if (
+            pendingSession
+            && pendingSession.questions.length > 0
+            && pendingSession.answered_count < pendingSession.question_count
+          ) {
+            const nextSession = withAssessmentAccuracy(pendingSession, response);
+            setAssessmentSession(nextSession);
+            setAssessmentQuestionIndex(clamp(nextSession.current_index, 0, nextSession.questions.length - 1));
+            setAssessmentAnswerReveal(null);
+            setAssessmentResultsVisible(false);
+            setAssessmentAdvanceAfterClose(false);
+            break;
+          }
+        }
+      } catch (error) {
+        if (!cancelled && isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
+          console.warn("Could not resume pending recall check:", error);
+        }
+      } finally {
+        if (!cancelled && isSearchScopeActive(searchScope)) {
+          setAssessmentBootstrapPending(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [getFeedMaterialIds, isSearchScopeActive, materialId, sessionHydrated, settingsScopeReady]);
+
   const refreshRefinedFeed = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
     if (!settingsScopeReady || feedMaterialIds.length === 0 || isRefreshingRefinementRef.current) {
@@ -2875,6 +3069,7 @@ function FeedPageInner() {
   }, []);
 
   useEffect(() => {
+    abortActiveChat();
     if (mobileDetailsCloseTimerRef.current) {
       clearTimeout(mobileDetailsCloseTimerRef.current);
       mobileDetailsCloseTimerRef.current = null;
@@ -2882,8 +3077,9 @@ function FeedPageInner() {
     setMobileDetailsClosing(false);
     setMobileDetailsOpen(false);
     setChatInput("");
+    setChatLoading(false);
     setChatError(null);
-  }, [activeIndex]);
+  }, [abortActiveChat, activeIndex]);
 
   const openMobileDetails = useCallback(() => {
     if (mobileDetailsCloseTimerRef.current) {
@@ -2898,6 +3094,8 @@ function FeedPageInner() {
     if (!mobileDetailsOpen || mobileDetailsClosing) {
       return;
     }
+    abortActiveChat();
+    setChatLoading(false);
     setMobileDetailsClosing(true);
     if (mobileDetailsCloseTimerRef.current) {
       clearTimeout(mobileDetailsCloseTimerRef.current);
@@ -2907,7 +3105,14 @@ function FeedPageInner() {
       setMobileDetailsClosing(false);
       mobileDetailsCloseTimerRef.current = null;
     }, MOBILE_DETAILS_CLOSE_MS);
-  }, [mobileDetailsClosing, mobileDetailsOpen]);
+  }, [abortActiveChat, mobileDetailsClosing, mobileDetailsOpen]);
+
+  const closeActiveChat = useCallback(() => {
+    abortActiveChat();
+    setChatLoading(false);
+    setChatError(null);
+    setChatPanelOpen(false);
+  }, [abortActiveChat]);
 
   useEffect(() => {
     if (typeof window === "undefined" || !materialId || !sessionHydrated) {
@@ -3256,6 +3461,7 @@ function FeedPageInner() {
   );
 
   const activeReel = reels[activeIndex] ?? null;
+  const assessmentPlaybackBlocked = assessmentBootstrapPending || assessmentGatePending || Boolean(assessmentSession);
   const [descriptionExpanded, setDescriptionExpanded] = useState(false);
   const [descriptionHydrating, setDescriptionHydrating] = useState(false);
   const atEndOfVisibleReels = reels.length > 0 && activeIndex >= reels.length - 1;
@@ -3319,20 +3525,10 @@ function FeedPageInner() {
     setDescriptionExpanded((prev) => !prev);
   }, [activeVideoDescription.compacted, descriptionExpanded, refreshRefinedFeed]);
 
-  const activeRelevanceReason = useMemo(() => {
-    if (!activeReel) {
-      return "";
-    }
-    const reason = activeReel.relevance_reason?.trim();
-    if (reason) {
-      return reason;
-    }
-    const terms = (activeReel.matched_terms ?? []).map((term) => term.trim()).filter(Boolean).slice(0, 5);
-    if (terms.length > 0) {
-      return `Matched terms from your material: ${terms.join(", ")}.`;
-    }
-    return "This reel was selected using semantic and keyword overlap with your uploaded material.";
-  }, [activeReel]);
+  const activeReelDetails = useMemo(
+    () => (activeReel ? buildReelDetailContent(activeReel) : { summary: "", takeaways: [], reason: "" }),
+    [activeReel],
+  );
 
   const activeFeedback = useMemo(() => {
     if (!activeReel) {
@@ -3364,6 +3560,11 @@ function FeedPageInner() {
       return;
     }
 
+    abortActiveChat();
+    const controller = new AbortController();
+    chatAbortControllerRef.current = controller;
+    const reelId = activeReel.reel_id;
+
     setChatError(null);
     setChatLoading(true);
 
@@ -3383,6 +3584,7 @@ function FeedPageInner() {
         activeReel.video_description,
         activeReel.ai_summary,
         activeReel.relevance_reason,
+        activeReel.match_reason,
         ...(activeReel.matched_terms ?? []),
         activeReel.transcript_snippet,
         ...activeReel.takeaways,
@@ -3394,27 +3596,37 @@ function FeedPageInner() {
         topic: activeReel.concept_title,
         text: contextText,
         history: nextHistory.slice(-8),
+        signal: controller.signal,
       });
+      if (controller.signal.aborted || chatAbortControllerRef.current !== controller) {
+        return;
+      }
       setChatByReel((prev) => {
-        const current = prev[activeReel.reel_id] ?? nextHistory;
+        const current = prev[reelId] ?? nextHistory;
         return {
           ...prev,
-          [activeReel.reel_id]: [...current, { role: "assistant", content: result.answer }],
+          [reelId]: [...current, { role: "assistant", content: result.answer }],
         };
       });
     } catch (e) {
+      if (controller.signal.aborted || isRequestInterruptedError(e) || chatAbortControllerRef.current !== controller) {
+        return;
+      }
       setChatError(e instanceof Error ? e.message : "Chat failed");
       setChatByReel((prev) => {
-        const current = prev[activeReel.reel_id] ?? nextHistory;
+        const current = prev[reelId] ?? nextHistory;
         return {
           ...prev,
-          [activeReel.reel_id]: [...current, { role: "assistant", content: "I could not reply right now. Try again." }],
+          [reelId]: [...current, { role: "assistant", content: "I could not reply right now. Try again." }],
         };
       });
     } finally {
-      setChatLoading(false);
+      if (chatAbortControllerRef.current === controller) {
+        chatAbortControllerRef.current = null;
+        setChatLoading(false);
+      }
     }
-  }, [activeReel, chatByReel, chatInput, chatLoading]);
+  }, [abortActiveChat, activeReel, chatByReel, chatInput, chatLoading]);
 
   const rerankUnseenTail = useCallback(async () => {
     const feedMaterialIds = getFeedMaterialIds();
@@ -3422,6 +3634,7 @@ function FeedPageInner() {
     if (!settingsScopeReady || feedMaterialIds.length === 0 || currentReels.length === 0) {
       return;
     }
+    const searchScope = activeSearchScopeRef.current;
 
     const currentIndex = clamp(activeIndexRef.current, 0, currentReels.length - 1);
     const watchedPrefix = currentReels.slice(0, currentIndex + 1);
@@ -3439,6 +3652,9 @@ function FeedPageInner() {
         try {
           const pages: Array<Awaited<ReturnType<typeof fetchFeed>>> = [];
           for (let pageNumber = 1; pageNumber <= pagesToFetch; pageNumber += 1) {
+            if (!isSearchScopeActive(searchScope)) {
+              return null;
+            }
             pages.push(await fetchFeed({
               materialId: id,
               page: pageNumber,
@@ -3453,6 +3669,7 @@ function FeedPageInner() {
               targetClipDurationSec: tuning.targetClipDurationSec,
               targetClipDurationMinSec: tuning.targetClipDurationMinSec,
               targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
+              signal: searchScope.controller.signal,
             }));
           }
           return pages;
@@ -3461,7 +3678,7 @@ function FeedPageInner() {
         }
       }),
     );
-    if (responses.some((response) => response === null)) {
+    if (!isSearchScopeActive(searchScope) || responses.some((response) => response === null)) {
       return;
     }
     const successful = responses as Array<Array<Awaited<ReturnType<typeof fetchFeed>>>>;
@@ -3493,9 +3710,268 @@ function FeedPageInner() {
     getFeedMaterialIds,
     getFeedTuningSettings,
     interleaveReelBatches,
+    isSearchScopeActive,
     settingsScopeReady,
     updateSessionReels,
   ]);
+
+  const reportActiveReelProgress = useCallback((reel: Reel, maxFraction: number, naturalEnd: boolean) => {
+    const reelId = String(reel.reel_id || "").trim();
+    const progressMaterialId = String(reel.material_id || materialId || "").trim();
+    if (!reelId || !progressMaterialId || reelId.startsWith("community:")) {
+      return;
+    }
+    const normalizedFraction = clamp(maxFraction, 0, 1);
+    const previousFraction = assessmentProgressMaxRef.current.get(reelId) ?? 0;
+    if (normalizedFraction <= previousFraction || normalizedFraction < 0.8) {
+      return;
+    }
+    assessmentProgressMaxRef.current.set(reelId, normalizedFraction);
+    if (naturalEnd) {
+      return;
+    }
+    const searchScope = activeSearchScopeRef.current;
+    void reportReelProgress({
+      reelId,
+      maxFraction: normalizedFraction,
+      signal: searchScope.controller.signal,
+    })
+      .then((response) => {
+        if (isSearchScopeActive(searchScope)) {
+          assessmentReadinessByReelRef.current.set(reelId, response.assessment_ready);
+        }
+      })
+      .catch((error) => {
+        if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
+          console.warn(`Could not save reel progress for ${reelId}:`, error);
+        }
+      });
+  }, [isSearchScopeActive, materialId]);
+
+  const openAssessmentAtBoundary = useCallback(async (reel: Reel) => {
+    const reelId = String(reel.reel_id || "").trim();
+    const progressMaterialId = String(reel.material_id || materialId || "").trim();
+    const searchScope = activeSearchScopeRef.current;
+    const releaseBoundary = () => {
+      if (!isSearchScopeActive(searchScope)) {
+        return;
+      }
+      assessmentBoundaryReelIdRef.current = null;
+      setAssessmentGatePending(false);
+      if (autoplayEnabled) {
+        requestAutoplayAdvance();
+      } else {
+        setPlaybackRestartToken((previous) => previous + 1);
+      }
+    };
+
+    try {
+      const progress = await reportReelProgress({
+        reelId,
+        maxFraction: 1,
+        signal: searchScope.controller.signal,
+      });
+      if (!isSearchScopeActive(searchScope) || assessmentBoundaryReelIdRef.current !== reelId) {
+        return;
+      }
+      if (!progress.assessment_ready) {
+        assessmentReadinessByReelRef.current.set(reelId, false);
+        releaseBoundary();
+        return;
+      }
+      assessmentReadinessByReelRef.current.set(reelId, true);
+      const response = await startNextAssessment({
+        materialId: progressMaterialId,
+        signal: searchScope.controller.signal,
+      });
+      if (!isSearchScopeActive(searchScope) || assessmentBoundaryReelIdRef.current !== reelId) {
+        return;
+      }
+      if (!response.session || response.session.questions.length === 0) {
+        releaseBoundary();
+        return;
+      }
+      const nextSession = withAssessmentAccuracy(response.session, response);
+      setAssessmentSession(nextSession);
+      setAssessmentQuestionIndex(clamp(nextSession.current_index, 0, nextSession.questions.length - 1));
+      setAssessmentAnswerReveal(null);
+      setAssessmentResultsVisible(nextSession.answered_count >= nextSession.question_count);
+      setAssessmentAdvanceAfterClose(true);
+      setAssessmentGatePending(false);
+      setAssessmentError(null);
+    } catch (error) {
+      if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
+        console.warn("Could not start recall check:", error);
+      }
+      releaseBoundary();
+    }
+  }, [autoplayEnabled, isSearchScopeActive, materialId, requestAutoplayAdvance]);
+
+  const handleAssessmentClipBoundary = useCallback((reel: Reel): boolean => {
+    const reelId = String(reel.reel_id || "").trim();
+    const progressMaterialId = String(reel.material_id || materialId || "").trim();
+    if (!reelId || !progressMaterialId || reelId.startsWith("community:")) {
+      return false;
+    }
+    if (assessmentReadinessByReelRef.current.get(reelId) === false) {
+      return false;
+    }
+    if (assessmentBoundaryReelIdRef.current === reelId || assessmentGatePending || assessmentSession) {
+      return true;
+    }
+    assessmentBoundaryReelIdRef.current = reelId;
+    setAssessmentGatePending(true);
+    setAssessmentError(null);
+    void openAssessmentAtBoundary(reel);
+    return true;
+  }, [assessmentGatePending, assessmentSession, materialId, openAssessmentAtBoundary]);
+
+  const persistAssessmentRecall = useCallback((session: AssessmentSession) => {
+    const questionCount = Math.max(0, session.question_count);
+    const scoreAccuracy = clamp(Number(session.score) || 0, 0, 1);
+    const correctCount = Math.round(scoreAccuracy * questionCount);
+    const recentAccuracy = Number.isFinite(session.recent_accuracy)
+      ? clamp(Number(session.recent_accuracy), 0, 1)
+      : questionCount > 0
+        ? scoreAccuracy
+        : undefined;
+    persistCurrentSearchHistoryEntry({
+      recall: {
+        recentScore: correctCount,
+        recentQuestionCount: questionCount,
+        recentAccuracy,
+        rollingAccuracy: Number.isFinite(session.rolling_accuracy)
+          ? clamp(Number(session.rolling_accuracy), 0, 1)
+          : undefined,
+        understoodConcepts: session.understood_concepts,
+        revisitConcepts: session.revisit_concepts,
+        completedAt: Date.now(),
+      },
+    });
+  }, [persistCurrentSearchHistoryEntry]);
+
+  const submitAssessmentAnswer = useCallback(async (choiceIndex: number) => {
+    if (!assessmentSession || assessmentAnswering || assessmentAnswerReveal) {
+      return;
+    }
+    const question = assessmentSession.questions[assessmentQuestionIndex];
+    if (!question || question.options.length !== 4 || choiceIndex < 0 || choiceIndex >= 4) {
+      setAssessmentError("This question is unavailable. Choose Later to continue learning.");
+      return;
+    }
+    const searchScope = activeSearchScopeRef.current;
+    setAssessmentAnswering(true);
+    setAssessmentError(null);
+    try {
+      const response = await answerAssessmentQuestion({
+        sessionId: assessmentSession.id,
+        questionId: question.id,
+        choiceIndex,
+        signal: searchScope.controller.signal,
+      });
+      if (!isSearchScopeActive(searchScope) || response.session.id !== assessmentSession.id) {
+        return;
+      }
+      const nextSession: AssessmentSession = {
+        ...response.session,
+        recent_accuracy: response.session.recent_accuracy ?? assessmentSession.recent_accuracy,
+        rolling_accuracy: response.session.rolling_accuracy ?? assessmentSession.rolling_accuracy,
+      };
+      setAssessmentSession(nextSession);
+      setAssessmentAnswerReveal({
+        questionId: question.id,
+        choiceIndex,
+        correct: response.correct,
+        correctIndex: response.correct_index,
+        explanation: response.explanation,
+      });
+    } catch (error) {
+      if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
+        setAssessmentError(error instanceof Error ? error.message : "Could not save that answer.");
+      }
+    } finally {
+      if (isSearchScopeActive(searchScope)) {
+        setAssessmentAnswering(false);
+      }
+    }
+  }, [assessmentAnswerReveal, assessmentAnswering, assessmentQuestionIndex, assessmentSession, isSearchScopeActive]);
+
+  const showNextAssessmentQuestion = useCallback(() => {
+    if (!assessmentSession || !assessmentAnswerReveal) {
+      return;
+    }
+    if (assessmentSession.answered_count >= assessmentSession.question_count) {
+      setAssessmentResultsVisible(true);
+      persistAssessmentRecall(assessmentSession);
+      setAssessmentPreparingFeed(true);
+      const searchScope = activeSearchScopeRef.current;
+      void rerankUnseenTail().finally(() => {
+        if (isSearchScopeActive(searchScope)) {
+          setAssessmentPreparingFeed(false);
+        }
+      });
+      return;
+    }
+    const nextIndex = clamp(
+      Math.max(assessmentQuestionIndex + 1, assessmentSession.current_index),
+      0,
+      assessmentSession.questions.length - 1,
+    );
+    setAssessmentQuestionIndex(nextIndex);
+    setAssessmentAnswerReveal(null);
+    setAssessmentError(null);
+  }, [assessmentAnswerReveal, assessmentQuestionIndex, assessmentSession, isSearchScopeActive, persistAssessmentRecall, rerankUnseenTail]);
+
+  const closeAssessmentAndContinue = useCallback(() => {
+    const shouldAdvance = assessmentAdvanceAfterClose;
+    assessmentBoundaryReelIdRef.current = null;
+    setAssessmentSession(null);
+    setAssessmentQuestionIndex(0);
+    setAssessmentAnswerReveal(null);
+    setAssessmentAnswering(false);
+    setAssessmentResultsVisible(false);
+    setAssessmentPreparingFeed(false);
+    setAssessmentSnoozing(false);
+    setAssessmentError(null);
+    setAssessmentGatePending(false);
+    setAssessmentAdvanceAfterClose(false);
+    if (shouldAdvance) {
+      requestAutoplayAdvance();
+    }
+  }, [assessmentAdvanceAfterClose, requestAutoplayAdvance]);
+
+  const snoozeActiveAssessment = useCallback(async () => {
+    if (!assessmentSession || assessmentSnoozing) {
+      return;
+    }
+    const searchScope = activeSearchScopeRef.current;
+    setAssessmentSnoozing(true);
+    setAssessmentError(null);
+    try {
+      await snoozeAssessment({
+        sessionId: assessmentSession.id,
+        signal: searchScope.controller.signal,
+      });
+      if (isSearchScopeActive(searchScope)) {
+        closeAssessmentAndContinue();
+      }
+    } catch (error) {
+      if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
+        setAssessmentError(error instanceof Error ? error.message : "Could not snooze this check.");
+        setAssessmentSnoozing(false);
+      }
+    }
+  }, [assessmentSession, assessmentSnoozing, closeAssessmentAndContinue, isSearchScopeActive]);
+
+  const handleActivePlaybackProgress = useCallback((maxFraction: number, naturalEnd: boolean) => {
+    if (activeReel) {
+      reportActiveReelProgress(activeReel, maxFraction, naturalEnd);
+    }
+  }, [activeReel, reportActiveReelProgress]);
+
+  const handleActiveClipBoundary = useCallback((): boolean => {
+    return activeReel ? handleAssessmentClipBoundary(activeReel) : false;
+  }, [activeReel, handleAssessmentClipBoundary]);
 
   const submitActiveFeedback = useCallback(
     async (action: FeedbackAction) => {
@@ -3589,6 +4065,7 @@ function FeedPageInner() {
   }, [communityHandoffIdParam, communityPreviewReel, communitySetIdParam, returnCommunitySetIdParam, returnTabParam]);
 
   const navigateBackToPreviousPage = useCallback(() => {
+    abortActiveChat();
     abortActiveSearchScope();
     if (returnTabParam === "search" || returnTabParam === "community") {
       router.push(feedFallbackPath);
@@ -3612,7 +4089,7 @@ function FeedPageInner() {
       }
     }
     router.push(feedFallbackPath);
-  }, [abortActiveSearchScope, feedFallbackPath, returnTabParam, router]);
+  }, [abortActiveChat, abortActiveSearchScope, feedFallbackPath, returnTabParam, router]);
 
   const cycleLevel = useCallback(async () => {
     if (!materialId || !knowledgeLevel || cycleLevelInFlightRef.current) {
@@ -3702,6 +4179,31 @@ function FeedPageInner() {
         </div>
       ) : null}
 
+      {assessmentSession ? (
+        <RecallCheck
+          session={assessmentSession}
+          questionIndex={assessmentQuestionIndex}
+          answerReveal={assessmentAnswerReveal}
+          answering={assessmentAnswering}
+          showResults={assessmentResultsVisible}
+          preparingFeed={assessmentPreparingFeed}
+          snoozing={assessmentSnoozing}
+          error={assessmentError}
+          onAnswer={submitAssessmentAnswer}
+          onNextQuestion={showNextAssessmentQuestion}
+          onLater={snoozeActiveAssessment}
+          onContinue={closeAssessmentAndContinue}
+        />
+      ) : null}
+
+      {(assessmentBootstrapPending || assessmentGatePending) && !assessmentSession ? (
+        <div className="fixed inset-0 z-[10000] grid place-items-center bg-black/86 px-6 text-white backdrop-blur-xl" role="status" aria-live="polite">
+          <div className="rounded-full border border-white/16 bg-white/[0.05] px-5 py-3 text-xs font-semibold uppercase tracking-[0.14em] text-white/72">
+            {assessmentGatePending ? "Preparing recall check..." : "Loading learning progress..."}
+          </div>
+        </div>
+      ) : null}
+
       <div ref={desktopShellRef} className="h-full min-h-[100dvh] md:min-h-0 lg:flex">
         <section className="relative h-[100dvh] min-h-[100dvh] md:h-full md:min-h-0 lg:min-w-0 lg:flex-1">
           {activeReel && !mobileDetailsOpen ? (
@@ -3729,14 +4231,17 @@ function FeedPageInner() {
                 <div key={reel.reel_id} className="h-[calc(100dvh-2rem)] shrink-0 grow-0 basis-full md:h-full lg:h-full">
                   <ReelCard
                     reel={reel}
-                    isActive={index === activeIndex}
+                    isActive={index === activeIndex && !assessmentPlaybackBlocked}
                     mutedPreference={mutedPreference}
                     onMutedPreferenceChange={setMutedPreference}
                     autoplayEnabled={autoplayEnabled}
                     onAutoplayEnabledChange={setAutoplayEnabled}
                     playbackRate={playbackRate}
+                    playbackRestartToken={playbackRestartToken}
                     onPlaybackRateChange={setPlaybackRate}
                     onRequestNextReel={index === activeIndex ? requestAutoplayAdvance : undefined}
+                    onPlaybackProgress={index === activeIndex ? handleActivePlaybackProgress : undefined}
+                    onClipBoundary={index === activeIndex ? handleActiveClipBoundary : undefined}
                     onOpenContent={index === activeIndex ? openMobileDetails : undefined}
                   />
                 </div>
@@ -3815,6 +4320,23 @@ function FeedPageInner() {
                 <h2 className="pr-8 text-xl font-bold leading-tight">{activeReel.concept_title}</h2>
 
                 <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">AI Summary</p>
+                  <p className="break-words leading-snug [overflow-wrap:anywhere]">{activeReelDetails.summary}</p>
+                </div>
+
+                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                  <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Key Takeaways</p>
+                  <ul className="space-y-1.5">
+                    {activeReelDetails.takeaways.map((takeaway) => (
+                      <li key={`mobile-takeaway-${activeReel.reel_id}-${takeaway}`} className="flex items-start gap-2">
+                        <span aria-hidden="true" className="mt-[0.45rem] h-1 w-1 shrink-0 rounded-full bg-white/60" />
+                        <span className="break-words [overflow-wrap:anywhere]">{takeaway}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Video Description</p>
                   <ExpandableText
                     text={activeVideoDescription.text}
@@ -3838,7 +4360,7 @@ function FeedPageInner() {
                       </span>
                     ) : null}
                   </div>
-                  <p className="break-words [overflow-wrap:anywhere]">{activeRelevanceReason}</p>
+                  <p className="break-words [overflow-wrap:anywhere]">{activeReelDetails.reason}</p>
                   {(activeReel.matched_terms?.length ?? 0) > 0 ? (
                     <div className="mt-2 flex flex-wrap gap-1.5">
                       {(activeReel.matched_terms ?? []).slice(0, 6).map((term) => (
@@ -3924,6 +4446,23 @@ function FeedPageInner() {
                 <h2 className="text-2xl font-bold leading-tight">{activeReel.concept_title}</h2>
 
                 <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">AI Summary</p>
+                  <p className="break-words leading-snug [overflow-wrap:anywhere]">{activeReelDetails.summary}</p>
+                </div>
+
+                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
+                  <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Key Takeaways</p>
+                  <ul className="space-y-1.5">
+                    {activeReelDetails.takeaways.map((takeaway) => (
+                      <li key={`desktop-takeaway-${activeReel.reel_id}-${takeaway}`} className="flex items-start gap-2">
+                        <span aria-hidden="true" className="mt-[0.45rem] h-1 w-1 shrink-0 rounded-full bg-white/60" />
+                        <span className="break-words [overflow-wrap:anywhere]">{takeaway}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                <div className="mt-3 min-w-0 rounded-2xl border border-white/20 bg-black/55 p-3 text-sm text-white/90">
                   <p className="mb-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-white/60">Video Description</p>
                   <ExpandableText
                     text={activeVideoDescription.text}
@@ -3947,7 +4486,7 @@ function FeedPageInner() {
                       </span>
                     ) : null}
                   </div>
-                  <p className="break-words [overflow-wrap:anywhere]">{activeRelevanceReason}</p>
+                  <p className="break-words [overflow-wrap:anywhere]">{activeReelDetails.reason}</p>
                   {(activeReel.matched_terms?.length ?? 0) > 0 ? (
                     <div className="mt-2 flex flex-wrap gap-1.5">
                       {(activeReel.matched_terms ?? []).slice(0, 6).map((term) => (
@@ -4018,9 +4557,29 @@ function FeedPageInner() {
           <section className="flex min-h-0 min-w-0 flex-col rounded-3xl border border-white/20 bg-black/62 px-4 pt-4 pb-0 text-white">
             <div className="mb-2 flex items-center justify-between">
               <p className="text-xs font-semibold uppercase tracking-[0.11em] text-white/75">AI Chat</p>
+              {chatPanelOpen ? (
+                <button
+                  type="button"
+                  onClick={closeActiveChat}
+                  aria-label="Close AI chat"
+                  className="grid h-7 w-7 place-items-center rounded-lg text-white/55 transition hover:bg-white/10 hover:text-white"
+                >
+                  <i className="fa-solid fa-xmark text-xs" aria-hidden="true" />
+                </button>
+              ) : null}
             </div>
 
-            {!activeReel ? (
+            {!chatPanelOpen ? (
+              <div className="grid min-h-0 flex-1 place-items-center">
+                <button
+                  type="button"
+                  onClick={() => setChatPanelOpen(true)}
+                  className="rounded-full border border-white/18 bg-white/[0.05] px-4 py-2 text-xs font-semibold text-white/72 transition hover:border-white/32 hover:text-white"
+                >
+                  Open AI Chat
+                </button>
+              </div>
+            ) : !activeReel ? (
               <div className="flex h-full items-center justify-center text-sm text-white/70">Open a reel to chat.</div>
             ) : (
               <>

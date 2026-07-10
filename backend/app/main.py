@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import ipaddress
@@ -47,6 +48,11 @@ from .db import (
     upsert,
 )
 from .models import (
+    AssessmentAnswerRequest,
+    AssessmentAnswerResponse,
+    AssessmentNextRequest,
+    AssessmentSnoozeResponse,
+    AssessmentWrapperResponse,
     ChatRequest,
     ChatResponse,
     CommunityAuthMeResponse,
@@ -98,6 +104,8 @@ from .models import (
     ReelsCanGenerateResponse,
     ReelsGenerateRequest,
     ReelsGenerateResponse,
+    ReelProgressRequest,
+    ReelProgressResponse,
     AdminSimulationRequest,
     AdminDiagnoseTopicRequest,
     DiagnoseTopicResponse,
@@ -105,6 +113,7 @@ from .models import (
     SimulationResponse,
     SimulationTopicResult,
 )
+from .services.assessments import AssessmentCancelledError, AssessmentService
 from .services.email import send_welcome_email
 from .services.embeddings import EmbeddingService
 from .services.liveness import is_video_alive
@@ -130,7 +139,7 @@ from .ingestion.errors import (
     TranscriptionError as IngestTranscriptionError,
     UnsupportedSourceError as IngestUnsupportedSourceError,
 )
-from .clip_engine.errors import EngineError as ClipEngineError
+from .clip_engine.errors import CancellationError as ClipEngineCancellationError, EngineError as ClipEngineError
 from .ingestion.models import (
     IngestFeedRequest,
     IngestFeedResult,
@@ -280,6 +289,7 @@ ingestion_pipeline = IngestionPipeline(
     serverless_mode=SERVERLESS_MODE,
 )
 reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service, ingestion_pipeline=ingestion_pipeline)
+assessment_service = AssessmentService()
 
 
 def _reels_generate_stream_deadline_sec() -> float:
@@ -360,6 +370,8 @@ REELS_RATE_LIMIT_PER_WINDOW = 12
 REELS_GENERATE_RATE_LIMIT_PER_WINDOW = 36
 REELS_REFINEMENT_STATUS_RATE_LIMIT_PER_WINDOW = 120
 FEEDBACK_RATE_LIMIT_PER_WINDOW = 60
+ASSESSMENT_PROGRESS_RATE_LIMIT_PER_WINDOW = 240
+ASSESSMENT_ACTION_RATE_LIMIT_PER_WINDOW = 60
 COMMUNITY_WRITE_RATE_LIMIT_PER_WINDOW = 12
 COMMUNITY_DURATION_RATE_LIMIT_PER_WINDOW = 30
 COMMUNITY_AUTH_RATE_LIMIT_PER_WINDOW = 20
@@ -4555,6 +4567,8 @@ def _ensure_generation_for_request(
             learner_id=learner_id,
         )
         active_job = _fetch_refinement_job_for_generation(conn, active_generation_id)
+        if should_cancel is not None and should_cancel():
+            raise GenerationCancelledError("Generation cancelled.")
         active_job = _queue_refinement_if_needed(
             conn,
             material_id=material_id,
@@ -4640,6 +4654,8 @@ def _ensure_generation_for_request(
             )
             return {**response_payload, "request_key": request_key}
 
+    if should_cancel is not None and should_cancel():
+        raise GenerationCancelledError("Generation cancelled.")
     generation_id = _create_generation_row(
         conn,
         material_id=material_id,
@@ -5042,7 +5058,9 @@ def _resolve_learner_identity(
     return None
 
 
-def _serialize_community_history_item(row: dict) -> CommunityHistoryItemOut:
+def _serialize_community_history_item(
+    row: dict, *, assessment_stats: dict[str, Any] | None = None
+) -> CommunityHistoryItemOut:
     generation_mode = str(row.get("generation_mode") or "").strip().lower()
     if generation_mode not in {"slow", "fast"}:
         generation_mode = "slow"
@@ -5052,6 +5070,38 @@ def _serialize_community_history_item(row: dict) -> CommunityHistoryItemOut:
     feed_query_raw = str(row.get("feed_query") or "").strip()
     active_index = _to_int(row.get("active_index"), -1)
     active_reel_id_raw = str(row.get("active_reel_id") or "").strip()
+    recall: dict[str, Any] | None = None
+    raw_recall = row.get("recall_json")
+    if isinstance(raw_recall, dict):
+        recall = raw_recall
+    elif raw_recall:
+        try:
+            parsed_recall = json.loads(str(raw_recall))
+            if isinstance(parsed_recall, dict) and parsed_recall:
+                recall = parsed_recall
+        except (TypeError, json.JSONDecodeError):
+            recall = None
+    recent_recall_accuracy = row.get("recent_recall_accuracy")
+    rolling_recall_accuracy = row.get("rolling_recall_accuracy")
+    if recall:
+        if recent_recall_accuracy is None:
+            recent_recall_accuracy = recall.get("recent_accuracy")
+        if rolling_recall_accuracy is None:
+            rolling_recall_accuracy = recall.get("rolling_accuracy")
+    if assessment_stats and int(assessment_stats.get("completed_checks") or 0) > 0:
+        recall = dict(recall or {})
+        authoritative_fields = {
+            "recent_score": assessment_stats.get("recent_correct"),
+            "recent_question_count": assessment_stats.get("recent_total"),
+            "recent_accuracy": assessment_stats.get("recent_accuracy"),
+            "rolling_accuracy": assessment_stats.get("rolling_accuracy"),
+            "completed_at": assessment_stats.get("last_completed_at"),
+        }
+        recall.update(
+            {key: value for key, value in authoritative_fields.items() if value is not None}
+        )
+        recent_recall_accuracy = assessment_stats.get("recent_accuracy")
+        rolling_recall_accuracy = assessment_stats.get("rolling_accuracy")
     return CommunityHistoryItemOut(
         material_id=str(row.get("material_id") or "").strip(),
         title=str(row.get("title") or "").strip() or "New Study Session",
@@ -5062,6 +5112,9 @@ def _serialize_community_history_item(row: dict) -> CommunityHistoryItemOut:
         feed_query=feed_query_raw or None,
         active_index=active_index if active_index >= 0 else None,
         active_reel_id=active_reel_id_raw or None,
+        recall=recall,
+        recent_recall_accuracy=recent_recall_accuracy,
+        rolling_recall_accuracy=rolling_recall_accuracy,
     )
 
 
@@ -5084,6 +5137,11 @@ def _normalize_community_history_items(payload_items) -> list[dict[str, object]]
         feed_query_raw = str(item.feed_query or "").strip()
         active_index = max(0, int(item.active_index)) if item.active_index is not None else None
         active_reel_id_raw = str(item.active_reel_id or "").strip()
+        recall_payload = item.recall.model_dump(exclude_none=True) if item.recall else {}
+        if item.recent_recall_accuracy is not None and "recent_accuracy" not in recall_payload:
+            recall_payload["recent_accuracy"] = item.recent_recall_accuracy
+        if item.rolling_recall_accuracy is not None and "rolling_accuracy" not in recall_payload:
+            recall_payload["rolling_accuracy"] = item.rolling_recall_accuracy
         normalized.append(
             {
                 "material_id": material_id,
@@ -5095,6 +5153,7 @@ def _normalize_community_history_items(payload_items) -> list[dict[str, object]]
                 "feed_query": feed_query_raw or None,
                 "active_index": active_index,
                 "active_reel_id": active_reel_id_raw or None,
+                "recall_json": dumps_json(recall_payload),
             }
         )
         if len(normalized) >= MAX_COMMUNITY_HISTORY_ITEMS:
@@ -5856,7 +5915,7 @@ def update_material_level(material_id: str, request: Request, payload: MaterialL
 
 
 @app.post("/api/reels/generate", response_model=ReelsGenerateResponse)
-def generate_reels(request: Request, payload: ReelsGenerateRequest):
+async def generate_reels(request: Request, payload: ReelsGenerateRequest):
     _require_community_client_identity(request)
     _enforce_rate_limit(request, "reels-generate", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
@@ -5883,9 +5942,11 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
         learner_progress = reel_service.learner_progress(conn, payload.material_id, learner_id)
         learner_knowledge_level = str(learner_progress.get("selected_level") or "beginner")
 
-        effective_generation_mode: Literal["slow", "fast"] = "fast" if SERVERLESS_MODE else payload.generation_mode
-        try:
-            generation_result = _ensure_generation_for_request(
+    effective_generation_mode: Literal["slow", "fast"] = "fast" if SERVERLESS_MODE else payload.generation_mode
+
+    def work(should_cancel: Callable[[], bool]):
+        with get_conn() as conn:
+            return _ensure_generation_for_request(
                 conn,
                 material_id=payload.material_id,
                 concept_id=payload.concept_id,
@@ -5904,28 +5965,34 @@ def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 multi_platform_search=payload.multi_platform_search,
                 knowledge_level_override=learner_knowledge_level,
                 learner_id=learner_id,
+                should_cancel=should_cancel,
             )
-        except IngestRateLimitedError as e:
-            # Clip-engine per-platform rate limiter tripped → 429 + Retry-After.
-            raise _ingest_error_to_http(e) from e
-        except ClipEngineError as e:
-            # Clip-engine config/search/transcript failure → upstream dependency error.
-            logger.warning("Reels generate clip-engine failure: %s", e)
-            raise HTTPException(status_code=502, detail=str(e)) from e
-        except YouTubeApiRequestError as e:
-            logger.warning(
-                "Reels generate request failed: %s",
-                json.dumps(
-                    {
-                        "material_id": payload.material_id,
-                        "generation_mode": effective_generation_mode,
-                        "requested_num_reels": requested_num_reels,
-                        "error": str(e),
-                    },
-                    sort_keys=True,
-                ),
-            )
-            raise HTTPException(status_code=502, detail=str(e)) from e
+
+    try:
+        generation_result = await _run_disconnect_cancellable(request, work)
+    except GenerationCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
+    except IngestRateLimitedError as e:
+        # Clip-engine per-platform rate limiter tripped → 429 + Retry-After.
+        raise _ingest_error_to_http(e) from e
+    except ClipEngineError as e:
+        # Clip-engine config/search/transcript failure → upstream dependency error.
+        logger.warning("Reels generate clip-engine failure: %s", e)
+        raise HTTPException(status_code=502, detail=str(e)) from e
+    except YouTubeApiRequestError as e:
+        logger.warning(
+            "Reels generate request failed: %s",
+            json.dumps(
+                {
+                    "material_id": payload.material_id,
+                    "generation_mode": effective_generation_mode,
+                    "requested_num_reels": requested_num_reels,
+                    "error": str(e),
+                },
+                sort_keys=True,
+            ),
+        )
+        raise HTTPException(status_code=502, detail=str(e)) from e
     return {
         "reels": list(generation_result.get("reels") or [])[:requested_num_reels],
         "generation_id": generation_result.get("generation_id"),
@@ -5954,8 +6021,27 @@ def _ingest_error_to_http(exc: IngestError) -> HTTPException:
     return http_exc
 
 
+async def _run_disconnect_cancellable(
+    request: Request,
+    work: Callable[[Callable[[], bool]], Any],
+) -> Any:
+    """Run the synchronous pipeline in a worker while observing disconnects."""
+    cancel_event = threading.Event()
+    task = asyncio.create_task(asyncio.to_thread(work, cancel_event.is_set))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=0.05)
+            if task in done:
+                return await task
+            if await request.is_disconnected():
+                cancel_event.set()
+    except asyncio.CancelledError:
+        cancel_event.set()
+        raise
+
+
 @app.post("/api/ingest/url", response_model=IngestResult)
-def ingest_url_endpoint(request: Request, payload: IngestRequest) -> IngestResult:
+async def ingest_url_endpoint(request: Request, payload: IngestRequest) -> IngestResult:
     """
     Download + process a single reel URL (YouTube / Instagram / TikTok) and persist a
     ReelOut-compatible record. See `app/ingestion/__init__.py` for the full design notes
@@ -5972,15 +6058,21 @@ def ingest_url_endpoint(request: Request, payload: IngestRequest) -> IngestResul
         )
 
     try:
-        result = ingestion_pipeline.ingest_url(
-            source_url=payload.source_url,
-            material_id=payload.material_id,
-            concept_id=payload.concept_id,
-            target_clip_duration_sec=payload.target_clip_duration_sec,
-            target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
-            target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
-            language=payload.language,
+        result = await _run_disconnect_cancellable(
+            request,
+            lambda should_cancel: ingestion_pipeline.ingest_url(
+                source_url=payload.source_url,
+                material_id=payload.material_id,
+                concept_id=payload.concept_id,
+                target_clip_duration_sec=payload.target_clip_duration_sec,
+                target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
+                target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+                language=payload.language,
+                should_cancel=should_cancel,
+            ),
         )
+    except ClipEngineCancellationError as exc:
+        raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
     except (
         IngestUnsupportedSourceError,
         IngestDownloadError,
@@ -6008,7 +6100,7 @@ def ingest_url_endpoint(request: Request, payload: IngestRequest) -> IngestResul
 
 
 @app.post("/api/ingest/topic-cut", response_model=IngestTopicCutResult)
-def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutRequest) -> IngestTopicCutResult:
+async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutRequest) -> IngestTopicCutResult:
     """
     Topic-aware variant of `/api/ingest/url`. Same download + transcribe path,
     but instead of returning ONE clip per video this endpoint returns one reel
@@ -6029,14 +6121,20 @@ def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutRequest) 
         )
 
     try:
-        result = ingestion_pipeline.ingest_topic_cut(
-            source_url=payload.source_url,
-            material_id=payload.material_id,
-            concept_id=payload.concept_id,
-            language=payload.language,
-            use_llm=payload.use_llm,
-            query=payload.query,
+        result = await _run_disconnect_cancellable(
+            request,
+            lambda should_cancel: ingestion_pipeline.ingest_topic_cut(
+                source_url=payload.source_url,
+                material_id=payload.material_id,
+                concept_id=payload.concept_id,
+                language=payload.language,
+                use_llm=payload.use_llm,
+                query=payload.query,
+                should_cancel=should_cancel,
+            ),
         )
+    except ClipEngineCancellationError as exc:
+        raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
     except (
         IngestUnsupportedSourceError,
         IngestDownloadError,
@@ -6064,7 +6162,7 @@ def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutRequest) 
 
 
 @app.post("/api/ingest/search", response_model=IngestSearchResult)
-def ingest_search_endpoint(request: Request, payload: IngestSearchRequest) -> IngestSearchResult:
+async def ingest_search_endpoint(request: Request, payload: IngestSearchRequest) -> IngestSearchResult:
     """
     Topic-based multi-platform search. Resolves YouTube + Instagram + TikTok search
     results via yt-dlp's native extractors, dedups against `exclude_video_ids` for
@@ -6084,18 +6182,24 @@ def ingest_search_endpoint(request: Request, payload: IngestSearchRequest) -> In
         )
 
     try:
-        result = ingestion_pipeline.ingest_search(
-            query=payload.query,
-            platforms=payload.platforms,
-            max_per_platform=payload.max_per_platform,
-            material_id=payload.material_id,
-            concept_id=payload.concept_id,
-            target_clip_duration_sec=payload.target_clip_duration_sec,
-            target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
-            target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
-            language=payload.language,
-            exclude_video_ids=payload.exclude_video_ids,
+        result = await _run_disconnect_cancellable(
+            request,
+            lambda should_cancel: ingestion_pipeline.ingest_search(
+                query=payload.query,
+                platforms=payload.platforms,
+                max_per_platform=payload.max_per_platform,
+                material_id=payload.material_id,
+                concept_id=payload.concept_id,
+                target_clip_duration_sec=payload.target_clip_duration_sec,
+                target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
+                target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+                language=payload.language,
+                exclude_video_ids=payload.exclude_video_ids,
+                should_cancel=should_cancel,
+            ),
         )
+    except ClipEngineCancellationError as exc:
+        raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
     except (
         IngestUnsupportedSourceError,
         IngestDownloadError,
@@ -6122,7 +6226,7 @@ def ingest_search_endpoint(request: Request, payload: IngestSearchRequest) -> In
 
 
 @app.post("/api/ingest/feed", response_model=IngestFeedResult)
-def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> IngestFeedResult:
+async def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> IngestFeedResult:
     """
     Resolve a profile / hashtag / playlist URL to a bounded list of individual reel URLs
     and ingest each in a small thread pool. Per-item failures are recorded in the response
@@ -6139,16 +6243,22 @@ def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> Ingest
         )
 
     try:
-        result = ingestion_pipeline.ingest_feed(
-            feed_url=payload.feed_url,
-            max_items=payload.max_items,
-            material_id=payload.material_id,
-            concept_id=payload.concept_id,
-            target_clip_duration_sec=payload.target_clip_duration_sec,
-            target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
-            target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
-            language=payload.language,
+        result = await _run_disconnect_cancellable(
+            request,
+            lambda should_cancel: ingestion_pipeline.ingest_feed(
+                feed_url=payload.feed_url,
+                max_items=payload.max_items,
+                material_id=payload.material_id,
+                concept_id=payload.concept_id,
+                target_clip_duration_sec=payload.target_clip_duration_sec,
+                target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
+                target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+                language=payload.language,
+                should_cancel=should_cancel,
+            ),
         )
+    except ClipEngineCancellationError as exc:
+        raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
     except (
         IngestUnsupportedSourceError,
         IngestDownloadError,
@@ -7010,23 +7120,30 @@ def feed(
 
 
 @app.post("/api/chat", response_model=ChatResponse)
-def chat(request: Request, payload: ChatRequest):
+async def chat(request: Request, payload: ChatRequest):
     _enforce_rate_limit(request, "chat", limit=CHAT_RATE_LIMIT_PER_WINDOW)
     history = [{"role": m.role, "content": m.content} for m in payload.history]
     # Pin chat to the dedicated backup Gemini key so it never contends with
     # reel-generation traffic on the primary rotation pool.
     chat_gemini_key = (os.environ.get("GEMINI_API_KEY_2") or "").strip() or None
-    answer = material_intelligence_service.chat_assistant(
-        message=payload.message,
-        topic=payload.topic,
-        text=payload.text,
-        history=history,
-        reel_summary=payload.reel_summary,
-        video_title=payload.video_title,
-        video_description=payload.video_description,
-        transcript_snippet=payload.transcript_snippet,
-        gemini_api_key_override=chat_gemini_key,
-    )
+    try:
+        answer = await _run_disconnect_cancellable(
+            request,
+            lambda should_cancel: material_intelligence_service.chat_assistant(
+                message=payload.message,
+                topic=payload.topic,
+                text=payload.text,
+                history=history,
+                reel_summary=payload.reel_summary,
+                video_title=payload.video_title,
+                video_description=payload.video_description,
+                transcript_snippet=payload.transcript_snippet,
+                gemini_api_key_override=chat_gemini_key,
+                should_cancel=should_cancel,
+            ),
+        )
+    except ClipEngineCancellationError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
     return {"answer": answer}
 
 
@@ -7059,6 +7176,127 @@ def feedback(request: Request, payload: FeedbackRequest):
         )
 
     return {"status": "ok", "reel_id": clean_reel_id}
+
+
+@app.post("/api/reels/{reel_id}/progress", response_model=ReelProgressResponse)
+async def record_reel_progress(request: Request, reel_id: str, payload: ReelProgressRequest):
+    _enforce_rate_limit(
+        request, "reel-progress", limit=ASSESSMENT_PROGRESS_RATE_LIMIT_PER_WINDOW
+    )
+    clean_reel_id = str(reel_id or "").strip()
+    if not clean_reel_id or len(clean_reel_id) > 160:
+        raise HTTPException(status_code=400, detail="Invalid reel_id.")
+    try:
+        with get_conn() as conn:
+            learner_id = _resolve_learner_identity(conn, request)
+        def work(should_cancel: Callable[[], bool]):
+            # Autocommit keeps the legacy-question provider call outside a
+            # long-lived SQLite write transaction.
+            with get_conn() as conn:
+                return assessment_service.record_progress(
+                    conn,
+                    learner_id=learner_id,
+                    reel_id=clean_reel_id,
+                    max_fraction=payload.max_fraction,
+                    should_cancel=should_cancel,
+                )
+        return await _run_disconnect_cancellable(request, work)
+    except AssessmentCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/assessments/pending", response_model=AssessmentWrapperResponse)
+def pending_assessment(request: Request, material_id: str):
+    _enforce_rate_limit(
+        request, "assessment-read", limit=ASSESSMENT_ACTION_RATE_LIMIT_PER_WINDOW
+    )
+    clean_material_id = str(material_id or "").strip()
+    if not clean_material_id or len(clean_material_id) > 240:
+        raise HTTPException(status_code=400, detail="Invalid material_id.")
+    with get_conn() as conn:
+        if not fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (clean_material_id,)):
+            raise HTTPException(status_code=404, detail="material_id not found")
+        learner_id = _resolve_learner_identity(conn, request)
+        return assessment_service.pending(
+            conn, learner_id=learner_id, material_id=clean_material_id
+        )
+
+
+@app.post("/api/assessments/next", response_model=AssessmentWrapperResponse)
+async def next_assessment(request: Request, payload: AssessmentNextRequest):
+    _enforce_rate_limit(
+        request, "assessment-next", limit=ASSESSMENT_ACTION_RATE_LIMIT_PER_WINDOW
+    )
+    try:
+        with get_conn() as conn:
+            if not fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (payload.material_id,)):
+                raise HTTPException(status_code=404, detail="material_id not found")
+            learner_id = _resolve_learner_identity(conn, request)
+        def work(should_cancel: Callable[[], bool]):
+            with get_conn() as conn:
+                return assessment_service.next_session(
+                    conn,
+                    learner_id=learner_id,
+                    material_id=payload.material_id,
+                    should_cancel=should_cancel,
+                )
+        return await _run_disconnect_cancellable(request, work)
+    except AssessmentCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/assessments/{session_id}/answer",
+    response_model=AssessmentAnswerResponse,
+)
+def answer_assessment(
+    request: Request, session_id: str, payload: AssessmentAnswerRequest
+):
+    _enforce_rate_limit(
+        request, "assessment-answer", limit=ASSESSMENT_ACTION_RATE_LIMIT_PER_WINDOW
+    )
+    try:
+        with get_conn(transactional=True) as conn:
+            learner_id = _resolve_learner_identity(conn, request)
+            result = assessment_service.answer(
+                conn,
+                learner_id=learner_id,
+                session_id=str(session_id or "").strip(),
+                question_id=payload.question_id,
+                choice_index=payload.choice_index,
+            )
+            session = result.get("session") or {}
+            if session.get("status") == "completed":
+                reel_service.update_level_adjustment(
+                    conn, str(session.get("material_id") or ""), learner_id
+                )
+            return result
+    except ValueError as exc:
+        detail = str(exc)
+        status = 409 if "not pending" in detail or "answered in order" in detail else 404
+        raise HTTPException(status_code=status, detail=detail) from exc
+
+
+@app.post(
+    "/api/assessments/{session_id}/snooze",
+    response_model=AssessmentSnoozeResponse,
+)
+def snooze_assessment(request: Request, session_id: str):
+    _enforce_rate_limit(
+        request, "assessment-snooze", limit=ASSESSMENT_ACTION_RATE_LIMIT_PER_WINDOW
+    )
+    try:
+        with get_conn(transactional=True) as conn:
+            learner_id = _resolve_learner_identity(conn, request)
+            return assessment_service.snooze(
+                conn,
+                learner_id=learner_id,
+                session_id=str(session_id or "").strip(),
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/community/reels/duration")
@@ -7181,7 +7419,8 @@ def get_community_history(request: Request, limit: int = MAX_COMMUNITY_HISTORY_I
                 source,
                 feed_query,
                 active_index,
-                active_reel_id
+                active_reel_id,
+                recall_json
             FROM community_material_history
             WHERE account_id = ?
             ORDER BY updated_at DESC
@@ -7189,7 +7428,18 @@ def get_community_history(request: Request, limit: int = MAX_COMMUNITY_HISTORY_I
             """,
             (str(account["id"]), safe_limit),
         )
-    items = [_serialize_community_history_item(row) for row in rows]
+        learner_id = f"account:{account['id']}"
+        items = [
+            _serialize_community_history_item(
+                row,
+                assessment_stats=assessment_service.history_stats(
+                    conn,
+                    learner_id=learner_id,
+                    material_id=str(row.get("material_id") or ""),
+                ),
+            )
+            for row in rows
+        ]
     return {"items": items}
 
 
@@ -7216,9 +7466,21 @@ def replace_community_history(request: Request, payload: CommunityHistoryReplace
                     "feed_query": item["feed_query"],
                     "active_index": item["active_index"],
                     "active_reel_id": item["active_reel_id"],
+                    "recall_json": item["recall_json"],
                 },
             )
-    items = [_serialize_community_history_item(row) for row in normalized_items]
+        learner_id = f"account:{account_id}"
+        items = [
+            _serialize_community_history_item(
+                row,
+                assessment_stats=assessment_service.history_stats(
+                    conn,
+                    learner_id=learner_id,
+                    material_id=str(row.get("material_id") or ""),
+                ),
+            )
+            for row in normalized_items
+        ]
     return {"items": items}
 
 

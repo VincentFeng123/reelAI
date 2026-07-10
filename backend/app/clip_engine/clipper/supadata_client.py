@@ -9,22 +9,30 @@ NOTE: uses httpx, not urllib — urllib.request capitalizes header names
 """
 from __future__ import annotations
 
-import time
+from collections.abc import Callable
 
 import httpx
 
 from . import config
 from .errors import PipelineError
+from ..cancellation import run_cancellable, wait_with_probe
 
 
-def _get(path: str, params: dict | None = None) -> tuple[int, dict]:
+async def _get_async(
+    path: str,
+    params: dict | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> tuple[int, dict]:
     if not config.SUPADATA_API_KEY:
         raise PipelineError(
             "SUPADATA_API_KEY is not set. Add it to .env (get a key at https://supadata.ai)."
         )
     headers = {"x-api-key": config.SUPADATA_API_KEY, "Accept": "application/json"}
     try:
-        r = httpx.get(f"{config.SUPADATA_BASE}{path}", params=params, headers=headers, timeout=90.0)
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            r = await client.get(
+                f"{config.SUPADATA_BASE}{path}", params=params, headers=headers
+            )
     except httpx.RequestError as e:
         raise PipelineError(f"Could not reach Supadata: {e}")
 
@@ -42,6 +50,17 @@ def _get(path: str, params: dict | None = None) -> tuple[int, dict]:
         raise PipelineError("Supadata returned a non-JSON response.")
 
 
+def _get(
+    path: str,
+    params: dict | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> tuple[int, dict]:
+    return run_cancellable(
+        lambda: _get_async(path, params=params, should_cancel=should_cancel),
+        should_cancel,
+    )
+
+
 def _normalize(content) -> list[dict]:
     chunks: list[dict] = []
     for c in content or []:
@@ -54,7 +73,12 @@ def _normalize(content) -> list[dict]:
     return chunks
 
 
-def fetch_transcript(url: str, lang: str = "en", chunk_size: int | None = None) -> list[dict]:
+def fetch_transcript(
+    url: str,
+    lang: str = "en",
+    chunk_size: int | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+) -> list[dict]:
     """Return [{text, start(sec), end(sec)}] ordered by time."""
     params = {"url": url, "text": "false", "mode": "auto"}
     if lang:
@@ -62,14 +86,14 @@ def fetch_transcript(url: str, lang: str = "en", chunk_size: int | None = None) 
     if chunk_size:
         params["chunkSize"] = str(chunk_size)
 
-    status, data = _get("/transcript", params)
+    status, data = _get("/transcript", params, should_cancel)
 
     # Async job → poll
     if status == 202 or (isinstance(data, dict) and data.get("jobId") and "content" not in data):
         job_id = data["jobId"]
         for _ in range(60):  # up to ~3 min
-            time.sleep(3)
-            _, jd = _get(f"/transcript/{job_id}")
+            wait_with_probe(3, should_cancel)
+            _, jd = _get(f"/transcript/{job_id}", should_cancel=should_cancel)
             state = (jd.get("status") or jd.get("state") or "").lower()
             if jd.get("content") is not None or state in ("completed", "succeeded", "done"):
                 data = jd

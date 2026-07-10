@@ -5,9 +5,10 @@ plain function. Supadata transcript -> one Gemini pass -> embed clip specs.
 from __future__ import annotations
 
 from . import config
+from .cancellation import raise_if_cancelled
 from .clipper import embed
 from .clipper.pipeline import gemini_segment
-from .errors import ClipError, TranscriptError, UnsupportedURLError
+from .errors import CancellationError, ClipError, TranscriptError, UnsupportedURLError
 from .metadata import extract_video_id
 
 
@@ -16,11 +17,14 @@ def _transcribe(url: str, video_id: str, settings: dict) -> dict:
     from .clipper.pipeline.transcribe import transcribe_supadata  # lazy
     try:
         return transcribe_supadata(url, video_id, settings)
+    except CancellationError:
+        raise
     except Exception as exc:  # normalize to engine error
         raise TranscriptError(f"Supadata transcript failed for {video_id}: {exc}") from exc
 
 
-def clip(url: str, topic: str, settings: dict | None = None) -> dict:
+def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=None) -> dict:
+    raise_if_cancelled(should_cancel)
     video_id = extract_video_id(url)
     if not video_id:
         raise UnsupportedURLError(f"Not a recognized YouTube URL: {url}")
@@ -28,16 +32,21 @@ def clip(url: str, topic: str, settings: dict | None = None) -> dict:
     settings.setdefault("segment_model", config.SEGMENT_MODEL)
     settings.setdefault("segment_fine_snap", config.SEGMENT_FINE_SNAP)
     settings.setdefault("segment_min_clip_s", config.SEGMENT_MIN_CLIP_S)
+    settings["should_cancel"] = should_cancel
 
     transcript = _transcribe(url, video_id, settings)
+    raise_if_cancelled(should_cancel)
     if not (transcript.get("segments")):
         raise TranscriptError(f"Empty transcript for {video_id}")
 
     try:
         clips, notes = gemini_segment.segment_clips(transcript, settings, topic=topic or "")
+    except CancellationError:
+        raise
     except Exception as exc:
         raise ClipError(f"Gemini segmentation failed for {video_id}: {exc}") from exc
 
     for c in clips:
+        raise_if_cancelled(should_cancel)
         c["embed_url"] = embed.embed_url(video_id, c["start"], c["end"])
     return {"video_id": video_id, "clips": clips, "transcript": transcript, "notes": notes}

@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.app.db import SCHEMA, _migrate_reel_feedback_uniqueness_sqlite
+from backend.app.db import now_iso
 from backend.app.services.reels import ReelService
 
 
@@ -284,6 +285,205 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         self.assertEqual((after["helpful"], after["confusing"], after["rating"], after["saved"]), (1, 0, 4, 1))
         self.assertEqual(second_revision, first_revision + 1)
         self.assertEqual(self.svc._difficulty({"difficulty": None}), 0.5)
+
+    def _insert_assessment_outcome(
+        self,
+        *,
+        session_id: str,
+        concept_id: str,
+        adjustment: float,
+        video_id: str = "va",
+        difficulty: float = 0.8,
+        learner_id: str | None = None,
+    ) -> None:
+        learner = learner_id or self.LEARNER
+        timestamp = now_iso()
+        self.conn.execute(
+            "INSERT INTO assessment_sessions "
+            "(id, learner_id, material_id, status, current_index, question_count, "
+            "correct_count, information_units, readiness_threshold, created_at, updated_at, completed_at) "
+            "VALUES (?, ?, ?, 'completed', 1, 1, ?, 3.5, 3.5, ?, ?, ?)",
+            (
+                session_id,
+                learner,
+                self.MATERIAL,
+                1 if adjustment > 0 else 0,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+        self.conn.execute(
+            "INSERT INTO assessment_concept_outcomes "
+            "(learner_id, session_id, material_id, concept_id, question_count, "
+            "correct_count, accuracy, adjustment, source_reel_id, source_video_id, "
+            "source_difficulty, created_at) "
+            "VALUES (?, ?, ?, ?, 1, ?, ?, ?, NULL, ?, ?, ?)",
+            (
+                learner,
+                session_id,
+                self.MATERIAL,
+                concept_id,
+                1 if adjustment > 0 else 0,
+                1.0 if adjustment > 0 else 0.0,
+                adjustment,
+                video_id,
+                difficulty,
+                timestamp,
+            ),
+        )
+
+    def test_assessment_outcomes_adjust_concepts_with_combined_bound(self) -> None:
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        self._insert_assessment_outcome(
+            session_id="assessment-positive", concept_id="c1", adjustment=0.08
+        )
+        self._insert_assessment_outcome(
+            session_id="assessment-negative", concept_id="c2", adjustment=-0.12
+        )
+        adjustments = self.svc._learner_adaptation_context(
+            self.conn, self.MATERIAL, self.LEARNER
+        )[1]
+        self.assertAlmostEqual(adjustments["c1"], 0.08)
+        self.assertAlmostEqual(adjustments["c2"], -0.12)
+
+        for index in range(3):
+            self._insert_assessment_outcome(
+                session_id=f"assessment-bound-{index}",
+                concept_id="c1",
+                adjustment=0.08,
+            )
+        bounded = self.svc._learner_adaptation_context(
+            self.conn, self.MATERIAL, self.LEARNER
+        )[1]
+        self.assertEqual(bounded["c1"], 0.25)
+
+    def test_incorrect_assessment_prefers_easier_alternative_source(self) -> None:
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        self._insert_assessment_outcome(
+            session_id="assessment-remediation",
+            concept_id="c1",
+            adjustment=-0.12,
+            video_id="va",
+            difficulty=0.8,
+        )
+        items = [
+            self._item("same-source", "c1", "va", 30, 10, 0.2),
+            self._item("alternate-source", "c1", "vb", 10, 1, 0.35),
+            self._item("other-concept", "c2", "vc", 10, 9, 0.1),
+        ]
+        ordered = self.svc.adaptive_curriculum_order(
+            self.conn, self.MATERIAL, self.LEARNER, items
+        )
+        self.assertEqual(ordered[0]["reel_id"], "alternate-source")
+
+    def test_mixed_assessment_session_remediates_incorrect_concept(self) -> None:
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        timestamp = now_iso()
+        self.conn.execute(
+            "INSERT INTO assessment_sessions "
+            "(id, learner_id, material_id, status, current_index, question_count, "
+            "correct_count, information_units, readiness_threshold, created_at, updated_at, completed_at) "
+            "VALUES ('mixed-session', ?, ?, 'completed', 2, 2, 1, 3.5, 3.5, ?, ?, ?)",
+            (self.LEARNER, self.MATERIAL, timestamp, timestamp, timestamp),
+        )
+        for concept_id, adjustment, video_id in (
+            ("c1", 0.08, "va"),
+            ("c2", -0.12, "vb"),
+        ):
+            self.conn.execute(
+                "INSERT INTO assessment_concept_outcomes "
+                "(learner_id, session_id, material_id, concept_id, question_count, "
+                "correct_count, accuracy, adjustment, source_reel_id, source_video_id, "
+                "source_difficulty, created_at) "
+                "VALUES (?, 'mixed-session', ?, ?, 1, ?, ?, ?, NULL, ?, 0.8, ?)",
+                (
+                    self.LEARNER,
+                    self.MATERIAL,
+                    concept_id,
+                    1 if adjustment > 0 else 0,
+                    1.0 if adjustment > 0 else 0.0,
+                    adjustment,
+                    video_id,
+                    timestamp,
+                ),
+            )
+        items = [
+            self._item("high-score-mastered", "c1", "va", 10, 10, 0.5),
+            self._item("weak-alternate", "c2", "vc", 10, 1, 0.3),
+        ]
+        ordered = self.svc.adaptive_curriculum_order(
+            self.conn, self.MATERIAL, self.LEARNER, items
+        )
+        self.assertEqual(ordered[0]["reel_id"], "weak-alternate")
+
+    def test_all_weak_concepts_in_latest_session_queue_remediation(self) -> None:
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        timestamp = now_iso()
+        self.conn.execute(
+            "INSERT INTO assessment_sessions "
+            "(id, learner_id, material_id, status, current_index, question_count, "
+            "correct_count, information_units, readiness_threshold, created_at, updated_at, completed_at) "
+            "VALUES ('two-weak-session', ?, ?, 'completed', 2, 2, 0, 3.5, 3.5, ?, ?, ?)",
+            (self.LEARNER, self.MATERIAL, timestamp, timestamp, timestamp),
+        )
+        for concept_id, video_id in (("c1", "va"), ("c2", "vb")):
+            self.conn.execute(
+                "INSERT INTO assessment_concept_outcomes "
+                "(learner_id, session_id, material_id, concept_id, question_count, "
+                "correct_count, accuracy, adjustment, source_reel_id, source_video_id, "
+                "source_difficulty, created_at) "
+                "VALUES (?, 'two-weak-session', ?, ?, 1, 0, 0.0, -0.12, NULL, ?, 0.8, ?)",
+                (self.LEARNER, self.MATERIAL, concept_id, video_id, timestamp),
+            )
+        items = [
+            self._item("high-score", "c1", "va", 10, 100, 0.9),
+            self._item("alternate-c1", "c1", "vb", 10, 1, 0.3),
+            self._item("alternate-c2", "c2", "vc", 10, 1, 0.3),
+        ]
+        ordered = self.svc.adaptive_curriculum_order(
+            self.conn, self.MATERIAL, self.LEARNER, items
+        )
+        self.assertEqual(
+            [row["reel_id"] for row in ordered[:2]],
+            ["alternate-c1", "alternate-c2"],
+        )
+
+    def test_assessment_concept_is_one_global_mastery_response(self) -> None:
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        self._insert_assessment_outcome(
+            session_id="global-1", concept_id="c1", adjustment=0.08
+        )
+        self._insert_assessment_outcome(
+            session_id="global-2", concept_id="c2", adjustment=0.08
+        )
+        self._insert_assessment_outcome(
+            session_id="global-3", concept_id="c1", adjustment=0.08
+        )
+        adjustment = self.svc.update_level_adjustment(
+            self.conn, self.MATERIAL, self.LEARNER
+        )
+        self.assertAlmostEqual(adjustment, 0.20)
 
 
 if __name__ == "__main__":

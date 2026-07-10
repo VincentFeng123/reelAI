@@ -3,7 +3,7 @@
 import { type DragEvent, type FormEvent, type RefObject, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 
-import { ingestUrl, uploadMaterial } from "@/lib/api";
+import { ingestUrl, isRequestInterruptedError, uploadMaterial } from "@/lib/api";
 import { safeStorageSetItem } from "@/lib/browserStorage";
 import { buildSearchFeedQuery } from "@/lib/feedQuery";
 import { type GenerationMode, type SearchInputMode, readStudyReelsSettings, subscribeToStudyReelsSettings } from "@/lib/settings";
@@ -153,6 +153,7 @@ function parseMaterialGroups(raw: string | null): Record<string, MaterialGroup> 
 }
 
 type UploadPanelProps = {
+  active?: boolean;
   onMaterialCreated?: (params: {
     materialId: string;
     title: string;
@@ -258,7 +259,7 @@ function buildMaterialTitle(params: { topic: string; text: string; fileName: str
   return "New Study Session";
 }
 
-export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollGesture, onScrollabilityChange, heroTitleRef }: UploadPanelProps) {
+export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetChange, onScrollGesture, onScrollabilityChange, heroTitleRef }: UploadPanelProps) {
   const router = useRouter();
   const touchStartYRef = useRef<number | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
@@ -307,10 +308,32 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
     };
   }, []);
 
+  useEffect(() => {
+    if (!active) {
+      abortControllerRef.current?.abort();
+    }
+  }, [active]);
+
+  useEffect(() => {
+    const abortActiveRequest = () => abortControllerRef.current?.abort();
+    window.addEventListener("beforeunload", abortActiveRequest);
+    window.addEventListener("pagehide", abortActiveRequest);
+    window.addEventListener("unload", abortActiveRequest);
+    return () => {
+      window.removeEventListener("beforeunload", abortActiveRequest);
+      window.removeEventListener("pagehide", abortActiveRequest);
+      window.removeEventListener("unload", abortActiveRequest);
+    };
+  }, []);
+
   const onSubmit = useCallback(async (event: FormEvent) => {
     event.preventDefault();
+    if (!active) {
+      return;
+    }
     abortControllerRef.current?.abort();
-    abortControllerRef.current = new AbortController();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     setError(null);
     setLoading(true);
 
@@ -334,7 +357,11 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
           targetClipDurationSec: activeSettings.targetClipDurationSec,
           targetClipDurationMinSec: activeSettings.targetClipDurationMinSec,
           targetClipDurationMaxSec: activeSettings.targetClipDurationMaxSec,
+          signal: controller.signal,
         });
+        if (controller.signal.aborted) {
+          return;
+        }
         const ingestedReel = result.reel;
         const ingestedMetadata = result.metadata;
         const ingestMaterialId = ingestedReel.material_id || INGEST_SENTINEL_MATERIAL_ID;
@@ -376,6 +403,9 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
             generationMode: generationModeForSearch,
             feedQuery,
           });
+          if (controller.signal.aborted) {
+            return;
+          }
         }
 
         const ingestFeedQuery = buildSearchFeedQuery({
@@ -404,8 +434,11 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
         // must not orphan successfully-created materials for the others —
         // Promise.all rejects the whole batch and would do exactly that.
         const settled = await Promise.allSettled(
-          topicList.map((topic) => uploadMaterial({ subjectTag: topic, knowledgeLevel })),
+          topicList.map((topic) => uploadMaterial({ subjectTag: topic, knowledgeLevel, signal: controller.signal })),
         );
+        if (controller.signal.aborted) {
+          return;
+        }
         const succeededIds = settled
           .map((result) =>
             result.status === "fulfilled" ? result.value.material_id : "",
@@ -433,7 +466,11 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
           file: fileValue,
           subjectTag: topicValue || undefined,
           knowledgeLevel: inputMode === "topic" ? knowledgeLevel : undefined,
+          signal: controller.signal,
         });
+        if (controller.signal.aborted) {
+          return;
+        }
         materialIds = [material.material_id];
       }
 
@@ -500,6 +537,9 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
           generationMode: generationModeForSearch,
           feedQuery,
         });
+        if (controller.signal.aborted) {
+          return;
+        }
       }
       const nextQuery = buildSearchFeedQuery({
         materialId: primaryMaterialId,
@@ -509,14 +549,17 @@ export function UploadPanel({ onMaterialCreated, onScrollOffsetChange, onScrollG
       });
       router.push(`/feed?${nextQuery}`);
     } catch (e) {
-      if (e instanceof DOMException && e.name === "AbortError") {
+      if (isRequestInterruptedError(e) || (e instanceof DOMException && e.name === "AbortError")) {
         return;
       }
       setError(e instanceof Error ? e.message : "Something failed");
     } finally {
-      setLoading(false);
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+        setLoading(false);
+      }
     }
-  }, [file, inputMode, onMaterialCreated, reelUrl, router, text, topics]);
+  }, [active, file, inputMode, onMaterialCreated, reelUrl, router, text, topics]);
 
   const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();

@@ -20,12 +20,15 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from ..db import DatabaseIntegrityError, dumps_json, fetch_one, now_iso, upsert
+from ..clip_engine.cancellation import raise_if_cancelled, run_cancellable
+from ..clip_engine.errors import CancellationError
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +199,7 @@ def _ollama_chat(
     temperature: float,
     json_mode: bool,
     max_tokens: int | None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str | None:
     """Call an Ollama server via its OpenAI-compatible chat endpoint."""
     payload: dict[str, Any] = {
@@ -211,17 +215,21 @@ def _ollama_chat(
     if max_tokens is not None:
         payload["max_tokens"] = int(max_tokens)
 
-    url = f"{ollama_client['base_url']}/v1/chat/completions"
-    with httpx.Client(timeout=OLLAMA_DEFAULT_TIMEOUT) as client:
-        resp = client.post(url, json=payload)
-    if resp.status_code >= 400:
-        raise RuntimeError(f"Ollama returned {resp.status_code}: {resp.text[:400]}")
-    data = resp.json()
-    choices = data.get("choices") or []
-    if not choices:
-        return None
-    content = (choices[0].get("message") or {}).get("content") or ""
-    return content.strip() or None
+    async def _request() -> str | None:
+        raise_if_cancelled(should_cancel)
+        url = f"{ollama_client['base_url']}/v1/chat/completions"
+        async with httpx.AsyncClient(timeout=OLLAMA_DEFAULT_TIMEOUT) as client:
+            resp = await client.post(url, json=payload)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Ollama returned {resp.status_code}: {resp.text[:400]}")
+        data = resp.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return None
+        content = (choices[0].get("message") or {}).get("content") or ""
+        return content.strip() or None
+
+    return run_cancellable(_request, should_cancel)
 
 
 def _gemini_chat(
@@ -234,6 +242,7 @@ def _gemini_chat(
     json_mode: bool,
     max_output_tokens: int | None,
     api_key_override: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str | None:
     global _gemini_key_offset
 
@@ -247,6 +256,7 @@ def _gemini_chat(
     from google.genai import types as genai_types
 
     for attempt in range(len(all_keys)):
+        raise_if_cancelled(should_cancel)
         idx = (_gemini_key_offset + attempt) % len(all_keys) if not api_key_override else 0
         key = all_keys[idx]
         if not key:
@@ -266,10 +276,13 @@ def _gemini_chat(
             config_kwargs["max_output_tokens"] = int(max_output_tokens)
 
         try:
-            response = client.models.generate_content(
-                model=model,
-                contents=user,
-                config=genai_types.GenerateContentConfig(**config_kwargs),
+            response = run_cancellable(
+                lambda: client.aio.models.generate_content(
+                    model=model,
+                    contents=user,
+                    config=genai_types.GenerateContentConfig(**config_kwargs),
+                ),
+                should_cancel,
             )
             text = (response.text or "").strip()
             if not text:
@@ -366,6 +379,7 @@ def chat_completion(
     groq_model: str = GROQ_DEFAULT_MODEL,
     cerebras_model: str = CEREBRAS_DEFAULT_MODEL,
     gemini_api_key_override: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> str | None:
     """Run a chat completion: Gemini first, Groq fallback.
 
@@ -382,6 +396,7 @@ def chat_completion(
     (used by the chat endpoint so it runs on a dedicated backup key without
     consuming the primary rotation pool's quota).
     """
+    raise_if_cancelled(should_cancel)
     effective_cache_key: str | None = None
     if conn is not None:
         if cache_key:
@@ -406,11 +421,15 @@ def chat_completion(
                 temperature=temperature,
                 json_mode=json_mode,
                 max_tokens=max_tokens,
+                should_cancel=should_cancel,
             )
             if out:
+                raise_if_cancelled(should_cancel)
                 if conn is not None and effective_cache_key:
                     _write_cache(conn, effective_cache_key, out)
                 return out
+        except CancellationError:
+            raise
         except Exception:
             logger.warning(
                 "llm_router.chat_completion: Ollama failed, falling back to Gemini",
@@ -429,11 +448,15 @@ def chat_completion(
                 json_mode=json_mode,
                 max_output_tokens=max_tokens,
                 api_key_override=gemini_api_key_override,
+                should_cancel=should_cancel,
             )
             if out:
+                raise_if_cancelled(should_cancel)
                 if conn is not None and effective_cache_key:
                     _write_cache(conn, effective_cache_key, out)
                 return out
+        except CancellationError:
+            raise
         except Exception:
             logger.warning("llm_router.chat_completion: Gemini failed, falling back to Groq", exc_info=True)
 

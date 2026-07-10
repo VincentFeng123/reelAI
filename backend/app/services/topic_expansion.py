@@ -4,10 +4,13 @@ import json
 import logging
 import os
 import re
+from collections.abc import Callable
 from typing import Any
 
-import requests
+import httpx
 
+from ..clip_engine.cancellation import raise_if_cancelled, run_cancellable
+from ..clip_engine.errors import CancellationError
 from ..db import dumps_json, fetch_one, now_iso, upsert
 from .text_utils import normalize_whitespace
 
@@ -538,8 +541,7 @@ class TopicExpansionService:
             os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
         )
         self.request_timeout_sec = self.SERVERLESS_TIMEOUT_SEC if self.serverless_mode else self.DEFAULT_TIMEOUT_SEC
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "StudyReels/1.0 topic-expansion"})
+        self._request_headers = {"User-Agent": "StudyReels/1.0 topic-expansion"}
 
     def expand_topic(
         self,
@@ -549,7 +551,9 @@ class TopicExpansionService:
         max_subtopics: int = 10,
         max_aliases: int = 6,
         max_related_terms: int = 6,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        raise_if_cancelled(should_cancel)
         clean_topic = normalize_whitespace(topic or "").strip()
         if not clean_topic:
             return {"canonical_topic": "", "aliases": [], "subtopics": [], "related_terms": []}
@@ -566,6 +570,7 @@ class TopicExpansionService:
                 try:
                     payload = json.loads(str(cached.get("response_json") or "{}"))
                     if isinstance(payload, dict):
+                        raise_if_cancelled(should_cancel)
                         return payload
                 except json.JSONDecodeError:
                     pass
@@ -575,7 +580,9 @@ class TopicExpansionService:
             max_subtopics=max_subtopics,
             max_aliases=max_aliases,
             max_related_terms=max_related_terms,
+            should_cancel=should_cancel,
         )
+        raise_if_cancelled(should_cancel)
         if conn is not None:
             upsert(
                 conn,
@@ -596,7 +603,9 @@ class TopicExpansionService:
         max_subtopics: int,
         max_aliases: int,
         max_related_terms: int,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
+        raise_if_cancelled(should_cancel)
         clean_topic = normalize_whitespace(topic).strip()
         normalized_topic = self._normalize_key(clean_topic)
         if not normalized_topic:
@@ -609,9 +618,14 @@ class TopicExpansionService:
 
         wikipedia_results: list[dict[str, str]] = []
         for query in wikipedia_queries[:2]:
-            wikipedia_results.extend(self._search_wikipedia_results(query))
+            raise_if_cancelled(should_cancel)
+            wikipedia_results.extend(
+                self._search_wikipedia_results(query, should_cancel=should_cancel)
+            )
         search_titles = [str(item.get("title") or "") for item in wikipedia_results if str(item.get("title") or "")]
-        wikidata_entities = self._search_wikidata_entities(clean_topic)
+        wikidata_entities = self._search_wikidata_entities(
+            clean_topic, should_cancel=should_cancel
+        )
 
         canonical_topic = clean_topic
         if search_titles:
@@ -628,7 +642,11 @@ class TopicExpansionService:
 
         candidate_titles = [title for title in search_titles if title and title != canonical_topic]
         if len(candidate_titles) < max(4, max_subtopics // 2) and canonical_topic:
-            candidate_titles.extend(self._fetch_wikipedia_links(canonical_topic))
+            candidate_titles.extend(
+                self._fetch_wikipedia_links(
+                    canonical_topic, should_cancel=should_cancel
+                )
+            )
         outline_titles = self._outline_titles(topic=clean_topic, canonical_topic=canonical_topic, titles=search_titles)
         weighted_candidates: list[tuple[str, float]] = []
         opaque_topic = self._is_opaque_single_token_topic(
@@ -665,7 +683,13 @@ class TopicExpansionService:
         weighted_candidates.extend((term, 2.0) for term in generic_subtopics)
         weighted_candidates.extend((title, 2.8) for title in candidate_titles)
         for outline_title in outline_titles:
-            weighted_candidates.extend((title, 4.0) for title in self._fetch_wikipedia_links(outline_title))
+            raise_if_cancelled(should_cancel)
+            weighted_candidates.extend(
+                (title, 4.0)
+                for title in self._fetch_wikipedia_links(
+                    outline_title, should_cancel=should_cancel
+                )
+            )
         for result in wikipedia_results:
             title = str(result.get("title") or "").strip()
             snippet = str(result.get("snippet") or "").strip()
@@ -695,7 +719,9 @@ class TopicExpansionService:
             companion_terms,
             limit=max_related_terms,
         )
-        raw_datamuse_terms = self._fetch_datamuse_related_terms(clean_topic)
+        raw_datamuse_terms = self._fetch_datamuse_related_terms(
+            clean_topic, should_cancel=should_cancel
+        )
         if opaque_topic:
             datamuse_terms = [
                 term for term in raw_datamuse_terms
@@ -721,6 +747,7 @@ class TopicExpansionService:
             max_related_terms=max_related_terms,
         )
 
+        raise_if_cancelled(should_cancel)
         return {
             "canonical_topic": canonical_topic,
             "aliases": aliases,
@@ -840,7 +867,12 @@ class TopicExpansionService:
         )
         return f"topic_expansion:{hashlib.sha256(payload.encode('utf-8')).hexdigest()}"
 
-    def _search_wikipedia_results(self, query: str) -> list[dict[str, str]]:
+    def _search_wikipedia_results(
+        self,
+        query: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[dict[str, str]]:
         payload = self._request_json(
             self.WIKIPEDIA_API_URL,
             {
@@ -852,6 +884,7 @@ class TopicExpansionService:
                 "utf8": 1,
                 "origin": "*",
             },
+            should_cancel=should_cancel,
         )
         items = (((payload or {}).get("query") or {}).get("search") or [])
         results: list[dict[str, str]] = []
@@ -866,7 +899,12 @@ class TopicExpansionService:
             results.append({"title": title, "snippet": snippet})
         return results
 
-    def _search_wikidata_entities(self, query: str) -> list[dict[str, Any]]:
+    def _search_wikidata_entities(
+        self,
+        query: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]]:
         payload = self._request_json(
             self.WIKIDATA_API_URL,
             {
@@ -878,6 +916,7 @@ class TopicExpansionService:
                 "limit": self.WIKIDATA_RESULT_LIMIT,
                 "origin": "*",
             },
+            should_cancel=should_cancel,
         )
         entities = payload.get("search") if isinstance(payload, dict) else []
         results: list[dict[str, Any]] = []
@@ -893,16 +932,29 @@ class TopicExpansionService:
             results.append({"label": label, "description": description, "aliases": aliases[:8]})
         return results
 
-    def _fetch_datamuse_related_terms(self, topic: str) -> list[str]:
+    def _fetch_datamuse_related_terms(
+        self,
+        topic: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[str]:
         try:
-            response = self._session.get(
-                self.DATAMUSE_API_URL,
-                params={"ml": topic, "max": self.DATAMUSE_RESULT_LIMIT},
-                timeout=self.request_timeout_sec,
-            )
-            response.raise_for_status()
-            payload = response.json()
-        except (requests.RequestException, ValueError) as exc:
+            async def request() -> Any:
+                async with httpx.AsyncClient(
+                    headers=self._request_headers,
+                    timeout=self.request_timeout_sec,
+                ) as client:
+                    response = await client.get(
+                        self.DATAMUSE_API_URL,
+                        params={"ml": topic, "max": self.DATAMUSE_RESULT_LIMIT},
+                    )
+                    response.raise_for_status()
+                    return response.json()
+
+            payload = run_cancellable(request, should_cancel)
+        except CancellationError:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
             logger.debug("topic expansion datamuse request failed for %s: %s", topic, exc)
             return []
 
@@ -923,7 +975,12 @@ class TopicExpansionService:
             terms.append(value)
         return terms
 
-    def _fetch_wikipedia_links(self, title: str) -> list[str]:
+    def _fetch_wikipedia_links(
+        self,
+        title: str,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[str]:
         clean_title = self._clean_wikipedia_title(title)
         if not clean_title:
             return []
@@ -940,6 +997,7 @@ class TopicExpansionService:
                 "redirects": 1,
                 "origin": "*",
             },
+            should_cancel=should_cancel,
         )
         pages = (((payload or {}).get("query") or {}).get("pages") or {})
         results: list[str] = []
@@ -1604,12 +1662,27 @@ class TopicExpansionService:
         cleaned = re.sub(r"[^a-z0-9\+# ]+", " ", cleaned)
         return re.sub(r"\s+", " ", cleaned).strip()
 
-    def _request_json(self, url: str, params: dict[str, Any]) -> dict[str, Any]:
+    def _request_json(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         try:
-            response = self._session.get(url, params=params, timeout=self.request_timeout_sec)
-            response.raise_for_status()
-            payload = response.json()
+            async def request() -> Any:
+                async with httpx.AsyncClient(
+                    headers=self._request_headers,
+                    timeout=self.request_timeout_sec,
+                ) as client:
+                    response = await client.get(url, params=params)
+                    response.raise_for_status()
+                    return response.json()
+
+            payload = run_cancellable(request, should_cancel)
             return payload if isinstance(payload, dict) else {}
-        except (requests.RequestException, ValueError) as exc:
+        except CancellationError:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
             logger.debug("topic expansion request failed for %s: %s", url, exc)
             return {}

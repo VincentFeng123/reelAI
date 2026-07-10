@@ -9,6 +9,7 @@ from typing import Callable, Optional
 
 from .. import config
 from ..errors import PipelineError
+from ...cancellation import raise_if_cancelled
 
 ProgressCb = Optional[Callable[[float, str], None]]
 
@@ -87,6 +88,8 @@ def transcribe_supadata(url: str, video_id: str, settings: dict, progress: Progr
         if progress:
             progress(max(0.0, min(1.0, frac)), msg)
 
+    should_cancel = settings.get("should_cancel")
+    raise_if_cancelled(should_cancel)
     cache = config.WORK_DIR / video_id / "transcript.json"
     if cache.exists():
         emit(1.0, "Using cached transcript")
@@ -96,7 +99,10 @@ def transcribe_supadata(url: str, video_id: str, settings: dict, progress: Progr
 
     emit(0.2, "Fetching transcript (Supadata)…")
     chunks = fetch_transcript(
-        url, settings.get("language", "en"), chunk_size=config.SUPADATA_CHUNK_SIZE
+        url,
+        settings.get("language", "en"),
+        chunk_size=config.SUPADATA_CHUNK_SIZE,
+        should_cancel=should_cancel,
     )
 
     words: list[dict] = []
@@ -121,6 +127,7 @@ def transcribe_supadata(url: str, video_id: str, settings: dict, progress: Progr
         "source": "supadata",
         "chunks": chunks,
     }
+    raise_if_cancelled(should_cancel)
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(result), encoding="utf-8")
     emit(1.0, "Transcript ready")
