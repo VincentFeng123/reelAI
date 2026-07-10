@@ -59,21 +59,39 @@ def test_search_one_sends_truthful_filters_and_caches(monkeypatch):
     cache = MemoryProviderCache()
     filters = {"preferred_video_duration": "medium", "creative_commons_only": True}
     first = ss.search_one(
-        "Calculus", filters, language="fr", page_token="p1", cache_store=cache
+        "Calculus", filters, language="fr", cache_store=cache
     )
     second = ss.search_one(
-        "  calculus ", filters, language="FR", page_token="p1", cache_store=cache
+        "  calculus ", filters, language="FR", cache_store=cache
     )
     assert calls[0]["headers"]["x-api-key"] == "sd_test"
     assert calls[0]["params"]["features"] == ["creative-commons", "subtitles"]
     assert calls[0]["params"]["duration"] == "medium"
-    assert calls[0]["params"]["lang"] == "fr"
-    assert calls[0]["params"]["pageToken"] == "p1"
+    assert "lang" not in calls[0]["params"]
     assert [video["id"] for video in first["videos"]] == ["dQw4w9WgXcQ"]
     assert first["next_page_token"] == "next"
     assert second["cache_hit"] is True
     assert second["billed"] == 0
     assert len(calls) == 1
+
+
+def test_search_page_token_uses_documented_parameter_without_filters(monkeypatch):
+    calls = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls.append(params)
+        return _Resp(200, {"results": []})
+
+    monkeypatch.setattr(ss.httpx, "get", fake_get)
+    ss.search_one(
+        "ignored on continuation",
+        {"creative_commons_only": True, "duration": "long"},
+        language="fr",
+        page_token="next-token",
+        cache_store=MemoryProviderCache(),
+    )
+
+    assert calls == [{"nextPageToken": "next-token"}]
 
 
 def test_quota_is_typed_and_not_converted_to_empty_success(monkeypatch):

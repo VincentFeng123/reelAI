@@ -67,9 +67,9 @@ def normalize_filters(filters: Mapping[str, Any] | None) -> dict[str, Any]:
         "relevance": "relevance",
         "date": "date",
         "rating": "rating",
-        "viewcount": "viewCount",
-        "view_count": "viewCount",
-        "views": "viewCount",
+        "viewcount": "views",
+        "view_count": "views",
+        "views": "views",
     }.get(raw_sort, "relevance")
     raw_upload = str(source.get("uploadDate") or source.get("upload_date") or "all").strip().casefold()
     upload_date = raw_upload if raw_upload in {"all", "hour", "today", "week", "month", "year"} else "all"

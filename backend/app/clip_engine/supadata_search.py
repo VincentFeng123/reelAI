@@ -34,7 +34,7 @@ def _message(response: httpx.Response) -> str:
     except Exception:
         return str(getattr(response, "text", "") or "")[:300]
     if isinstance(body, dict):
-        return str(body.get("message") or body.get("error") or "")[:300]
+        return str(body.get("details") or body.get("message") or body.get("error") or "")[:300]
     return ""
 
 
@@ -93,21 +93,20 @@ async def _search_one_async(
         }
     key = config.require_supadata_key()
 
-    params: dict[str, Any] = {
-        "query": " ".join(str(query or "").split()),
-        "type": "video",
-        "features": normalized_filters["features"],
-    }
-    if normalized_filters["sort_by"] != "relevance":
-        params["sortBy"] = normalized_filters["sort_by"]
-    if normalized_filters["upload_date"] != "all":
-        params["uploadDate"] = normalized_filters["upload_date"]
-    if normalized_filters["duration"] != "all":
-        params["duration"] = normalized_filters["duration"]
-    if normalized_language:
-        params["lang"] = normalized_language
     if page_token:
-        params["pageToken"] = str(page_token).strip()
+        params: dict[str, Any] = {"nextPageToken": str(page_token).strip()}
+    else:
+        params = {
+            "query": " ".join(str(query or "").split()),
+            "type": "video",
+            "features": normalized_filters["features"],
+        }
+        if normalized_filters["sort_by"] != "relevance":
+            params["sortBy"] = normalized_filters["sort_by"]
+        if normalized_filters["upload_date"] != "all":
+            params["uploadDate"] = normalized_filters["upload_date"]
+        if normalized_filters["duration"] != "all":
+            params["duration"] = normalized_filters["duration"]
 
     billed_total = 0
     async with httpx.AsyncClient(timeout=30.0) as client:

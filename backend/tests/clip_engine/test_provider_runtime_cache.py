@@ -109,6 +109,7 @@ def test_search_cache_key_normalizes_query_filters_and_language_but_not_page() -
         "upload_date": "all",
     }
     assert normalize_filters({"creative_commons_only": "false"})["features"] == ["subtitles"]
+    assert normalize_filters({"sort_by": "viewCount"})["sort_by"] == "views"
 
 
 def test_search_cache_uses_shorter_empty_ttl_and_filters_tombstones_twice() -> None:
