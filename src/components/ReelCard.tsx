@@ -528,7 +528,6 @@ export function ReelCard({
             rel: 0,
             playsinline: 1,
             iv_load_policy: 3,
-            modestbranding: 1,
             start: Math.floor(clipStart),
             end: Math.ceil(clipEnd),
             mute: 1,

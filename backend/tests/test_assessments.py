@@ -166,6 +166,39 @@ def test_dense_clips_create_and_resume_private_question_session(conn) -> None:
         assert "explanation" not in question
 
 
+def test_session_questions_are_watched_only_and_question_count_adapts(conn) -> None:
+    service = AssessmentService()
+    reel_ids = ["adaptive-0", "adaptive-1", "adaptive-unwatched"]
+    for index, reel_id in enumerate(reel_ids):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"adaptive-c{index}",
+            video_id=f"adaptive-v{index}",
+        )
+
+    for reel_id in reel_ids[:2]:
+        _complete(service, conn, reel_id, LEARNER)
+    two_reel_session = service.next_session(
+        conn, learner_id=LEARNER, material_id=MATERIAL
+    )["session"]
+    assert two_reel_session["question_count"] == 2
+    assert {question["reel_id"] for question in two_reel_session["questions"]} == set(
+        reel_ids[:2]
+    )
+
+    second_learner = "owner:adaptive-learner-b"
+    for reel_id in reel_ids:
+        _complete(service, conn, reel_id, second_learner)
+    three_reel_session = service.next_session(
+        conn, learner_id=second_learner, material_id=MATERIAL
+    )["session"]
+    assert three_reel_session["question_count"] == 3
+    assert {question["reel_id"] for question in three_reel_session["questions"]} == set(
+        reel_ids
+    )
+
+
 def test_question_storage_is_immutable_for_a_reel_fingerprint(conn) -> None:
     _seed_reel(conn, reel_id="immutable", concept_id="immutable-c", video_id="immutable-v")
     original = conn.execute(
@@ -195,6 +228,24 @@ def test_question_storage_is_immutable_for_a_reel_fingerprint(conn) -> None:
         correct_index=0.5,
         explanation="Gravity pulls an object toward Earth with force.",
         fingerprint="non-integral-answer",
+    ) is None
+
+
+def test_question_storage_rejects_content_not_supported_by_the_watched_reel(conn) -> None:
+    _seed_reel(
+        conn,
+        reel_id="grounded",
+        concept_id="grounded-c",
+        video_id="grounded-v",
+        with_question=False,
+    )
+    assert store_reel_assessment_question(
+        conn,
+        reel_id="grounded",
+        prompt="Which pigment captures sunlight during photosynthesis?",
+        options=["Chlorophyll", "Hemoglobin", "Keratin", "Collagen"],
+        correct_index=0,
+        explanation="Chlorophyll captures sunlight for photosynthesis.",
     ) is None
 
 
@@ -425,11 +476,24 @@ def test_snooze_reports_an_already_completed_session_as_completed(conn) -> None:
     ) == {"status": "completed", "assessment_ready": False}
 
 
-def test_legacy_backfill_is_one_batch_cached_and_malformed_items_are_isolated(conn) -> None:
+def test_malformed_backfill_is_isolated_and_retried_with_later_progress(conn) -> None:
     calls: list[list[str]] = []
 
     def generator(rows, _should_cancel=None):
         calls.append([str(row["reel_id"]) for row in rows])
+        if len(calls) > 1:
+            return {
+                "questions": [
+                    {
+                        "reel_id": row["reel_id"],
+                        "prompt": "What pulls an object toward Earth?",
+                        "options": ["Gravity", "Sound", "Heat", "Light"],
+                        "correct_index": 0,
+                        "explanation": "Gravity pulls an object toward Earth.",
+                    }
+                    for row in rows
+                ]
+            }
         return {
             "questions": [
                 {
@@ -465,7 +529,6 @@ def test_legacy_backfill_is_one_batch_cached_and_malformed_items_are_isolated(co
         "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'assessment_question_backfill:%'"
     ).fetchone()[0] == 2
 
-    conn.execute("DELETE FROM reel_assessment_questions")
     service._ensure_question_pool(
         conn,
         learner_id=LEARNER,
@@ -474,7 +537,22 @@ def test_legacy_backfill_is_one_batch_cached_and_malformed_items_are_isolated(co
         should_cancel=None,
     )
     assert len(calls) == 1
-    assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 1
+    conn.execute(
+        "UPDATE llm_cache SET created_at = '2020-01-01T00:00:00+00:00' "
+        "WHERE response_json LIKE '%null%'"
+    )
+
+    _seed_reel(
+        conn,
+        reel_id="legacy-2",
+        concept_id="legacy-c2",
+        video_id="legacy-v2",
+        with_question=False,
+    )
+    progress = _complete(service, conn, "legacy-2")
+    assert len(calls) == 2
+    assert progress["assessment_ready"] is True
+    assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 3
 
 
 def test_legacy_backfill_scans_past_cached_old_rows(conn) -> None:

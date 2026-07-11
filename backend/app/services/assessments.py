@@ -9,6 +9,7 @@ import re
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -30,6 +31,7 @@ MIN_COMPLETED_QUESTION_REELS = 2
 MAX_SESSION_QUESTIONS = 4
 CONCEPT_ADJUSTMENT_BOUND = 0.25
 BACKFILL_CACHE_PREFIX = "assessment_question_backfill:"
+NEGATIVE_BACKFILL_CACHE_TTL_SECONDS = 30
 
 _WORD_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 _GROUNDING_STOP_WORDS = {
@@ -512,7 +514,7 @@ class AssessmentService:
     def _load_cached_backfill(self, conn: Any, fingerprint: str) -> tuple[bool, object]:
         row = fetch_one(
             conn,
-            "SELECT response_json FROM llm_cache WHERE cache_key = ?",
+            "SELECT response_json, created_at FROM llm_cache WHERE cache_key = ?",
             (f"{BACKFILL_CACHE_PREFIX}{fingerprint}",),
         )
         if not row:
@@ -523,7 +525,20 @@ class AssessmentService:
             return False, None
         if not isinstance(payload, dict) or "question" not in payload:
             return False, None
-        return True, payload.get("question")
+        question = payload.get("question")
+        if question is None:
+            try:
+                created_at = datetime.fromisoformat(
+                    str(row.get("created_at") or "").replace("Z", "+00:00")
+                )
+            except ValueError:
+                return False, None
+            if created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
+            age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
+            if age_seconds >= NEGATIVE_BACKFILL_CACHE_TTL_SECONDS:
+                return False, None
+        return True, question
 
     @staticmethod
     def _write_cached_backfill(conn: Any, fingerprint: str, question: object) -> None:

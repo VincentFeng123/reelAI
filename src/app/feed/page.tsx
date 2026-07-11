@@ -2322,13 +2322,23 @@ function FeedPageInner() {
           if (cancelled || !isSearchScopeActive(searchScope)) {
             return;
           }
-          const pendingSession = response.session;
+          let assessmentResponse = response;
+          if (!assessmentResponse.session && assessmentResponse.assessment_ready) {
+            assessmentResponse = await startNextAssessment({
+              materialId: pendingMaterialId,
+              signal: searchScope.controller.signal,
+            });
+            if (cancelled || !isSearchScopeActive(searchScope)) {
+              return;
+            }
+          }
+          const pendingSession = assessmentResponse.session;
           if (
             pendingSession
             && pendingSession.questions.length > 0
             && pendingSession.answered_count < pendingSession.question_count
           ) {
-            const nextSession = withAssessmentAccuracy(pendingSession, response);
+            const nextSession = withAssessmentAccuracy(pendingSession, assessmentResponse);
             setAssessmentSession(nextSession);
             setAssessmentQuestionIndex(clamp(nextSession.current_index, 0, nextSession.questions.length - 1));
             setAssessmentAnswerReveal(null);
