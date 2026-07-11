@@ -30,27 +30,3 @@ pypdf==5.3.1
 boto3==1.37.1
 python-dateutil==2.9.0.post0
 psycopg[binary]==3.2.10
-resend==2.10.0
-yt-dlp==2026.3.17
-# Optional yt-dlp plugin that supplies PO Tokens via a bgutil HTTP provider.
-# Safe to install even when no provider is deployed — yt-dlp skips the plugin
-# if extractor_args don't point to a reachable URL. Activate by deploying
-# `brainicism/bgutil-ytdlp-pot-provider` as a sidecar and setting
-# YTDLP_POT_PROVIDER_URL (see config.py).
-bgutil-ytdlp-pot-provider>=0.7.0
-# Semantic text embeddings for clip-relevance scoring. Loaded lazily on
-# first use; the module auto-falls-back to the hash embedder if the model
-# cannot load.
-sentence-transformers>=3.0.0
-google-genai==1.73.1
-tiktoken==0.8.0
-rapidfuzz==3.10.1
-# Third-tier LLM fallback (after Gemini). Cerebras serves Llama 3.3
-# 70B at ~2000 tok/sec on a generous free tier — useful when the Gemini
-# daily quota is exhausted. OpenAI-compatible API shape.
-cerebras-cloud-sdk>=1.35.0
-# Sentence boundary detection for ClipBoundaryEngine (Phase A.2). ~50KB, pure
-# Python, no C deps — handles abbreviations (Dr./Mr./e.g./decimals) that the
-# regex fallback mis-splits on. If this import ever fails, services/sentences.py
-# degrades to the regex splitter automatically.
-pysbd==0.3.4
