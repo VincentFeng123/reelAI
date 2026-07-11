@@ -12,6 +12,30 @@ class Payload(BaseModel):
     value: str
 
 
+def test_gemini_uses_developer_json_schema_field(monkeypatch) -> None:
+    configs = []
+
+    class Models:
+        async def generate_content(self, *args, **kwargs):
+            configs.append(kwargs["config"])
+            return SimpleNamespace(
+                text='{"value":"ok"}',
+                model_version="primary-v1",
+                usage_metadata=None,
+            )
+
+    client = SimpleNamespace(aio=SimpleNamespace(models=Models()))
+    monkeypatch.setattr(gemini_client, "get_client", lambda: client)
+
+    result = gemini_client.generate_json_result(
+        "system", "user", Payload, model="primary"
+    )
+
+    assert result.text == '{"value":"ok"}'
+    assert configs[0].response_schema is None
+    assert configs[0].response_json_schema == Payload.model_json_schema()
+
+
 def test_only_explicit_fallback_model_can_degrade(monkeypatch) -> None:
     calls = []
 

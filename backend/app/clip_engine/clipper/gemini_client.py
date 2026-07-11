@@ -246,7 +246,7 @@ def generate_json_result(system: str, user: str, schema, temperature: float = 0.
         return types.GenerateContentConfig(
             system_instruction=system,
             response_mime_type="application/json",
-            response_schema=schema,
+            response_json_schema=schema.model_json_schema(),
             temperature=temperature,
             max_output_tokens=max_output_tokens,
         )

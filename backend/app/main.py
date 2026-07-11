@@ -3340,6 +3340,7 @@ def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
                 # cancellation. Leave the durable row for expiry/recovery.
                 logger.info("generation worker yielded lease job_id=%s", job_id)
     except ClipEngineProviderError as exc:
+        logger.warning("generation provider failure job_id=%s error=%s", job_id, exc.as_dict())
         with get_conn(transactional=True) as conn:
             transition_generation_terminal(
                 conn,
