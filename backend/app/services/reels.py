@@ -1,4 +1,3 @@
-import difflib
 import hashlib
 import json
 import logging
@@ -7,7 +6,6 @@ import os
 import re
 import sqlite3
 import threading
-import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -32,7 +30,6 @@ from . import llm_router
 from .concepts import build_takeaways
 from ..ingestion.errors import RateLimitedError as _IngestRateLimitedError
 from ..ingestion.segment import normalize_clip_window as _normalize_clip_window_fn
-from ..clip_engine import expand as _clip_engine_expand
 from ..clip_engine.cancellation import raise_if_cancelled as _raise_if_clip_cancelled
 from ..clip_engine.errors import CancellationError as _ClipEngineCancellationError
 from ..clip_engine.errors import ProviderError as _ClipEngineProviderError
@@ -49,6 +46,7 @@ from .segmenter import (
     normalize_terms,
     select_segments,
 )
+from .search_query_plan import build_search_query_plan
 from .topic_expansion import TopicExpansionService
 from .structural_classifier import classify_passage
 from .knowledge_level import effective_level_target
@@ -191,8 +189,6 @@ class _ChainBufferingEmitter:
 
 
 class ReelService:
-    _SUBJECT_CORRECTION_CACHE: dict[str, tuple[float, str]] = {}
-    _SUBJECT_CORRECTION_CACHE_TTL_SEC = 24 * 60 * 60
     VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
     DEFAULT_TARGET_CLIP_DURATION_SEC = 55
     MIN_TARGET_CLIP_DURATION_SEC = 15
@@ -1191,8 +1187,8 @@ class ReelService:
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
     RANKED_FEED_CACHE_VERSION = 10
     CONCEPT_ADJUSTMENT_BOUND = 0.25
-    GOT_IT_CONCEPT_STEP = 0.12
-    NEED_HELP_CONCEPT_STEP = 0.15
+    GOT_IT_CONCEPT_STEP = 0.04
+    NEED_HELP_CONCEPT_STEP = 0.06
     GLOBAL_FEEDBACK_WINDOW = 12
     GLOBAL_FEEDBACK_MIN_ROWS = 3
     def __init__(self, embedding_service, youtube_service, ingestion_pipeline=None) -> None:
@@ -1588,40 +1584,37 @@ class ReelService:
             else stored_knowledge_level
         )
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
+        literal_subject_tag = subject_tag
         strict_topic_only = str((material or {}).get("source_type") or "").strip().lower() == "topic"
+        strict_topic_expansion: dict[str, Any] | None = None
         if strict_topic_only and subject_tag:
-            # Spellcheck once for retrieval, but keep the learner-authored material
-            # and concept records immutable. Corrected forms are persisted as search
-            # terms by `_sync_topic_expansion_concepts` below.
-            _corrected = run_pre_ingestion(
-                lambda: self._corrected_subject_tag(subject_tag, should_cancel=should_cancel)
+            strict_topic_expansion = run_pre_ingestion(
+                lambda: self._topic_expansion_from_query_plan(
+                    conn,
+                    subject_tag=subject_tag,
+                    should_cancel=should_cancel,
+                )
             )
-            if _corrected != subject_tag:
-                subject_tag = _corrected
         if not concepts and strict_topic_only and subject_tag:
             concepts = run_pre_ingestion(
                 lambda: self._build_topic_only_concepts_from_expansion(
                     conn,
                     material_id=material_id,
                     subject_tag=subject_tag,
+                    expansion=strict_topic_expansion,
                     should_cancel=should_cancel,
                 )
             )
         if not concepts:
             return []
-        strict_topic_expansion: dict[str, Any] | None = None
         root_topic_terms: list[str] = []
         if strict_topic_only and subject_tag:
-            strict_topic_expansion = run_pre_ingestion(
-                lambda: self.topic_expansion_service.expand_topic(
-                    conn,
-                    topic=subject_tag,
-                    max_subtopics=10,
-                    max_aliases=8,
-                    max_related_terms=8,
-                    should_cancel=should_cancel,
-                )
-            )
+            strict_topic_expansion = strict_topic_expansion or {
+                "canonical_topic": subject_tag,
+                "aliases": [],
+                "subtopics": [],
+                "related_terms": [],
+            }
             concepts = run_pre_ingestion(
                 lambda: self._sync_topic_expansion_concepts(
                     conn,
@@ -1632,6 +1625,8 @@ class ReelService:
                     should_cancel=should_cancel,
                 )
             )
+            if not concepts:
+                return []
             root_topic_terms = self._topic_root_anchor_terms(
                 subject_tag=subject_tag,
                 expansion=strict_topic_expansion,
@@ -1644,6 +1639,7 @@ class ReelService:
                         concepts=concepts,
                         subject_tag=subject_tag,
                         material_id=material_id,
+                        expansion=strict_topic_expansion,
                         should_cancel=should_cancel,
                     )
                 )
@@ -1769,32 +1765,6 @@ class ReelService:
                     row.get("reel_count") or 0
                 )
         generated: list[dict[str, Any]] = []
-        if strict_topic_only and subject_tag:
-            if safe_retrieval_profile == "deep" and generation_context is None:
-                topic_expansion = run_pre_ingestion(
-                    lambda: self._deep_topic_expansion(
-                        conn,
-                        material_id=material_id,
-                        subject_tag=subject_tag,
-                        generation_id=generation_id,
-                        should_cancel=should_cancel,
-                    )
-                )
-                concepts = run_pre_ingestion(
-                    lambda: self._sync_topic_expansion_concepts(
-                        conn,
-                        material_id=material_id,
-                        concepts=concepts,
-                        subject_tag=subject_tag,
-                        expansion=topic_expansion,
-                        should_cancel=should_cancel,
-                    )
-                )
-                root_topic_terms = self._topic_root_anchor_terms(
-                    subject_tag=subject_tag,
-                    expansion=topic_expansion,
-                    concepts=concepts,
-                )
         accumulated_exclusions: list[str] = list(exclude_video_ids or [])
         # Finding #3: exclude videos we've already clipped for this generation and
         # videos from the excluded prior generations (exclude_generation_ids) so
@@ -1877,6 +1847,11 @@ class ReelService:
                     creative_commons_only=creative_commons_only,
                     preferred_video_duration=safe_video_duration_pref,
                     generation_context=generation_context,
+                    literal_topic=(
+                        literal_subject_tag
+                        if strict_topic_only and literal_subject_tag
+                        else topic
+                    ),
                 )
             except _ClipEngineCancellationError as exc:
                 raise GenerationCancelledError("Generation cancelled.") from exc
@@ -2430,6 +2405,10 @@ class ReelService:
             return None
         return vector
 
+    def _semantic_embeddings_available(self) -> bool:
+        available = getattr(self.embedding_service, "semantic_available", False)
+        return available if isinstance(available, bool) else False
+
 
 
 
@@ -2443,64 +2422,11 @@ class ReelService:
         tokens = re.findall(r"[a-z0-9\+#]+", cleaned)
         return " ".join(tokens)
 
-    def _corrected_subject_tag(
-        self,
-        subject_tag: str,
-        *,
-        should_cancel: Callable[[], bool] | None = None,
-    ) -> str:
-        """Spellcheck a topic-material subject via the clip engine's expansion
-        pass (Gemini flash-lite when keyed; the keyless fallback returns it
-        unchanged, so this never breaks offline paths).
-
-        Only conservative SPELLING fixes are accepted ('pychology' →
-        'psychology'); field-qualifying rewrites ('jaguar' → 'jaguar animal
-        biology') are rejected — discover()'s expansion applies those per-query
-        without renaming the user's topic."""
-        cache_key = subject_tag.strip().lower()
-        _raise_if_clip_cancelled(should_cancel)
-        cached = self._SUBJECT_CORRECTION_CACHE.get(cache_key)
-        if cached is not None:
-            cached_at, cached_value = cached
-            if time.time() - cached_at <= self._SUBJECT_CORRECTION_CACHE_TTL_SEC:
-                return cached_value
-            self._SUBJECT_CORRECTION_CACHE.pop(cache_key, None)
-        try:
-            expansion = (
-                _clip_engine_expand.expand_query(
-                    subject_tag, 1, should_cancel=should_cancel
-                )
-                if should_cancel is not None
-                else _clip_engine_expand.expand_query(subject_tag, 1)
-            )
-            corrected = str(expansion.get("corrected") or "").strip()
-        except _ClipEngineCancellationError:
-            raise
-        except Exception:
-            # Transient failure: fall back WITHOUT caching, so a later
-            # generation can still pick up the real correction.
-            logger.exception("subject correction failed; using raw subject %r", subject_tag)
-            return subject_tag
-        result = subject_tag
-        if corrected and corrected.lower() != cache_key:
-            same_word_count = len(corrected.split()) == len(subject_tag.split())
-            similarity = difflib.SequenceMatcher(
-                None, cache_key, corrected.lower()
-            ).ratio()
-            if same_word_count and similarity >= 0.75:
-                result = corrected
-        _raise_if_clip_cancelled(should_cancel)
-        if len(self._SUBJECT_CORRECTION_CACHE) < 512:
-            self._SUBJECT_CORRECTION_CACHE[cache_key] = (time.time(), result)
-        return result
-
     def _concept_topic_query(self, concept_row: dict) -> str:
         """Return a search-engine topic string for a concept row: its clean title.
 
-        No wiki-keyword append — the clip engine's `discover()` expansion
-        (spellcheck + field inference + educational phrasings) owns
-        disambiguation now, and appended `keywords_json` terms polluted the
-        seed query with unrelated wiki noise.
+        Topic-material concepts and search terms come from the shared cached AI
+        query plan; document concepts retain their source-grounded titles.
         """
         title = self._clean_query_text(str(concept_row.get("title") or ""))
         search_terms = concept_row.get("_search_terms")
@@ -3638,7 +3564,7 @@ class ReelService:
         if not cleaned:
             return 0.0
         lexical = lexical_overlap_score(cleaned, concept_terms)
-        if concept_embedding is None:
+        if concept_embedding is None or not self._semantic_embeddings_available():
             return float(lexical)
         try:
             text_embedding = self.embedding_service.embed_texts(conn, [cleaned])[0]
@@ -3660,7 +3586,7 @@ class ReelService:
         if not left_clean or not right_clean:
             return 0.0
         lexical = lexical_overlap_score(left_clean, [right_clean])
-        if fast_mode:
+        if fast_mode or not self._semantic_embeddings_available():
             return float(max(0.0, min(1.0, lexical)))
         try:
             embeddings = self.embedding_service.embed_texts(conn, [left_clean, right_clean])
@@ -4247,6 +4173,41 @@ class ReelService:
         ranked = sorted(scores.items(), key=lambda item: (-item[1], order[item[0]]))
         return [term for term, _ in ranked[:max_terms]]
 
+    def _topic_expansion_from_query_plan(
+        self,
+        conn,
+        *,
+        subject_tag: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        literal = self._clean_query_text(subject_tag)
+        fallback = {
+            "canonical_topic": literal,
+            "aliases": [],
+            "subtopics": [],
+            "related_terms": [],
+        }
+        if not literal:
+            return fallback
+        try:
+            plan = build_search_query_plan(
+                conn,
+                literal_query=literal,
+                should_cancel=should_cancel,
+            )
+        except _ClipEngineCancellationError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "topic query plan unavailable during reel generation error_type=%s",
+                type(exc).__name__,
+            )
+            return fallback
+        _raise_if_clip_cancelled(should_cancel)
+        if plan.ai_status != "validated":
+            return fallback
+        return plan.as_topic_expansion()
+
     def _bootstrap_topic_retrieval_concepts(
         self,
         *,
@@ -4254,6 +4215,7 @@ class ReelService:
         concepts: list[dict[str, Any]],
         subject_tag: str,
         material_id: str,
+        expansion: dict[str, Any] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         _raise_if_clip_cancelled(should_cancel)
@@ -4281,6 +4243,7 @@ class ReelService:
                 root_concept,
                 subject_tag=subject_tag,
                 conn=conn,
+                expansion=expansion,
                 should_cancel=should_cancel,
             )
         )
@@ -4292,38 +4255,24 @@ class ReelService:
         *,
         subject_tag: str,
         conn=None,
+        expansion: dict[str, Any] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[str]:
-        expansion = self.topic_expansion_service.expand_topic(
+        expansion = expansion or self._topic_expansion_from_query_plan(
             conn,
-            topic=subject_tag,
-            max_subtopics=4,
-            max_aliases=4,
-            max_related_terms=4,
+            subject_tag=subject_tag,
             should_cancel=should_cancel,
         )
         _raise_if_clip_cancelled(should_cancel)
-        search_terms = self.topic_expansion_service.build_topic_search_terms(
-            topic=subject_tag,
-            expansion=expansion,
-            limit=6,
-        )
-        canonical_topic = self._clean_query_text(str(expansion.get("canonical_topic") or ""))
-        companion_terms = [
-            self._clean_query_text(str(term or ""))
-            for term in (expansion.get("related_terms") or [])
-            if self.topic_expansion_service._allows_unanchored_opaque_search_term(str(term or ""))
-            and not self.topic_expansion_service._is_topic_anchor_candidate(
-                topic=subject_tag,
-                canonical_topic=canonical_topic,
-                candidate=str(term or ""),
-            )
-        ]
         candidates = [
             self._clean_query_text(subject_tag),
             self._clean_query_text(str(concept.get("title") or "")),
-            *companion_terms,
-            *[self._clean_query_text(term) for term in search_terms],
+            self._clean_query_text(str(expansion.get("canonical_topic") or "")),
+            *[
+                self._clean_query_text(str(term or ""))
+                for key in ("aliases", "subtopics", "related_terms")
+                for term in (expansion.get(key) or [])
+            ],
         ]
         deduped: list[str] = []
         seen: set[str] = set()
@@ -4345,247 +4294,11 @@ class ReelService:
         should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         _raise_if_clip_cancelled(should_cancel)
-        base_expansion = self.topic_expansion_service.expand_topic(
-            conn,
-            topic=subject_tag,
-            max_subtopics=12,
-            max_aliases=8,
-            max_related_terms=8,
-            should_cancel=should_cancel,
-        )
-        _raise_if_clip_cancelled(should_cancel)
-        observed_examples = self._topic_expansion_observed_examples(
-            conn,
-            material_id=material_id,
-            generation_id=generation_id,
-            limit=4,
-        )
-        ai_expansion = self._expand_topic_via_llm(
+        return self._topic_expansion_from_query_plan(
             conn,
             subject_tag=subject_tag,
-            base_expansion=base_expansion,
-            observed_examples=observed_examples,
             should_cancel=should_cancel,
         )
-        _raise_if_clip_cancelled(should_cancel)
-        return self._merge_topic_expansions(base_expansion, ai_expansion, subject_tag=subject_tag)
-
-    def _topic_expansion_observed_examples(
-        self,
-        conn,
-        *,
-        material_id: str,
-        generation_id: str | None,
-        limit: int,
-    ) -> list[dict[str, str]]:
-        params: list[Any] = [material_id]
-        generation_clause = ""
-        if generation_id:
-            generation_clause = " AND COALESCE(r.generation_id, '') = ?"
-            params.append(str(generation_id))
-        rows = fetch_all(
-            conn,
-            f"""
-            SELECT
-                COALESCE(v.title, '') AS title,
-                COALESCE(r.transcript_snippet, '') AS snippet,
-                MIN(COALESCE(r.created_at, '')) AS first_seen_at
-            FROM reels r
-            JOIN videos v ON v.id = r.video_id
-            WHERE r.material_id = ?
-              {generation_clause}
-            GROUP BY COALESCE(v.title, ''), COALESCE(r.transcript_snippet, '')
-            ORDER BY first_seen_at ASC, title ASC, snippet ASC
-            LIMIT ?
-            """,
-            tuple([*params, int(limit)]),
-        )
-        examples: list[dict[str, str]] = []
-        for row in rows:
-            title = self._clean_query_text(str(row.get("title") or ""))
-            snippet = self._clean_query_text(str(row.get("snippet") or ""))
-            if not title and not snippet:
-                continue
-            examples.append({"title": title, "snippet": snippet})
-        return examples
-
-    def _expand_topic_via_llm(
-        self,
-        conn,
-        *,
-        subject_tag: str,
-        base_expansion: dict[str, Any],
-        observed_examples: list[dict[str, str]],
-        should_cancel: Callable[[], bool] | None = None,
-    ) -> dict[str, Any]:
-        _raise_if_clip_cancelled(should_cancel)
-        injected_client = getattr(self, "openai_client", None)
-        if not self.llm_available and injected_client is None:
-            return {}
-
-        observed_block = "\n".join(
-            f"- title: {example.get('title') or 'n/a'} | snippet: {example.get('snippet') or 'n/a'}"
-            for example in observed_examples[:4]
-        )
-        base_terms = self._topic_expansion_terms(
-            expansion=base_expansion,
-            subject_tag=subject_tag,
-            limit=12,
-        )
-        cache_payload = "|".join(
-            [
-                "topic_deep_expand_v1",
-                self.chat_model,
-                self._normalize_query_key(subject_tag),
-                *[self._normalize_query_key(term) for term in base_terms[:8]],
-                *[
-                    self._normalize_query_key(f"{example.get('title') or ''} {example.get('snippet') or ''}")
-                    for example in observed_examples[:4]
-                ],
-            ]
-        )
-        cache_key = f"topic_deep_expand:{hashlib.sha256(cache_payload.encode('utf-8')).hexdigest()}"
-        cached = fetch_one(conn, "SELECT response_json FROM llm_cache WHERE cache_key = ?", (cache_key,))
-        if cached:
-            try:
-                payload = json.loads(str(cached.get("response_json") or "{}"))
-                if isinstance(payload, dict):
-                    _raise_if_clip_cancelled(should_cancel)
-                    return payload
-            except json.JSONDecodeError:
-                pass
-
-        system_prompt = (
-            "You expand educational study topics into strict on-topic YouTube search terms. "
-            "Return strict JSON only with keys aliases, subtopics, related_terms. "
-            "Keep every term educational, concrete, and tightly anchored to the topic. "
-            "Do not output generic filler like basics, overview, foundations, worked examples, or problem solving."
-        )
-        user_prompt = (
-            f"Topic: {subject_tag}\n"
-            f"Existing non-AI expansion terms: {', '.join(base_terms[:12]) or 'none'}\n"
-            f"Observed starter reels:\n{observed_block or '- none yet'}\n"
-            "Return JSON with:\n"
-            "- aliases: 0-6 alternate names or near-synonyms for the same study topic\n"
-            "- subtopics: 4-10 concrete subtopics that would find more educational videos\n"
-            "- related_terms: 0-6 tightly related educational search phrases\n"
-            "Rules:\n"
-            "- stay strictly within the topic\n"
-            "- prefer academically useful terms\n"
-            "- avoid generic pedagogy words alone\n"
-            "- no numbering, prose, or markdown"
-        )
-        try:
-            if injected_client is not None:
-                response = injected_client.chat.completions.create(
-                    model=self.chat_model,
-                    temperature=0.2,
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                )
-                raw = response.choices[0].message.content or "{}"
-            else:
-                raw = llm_router.chat_completion(
-                    system=system_prompt,
-                    user=user_prompt,
-                    temperature=0.2,
-                    json_mode=True,
-                    should_cancel=should_cancel,
-                ) or "{}"
-            _raise_if_clip_cancelled(should_cancel)
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                return {}
-            sanitized = self._sanitize_topic_expansion_payload(payload, subject_tag=subject_tag)
-            _raise_if_clip_cancelled(should_cancel)
-            upsert(
-                conn,
-                "llm_cache",
-                {
-                    "cache_key": cache_key,
-                    "response_json": dumps_json(sanitized),
-                    "created_at": now_iso(),
-                },
-                pk="cache_key",
-            )
-            return sanitized
-        except _ClipEngineCancellationError:
-            raise
-        except Exception:
-            return {}
-
-    def _sanitize_topic_expansion_payload(self, payload: dict[str, Any], *, subject_tag: str) -> dict[str, Any]:
-        return {
-            "canonical_topic": self._clean_query_text(str(payload.get("canonical_topic") or subject_tag)) or subject_tag,
-            "aliases": self._sanitize_topic_term_list(payload.get("aliases"), subject_tag=subject_tag, limit=8),
-            "subtopics": self._sanitize_topic_term_list(payload.get("subtopics"), subject_tag=subject_tag, limit=12),
-            "related_terms": self._sanitize_topic_term_list(payload.get("related_terms"), subject_tag=subject_tag, limit=8),
-        }
-
-    def _sanitize_topic_term_list(self, value: Any, *, subject_tag: str, limit: int) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        subject_key = self._normalize_query_key(subject_tag)
-        generic = {
-            "basics",
-            "foundations",
-            "introduction",
-            "overview",
-            "problem solving",
-            "worked examples",
-        }
-        cleaned_terms: list[str] = []
-        seen: set[str] = set()
-        for item in value:
-            cleaned = self._clean_query_text(str(item or ""))
-            normalized = self._normalize_query_key(cleaned)
-            if (
-                not cleaned
-                or not normalized
-                or normalized == subject_key
-                or normalized in seen
-                or normalized in generic
-            ):
-                continue
-            seen.add(normalized)
-            cleaned_terms.append(cleaned)
-            if len(cleaned_terms) >= limit:
-                break
-        return cleaned_terms
-
-    def _merge_topic_expansions(
-        self,
-        base_expansion: dict[str, Any],
-        ai_expansion: dict[str, Any],
-        *,
-        subject_tag: str,
-    ) -> dict[str, Any]:
-        merged = {
-            "canonical_topic": str(ai_expansion.get("canonical_topic") or base_expansion.get("canonical_topic") or subject_tag),
-            "aliases": [],
-            "subtopics": [],
-            "related_terms": [],
-        }
-        for key, limit in (("aliases", 8), ("subtopics", 12), ("related_terms", 8)):
-            seen: set[str] = set()
-            values: list[str] = []
-            for source in (ai_expansion, base_expansion):
-                for raw in (source.get(key) or []):
-                    cleaned = self._clean_query_text(str(raw or ""))
-                    normalized = self._normalize_query_key(cleaned)
-                    if not cleaned or not normalized or normalized in seen:
-                        continue
-                    seen.add(normalized)
-                    values.append(cleaned)
-                    if len(values) >= limit:
-                        break
-                if len(values) >= limit:
-                    break
-            merged[key] = values
-        return merged
 
     def _topic_root_anchor_terms(
         self,
@@ -4652,26 +4365,20 @@ class ReelService:
         *,
         material_id: str,
         subject_tag: str,
+        expansion: dict[str, Any] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         _raise_if_clip_cancelled(should_cancel)
-        expansion = self.topic_expansion_service.expand_topic(
+        expansion = expansion or self._topic_expansion_from_query_plan(
             conn,
-            topic=subject_tag,
-            max_subtopics=10,
-            max_aliases=8,
-            max_related_terms=8,
+            subject_tag=subject_tag,
             should_cancel=should_cancel,
         )
-        root_topic_terms = self._topic_root_anchor_terms(subject_tag=subject_tag, expansion=expansion)
         expansion_terms = self._topic_expansion_terms(
             expansion=expansion,
             subject_tag=subject_tag,
             limit=8,
         )
-        expansion_terms = [
-            term for term in expansion_terms if self._term_has_root_topic_anchor(term, root_topic_terms=root_topic_terms)
-        ]
 
         subject_title = self._title_case_phrase(subject_tag)
         created_concepts: list[dict[str, Any]] = []
@@ -4730,18 +4437,37 @@ class ReelService:
 
         Earlier versions recycled concept IDs by changing their titles to whichever
         static/LLM expansion happened to win that run. Besides corrupting progress,
-        that made a concept mean different things across generations. Expansion is
-        retrieval metadata now: IDs, titles, summaries, and embeddings stay untouched.
+        that made a concept mean different things across generations. Database rows
+        stay untouched, while the generation working set is limited to the literal
+        topic and terms in the current validated AI plan.
         """
         _raise_if_clip_cancelled(should_cancel)
-        working = [dict(concept) for concept in concepts]
-        if not working:
-            return working
-
         canonical = self._clean_query_text(
             str(expansion.get("canonical_topic") or subject_tag)
         ) or self._clean_query_text(subject_tag)
         subject_key = self._normalize_query_key(subject_tag)
+        allowed_concept_keys = {
+            self._normalize_query_key(value)
+            for value in [
+                subject_tag,
+                canonical,
+                *[
+                    str(term or "")
+                    for key in ("aliases", "subtopics", "related_terms")
+                    for term in (expansion.get(key) or [])
+                ],
+            ]
+            if self._normalize_query_key(value)
+        }
+        working = [
+            dict(concept)
+            for concept in concepts
+            if self._normalize_query_key(str(concept.get("title") or ""))
+            in allowed_concept_keys
+        ]
+        if not working:
+            return working
+
         root_index = next(
             (
                 index
@@ -4844,7 +4570,6 @@ class ReelService:
         def add_term(raw_value: str) -> bool:
             cleaned = self._clean_query_text(str(raw_value or ""))
             normalized = self._normalize_query_key(cleaned)
-            allow_companion = self.topic_expansion_service._allows_unanchored_opaque_search_term(cleaned)
             if (
                 not cleaned
                 or not normalized
@@ -4852,61 +4577,16 @@ class ReelService:
                 or normalized in seen
             ):
                 return False
-            if not allow_companion and self._is_low_signal_topic_concept(cleaned, subject_tag=subject_tag):
-                return False
             seen.add(normalized)
             ordered.append(cleaned)
             return True
 
-        for raw_value in self._curated_topic_subtopic_terms(subject_tag):
-            add_term(raw_value)
-            if len(ordered) >= limit:
-                return ordered[:limit]
-
-        candidate_terms = self.topic_expansion_service.build_topic_search_terms(
-            topic=subject_tag,
-            expansion=expansion,
-            limit=max(limit + 2, 8),
-        )
-        for raw_value in candidate_terms:
-            if not add_term(str(raw_value or "")):
-                continue
-            if len(ordered) >= limit:
-                return ordered
-        return ordered
-
-    def _curated_topic_subtopic_terms(self, subject_tag: str) -> list[str]:
-        subject_key = self._normalize_query_key(subject_tag)
-        if not subject_key:
-            return []
-
-        ordered: list[str] = []
-        seen: set[str] = set()
-
-        def add_term(raw_value: str) -> None:
-            cleaned = self._clean_query_text(str(raw_value or ""))
-            normalized = self._normalize_query_key(cleaned)
-            if not cleaned or not normalized or normalized == subject_key or normalized in seen:
-                return
-            seen.add(normalized)
-            ordered.append(cleaned)
-
-        for mapping in (
-            getattr(self.topic_expansion_service, "STATIC_TOPIC_SUBTOPICS", {}),
-            self.BROAD_TOPIC_SUBTOPICS,
-        ):
-            for raw_topic, topic_terms in mapping.items():
-                if self._normalize_query_key(raw_topic) != subject_key:
-                    continue
-                for term in topic_terms:
-                    add_term(str(term or ""))
-                break
-
-        for term in self._expand_controlled_synonyms([subject_tag], fast_mode=True):
-            if len(self._normalize_query_key(term).split()) < 2:
-                continue
-            add_term(term)
-        return ordered[:10]
+        for key in ("subtopics", "aliases", "related_terms"):
+            for raw_value in expansion.get(key) or []:
+                if add_term(str(raw_value or "")) and len(ordered) >= limit:
+                    return ordered
+        add_term(str(expansion.get("canonical_topic") or ""))
+        return ordered[:limit]
 
     def _topic_concept_keywords(
         self,
@@ -4919,7 +4599,6 @@ class ReelService:
             self._clean_query_text(primary_term),
             self._clean_query_text(subject_tag),
             *[self._clean_query_text(term) for term in expansion_terms[:5]],
-            self._clean_query_text(f"{primary_term} explained"),
         ]
         deduped: list[str] = []
         seen: set[str] = set()
@@ -5029,9 +4708,12 @@ class ReelService:
         subject_overlap = lexical_overlap_score(cleaned, [subject_tag]) if subject_tag else 0.0
 
         embedding_sim = 0.0
-        if concept_embedding is not None:
-            text_embedding = self.embedding_service.embed_texts(conn, [cleaned])[0]
-            embedding_sim = float(text_embedding @ concept_embedding.astype(np.float32))
+        if concept_embedding is not None and self._semantic_embeddings_available():
+            try:
+                text_embedding = self.embedding_service.embed_texts(conn, [cleaned])[0]
+                embedding_sim = float(text_embedding @ concept_embedding.astype(np.float32))
+            except Exception:
+                embedding_sim = 0.0
 
         allowed_terms = [*concept_terms, *context_terms]
         if subject_tag:
@@ -5412,26 +5094,49 @@ class ReelService:
             if "no such table: assessment_concept_outcomes" not in str(exc):
                 raise
             assessment_rows = []
-        rows = list(feedback_rows)
+        rows = [
+            {
+                **row,
+                "signal": (
+                    self.GOT_IT_CONCEPT_STEP
+                    if int(row.get("helpful") or 0) > 0
+                    else 0.0
+                )
+                - (
+                    self.NEED_HELP_CONCEPT_STEP
+                    if int(row.get("confusing") or 0) > 0
+                    else 0.0
+                ),
+                "source": "manual",
+            }
+            for row in feedback_rows
+        ]
         for row in assessment_rows:
             adjustment = float(row.get("adjustment") or 0.0)
             rows.append(
                 {
                     **row,
-                    "helpful": 1 if adjustment > 0 else 0,
-                    "confusing": 1 if adjustment < 0 else 0,
+                    "signal": adjustment,
+                    "source": "assessment",
                 }
             )
         rows.sort(key=lambda row: str(row.get("event_at") or ""), reverse=True)
         rows = rows[: self.GLOBAL_FEEDBACK_WINDOW]
-        distinct_concepts = {str(row.get("concept_id") or "") for row in rows}
-        if len(rows) < self.GLOBAL_FEEDBACK_MIN_ROWS or len(distinct_concepts) < 2:
+        assessment_present = bool(assessment_rows)
+        manual_rows = [row for row in rows if row.get("source") == "manual"]
+        manual_concepts = {
+            str(row.get("concept_id") or "") for row in manual_rows
+        }
+        if (
+            not assessment_present
+            and (
+                len(manual_rows) < self.GLOBAL_FEEDBACK_MIN_ROWS
+                or len(manual_concepts) < 2
+            )
+        ):
             adjustment = 0.0
         else:
-            n = len(rows)
-            got_it = sum(1 for row in rows if int(row.get("helpful") or 0) > 0)
-            need_help = sum(1 for row in rows if int(row.get("confusing") or 0) > 0)
-            signal = 0.20 * (got_it - need_help) / n
+            signal = sum(float(row.get("signal") or 0.0) for row in rows)
             adjustment = max(-ADJUSTMENT_BOUND, min(ADJUSTMENT_BOUND, signal))
         execute_modify(
             conn,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import re
 import uuid
 from collections.abc import Callable
@@ -22,13 +21,14 @@ from ..db import (
     now_iso,
     upsert,
 )
-from ..clip_engine.errors import CancellationError
+from ..clip_engine.errors import CancellationError, ProviderError
 
 
 COMPLETION_FRACTION = 0.80
-DEFAULT_RECENT_ACCURACY = 0.70
-MIN_COMPLETED_QUESTION_REELS = 2
-MAX_SESSION_QUESTIONS = 4
+LOW_ACCURACY_COMPLETION_TARGET = 2
+DEFAULT_COMPLETION_TARGET = 3
+HIGH_ACCURACY_COMPLETION_TARGET = 4
+SESSION_QUESTION_TARGET = 2
 CONCEPT_ADJUSTMENT_BOUND = 0.25
 BACKFILL_CACHE_PREFIX = "assessment_question_backfill:"
 NEGATIVE_BACKFILL_CACHE_TTL_SECONDS = 30
@@ -275,9 +275,16 @@ class AssessmentService:
         return total
 
     @staticmethod
-    def _readiness_threshold(rolling_accuracy: float | None) -> float:
-        accuracy = DEFAULT_RECENT_ACCURACY if rolling_accuracy is None else float(rolling_accuracy)
-        return max(2.5, min(5.0, 3.5 + 3.0 * (accuracy - 0.70)))
+    def _completed_reel_target(
+        recent_accuracy: float | None, recent_sessions: list[float]
+    ) -> int:
+        if len(recent_sessions) >= 2 and all(
+            accuracy >= 0.90 for accuracy in recent_sessions[:2]
+        ):
+            return HIGH_ACCURACY_COMPLETION_TARGET
+        if recent_accuracy is not None and float(recent_accuracy) < 0.70:
+            return LOW_ACCURACY_COMPLETION_TARGET
+        return DEFAULT_COMPLETION_TARGET
 
     def _accuracy_stats(
         self, conn: Any, learner_id: str, material_id: str
@@ -413,39 +420,58 @@ class AssessmentService:
         recent_accuracy, rolling_accuracy, recent_sessions = self._accuracy_stats(
             conn, learner_id, material_id
         )
-        threshold = self._readiness_threshold(rolling_accuracy)
+        completion_target = self._completed_reel_target(
+            recent_accuracy, recent_sessions
+        )
         completed_cutoff = self._latest_cutoff(conn, learner_id, material_id, "completed")
         rows = self._completed_rows(conn, learner_id, material_id, completed_cutoff)
         total_units = self._information_units(rows)
 
         snoozed_cutoff = self._latest_cutoff(conn, learner_id, material_id, "snoozed")
-        effective_threshold = threshold
-        readiness_units = total_units
+        cadence_rows = rows
         if snoozed_cutoff and snoozed_cutoff > completed_cutoff:
-            readiness_units = self._information_units(
-                self._completed_rows(conn, learner_id, material_id, snoozed_cutoff)
+            cadence_rows = self._completed_rows(
+                conn, learner_id, material_id, snoozed_cutoff
             )
-            effective_threshold = max(1.5, threshold * 0.5)
+            completion_target = 1
 
         available = self._available_questions(conn, learner_id, material_id, completed_cutoff)
-        question_reels = {str(row.get("reel_id") or "") for row in available}
-        numeric_due = (
-            len(rows) >= MIN_COMPLETED_QUESTION_REELS
-            and readiness_units + 1e-9 >= effective_threshold
+        question_reels = {
+            str(row.get("reel_id") or "")
+            for row in available
+            if str(row.get("reel_id") or "")
+        }
+        question_concepts = {
+            str(row.get("concept_id") or "")
+            for row in available
+            if str(row.get("concept_id") or "")
+        }
+        completion_concepts = {
+            str(row.get("concept_id") or "")
+            for row in rows
+            if str(row.get("concept_id") or "")
+        }
+        question_target = min(SESSION_QUESTION_TARGET, len(completion_concepts))
+        question_pool_complete = (
+            question_target > 0
+            and len(question_reels) >= question_target
+            and len(question_concepts) >= question_target
         )
-        ready = bool(pending) or (
-            numeric_due
-            and len(question_reels) >= MIN_COMPLETED_QUESTION_REELS
-            and bool(available)
-        )
+        numeric_due = len(cadence_rows) >= completion_target
+        # Readiness is the durable due state. Question availability is handled
+        # separately so a transient provider failure cannot erase that state.
+        ready = bool(pending) or numeric_due
         return {
             "assessment_ready": ready,
             "numeric_due": numeric_due,
             "information_units": total_units,
-            "readiness_threshold": effective_threshold,
+            # Preserve the legacy field while reporting the cadence actually
+            # used by readiness (completed reels, not clip-duration units).
+            "readiness_threshold": float(completion_target),
             "completed_cutoff": completed_cutoff,
             "completion_rows": rows,
             "available_questions": available,
+            "question_pool_complete": question_pool_complete,
             "pending": pending,
             "recent_accuracy": recent_accuracy,
             "rolling_accuracy": rolling_accuracy,
@@ -493,7 +519,10 @@ class AssessmentService:
             pk=["learner_id", "reel_id"],
         )
         state = self._readiness_state(conn, learner_id, str(reel["material_id"]))
-        if state["numeric_due"] and not state["assessment_ready"]:
+        if (
+            state["numeric_due"]
+            and not bool(state["question_pool_complete"])
+        ):
             self._ensure_question_pool(
                 conn,
                 learner_id=learner_id,
@@ -596,7 +625,30 @@ class AssessmentService:
     ) -> None:
         del learner_id, material_id  # content is reel-scoped; eligibility is learner-scoped.
         uncached: list[dict[str, Any]] = []
-        for row in reversed(completion_rows):
+        satisfied_reels: set[str] = set()
+        satisfied_concepts: set[str] = set()
+        newest_first = list(reversed(completion_rows))
+        distinct_concepts: list[dict[str, Any]] = []
+        repeated_concepts: list[dict[str, Any]] = []
+        seen_concepts: set[str] = set()
+        for row in newest_first:
+            concept_id = str(row.get("concept_id") or "")
+            if concept_id and concept_id not in seen_concepts:
+                distinct_concepts.append(row)
+                seen_concepts.add(concept_id)
+            else:
+                repeated_concepts.append(row)
+        question_target = min(SESSION_QUESTION_TARGET, len(seen_concepts))
+
+        def pool_complete() -> bool:
+            return (
+                question_target > 0
+                and len(satisfied_reels) >= question_target
+                and len(satisfied_concepts) >= question_target
+            )
+
+        candidates: list[dict[str, Any]] = []
+        for row in [*distinct_concepts, *repeated_concepts]:
             _check_cancelled(should_cancel)
             fingerprint = _question_fingerprint(row)
             existing = fetch_one(
@@ -605,12 +657,29 @@ class AssessmentService:
                 (row["reel_id"], fingerprint),
             )
             if existing:
+                satisfied_reels.add(str(row["reel_id"]))
+                satisfied_concepts.add(str(row.get("concept_id") or ""))
                 continue
+            candidates.append({**row, "fingerprint": fingerprint})
+        if pool_complete():
+            return
+
+        candidates.sort(
+            key=lambda row: (
+                int(str(row.get("concept_id") or "") not in satisfied_concepts),
+                str(row.get("completed_at") or ""),
+            ),
+            reverse=True,
+        )
+
+        for row in candidates:
+            _check_cancelled(should_cancel)
+            fingerprint = str(row["fingerprint"])
             cache_hit, cached_question = self._load_cached_backfill(conn, fingerprint)
             if cache_hit:
                 if isinstance(cached_question, dict):
                     _check_cancelled(should_cancel)
-                    store_reel_assessment_question(
+                    stored = store_reel_assessment_question(
                         conn,
                         reel_id=str(row["reel_id"]),
                         prompt=str(cached_question.get("prompt") or ""),
@@ -619,9 +688,23 @@ class AssessmentService:
                         explanation=str(cached_question.get("explanation") or ""),
                         fingerprint=fingerprint,
                     )
+                    if stored:
+                        satisfied_reels.add(str(row["reel_id"]))
+                        satisfied_concepts.add(str(row.get("concept_id") or ""))
+                        if pool_complete():
+                            return
                 continue
-            uncached.append({**row, "fingerprint": fingerprint})
-            if len(uncached) >= 12:
+            uncached.append(row)
+            projected_reels = satisfied_reels | {
+                str(candidate.get("reel_id") or "") for candidate in uncached
+            }
+            projected_concepts = satisfied_concepts | {
+                str(candidate.get("concept_id") or "") for candidate in uncached
+            }
+            if (
+                len(projected_reels) >= question_target
+                and len(projected_concepts) >= question_target
+            ):
                 break
         if not uncached:
             return
@@ -638,6 +721,10 @@ class AssessmentService:
                     raise two_arg_error
         except CancellationError as exc:
             raise AssessmentCancelledError(str(exc)) from exc
+        except ProviderError:
+            # Progress is already durable (the API uses autocommit). Leave the
+            # due state intact and retry generation on the next session call.
+            return
         _check_cancelled(should_cancel)
         if generated is None:
             return
@@ -677,18 +764,22 @@ class AssessmentService:
             self._write_cached_backfill(conn, str(row["fingerprint"]), cached_value)
 
     def _desired_question_count(self, conn: Any, state: dict[str, Any]) -> int:
-        units = float(state["information_units"])
-        count = max(1, min(MAX_SESSION_QUESTIONS, int(math.floor(units / 1.5 + 0.5))))
-        distinct_concepts = {
-            str(row.get("concept_id") or "") for row in state["completion_rows"]
+        del conn
+        distinct_reels = {
+            str(row.get("reel_id") or "")
+            for row in state["available_questions"]
+            if str(row.get("reel_id") or "")
         }
-        recent = state.get("recent_accuracy")
-        if len(distinct_concepts) >= 3 or (recent is not None and float(recent) < 0.65):
-            count += 1
-        recent_sessions = list(state.get("recent_session_accuracies") or [])
-        if len(recent_sessions) >= 2 and all(value >= 0.90 for value in recent_sessions[:2]):
-            count -= 1
-        return max(1, min(MAX_SESSION_QUESTIONS, count, len(state["available_questions"])))
+        distinct_concepts = {
+            str(row.get("concept_id") or "")
+            for row in state["available_questions"]
+            if str(row.get("concept_id") or "")
+        }
+        return min(
+            SESSION_QUESTION_TARGET,
+            len(distinct_reels),
+            len(distinct_concepts),
+        )
 
     @staticmethod
     def _select_questions(rows: list[dict[str, Any]], count: int) -> list[dict[str, Any]]:
@@ -698,11 +789,17 @@ class AssessmentService:
         reels: set[str] = set()
         videos: set[str] = set()
         while remaining and len(chosen) < count:
+            distinct_rows = [
+                row
+                for row in remaining
+                if str(row.get("reel_id") or "") not in reels
+                and str(row.get("concept_id") or "") not in concepts
+            ]
+            if not distinct_rows:
+                break
             best = max(
-                remaining,
+                distinct_rows,
                 key=lambda row: (
-                    int(str(row.get("concept_id") or "") not in concepts),
-                    int(str(row.get("reel_id") or "") not in reels),
                     int(str(row.get("video_id") or "") not in videos),
                     str(row.get("completed_at") or ""),
                     str(row.get("id") or ""),
@@ -743,7 +840,10 @@ class AssessmentService:
                 "recent_accuracy": state["recent_accuracy"],
                 "rolling_accuracy": state["rolling_accuracy"],
             }
-        if state["numeric_due"] and not state["assessment_ready"]:
+        if (
+            state["numeric_due"]
+            and not bool(state["question_pool_complete"])
+        ):
             self._ensure_question_pool(
                 conn,
                 learner_id=learner_id,
@@ -765,7 +865,7 @@ class AssessmentService:
         if not selected:
             return {
                 "status": "not_ready",
-                "assessment_ready": False,
+                "assessment_ready": bool(state["numeric_due"]),
                 "session": None,
                 "recent_accuracy": state["recent_accuracy"],
                 "rolling_accuracy": state["rolling_accuracy"],
@@ -943,6 +1043,9 @@ class AssessmentService:
 
     def _finalize_session(self, conn: Any, session: dict[str, Any]) -> None:
         session_id = str(session["id"])
+        self._ensure_learner_progress(
+            conn, str(session["learner_id"]), str(session["material_id"])
+        )
         timestamp = now_iso()
         transitioned = execute_modify(
             conn,
@@ -1010,9 +1113,6 @@ class AssessmentService:
                 },
                 pk=["session_id", "concept_id"],
             )
-        self._ensure_learner_progress(
-            conn, str(session["learner_id"]), str(session["material_id"])
-        )
         execute_modify(
             conn,
             """

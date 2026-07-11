@@ -106,6 +106,7 @@ from .models import (
     ReelProgressRequest,
     ReelProgressResponse,
 )
+from .services import llm_router
 from .services.assessments import AssessmentCancelledError, AssessmentService
 from .services.email import send_welcome_email
 from .services.embeddings import EmbeddingService
@@ -113,6 +114,7 @@ from .services.liveness import is_video_alive
 from .services.material_intelligence import MaterialIntelligenceService
 from .services.parsers import ParseError, extract_text_from_file
 from .services.reels import GenerationCancelledError, ReelService
+from .services.search_query_plan import build_search_query_plan
 from .services.storage import get_storage
 from .services.text_utils import chunk_text, normalize_whitespace
 from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8601_duration
@@ -2000,52 +2002,25 @@ def _dedupe_request_terms(raw_terms: list[str]) -> list[str]:
     return deduped
 
 
-def _request_curated_companion_terms(subject_tag: str | None) -> list[str]:
-    cleaned = str(subject_tag or "").strip()
-    if not cleaned:
-        return []
-
-    normalized_subject = reel_service._normalize_query_key(cleaned)
-    ordered: list[str] = []
-    seen: set[str] = set()
-
-    def add_term(raw_value: str) -> None:
-        candidate = str(raw_value or "").strip()
-        normalized = reel_service._normalize_query_key(candidate)
-        if not candidate or not normalized or normalized == normalized_subject or normalized in seen:
-            return
-        seen.add(normalized)
-        ordered.append(candidate)
-
-    for mapping in (
-        getattr(reel_service.topic_expansion_service, "STATIC_TOPIC_SUBTOPICS", {}),
-        getattr(reel_service, "BROAD_TOPIC_SUBTOPICS", {}),
-    ):
-        for raw_topic, topic_terms in mapping.items():
-            if reel_service._normalize_query_key(raw_topic) != normalized_subject:
-                continue
-            for term in topic_terms:
-                add_term(str(term or ""))
-            break
-
-    for term in reel_service._expand_controlled_synonyms([cleaned], fast_mode=True):
-        normalized_term = reel_service._normalize_query_key(str(term or ""))
-        if len(normalized_term.split()) < 2:
-            continue
-        add_term(str(term or ""))
-    return ordered[:10]
-
-
 def _request_root_anchor_terms(subject_tag: str | None) -> tuple[list[str], list[str], list[str]]:
     cleaned = str(subject_tag or "").strip()
     if not cleaned:
         return ([], [], [])
-    aliases = reel_service.topic_expansion_service._deterministic_alias_terms(topic=cleaned, canonical_topic=cleaned)
-    companions = reel_service.topic_expansion_service._deterministic_companion_terms(topic=cleaned, canonical_topic=cleaned)
-    page_one_companions = _request_curated_companion_terms(cleaned)
-    deduped_root = _dedupe_request_terms([cleaned, *aliases])
-    deduped_companions = _dedupe_request_terms([*companions, *page_one_companions])
-    return deduped_root, deduped_companions, page_one_companions
+    try:
+        with get_conn() as conn:
+            plan = build_search_query_plan(conn, literal_query=cleaned)
+    except Exception:
+        plan = None
+    if plan is None or plan.ai_status != "validated":
+        return ([cleaned], [], [])
+
+    roots = _dedupe_request_terms(
+        [cleaned, plan.canonical_query, *plan.accepted_aliases]
+    )
+    companions = _dedupe_request_terms(
+        [*plan.accepted_subtopics, *plan.accepted_related_terms]
+    )
+    return roots, companions, companions[:10]
 
 
 def _request_reel_text(reel: dict[str, Any]) -> str:
@@ -2390,16 +2365,6 @@ def _shape_request_page_reels(
         )
         shaped = _merge_request_reel_lists(shaped, relaxed_shaped)
 
-    if len(shaped) < target_visible_count and strict_topic_only and subject_tag:
-        relaxed_topic_shaped = _shape_reels_for_request_context(
-            _filter_reels_by_min_relevance(ranked, min_relevance),
-            page=page,
-            limit=limit,
-            subject_tag=subject_tag,
-            strict_topic_only=False,
-        )
-        shaped = _merge_request_reel_lists(shaped, relaxed_topic_shaped)
-
     if page <= 1 and strict_topic_only and subject_tag and len(shaped) < max(1, limit):
         emergency_min_relevance = max(0.27, float(min_relevance or 0.3) - 0.03)
         emergency_serialized = _serialize_reels_for_request(
@@ -2425,7 +2390,7 @@ def _shape_request_page_reels(
             page=page,
             limit=limit,
             subject_tag=subject_tag,
-            strict_topic_only=False,
+            strict_topic_only=strict_topic_only,
         )
         shaped = _merge_request_reel_lists(shaped, fallback_shaped)
 
@@ -3838,6 +3803,10 @@ def admin_health() -> dict:
         and generation_workers_alive == GENERATION_WORKER_COUNT
         and not _generation_worker_stop.is_set()
     )
+    text_llm = llm_router.text_llm_status(
+        gemini_model=material_intelligence_service.model,
+    )
+    embedding_backend = embedding_service.backend_name
     return {
         "ok": generation_pool_ready,
         "generation_worker_alive": generation_pool_ready,
@@ -3845,7 +3814,13 @@ def admin_health() -> dict:
         "generation_workers_alive": generation_workers_alive,
         "supadata_configured": bool(os.getenv("SUPADATA_API_KEY", "").strip()),
         "gemini_primary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
+        "gemini_chat_configured": bool(os.getenv("GEMINI_API_KEY_2", "").strip()),
         "gemini_fallback_model": os.getenv("SEGMENT_FALLBACK_MODEL", "").strip() or None,
+        "text_llm_available": bool(text_llm["available"]),
+        "text_llm_provider": text_llm["provider"],
+        "text_llm_providers": text_llm["providers"],
+        "chat_model": text_llm["model"] or material_intelligence_service.model,
+        "embedding_backend": embedding_backend,
     }
 
 
@@ -5457,8 +5432,8 @@ def feed(
 async def chat(request: Request, payload: ChatRequest):
     _enforce_rate_limit(request, "chat", limit=CHAT_RATE_LIMIT_PER_WINDOW)
     history = [{"role": m.role, "content": m.content} for m in payload.history]
-    # Pin chat to the dedicated backup Gemini key so it never contends with
-    # reel-generation traffic on the primary rotation pool.
+    # Prefer the dedicated chat key. MaterialIntelligenceService retries the
+    # primary rotation pool if this credential cannot complete the request.
     chat_gemini_key = (os.environ.get("GEMINI_API_KEY_2") or "").strip() or None
     try:
         answer = await _run_disconnect_cancellable(
@@ -5478,6 +5453,12 @@ async def chat(request: Request, payload: ChatRequest):
         )
     except ClipEngineCancellationError as exc:
         raise HTTPException(status_code=499, detail=str(exc)) from exc
+    except llm_router.TextLLMUnavailableError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=exc.as_dict(),
+            headers={"Retry-After": "5"},
+        ) from exc
     return {"answer": answer}
 
 

@@ -54,7 +54,7 @@ class TestAssessmentApi:
                 "VALUES (?, 'physics', 'physics', 'topic', 'beginner', ?)",
                 (MATERIAL, "2026-07-09T00:00:00+00:00"),
             )
-            for index in range(2):
+            for index in range(3):
                 concept_id = f"api-concept-{index}"
                 video_id = f"api-video-{index}"
                 reel_id = f"api-reel-{index}"
@@ -104,9 +104,16 @@ class TestAssessmentApi:
             headers=self.headers_a,
             json={"max_fraction": 1.0},
         )
+        third = self.client.post(
+            "/api/reels/api-reel-2/progress",
+            headers=self.headers_a,
+            json={"max_fraction": 1.0},
+        )
         assert first.status_code == 200
         assert second.status_code == 200
-        assert second.json()["assessment_ready"] is True
+        assert third.status_code == 200
+        assert second.json()["assessment_ready"] is False
+        assert third.json()["assessment_ready"] is True
         assert {
             "reel_id",
             "completed",
@@ -114,7 +121,7 @@ class TestAssessmentApi:
             "assessment_ready",
             "information_units",
             "readiness_threshold",
-        } == set(second.json())
+        } == set(third.json())
 
         created = self.client.post(
             "/api/assessments/next",
@@ -154,9 +161,18 @@ class TestAssessmentApi:
         assert result["session"]["status"] == "completed"
         assert result["session"]["score"] == 1.0
         assert len(result["session"]["understood_concepts"]) == 2
+        with db_module.get_conn() as conn:
+            progress = db_module.fetch_one(
+                conn,
+                "SELECT global_adjustment FROM learner_material_progress "
+                "WHERE material_id = ?",
+                (MATERIAL,),
+            )
+        assert progress is not None
+        assert float(progress["global_adjustment"]) == 0.16
 
     def test_other_learner_cannot_resume_or_answer_session(self) -> None:
-        for index in range(2):
+        for index in range(3):
             response = self.client.post(
                 f"/api/reels/api-reel-{index}/progress",
                 headers=self.headers_a,

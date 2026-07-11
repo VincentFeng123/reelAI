@@ -9,6 +9,7 @@ import pytest
 
 import backend.app.services.assessments as assessments_module
 from backend.app.db import SCHEMA
+from backend.app.clip_engine.errors import ProviderTransientError
 from backend.app.services.assessments import (
     AssessmentCancelledError,
     AssessmentService,
@@ -97,6 +98,35 @@ def _complete(service: AssessmentService, conn, reel_id: str, learner: str = LEA
     )
 
 
+def _seed_completed_accuracy(
+    conn,
+    *,
+    session_id: str,
+    correct_count: int,
+    question_count: int = 10,
+    learner: str = LEARNER,
+    completed_at: str = "2026-07-08T00:00:00+00:00",
+) -> None:
+    conn.execute(
+        "INSERT INTO assessment_sessions "
+        "(id, learner_id, material_id, status, current_index, question_count, "
+        "correct_count, information_units, readiness_threshold, created_at, "
+        "updated_at, completed_at) "
+        "VALUES (?, ?, ?, 'completed', ?, ?, ?, 0, 3, ?, ?, ?)",
+        (
+            session_id,
+            learner,
+            MATERIAL,
+            question_count,
+            question_count,
+            correct_count,
+            completed_at,
+            completed_at,
+            completed_at,
+        ),
+    )
+
+
 def test_progress_is_idempotent_and_rejects_non_study_reels(conn) -> None:
     _seed_reel(conn, reel_id="r1", concept_id="c1", video_id="v1")
     service = AssessmentService()
@@ -124,9 +154,10 @@ def test_progress_is_idempotent_and_rejects_non_study_reels(conn) -> None:
         )
 
 
-def test_short_clips_do_not_create_a_fixed_two_clip_cadence(conn) -> None:
+def test_no_history_becomes_ready_after_three_completed_videos(conn) -> None:
     service = AssessmentService(question_generator=lambda *_args: None)
-    for index in range(2):
+    results = []
+    for index in range(3):
         reel_id = f"short-{index}"
         _seed_reel(
             conn,
@@ -136,14 +167,85 @@ def test_short_clips_do_not_create_a_fixed_two_clip_cadence(conn) -> None:
             duration=20.0,
             informativeness=0.6,
         )
-        result = _complete(service, conn, reel_id)
-    assert result["information_units"] < result["readiness_threshold"]
-    assert result["assessment_ready"] is False
+        results.append(_complete(service, conn, reel_id))
+    assert [result["assessment_ready"] for result in results] == [False, False, True]
+    assert results[-1]["readiness_threshold"] == 3.0
+
+
+def test_low_recent_accuracy_becomes_ready_after_two_completed_videos(conn) -> None:
+    _seed_completed_accuracy(
+        conn, session_id="low-accuracy", correct_count=6
+    )
+    service = AssessmentService()
+    results = []
+    for index in range(2):
+        reel_id = f"low-{index}"
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"low-c{index}",
+            video_id=f"low-v{index}",
+        )
+        results.append(_complete(service, conn, reel_id))
+    assert [result["assessment_ready"] for result in results] == [False, True]
+    assert results[-1]["readiness_threshold"] == 2.0
+
+
+def test_mid_recent_accuracy_becomes_ready_after_three_completed_videos(conn) -> None:
+    _seed_completed_accuracy(
+        conn, session_id="mid-accuracy", correct_count=8
+    )
+    service = AssessmentService()
+    results = []
+    for index in range(3):
+        reel_id = f"mid-{index}"
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"mid-c{index}",
+            video_id=f"mid-v{index}",
+        )
+        results.append(_complete(service, conn, reel_id))
+    assert [result["assessment_ready"] for result in results] == [False, False, True]
+    assert results[-1]["readiness_threshold"] == 3.0
+
+
+def test_two_high_accuracy_sessions_defer_until_four_completed_videos(conn) -> None:
+    _seed_completed_accuracy(
+        conn,
+        session_id="high-older",
+        correct_count=9,
+        completed_at="2026-07-08T00:00:00+00:00",
+    )
+    _seed_completed_accuracy(
+        conn,
+        session_id="high-newer",
+        correct_count=10,
+        completed_at="2026-07-08T01:00:00+00:00",
+    )
+    service = AssessmentService()
+    results = []
+    for index in range(4):
+        reel_id = f"high-{index}"
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"high-c{index}",
+            video_id=f"high-v{index}",
+        )
+        results.append(_complete(service, conn, reel_id))
+    assert [result["assessment_ready"] for result in results] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+    assert results[-1]["readiness_threshold"] == 4.0
 
 
 def test_dense_clips_create_and_resume_private_question_session(conn) -> None:
     service = AssessmentService()
-    for index in range(2):
+    for index in range(3):
         reel_id = f"dense-{index}"
         _seed_reel(
             conn,
@@ -159,16 +261,16 @@ def test_dense_clips_create_and_resume_private_question_session(conn) -> None:
     assert created["status"] == "ready"
     assert resumed["status"] == "pending"
     assert resumed["session"]["id"] == created["session"]["id"]
-    assert 1 <= created["session"]["question_count"] <= 4
+    assert created["session"]["question_count"] == 2
     for question in created["session"]["questions"]:
         assert len(question["options"]) == 4
         assert "correct_index" not in question
         assert "explanation" not in question
 
 
-def test_session_questions_are_watched_only_and_question_count_adapts(conn) -> None:
+def test_session_uses_two_distinct_watched_reels_and_concepts(conn) -> None:
     service = AssessmentService()
-    reel_ids = ["adaptive-0", "adaptive-1", "adaptive-unwatched"]
+    reel_ids = ["adaptive-0", "adaptive-1", "adaptive-2", "adaptive-unwatched"]
     for index, reel_id in enumerate(reel_ids):
         _seed_reel(
             conn,
@@ -177,26 +279,129 @@ def test_session_questions_are_watched_only_and_question_count_adapts(conn) -> N
             video_id=f"adaptive-v{index}",
         )
 
-    for reel_id in reel_ids[:2]:
+    for reel_id in reel_ids[:3]:
         _complete(service, conn, reel_id, LEARNER)
-    two_reel_session = service.next_session(
+    session = service.next_session(
         conn, learner_id=LEARNER, material_id=MATERIAL
     )["session"]
-    assert two_reel_session["question_count"] == 2
-    assert {question["reel_id"] for question in two_reel_session["questions"]} == set(
-        reel_ids[:2]
-    )
+    assert session["question_count"] == 2
+    assert len({question["reel_id"] for question in session["questions"]}) == 2
+    assert len({question["concept_id"] for question in session["questions"]}) == 2
+    assert {question["reel_id"] for question in session["questions"]} <= set(reel_ids[:3])
 
-    second_learner = "owner:adaptive-learner-b"
-    for reel_id in reel_ids:
-        _complete(service, conn, reel_id, second_learner)
-    three_reel_session = service.next_session(
-        conn, learner_id=second_learner, material_id=MATERIAL
-    )["session"]
-    assert three_reel_session["question_count"] == 3
-    assert {question["reel_id"] for question in three_reel_session["questions"]} == set(
-        reel_ids
-    )
+
+def test_question_backfill_fills_a_second_recent_concept(conn) -> None:
+    generated_reels: list[str] = []
+
+    def generator(rows, _should_cancel=None):
+        generated_reels.extend(str(row["reel_id"]) for row in rows)
+        return {
+            "questions": [
+                {
+                    "reel_id": row["reel_id"],
+                    "prompt": "What pulls an object toward Earth?",
+                    "options": ["Gravity", "Sound", "Heat", "Light"],
+                    "correct_index": 0,
+                    "explanation": "Gravity pulls an object toward Earth.",
+                }
+                for row in rows
+            ]
+        }
+
+    service = AssessmentService(question_generator=generator)
+    specs = [
+        ("same-concept-0", "shared-concept", True),
+        ("same-concept-1", "shared-concept", True),
+        ("second-concept", "distinct-concept", False),
+    ]
+    for index, (reel_id, concept_id, with_question) in enumerate(specs):
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=concept_id,
+            video_id=f"concept-v{index}",
+            with_question=with_question,
+        )
+        _complete(service, conn, reel_id)
+
+    assert generated_reels == ["second-concept"]
+    session = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)[
+        "session"
+    ]
+    assert {question["concept_id"] for question in session["questions"]} == {
+        "shared-concept",
+        "distinct-concept",
+    }
+
+
+def test_due_session_uses_one_question_when_only_one_is_grounded(conn) -> None:
+    calls = 0
+
+    def unavailable_generator(*_args):
+        nonlocal calls
+        calls += 1
+        return None
+
+    service = AssessmentService(question_generator=unavailable_generator)
+    for index in range(3):
+        _seed_reel(
+            conn,
+            reel_id=f"fallback-{index}",
+            concept_id=f"fallback-c{index}",
+            video_id=f"fallback-v{index}",
+            with_question=index == 0,
+        )
+        progress = _complete(service, conn, f"fallback-{index}")
+
+    assert progress["assessment_ready"] is True
+    created = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+    assert created["status"] == "ready"
+    assert created["session"]["question_count"] == 1
+    assert created["session"]["questions"][0]["reel_id"] == "fallback-0"
+    assert calls == 2
+
+
+def test_transient_generation_failure_keeps_due_state_and_retries(conn) -> None:
+    calls = 0
+
+    def transient_generator(rows, _should_cancel=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ProviderTransientError(
+                "temporary assessment provider failure",
+                provider="gemini",
+                operation="assessment",
+            )
+        return {
+            "questions": [
+                {
+                    "reel_id": row["reel_id"],
+                    "prompt": "What pulls an object toward Earth?",
+                    "options": ["Gravity", "Sound", "Heat", "Light"],
+                    "correct_index": 0,
+                    "explanation": "Gravity pulls an object toward Earth.",
+                }
+                for row in rows
+            ]
+        }
+
+    service = AssessmentService(question_generator=transient_generator)
+    for index in range(3):
+        _seed_reel(
+            conn,
+            reel_id=f"retry-{index}",
+            concept_id=f"retry-c{index}",
+            video_id=f"retry-v{index}",
+            with_question=False,
+        )
+        progress = _complete(service, conn, f"retry-{index}")
+
+    assert progress["assessment_ready"] is True
+    created = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+    assert calls == 2
+    assert created["status"] == "ready"
+    assert created["session"]["question_count"] == 2
 
 
 def test_question_storage_is_immutable_for_a_reel_fingerprint(conn) -> None:
@@ -250,6 +455,7 @@ def test_question_storage_rejects_content_not_supported_by_the_watched_reel(conn
 
 
 def test_answer_reveals_key_then_applies_concept_outcomes_once(conn) -> None:
+    _seed_completed_accuracy(conn, session_id="answer-history", correct_count=5)
     service = AssessmentService()
     for index in range(2):
         _seed_reel(
@@ -314,6 +520,7 @@ def test_answer_reveals_key_then_applies_concept_outcomes_once(conn) -> None:
 
 
 def test_new_answers_must_follow_question_order(conn) -> None:
+    _seed_completed_accuracy(conn, session_id="ordered-history", correct_count=5)
     service = AssessmentService()
     for index in range(2):
         _seed_reel(
@@ -348,6 +555,7 @@ def test_new_answers_must_follow_question_order(conn) -> None:
 
 
 def test_attempt_insert_race_reloads_the_winning_choice(conn, monkeypatch) -> None:
+    _seed_completed_accuracy(conn, session_id="race-history", correct_count=5)
     service = AssessmentService()
     for index in range(2):
         _seed_reel(
@@ -389,6 +597,15 @@ def test_attempt_insert_race_reloads_the_winning_choice(conn, monkeypatch) -> No
 
 
 def test_sessions_and_attempts_are_learner_isolated(conn) -> None:
+    _seed_completed_accuracy(
+        conn, session_id="isolated-history-a", correct_count=5
+    )
+    _seed_completed_accuracy(
+        conn,
+        session_id="isolated-history-b",
+        correct_count=5,
+        learner="owner:learner-b",
+    )
     service = AssessmentService()
     for index in range(2):
         _seed_reel(
@@ -415,6 +632,7 @@ def test_sessions_and_attempts_are_learner_isolated(conn) -> None:
 
 
 def test_snooze_requires_new_information_without_penalty(conn) -> None:
+    _seed_completed_accuracy(conn, session_id="snooze-history", correct_count=5)
     service = AssessmentService()
     for index in range(2):
         _seed_reel(
@@ -449,6 +667,9 @@ def test_snooze_requires_new_information_without_penalty(conn) -> None:
 
 
 def test_snooze_reports_an_already_completed_session_as_completed(conn) -> None:
+    _seed_completed_accuracy(
+        conn, session_id="completed-snooze-history", correct_count=5
+    )
     service = AssessmentService()
     for index in range(2):
         _seed_reel(
@@ -477,6 +698,7 @@ def test_snooze_reports_an_already_completed_session_as_completed(conn) -> None:
 
 
 def test_malformed_backfill_is_isolated_and_retried_with_later_progress(conn) -> None:
+    _seed_completed_accuracy(conn, session_id="backfill-history", correct_count=5)
     calls: list[list[str]] = []
 
     def generator(rows, _should_cancel=None):
@@ -552,7 +774,7 @@ def test_malformed_backfill_is_isolated_and_retried_with_later_progress(conn) ->
     progress = _complete(service, conn, "legacy-2")
     assert len(calls) == 2
     assert progress["assessment_ready"] is True
-    assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 3
+    assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 2
 
 
 def test_legacy_backfill_scans_past_cached_old_rows(conn) -> None:
@@ -604,25 +826,31 @@ def test_legacy_backfill_scans_past_cached_old_rows(conn) -> None:
     assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 2
 
 
-def test_latest_check_accuracy_controls_the_question_count_bonus(conn) -> None:
+def test_question_count_is_two_distinct_reels_with_one_reel_fallback(conn) -> None:
     service = AssessmentService()
     state = {
-        "information_units": 3.0,
-        "completion_rows": [{"concept_id": "c1"}, {"concept_id": "c2"}],
-        "recent_accuracy": 0.50,
-        "rolling_accuracy": 0.95,
-        "recent_session_accuracies": [0.50, 1.0],
-        "available_questions": [{"id": str(index)} for index in range(4)],
+        "available_questions": [
+            {"id": "q1", "reel_id": "r1", "concept_id": "c1"},
+            {"id": "q1-duplicate", "reel_id": "r1", "concept_id": "c1"},
+            {"id": "q2", "reel_id": "r2", "concept_id": "c2"},
+        ],
     }
-    assert service._desired_question_count(conn, state) == 3
-    state["recent_accuracy"] = 0.95
-    state["rolling_accuracy"] = 0.50
     assert service._desired_question_count(conn, state) == 2
+    state["available_questions"] = [
+        {"id": "q1", "reel_id": "r1", "concept_id": "c1"}
+    ]
+    assert service._desired_question_count(conn, state) == 1
+    state["available_questions"] = [
+        {"id": "q1", "reel_id": "r1", "concept_id": "c1"},
+        {"id": "q2", "reel_id": "r2", "concept_id": "c1"},
+    ]
+    assert service._desired_question_count(conn, state) == 1
 
 
 def test_session_creation_cancels_before_writes_and_rolls_back_child_failure(
     conn, monkeypatch
 ) -> None:
+    _seed_completed_accuracy(conn, session_id="atomic-history", correct_count=5)
     service = AssessmentService()
     for index in range(2):
         _seed_reel(
@@ -639,7 +867,9 @@ def test_session_creation_cancels_before_writes_and_rolls_back_child_failure(
             material_id=MATERIAL,
             should_cancel=lambda: True,
         )
-    assert conn.execute("SELECT COUNT(*) FROM assessment_sessions").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM assessment_sessions WHERE status = 'pending'"
+    ).fetchone()[0] == 0
 
     original_execute = assessments_module.execute_modify
     child_writes = 0
@@ -655,7 +885,9 @@ def test_session_creation_cancels_before_writes_and_rolls_back_child_failure(
     monkeypatch.setattr(assessments_module, "execute_modify", failing_execute)
     with pytest.raises(RuntimeError, match="injected child failure"):
         service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
-    assert conn.execute("SELECT COUNT(*) FROM assessment_sessions").fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM assessment_sessions WHERE status = 'pending'"
+    ).fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM assessment_session_questions").fetchone()[0] == 0
 
 
@@ -679,6 +911,7 @@ def test_default_backfill_forwards_the_cancellation_probe(monkeypatch) -> None:
 
 
 def test_backfill_observes_cancellation_before_any_cache_or_question_write(conn) -> None:
+    _seed_completed_accuracy(conn, session_id="cancel-history", correct_count=5)
     for index in range(2):
         _seed_reel(
             conn,

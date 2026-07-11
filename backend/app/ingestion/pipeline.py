@@ -83,6 +83,10 @@ from ..clip_engine.errors import (
     UnsupportedURLError as _ClipUnsupportedURLError,
 )
 from ..services.assessments import store_reel_assessment_question
+from ..services.search_query_plan import (
+    SearchQueryPlan,
+    topic_signature_evidence,
+)
 
 logger: logging.Logger = get_ingest_logger(__name__)
 
@@ -123,6 +127,9 @@ def _discover(
     preferred_video_duration: str = "any",
     language: str = "en",
     generation_context: GenerationContext | None = None,
+    literal_topic: str | None = None,
+    use_query_planner: bool = True,
+    breadth: int | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "limit": limit,
@@ -134,12 +141,77 @@ def _discover(
         "language": language,
         "context": generation_context,
         "cache_store": generation_context.cache_store if generation_context is not None else None,
+        "literal_topic": literal_topic or topic,
+        "use_query_planner": bool(use_query_planner),
     }
+    if breadth is not None:
+        kwargs["breadth"] = max(1, int(breadth))
     if level is not None:
         kwargs["level"] = level
     if should_cancel is not None:
         kwargs["should_cancel"] = should_cancel
     return clip_engine_search.discover(topic, **kwargs)
+
+
+def _strict_topic_clips(
+    clips: list[dict[str, Any]],
+    transcript: dict[str, Any],
+    query_plan: SearchQueryPlan | None,
+) -> list[dict[str, Any]]:
+    """Keep only exact native-cue windows proven by the trusted topic signature."""
+    if query_plan is None:
+        # Compatibility for injected/mocked discover implementations. The real
+        # topic search path always returns a validated plan.
+        return clips
+    if transcript.get("source") != "supadata" or transcript.get("native_mode") is not True:
+        return []
+
+    kept: list[dict[str, Any]] = []
+    for clip in clips:
+        cue_ids = clip.get("cue_ids")
+        text = clip_engine_bridge.cue_text(transcript, cue_ids)
+        if not text:
+            text = clip_engine_bridge.window_text(
+                transcript,
+                float(clip.get("start") or 0.0),
+                float(clip.get("end") or 0.0),
+            )
+        evidence = topic_signature_evidence(text, query_plan)
+        if not evidence:
+            continue
+        clip["topic_evidence_terms"] = evidence[:8]
+        kept.append(clip)
+    return kept
+
+
+def _retrieval_search_context(
+    *,
+    requested_topic: str,
+    corrected_topic: str,
+    video: dict[str, Any],
+    query_plan: SearchQueryPlan | None,
+    creative_commons_only: bool,
+    source_duration: str,
+) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "requested_topic": requested_topic,
+        "corrected_topic": corrected_topic,
+        "creative_commons_only": bool(creative_commons_only),
+        "source_duration": source_duration,
+        "matched_queries": list(video.get("matched_queries") or [])[:12],
+        "matched_query_families": list(video.get("matched_families") or [])[:12],
+        "matched_query_provenance": dict(video.get("matched_query_provenance") or {}),
+    }
+    if query_plan is not None:
+        context.update(
+            {
+                "literal_query": query_plan.literal_query,
+                "canonical_query": query_plan.canonical_query,
+                "query_plan_version": query_plan.version,
+                "query_plan_ai_status": query_plan.ai_status,
+            }
+        )
+    return context
 
 
 # --------------------------------------------------------------------- #
@@ -606,7 +678,13 @@ class IngestionPipeline:
             exclude_video_ids=exclude_video_ids or [],
             level=None,
             should_cancel=should_cancel,
+            literal_topic=query,
+            use_query_planner=True,
+            breadth=3,
         )
+        query_plan = disc.get("query_plan")
+        if not isinstance(query_plan, SearchQueryPlan):
+            query_plan = None
 
         _search_warning = disc.get("warning")
         if _search_warning:
@@ -619,17 +697,38 @@ class IngestionPipeline:
         for v in disc["videos"]:
             raise_if_cancelled(should_cancel)
             try:
+                v["_search_context"] = _retrieval_search_context(
+                    requested_topic=query,
+                    corrected_topic=str(disc.get("corrected") or query),
+                    video=v,
+                    query_plan=query_plan,
+                    creative_commons_only=False,
+                    source_duration="any",
+                )
                 engine_out = _run_clip(
                     v["url"], topic=query, language=language,
                     should_cancel=should_cancel,
                 )
-                if not engine_out["clips"]:
+                eligible_clips = _strict_topic_clips(
+                    list(engine_out["clips"]),
+                    engine_out["transcript"],
+                    query_plan,
+                )
+                if not eligible_clips:
                     items.append(IngestSearchItem(
                         platform="yt", source_url=v["url"], status="skipped"
                     ))
                     continue
 
-                best = clip_engine_bridge.pick_best_clip(engine_out["clips"], target_clip_duration_sec, target_clip_duration_max_sec)
+                best = clip_engine_bridge.pick_best_clip(
+                    eligible_clips,
+                    target_clip_duration_sec,
+                    target_clip_duration_max_sec,
+                )
+                best["search_context"] = {
+                    **dict(v.get("_search_context") or {}),
+                    "topic_evidence_terms": list(best.get("topic_evidence_terms") or [])[:8],
+                }
 
                 persisted, metadata = self._persist_engine_clip(
                     v=v,
@@ -702,6 +801,7 @@ class IngestionPipeline:
         creative_commons_only: bool = False,
         preferred_video_duration: str = "any",
         generation_context: GenerationContext | None = None,
+        literal_topic: str | None = None,
     ) -> tuple[list[ReelOutWithAttribution], list[str]]:
         """
         Route ONE study concept through the clip engine and persist EVERY
@@ -744,6 +844,9 @@ class IngestionPipeline:
             preferred_video_duration=preferred_video_duration,
             language=language,
             generation_context=generation_context,
+            literal_topic=literal_topic or topic,
+            use_query_planner=True,
+            breadth=3 if generation_context is not None and generation_context.budget.mode == "fast" else 6,
         )
 
         warning = disc.get("warning")
@@ -751,14 +854,20 @@ class IngestionPipeline:
             log_event(logger, logging.WARNING, "ingest_topic_warning", warning=warning)
 
         corrected_topic = " ".join(str(disc.get("corrected") or topic).split()) or topic
-        search_context = {
-            "requested_topic": topic,
-            "corrected_topic": corrected_topic,
-            "creative_commons_only": bool(creative_commons_only),
-            "source_duration": preferred_video_duration,
-        }
+        query_plan = disc.get("query_plan")
+        if not isinstance(query_plan, SearchQueryPlan):
+            query_plan = None
         for discovered_video in disc["videos"]:
-            discovered_video["_search_context"] = search_context
+            discovered_video["_search_context"] = _retrieval_search_context(
+                requested_topic=topic,
+                corrected_topic=corrected_topic,
+                video=discovered_video,
+                query_plan=query_plan,
+                creative_commons_only=creative_commons_only,
+                source_duration=preferred_video_duration,
+            )
+            if query_plan is not None:
+                discovered_video["_query_plan"] = query_plan
         resolved_video_ids = [v["id"] for v in disc["videos"]]
 
         # dry_run: discover-only viability probe — no run.clip, no DB writes.
@@ -877,7 +986,7 @@ class IngestionPipeline:
                     remaining = max(0.0, deadline - time.monotonic())
                     done, _ = wait(
                         pending,
-                        timeout=min(0.25, remaining),
+                        timeout=min(0.01, remaining),
                         return_when=FIRST_COMPLETED,
                     )
                     if not done:
@@ -916,7 +1025,6 @@ class IngestionPipeline:
             batch_cancelled.set()
             for future in futures:
                 future.cancel()
-            wait(futures, timeout=0.3)
             executor.shutdown(wait=False, cancel_futures=True)
 
         if max_reels is not None:
@@ -955,7 +1063,12 @@ class IngestionPipeline:
         )
         if not engine_out["clips"]:
             return v, [], engine_out
-        for clip in engine_out["clips"]:
+        eligible_clips = _strict_topic_clips(
+            list(engine_out["clips"]),
+            engine_out["transcript"],
+            v.get("_query_plan") if isinstance(v.get("_query_plan"), SearchQueryPlan) else None,
+        )
+        for clip in eligible_clips:
             relevance = clip_engine_bridge.relevance_score(
                 clip, engine_out["transcript"], topic
             )
@@ -964,8 +1077,11 @@ class IngestionPipeline:
                 0.5 if raw_info is None else max(0.0, min(1.0, float(raw_info)))
             )
             clip["score"] = relevance * (0.5 + 0.5 * informativeness)
-            clip["search_context"] = dict(v.get("_search_context") or {})
-        kept = sorted(engine_out["clips"], key=lambda c: c["score"], reverse=True)
+            clip["search_context"] = {
+                **dict(v.get("_search_context") or {}),
+                "topic_evidence_terms": list(clip.get("topic_evidence_terms") or [])[:8],
+            }
+        kept = sorted(eligible_clips, key=lambda c: c["score"], reverse=True)
         return v, kept, engine_out
 
     def _ensure_search_material(self, query: str) -> str:
