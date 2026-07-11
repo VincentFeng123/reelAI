@@ -1350,6 +1350,12 @@ function FeedPageInner() {
   ) => {
     activeRecoveryRequestRef.current = { key: scope.key, seq: scope.seq, phase };
     clearRecoveryRequestIdleTimer();
+    // Durable generation streams have their own body timeout and reconnect via
+    // persisted job status. The first valid candidate can take minutes, so the
+    // short paged-feed watchdog must not cancel an otherwise healthy job.
+    if (phase === "generating") {
+      return;
+    }
     recoveryRequestIdleTimerRef.current = setTimeout(() => {
       const current = activeRecoveryRequestRef.current;
       if (!current || current.key !== scope.key || current.seq !== scope.seq) {

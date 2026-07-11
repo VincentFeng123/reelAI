@@ -320,7 +320,7 @@ def test_retry_cap_fails_expired_second_attempt_with_terminal_event() -> None:
         conn.close()
 
 
-def test_deadline_prevents_claim_and_persists_typed_terminal_error() -> None:
+def test_queued_first_attempt_gets_fresh_execution_deadline_when_leased() -> None:
     conn = _memory_conn()
     try:
         job, _ = jobs.submit_or_get_active(
@@ -334,16 +334,144 @@ def test_deadline_prevents_claim_and_persists_typed_terminal_error() -> None:
             now=BASE_TIME,
             deadline_seconds=10,
         )
-        assert jobs.lease_job(
+        original_submission_window = datetime.fromisoformat(job["deadline_at"])
+        assert original_submission_window == BASE_TIME + timedelta(seconds=10)
+
+        claimed_at = BASE_TIME + timedelta(seconds=jobs.DEFAULT_QUEUE_TTL_SECONDS - 1)
+        leased = jobs.lease_job(
             conn,
             job_id=job["id"],
             lease_owner="late-worker",
-            now=BASE_TIME + timedelta(seconds=11),
+            now=claimed_at,
+        )
+        assert leased and leased["status"] == "running"
+        assert leased["lease_owner"] == "late-worker"
+        assert leased["attempt_count"] == 1
+        assert datetime.fromisoformat(leased["started_at"]) == claimed_at
+        assert datetime.fromisoformat(leased["deadline_at"]) == claimed_at + timedelta(
+            seconds=10
+        )
+        assert datetime.fromisoformat(leased["lease_expires_at"]) == claimed_at + timedelta(
+            seconds=10
+        )
+    finally:
+        conn.close()
+
+
+def test_stale_queued_first_attempt_times_out_once_and_cannot_be_leased() -> None:
+    conn = _memory_conn()
+    try:
+        job, _ = _submit(conn, request_key="stale-queue-request")
+        expired_at = BASE_TIME + timedelta(seconds=jobs.DEFAULT_QUEUE_TTL_SECONDS)
+
+        assert jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-a",
+            now=expired_at,
         ) is None
         expired = jobs.get_job(conn, job["id"])
         assert expired and expired["status"] == "failed"
-        assert expired["terminal_error_code"] == "deadline_exceeded"
-        assert jobs.replay_events(conn, job_id=job["id"])[0]["type"] == "terminal"
+        assert expired["attempt_count"] == 0
+        assert expired["terminal_error_code"] == "queue_timeout"
+        assert expired["lease_owner"] is None
+
+        jobs.expire_stale_queued_job(conn, job_id=job["id"], now=expired_at)
+        assert jobs.lease_job(
+            conn,
+            job_id=job["id"],
+            lease_owner="worker-b",
+            now=expired_at + timedelta(seconds=1),
+        ) is None
+        events = jobs.replay_events(conn, job_id=job["id"])
+        assert [(event["seq"], event["type"]) for event in events] == [(1, "terminal")]
+        assert events[0]["payload"]["error"]["code"] == "queue_timeout"
+    finally:
+        conn.close()
+
+
+def test_concurrent_queue_expiration_emits_one_terminal_event(tmp_path) -> None:
+    path = tmp_path / "queue-expiration.db"
+    setup = sqlite3.connect(path, isolation_level=None)
+    setup.row_factory = sqlite3.Row
+    setup.executescript(db.SCHEMA)
+    db._migrate_durable_generation_foundation_sqlite(setup)
+    setup.execute(
+        "INSERT INTO materials (id, raw_text, source_type, created_at) VALUES (?, ?, ?, ?)",
+        ("material-1", "Cell biology", "topic", BASE_TIME.isoformat()),
+    )
+    setup.execute(
+        "INSERT INTO concepts (id, material_id, title, keywords_json, summary, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("concept-1", "material-1", "Mitochondria", "[]", "Cell energy", BASE_TIME.isoformat()),
+    )
+    job, _ = _submit(setup, request_key="concurrent-queue-expiration")
+    setup.close()
+
+    barrier = threading.Barrier(2)
+    results: list[bool] = []
+    errors: list[BaseException] = []
+    expired_at = BASE_TIME + timedelta(seconds=jobs.DEFAULT_QUEUE_TTL_SECONDS)
+
+    def expire() -> None:
+        conn = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 5000")
+        try:
+            barrier.wait(timeout=2.0)
+            results.append(
+                jobs.expire_stale_queued_job(conn, job_id=job["id"], now=expired_at)
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    threads = [threading.Thread(target=expire) for _index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+
+    verify = sqlite3.connect(path)
+    verify.row_factory = sqlite3.Row
+    try:
+        assert errors == []
+        assert sorted(results) == [False, True]
+        assert jobs.get_job(verify, job["id"])["terminal_error_code"] == "queue_timeout"
+        assert [event["type"] for event in jobs.replay_events(verify, job_id=job["id"])] == [
+            "terminal"
+        ]
+    finally:
+        verify.close()
+
+
+def test_submit_expires_stale_active_job_before_creating_replacement() -> None:
+    conn = _memory_conn()
+    try:
+        stale, created = _submit(conn, request_key="replace-stale-request")
+        assert created is True
+
+        replacement, replacement_created = jobs.submit_or_get_active(
+            conn,
+            material_id="material-1",
+            concept_id="concept-1",
+            request_key="replace-stale-request",
+            content_fingerprint="fingerprint-1",
+            learner_id="learner-1",
+            request_params={"generation_mode": "slow"},
+            now=BASE_TIME + timedelta(seconds=jobs.DEFAULT_QUEUE_TTL_SECONDS),
+        )
+
+        assert replacement_created is True
+        assert replacement["id"] != stale["id"]
+        assert replacement["status"] == "queued"
+        expired = jobs.get_job(conn, stale["id"])
+        assert expired and expired["status"] == "failed"
+        assert expired["terminal_error_code"] == "queue_timeout"
+        assert [
+            event["type"] for event in jobs.replay_events(conn, job_id=stale["id"])
+        ] == ["terminal"]
     finally:
         conn.close()
 

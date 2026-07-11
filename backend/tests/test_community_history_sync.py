@@ -8,11 +8,9 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-_TEST_DATA_DIR = tempfile.TemporaryDirectory()
-os.environ["DATA_DIR"] = _TEST_DATA_DIR.name
-
 from fastapi.testclient import TestClient
 
+from backend.app import db as db_module
 from backend.app.config import get_settings
 import backend.app.main as main_module
 
@@ -24,8 +22,13 @@ from backend.app.main import COMMUNITY_OWNER_HEADER, COMMUNITY_SESSION_HEADER, a
 
 class CommunityHistorySyncTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.previous_data_dir = os.environ.get("DATA_DIR")
         self.previous_verification_required = os.environ.get("COMMUNITY_EMAIL_VERIFICATION_REQUIRED")
+        os.environ["DATA_DIR"] = self.temp_dir.name
         os.environ["COMMUNITY_EMAIL_VERIFICATION_REQUIRED"] = "1"
+        db_module._db_ready = False
         get_settings.cache_clear()
         main_module.settings = get_settings()
         self.client = TestClient(app)
@@ -46,10 +49,15 @@ class CommunityHistorySyncTests(unittest.TestCase):
         main_module._rate_limit_hits.clear()
 
     def _restore_environment(self) -> None:
+        if self.previous_data_dir is None:
+            os.environ.pop("DATA_DIR", None)
+        else:
+            os.environ["DATA_DIR"] = self.previous_data_dir
         if self.previous_verification_required is None:
             os.environ.pop("COMMUNITY_EMAIL_VERIFICATION_REQUIRED", None)
         else:
             os.environ["COMMUNITY_EMAIL_VERIFICATION_REQUIRED"] = self.previous_verification_required
+        db_module._db_ready = False
         get_settings.cache_clear()
         main_module.settings = get_settings()
 

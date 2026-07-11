@@ -97,6 +97,7 @@ class Settings(BaseSettings):
     generation_job_heartbeat_sec: int = 15
     generation_job_lease_sec: int = 90
     generation_job_poll_sec: float = 1.0
+    generation_job_worker_count: int = 2
 
 
 @lru_cache

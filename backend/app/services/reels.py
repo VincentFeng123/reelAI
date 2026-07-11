@@ -1204,7 +1204,7 @@ class ReelService:
         self.retrieval_engine_v2_enabled = bool(settings.retrieval_engine_v2_enabled)
         self.retrieval_tier2_enabled = bool(settings.retrieval_tier2_enabled)
         self.retrieval_debug_logging = bool(settings.retrieval_debug_logging)
-        self._min_relevance_threshold = 0.0
+        self._generation_state = threading.local()
         self.serverless_mode = bool(
             os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE")
         )
@@ -1556,7 +1556,9 @@ class ReelService:
 
         raise_if_cancelled()
         chain_emitter = _ChainBufferingEmitter(on_reel_created) if on_reel_created is not None else None
-        self._min_relevance_threshold = max(0.0, min(1.0, float(min_relevance_threshold)))
+        self._generation_state.min_relevance_threshold = max(
+            0.0, min(1.0, float(min_relevance_threshold))
+        )
         safe_page_hint = max(1, int(page_hint or 1))
         safe_retrieval_profile = self._normalize_retrieval_profile(retrieval_profile)
         params: tuple[Any, ...] = (material_id,)
@@ -1883,7 +1885,21 @@ class ReelService:
                 # too. Stop and surface it so the endpoint maps it to HTTP 429.
                 raise
             except _ClipEngineProviderError:
-                raise
+                existing_progress = bool(generated)
+                if not existing_progress and generation_id:
+                    existing_progress = fetch_one(
+                        conn,
+                        "SELECT id FROM reels WHERE generation_id = ? LIMIT 1",
+                        (generation_id,),
+                    ) is not None
+                if not existing_progress:
+                    raise
+                logger.warning(
+                    "generate_reels: provider failed after partial progress; "
+                    "keeping generation=%s",
+                    generation_id,
+                )
+                break
             except Exception:
                 # One concept's engine failure must not abort the whole generation —
                 # log it and move on to the next concept (Finding #4a).
@@ -3018,8 +3034,14 @@ class ReelService:
         if short_form_topic_support:
             min_discovery = max(0.12 if fast_mode else 0.14, min_discovery - 0.02)
         # Raise the floor when user has set a higher relevance threshold
-        if self._min_relevance_threshold > 0.0:
-            min_discovery = max(min_discovery, min_discovery + 0.06 * self._min_relevance_threshold)
+        min_relevance_threshold = float(
+            getattr(self._generation_state, "min_relevance_threshold", 0.0)
+        )
+        if min_relevance_threshold > 0.0:
+            min_discovery = max(
+                min_discovery,
+                min_discovery + 0.06 * min_relevance_threshold,
+            )
         passes = text_pass and discovery >= min_discovery and precision_guard
 
         final_score = 0.74 * discovery + 0.26 * clipability

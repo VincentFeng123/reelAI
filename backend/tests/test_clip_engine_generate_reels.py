@@ -559,6 +559,51 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertGreaterEqual(len(rows), 1)
 
+    def test_provider_failure_after_previous_pass_keeps_persisted_generation(self) -> None:
+        _search, run = self._patched_engine(_multi_clip_engine_out())
+        generation_id = "gen-provider-partial"
+
+        with db_module.get_conn() as conn:
+            first = main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=None,
+                num_reels=5,
+                creative_commons_only=False,
+                generation_id=generation_id,
+            )
+        self.assertTrue(first)
+        with db_module.get_conn() as conn:
+            before = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM reels WHERE generation_id = ?",
+                (generation_id,),
+            )
+
+        run.clip.side_effect = pipeline_module._ClipProviderError(
+            "provider unavailable",
+            provider="test",
+            operation="clip",
+        )
+        with db_module.get_conn() as conn:
+            second = main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=None,
+                num_reels=5,
+                creative_commons_only=False,
+                generation_id=generation_id,
+            )
+
+        with db_module.get_conn() as conn:
+            after = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM reels WHERE generation_id = ?",
+                (generation_id,),
+            )
+        self.assertEqual(second, [])
+        self.assertEqual(int(after["count"]), int(before["count"]))
+
     # ------------------------------------------------------------------ #
     # Finding #4b: rate-limit surfaces as HTTP 429 at the generate endpoint
     # ------------------------------------------------------------------ #

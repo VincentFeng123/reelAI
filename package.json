@@ -6,6 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "test": "node --test src/lib/api.stream.test.cjs",
     "typecheck": "next typegen && tsc --noEmit --incremental false",
     "lint": "npm run typecheck"
   },

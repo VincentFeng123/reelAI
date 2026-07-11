@@ -41,6 +41,7 @@ DEFAULT_MAX_ATTEMPTS = 2
 DEFAULT_HEARTBEAT_SECONDS = 15
 DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 8 * 60
+DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 REQUEST_SCHEMA_VERSION = "generation-request-v2"
 
 
@@ -203,8 +204,13 @@ def get_job(conn: Any, job_id: str) -> dict[str, Any] | None:
     return fetch_one(conn, "SELECT * FROM reel_generation_jobs WHERE id = ?", (job_id,))
 
 
-def find_active_job(conn: Any, request_key: str) -> dict[str, Any] | None:
-    return fetch_one(
+def find_active_job(
+    conn: Any,
+    request_key: str,
+    *,
+    now: datetime | str | None = None,
+) -> dict[str, Any] | None:
+    active = fetch_one(
         conn,
         """
         SELECT * FROM reel_generation_jobs
@@ -214,6 +220,18 @@ def find_active_job(conn: Any, request_key: str) -> dict[str, Any] | None:
         """,
         (request_key,),
     )
+    if active and expire_stale_queued_job(conn, job_id=str(active["id"]), now=now):
+        return fetch_one(
+            conn,
+            """
+            SELECT * FROM reel_generation_jobs
+            WHERE request_key = ? AND status IN ('queued', 'running')
+            ORDER BY created_at, id
+            LIMIT 1
+            """,
+            (request_key,),
+        )
+    return active
 
 
 def find_completed_job(conn: Any, request_key: str) -> dict[str, Any] | None:
@@ -259,6 +277,9 @@ def submit_or_get_active(
     bounded_deadline = max(1, min(DEFAULT_DEADLINE_SECONDS, int(deadline_seconds)))
     deadline_at = (started + timedelta(seconds=bounded_deadline)).isoformat()
     requested_id = str(job_id or "").strip()
+    active = find_active_job(conn, request_key, now=started)
+    if active:
+        return active, False
     for attempt in range(3):
         candidate_id = requested_id if attempt == 0 and requested_id else str(uuid.uuid4())
         row = {
@@ -300,10 +321,10 @@ def submit_or_get_active(
             insert(conn, "reel_generation_jobs", row)
             return row, True
         except DatabaseIntegrityError:
-            active = find_active_job(conn, request_key)
+            active = find_active_job(conn, request_key, now=started)
             if active:
                 return active, False
-    active = find_active_job(conn, request_key)
+    active = find_active_job(conn, request_key, now=started)
     if active:
         return active, False
     raise RuntimeError("could not submit or locate an active generation job")
@@ -414,6 +435,68 @@ def replay_events(
     ]
 
 
+def expire_stale_queued_job(
+    conn: Any,
+    *,
+    job_id: str,
+    now: datetime | str | None = None,
+    queue_ttl_seconds: int = DEFAULT_QUEUE_TTL_SECONDS,
+) -> bool:
+    """Fail an unstarted job once after its bounded queue wait elapses."""
+    current = get_job(conn, job_id)
+    if not current or str(current.get("status") or "") != "queued":
+        return False
+    if int(current.get("attempt_count") or 0) != 0:
+        return False
+    now_dt = _utc_now(now)
+    ttl_seconds = max(1, int(queue_ttl_seconds))
+    cutoff = now_dt - timedelta(seconds=ttl_seconds)
+    try:
+        if _utc_now(current.get("created_at")) > cutoff:
+            return False
+    except (TypeError, ValueError):
+        return False
+
+    timestamp = now_dt.isoformat()
+    cutoff_text = cutoff.isoformat()
+    with _atomic_write(conn):
+        updated = execute_modify(
+            conn,
+            """
+            UPDATE reel_generation_jobs
+            SET status = 'failed',
+                phase = 'terminal',
+                progress = 1.0,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                heartbeat_at = NULL,
+                completed_at = ?,
+                updated_at = ?,
+                terminal_error_code = 'queue_timeout',
+                terminal_error_message = 'Generation job waited too long to start.',
+                terminal_error_json = NULL,
+                error_text = 'queue_timeout'
+            WHERE id = ?
+              AND status = 'queued'
+              AND attempt_count = 0
+              AND created_at <= ?
+            """,
+            (timestamp, timestamp, job_id, cutoff_text),
+        )
+        if not updated:
+            return False
+        row = get_job(conn, job_id)
+        if row:
+            append_event(
+                conn,
+                job_id=job_id,
+                event_type="terminal",
+                payload=_terminal_payload(row),
+                now=timestamp,
+            )
+    return True
+
+
 def _fail_unclaimable_job(conn: Any, job_id: str, now_text: str) -> None:
     with _atomic_write(conn):
         updated = execute_modify(
@@ -477,8 +560,39 @@ def lease_job(
         raise ValueError("lease_owner is required")
     now_dt = _utc_now(now)
     now_text = now_dt.isoformat()
+    if expire_stale_queued_job(conn, job_id=job_id, now=now_dt):
+        return None
+    current = get_job(conn, job_id)
+    if not current:
+        return None
+    first_attempt = (
+        str(current.get("status") or "") == "queued"
+        and int(current.get("attempt_count") or 0) == 0
+    )
+    if first_attempt:
+        # Queue time must not consume the execution window. Before the first
+        # lease, deadline_at - created_at retains the requested window length.
+        try:
+            raw_submitted_at = current.get("created_at")
+            raw_submitted_deadline = current.get("deadline_at")
+            if not raw_submitted_at or not raw_submitted_deadline:
+                raise ValueError("missing submitted execution window")
+            submitted_at = _utc_now(raw_submitted_at)
+            submitted_deadline = _utc_now(raw_submitted_deadline)
+            execution_seconds = int((submitted_deadline - submitted_at).total_seconds())
+        except (TypeError, ValueError):
+            execution_seconds = DEFAULT_DEADLINE_SECONDS
+        execution_seconds = max(1, min(DEFAULT_DEADLINE_SECONDS, execution_seconds))
+        deadline_at = (now_dt + timedelta(seconds=execution_seconds)).isoformat()
+    else:
+        raw_deadline = current.get("deadline_at")
+        deadline_at = _iso(raw_deadline) if raw_deadline else None
     lease_duration = max(1, min(DEFAULT_LEASE_SECONDS, int(lease_seconds)))
-    lease_expires_at = (now_dt + timedelta(seconds=lease_duration)).isoformat()
+    lease_expires_dt = now_dt + timedelta(seconds=lease_duration)
+    if deadline_at:
+        lease_expires_dt = min(lease_expires_dt, _utc_now(deadline_at))
+    lease_expires_at = lease_expires_dt.isoformat()
+    queue_cutoff = (now_dt - timedelta(seconds=DEFAULT_QUEUE_TTL_SECONDS)).isoformat()
     claimed = execute_modify(
         conn,
         """
@@ -486,10 +600,11 @@ def lease_job(
         SET status = 'running',
             phase = CASE WHEN phase = 'queued' THEN 'starting' ELSE phase END,
             lease_owner = ?,
-            lease_expires_at = CASE
-                WHEN deadline_at IS NOT NULL AND deadline_at < ? THEN deadline_at
-                ELSE ?
+            deadline_at = CASE
+                WHEN status = 'queued' AND attempt_count = 0 THEN ?
+                ELSE deadline_at
             END,
+            lease_expires_at = ?,
             heartbeat_at = ?,
             attempt_count = attempt_count + 1,
             started_at = COALESCE(started_at, ?),
@@ -502,20 +617,33 @@ def lease_job(
         WHERE id = ?
           AND cancel_requested = 0
           AND attempt_count < max_attempts
-          AND (deadline_at IS NULL OR deadline_at > ?)
           AND (
-              status = 'queued'
-              OR (status = 'running' AND (lease_expires_at IS NULL OR lease_expires_at <= ?))
+              (
+                  status = 'queued'
+                  AND attempt_count = 0
+                  AND created_at > ?
+              )
+              OR (
+                  (deadline_at IS NULL OR deadline_at > ?)
+                  AND (
+                      (status = 'queued' AND attempt_count > 0)
+                      OR (
+                          status = 'running'
+                          AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+                      )
+                  )
+              )
           )
         """,
         (
             lease_owner,
-            lease_expires_at,
+            deadline_at,
             lease_expires_at,
             now_text,
             now_text,
             now_text,
             job_id,
+            queue_cutoff,
             now_text,
             now_text,
         ),
@@ -854,12 +982,14 @@ __all__ = [
     "DEFAULT_HEARTBEAT_SECONDS",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_MAX_ATTEMPTS",
+    "DEFAULT_QUEUE_TTL_SECONDS",
     "EVENT_TYPES",
     "JobLeaseLostError",
     "TERMINAL_STATUSES",
     "append_event",
     "build_request_key",
     "cancellation_requested",
+    "expire_stale_queued_job",
     "find_active_job",
     "find_completed_job",
     "get_job",

@@ -20,8 +20,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-os.environ.setdefault("VERCEL", "1")
-
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -30,8 +28,13 @@ import backend.app.services.reels as reels_module  # noqa: E402
 from backend.app.services.reels import ReelService  # noqa: E402
 
 
-def _svc() -> ReelService:
-    return ReelService(embedding_service=None, youtube_service=None)
+def _svc(*, ingestion_pipeline=None) -> ReelService:
+    with mock.patch.dict(os.environ, {"VERCEL": "1"}):
+        return ReelService(
+            embedding_service=None,
+            youtube_service=None,
+            ingestion_pipeline=ingestion_pipeline,
+        )
 
 
 def _row(title: str, keywords: list[str]) -> dict:
@@ -69,7 +72,7 @@ class ConceptTopicQueryTests(unittest.TestCase):
     # ------------------------------------------------------------------
     def test_ingestion_pipeline_stored(self) -> None:
         sentinel = object()
-        svc = ReelService(embedding_service=None, youtube_service=None, ingestion_pipeline=sentinel)
+        svc = _svc(ingestion_pipeline=sentinel)
         self.assertIs(svc.ingestion_pipeline, sentinel)
 
     def test_ingestion_pipeline_defaults_none(self) -> None:

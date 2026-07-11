@@ -28,7 +28,7 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from pathlib import Path
 from typing import Any, Callable
 
@@ -72,7 +72,7 @@ from .persistence import (
     upsert_video,
 )
 from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta, config as clip_engine_config  # noqa: F401
-from ..clip_engine.cancellation import raise_if_cancelled
+from ..clip_engine.cancellation import is_cancelled, raise_if_cancelled
 from ..clip_engine.provider_runtime import GenerationContext
 from ..clip_engine.errors import (
     CaptionsUnavailableError as _CaptionsUnavailableError,
@@ -86,8 +86,8 @@ from ..services.assessments import store_reel_assessment_question
 
 logger: logging.Logger = get_ingest_logger(__name__)
 
-# Per-video wall-clock budget for clip+filter (VidScout's feed abandons a
-# video's job after 180s); a pathological video must not stall the generation.
+# Shared wall-clock budget for one topic's concurrent clip+filter batch. A
+# pathological set of videos must not multiply this deadline by video count.
 INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "180"))
 
 
@@ -714,10 +714,11 @@ class IngestionPipeline:
         `discover` returned (a viability probe callers consume even under
         `dry_run`).
 
-        Cost/latency guardrail: `max_videos` bounds the paid `run.clip` calls;
-        the per-video clip+filter FETCH runs concurrently, but persist +
-        `on_reel_created` + the `max_reels` early-stop run SEQUENTIALLY in
-        discover order so ordering and the global cap stay deterministic.
+        Cost/latency guardrail: `max_videos` bounds the paid `run.clip` calls.
+        Without `max_reels`, each video's clips persist as soon as that video
+        finishes; the returned list is restored to discover order. With
+        `max_reels`, fetch and persistence stay in discover order so the capped
+        selection remains deterministic.
         """
         topic = " ".join(str(topic or "").split())
         if not topic:
@@ -766,62 +767,78 @@ class IngestionPipeline:
 
         videos = disc["videos"]
 
-        # FETCH stage: clip + relevance-filter each video concurrently, with a
-        # per-video wall-clock deadline; persistence stays single-threaded.
-        # shutdown(wait=False) abandons a stuck video's thread rather than
-        # blocking the whole generation on it.
-        fetched: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]] = []
-        if videos:
-            executor = ThreadPoolExecutor(max_workers=min(4, len(videos)))
-            try:
-                futures = [
-                    executor.submit(
-                        self._clip_and_filter,
-                        v,
-                        corrected_topic,
-                        language,
-                        should_cancel,
-                        generation_context,
-                    )
-                    for v in videos
-                ]
-                for v, future in zip(videos, futures):
-                    raise_if_cancelled(should_cancel)
-                    try:
-                        fetched.append(future.result(timeout=INGEST_TOPIC_VIDEO_TIMEOUT_SEC))
-                    except _ClipCancellationError:
-                        raise
-                    except _CaptionsUnavailableError as exc:
-                        log_event(
-                            logger,
-                            logging.INFO,
-                            "ingest_topic_native_captions_unavailable",
-                            video_id=v.get("id"),
-                            error=str(exc),
-                        )
-                    except _ClipProviderError:
-                        raise
-                    except Exception as exc:
-                        log_event(
-                            logger,
-                            logging.WARNING,
-                            "ingest_topic_video_failed",
-                            video_id=v.get("id"),
-                            error=str(exc),
-                        )
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
+        if not videos:
+            return [], resolved_video_ids
 
-        # PERSIST stage: sequential, discover order — the `on_reel_created`
-        # ordering and the (optional) `max_reels` early-stop stay deterministic.
-        # Duration/kind/confidence gates already ran inside the engine;
-        # `_clip_and_filter` preserves every accepted clip per video.
-        reels: list[ReelOutWithAttribution] = []
-        for v, kept, engine_out in fetched:
-            for clip in kept:
+        # FETCH stage: clip + relevance-filter each video concurrently under one
+        # shared deadline. shutdown(wait=False) abandons stuck worker threads.
+        executor = ThreadPoolExecutor(max_workers=min(4, len(videos)))
+        batch_cancelled = threading.Event()
+
+        def fetch_should_cancel() -> bool:
+            return batch_cancelled.is_set() or is_cancelled(should_cancel)
+
+        deadline = time.monotonic() + max(0.0, INGEST_TOPIC_VIDEO_TIMEOUT_SEC)
+        futures = [
+            executor.submit(
+                self._clip_and_filter,
+                v,
+                corrected_topic,
+                language,
+                fetch_should_cancel,
+                generation_context,
+            )
+            for v in videos
+        ]
+
+        def fetch_result(v: dict[str, Any], future: Any, timeout: float):
+            try:
+                return future.result(timeout=timeout)
+            except _ClipCancellationError:
+                if batch_cancelled.is_set() and not is_cancelled(should_cancel):
+                    return None
+                raise
+            except FutureTimeoutError:
+                batch_cancelled.set()
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "ingest_topic_video_failed",
+                    video_id=v.get("id"),
+                    error=(
+                        "shared clip fetch deadline exceeded "
+                        f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
+                    ),
+                )
+            except _CaptionsUnavailableError as exc:
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "ingest_topic_native_captions_unavailable",
+                    video_id=v.get("id"),
+                    error=str(exc),
+                )
+            except _ClipProviderError:
+                raise
+            except Exception as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "ingest_topic_video_failed",
+                    video_id=v.get("id"),
+                    error=str(exc),
+                )
+            return None
+
+        def persist_result(
+            result: tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
+            *,
+            limit: int | None = None,
+        ) -> list[ReelOutWithAttribution]:
+            v, kept, engine_out = result
+            persisted: list[ReelOutWithAttribution] = []
+            for clip in kept if limit is None else kept[:max(0, limit)]:
                 raise_if_cancelled(should_cancel)
-                if max_reels is not None and len(reels) >= max_reels:
-                    return reels, resolved_video_ids
                 reel, _ = self._persist_engine_clip(
                     v=v,
                     clip=clip,
@@ -832,10 +849,93 @@ class IngestionPipeline:
                     generation_id=generation_id,
                     should_cancel=should_cancel,
                 )
-                reels.append(reel)
+                persisted.append(reel)
                 if on_reel_created is not None:
                     on_reel_created(reel)
+            return persisted
 
+        fetched: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]] = []
+        reels_by_video: dict[int, list[ReelOutWithAttribution]] = {}
+        provider_errors: list[_ClipProviderError] = []
+        try:
+            # A numeric cap preserves the prior discover-order selection contract.
+            if max_reels is not None:
+                for v, future in zip(videos, futures):
+                    raise_if_cancelled(should_cancel)
+                    remaining = max(0.0, deadline - time.monotonic())
+                    result = fetch_result(v, future, remaining)
+                    if result is not None:
+                        fetched.append(result)
+            else:
+                # Uncapped primary generation persists each completed video now.
+                pending = {
+                    future: (index, v)
+                    for index, (v, future) in enumerate(zip(videos, futures))
+                }
+                while pending:
+                    raise_if_cancelled(should_cancel)
+                    remaining = max(0.0, deadline - time.monotonic())
+                    done, _ = wait(
+                        pending,
+                        timeout=min(0.25, remaining),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        if time.monotonic() < deadline:
+                            continue
+                        for _, v in pending.values():
+                            log_event(
+                                logger,
+                                logging.WARNING,
+                                "ingest_topic_video_failed",
+                                video_id=v.get("id"),
+                                error=(
+                                    "shared clip fetch deadline exceeded "
+                                    f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
+                                ),
+                            )
+                        break
+
+                    for future in sorted(done, key=lambda item: pending[item][0]):
+                        index, v = pending.pop(future)
+                        try:
+                            result = fetch_result(v, future, 0.0)
+                        except _ClipProviderError as exc:
+                            provider_errors.append(exc)
+                            log_event(
+                                logger,
+                                logging.WARNING,
+                                "ingest_topic_video_failed",
+                                video_id=v.get("id"),
+                                error=str(exc),
+                            )
+                            continue
+                        if result is not None:
+                            reels_by_video[index] = persist_result(result)
+        finally:
+            batch_cancelled.set()
+            for future in futures:
+                future.cancel()
+            wait(futures, timeout=0.3)
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        if max_reels is not None:
+            reels: list[ReelOutWithAttribution] = []
+            for result in fetched:
+                if len(reels) >= max_reels:
+                    break
+                reels.extend(persist_result(result, limit=max_reels - len(reels)))
+            return reels, resolved_video_ids
+
+        # Progressive callbacks reflect availability; restore discover order in
+        # the final result for deterministic downstream inventory.
+        reels = [
+            reel
+            for index in range(len(videos))
+            for reel in reels_by_video.get(index, [])
+        ]
+        if not reels and provider_errors:
+            raise provider_errors[0]
         return reels, resolved_video_ids
 
     def _clip_and_filter(

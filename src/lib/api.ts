@@ -396,7 +396,10 @@ function normalizeCommunityAuthSession(raw: unknown): CommunityAuthSession | nul
 async function parseJsonResponse<T>(response: Response): Promise<T> {
   try {
     return await response.json() as T;
-  } catch {
+  } catch (error) {
+    if (isTransportError(error) || isRequestInterruptedError(error)) {
+      throw error;
+    }
     throw new Error("Backend returned an invalid JSON response.");
   }
 }
@@ -768,6 +771,7 @@ type GenerateReelsParams = {
   targetClipDurationSec?: number;
   targetClipDurationMinSec?: number;
   targetClipDurationMaxSec?: number;
+  signal?: AbortSignal;
 };
 
 // Max number of IDs we send on any request. After a long session the client's
@@ -848,7 +852,9 @@ export async function generateReels(params: GenerateReelsParams): Promise<ReelsG
       ...communityRequestHeaders(),
     },
     body: JSON.stringify(buildGenerateReelsRequestBody(params)),
-    timeoutMs: 900_000,
+    signal: params.signal,
+    timeoutMs: 30_000,
+    keepSignalAliveThroughBody: true,
   });
 
   return parseJsonResponse<ReelsGenerateSubmission>(res);
@@ -909,6 +915,7 @@ export async function ingestSearch(params: IngestSearchParams): Promise<IngestSe
     body: JSON.stringify(body),
     signal: params.signal,
     timeoutMs: 300_000,
+    keepSignalAliveThroughBody: true,
   });
 
   return parseJsonResponse<IngestSearchResult>(res);
@@ -933,6 +940,7 @@ export async function ingestUrl(params: IngestUrlParams): Promise<IngestResult> 
     body: JSON.stringify(body),
     signal: params.signal,
     timeoutMs: 180_000,
+    keepSignalAliveThroughBody: true,
   });
 
   return parseJsonResponse<IngestResult>(res);
@@ -985,12 +993,14 @@ async function waitForReconnect(signal?: AbortSignal): Promise<void> {
 
 export async function fetchGenerationStatus(
   jobId: string,
-  options?: { signal?: AbortSignal },
+  options?: { signal?: AbortSignal; timeoutMs?: number },
 ): Promise<GenerationJobStatusResponse> {
   const res = await safeFetch(apiUrl(`/reels/generation-status/${encodeURIComponent(jobId)}`), {
     cache: "no-store",
     headers: { ...communityRequestHeaders() },
     signal: options?.signal,
+    timeoutMs: options?.timeoutMs ?? 30_000,
+    keepSignalAliveThroughBody: true,
   });
   return parseJsonResponse<GenerationJobStatusResponse>(res);
 }
@@ -1013,9 +1023,12 @@ async function consumeGenerationJob(
 ): Promise<ReelsGenerateResponse> {
   let afterSeq = 0;
   let finalResponse: ReelsGenerateResponse | null = null;
-  const deadline = Date.now() + 9 * 60_000;
+  // Backend permits up to eight minutes queued plus a fresh eight-minute
+  // execution window. Keep one minute of transport slack, but stay finite.
+  const deadline = Date.now() + 17 * 60_000;
 
   while (Date.now() < deadline) {
+    const remainingMs = Math.max(1_000, deadline - Date.now());
     let terminalStatus: string | null = null;
     let terminalError: TypedApiError | null | undefined;
     try {
@@ -1029,7 +1042,8 @@ async function consumeGenerationJob(
             ...communityRequestHeaders(),
           },
           signal: options.signal,
-          timeoutMs: 540_000,
+          timeoutMs: Math.min(540_000, remainingMs),
+          keepSignalAliveThroughBody: true,
         },
       );
       if (!res.body) {
@@ -1059,10 +1073,12 @@ async function consumeGenerationJob(
         }
       };
 
+      let readerDone = false;
       try {
         while (!terminalStatus) {
           const { done, value } = await reader.read();
           if (done) {
+            readerDone = true;
             break;
           }
           buffer += decoder.decode(value, { stream: true });
@@ -1078,6 +1094,13 @@ async function consumeGenerationJob(
           processLine(buffer);
         }
       } finally {
+        if (!readerDone) {
+          try {
+            await reader.cancel();
+          } catch {
+            // The underlying request may already have failed or been aborted.
+          }
+        }
         reader.releaseLock();
       }
     } catch (error) {
@@ -1098,7 +1121,22 @@ async function consumeGenerationJob(
       }
     }
 
-    const status = await fetchGenerationStatus(job.job_id, { signal: options.signal });
+    let status: GenerationJobStatusResponse;
+    try {
+      status = await fetchGenerationStatus(job.job_id, {
+        signal: options.signal,
+        timeoutMs: Math.min(30_000, Math.max(1_000, deadline - Date.now())),
+      });
+    } catch (error) {
+      if (isRequestInterruptedError(error) || options.signal?.aborted) {
+        throw error;
+      }
+      if (!isTransportError(error)) {
+        throw error;
+      }
+      await waitForReconnect(options.signal);
+      continue;
+    }
     if (status.status === "failed" || status.status === "cancelled") {
       throwTerminalGenerationError(status.error, status.status);
     }
@@ -1246,6 +1284,7 @@ export async function fetchFeed(params: {
     },
     signal: params.signal,
     timeoutMs: 300_000,
+    keepSignalAliveThroughBody: true,
   });
 
   return parseJsonResponse<FeedResponse>(res);
@@ -1959,6 +1998,7 @@ export async function fetchCommunityReelDuration(params: {
 
 type SafeFetchInit = RequestInit & {
   timeoutMs?: number;
+  keepSignalAliveThroughBody?: boolean;
 };
 
 async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
@@ -1966,6 +2006,7 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
   const timeoutMs = Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.max(1_000, timeoutRaw) : null;
   const upstreamSignal = init?.signal;
   const controller = new AbortController();
+  const keepSignalAliveThroughBody = init?.keepSignalAliveThroughBody === true;
   let didTimeout = false;
   const timeoutId = timeoutMs
     ? setTimeout(() => {
@@ -1974,6 +2015,22 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
     }, timeoutMs)
     : null;
   const onUpstreamAbort = () => controller.abort();
+  let cleanedUp = false;
+  const cleanup = () => {
+    if (cleanedUp) {
+      return;
+    }
+    cleanedUp = true;
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+    if (upstreamSignal) {
+      upstreamSignal.removeEventListener("abort", onUpstreamAbort);
+    }
+  };
+  const abortError = (): Error => didTimeout
+    ? new TransportError("Request timed out before the backend response completed.")
+    : new Error("Request was interrupted.");
 
   if (upstreamSignal) {
     if (upstreamSignal.aborted) {
@@ -1990,28 +2047,76 @@ async function safeFetch(url: string, init?: SafeFetchInit): Promise<Response> {
       signal: controller.signal,
     };
     delete (requestInit as SafeFetchInit).timeoutMs;
+    delete (requestInit as SafeFetchInit).keepSignalAliveThroughBody;
     response = await fetch(url, requestInit);
   } catch (error) {
+    cleanup();
     if (error instanceof Error && error.name === "AbortError") {
-      if (didTimeout) {
-        throw new TransportError("Request timed out before the backend responded.");
-      }
-      throw new Error("Request was interrupted.");
+      throw abortError();
     }
     throw new TransportError(getBackendDownError());
-  } finally {
-    if (timeoutId) {
-      clearTimeout(timeoutId);
-    }
-    if (upstreamSignal) {
-      upstreamSignal.removeEventListener("abort", onUpstreamAbort);
-    }
   }
 
-  if (!response.ok) {
-    throw await buildApiError(response);
+  if (!keepSignalAliveThroughBody || !response.body) {
+    cleanup();
+    if (!response.ok) {
+      throw await buildApiError(response);
+    }
+    return response;
   }
-  return response;
+
+  const sourceReader = response.body.getReader();
+  let sourceReaderReleased = false;
+  const releaseSourceReader = () => {
+    if (sourceReaderReleased) {
+      return;
+    }
+    sourceReaderReleased = true;
+    sourceReader.releaseLock();
+  };
+  const body = new ReadableStream<Uint8Array>({
+    async pull(streamController) {
+      try {
+        const { done, value } = await sourceReader.read();
+        if (done) {
+          releaseSourceReader();
+          cleanup();
+          streamController.close();
+          return;
+        }
+        streamController.enqueue(value);
+      } catch (error) {
+        releaseSourceReader();
+        cleanup();
+        if (error instanceof Error && error.name === "AbortError") {
+          streamController.error(abortError());
+          return;
+        }
+        streamController.error(new TransportError(getBackendDownError()));
+      }
+    },
+    async cancel(reason) {
+      controller.abort();
+      try {
+        await sourceReader.cancel(reason);
+      } catch {
+        // The source may already be errored by the request abort.
+      } finally {
+        releaseSourceReader();
+        cleanup();
+      }
+    },
+  });
+
+  const wrappedResponse = new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+  if (!wrappedResponse.ok) {
+    throw await buildApiError(wrappedResponse);
+  }
+  return wrappedResponse;
 }
 
 export function isRequestInterruptedError(error: unknown): boolean {
@@ -2070,7 +2175,10 @@ async function buildApiError(response: Response): Promise<ApiError> {
         message = json.message.trim();
       }
     }
-  } catch {
+  } catch (error) {
+    if (isTransportError(error) || isRequestInterruptedError(error)) {
+      throw error;
+    }
     // Keep the generic status message when the body is absent or malformed.
   }
   return new ApiError(message, response.status, typedError?.code ?? null, typedError);

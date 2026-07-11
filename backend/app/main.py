@@ -153,6 +153,7 @@ from .services.generation_jobs import (
     append_event as append_generation_event,
     build_request_key as build_durable_request_key,
     cancellation_requested as generation_cancellation_requested,
+    expire_stale_queued_job as expire_stale_generation_job,
     find_completed_job as find_completed_generation_job,
     get_job as get_generation_job,
     heartbeat_job as heartbeat_generation_job,
@@ -184,10 +185,18 @@ GENERATION_WORKER_POLL_SEC = max(
     0.1,
     min(30.0, float(settings.generation_job_poll_sec)),
 )
-_generation_worker_id = f"worker-{uuid.uuid4()}"
+GENERATION_WORKER_COUNT = max(
+    1,
+    min(8, int(settings.generation_job_worker_count)),
+)
+_generation_worker_ids = tuple(
+    f"worker-{uuid.uuid4()}" for _index in range(GENERATION_WORKER_COUNT)
+)
+_generation_worker_id = _generation_worker_ids[0]
 _generation_worker_stop = threading.Event()
 _generation_worker_lock = threading.Lock()
 _generation_worker_thread: threading.Thread | None = None
+_generation_worker_threads: list[threading.Thread] = []
 
 @asynccontextmanager
 async def lifespan(app_instance):
@@ -3104,7 +3113,48 @@ def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, A
     }
 
 
-def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
+def _generation_job_db_should_stop(
+    job_id: str,
+    lease_owner: str,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    checked_at = now or datetime.now(timezone.utc)
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    checked_at = checked_at.astimezone(timezone.utc)
+    with get_conn() as conn:
+        current = get_generation_job(conn, job_id)
+    if not current:
+        return True
+    if str(current.get("status") or "") != "running":
+        return True
+    if str(current.get("lease_owner") or "") != lease_owner:
+        return True
+    if int(current.get("cancel_requested") or 0):
+        return True
+
+    def reached(value: object, *, missing_is_expired: bool) -> bool:
+        normalized = _normalize_datetime_for_api(value)
+        if not normalized:
+            return missing_is_expired
+        try:
+            parsed = datetime.fromisoformat(normalized.replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return checked_at >= parsed.astimezone(timezone.utc)
+
+    return reached(current.get("lease_expires_at"), missing_is_expired=True) or reached(
+        current.get("deadline_at"), missing_is_expired=False
+    )
+
+
+def _run_leased_generation_job(
+    job_row: dict[str, Any],
+    worker_stop: threading.Event | None = None,
+) -> None:
     job_id = str(job_row.get("id") or "")
     lease_owner = str(job_row.get("lease_owner") or "")
     params = _job_request_params(job_row)
@@ -3114,6 +3164,7 @@ def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
     concept_id = str(job_row.get("concept_id") or "") or None
     learner_id = str(job_row.get("learner_id") or LEGACY_LEARNER_ID)
     local_stop = threading.Event()
+    active_worker_stop = worker_stop or _generation_worker_stop
 
     def heartbeat_loop() -> None:
         while not local_stop.wait(GENERATION_HEARTBEAT_SEC):
@@ -3143,21 +3194,12 @@ def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
 
     def should_cancel() -> bool:
         nonlocal last_cancel_check, cached_cancelled
-        if local_stop.is_set() or _generation_worker_stop.is_set():
+        if local_stop.is_set() or active_worker_stop.is_set():
             return True
         now_mono = time.monotonic()
         if now_mono - last_cancel_check >= 0.5:
             last_cancel_check = now_mono
-            with get_conn() as check_conn:
-                cached_cancelled = generation_cancellation_requested(check_conn, job_id)
-                current = get_generation_job(check_conn, job_id) or {}
-                deadline = _normalize_datetime_for_api(current.get("deadline_at"))
-                if deadline:
-                    try:
-                        parsed = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
-                        cached_cancelled = cached_cancelled or datetime.now(timezone.utc) >= parsed
-                    except ValueError:
-                        pass
+            cached_cancelled = _generation_job_db_should_stop(job_id, lease_owner)
         return cached_cancelled
 
     context = GenerationContext(
@@ -3168,24 +3210,50 @@ def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
     )
     generation_id = ""
     try:
-        with get_conn() as conn:
-            update_generation_progress(
-                conn,
+        with get_conn(transactional=True) as setup_conn:
+            if not update_generation_progress(
+                setup_conn,
                 job_id=job_id,
                 lease_owner=lease_owner,
                 phase="retrieval",
                 progress=0.05,
-            )
-            generation_id = _create_generation_row(
-                conn,
-                material_id=material_id,
-                concept_id=concept_id,
-                request_key=str(job_row.get("request_key") or ""),
-                generation_mode=mode,
-                retrieval_profile="unified",
-                source_generation_id=None,
-            )
+            ):
+                raise JobLeaseLostError(
+                    f"generation job lease is no longer active: {job_id}"
+                )
+            generation_id = str(job_row.get("result_generation_id") or "").strip()
+            if not _fetch_generation_row(setup_conn, generation_id):
+                generation_id = _create_generation_row(
+                    setup_conn,
+                    material_id=material_id,
+                    concept_id=concept_id,
+                    request_key=str(job_row.get("request_key") or ""),
+                    generation_mode=mode,
+                    retrieval_profile="unified",
+                    source_generation_id=None,
+                )
+                attached_at = now_iso()
+                attached = execute_modify(
+                    setup_conn,
+                    "UPDATE reel_generation_jobs SET result_generation_id = ?, updated_at = ? "
+                    "WHERE id = ? AND status = 'running' AND lease_owner = ? "
+                    "AND cancel_requested = 0 AND lease_expires_at > ? "
+                    "AND (deadline_at IS NULL OR deadline_at > ?)",
+                    (
+                        generation_id,
+                        attached_at,
+                        job_id,
+                        lease_owner,
+                        attached_at,
+                        attached_at,
+                    ),
+                )
+                if not attached:
+                    raise JobLeaseLostError(
+                        f"generation job lease is no longer active: {job_id}"
+                    )
 
+        with get_conn() as conn:
             emitted: set[tuple[str, str]] = set()
 
             def on_candidate(reel: dict[str, Any]) -> None:
@@ -3203,9 +3271,11 @@ def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
                     lease_owner=lease_owner,
                 )
 
-            previous_count = 0
+            previous_count = _count_generation_reels(conn, generation_id)
             last_growth: int | None = None
             for pass_index in range(context.budget.max_passes):
+                if previous_count >= requested_count:
+                    break
                 if pass_index > 0 and any(
                     context.budget.remaining(operation) <= 0
                     for operation in ("search", "transcript", "segmentation")
@@ -3254,14 +3324,17 @@ def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
                     acquisition_concept_offset=pass_index,
                 )
                 current_count = _count_generation_reels(conn, generation_id)
-                update_generation_progress(
+                if not update_generation_progress(
                     conn,
                     job_id=job_id,
                     lease_owner=lease_owner,
                     phase="ranking",
                     progress=min(0.85, 0.25 + 0.2 * (pass_index + 1)),
                     usage=context.budget.snapshot(),
-                )
+                ):
+                    raise JobLeaseLostError(
+                        f"generation job lease is no longer active: {job_id}"
+                    )
                 if current_count >= requested_count or mode == "fast":
                     break
                 last_growth = max(0, current_count - previous_count)
@@ -3275,11 +3348,6 @@ def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
                     request_key=str(job_row.get("request_key") or ""),
                     generation_id=generation_id,
                     retrieval_profile="unified",
-                )
-                execute_modify(
-                    conn,
-                    "UPDATE reel_generation_jobs SET result_generation_id = ? WHERE id = ?",
-                    (generation_id, job_id),
                 )
                 refreshed_job = get_generation_job(conn, job_id) or {**job_row, "result_generation_id": generation_id}
                 final_reels = _generation_job_reels(conn, refreshed_job)
@@ -3373,46 +3441,64 @@ def _run_leased_generation_job(job_row: dict[str, Any]) -> None:
         heartbeat_thread.join(timeout=1.0)
 
 
-def _generation_worker_loop() -> None:
-    while not _generation_worker_stop.is_set():
+def _generation_worker_loop(
+    lease_owner: str,
+    stop_event: threading.Event,
+) -> None:
+    worker_id = lease_owner or _generation_worker_id
+    while not stop_event.is_set():
         try:
             with get_conn(transactional=True) as conn:
                 job_row = lease_next_job(
                     conn,
-                    lease_owner=_generation_worker_id,
+                    lease_owner=worker_id,
                     lease_seconds=GENERATION_LEASE_SEC,
                 )
             if job_row:
-                _run_leased_generation_job(job_row)
+                _run_leased_generation_job(job_row, stop_event)
                 continue
         except Exception:
             logger.exception("generation worker poll failed")
-        _generation_worker_stop.wait(GENERATION_WORKER_POLL_SEC)
+        stop_event.wait(GENERATION_WORKER_POLL_SEC)
 
 
 def _start_generation_worker() -> None:
-    global _generation_worker_thread
+    global _generation_worker_id, _generation_worker_ids, _generation_worker_stop
+    global _generation_worker_thread, _generation_worker_threads
     with _generation_worker_lock:
-        if _generation_worker_thread is not None and _generation_worker_thread.is_alive():
+        if any(thread.is_alive() for thread in _generation_worker_threads):
             return
-        _generation_worker_stop.clear()
-        _generation_worker_thread = threading.Thread(
-            target=_generation_worker_loop,
-            name="reel-generation-worker",
-            daemon=True,
+        _generation_worker_stop = threading.Event()
+        _generation_worker_ids = tuple(
+            f"worker-{uuid.uuid4()}" for _index in range(GENERATION_WORKER_COUNT)
         )
-        _generation_worker_thread.start()
+        _generation_worker_id = _generation_worker_ids[0]
+        _generation_worker_threads = [
+            threading.Thread(
+                target=_generation_worker_loop,
+                args=(worker_id, _generation_worker_stop),
+                name=f"reel-generation-worker-{index + 1}",
+                daemon=True,
+            )
+            for index, worker_id in enumerate(_generation_worker_ids)
+        ]
+        _generation_worker_thread = _generation_worker_threads[0]
+        for thread in _generation_worker_threads:
+            thread.start()
 
 
 def _stop_generation_worker() -> None:
-    global _generation_worker_thread
+    global _generation_worker_thread, _generation_worker_threads
     with _generation_worker_lock:
-        thread = _generation_worker_thread
+        threads = list(_generation_worker_threads)
         _generation_worker_stop.set()
-    if thread is not None:
-        thread.join(timeout=5.0)
-    with _generation_worker_lock:
-        _generation_worker_thread = None
+        join_deadline = time.monotonic() + 5.0
+        for thread in threads:
+            thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
+        _generation_worker_threads = [thread for thread in threads if thread.is_alive()]
+        _generation_worker_thread = (
+            _generation_worker_threads[0] if _generation_worker_threads else None
+        )
 
 
 def _normalize_datetime_for_api(value: object) -> str | None:
@@ -3744,11 +3830,19 @@ def health() -> dict:
 
 @app.get("/api/admin/health")
 def admin_health() -> dict:
+    generation_workers_alive = sum(
+        thread.is_alive() for thread in _generation_worker_threads
+    )
+    generation_pool_ready = (
+        len(_generation_worker_threads) == GENERATION_WORKER_COUNT
+        and generation_workers_alive == GENERATION_WORKER_COUNT
+        and not _generation_worker_stop.is_set()
+    )
     return {
-        "ok": True,
-        "generation_worker_alive": bool(
-            _generation_worker_thread is not None and _generation_worker_thread.is_alive()
-        ),
+        "ok": generation_pool_ready,
+        "generation_worker_alive": generation_pool_ready,
+        "generation_worker_count": GENERATION_WORKER_COUNT,
+        "generation_workers_alive": generation_workers_alive,
         "supadata_configured": bool(os.getenv("SUPADATA_API_KEY", "").strip()),
         "gemini_primary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
         "gemini_fallback_model": os.getenv("SEGMENT_FALLBACK_MODEL", "").strip() or None,
@@ -4599,8 +4693,10 @@ def generation_status(request: Request, job_id: str):
         "reels-generation-status",
         limit=GENERATION_JOB_STATUS_RATE_LIMIT_PER_WINDOW,
     )
-    with get_conn() as conn:
-        job_row = get_generation_job(conn, str(job_id or "").strip())
+    clean_job_id = str(job_id or "").strip()
+    with get_conn(transactional=True) as conn:
+        expire_stale_generation_job(conn, job_id=clean_job_id)
+        job_row = get_generation_job(conn, clean_job_id)
         if not job_row:
             raise HTTPException(status_code=404, detail="job_id not found")
         return _generation_job_status_payload(conn, job_row)
@@ -4615,14 +4711,16 @@ async def generation_stream(request: Request, job_id: str, after_seq: int = 0):
         limit=GENERATION_JOB_STATUS_RATE_LIMIT_PER_WINDOW,
     )
     clean_job_id = str(job_id or "").strip()
-    with get_conn() as conn:
+    with get_conn(transactional=True) as conn:
+        expire_stale_generation_job(conn, job_id=clean_job_id)
         if not get_generation_job(conn, clean_job_id):
             raise HTTPException(status_code=404, detail="job_id not found")
 
     async def ndjson_events():
         cursor = max(0, int(after_seq or 0))
         while True:
-            with get_conn() as conn:
+            with get_conn(transactional=True) as conn:
+                expire_stale_generation_job(conn, job_id=clean_job_id)
                 events = replay_generation_events(
                     conn,
                     job_id=clean_job_id,

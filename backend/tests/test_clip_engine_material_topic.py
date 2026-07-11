@@ -14,6 +14,8 @@ writes to a temp SQLite DB.
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -103,7 +105,7 @@ def _discover_side_effect(topic, limit, exclude_video_ids=None, **kw):
     return {"corrected": topic, "videos": videos, "credits_used": 0, "warning": None}
 
 
-def _clip_side_effect(url, topic=None, settings=None):
+def _clip_side_effect(url, topic=None, settings=None, **_kwargs):
     vid = next(v["id"] for v in POOL if v["url"] == url)
     return _build_engine_out(vid)
 
@@ -272,6 +274,8 @@ class IngestTopicTests(unittest.TestCase):
         # Exactly 2 persisted even though 3 clips are available
         self.assertEqual(len(reels), 2)
         self.assertEqual(len(seen), 2)
+        self.assertEqual([r.t_start for r in reels], [30.0, 120.0])
+        self.assertTrue(all("vidAAAAAAAA" in r.video_url for r in reels))
         rows = self._reels_for_generation("gen-3")
         self.assertEqual(len(rows), 2)
 
@@ -653,6 +657,233 @@ class LevelThreadingTests(IngestTopicTests):
             )
             _, kwargs = mock_search.discover.call_args
             self.assertEqual(kwargs.get("level"), "advanced")
+
+
+class IngestTopicProgressTests(unittest.TestCase):
+    @staticmethod
+    def _video(video_id: str) -> dict:
+        return {
+            "id": video_id,
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "title": video_id,
+            "channel": "Test",
+            "duration": 60.0,
+            "thumbnail": "",
+        }
+
+    def _pipeline(self) -> pipeline_module.IngestionPipeline:
+        return pipeline_module.IngestionPipeline(
+            youtube_service=mock.Mock(),
+            embedding_service=mock.Mock(),
+            rate_limiter=pipeline_module._PlatformRateLimiter(
+                overrides={"yt": (1000, 60.0)}
+            ),
+        )
+
+    def test_fast_video_is_persisted_and_emitted_while_earlier_video_is_still_running(self) -> None:
+        pipeline = self._pipeline()
+        slow = self._video("slow-video")
+        fast = self._video("fast-video")
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+        slow_finished = threading.Event()
+        persist_states: list[tuple[str, bool]] = []
+        callback_states: list[tuple[str, bool]] = []
+
+        def clip_and_filter(video, *_args):
+            if video["id"] == "slow-video":
+                slow_started.set()
+                self.assertTrue(release_slow.wait(1.0))
+                slow_finished.set()
+            else:
+                self.assertTrue(slow_started.wait(1.0))
+            return video, [{"title": video["id"]}], {"transcript": {}}
+
+        def persist_engine_clip(**kwargs):
+            video_id = kwargs["v"]["id"]
+            persist_states.append((video_id, slow_finished.is_set()))
+            return video_id, mock.sentinel.metadata
+
+        def on_reel_created(reel: str) -> None:
+            callback_states.append((reel, slow_finished.is_set()))
+            if reel == "fast-video":
+                release_slow.set()
+
+        try:
+            with (
+                mock.patch.object(
+                    pipeline_module,
+                    "_discover",
+                    return_value={
+                        "corrected": TOPIC,
+                        "videos": [slow, fast],
+                        "credits_used": 0,
+                        "warning": None,
+                    },
+                ),
+                mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+                mock.patch.object(
+                    pipeline, "_persist_engine_clip", side_effect=persist_engine_clip
+                ),
+            ):
+                reels, _ = pipeline.ingest_topic(
+                    topic=TOPIC,
+                    material_id="material",
+                    concept_id="concept",
+                    max_videos=2,
+                    on_reel_created=on_reel_created,
+                )
+        finally:
+            release_slow.set()
+
+        self.assertIn(("fast-video", False), persist_states)
+        self.assertIn(("fast-video", False), callback_states)
+        self.assertEqual(reels, ["slow-video", "fast-video"])
+
+    def test_stalled_videos_share_one_fetch_timeout(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video("slow-a"), self._video("slow-b")]
+        finished = [threading.Event(), threading.Event()]
+        cancelled = [threading.Event(), threading.Event()]
+
+        def clip_and_filter(video, _topic, _language, should_cancel, _context):
+            index = 0 if video["id"] == "slow-a" else 1
+            emergency_deadline = time.monotonic() + 1.0
+            while not should_cancel() and time.monotonic() < emergency_deadline:
+                time.sleep(0.005)
+            if should_cancel():
+                cancelled[index].set()
+            finished[index].set()
+            return video, [], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(
+                pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.2
+            ),
+            mock.patch.object(
+                pipeline, "_clip_and_filter", side_effect=clip_and_filter
+            ),
+        ):
+            started = time.monotonic()
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(reels, [])
+        self.assertLess(elapsed, 0.32)
+        self.assertTrue(all(event.wait(0.1) for event in finished))
+        self.assertTrue(all(event.is_set() for event in cancelled))
+
+    def test_capped_result_keeps_discover_order_when_later_video_finishes_first(self) -> None:
+        pipeline = self._pipeline()
+        slow = self._video("slow-video")
+        fast = self._video("fast-video")
+        slow_started = threading.Event()
+        fast_finished = threading.Event()
+        seen: list[str] = []
+
+        def clip_and_filter(video, *_args):
+            if video["id"] == "slow-video":
+                slow_started.set()
+                self.assertTrue(fast_finished.wait(1.0))
+            else:
+                self.assertTrue(slow_started.wait(1.0))
+                fast_finished.set()
+            return video, [{"title": video["id"]}], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": [slow, fast],
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (kwargs["v"]["id"], mock.sentinel.metadata),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                max_reels=1,
+                on_reel_created=seen.append,
+            )
+
+        self.assertEqual(reels, ["slow-video"])
+        self.assertEqual(seen, ["slow-video"])
+
+    def test_provider_error_after_progress_keeps_completed_reel(self) -> None:
+        pipeline = self._pipeline()
+        success = self._video("success-video")
+        failure = self._video("failure-video")
+        success_emitted = threading.Event()
+        seen: list[str] = []
+
+        def clip_and_filter(video, *_args):
+            if video["id"] == "failure-video":
+                self.assertTrue(success_emitted.wait(1.0))
+                raise pipeline_module._ClipProviderError(
+                    "provider unavailable",
+                    provider="test",
+                    operation="clip",
+                )
+            return video, [{"title": video["id"]}], {"transcript": {}}
+
+        def on_reel_created(reel: str) -> None:
+            seen.append(reel)
+            success_emitted.set()
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": [success, failure],
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (kwargs["v"]["id"], mock.sentinel.metadata),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                on_reel_created=on_reel_created,
+            )
+
+        self.assertEqual(reels, ["success-video"])
+        self.assertEqual(seen, ["success-video"])
 
 
 if __name__ == "__main__":
