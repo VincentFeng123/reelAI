@@ -102,15 +102,31 @@ class LevelAutoAdjustTests(unittest.TestCase):
         self._feedback([("c1", True, False)] * 3)
         self.assertEqual(self._adj(), 0.0)
 
-    def test_uses_signed_ratio_across_two_concepts(self) -> None:
+    def test_uses_explicit_signed_weights_across_two_concepts(self) -> None:
         self._feedback(
             [("c1", True, False), ("c2", True, False), ("c1", False, True)]
         )
-        self.assertAlmostEqual(self._adj(), 0.20 / 3.0)
+        self.assertAlmostEqual(self._adj(), 0.02)
 
-    def test_uses_latest_twelve_responses(self) -> None:
-        self._feedback([("c1", False, True)] + [("c1" if i % 2 else "c2", True, False) for i in range(12)])
+    def test_uses_latest_twelve_signals(self) -> None:
+        latest = [
+            ("c1" if i % 2 else "c2", i < 6, i >= 6)
+            for i in range(12)
+        ]
+        self._feedback([("c1", True, False), *latest])
+        self.assertAlmostEqual(self._adj(), -0.12)
+
+    def test_clamps_global_drift_to_positive_point_two(self) -> None:
+        self._feedback(
+            [("c1" if i % 2 else "c2", True, False) for i in range(12)]
+        )
         self.assertAlmostEqual(self._adj(), 0.20)
+
+    def test_clamps_global_drift_to_negative_point_two(self) -> None:
+        self._feedback(
+            [("c1" if i % 2 else "c2", False, True) for i in range(12)]
+        )
+        self.assertAlmostEqual(self._adj(), -0.20)
 
     def test_persists_on_learner_progress_not_material(self) -> None:
         self._feedback([("c1", True, False), ("c2", True, False), ("c1", True, False)])
@@ -128,7 +144,7 @@ class LevelAutoAdjustTests(unittest.TestCase):
 
     def test_manual_level_change_resets_drift_but_retains_coverage(self) -> None:
         self._feedback([("c1", True, False), ("c2", True, False), ("c1", True, False)])
-        self.assertAlmostEqual(self._adj(), 0.20)
+        self.assertAlmostEqual(self._adj(), 0.12)
         with self.db.get_conn(transactional=True) as conn:
             progress = self.svc.set_learner_level(conn, "m1", self.LEARNER, "intermediate")
             self.assertEqual(progress["selected_level"], "intermediate")

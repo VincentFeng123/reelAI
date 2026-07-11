@@ -66,6 +66,8 @@ def test_search_one_sends_truthful_filters_and_caches(monkeypatch):
     )
     assert calls[0]["headers"]["x-api-key"] == "sd_test"
     assert calls[0]["params"]["features"] == ["creative-commons", "subtitles"]
+    assert calls[0]["params"]["type"] == "video"
+    assert calls[0]["params"]["sortBy"] == "relevance"
     assert calls[0]["params"]["duration"] == "medium"
     assert "lang" not in calls[0]["params"]
     assert [video["id"] for video in first["videos"]] == ["dQw4w9WgXcQ"]
@@ -86,6 +88,8 @@ def test_search_one_keeps_singleton_features_as_array_on_wire(monkeypatch):
     result = ss.search_one("Calculus", cache_store=MemoryProviderCache())
 
     assert calls[0]["features"] == ["subtitles", "subtitles"]
+    assert calls[0]["type"] == "video"
+    assert calls[0]["sortBy"] == "relevance"
     assert result["filters_applied"]["features"] == ["subtitles"]
 
 

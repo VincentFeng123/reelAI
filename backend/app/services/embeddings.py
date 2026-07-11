@@ -77,6 +77,14 @@ class EmbeddingService:
             self._semantic_model = model
             self.dim = _SEMANTIC_DIM
 
+    @property
+    def semantic_available(self) -> bool:
+        return self._semantic_model is not None
+
+    @property
+    def backend_name(self) -> str:
+        return _SEMANTIC_MODEL_ID if self.semantic_available else "hash-lexical-fallback"
+
     def embed_texts(self, conn, texts: Iterable[str]) -> np.ndarray:
         text_list = [t.strip() for t in texts]
         if not text_list:
@@ -153,25 +161,35 @@ class EmbeddingService:
             return np.empty((0, self.dim), dtype=np.float32)
         return self._embed_local(text_list)
 
+    def embed_semantic(self, texts: Iterable[str]) -> np.ndarray | None:
+        """Return normalized sentence-transformer vectors, never hash vectors."""
+        text_list = [str(text).strip() for text in texts]
+        if not text_list or self._semantic_model is None:
+            return None
+        try:
+            vectors = self._semantic_model.encode(  # type: ignore[attr-defined]
+                text_list,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            )
+        except Exception:
+            logger.exception("semantic embed raised; semantic proof unavailable")
+            return None
+        if not isinstance(vectors, np.ndarray) or vectors.ndim != 2 or vectors.shape[1] != self.dim:
+            logger.warning("semantic model returned unexpected shape %s", getattr(vectors, "shape", None))
+            return None
+        return vectors.astype(np.float32)
+
     def _embed_local(self, texts: list[str]) -> np.ndarray:
+        semantic_vectors = self.embed_semantic(texts)
+        if semantic_vectors is not None:
+            return semantic_vectors
         if self._semantic_model is not None:
-            try:
-                # encode() returns np.ndarray; normalize for cosine-sim usage
-                # downstream. batch_size and convert_to_numpy defaults are fine.
-                vecs = self._semantic_model.encode(  # type: ignore[attr-defined]
-                    texts,
-                    show_progress_bar=False,
-                    convert_to_numpy=True,
-                    normalize_embeddings=True,
-                )
-                if isinstance(vecs, np.ndarray) and vecs.ndim == 2 and vecs.shape[1] == self.dim:
-                    return vecs.astype(np.float32)
-                logger.warning(
-                    "semantic model returned unexpected shape %s; falling through to hash embed",
-                    getattr(vecs, "shape", None),
-                )
-            except Exception:
-                logger.exception("semantic embed raised; falling back to hash embed for this batch")
+            # A loaded semantic backend that fails at inference time must fail
+            # closed. Returning same-dimension hash vectors here would let
+            # callers mistake them for cosine-semantic evidence.
+            raise RuntimeError("Semantic embedding inference failed.")
         vectors = [self._hash_embed(t) for t in texts]
         return np.array(vectors, dtype=np.float32)
 

@@ -6,11 +6,10 @@ import asyncio
 import sqlite3
 import threading
 import time
-from unittest import mock
 
 import pytest
 
-import backend.app.services.llm_router as llm_router
+import backend.app.services.reels as reels_module
 import backend.app.services.topic_expansion as topic_expansion_module
 from backend.app.clip_engine.errors import CancellationError
 from backend.app.db import SCHEMA
@@ -94,7 +93,7 @@ def test_topic_expansion_cancels_active_http_and_skips_later_calls_and_cache(
     conn.close()
 
 
-def test_deep_expansion_cancels_active_llm_without_cache_or_merge(
+def test_deep_expansion_forwards_cancellation_to_shared_query_plan(
     monkeypatch,
 ) -> None:
     conn = _connection()
@@ -105,47 +104,17 @@ def test_deep_expansion_cancels_active_llm_without_cache_or_merge(
         "'topic', 'beginner', '2026-07-09T00:00:00+00:00')"
     )
     started = threading.Event()
-    provider_cancelled = threading.Event()
     cancel = threading.Event()
 
-    class BlockingClient:
-        def __init__(self, **_kwargs) -> None:
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args) -> None:
-            pass
-
-        async def post(self, _url, **_kwargs):
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                provider_cancelled.set()
-                raise
+    def blocking_plan(_conn, *, literal_query, should_cancel):
+        assert literal_query == "psychology"
+        started.set()
+        while not should_cancel():
+            time.sleep(0.005)
+        raise CancellationError("cancelled")
 
     service = ReelService(embedding_service=None, youtube_service=None)
-    service.llm_available = True
-    service.topic_expansion_service.expand_topic = mock.Mock(
-        return_value={
-            "canonical_topic": "Psychology",
-            "aliases": [],
-            "subtopics": ["cognitive psychology"],
-            "related_terms": [],
-        }
-    )
-    merge = mock.Mock(side_effect=AssertionError("must not merge after cancellation"))
-    monkeypatch.setattr(service, "_merge_topic_expansions", merge)
-    monkeypatch.setattr(llm_router.httpx, "AsyncClient", BlockingClient)
-    monkeypatch.setattr(
-        llm_router,
-        "_build_ollama_client",
-        lambda: {"base_url": "https://ollama.invalid", "model": "test"},
-    )
-    later_provider = mock.Mock(return_value=None)
-    monkeypatch.setattr(llm_router, "_build_gemini_module", later_provider)
+    monkeypatch.setattr(reels_module, "build_search_query_plan", blocking_plan)
 
     error = _run_until_cancelled(
         lambda: service._deep_topic_expansion(
@@ -160,10 +129,5 @@ def test_deep_expansion_cancels_active_llm_without_cache_or_merge(
     )
 
     assert isinstance(error, CancellationError)
-    assert provider_cancelled.wait(0.2)
-    later_provider.assert_not_called()
-    merge.assert_not_called()
-    assert conn.execute(
-        "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'topic_deep_expand:%'"
-    ).fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0] == 0
     conn.close()

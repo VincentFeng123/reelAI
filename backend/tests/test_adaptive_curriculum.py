@@ -156,7 +156,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         adjustments = self.svc._learner_adaptation_context(
             self.conn, self.MATERIAL, self.LEARNER
         )[1]
-        self.assertAlmostEqual(adjustments["c1"], 0.12)
+        self.assertAlmostEqual(adjustments["c1"], 0.04)
 
     def test_need_help_prefers_easier_same_concept_from_other_source(self) -> None:
         self._insert_reel("watched", "c1", "va", 1, 0.8)
@@ -176,7 +176,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
         adjustments = self.svc._learner_adaptation_context(
             self.conn, self.MATERIAL, self.LEARNER
         )[1]
-        self.assertAlmostEqual(adjustments["c1"], -0.15)
+        self.assertAlmostEqual(adjustments["c1"], -0.06)
 
     def test_need_help_falls_back_to_same_source(self) -> None:
         self._insert_reel("watched", "c1", "va", 1, 0.8)
@@ -234,7 +234,7 @@ class AdaptiveCurriculumTests(unittest.TestCase):
     def test_concept_adjustment_is_bounded_and_learners_are_isolated(self) -> None:
         other = "owner:learner-b"
         self.svc.learner_progress(self.conn, self.MATERIAL, other)
-        for index in range(3):
+        for index in range(7):
             reel_id = f"feedback-{index}"
             self._insert_reel(reel_id, "c1", "va", 10 + index * 25, 0.5)
             self.svc.record_feedback(
@@ -484,6 +484,20 @@ class AdaptiveCurriculumTests(unittest.TestCase):
             self.conn, self.MATERIAL, self.LEARNER
         )
         self.assertAlmostEqual(adjustment, 0.20)
+
+    def test_first_quiz_signal_updates_global_drift_without_manual_minimum(self) -> None:
+        self.conn.execute(
+            "UPDATE learner_material_progress SET difficulty_reset_at = '' "
+            "WHERE learner_id = ? AND material_id = ?",
+            (self.LEARNER, self.MATERIAL),
+        )
+        self._insert_assessment_outcome(
+            session_id="first-quiz", concept_id="c1", adjustment=-0.12
+        )
+        adjustment = self.svc.update_level_adjustment(
+            self.conn, self.MATERIAL, self.LEARNER
+        )
+        self.assertAlmostEqual(adjustment, -0.12)
 
 
 if __name__ == "__main__":

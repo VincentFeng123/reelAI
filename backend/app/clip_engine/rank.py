@@ -1,5 +1,5 @@
 """Merge results across expanded queries, dedupe by video id, rank.
-Strongest signal = match_count (how many queries surfaced the video).
+Strongest signal = trusted semantic query-family evidence, with literal first.
 Port of practice/lib/rank.js.
 """
 from __future__ import annotations
@@ -131,6 +131,12 @@ def _first_nonblank(*values: object) -> str:
 def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict]:
     by_id: dict[str, dict] = {}
     for res in per_query or []:
+        query_family = str(res.get("query_family") or "").strip()
+        if not query_family:
+            from ..services.search_query_plan import semantic_query_family
+
+            query_family = semantic_query_family(res.get("query") or "")
+        query_trust = str(res.get("query_trust") or "trusted").strip().casefold()
         seen_in_query: set[str] = set()
         for rank, v in enumerate(res.get("videos") or []):
             vid = _video_id(v.get("id") or v.get("videoId") or v.get("url"))
@@ -175,6 +181,13 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
                     "match_count": 0,
                     "best_rank": rank,
                     "matched_queries": [],
+                    "matched_query_provenance": {},
+                    "matched_families": [],
+                    "_family_trust": {},
+                    "literal_match": False,
+                    "canonical_match": False,
+                    "trusted_match_count": 0,
+                    "ai_match_count": 0,
                 }
                 by_id[vid] = entry
             else:
@@ -194,11 +207,31 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
                 if entry.get("duration") is None and duration is not None:
                     entry["duration"] = duration
                 entry["view_count"] = max(int(entry.get("view_count") or 0), view_count)
-            entry["match_count"] += 1
+            previous_trust = str(entry["_family_trust"].get(query_family) or "")
+            if not previous_trust:
+                entry["matched_families"].append(query_family)
+                entry["_family_trust"][query_family] = query_trust
+                entry["match_count"] += 1
+                if query_trust == "ai":
+                    entry["ai_match_count"] += 1
+                else:
+                    entry["trusted_match_count"] += 1
+            elif previous_trust == "ai" and query_trust != "ai":
+                entry["_family_trust"][query_family] = query_trust
+                entry["ai_match_count"] = max(0, int(entry["ai_match_count"]) - 1)
+                entry["trusted_match_count"] += 1
+            if query_trust == "literal":
+                entry["literal_match"] = True
+            elif query_trust == "canonical":
+                entry["canonical_match"] = True
             entry["best_rank"] = min(entry["best_rank"], rank)
             q = res.get("query")
             if q and q not in entry["matched_queries"]:
                 entry["matched_queries"].append(q)
+            if q:
+                entry["matched_query_provenance"][str(q)] = str(
+                    res.get("query_provenance") or query_trust
+                )
 
     items = list(by_id.values())
     for v in items:
@@ -206,8 +239,30 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
         rank_score = 1 / (1 + v["best_rank"])
         edu = _edu_score(v)
         v["edu_score"] = edu
-        v["score"] = v["match_count"] * 10 + view_score + rank_score * 2 + edu + _level_score(v, level)
-    items.sort(key=lambda v: (v["match_count"], v["score"], v["view_count"]), reverse=True)
+        anchor_bonus = 8.0 if v["literal_match"] else (5.0 if v["canonical_match"] else 0.0)
+        # AI-only query families help discovery but cannot overwhelm literal,
+        # canonical, or independently trusted evidence.
+        ai_boost = min(0.75, 0.25 * int(v["ai_match_count"]))
+        v["score"] = (
+            int(v["trusted_match_count"]) * 10
+            + anchor_bonus
+            + ai_boost
+            + view_score
+            + rank_score * 2
+            + edu
+            + _level_score(v, level)
+        )
+    items.sort(
+        key=lambda v: (
+            bool(v["literal_match"]),
+            bool(v["canonical_match"]),
+            int(v["trusted_match_count"]),
+            v["score"],
+            v["view_count"],
+        ),
+        reverse=True,
+    )
     for v in items:
         v.pop("best_rank", None)
+        v.pop("_family_trust", None)
     return items

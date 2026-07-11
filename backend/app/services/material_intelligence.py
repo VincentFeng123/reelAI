@@ -10,121 +10,17 @@ from ..config import get_settings
 from ..db import dumps_json, fetch_one, now_iso, upsert
 from . import llm_router
 from .concepts import extract_concepts, extract_learning_objectives
+from .search_query_plan import build_search_query_plan
 from .text_utils import normalize_whitespace
-from .topic_expansion import TopicExpansionService
 
 logger = logging.getLogger(__name__)
 
 
 class MaterialIntelligenceService:
-    TOPIC_SUBTOPICS: dict[str, tuple[str, ...]] = {
-        "calculus": (
-            "limits",
-            "continuity",
-            "derivatives",
-            "chain rule",
-            "product rule",
-            "implicit differentiation",
-            "integrals",
-            "u substitution",
-            "optimization",
-            "fundamental theorem of calculus",
-        ),
-        "algebra": (
-            "linear equations",
-            "quadratic equations",
-            "factoring",
-            "systems of equations",
-            "polynomials",
-        ),
-        "biology": (
-            "cell signaling",
-            "photosynthesis",
-            "cell cycle",
-            "genetics",
-            "evolution",
-        ),
-        "chemistry": (
-            "stoichiometry",
-            "chemical bonding",
-            "equilibrium",
-            "acids and bases",
-            "thermodynamics",
-        ),
-        "physics": (
-            "kinematics",
-            "forces",
-            "energy",
-            "momentum",
-            "electricity",
-        ),
-        "computer science": (
-            "data structures",
-            "algorithms",
-            "recursion",
-            "time complexity",
-            "dynamic programming",
-        ),
-        "machine learning": (
-            "supervised learning",
-            "unsupervised learning",
-            "regression",
-            "classification",
-            "neural networks",
-            "model evaluation",
-        ),
-        "linear algebra": (
-            "vectors",
-            "matrices",
-            "linear transformations",
-            "eigenvalues",
-            "eigenvectors",
-        ),
-        "photosynthesis": (
-            "light dependent reactions",
-            "calvin cycle",
-            "chloroplast",
-            "carbon fixation",
-            "atp and nadph",
-            "stomata",
-        ),
-        "probability": (
-            "conditional probability",
-            "random variables",
-            "expected value",
-            "distributions",
-            "bayes theorem",
-        ),
-        "python programming": (
-            "variables",
-            "loops",
-            "functions",
-            "lists and dictionaries",
-            "classes and objects",
-            "file handling",
-        ),
-        "statistics": (
-            "descriptive statistics",
-            "probability distributions",
-            "hypothesis testing",
-            "confidence intervals",
-            "regression",
-        ),
-        "world war ii": (
-            "causes of world war ii",
-            "european theater",
-            "pacific theater",
-            "d day",
-            "axis and allies",
-            "holocaust",
-        ),
-    }
-
     def __init__(self) -> None:
         settings = get_settings()
         self.model = settings.gemini_model
         self.llm_available = llm_router.gemini_or_groq_available()
-        self.topic_expansion_service = TopicExpansionService()
 
     def extract_concepts_and_objectives(
         self,
@@ -134,41 +30,18 @@ class MaterialIntelligenceService:
         max_concepts: int = 12,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         prefer_topic_seed = self._is_topic_only_material(text=text, subject_tag=subject_tag)
-        opaque_topic_seed = False
-        clean_subject = normalize_whitespace(subject_tag or "").strip()
-        if prefer_topic_seed and clean_subject:
-            expansion = self.topic_expansion_service.expand_topic(
-                conn,
-                topic=clean_subject,
-                max_subtopics=max(8, max_concepts + 2),
-                max_aliases=6,
-                max_related_terms=6,
-            )
-            opaque_topic_seed = self.topic_expansion_service._is_opaque_single_token_topic(
-                clean_subject,
-                canonical_topic=str(expansion.get("canonical_topic") or clean_subject),
-                likely_language=self.topic_expansion_service._looks_like_language_topic(
-                    str(expansion.get("canonical_topic") or clean_subject)
-                ),
-            )
-        topic_seed_concepts, topic_seed_objectives = self._topic_seed_material(
-            conn=conn,
-            text=text,
-            subject_tag=subject_tag,
-            max_concepts=max_concepts,
-        )
-        heuristic_concepts = extract_concepts(text, max_concepts=max_concepts)
-        if prefer_topic_seed and topic_seed_concepts:
-            heuristic_concepts = self._filter_topic_only_heuristic_concepts(
-                heuristic_concepts,
+        if prefer_topic_seed:
+            return self._topic_seed_material(
+                conn=conn,
+                text=text,
                 subject_tag=subject_tag,
+                max_concepts=max_concepts,
             )
-        heuristic_objectives = extract_learning_objectives(text, limit=6)
-        base_concepts = self._merge_concepts(topic_seed_concepts, heuristic_concepts, max_concepts=max_concepts)
-        base_objectives = self._merge_objectives(topic_seed_objectives, heuristic_objectives, limit=6)
 
-        if prefer_topic_seed and opaque_topic_seed:
-            return base_concepts, base_objectives
+        heuristic_concepts = extract_concepts(text, max_concepts=max_concepts)
+        heuristic_objectives = extract_learning_objectives(text, limit=6)
+        base_concepts = heuristic_concepts
+        base_objectives = heuristic_objectives
 
         if not self.llm_available:
             return base_concepts, base_objectives
@@ -181,12 +54,8 @@ class MaterialIntelligenceService:
         if priority_focus and not prefer_topic_seed:
             llm_concepts = [priority_focus, *llm_concepts]
 
-        if prefer_topic_seed:
-            merged_concepts = self._merge_concepts(base_concepts, llm_concepts, max_concepts=max_concepts)
-            merged_objectives = self._merge_objectives(base_objectives, llm_objectives, limit=6)
-        else:
-            merged_concepts = self._merge_concepts(llm_concepts, base_concepts, max_concepts=max_concepts)
-            merged_objectives = self._merge_objectives(llm_objectives, base_objectives, limit=6)
+        merged_concepts = self._merge_concepts(llm_concepts, base_concepts, max_concepts=max_concepts)
+        merged_objectives = self._merge_objectives(llm_objectives, base_objectives, limit=6)
         return merged_concepts, merged_objectives
 
     def _topic_seed_material(
@@ -205,56 +74,24 @@ class MaterialIntelligenceService:
         if not self._is_topic_only_material(text=text, subject_tag=subject_tag):
             return [], []
 
-        expansion = self.topic_expansion_service.expand_topic(
-            conn,
-            topic=clean_subject,
-            max_subtopics=max(8, max_concepts + 2),
-            max_aliases=6,
-            max_related_terms=6,
-        )
-        search_terms = self.topic_expansion_service.build_topic_search_terms(
-            topic=clean_subject,
-            expansion=expansion,
-            limit=8,
-        )
-        canonical_topic = str(expansion.get("canonical_topic") or "").strip().lower()
-        opaque_topic = self.topic_expansion_service._is_opaque_single_token_topic(
-            clean_subject,
-            canonical_topic=str(expansion.get("canonical_topic") or clean_subject),
-            likely_language=self.topic_expansion_service._looks_like_language_topic(
-                str(expansion.get("canonical_topic") or clean_subject)
-            ),
-        )
-        search_subtopics = [
-            term
-            for term in search_terms
-            if term.strip().lower() not in {normalized_subject, canonical_topic}
-            and len(normalize_whitespace(term).split()) <= 2
-            and (
-                not opaque_topic
-                or self.topic_expansion_service._is_topic_anchor_candidate(
-                    topic=clean_subject,
-                    canonical_topic=str(expansion.get("canonical_topic") or clean_subject),
-                    candidate=term,
-                )
-            )
-        ]
-        expansion_subtopics = [str(item).strip() for item in (expansion.get("subtopics") or []) if str(item).strip()]
-        prefer_search_subtopics = bool(search_subtopics) and (
-            not expansion_subtopics
-            or not any(len(normalize_whitespace(term).split()) <= 2 for term in expansion_subtopics[:4])
-        )
+        expansion = self._ai_topic_expansion(conn, clean_subject)
+        canonical_topic = str(expansion.get("canonical_topic") or clean_subject).strip()
+        aliases = [str(item).strip() for item in (expansion.get("aliases") or []) if str(item).strip()]
         subtopics = self._dedupe_topic_terms(
-            [
-                *self._topic_subtopics(clean_subject),
-                *(search_subtopics if prefer_search_subtopics else expansion_subtopics),
-            ]
+            [str(item).strip() for item in (expansion.get("subtopics") or []) if str(item).strip()]
         )
+        related_terms = [
+            str(item).strip()
+            for item in (expansion.get("related_terms") or [])
+            if str(item).strip()
+        ]
         root_keywords = self._dedupe_topic_terms(
             [
                 normalized_subject,
-                *[term.lower() for term in search_terms],
-                *[str(item).strip().lower() for item in subtopics],
+                canonical_topic.lower(),
+                *[term.lower() for term in aliases],
+                *[term.lower() for term in subtopics],
+                *[term.lower() for term in related_terms],
             ]
         )
         title_subject = self._title_case_topic(clean_subject)
@@ -265,7 +102,7 @@ class MaterialIntelligenceService:
                 "keywords": root_keywords[:8] or [normalized_subject],
                 "summary": self._topic_root_summary(
                     subject=title_subject,
-                    canonical_topic=str(expansion.get("canonical_topic") or "").strip(),
+                    canonical_topic=canonical_topic,
                 ),
             }
         ]
@@ -277,7 +114,6 @@ class MaterialIntelligenceService:
                         term.lower(),
                         normalized_subject,
                         *root_keywords[:4],
-                        f"{term.lower()} explained",
                     ]
                 )
                 concepts.append(
@@ -288,22 +124,6 @@ class MaterialIntelligenceService:
                         "summary": f"Key subtopic within {title_subject}: {term}.",
                     }
                 )
-        else:
-            generic_titles = (
-                f"{title_subject} Foundations",
-                f"{title_subject} Worked Examples",
-                f"{title_subject} Problem Solving",
-            )
-            for term in generic_titles[: max(0, max_concepts - 1)]:
-                concepts.append(
-                    {
-                        "id": str(uuid.uuid4()),
-                        "title": term,
-                        "keywords": [normalized_subject, term.lower(), f"{normalized_subject} tutorial"][:8],
-                        "summary": f"Foundational study path for {title_subject}.",
-                    }
-                )
-
         objectives = [
             f"Understand the core definitions and intuition behind {title_subject}.",
             f"Solve representative problems in {title_subject}.",
@@ -314,15 +134,27 @@ class MaterialIntelligenceService:
         )
         return concepts[:max_concepts], objectives[:6]
 
-    def _topic_subtopics(self, subject_tag: str) -> list[str]:
-        normalized_subject = normalize_whitespace(subject_tag).strip().lower()
-        if not normalized_subject:
-            return []
-        for topic, subtopics in self.TOPIC_SUBTOPICS.items():
-            normalized_topic = topic.lower()
-            if normalized_subject == normalized_topic or normalized_topic in normalized_subject or normalized_subject in normalized_topic:
-                return [str(item).strip() for item in subtopics if str(item).strip()]
-        return []
+    def _ai_topic_expansion(self, conn, literal_topic: str) -> dict[str, Any]:
+        literal = normalize_whitespace(literal_topic or "").strip()
+        fallback = {
+            "canonical_topic": literal,
+            "aliases": [],
+            "subtopics": [],
+            "related_terms": [],
+        }
+        if not literal:
+            return fallback
+        try:
+            plan = build_search_query_plan(conn, literal_query=literal)
+        except Exception as exc:
+            logger.warning(
+                "topic query plan unavailable during material creation error_type=%s",
+                type(exc).__name__,
+            )
+            return fallback
+        if plan.ai_status != "validated":
+            return fallback
+        return plan.as_topic_expansion()
 
     def _title_case_topic(self, value: str) -> str:
         parts = [segment for segment in normalize_whitespace(value).split(" ") if segment]
@@ -357,39 +189,6 @@ class MaterialIntelligenceService:
             f"topic {clean_subject}",
         }
 
-    def _filter_topic_only_heuristic_concepts(
-        self,
-        concepts: list[dict[str, Any]],
-        *,
-        subject_tag: str | None,
-    ) -> list[dict[str, Any]]:
-        clean_subject = normalize_whitespace(subject_tag or "").strip().lower()
-        if not clean_subject:
-            return concepts
-
-        filtered: list[dict[str, Any]] = []
-        blocked_titles = {
-            "topic",
-            clean_subject,
-            f"topic {clean_subject}",
-            f"topic: {clean_subject}",
-        }
-        blocked_prefixes = (
-            "topic ",
-            "topic:",
-        )
-        for concept in concepts:
-            title = normalize_whitespace(str(concept.get("title") or "")).strip()
-            title_key = title.lower()
-            if not title:
-                continue
-            if title_key in blocked_titles:
-                continue
-            if any(title_key.startswith(prefix) for prefix in blocked_prefixes):
-                continue
-            filtered.append(concept)
-        return filtered
-
     def chat_assistant(
         self,
         message: str,
@@ -415,13 +214,11 @@ class MaterialIntelligenceService:
         transcript_clean = normalize_whitespace(transcript_snippet or "").strip()
         context_excerpt = self._build_excerpt(text_clean, max_chars=7000) if text_clean else ""
 
-        if not self.llm_available:
-            if topic_clean:
-                return (
-                    f"Based on '{topic_clean}', focus on core definitions first, then one worked example. "
-                    "Send your question again after adding more source text for a better answer."
-                )
-            return "Add a topic or source text, then ask a specific question for better guidance."
+        llm_available = llm_router.gemini_or_groq_available(
+            gemini_api_key_override=gemini_api_key_override,
+        )
+        if not llm_available:
+            raise llm_router.TextLLMUnavailableError()
 
         system_prompt = (
             "You are a concise study coach. Answer directly, use plain language, and stay grounded in the provided context. "
@@ -461,6 +258,7 @@ class MaterialIntelligenceService:
                 system=system_prompt,
                 user=user_prompt,
                 temperature=0.25,
+                gemini_model=self.model,
                 gemini_api_key_override=gemini_api_key_override,
                 should_cancel=should_cancel,
             )
@@ -468,12 +266,15 @@ class MaterialIntelligenceService:
                 return answer.strip()[:1200]
             logger.warning(
                 "chat_assistant: primary chat_completion returned no answer (override=%s, llm_available=%s)",
-                bool(gemini_api_key_override), self.llm_available,
+                bool(gemini_api_key_override), llm_available,
             )
         except CancellationError:
             raise
-        except Exception:
-            logger.exception("chat_assistant: primary chat_completion raised")
+        except Exception as exc:
+            logger.warning(
+                "chat_assistant: primary text provider failed error_type=%s",
+                type(exc).__name__,
+            )
 
         if gemini_api_key_override:
             try:
@@ -481,6 +282,7 @@ class MaterialIntelligenceService:
                     system=system_prompt,
                     user=user_prompt,
                     temperature=0.25,
+                    gemini_model=self.model,
                     should_cancel=should_cancel,
                 )
                 if answer:
@@ -488,12 +290,13 @@ class MaterialIntelligenceService:
                 logger.warning("chat_assistant: fallback chat_completion returned no answer")
             except CancellationError:
                 raise
-            except Exception:
-                logger.exception("chat_assistant: fallback chat_completion raised")
+            except Exception as exc:
+                logger.warning(
+                    "chat_assistant: fallback text provider failed error_type=%s",
+                    type(exc).__name__,
+                )
 
-        if topic_clean:
-            return f"I could not reach the model right now. For '{topic_clean}', start with one key definition and one example."
-        return "I could not reach the model right now. Try again in a moment."
+        raise llm_router.TextLLMUnavailableError()
 
     def _cached_or_generate(
         self,

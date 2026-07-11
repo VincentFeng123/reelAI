@@ -71,7 +71,7 @@ async def _search_one_async(
     cache_store: ProviderCacheStore | None = None,
 ) -> dict[str, Any]:
     store = cache_store or (context.cache_store if context is not None else None) or DEFAULT_PROVIDER_CACHE
-    normalized_filters = normalize_filters(filters)
+    normalized_filters = {**normalize_filters(filters), "sort_by": "relevance"}
     normalized_language = normalize_language(language) or "en"
     cache_key = search_cache_key(
         query=query,
@@ -105,9 +105,8 @@ async def _search_one_async(
             "query": " ".join(str(query or "").split()),
             "type": "video",
             "features": wire_features,
+            "sortBy": "relevance",
         }
-        if normalized_filters["sort_by"] != "relevance":
-            params["sortBy"] = normalized_filters["sort_by"]
         if normalized_filters["upload_date"] != "all":
             params["uploadDate"] = normalized_filters["upload_date"]
         if normalized_filters["duration"] != "all":

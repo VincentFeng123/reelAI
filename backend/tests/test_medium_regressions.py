@@ -22,6 +22,13 @@ from backend.app.clip_engine.provider_cache import transcript_artifact_key
 from fastapi.testclient import TestClient
 
 
+def _validated_query_plan(expansion: dict[str, object]) -> mock.Mock:
+    plan = mock.Mock()
+    plan.ai_status = "validated"
+    plan.as_topic_expansion.return_value = expansion
+    return plan
+
+
 class MediumRegressionTests(unittest.TestCase):
     def _build_generation_test_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(":memory:", check_same_thread=False)
@@ -370,29 +377,44 @@ class MediumRegressionTests(unittest.TestCase):
     def test_material_intelligence_seeds_topic_only_material_with_subtopics(self) -> None:
         service = MaterialIntelligenceService()
         service.client = None
-        concepts, objectives = service.extract_concepts_and_objectives(
-            None,
-            "Topic: calculus",
-            subject_tag="calculus",
-            max_concepts=6,
+        plan = _validated_query_plan(
+            {
+                "canonical_topic": "Calculus",
+                "aliases": [],
+                "subtopics": ["limits", "derivatives", "chain rule"],
+                "related_terms": [],
+            }
         )
+        with mock.patch(
+            "backend.app.services.material_intelligence.build_search_query_plan",
+            return_value=plan,
+        ) as planner:
+            concepts, objectives = service.extract_concepts_and_objectives(
+                None,
+                "Topic: calculus",
+                subject_tag="calculus",
+                max_concepts=6,
+            )
+        planner.assert_called_once_with(None, literal_query="calculus")
         titles = {str(concept.get("title") or "").strip().lower() for concept in concepts}
         self.assertIn("calculus", titles)
         self.assertTrue({"limits", "derivatives", "chain rule"}.intersection(titles))
         self.assertTrue(any("calculus" in objective.lower() for objective in objectives))
 
-    def test_material_intelligence_uses_topic_expansion_for_unmapped_topic(self) -> None:
+    def test_material_intelligence_uses_ai_query_plan_for_unmapped_topic(self) -> None:
         service = MaterialIntelligenceService()
         service.client = None
-        with mock.patch.object(
-            service.topic_expansion_service,
-            "expand_topic",
-            return_value={
+        plan = _validated_query_plan(
+            {
                 "canonical_topic": "Spanish language",
                 "aliases": ["Spanish language"],
                 "subtopics": ["grammar", "verb conjugation", "pronunciation", "common phrases"],
                 "related_terms": ["conversation practice", "listening comprehension"],
-            },
+            }
+        )
+        with mock.patch(
+            "backend.app.services.material_intelligence.build_search_query_plan",
+            return_value=plan,
         ):
             concepts, objectives = service.extract_concepts_and_objectives(
                 None,
@@ -411,59 +433,73 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertIn("grammar", root_keywords)
         self.assertTrue(any("spanish" in objective.lower() for objective in objectives))
 
-    def test_material_intelligence_psychology_topic_has_real_fallback_subtopics(self) -> None:
+    def test_material_intelligence_ai_failure_keeps_literal_topic_only(self) -> None:
         service = MaterialIntelligenceService()
         service.client = None
-        with mock.patch.object(service.topic_expansion_service, "_request_json", return_value={}):
+        plan = mock.Mock()
+        plan.ai_status = "unavailable"
+        with (
+            mock.patch(
+                "backend.app.services.material_intelligence.build_search_query_plan",
+                return_value=plan,
+            ),
+            mock.patch.object(service, "_cached_or_generate") as material_llm,
+        ):
             concepts, objectives = service.extract_concepts_and_objectives(
                 None,
                 "Topic: psychology",
                 subject_tag="psychology",
                 max_concepts=6,
             )
+        material_llm.assert_not_called()
+        plan.as_topic_expansion.assert_not_called()
         titles = {str(concept.get("title") or "").strip().lower() for concept in concepts}
-        self.assertIn("psychology", titles)
-        self.assertTrue(
-            {
-                "cognitive psychology",
-                "behavioral psychology",
-                "developmental psychology",
-                "social psychology",
-            }.intersection(titles)
-        )
-        self.assertNotIn("topic", titles)
-        self.assertNotIn("topic psychology", titles)
+        self.assertEqual(titles, {"psychology"})
         self.assertTrue(any("psychology" in objective.lower() for objective in objectives))
 
-    def test_material_intelligence_machine_learning_topic_prefers_curated_core_subtopics(self) -> None:
+    def test_material_intelligence_topic_uses_ai_terms_without_curated_injection(self) -> None:
         service = MaterialIntelligenceService()
         service.client = None
-        concepts, _objectives = service.extract_concepts_and_objectives(
-            None,
-            "Topic: machine learning",
-            subject_tag="machine learning",
-            max_concepts=6,
+        plan = _validated_query_plan(
+            {
+                "canonical_topic": "Machine learning",
+                "aliases": [],
+                "subtopics": ["reinforcement learning", "feature engineering"],
+                "related_terms": [],
+            }
         )
+        with mock.patch(
+            "backend.app.services.material_intelligence.build_search_query_plan",
+            return_value=plan,
+        ):
+            concepts, _objectives = service.extract_concepts_and_objectives(
+                None,
+                "Topic: machine learning",
+                subject_tag="machine learning",
+                max_concepts=6,
+            )
         titles = [str(concept.get("title") or "").strip().lower() for concept in concepts]
         self.assertEqual(titles[0], "machine learning")
-        self.assertIn("supervised learning", titles)
-        self.assertIn("unsupervised learning", titles)
-        self.assertNotIn("quantum machine learning", titles)
-        self.assertNotIn("adversarial machine learning", titles)
+        self.assertIn("reinforcement learning", titles)
+        self.assertIn("feature engineering", titles)
+        self.assertNotIn("supervised learning", titles)
+        self.assertNotIn("unsupervised learning", titles)
 
     def test_material_intelligence_topic_seed_precedes_llm_for_topic_only_material(self) -> None:
         service = MaterialIntelligenceService()
         service.client = object()
+        plan = _validated_query_plan(
+            {
+                "canonical_topic": "Spanish language",
+                "aliases": ["Spanish language"],
+                "subtopics": ["grammar", "verb conjugation", "pronunciation"],
+                "related_terms": ["conversation practice"],
+            }
+        )
         with (
-            mock.patch.object(
-                service.topic_expansion_service,
-                "expand_topic",
-                return_value={
-                    "canonical_topic": "Spanish language",
-                    "aliases": ["Spanish language"],
-                    "subtopics": ["grammar", "verb conjugation", "pronunciation"],
-                    "related_terms": ["conversation practice"],
-                },
+            mock.patch(
+                "backend.app.services.material_intelligence.build_search_query_plan",
+                return_value=plan,
             ),
             mock.patch.object(
                 service,
@@ -475,7 +511,7 @@ class MediumRegressionTests(unittest.TestCase):
                     ],
                     "objectives": ["generic objective"],
                 },
-            ),
+            ) as material_llm,
         ):
             concepts, objectives = service.extract_concepts_and_objectives(
                 None,
@@ -487,19 +523,22 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual(titles[0], "spanish")
         self.assertIn("grammar", titles)
         self.assertNotEqual(objectives[0].lower(), "generic objective")
+        material_llm.assert_not_called()
 
     def test_material_intelligence_opaque_topic_seed_does_not_promote_companion_terms_to_concepts(self) -> None:
         service = MaterialIntelligenceService()
         service.client = None
-        with mock.patch.object(
-            service.topic_expansion_service,
-            "expand_topic",
-            return_value={
+        plan = _validated_query_plan(
+            {
                 "canonical_topic": "Melittology",
                 "aliases": [],
                 "subtopics": ["Melittology field methods"],
                 "related_terms": ["bees"],
-            },
+            }
+        )
+        with mock.patch(
+            "backend.app.services.material_intelligence.build_search_query_plan",
+            return_value=plan,
         ):
             concepts, _objectives = service.extract_concepts_and_objectives(
                 None,
@@ -515,16 +554,18 @@ class MediumRegressionTests(unittest.TestCase):
     def test_material_intelligence_opaque_topic_only_material_skips_llm_garbage(self) -> None:
         service = MaterialIntelligenceService()
         service.client = object()
+        plan = _validated_query_plan(
+            {
+                "canonical_topic": "Apiology",
+                "aliases": [],
+                "subtopics": ["Apiology field methods"],
+                "related_terms": ["bees"],
+            }
+        )
         with (
-            mock.patch.object(
-                service.topic_expansion_service,
-                "expand_topic",
-                return_value={
-                    "canonical_topic": "Melittology",
-                    "aliases": [],
-                    "subtopics": ["Melittology field methods"],
-                    "related_terms": ["bees"],
-                },
+            mock.patch(
+                "backend.app.services.material_intelligence.build_search_query_plan",
+                return_value=plan,
             ),
             mock.patch.object(
                 service,
@@ -837,21 +878,28 @@ class MediumRegressionTests(unittest.TestCase):
         )
         service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
         try:
-            with mock.patch.object(
-                service.topic_expansion_service,
-                "expand_topic",
-                return_value={
+            plan = _validated_query_plan(
+                {
                     "canonical_topic": "Psychology",
                     "aliases": ["Psychology"],
                     "subtopics": ["cognitive psychology", "behavioral psychology", "social psychology"],
                     "related_terms": ["classic studies in psychology"],
-                },
-            ):
+                }
+            )
+            with mock.patch(
+                "backend.app.services.reels.build_search_query_plan",
+                return_value=plan,
+            ) as planner:
                 concepts = service._build_topic_only_concepts_from_expansion(
                     conn,
                     material_id="material-topic-only",
                     subject_tag="psychology",
                 )
+            planner.assert_called_once_with(
+                conn,
+                literal_query="psychology",
+                should_cancel=None,
+            )
             titles = {str(concept.get("title") or "").strip().lower() for concept in concepts}
             self.assertIn("psychology", titles)
             self.assertIn("cognitive psychology", titles)
@@ -863,7 +911,7 @@ class MediumRegressionTests(unittest.TestCase):
 
 
 
-    def test_topic_expansion_preserves_concepts_and_persists_search_terms(self) -> None:
+    def test_topic_expansion_preserves_rows_but_filters_stale_generation_concepts(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA)
@@ -906,7 +954,7 @@ class MediumRegressionTests(unittest.TestCase):
                 ).fetchall()
             ]
             self.assertEqual(after, before)
-            self.assertEqual({row["id"] for row in working}, {"concept-root", "concept-taxonomy"})
+            self.assertEqual({row["id"] for row in working}, {"concept-root"})
             terms = {
                 (row["concept_id"], row["term"], row["term_kind"])
                 for row in conn.execute(
@@ -916,6 +964,7 @@ class MediumRegressionTests(unittest.TestCase):
             self.assertIn(("concept-root", "Apiology", "alias"), terms)
             self.assertIn(("concept-root", "Bee field methods", "expansion"), terms)
             self.assertTrue(any(kind == "material_context" for _, _, kind in terms))
+            self.assertFalse(any(concept_id == "concept-taxonomy" for concept_id, _, _ in terms))
         finally:
             conn.close()
 
@@ -1270,7 +1319,7 @@ class MediumRegressionTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_ranked_request_reels_accepts_alias_anchor_on_page_one_for_odonatology(self) -> None:
+    def test_ranked_request_reels_rejects_unplanned_alias_without_transcript_evidence(self) -> None:
         conn = self._build_generation_test_conn()
         conn.execute(
             "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
@@ -1308,7 +1357,7 @@ class MediumRegressionTests(unittest.TestCase):
                     limit=5,
                 )
 
-            self.assertEqual([row["reel_id"] for row in page_one], ["good-alias"])
+            self.assertEqual(page_one, [])
         finally:
             conn.close()
 
@@ -2081,7 +2130,7 @@ class MediumRegressionTests(unittest.TestCase):
                 )
             )
 
-    def test_reel_service_topic_expansion_terms_prioritize_curated_broad_subtopics(self) -> None:
+    def test_reel_service_topic_expansion_terms_use_only_plan_values(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
 
         terms = service._topic_expansion_terms(
@@ -2106,16 +2155,13 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual(
             terms[:6],
             [
-                "supervised learning",
-                "unsupervised learning",
-                "regression",
-                "classification",
-                "neural networks",
-                "model evaluation",
+                "quantum machine learning",
+                "adversarial machine learning",
+                "attention",
             ],
         )
 
-    def test_reel_service_deep_topic_expansion_merges_ai_terms_when_available(self) -> None:
+    def test_reel_service_deep_topic_expansion_reuses_ai_query_plan(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.executescript(SCHEMA)
@@ -2128,152 +2174,59 @@ class MediumRegressionTests(unittest.TestCase):
             ("material-ai-expand", "psychology", "Topic: psychology", "topic", None, "2026-03-14T00:00:00+00:00"),
         )
         service = ReelService(embedding_service=None, youtube_service=None)
-        service.openai_client = mock.Mock()
-        service.openai_client.chat.completions.create.return_value = mock.Mock(
-            choices=[
-                mock.Mock(
-                    message=mock.Mock(
-                        content=json.dumps(
-                            {
-                                "aliases": ["behavior science"],
-                                "subtopics": ["attachment theory", "memory"],
-                                "related_terms": ["cognitive bias"],
-                            }
-                        )
-                    )
-                )
-            ]
-        )
-        with mock.patch.object(
-            service.topic_expansion_service,
-            "expand_topic",
-            return_value={
-                "canonical_topic": "Psychology",
-                "aliases": ["Psychology"],
-                "subtopics": ["cognitive psychology", "behavioral psychology"],
-                "related_terms": ["classic studies in psychology"],
-            },
-        ):
+        expected = {
+            "canonical_topic": "Psychology",
+            "aliases": ["behavior science"],
+            "subtopics": ["attachment theory", "memory"],
+            "related_terms": ["cognitive bias"],
+        }
+        plan = _validated_query_plan(expected)
+        with mock.patch(
+            "backend.app.services.reels.build_search_query_plan",
+            return_value=plan,
+        ) as planner:
             expansion = service._deep_topic_expansion(
                 conn,
                 material_id="material-ai-expand",
                 subject_tag="psychology",
                 generation_id=None,
             )
+        planner.assert_called_once_with(
+            conn,
+            literal_query="psychology",
+            should_cancel=None,
+        )
+        self.assertEqual(expansion, expected)
         self.assertIn("attachment theory", expansion["subtopics"])
         self.assertIn("memory", expansion["subtopics"])
         self.assertIn("behavior science", expansion["aliases"])
         self.assertIn("cognitive bias", expansion["related_terms"])
         conn.close()
 
-    def test_reel_service_topic_expansion_observed_examples_use_first_seen_order(self) -> None:
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        conn.executescript(SCHEMA)
-        conn.execute(
-            """
-            INSERT INTO materials (
-                id, subject_tag, raw_text, source_type, source_path, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            ("material-observed", "calculus", "Topic: calculus", "topic", None, "2026-03-14T00:00:00+00:00"),
-        )
-        conn.execute(
-            """
-            INSERT INTO concepts (
-                id, material_id, title, keywords_json, summary, embedding_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "concept-observed",
-                "material-observed",
-                "Calculus",
-                json.dumps(["calculus"]),
-                "Core ideas in calculus.",
-                None,
-                "2026-03-14T00:00:01+00:00",
-            ),
-        )
-        conn.executemany(
-            """
-            INSERT INTO videos (
-                id, title, channel_title, description, duration_sec, view_count, is_creative_commons, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                ("video-observed-1", "Limits lecture", "Math", "Limits", 900, 0, 0, "2026-03-14T00:00:02+00:00"),
-                ("video-observed-2", "Derivatives lecture", "Math", "Derivatives", 900, 0, 0, "2026-03-14T00:00:03+00:00"),
-            ],
-        )
-        conn.executemany(
-            """
-            INSERT INTO reels (
-                id, generation_id, material_id, concept_id, video_id, video_url,
-                t_start, t_end, transcript_snippet, takeaways_json, base_score, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    "reel-observed-1",
-                    None,
-                    "material-observed",
-                    "concept-observed",
-                    "video-observed-1",
-                    "https://example.com/watch?v=video-observed-1",
-                    0.0,
-                    30.0,
-                    "Limits describe approach behavior.",
-                    json.dumps(["Limits"]),
-                    1.0,
-                    "2026-03-14T00:00:04+00:00",
-                ),
-                (
-                    "reel-observed-2",
-                    None,
-                    "material-observed",
-                    "concept-observed",
-                    "video-observed-1",
-                    "https://example.com/watch?v=video-observed-1",
-                    35.0,
-                    60.0,
-                    "Limits describe approach behavior.",
-                    json.dumps(["Limits duplicate"]),
-                    0.9,
-                    "2026-03-14T00:00:06+00:00",
-                ),
-                (
-                    "reel-observed-3",
-                    None,
-                    "material-observed",
-                    "concept-observed",
-                    "video-observed-2",
-                    "https://example.com/watch?v=video-observed-2",
-                    0.0,
-                    28.0,
-                    "Derivatives measure instantaneous change.",
-                    json.dumps(["Derivatives"]),
-                    1.1,
-                    "2026-03-14T00:00:05+00:00",
-                ),
-            ],
-        )
+    def test_reel_service_deep_topic_expansion_falls_back_to_literal(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
-
-        examples = service._topic_expansion_observed_examples(
-            conn,
-            material_id="material-observed",
-            generation_id=None,
-            limit=4,
-        )
-
+        plan = mock.Mock()
+        plan.ai_status = "invalid"
+        with mock.patch(
+            "backend.app.services.reels.build_search_query_plan",
+            return_value=plan,
+        ):
+            expansion = service._deep_topic_expansion(
+                None,
+                material_id="material-observed",
+                subject_tag="calculus",
+                generation_id=None,
+            )
         self.assertEqual(
-            examples,
-            [
-                {"title": "Limits lecture", "snippet": "Limits describe approach behavior."},
-                {"title": "Derivatives lecture", "snippet": "Derivatives measure instantaneous change."},
-            ],
+            expansion,
+            {
+                "canonical_topic": "calculus",
+                "aliases": [],
+                "subtopics": [],
+                "related_terms": [],
+            },
         )
-        conn.close()
+        plan.as_topic_expansion.assert_not_called()
 
     def test_reel_service_topic_gate_rejects_dental_calculus_false_positive(self) -> None:
         service = ReelService(embedding_service=None, youtube_service=None)
@@ -3606,7 +3559,7 @@ class MediumRegressionTests(unittest.TestCase):
         )
         self.assertFalse(result["passes"])
 
-    def test_shape_reels_for_request_context_accepts_topical_short_companion_anchor(self) -> None:
+    def test_shape_reels_for_request_context_rejects_unplanned_companion_anchor(self) -> None:
         shaped = main_module._shape_reels_for_request_context(
             [
                 {
@@ -3630,8 +3583,7 @@ class MediumRegressionTests(unittest.TestCase):
             strict_topic_only=True,
         )
 
-        self.assertEqual(len(shaped), 1)
-        self.assertEqual(str(shaped[0]["reel_id"]), "reel-1")
+        self.assertEqual(shaped, [])
 
     def test_request_source_surface_allowed_opens_related_results_on_page_two(self) -> None:
         reel = {"source_surface": "youtube_related"}
@@ -3745,41 +3697,40 @@ class MediumRegressionTests(unittest.TestCase):
             "summary": "Core ideas, terminology, and intuition for Apiology.",
         }
 
-        with mock.patch.object(
-            service.topic_expansion_service,
-            "expand_topic",
-            return_value={
+        plan = _validated_query_plan(
+            {
                 "canonical_topic": "Melittology",
                 "aliases": ["Melittology"],
                 "subtopics": [],
                 "related_terms": ["Apiology"],
-            },
+            }
+        )
+        with mock.patch(
+            "backend.app.services.reels.build_search_query_plan",
+            return_value=plan,
         ):
             keywords = service._bootstrap_topic_keywords(concept, subject_tag="apiology", conn=None)
 
         self.assertEqual(keywords[0], "apiology")
         self.assertIn("melittology", keywords)
 
-    def test_bootstrap_topic_keywords_prioritize_companion_terms_for_opaque_topics(self) -> None:
+    def test_bootstrap_topic_keywords_ai_failure_keeps_literal_only(self) -> None:
         service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
         concept = {
             "title": "Apiology",
             "summary": "Core ideas, terminology, and intuition for Apiology.",
         }
 
-        with mock.patch.object(
-            service.topic_expansion_service,
-            "expand_topic",
-            return_value={
-                "canonical_topic": "Melittology",
-                "aliases": ["Melittology"],
-                "subtopics": [],
-                "related_terms": ["bees", "Melittology"],
-            },
+        plan = mock.Mock()
+        plan.ai_status = "unavailable"
+        with mock.patch(
+            "backend.app.services.reels.build_search_query_plan",
+            return_value=plan,
         ):
             keywords = service._bootstrap_topic_keywords(concept, subject_tag="apiology", conn=None)
 
-        self.assertEqual(keywords[:3], ["apiology", "bees", "melittology"])
+        self.assertEqual(keywords, ["apiology"])
+        plan.as_topic_expansion.assert_not_called()
 
     def test_bug_1b_final_unique_reels_counter_increments(self) -> None:
         """Bug 1B: final_unique_reels should increment, not stay at max(current, 1)."""

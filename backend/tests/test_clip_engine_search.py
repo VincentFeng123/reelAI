@@ -208,6 +208,9 @@ class ClipEngineSearchTests(unittest.TestCase):
             language="en",
             context=None,
             cache_store=None,
+            literal_topic="calc",
+            use_query_planner=True,
+            breadth=3,
         )
 
     # --------------------------------------------------------------------- #
