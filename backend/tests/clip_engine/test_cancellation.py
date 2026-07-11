@@ -94,7 +94,7 @@ def test_gemini_active_request_receives_cancellation(monkeypatch):
     class Payload(BaseModel):
         value: str
 
-    monkeypatch.setattr(gemini_client, "get_client", lambda: Client())
+    monkeypatch.setattr(gemini_client, "_create_client", lambda: Client())
     _cancel_shortly(cancel)
     started = time.monotonic()
     with pytest.raises(CancellationError):
@@ -128,7 +128,7 @@ def test_gemini_retry_backoff_stops_before_another_provider_call(monkeypatch):
     class Payload(BaseModel):
         value: str
 
-    monkeypatch.setattr(gemini_client, "get_client", lambda: Client())
+    monkeypatch.setattr(gemini_client, "_create_client", lambda: Client())
     with pytest.raises(CancellationError):
         gemini_client.generate_json(
             "system", "user", Payload, should_cancel=cancel.is_set

@@ -1,12 +1,12 @@
 # Graph Report - .  (2026-07-10)
 
 ## Corpus Check
-- 149 files · ~703,064 words
+- 149 files · ~703,323 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 3624 nodes · 22314 edges · 268 communities detected
-- Extraction: 21% EXTRACTED · 79% INFERRED · 0% AMBIGUOUS · INFERRED: 17645 edges (avg confidence: 0.5)
+- 3635 nodes · 22408 edges · 267 communities detected
+- Extraction: 21% EXTRACTED · 79% INFERRED · 0% AMBIGUOUS · INFERRED: 17736 edges (avg confidence: 0.5)
 - Token cost: 0 input · 0 output
 
 ## Community Hubs (Navigation)
@@ -277,7 +277,6 @@
 - [[_COMMUNITY_Community 264|Community 264]]
 - [[_COMMUNITY_Community 265|Community 265]]
 - [[_COMMUNITY_Community 266|Community 266]]
-- [[_COMMUNITY_Community 267|Community 267]]
 
 ## God Nodes (most connected - your core abstractions)
 1. `ReelService` - 486 edges
@@ -289,7 +288,7 @@
 7. `TranscriptQuality` - 248 edges
 8. `MaterialIntelligenceService` - 245 edges
 9. `DownloadError` - 238 edges
-10. `TopicExpansionService` - 234 edges
+10. `CancellationError` - 237 edges
 
 ## Surprising Connections (you probably didn't know these)
 - `DatabaseIntegrityError` --uses--> `Database-backed generation job lifecycle and replayable event storage.`  [INFERRED]
@@ -307,7 +306,7 @@
 
 ### Community 0 - "Community 0"
 Cohesion: 0.01
-Nodes (726): Audit the punctuation contract: every clip returned by pick_clip_heuristic and s, Reconstruct the exact words inside [t_start, t_end] from word     timings, plus, Check whether the clip begins and ends on punctuation boundaries.      Returns `, Run a case through the heuristic picker AND (optionally) snap_llm_boundary., Build a list of cues (one per sentence) with known word-level     timestamps. Ea, cue_text(), filter_by_query(), pick_best_clip() (+718 more)
+Nodes (723): Audit the punctuation contract: every clip returned by pick_clip_heuristic and s, Reconstruct the exact words inside [t_start, t_end] from word     timings, plus, Check whether the clip begins and ends on punctuation boundaries.      Returns `, Run a case through the heuristic picker AND (optionally) snap_llm_boundary., Build a list of cues (one per sentence) with known word-level     timestamps. Ea, cue_text(), filter_by_query(), pick_best_clip() (+715 more)
 
 ### Community 1 - "Community 1"
 Cohesion: 0.01
@@ -318,16 +317,16 @@ Cohesion: 0.32
 Nodes (278): AssessmentCancelledError, AssessmentService, BaseModel, DownloadError, EngineError, IngestError, Base class for all ingestion failures., The URL is not a supported platform, is private, or robots.txt disallows it. (+270 more)
 
 ### Community 3 - "Community 3"
-Cohesion: 0.01
-Nodes (183): BaseSettings, _await_with_probe(), is_cancelled(), raise_if_cancelled(), Small async-to-sync bridge for actively cancellable provider requests.  The publ, Run an async request from synchronous pipeline code.      Normal generation work, run_cancellable(), sleep_with_probe() (+175 more)
+Cohesion: 0.02
+Nodes (172): _await_with_probe(), is_cancelled(), raise_if_cancelled(), Small async-to-sync bridge for actively cancellable provider requests.  The publ, Run an async request from synchronous pipeline code.      Normal generation work, run_cancellable(), sleep_with_probe(), wait_with_probe() (+164 more)
 
 ### Community 4 - "Community 4"
 Cohesion: 0.03
 Nodes (203): Email service using Resend for transactional email delivery., Send a welcome email to a newly registered user.      Errors are caught and logg, send_welcome_email(), _activate_generation(), _adaptive_min_relevance_floor(), answer_assessment(), _auto_verify_community_account_if_allowed(), _bare_video_id() (+195 more)
 
 ### Community 5 - "Community 5"
-Cohesion: 0.04
-Nodes (83): _atomic_write(), _available_questions(), _BackfillPlan, _check_cancelled(), _completed_rows(), _ensure_learner_progress(), _information_units(), _latest_cutoff() (+75 more)
+Cohesion: 0.03
+Nodes (103): ABC, BaseSettings, get_settings(), Settings, _adapt_query_for_postgres(), _connect_postgres_with_retry(), _database_url(), _db_path() (+95 more)
 
 ### Community 6 - "Community 6"
 Cohesion: 0.02
@@ -354,8 +353,8 @@ Cohesion: 0.06
 Nodes (4): _make_clip(), Pure unit tests for backend.app.clip_engine.bridge — no DB, no network., test_pick_best_clip_fallback_when_none_in_bounds(), test_pick_best_clip_prefers_in_bounds()
 
 ### Community 12 - "Community 12"
-Cohesion: 0.13
-Nodes (27): append_event(), _atomic_write(), build_request_key(), _fail_unclaimable_job(), find_active_job(), get_job(), heartbeat_job(), _iso() (+19 more)
+Cohesion: 0.1
+Nodes (19): _atomic_write(), _available_questions(), _BackfillPlan, _check_cancelled(), _completed_rows(), _ensure_learner_progress(), _information_units(), _latest_cutoff() (+11 more)
 
 ### Community 13 - "Community 13"
 Cohesion: 0.09
@@ -446,40 +445,40 @@ Cohesion: 0.25
 Nodes (11): _expansion(), _run_discover(), test_consensus_expands_one_query_at_a_time(), test_discover_excludes_and_limits(), test_excluded_consensus_does_not_stop_expansion(), test_fast_context_limits_initial_expansion_to_three_queries(), test_no_consensus_uses_at_most_all_six(), test_normal_consensus_path_searches_exactly_three() (+3 more)
 
 ### Community 35 - "Community 35"
-Cohesion: 0.22
-Nodes (2): PersistenceIntegrityTests, _seed_identity()
-
-### Community 36 - "Community 36"
 Cohesion: 0.31
 Nodes (2): LevelAutoAdjustTests, Learner-scoped global difficulty adjustment semantics.
 
-### Community 37 - "Community 37"
-Cohesion: 0.27
-Nodes (6): ABC, get_storage(), LocalStorage, S3Storage, _safe_filename(), Storage
+### Community 36 - "Community 36"
+Cohesion: 0.17
+Nodes (11): friendly_error(), PipelineError, Exception hierarchy for the ingestion pipeline.  Each class carries a `.status_c, Map a raw exception to a readable line for the UI., Raised by pipeline stages with an already-friendly, user-facing message., Return [{text, start(sec), end(sec)}] ordered by time., Return [{text, start(sec), end(sec)}] ordered by time., Return {'text','duration','words':[{word,start,end}],'segments':[{start,end,text (+3 more)
 
-### Community 38 - "Community 38"
+### Community 37 - "Community 37"
 Cohesion: 0.21
 Nodes (2): KnowledgeLevelMigrationTests, Columns for the knowledge-level feature exist after init and are idempotent.
 
-### Community 39 - "Community 39"
+### Community 38 - "Community 38"
 Cohesion: 0.17
 Nodes (4): ClipEngineSearchTests, Tests for Task 11: ingest_search routed through Supadata + clip engine (YouTube-, Caller passes platforms=["yt","ig","tt"]; result must have platforms==["yt"], When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,
 
-### Community 40 - "Community 40"
+### Community 39 - "Community 39"
 Cohesion: 0.4
 Nodes (8): _conn(), _patch_request_context(), test_feed_autofill_false_never_submits_and_true_submits_before_return(), test_feed_rejects_deprecated_multi_platform_true(), test_generate_rejects_multi_platform_before_submitting(), test_generate_returns_202_and_idempotently_reuses_active_job(), test_generation_stream_replays_monotonic_persisted_events(), test_preflight_uses_one_metadata_search_and_no_generation()
 
-### Community 41 - "Community 41"
+### Community 40 - "Community 40"
 Cohesion: 0.24
 Nodes (3): ClipEngineIngestUrlTests, _fake_engine_out(), Tests for the clip-engine-routed ingest_url (Task 9).  Strategy: mock the two he
 
-### Community 42 - "Community 42"
+### Community 41 - "Community 41"
 Cohesion: 0.22
 Nodes (4): ClipEngineTopicCutTests, _fake_engine_out_two_clips(), Tests for the clip-engine-routed ingest_topic_cut (Task 10).  Strategy: mirror t, Returns a transcript + 2 clips.     Clip 0 (30-90s): talks about the "chain rule
 
-### Community 43 - "Community 43"
+### Community 42 - "Community 42"
 Cohesion: 0.22
 Nodes (3): normalizeSignupEmailForComparison(), onSendVerificationEmail(), onVerifyAccount()
+
+### Community 43 - "Community 43"
+Cohesion: 0.38
+Nodes (9): _channel_name(), _duration(), _edu_score(), _first_nonblank(), _integer(), _level_score(), merge_and_rank(), Merge results across expanded queries, dedupe by video id, rank. Strongest signa (+1 more)
 
 ### Community 44 - "Community 44"
 Cohesion: 0.2
@@ -582,12 +581,12 @@ Cohesion: 0.4
 Nodes (0):
 
 ### Community 69 - "Community 69"
-Cohesion: 0.67
-Nodes (2): _cue(), QueryFocusedSnippetTests
-
-### Community 70 - "Community 70"
 Cohesion: 0.5
 Nodes (3): embed_url(), Canonical YouTube embed-URL helper — the single source of truth shared by the se, YouTube embed URL that plays only [start, end] (whole seconds: floor start / cei
+
+### Community 70 - "Community 70"
+Cohesion: 0.67
+Nodes (2): _cue(), QueryFocusedSnippetTests
 
 ### Community 71 - "Community 71"
 Cohesion: 0.5
@@ -875,510 +874,506 @@ Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolu
 
 ### Community 142 - "Community 142"
 Cohesion: 1.0
-Nodes (1): A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma
+Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
 
 ### Community 143 - "Community 143"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
+Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
 
 ### Community 144 - "Community 144"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p
+Nodes (1): `core` ends with '.'. True if that period is part of an abbreviation/initial.
 
 ### Community 145 - "Community 145"
 Cohesion: 1.0
-Nodes (1): `core` ends with '.'. True if that period is part of an abbreviation/initial.
+Nodes (1): Return the sentence terminator: '.', '?', '!', or '' (none/guarded/ellipsis).
 
 ### Community 146 - "Community 146"
 Cohesion: 1.0
-Nodes (1): Return the sentence terminator: '.', '?', '!', or '' (none/guarded/ellipsis).
+Nodes (1): Return [(sentence_text, terminator), ...].
 
 ### Community 147 - "Community 147"
 Cohesion: 1.0
-Nodes (1): Return [(sentence_text, terminator), ...].
+Nodes (1): Handle Whisper merge/split. Return (advance_sentence_tokens, advance_words).
 
 ### Community 148 - "Community 148"
 Cohesion: 1.0
-Nodes (1): Handle Whisper merge/split. Return (advance_sentence_tokens, advance_words).
+Nodes (1): Fill start/end for any unmatched sentences from their neighbours.
 
 ### Community 149 - "Community 149"
 Cohesion: 1.0
-Nodes (1): Fill start/end for any unmatched sentences from their neighbours.
+Nodes (1): Re-window a transcript into ~target_sec units from word times.      Used when ca
 
 ### Community 150 - "Community 150"
 Cohesion: 1.0
-Nodes (1): Re-window a transcript into ~target_sec units from word times.      Used when ca
+Nodes (1): Convert a ``PunctuationResult`` into the legacy ``Sentence`` model, exactly.
 
 ### Community 151 - "Community 151"
 Cohesion: 1.0
-Nodes (1): Convert a ``PunctuationResult`` into the legacy ``Sentence`` model, exactly.
+Nodes (1): Fallback: treat each transcript chunk as a sentence unit (chunk edges are     va
 
 ### Community 152 - "Community 152"
 Cohesion: 1.0
-Nodes (1): Fallback: treat each transcript chunk as a sentence unit (chunk edges are     va
+Nodes (1): # NOTE: we deliberately do NOT treat a lone single letter ("J.", "v.") as an
 
 ### Community 153 - "Community 153"
 Cohesion: 1.0
-Nodes (1): # NOTE: we deliberately do NOT treat a lone single letter ("J.", "v.") as an
+Nodes (1): Clamp to [0, 1], tolerating models that answer on a 0-10 or 0-100 scale     (7 →
 
 ### Community 154 - "Community 154"
 Cohesion: 1.0
-Nodes (1): Clamp to [0, 1], tolerating models that answer on a 0-10 or 0-100 scale     (7 →
+Nodes (1): Find ``quote`` among ``words`` whose times fall in [lo_t, hi_t] and return the
 
 ### Community 155 - "Community 155"
 Cohesion: 1.0
-Nodes (1): Find ``quote`` among ``words`` whose times fall in [lo_t, hi_t] and return the
+Nodes (1): Move outward to the nearest qualifying caption-gap midpoint.
 
 ### Community 156 - "Community 156"
 Cohesion: 1.0
-Nodes (1): Move outward to the nearest qualifying caption-gap midpoint.
+Nodes (1): Return a privacy-ready stored question or None.      Validation happens after th
 
 ### Community 157 - "Community 157"
 Cohesion: 1.0
-Nodes (1): Return a privacy-ready stored question or None.      Validation happens after th
+Nodes (1): One Gemini comprehension pass → curated teaching clips (topic-relevant when
 
 ### Community 158 - "Community 158"
 Cohesion: 1.0
-Nodes (1): One Gemini comprehension pass → curated teaching clips (topic-relevant when
+Nodes (1): Client-level circuit breaker (Phase B.3).  Used to gate yt-dlp `fallback_clients
 
 ### Community 159 - "Community 159"
 Cohesion: 1.0
-Nodes (1): Client-level circuit breaker (Phase B.3).  Used to gate yt-dlp `fallback_clients
+Nodes (1): Multi-client circuit breaker keyed on a string client identifier.
 
 ### Community 160 - "Community 160"
 Cohesion: 1.0
-Nodes (1): Multi-client circuit breaker keyed on a string client identifier.
+Nodes (1): Dump all tracked clients' state — for /admin/health observability.
 
 ### Community 161 - "Community 161"
 Cohesion: 1.0
-Nodes (1): Dump all tracked clients' state — for /admin/health observability.
+Nodes (1): Return True if work should be attempted on `client` right now.         A client
 
 ### Community 162 - "Community 162"
 Cohesion: 1.0
-Nodes (1): Return True if work should be attempted on `client` right now.         A client
+Nodes (1): In-process pub/sub bus for refinement-job progress events (Phase D.1).  Backend
 
 ### Community 163 - "Community 163"
 Cohesion: 1.0
-Nodes (1): In-process pub/sub bus for refinement-job progress events (Phase D.1).  Backend
+Nodes (1): Drop topics inactive for longer than the TTL, or oldest-first if over MAX_JOBS.
 
 ### Community 164 - "Community 164"
 Cohesion: 1.0
-Nodes (1): Drop topics inactive for longer than the TTL, or oldest-first if over MAX_JOBS.
+Nodes (1): Put an event on a subscriber's queue from an arbitrary thread.
 
 ### Community 165 - "Community 165"
 Cohesion: 1.0
-Nodes (1): Put an event on a subscriber's queue from an arbitrary thread.
+Nodes (1): Publish an event to all subscribers of `job_id` and append it to the replay buff
 
 ### Community 166 - "Community 166"
 Cohesion: 1.0
-Nodes (1): Publish an event to all subscribers of `job_id` and append it to the replay buff
+Nodes (1): Mark a job's stream complete. Subscribers still attached will receive the option
 
 ### Community 167 - "Community 167"
 Cohesion: 1.0
-Nodes (1): Mark a job's stream complete. Subscribers still attached will receive the option
+Nodes (1): Async iterator over events for `job_id`.      - Replays any buffered events whos
 
 ### Community 168 - "Community 168"
 Cohesion: 1.0
-Nodes (1): Async iterator over events for `job_id`.      - Replays any buffered events whos
+Nodes (1): Return a copy of the current replay buffer (for debugging / test assertions).
 
 ### Community 169 - "Community 169"
 Cohesion: 1.0
-Nodes (1): Return a copy of the current replay buffer (for debugging / test assertions).
+Nodes (1): List currently-tracked job ids (debug/metrics).
 
 ### Community 170 - "Community 170"
 Cohesion: 1.0
-Nodes (1): List currently-tracked job ids (debug/metrics).
+Nodes (1): Multi-platform video provider registry.  Pluggable adapters for Vimeo / Dailymot
 
 ### Community 171 - "Community 171"
 Cohesion: 1.0
-Nodes (1): Multi-platform video provider registry.  Pluggable adapters for Vimeo / Dailymot
+Nodes (1): Keyless search hop via DuckDuckGo HTML. Narrows the query with     `site:{site_f
 
 ### Community 172 - "Community 172"
 Cohesion: 1.0
-Nodes (1): Keyless search hop via DuckDuckGo HTML. Narrows the query with     `site:{site_f
+Nodes (1): Canonical search result. Maps 1:1 to a row inserted into `videos`.
 
 ### Community 173 - "Community 173"
 Cohesion: 1.0
-Nodes (1): Canonical search result. Maps 1:1 to a row inserted into `videos`.
+Nodes (1): Best-effort keyword search. Returns [] on any failure.
 
 ### Community 174 - "Community 174"
 Cohesion: 1.0
-Nodes (1): Best-effort keyword search. Returns [] on any failure.
+Nodes (1): Best-effort captions fetch. Returns None when unavailable.
 
 ### Community 175 - "Community 175"
 Cohesion: 1.0
-Nodes (1): Best-effort captions fetch. Returns None when unavailable.
+Nodes (1): Vimeo API v3 (api.vimeo.com). Auth is a bearer PAT stored at     `config.vimeo_a
 
 ### Community 176 - "Community 176"
 Cohesion: 1.0
-Nodes (1): Vimeo API v3 (api.vimeo.com). Auth is a bearer PAT stored at     `config.vimeo_a
+Nodes (1): Twitch Helix API for clips. Helix has no free-text clip search; we     translate
 
 ### Community 177 - "Community 177"
 Cohesion: 1.0
-Nodes (1): Twitch Helix API for clips. Helix has no free-text clip search; we     translate
+Nodes (1): Returns (access_token, client_id) or None when unconfigured / failed.
 
 ### Community 178 - "Community 178"
 Cohesion: 1.0
-Nodes (1): Returns (access_token, client_id) or None when unconfigured / failed.
+Nodes (1): TikTok via yt-dlp. yt-dlp doesn't expose a `tiktoksearch:` pseudo-URL     the wa
 
 ### Community 179 - "Community 179"
 Cohesion: 1.0
-Nodes (1): TikTok via yt-dlp. yt-dlp doesn't expose a `tiktoksearch:` pseudo-URL     the wa
+Nodes (1): Thin aggregator. The order below mirrors the user-facing preference     captured
 
 ### Community 180 - "Community 180"
 Cohesion: 1.0
-Nodes (1): Thin aggregator. The order below mirrors the user-facing preference     captured
+Nodes (1): Fan out search across every registered provider **in parallel**.         Results
 
 ### Community 181 - "Community 181"
 Cohesion: 1.0
-Nodes (1): Fan out search across every registered provider **in parallel**.         Results
+Nodes (1): Dispatch by provider name. Returns None for unknown providers.
 
 ### Community 182 - "Community 182"
 Cohesion: 1.0
-Nodes (1): Dispatch by provider name. Returns None for unknown providers.
+Nodes (1): Parse a SRT or WebVTT payload into cues. Tolerant of format variations.     Stri
 
 ### Community 183 - "Community 183"
 Cohesion: 1.0
-Nodes (1): Parse a SRT or WebVTT payload into cues. Tolerant of format variations.     Stri
+Nodes (1): Prefer a track whose language starts with 'en'; else return the first.
 
 ### Community 184 - "Community 184"
 Cohesion: 1.0
-Nodes (1): Prefer a track whose language starts with 'en'; else return the first.
+Nodes (1): Shared captions fetcher for providers that fall back to yt-dlp for     their sub
 
 ### Community 185 - "Community 185"
 Cohesion: 1.0
-Nodes (1): Shared captions fetcher for providers that fall back to yt-dlp for     their sub
+Nodes (1): Tests for dry_run / can-generate parity on the clip-engine path (Task T6).  Asse
 
 ### Community 186 - "Community 186"
 Cohesion: 1.0
-Nodes (1): Tests for dry_run / can-generate parity on the clip-engine path (Task T6).  Asse
+Nodes (1): Patch both engine surfaces; only discover return value matters for dry_run.
 
 ### Community 187 - "Community 187"
 Cohesion: 1.0
-Nodes (1): Patch both engine surfaces; only discover return value matters for dry_run.
+Nodes (1): Unit tests for ``backend/app/services/provider_registry.py``.  Three layers:   *
 
 ### Community 188 - "Community 188"
 Cohesion: 1.0
-Nodes (1): Unit tests for ``backend/app/services/provider_registry.py``.  Three layers:   *
+Nodes (1): Build a mock yt_dlp.YoutubeDL class that behaves as a context manager     and re
 
 ### Community 189 - "Community 189"
 Cohesion: 1.0
-Nodes (1): Build a mock yt_dlp.YoutubeDL class that behaves as a context manager     and re
+Nodes (1): When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,
 
 ### Community 190 - "Community 190"
 Cohesion: 1.0
-Nodes (1): When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,
+Nodes (1): Print the Whisper transcript of every reel in an audit CSV.  For each row, we al
 
 ### Community 191 - "Community 191"
 Cohesion: 1.0
-Nodes (1): Print the Whisper transcript of every reel in an audit CSV.  For each row, we al
+Nodes (1): Exercise the psycopg branches of the shared DB helpers over SQLite.
 
 ### Community 192 - "Community 192"
 Cohesion: 1.0
-Nodes (1): Exercise the psycopg branches of the shared DB helpers over SQLite.
+Nodes (1): Visualise clip boundaries with before/after word context.  For every row in audi
 
 ### Community 193 - "Community 193"
 Cohesion: 1.0
-Nodes (1): Visualise clip boundaries with before/after word context.  For every row in audi
+Nodes (1): Scan $TMPDIR for prior-run reelai-ingest-clip-audio-* dirs and seed     `_FULL_V
 
 ### Community 194 - "Community 194"
 Cohesion: 1.0
-Nodes (1): Scan $TMPDIR for prior-run reelai-ingest-clip-audio-* dirs and seed     `_FULL_V
+Nodes (1): Return [(word_start, word_end, text), ...] inside [t0, t1].
 
 ### Community 195 - "Community 195"
 Cohesion: 1.0
-Nodes (1): Return [(word_start, word_end, text), ...] inside [t0, t1].
+Nodes (1): side='start' → BEFORE clipped out, AFTER clipped in.     side='end'   → BEFORE c
 
 ### Community 196 - "Community 196"
 Cohesion: 1.0
-Nodes (1): side='start' → BEFORE clipped out, AFTER clipped in.     side='end'   → BEFORE c
+Nodes (1): Fallback expansion includes educational variants; dedup/order/contract intact.
 
 ### Community 197 - "Community 197"
 Cohesion: 1.0
-Nodes (1): Fallback expansion includes educational variants; dedup/order/contract intact.
+Nodes (1): _SYSTEM asserts educational steering exists and entertainment avoidance.
 
 ### Community 198 - "Community 198"
 Cohesion: 1.0
-Nodes (1): _SYSTEM asserts educational steering exists and entertainment avoidance.
+Nodes (1): Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a
 
 ### Community 199 - "Community 199"
 Cohesion: 1.0
-Nodes (1): Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a
+Nodes (1): Add knowledge-level columns to pre-existing DBs (sqlite lacks     ADD COLUMN IF
 
 ### Community 200 - "Community 200"
 Cohesion: 1.0
-Nodes (1): Add knowledge-level columns to pre-existing DBs (sqlite lacks     ADD COLUMN IF
+Nodes (1): Add one-pass learning-content columns to pre-existing reel tables.
 
 ### Community 201 - "Community 201"
 Cohesion: 1.0
-Nodes (1): Add one-pass learning-content columns to pre-existing reel tables.
+Nodes (1): Connect to Postgres, retrying transient startup errors.      Returns an open psy
 
 ### Community 202 - "Community 202"
 Cohesion: 1.0
-Nodes (1): Connect to Postgres, retrying transient startup errors.      Returns an open psy
+Nodes (1): Return a reusable PostgreSQL connection, or create a fresh one.
 
 ### Community 203 - "Community 203"
 Cohesion: 1.0
-Nodes (1): Return a reusable PostgreSQL connection, or create a fresh one.
+Nodes (1): Return a connection to the pool (or close it if the pool is full).
 
 ### Community 204 - "Community 204"
 Cohesion: 1.0
-Nodes (1): Return a connection to the pool (or close it if the pool is full).
+Nodes (1): Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.
 
 ### Community 205 - "Community 205"
 Cohesion: 1.0
-Nodes (1): Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.
+Nodes (1): Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a
 
 ### Community 206 - "Community 206"
 Cohesion: 1.0
-Nodes (1): Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a
+Nodes (1): Base kwargs for upsert_reel_row — override specific fields as needed.
 
 ### Community 207 - "Community 207"
 Cohesion: 1.0
-Nodes (1): Base kwargs for upsert_reel_row — override specific fields as needed.
+Nodes (1): Reel persisted with generation_id='gen-x' is:         - stored in the DB with th
 
 ### Community 208 - "Community 208"
 Cohesion: 1.0
-Nodes (1): Reel persisted with generation_id='gen-x' is:         - stored in the DB with th
+Nodes (1): Reel persisted with generation_id=None (or omitted) stores NULL         and is f
 
 ### Community 209 - "Community 209"
 Cohesion: 1.0
-Nodes (1): Reel persisted with generation_id=None (or omitted) stores NULL         and is f
+Nodes (1): The same (material_id, video_id, t_start, t_end) tuple under two         differe
 
 ### Community 210 - "Community 210"
 Cohesion: 1.0
-Nodes (1): The same (material_id, video_id, t_start, t_end) tuple under two         differe
+Nodes (1): Caller passes platforms=["yt","ig","tt"]; result must have platforms==["yt"]
 
 ### Community 211 - "Community 211"
 Cohesion: 1.0
-Nodes (1): Caller passes platforms=["yt","ig","tt"]; result must have platforms==["yt"]
+Nodes (1): When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,
 
 ### Community 212 - "Community 212"
 Cohesion: 1.0
-Nodes (1): When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,
+Nodes (1): resolve_feed_urls extracts watch URLs from yt_dlp entries.
 
 ### Community 213 - "Community 213"
 Cohesion: 1.0
-Nodes (1): resolve_feed_urls extracts watch URLs from yt_dlp entries.
+Nodes (1): resolve_feed_urls truncates to max_items.
 
 ### Community 214 - "Community 214"
 Cohesion: 1.0
-Nodes (1): resolve_feed_urls truncates to max_items.
+Nodes (1): resolve_feed_urls swallows exceptions and returns [].
 
 ### Community 215 - "Community 215"
 Cohesion: 1.0
-Nodes (1): resolve_feed_urls swallows exceptions and returns [].
+Nodes (1): True when the error text indicates PG is still booting or unreachable.      Matc
 
 ### Community 216 - "Community 216"
 Cohesion: 1.0
-Nodes (1): True when the error text indicates PG is still booting or unreachable.      Matc
+Nodes (1): Connect to Postgres, retrying transient startup errors.      Returns an open psy
 
 ### Community 217 - "Community 217"
 Cohesion: 1.0
-Nodes (1): Connect to Postgres, retrying transient startup errors.      Returns an open psy
+Nodes (1): Return a reusable PostgreSQL connection, or create a fresh one.
 
 ### Community 218 - "Community 218"
 Cohesion: 1.0
-Nodes (1): Return a reusable PostgreSQL connection, or create a fresh one.
+Nodes (1): Return a connection to the pool (or close it if the pool is full).
 
 ### Community 219 - "Community 219"
 Cohesion: 1.0
-Nodes (1): Return a connection to the pool (or close it if the pool is full).
+Nodes (1): Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.
 
 ### Community 220 - "Community 220"
 Cohesion: 1.0
-Nodes (1): Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.
+Nodes (1): Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a
 
 ### Community 221 - "Community 221"
 Cohesion: 1.0
-Nodes (1): Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a
+Nodes (1): Title/author/duration/thumbnail via yt-dlp (metadata only, no download).     Laz
 
 ### Community 222 - "Community 222"
 Cohesion: 1.0
-Nodes (1): Title/author/duration/thumbnail via yt-dlp (metadata only, no download).     Laz
+Nodes (1): Resolve a channel/playlist URL to individual YouTube watch URLs (no download).
 
 ### Community 223 - "Community 223"
 Cohesion: 1.0
-Nodes (1): Resolve a channel/playlist URL to individual YouTube watch URLs (no download).
+Nodes (1): A strict 'return only JSON of this shape' instruction appended on retry.
 
 ### Community 224 - "Community 224"
 Cohesion: 1.0
-Nodes (1): A strict 'return only JSON of this shape' instruction appended on retry.
+Nodes (1): Return a validated ``schema`` instance from Gemini.      One structured call (Py
 
 ### Community 225 - "Community 225"
 Cohesion: 1.0
-Nodes (1): Return a validated ``schema`` instance from Gemini.      One structured call (Py
+Nodes (1): Run ``call`` (returns response text or falsy) with backoff on transient errors.
 
 ### Community 226 - "Community 226"
 Cohesion: 1.0
-Nodes (1): Run ``call`` (returns response text or falsy) with backoff on transient errors.
+Nodes (1): Return a JSON string conforming to `schema` (a Pydantic model class).      ``max
 
 ### Community 227 - "Community 227"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to `schema` (a Pydantic model class).      ``max
+Nodes (1): A Gemini image Part from raw JPEG bytes.
 
 ### Community 228 - "Community 228"
 Cohesion: 1.0
-Nodes (1): A Gemini image Part from raw JPEG bytes.
+Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
 
 ### Community 229 - "Community 229"
 Cohesion: 1.0
-Nodes (1): Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum
+Nodes (1): A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma
 
 ### Community 230 - "Community 230"
 Cohesion: 1.0
-Nodes (1): A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma
+Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
 
 ### Community 231 - "Community 231"
 Cohesion: 1.0
-Nodes (1): Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p
+Nodes (1): Find ``quote`` among ``words`` whose times fall in [lo_t, hi_t] and return the
 
 ### Community 232 - "Community 232"
 Cohesion: 1.0
-Nodes (1): Find ``quote`` among ``words`` whose times fall in [lo_t, hi_t] and return the
+Nodes (1): One Gemini comprehension pass → substantive topic clips. Returns (clips_spec, no
 
 ### Community 233 - "Community 233"
 Cohesion: 1.0
-Nodes (1): One Gemini comprehension pass → substantive topic clips. Returns (clips_spec, no
+Nodes (1): Base kwargs for upsert_reel_row — override specific fields as needed.
 
 ### Community 234 - "Community 234"
 Cohesion: 1.0
-Nodes (1): Base kwargs for upsert_reel_row — override specific fields as needed.
+Nodes (1): Reel persisted with generation_id='gen-x' is:         - stored in the DB with th
 
 ### Community 235 - "Community 235"
 Cohesion: 1.0
-Nodes (1): Reel persisted with generation_id='gen-x' is:         - stored in the DB with th
+Nodes (1): Reel persisted with generation_id=None (or omitted) stores NULL         and is f
 
 ### Community 236 - "Community 236"
 Cohesion: 1.0
-Nodes (1): Reel persisted with generation_id=None (or omitted) stores NULL         and is f
+Nodes (1): The same (material_id, video_id, t_start, t_end) tuple under two         differe
 
 ### Community 237 - "Community 237"
 Cohesion: 1.0
-Nodes (1): The same (material_id, video_id, t_start, t_end) tuple under two         differe
+Nodes (1): Return True iff ``video_id`` appears live on YouTube.      Consults ``video_live
 
 ### Community 238 - "Community 238"
 Cohesion: 1.0
-Nodes (1): Return True iff ``video_id`` appears live on YouTube.      Consults ``video_live
+Nodes (1): Context managers patching discover + run.clip at the pipeline aliases.
 
 ### Community 239 - "Community 239"
 Cohesion: 1.0
-Nodes (1): Context managers patching discover + run.clip at the pipeline aliases.
+Nodes (1): Connect to Postgres, retrying transient startup errors.      Returns an open psy
 
 ### Community 240 - "Community 240"
 Cohesion: 1.0
-Nodes (1): Connect to Postgres, retrying transient startup errors.      Returns an open psy
+Nodes (1): Return a reusable PostgreSQL connection, or create a fresh one.
 
 ### Community 241 - "Community 241"
 Cohesion: 1.0
-Nodes (1): Return a reusable PostgreSQL connection, or create a fresh one.
+Nodes (1): Return a connection to the pool (or close it if the pool is full).
 
 ### Community 242 - "Community 242"
 Cohesion: 1.0
-Nodes (1): Return a connection to the pool (or close it if the pool is full).
+Nodes (1): Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.
 
 ### Community 243 - "Community 243"
 Cohesion: 1.0
-Nodes (1): Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.
+Nodes (1): Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a
 
 ### Community 244 - "Community 244"
 Cohesion: 1.0
-Nodes (1): Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a
+Nodes (1): Temp workspace lifecycle + orphan sweeper.  Everything the ingestion pipeline do
 
 ### Community 245 - "Community 245"
 Cohesion: 1.0
-Nodes (1): Temp workspace lifecycle + orphan sweeper.  Everything the ingestion pipeline do
+Nodes (1): Create a fresh temp directory, yield its Path, and delete it on exit.      Uses
 
 ### Community 246 - "Community 246"
 Cohesion: 1.0
-Nodes (1): Create a fresh temp directory, yield its Path, and delete it on exit.      Uses
+Nodes (1): Delete any `reelai-ingest-*` directories older than `max_age_sec` from the syste
 
 ### Community 247 - "Community 247"
 Cohesion: 1.0
-Nodes (1): Delete any `reelai-ingest-*` directories older than `max_age_sec` from the syste
+Nodes (1): Generate stem variants for better lexical recall without a heavy stemmer.
 
 ### Community 248 - "Community 248"
 Cohesion: 1.0
-Nodes (1): Generate stem variants for better lexical recall without a heavy stemmer.
+Nodes (1): LLM-direct clip picker.  Given a user query and a transcript, ask the LLM to ret
 
 ### Community 249 - "Community 249"
 Cohesion: 1.0
-Nodes (1): LLM-direct clip picker.  Given a user query and a transcript, ask the LLM to ret
+Nodes (1): A3 feature flag. Default ON; set LLM_TIMESTAMP_STRICT_VALIDATION=0 to     revert
 
 ### Community 250 - "Community 250"
 Cohesion: 1.0
-Nodes (1): A3 feature flag. Default ON; set LLM_TIMESTAMP_STRICT_VALIDATION=0 to     revert
+Nodes (1): Return a copy of the snap-telemetry counters for audit/health readers.
 
 ### Community 251 - "Community 251"
 Cohesion: 1.0
-Nodes (1): Return a copy of the snap-telemetry counters for audit/health readers.
+Nodes (1): Raw LLM output for a single clip. Timestamps are unsnapped — the     caller runs
 
 ### Community 252 - "Community 252"
 Cohesion: 1.0
-Nodes (1): Raw LLM output for a single clip. Timestamps are unsnapped — the     caller runs
+Nodes (1): System prompt for the single-clip picker.      Emphasizes: (a) exactly one clip,
 
 ### Community 253 - "Community 253"
 Cohesion: 1.0
-Nodes (1): System prompt for the single-clip picker.      Emphasizes: (a) exactly one clip,
+Nodes (1): Parse the JSON response into a ClipPick or return None on any     malformation /
 
 ### Community 254 - "Community 254"
 Cohesion: 1.0
-Nodes (1): Parse the JSON response into a ClipPick or return None on any     malformation /
+Nodes (1): Reject picks outside duration bounds or referencing timestamps the     LLM inven
 
 ### Community 255 - "Community 255"
 Cohesion: 1.0
-Nodes (1): Reject picks outside duration bounds or referencing timestamps the     LLM inven
+Nodes (1): Try Gemini Flash first — cheapest + fastest. Rotates API keys on     rate-limit
 
 ### Community 256 - "Community 256"
 Cohesion: 1.0
-Nodes (1): Try Gemini Flash first — cheapest + fastest. Rotates API keys on     rate-limit
+Nodes (1): Groq Llama fallback when Gemini is unavailable or exhausted.
 
 ### Community 257 - "Community 257"
 Cohesion: 1.0
-Nodes (1): Groq Llama fallback when Gemini is unavailable or exhausted.
+Nodes (1): Cerebras Llama 3.3 70B fallback when both Gemini and Groq fail.      Cerebras us
 
 ### Community 258 - "Community 258"
 Cohesion: 1.0
-Nodes (1): Cerebras Llama 3.3 70B fallback when both Gemini and Groq fail.      Cerebras us
+Nodes (1): Pick the single best clip for the query from the transcript via LLM.      `min_s
 
 ### Community 259 - "Community 259"
 Cohesion: 1.0
-Nodes (1): Pick the single best clip for the query from the transcript via LLM.      `min_s
+Nodes (1): Output of the global reranker. One per selected candidate, ordered     by virali
 
 ### Community 260 - "Community 260"
 Cohesion: 1.0
-Nodes (1): Output of the global reranker. One per selected candidate, ordered     by virali
+Nodes (1): Compact numbered rendering of candidates — metadata only, no transcript text.
 
 ### Community 261 - "Community 261"
 Cohesion: 1.0
-Nodes (1): Compact numbered rendering of candidates — metadata only, no transcript text.
+Nodes (1): Deterministic ranking when the LLM chain returns nothing usable.     Combined we
 
 ### Community 262 - "Community 262"
 Cohesion: 1.0
-Nodes (1): Deterministic ranking when the LLM chain returns nothing usable.     Combined we
+Nodes (1): Rank candidates globally across the video. Sends metadata (not     transcript te
 
 ### Community 263 - "Community 263"
 Cohesion: 1.0
-Nodes (1): Rank candidates globally across the video. Sends metadata (not     transcript te
+Nodes (1): Phase 3 tests for `backend/app/services/clip_llm.py::rerank_clip_candidates_llm`
 
 ### Community 264 - "Community 264"
 Cohesion: 1.0
-Nodes (1): Phase 3 tests for `backend/app/services/clip_llm.py::rerank_clip_candidates_llm`
+Nodes (1): 20 cues × 30 seconds = 10 minutes of fake speech, two clearly distinct topics.
 
 ### Community 265 - "Community 265"
 Cohesion: 1.0
-Nodes (1): 20 cues × 30 seconds = 10 minutes of fake speech, two clearly distinct topics.
-
-### Community 266 - "Community 266"
-Cohesion: 1.0
 Nodes (1): Build a chat-completions mock that returns `segments_payload` as JSON.
 
-### Community 267 - "Community 267"
+### Community 266 - "Community 266"
 Cohesion: 1.0
 Nodes (1): Phase 2 + 3 unit tests for `backend/app/services/clip_boundary.py`.  Covered:
 
 ## Knowledge Gaps
-- **504 isolated node(s):** `True when the error text indicates PG is still booting or unreachable.      Matc`, `Add knowledge-level columns to pre-existing DBs (sqlite lacks     ADD COLUMN IF`, `Add one-pass learning-content columns to pre-existing reel tables.`, `Idempotently upgrade legacy SQLite tables for durable generation work.`, `Idempotently upgrade legacy PostgreSQL tables for durable generation work.` (+499 more)
+- **503 isolated node(s):** `True when the error text indicates PG is still booting or unreachable.      Matc`, `Add knowledge-level columns to pre-existing DBs (sqlite lacks     ADD COLUMN IF`, `Add one-pass learning-content columns to pre-existing reel tables.`, `Idempotently upgrade legacy SQLite tables for durable generation work.`, `Idempotently upgrade legacy PostgreSQL tables for durable generation work.` (+498 more)
   These have ≤1 connection - possible missing edges or undocumented components.
 - **Thin community `Community 79`** (2 nodes): `VolumetricGlowBackground.tsx`, `VolumetricGlowBackground()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
@@ -1506,265 +1501,263 @@ Nodes (1): Phase 2 + 3 unit tests for `backend/app/services/clip_boundary.py`.  
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 141`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 142`** (1 nodes): `A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma`
+- **Thin community `Community 142`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 143`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
+- **Thin community `Community 143`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 144`** (1 nodes): `Return a JSON string conforming to ``schema`` from a multimodal prompt.      ``p`
+- **Thin community `Community 144`** (1 nodes): ``core` ends with '.'. True if that period is part of an abbreviation/initial.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 145`** (1 nodes): ``core` ends with '.'. True if that period is part of an abbreviation/initial.`
+- **Thin community `Community 145`** (1 nodes): `Return the sentence terminator: '.', '?', '!', or '' (none/guarded/ellipsis).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 146`** (1 nodes): `Return the sentence terminator: '.', '?', '!', or '' (none/guarded/ellipsis).`
+- **Thin community `Community 146`** (1 nodes): `Return [(sentence_text, terminator), ...].`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 147`** (1 nodes): `Return [(sentence_text, terminator), ...].`
+- **Thin community `Community 147`** (1 nodes): `Handle Whisper merge/split. Return (advance_sentence_tokens, advance_words).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 148`** (1 nodes): `Handle Whisper merge/split. Return (advance_sentence_tokens, advance_words).`
+- **Thin community `Community 148`** (1 nodes): `Fill start/end for any unmatched sentences from their neighbours.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 149`** (1 nodes): `Fill start/end for any unmatched sentences from their neighbours.`
+- **Thin community `Community 149`** (1 nodes): `Re-window a transcript into ~target_sec units from word times.      Used when ca`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 150`** (1 nodes): `Re-window a transcript into ~target_sec units from word times.      Used when ca`
+- **Thin community `Community 150`** (1 nodes): `Convert a ``PunctuationResult`` into the legacy ``Sentence`` model, exactly.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 151`** (1 nodes): `Convert a ``PunctuationResult`` into the legacy ``Sentence`` model, exactly.`
+- **Thin community `Community 151`** (1 nodes): `Fallback: treat each transcript chunk as a sentence unit (chunk edges are     va`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 152`** (1 nodes): `Fallback: treat each transcript chunk as a sentence unit (chunk edges are     va`
+- **Thin community `Community 152`** (1 nodes): `# NOTE: we deliberately do NOT treat a lone single letter ("J.", "v.") as an`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 153`** (1 nodes): `# NOTE: we deliberately do NOT treat a lone single letter ("J.", "v.") as an`
+- **Thin community `Community 153`** (1 nodes): `Clamp to [0, 1], tolerating models that answer on a 0-10 or 0-100 scale     (7 →`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 154`** (1 nodes): `Clamp to [0, 1], tolerating models that answer on a 0-10 or 0-100 scale     (7 →`
+- **Thin community `Community 154`** (1 nodes): `Find ``quote`` among ``words`` whose times fall in [lo_t, hi_t] and return the`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 155`** (1 nodes): `Find ``quote`` among ``words`` whose times fall in [lo_t, hi_t] and return the`
+- **Thin community `Community 155`** (1 nodes): `Move outward to the nearest qualifying caption-gap midpoint.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 156`** (1 nodes): `Move outward to the nearest qualifying caption-gap midpoint.`
+- **Thin community `Community 156`** (1 nodes): `Return a privacy-ready stored question or None.      Validation happens after th`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 157`** (1 nodes): `Return a privacy-ready stored question or None.      Validation happens after th`
+- **Thin community `Community 157`** (1 nodes): `One Gemini comprehension pass → curated teaching clips (topic-relevant when`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 158`** (1 nodes): `One Gemini comprehension pass → curated teaching clips (topic-relevant when`
+- **Thin community `Community 158`** (1 nodes): `Client-level circuit breaker (Phase B.3).  Used to gate yt-dlp `fallback_clients`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 159`** (1 nodes): `Client-level circuit breaker (Phase B.3).  Used to gate yt-dlp `fallback_clients`
+- **Thin community `Community 159`** (1 nodes): `Multi-client circuit breaker keyed on a string client identifier.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 160`** (1 nodes): `Multi-client circuit breaker keyed on a string client identifier.`
+- **Thin community `Community 160`** (1 nodes): `Dump all tracked clients' state — for /admin/health observability.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 161`** (1 nodes): `Dump all tracked clients' state — for /admin/health observability.`
+- **Thin community `Community 161`** (1 nodes): `Return True if work should be attempted on `client` right now.         A client`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 162`** (1 nodes): `Return True if work should be attempted on `client` right now.         A client`
+- **Thin community `Community 162`** (1 nodes): `In-process pub/sub bus for refinement-job progress events (Phase D.1).  Backend`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 163`** (1 nodes): `In-process pub/sub bus for refinement-job progress events (Phase D.1).  Backend`
+- **Thin community `Community 163`** (1 nodes): `Drop topics inactive for longer than the TTL, or oldest-first if over MAX_JOBS.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 164`** (1 nodes): `Drop topics inactive for longer than the TTL, or oldest-first if over MAX_JOBS.`
+- **Thin community `Community 164`** (1 nodes): `Put an event on a subscriber's queue from an arbitrary thread.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 165`** (1 nodes): `Put an event on a subscriber's queue from an arbitrary thread.`
+- **Thin community `Community 165`** (1 nodes): `Publish an event to all subscribers of `job_id` and append it to the replay buff`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 166`** (1 nodes): `Publish an event to all subscribers of `job_id` and append it to the replay buff`
+- **Thin community `Community 166`** (1 nodes): `Mark a job's stream complete. Subscribers still attached will receive the option`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 167`** (1 nodes): `Mark a job's stream complete. Subscribers still attached will receive the option`
+- **Thin community `Community 167`** (1 nodes): `Async iterator over events for `job_id`.      - Replays any buffered events whos`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 168`** (1 nodes): `Async iterator over events for `job_id`.      - Replays any buffered events whos`
+- **Thin community `Community 168`** (1 nodes): `Return a copy of the current replay buffer (for debugging / test assertions).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 169`** (1 nodes): `Return a copy of the current replay buffer (for debugging / test assertions).`
+- **Thin community `Community 169`** (1 nodes): `List currently-tracked job ids (debug/metrics).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 170`** (1 nodes): `List currently-tracked job ids (debug/metrics).`
+- **Thin community `Community 170`** (1 nodes): `Multi-platform video provider registry.  Pluggable adapters for Vimeo / Dailymot`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 171`** (1 nodes): `Multi-platform video provider registry.  Pluggable adapters for Vimeo / Dailymot`
+- **Thin community `Community 171`** (1 nodes): `Keyless search hop via DuckDuckGo HTML. Narrows the query with     `site:{site_f`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 172`** (1 nodes): `Keyless search hop via DuckDuckGo HTML. Narrows the query with     `site:{site_f`
+- **Thin community `Community 172`** (1 nodes): `Canonical search result. Maps 1:1 to a row inserted into `videos`.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 173`** (1 nodes): `Canonical search result. Maps 1:1 to a row inserted into `videos`.`
+- **Thin community `Community 173`** (1 nodes): `Best-effort keyword search. Returns [] on any failure.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 174`** (1 nodes): `Best-effort keyword search. Returns [] on any failure.`
+- **Thin community `Community 174`** (1 nodes): `Best-effort captions fetch. Returns None when unavailable.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 175`** (1 nodes): `Best-effort captions fetch. Returns None when unavailable.`
+- **Thin community `Community 175`** (1 nodes): `Vimeo API v3 (api.vimeo.com). Auth is a bearer PAT stored at     `config.vimeo_a`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 176`** (1 nodes): `Vimeo API v3 (api.vimeo.com). Auth is a bearer PAT stored at     `config.vimeo_a`
+- **Thin community `Community 176`** (1 nodes): `Twitch Helix API for clips. Helix has no free-text clip search; we     translate`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 177`** (1 nodes): `Twitch Helix API for clips. Helix has no free-text clip search; we     translate`
+- **Thin community `Community 177`** (1 nodes): `Returns (access_token, client_id) or None when unconfigured / failed.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 178`** (1 nodes): `Returns (access_token, client_id) or None when unconfigured / failed.`
+- **Thin community `Community 178`** (1 nodes): `TikTok via yt-dlp. yt-dlp doesn't expose a `tiktoksearch:` pseudo-URL     the wa`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 179`** (1 nodes): `TikTok via yt-dlp. yt-dlp doesn't expose a `tiktoksearch:` pseudo-URL     the wa`
+- **Thin community `Community 179`** (1 nodes): `Thin aggregator. The order below mirrors the user-facing preference     captured`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 180`** (1 nodes): `Thin aggregator. The order below mirrors the user-facing preference     captured`
+- **Thin community `Community 180`** (1 nodes): `Fan out search across every registered provider **in parallel**.         Results`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 181`** (1 nodes): `Fan out search across every registered provider **in parallel**.         Results`
+- **Thin community `Community 181`** (1 nodes): `Dispatch by provider name. Returns None for unknown providers.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 182`** (1 nodes): `Dispatch by provider name. Returns None for unknown providers.`
+- **Thin community `Community 182`** (1 nodes): `Parse a SRT or WebVTT payload into cues. Tolerant of format variations.     Stri`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 183`** (1 nodes): `Parse a SRT or WebVTT payload into cues. Tolerant of format variations.     Stri`
+- **Thin community `Community 183`** (1 nodes): `Prefer a track whose language starts with 'en'; else return the first.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 184`** (1 nodes): `Prefer a track whose language starts with 'en'; else return the first.`
+- **Thin community `Community 184`** (1 nodes): `Shared captions fetcher for providers that fall back to yt-dlp for     their sub`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 185`** (1 nodes): `Shared captions fetcher for providers that fall back to yt-dlp for     their sub`
+- **Thin community `Community 185`** (1 nodes): `Tests for dry_run / can-generate parity on the clip-engine path (Task T6).  Asse`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 186`** (1 nodes): `Tests for dry_run / can-generate parity on the clip-engine path (Task T6).  Asse`
+- **Thin community `Community 186`** (1 nodes): `Patch both engine surfaces; only discover return value matters for dry_run.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 187`** (1 nodes): `Patch both engine surfaces; only discover return value matters for dry_run.`
+- **Thin community `Community 187`** (1 nodes): `Unit tests for ``backend/app/services/provider_registry.py``.  Three layers:   *`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 188`** (1 nodes): `Unit tests for ``backend/app/services/provider_registry.py``.  Three layers:   *`
+- **Thin community `Community 188`** (1 nodes): `Build a mock yt_dlp.YoutubeDL class that behaves as a context manager     and re`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 189`** (1 nodes): `Build a mock yt_dlp.YoutubeDL class that behaves as a context manager     and re`
+- **Thin community `Community 189`** (1 nodes): `When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 190`** (1 nodes): `When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,`
+- **Thin community `Community 190`** (1 nodes): `Print the Whisper transcript of every reel in an audit CSV.  For each row, we al`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 191`** (1 nodes): `Print the Whisper transcript of every reel in an audit CSV.  For each row, we al`
+- **Thin community `Community 191`** (1 nodes): `Exercise the psycopg branches of the shared DB helpers over SQLite.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 192`** (1 nodes): `Exercise the psycopg branches of the shared DB helpers over SQLite.`
+- **Thin community `Community 192`** (1 nodes): `Visualise clip boundaries with before/after word context.  For every row in audi`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 193`** (1 nodes): `Visualise clip boundaries with before/after word context.  For every row in audi`
+- **Thin community `Community 193`** (1 nodes): `Scan $TMPDIR for prior-run reelai-ingest-clip-audio-* dirs and seed     `_FULL_V`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 194`** (1 nodes): `Scan $TMPDIR for prior-run reelai-ingest-clip-audio-* dirs and seed     `_FULL_V`
+- **Thin community `Community 194`** (1 nodes): `Return [(word_start, word_end, text), ...] inside [t0, t1].`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 195`** (1 nodes): `Return [(word_start, word_end, text), ...] inside [t0, t1].`
+- **Thin community `Community 195`** (1 nodes): `side='start' → BEFORE clipped out, AFTER clipped in.     side='end'   → BEFORE c`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 196`** (1 nodes): `side='start' → BEFORE clipped out, AFTER clipped in.     side='end'   → BEFORE c`
+- **Thin community `Community 196`** (1 nodes): `Fallback expansion includes educational variants; dedup/order/contract intact.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 197`** (1 nodes): `Fallback expansion includes educational variants; dedup/order/contract intact.`
+- **Thin community `Community 197`** (1 nodes): `_SYSTEM asserts educational steering exists and entertainment avoidance.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 198`** (1 nodes): `_SYSTEM asserts educational steering exists and entertainment avoidance.`
+- **Thin community `Community 198`** (1 nodes): `Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 199`** (1 nodes): `Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a`
+- **Thin community `Community 199`** (1 nodes): `Add knowledge-level columns to pre-existing DBs (sqlite lacks     ADD COLUMN IF`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 200`** (1 nodes): `Add knowledge-level columns to pre-existing DBs (sqlite lacks     ADD COLUMN IF`
+- **Thin community `Community 200`** (1 nodes): `Add one-pass learning-content columns to pre-existing reel tables.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 201`** (1 nodes): `Add one-pass learning-content columns to pre-existing reel tables.`
+- **Thin community `Community 201`** (1 nodes): `Connect to Postgres, retrying transient startup errors.      Returns an open psy`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 202`** (1 nodes): `Connect to Postgres, retrying transient startup errors.      Returns an open psy`
+- **Thin community `Community 202`** (1 nodes): `Return a reusable PostgreSQL connection, or create a fresh one.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 203`** (1 nodes): `Return a reusable PostgreSQL connection, or create a fresh one.`
+- **Thin community `Community 203`** (1 nodes): `Return a connection to the pool (or close it if the pool is full).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 204`** (1 nodes): `Return a connection to the pool (or close it if the pool is full).`
+- **Thin community `Community 204`** (1 nodes): `Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 205`** (1 nodes): `Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.`
+- **Thin community `Community 205`** (1 nodes): `Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 206`** (1 nodes): `Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a`
+- **Thin community `Community 206`** (1 nodes): `Base kwargs for upsert_reel_row — override specific fields as needed.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 207`** (1 nodes): `Base kwargs for upsert_reel_row — override specific fields as needed.`
+- **Thin community `Community 207`** (1 nodes): `Reel persisted with generation_id='gen-x' is:         - stored in the DB with th`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 208`** (1 nodes): `Reel persisted with generation_id='gen-x' is:         - stored in the DB with th`
+- **Thin community `Community 208`** (1 nodes): `Reel persisted with generation_id=None (or omitted) stores NULL         and is f`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 209`** (1 nodes): `Reel persisted with generation_id=None (or omitted) stores NULL         and is f`
+- **Thin community `Community 209`** (1 nodes): `The same (material_id, video_id, t_start, t_end) tuple under two         differe`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 210`** (1 nodes): `The same (material_id, video_id, t_start, t_end) tuple under two         differe`
+- **Thin community `Community 210`** (1 nodes): `Caller passes platforms=["yt","ig","tt"]; result must have platforms==["yt"]`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 211`** (1 nodes): `Caller passes platforms=["yt","ig","tt"]; result must have platforms==["yt"]`
+- **Thin community `Community 211`** (1 nodes): `When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 212`** (1 nodes): `When discover() returns a truthy "warning" (e.g. out-of-credits) and no videos,`
+- **Thin community `Community 212`** (1 nodes): `resolve_feed_urls extracts watch URLs from yt_dlp entries.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 213`** (1 nodes): `resolve_feed_urls extracts watch URLs from yt_dlp entries.`
+- **Thin community `Community 213`** (1 nodes): `resolve_feed_urls truncates to max_items.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 214`** (1 nodes): `resolve_feed_urls truncates to max_items.`
+- **Thin community `Community 214`** (1 nodes): `resolve_feed_urls swallows exceptions and returns [].`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 215`** (1 nodes): `resolve_feed_urls swallows exceptions and returns [].`
+- **Thin community `Community 215`** (1 nodes): `True when the error text indicates PG is still booting or unreachable.      Matc`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 216`** (1 nodes): `True when the error text indicates PG is still booting or unreachable.      Matc`
+- **Thin community `Community 216`** (1 nodes): `Connect to Postgres, retrying transient startup errors.      Returns an open psy`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 217`** (1 nodes): `Connect to Postgres, retrying transient startup errors.      Returns an open psy`
+- **Thin community `Community 217`** (1 nodes): `Return a reusable PostgreSQL connection, or create a fresh one.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 218`** (1 nodes): `Return a reusable PostgreSQL connection, or create a fresh one.`
+- **Thin community `Community 218`** (1 nodes): `Return a connection to the pool (or close it if the pool is full).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 219`** (1 nodes): `Return a connection to the pool (or close it if the pool is full).`
+- **Thin community `Community 219`** (1 nodes): `Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 220`** (1 nodes): `Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.`
+- **Thin community `Community 220`** (1 nodes): `Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 221`** (1 nodes): `Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a`
+- **Thin community `Community 221`** (1 nodes): `Title/author/duration/thumbnail via yt-dlp (metadata only, no download).     Laz`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 222`** (1 nodes): `Title/author/duration/thumbnail via yt-dlp (metadata only, no download).     Laz`
+- **Thin community `Community 222`** (1 nodes): `Resolve a channel/playlist URL to individual YouTube watch URLs (no download).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 223`** (1 nodes): `Resolve a channel/playlist URL to individual YouTube watch URLs (no download).`
+- **Thin community `Community 223`** (1 nodes): `A strict 'return only JSON of this shape' instruction appended on retry.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 224`** (1 nodes): `A strict 'return only JSON of this shape' instruction appended on retry.`
+- **Thin community `Community 224`** (1 nodes): `Return a validated ``schema`` instance from Gemini.      One structured call (Py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 225`** (1 nodes): `Return a validated ``schema`` instance from Gemini.      One structured call (Py`
+- **Thin community `Community 225`** (1 nodes): `Run ``call`` (returns response text or falsy) with backoff on transient errors.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 226`** (1 nodes): `Run ``call`` (returns response text or falsy) with backoff on transient errors.`
+- **Thin community `Community 226`** (1 nodes): `Return a JSON string conforming to `schema` (a Pydantic model class).      ``max`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 227`** (1 nodes): `Return a JSON string conforming to `schema` (a Pydantic model class).      ``max`
+- **Thin community `Community 227`** (1 nodes): `A Gemini image Part from raw JPEG bytes.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 228`** (1 nodes): `A Gemini image Part from raw JPEG bytes.`
+- **Thin community `Community 228`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 229`** (1 nodes): `Map a config string ('low'|'medium'|'high') → a ``types.MediaResolution`` enum`
+- **Thin community `Community 229`** (1 nodes): `A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 230`** (1 nodes): `A Gemini video Part from raw mp4 bytes, sent INLINE (use when the request is sma`
+- **Thin community `Community 230`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 231`** (1 nodes): `Return a JSON string conforming to ``schema`` from a VIDEO+text prompt.      ``p`
+- **Thin community `Community 231`** (1 nodes): `Find ``quote`` among ``words`` whose times fall in [lo_t, hi_t] and return the`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 232`** (1 nodes): `Find ``quote`` among ``words`` whose times fall in [lo_t, hi_t] and return the`
+- **Thin community `Community 232`** (1 nodes): `One Gemini comprehension pass → substantive topic clips. Returns (clips_spec, no`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 233`** (1 nodes): `One Gemini comprehension pass → substantive topic clips. Returns (clips_spec, no`
+- **Thin community `Community 233`** (1 nodes): `Base kwargs for upsert_reel_row — override specific fields as needed.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 234`** (1 nodes): `Base kwargs for upsert_reel_row — override specific fields as needed.`
+- **Thin community `Community 234`** (1 nodes): `Reel persisted with generation_id='gen-x' is:         - stored in the DB with th`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 235`** (1 nodes): `Reel persisted with generation_id='gen-x' is:         - stored in the DB with th`
+- **Thin community `Community 235`** (1 nodes): `Reel persisted with generation_id=None (or omitted) stores NULL         and is f`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 236`** (1 nodes): `Reel persisted with generation_id=None (or omitted) stores NULL         and is f`
+- **Thin community `Community 236`** (1 nodes): `The same (material_id, video_id, t_start, t_end) tuple under two         differe`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 237`** (1 nodes): `The same (material_id, video_id, t_start, t_end) tuple under two         differe`
+- **Thin community `Community 237`** (1 nodes): `Return True iff ``video_id`` appears live on YouTube.      Consults ``video_live`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 238`** (1 nodes): `Return True iff ``video_id`` appears live on YouTube.      Consults ``video_live`
+- **Thin community `Community 238`** (1 nodes): `Context managers patching discover + run.clip at the pipeline aliases.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 239`** (1 nodes): `Context managers patching discover + run.clip at the pipeline aliases.`
+- **Thin community `Community 239`** (1 nodes): `Connect to Postgres, retrying transient startup errors.      Returns an open psy`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 240`** (1 nodes): `Connect to Postgres, retrying transient startup errors.      Returns an open psy`
+- **Thin community `Community 240`** (1 nodes): `Return a reusable PostgreSQL connection, or create a fresh one.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 241`** (1 nodes): `Return a reusable PostgreSQL connection, or create a fresh one.`
+- **Thin community `Community 241`** (1 nodes): `Return a connection to the pool (or close it if the pool is full).`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 242`** (1 nodes): `Return a connection to the pool (or close it if the pool is full).`
+- **Thin community `Community 242`** (1 nodes): `Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 243`** (1 nodes): `Plain INSERT — raises DatabaseIntegrityError on unique constraint violation.`
+- **Thin community `Community 243`** (1 nodes): `Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 244`** (1 nodes): `Execute a non-SELECT statement (INSERT/UPDATE/DELETE) and return the number of a`
+- **Thin community `Community 244`** (1 nodes): `Temp workspace lifecycle + orphan sweeper.  Everything the ingestion pipeline do`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 245`** (1 nodes): `Temp workspace lifecycle + orphan sweeper.  Everything the ingestion pipeline do`
+- **Thin community `Community 245`** (1 nodes): `Create a fresh temp directory, yield its Path, and delete it on exit.      Uses`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 246`** (1 nodes): `Create a fresh temp directory, yield its Path, and delete it on exit.      Uses`
+- **Thin community `Community 246`** (1 nodes): `Delete any `reelai-ingest-*` directories older than `max_age_sec` from the syste`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 247`** (1 nodes): `Delete any `reelai-ingest-*` directories older than `max_age_sec` from the syste`
+- **Thin community `Community 247`** (1 nodes): `Generate stem variants for better lexical recall without a heavy stemmer.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 248`** (1 nodes): `Generate stem variants for better lexical recall without a heavy stemmer.`
+- **Thin community `Community 248`** (1 nodes): `LLM-direct clip picker.  Given a user query and a transcript, ask the LLM to ret`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 249`** (1 nodes): `LLM-direct clip picker.  Given a user query and a transcript, ask the LLM to ret`
+- **Thin community `Community 249`** (1 nodes): `A3 feature flag. Default ON; set LLM_TIMESTAMP_STRICT_VALIDATION=0 to     revert`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 250`** (1 nodes): `A3 feature flag. Default ON; set LLM_TIMESTAMP_STRICT_VALIDATION=0 to     revert`
+- **Thin community `Community 250`** (1 nodes): `Return a copy of the snap-telemetry counters for audit/health readers.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 251`** (1 nodes): `Return a copy of the snap-telemetry counters for audit/health readers.`
+- **Thin community `Community 251`** (1 nodes): `Raw LLM output for a single clip. Timestamps are unsnapped — the     caller runs`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 252`** (1 nodes): `Raw LLM output for a single clip. Timestamps are unsnapped — the     caller runs`
+- **Thin community `Community 252`** (1 nodes): `System prompt for the single-clip picker.      Emphasizes: (a) exactly one clip,`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 253`** (1 nodes): `System prompt for the single-clip picker.      Emphasizes: (a) exactly one clip,`
+- **Thin community `Community 253`** (1 nodes): `Parse the JSON response into a ClipPick or return None on any     malformation /`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 254`** (1 nodes): `Parse the JSON response into a ClipPick or return None on any     malformation /`
+- **Thin community `Community 254`** (1 nodes): `Reject picks outside duration bounds or referencing timestamps the     LLM inven`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 255`** (1 nodes): `Reject picks outside duration bounds or referencing timestamps the     LLM inven`
+- **Thin community `Community 255`** (1 nodes): `Try Gemini Flash first — cheapest + fastest. Rotates API keys on     rate-limit`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 256`** (1 nodes): `Try Gemini Flash first — cheapest + fastest. Rotates API keys on     rate-limit`
+- **Thin community `Community 256`** (1 nodes): `Groq Llama fallback when Gemini is unavailable or exhausted.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 257`** (1 nodes): `Groq Llama fallback when Gemini is unavailable or exhausted.`
+- **Thin community `Community 257`** (1 nodes): `Cerebras Llama 3.3 70B fallback when both Gemini and Groq fail.      Cerebras us`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 258`** (1 nodes): `Cerebras Llama 3.3 70B fallback when both Gemini and Groq fail.      Cerebras us`
+- **Thin community `Community 258`** (1 nodes): `Pick the single best clip for the query from the transcript via LLM.      `min_s`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 259`** (1 nodes): `Pick the single best clip for the query from the transcript via LLM.      `min_s`
+- **Thin community `Community 259`** (1 nodes): `Output of the global reranker. One per selected candidate, ordered     by virali`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 260`** (1 nodes): `Output of the global reranker. One per selected candidate, ordered     by virali`
+- **Thin community `Community 260`** (1 nodes): `Compact numbered rendering of candidates — metadata only, no transcript text.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 261`** (1 nodes): `Compact numbered rendering of candidates — metadata only, no transcript text.`
+- **Thin community `Community 261`** (1 nodes): `Deterministic ranking when the LLM chain returns nothing usable.     Combined we`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 262`** (1 nodes): `Deterministic ranking when the LLM chain returns nothing usable.     Combined we`
+- **Thin community `Community 262`** (1 nodes): `Rank candidates globally across the video. Sends metadata (not     transcript te`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 263`** (1 nodes): `Rank candidates globally across the video. Sends metadata (not     transcript te`
+- **Thin community `Community 263`** (1 nodes): `Phase 3 tests for `backend/app/services/clip_llm.py::rerank_clip_candidates_llm``
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 264`** (1 nodes): `Phase 3 tests for `backend/app/services/clip_llm.py::rerank_clip_candidates_llm``
+- **Thin community `Community 264`** (1 nodes): `20 cues × 30 seconds = 10 minutes of fake speech, two clearly distinct topics.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 265`** (1 nodes): `20 cues × 30 seconds = 10 minutes of fake speech, two clearly distinct topics.`
+- **Thin community `Community 265`** (1 nodes): `Build a chat-completions mock that returns `segments_payload` as JSON.`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 266`** (1 nodes): `Build a chat-completions mock that returns `segments_payload` as JSON.`
-  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 267`** (1 nodes): `Phase 2 + 3 unit tests for `backend/app/services/clip_boundary.py`.  Covered:`
+- **Thin community `Community 266`** (1 nodes): `Phase 2 + 3 unit tests for `backend/app/services/clip_boundary.py`.  Covered:`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `ReelService` connect `Community 1` to `Community 0`, `Community 2`, `Community 3`, `Community 36`, `Community 6`, `Community 19`, `Community 22`, `Community 24`?**
+- **Why does `ReelService` connect `Community 1` to `Community 0`, `Community 2`, `Community 3`, `Community 35`, `Community 6`, `Community 19`, `Community 22`, `Community 24`?**
   _High betweenness centrality (0.144) - this node is a cross-community bridge._
-- **Why does `IngestTranscriptCue` connect `Community 0` to `Community 1`, `Community 2`, `Community 69`?**
+- **Why does `IngestTranscriptCue` connect `Community 0` to `Community 1`, `Community 2`, `Community 70`?**
   _High betweenness centrality (0.075) - this node is a cross-community bridge._
 - **Why does `YouTubeService` connect `Community 1` to `Community 0`, `Community 2`, `Community 6`?**
   _High betweenness centrality (0.068) - this node is a cross-community bridge._

@@ -36,21 +36,25 @@ _client: Optional[genai.Client] = None
 _lock = threading.Lock()
 
 
+def _create_client() -> genai.Client:
+    if not config.GEMINI_API_KEY:
+        raise ProviderConfigurationError(
+            "GEMINI_API_KEY (or GOOGLE_API_KEY) is not set.",
+            provider="gemini",
+            operation="segmentation",
+        )
+    return genai.Client(
+        api_key=config.GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=120_000),  # ms; don't hang forever
+    )
+
+
 def get_client() -> genai.Client:
     global _client
     if _client is None:
         with _lock:
             if _client is None:
-                if not config.GEMINI_API_KEY:
-                    raise ProviderConfigurationError(
-                        "GEMINI_API_KEY (or GOOGLE_API_KEY) is not set.",
-                        provider="gemini",
-                        operation="segmentation",
-                    )
-                _client = genai.Client(
-                    api_key=config.GEMINI_API_KEY,
-                    http_options=types.HttpOptions(timeout=120_000),  # ms; don't hang forever
-                )
+                _client = _create_client()
     return _client
 
 
@@ -76,6 +80,7 @@ def _is_retryable(e: Exception) -> bool:
     return (
         "429" in s or "resource_exhausted" in s or "rate limit" in s or "rate_limit" in s
         or "503" in s or "500" in s or "unavailable" in s or "overloaded" in s
+        or "handler is closed" in s or "client has been closed" in s
     )
 
 
@@ -239,7 +244,6 @@ def generate_json_result(system: str, user: str, schema, temperature: float = 0.
     ``max_output_tokens`` bounds the response; raise it for calls whose JSON is large
     OR that use a thinking model (thinking tokens share this budget, so an 8192 cap can
     truncate the JSON on a preview/pro model that ignores thinking_budget=0)."""
-    client = get_client()
     mdl = model or config.GEMINI_MODEL
 
     def _make_config():
@@ -253,9 +257,20 @@ def generate_json_result(system: str, user: str, schema, temperature: float = 0.
 
     async def _call():
         raise_if_cancelled(should_cancel)
-        return await client.aio.models.generate_content(
-            model=mdl, contents=user, config=_make_config()
-        )
+        client = _create_client()
+        try:
+            return await client.aio.models.generate_content(
+                model=mdl, contents=user, config=_make_config()
+            )
+        finally:
+            try:
+                await client.aio.aclose()
+            except Exception:
+                pass
+            try:
+                client.close()
+            except Exception:
+                pass
 
     return run_cancellable(
         lambda: _retry_async(
