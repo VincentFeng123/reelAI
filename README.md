@@ -6,9 +6,9 @@ ReelAI turns study materials into a learner-specific feed of transcript-grounded
 
 - Vercel hosts only the Next.js application. `RAILWAY_BACKEND_ORIGIN` configures the same-origin `/api/*` rewrite.
 - Railway hosts the durable FastAPI process and generation worker.
-- PostgreSQL stores material data, generation jobs/events, provider usage, Supadata search evidence, and native transcript artifacts.
-- Supadata supplies YouTube search and native caption cues. Instagram, TikTok, audio download, local Whisper, and synthetic word timing are not supported.
-- Gemini selects self-contained clips on exact caption-cue boundaries. `SEGMENT_FALLBACK_MODEL` is the only permitted fallback and is disabled when blank.
+- PostgreSQL stores material data, generation jobs/events, provider usage, Supadata search evidence, and timestamped transcript artifacts.
+- Supadata supplies YouTube search and hosted timestamped transcript cues, preferring native captions and generating a transcript when captions are unavailable. Instagram, TikTok, audio download, local Whisper, and synthetic word timing are not supported.
+- Gemini selects self-contained clips on exact transcript-cue boundaries. `SEGMENT_FALLBACK_MODEL` is the only permitted fallback and is disabled when blank.
 
 ## Generation contract
 
@@ -29,7 +29,7 @@ Every event includes `job_id`, a monotonic `seq`, and a timestamp. Status and ca
 
 ## Retrieval and duration semantics
 
-Only canonical YouTube video, playlist, and channel URLs are accepted by ingestion surfaces. Discovery always requests subtitle-bearing results; Creative Commons and source-duration filters map directly to Supadata when selected. Transcripts use `mode=native`; a video without native captions is skipped.
+Only canonical YouTube video, playlist, and channel URLs are accepted by ingestion surfaces. Discovery always includes an unrestricted literal query, while duplicate and expanded searches may prefer HD sources. Creative Commons and source-duration filters map directly to Supadata when selected. Transcripts use `mode=auto`: native captions are used when available and Supadata generates hosted timestamped cues otherwise. The service does not download media or run local Whisper.
 
 Clip duration is a preference. Valid self-contained clips are persisted inside the global 1–180 second safety envelope. Serving ranks requested-range clips first, then fills shortages with the nearest shorter/longer clips and reports `duration_preference_met` plus `duration_fit`.
 

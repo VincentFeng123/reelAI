@@ -9,13 +9,38 @@ from . import rank, supadata_search
 from .cancellation import raise_if_cancelled
 from .errors import SearchError
 from .metadata import normalize_youtube_video_id
-from .provider_cache import ProviderCacheStore
+from .provider_cache import ProviderCacheStore, normalize_filters
 from .provider_runtime import GenerationContext
 
 if TYPE_CHECKING:
     from ..services.search_query_plan import SearchQueryPlan
 
 logger = logging.getLogger(__name__)
+
+
+def _request_filters(filters: dict | None, *, prefer_hd: bool) -> dict:
+    """Keep mandatory filters while making HD a per-request preference."""
+    normalized = normalize_filters(filters)
+    features = [
+        feature
+        for feature in normalized.get("features") or []
+        if feature == "creative-commons"
+    ]
+    if prefer_hd:
+        features.append("hd")
+    return {**normalized, "features": features}
+
+
+def _planned_query_offset(context: GenerationContext | None) -> int:
+    """Count expansion slots consumed by earlier slow acquisition passes."""
+    if context is None or context.budget.mode != "slow":
+        return 0
+    pass_count = max(1, int(context.budget.snapshot().get("passes") or 0))
+    if pass_count <= 1:
+        return 0
+    # The six-call initial pass spends two slots on literal coverage, leaving
+    # four expansions. Each earlier three-call continuation leaves one.
+    return 4 + max(0, pass_count - 2)
 
 
 def _select_ranked_candidates(ranked: list[dict], *, limit: int, excluded: set[str]) -> list[dict]:
@@ -142,53 +167,85 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
 
     planned_queries = []
     if effective_plan is not None:
-        pass_count = int(context.budget.snapshot().get("passes") or 0) if context is not None else 1
-        if context is not None and context.budget.mode == "slow" and pass_count > 1:
-            offset = 6 + (pass_count - 2) * 3
-        else:
-            offset = 0
-        planned_queries = effective_plan.query_window(offset=offset, limit=n)
-        expansion = {
-            # Segmentation stays focused on the requested concept. The plan's
-            # literal topic is the separate, immutable final relevance gate.
-            "corrected": topic,
-            "queries": [item.text for item in planned_queries],
-            "provider_used": "validated_query_plan",
-        }
-    else:
-        expansion = {
-            "corrected": topic,
-            "queries": [topic],
-            "provider_used": "literal_only",
-        }
-    if not expansion["queries"]:
-        raise SearchError("search query plan exhausted")
+        planned_queries = list(effective_plan.queries)
     exclude = {
         normalize_youtube_video_id(video_id) or str(video_id)
         for video_id in (exclude_video_ids or [])
     }
-    planned_by_query = {
-        " ".join(item.text.casefold().split()): item
-        for item in planned_queries
+    from ..services.search_query_plan import semantic_query_family
+
+    literal_query = " ".join(
+        str(
+            effective_plan.literal_query
+            if effective_plan is not None
+            else literal_topic or topic
+        ).split()
+    ) or topic
+    literal_key = " ".join(literal_query.casefold().split())
+    literal_plan = next(
+        (item for item in planned_queries if item.trust == "literal"),
+        None,
+    )
+    literal_metadata = {
+        "query": literal_query,
+        "query_family": (
+            literal_plan.family if literal_plan is not None
+            else semantic_query_family(literal_query)
+        ),
+        "query_trust": "literal",
+        "query_provenance": (
+            literal_plan.provenance if literal_plan is not None else "literal"
+        ),
+        "hd_preferred": False,
     }
+    requests = [literal_metadata]
+    if n >= 2:
+        requests.append({**literal_metadata, "hd_preferred": True})
+
+    expansion_candidates = [
+        item
+        for item in planned_queries
+        if item.trust != "literal"
+        and " ".join(item.text.casefold().split()) != literal_key
+    ]
+    expansion_offset = _planned_query_offset(context)
+    for planned in expansion_candidates[expansion_offset:]:
+        if len(requests) >= n:
+            break
+        requests.append(
+            {
+                "query": planned.text,
+                "query_family": planned.family,
+                "query_trust": planned.trust,
+                "query_provenance": planned.provenance,
+                "hd_preferred": True,
+            }
+        )
+
+    def annotate_result_sets(per_query: list[dict]) -> None:
+        for result_set, request in zip(per_query, requests):
+            result_set.update(
+                query_family=request["query_family"],
+                query_trust=request["query_trust"],
+                query_provenance=request["query_provenance"],
+                hd_preferred=request["hd_preferred"],
+            )
 
     def consensus_reached(per_query: list[dict]) -> bool:
-        for result_set in per_query:
-            planned = planned_by_query.get(
-                " ".join(str(result_set.get("query") or "").casefold().split())
-            )
-            if planned is not None:
-                result_set["query_family"] = planned.family
-                result_set["query_trust"] = planned.trust
-                result_set["query_provenance"] = planned.provenance
+        annotate_result_sets(per_query)
         return _consensus_count(per_query, exclude) >= limit
 
+    request_queries = [str(request["query"]) for request in requests]
     res = supadata_search.search_all(
-        expansion["queries"][:n],
+        request_queries,
         filters,
+        request_filters=[
+            _request_filters(filters, prefer_hd=bool(request["hd_preferred"]))
+            for request in requests
+        ],
         minimum_queries=(
-            len(expansion["queries"][:n]) if context is not None and context.budget.mode == "slow"
-            else min(3, len(expansion["queries"][:n]))
+            len(requests) if context is not None and context.budget.mode == "slow"
+            else min(3, len(requests))
         ),
         stop_when=consensus_reached,
         should_cancel=should_cancel,
@@ -197,19 +254,9 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
         cache_store=cache_store,
     )
     raise_if_cancelled(should_cancel)
-    for result_set, planned in zip(res["per_query"], planned_queries):
-        result_set["query_family"] = planned.family
-        result_set["query_trust"] = planned.trust
-        result_set["query_provenance"] = planned.provenance
-    if not planned_queries:
-        from ..services.search_query_plan import semantic_query_family
-
-        for result_set in res["per_query"]:
-            result_set["query_family"] = semantic_query_family(result_set.get("query") or topic)
-            result_set["query_trust"] = "literal"
-            result_set["query_provenance"] = "literal"
+    annotate_result_sets(res["per_query"])
     ranked = rank.merge_and_rank(res["per_query"], level=level)
     videos = _select_ranked_candidates(ranked, limit=limit, excluded=exclude)
-    return {"corrected": expansion["corrected"], "videos": videos,
+    return {"corrected": topic, "videos": videos,
             "credits_used": res["credits_used"], "warning": res["warning"],
             "query_plan": effective_plan}

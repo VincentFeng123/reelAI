@@ -239,7 +239,7 @@ export type AssessmentSnoozeResponse = {
   assessment_ready: false;
 };
 
-// POST /api/ingest/url — native-caption YouTube ingestion.
+// POST /api/ingest/url — YouTube ingestion using hosted timestamped transcript cues.
 
 export type IngestUrlRequest = {
   source_url: string;

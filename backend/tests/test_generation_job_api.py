@@ -493,7 +493,7 @@ def test_preflight_uses_one_metadata_search_and_no_generation(monkeypatch) -> No
             "videos": [{"id": "dQw4w9WgXcQ"}],
             "cache_hit": False,
             "evidence_age_sec": 0,
-            "filters_applied": {"features": ["subtitles"]},
+            "filters_applied": {"features": []},
         },
     )
     monkeypatch.setattr(

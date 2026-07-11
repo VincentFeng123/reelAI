@@ -104,9 +104,10 @@ async def _search_one_async(
         params = {
             "query": " ".join(str(query or "").split()),
             "type": "video",
-            "features": wire_features,
             "sortBy": "relevance",
         }
+        if wire_features:
+            params["features"] = wire_features
         if normalized_filters["upload_date"] != "all":
             params["uploadDate"] = normalized_filters["upload_date"]
         if normalized_filters["duration"] != "all":
@@ -254,6 +255,7 @@ def search_all(
     queries: list[str],
     filters: dict[str, Any] | None = None,
     *,
+    request_filters: list[dict[str, Any] | None] | None = None,
     minimum_queries: int = 0,
     stop_when: Callable[[list[dict]], bool] | None = None,
     should_cancel: Callable[[], bool] | None = None,
@@ -265,9 +267,14 @@ def search_all(
     per_query: list[dict] = []
     for index, query in enumerate(queries):
         raise_if_cancelled(should_cancel)
+        effective_filters = (
+            request_filters[index]
+            if request_filters is not None and index < len(request_filters)
+            else filters
+        )
         result = search_one(
             query,
-            filters,
+            effective_filters,
             should_cancel,
             language=language,
             context=context,

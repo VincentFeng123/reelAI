@@ -398,7 +398,7 @@ COMMUNITY_SETTINGS_RATE_LIMIT_PER_WINDOW = 90
 INGEST_URL_RATE_LIMIT_PER_WINDOW = 6
 INGEST_FEED_RATE_LIMIT_PER_WINDOW = 2
 INGEST_SEARCH_RATE_LIMIT_PER_WINDOW = 3
-# Topic-cut runs native-caption retrieval plus Gemini segmentation for one
+# Topic-cut runs timestamped-transcript retrieval plus Gemini segmentation for one
 # video. Six requests per window matches /api/ingest/url's full-video budget.
 INGEST_TOPIC_CUT_RATE_LIMIT_PER_WINDOW = 6
 MAX_COMMUNITY_HISTORY_ITEMS = 120
@@ -3116,6 +3116,45 @@ def _generation_job_db_should_stop(
     )
 
 
+def _generation_exhaustion_message(counters: dict[str, int]) -> str:
+    """Describe the furthest successful pipeline stage without blaming captions."""
+    discovered = int(counters.get("discovered_videos") or 0)
+    transcripts = int(counters.get("usable_transcripts") or 0)
+    transcript_failures = int(counters.get("transcript_failures") or 0)
+    timeouts = int(counters.get("transcript_timeouts") or 0)
+    gemini_empty_results = int(counters.get("gemini_empty_results") or 0)
+    topic_rejections = int(counters.get("topic_rejections") or 0)
+
+    if discovered <= 0:
+        return "No matching YouTube videos were discovered for this topic."
+    if transcripts <= 0:
+        if timeouts > 0:
+            return (
+                "Matching YouTube videos were discovered, but no usable timestamped "
+                "transcripts were available before the generation deadline."
+            )
+        if transcript_failures > 0:
+            return (
+                "Matching YouTube videos were discovered, but none provided a usable "
+                "timestamped transcript."
+            )
+        return (
+            "Matching YouTube videos were discovered, but transcript retrieval did not "
+            "complete."
+        )
+    if topic_rejections > 0:
+        return (
+            "Videos with usable timestamped transcripts were found, but no clips passed "
+            "the topic and quality checks."
+        )
+    if gemini_empty_results > 0:
+        return (
+            "Videos with usable timestamped transcripts were found, but no clips passed "
+            "the content quality checks."
+        )
+    return "No discovered YouTube videos produced valid clips."
+
+
 def _run_leased_generation_job(
     job_row: dict[str, Any],
     worker_stop: threading.Event | None = None,
@@ -3327,6 +3366,7 @@ def _run_leased_generation_job(
                 final_reels = []
 
             usage_records = context.usage()
+            stage_counters = context.counters()
             model_records = [row for row in usage_records if row.get("operation") == "segmentation"]
             model_used = str((model_records[-1] if model_records else {}).get("model_used") or "") or None
             quality_degraded = any(bool(row.get("quality_degraded")) for row in model_records)
@@ -3356,10 +3396,19 @@ def _run_leased_generation_job(
                 lease_owner=lease_owner,
                 model_used=model_used,
                 quality_degraded=quality_degraded,
-                usage={"budget": context.budget.snapshot(), "provider_calls": usage_records},
+                usage={
+                    "budget": context.budget.snapshot(),
+                    "provider_calls": usage_records,
+                    "counters": stage_counters,
+                },
                 error_code="inventory_exhausted" if terminal_status == "exhausted" else None,
                 error_message=(
-                    "No eligible YouTube videos with native captions produced valid clips."
+                    _generation_exhaustion_message(stage_counters)
+                    if terminal_status == "exhausted"
+                    else None
+                ),
+                error_detail=(
+                    {"counters": stage_counters}
                     if terminal_status == "exhausted"
                     else None
                 ),
@@ -3381,10 +3430,14 @@ def _run_leased_generation_job(
                 status="failed",
                 result_generation_id=generation_id or None,
                 lease_owner=lease_owner,
-                usage={"budget": context.budget.snapshot(), "provider_calls": context.usage()},
+                usage={
+                    "budget": context.budget.snapshot(),
+                    "provider_calls": context.usage(),
+                    "counters": context.counters(),
+                },
                 error_code=exc.code,
                 error_message=str(exc),
-                error_detail=exc.as_dict(),
+                error_detail={**exc.as_dict(), "counters": context.counters()},
             )
     except JobLeaseLostError:
         logger.info("generation worker lost lease job_id=%s", job_id)
@@ -3397,9 +3450,14 @@ def _run_leased_generation_job(
                 status="failed",
                 result_generation_id=generation_id or None,
                 lease_owner=lease_owner,
-                usage={"budget": context.budget.snapshot(), "provider_calls": context.usage()},
+                usage={
+                    "budget": context.budget.snapshot(),
+                    "provider_calls": context.usage(),
+                    "counters": context.counters(),
+                },
                 error_code="generation_failed",
                 error_message=str(exc),
+                error_detail={"counters": context.counters()},
             )
     finally:
         local_stop.set()
@@ -4799,7 +4857,7 @@ def _reject_multi_platform_search(enabled: bool) -> None:
 @app.post("/api/ingest/url", response_model=IngestResult)
 async def ingest_url_endpoint(request: Request, payload: IngestRequest) -> IngestResult:
     """
-    Process one canonical YouTube video URL with native captions.
+    Process one canonical YouTube video URL with a timestamped transcript.
     """
     _enforce_rate_limit(request, "ingest-url", limit=INGEST_URL_RATE_LIMIT_PER_WINDOW)
     _reject_multi_platform_search(payload.multi_platform_search)
@@ -4832,6 +4890,8 @@ async def ingest_url_endpoint(request: Request, payload: IngestRequest) -> Inges
         )
     except ClipEngineCancellationError as exc:
         raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
+    except ClipEngineProviderError as exc:
+        raise _provider_error_to_http(exc) from exc
     except (
         IngestUnsupportedSourceError,
         IngestDownloadError,
@@ -4899,6 +4959,8 @@ async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutReq
         )
     except ClipEngineCancellationError as exc:
         raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
+    except ClipEngineProviderError as exc:
+        raise _provider_error_to_http(exc) from exc
     except (
         IngestUnsupportedSourceError,
         IngestDownloadError,
@@ -4928,7 +4990,7 @@ async def ingest_topic_cut_endpoint(request: Request, payload: IngestTopicCutReq
 @app.post("/api/ingest/search", response_model=IngestSearchResult)
 async def ingest_search_endpoint(request: Request, payload: IngestSearchRequest) -> IngestSearchResult:
     """
-    YouTube-only discovery with native-caption ingestion.
+    YouTube-only discovery with timestamped-transcript ingestion.
     """
     _enforce_rate_limit(request, "ingest-search", limit=INGEST_SEARCH_RATE_LIMIT_PER_WINDOW)
     _reject_multi_platform_search(payload.multi_platform_search)
@@ -4960,6 +5022,8 @@ async def ingest_search_endpoint(request: Request, payload: IngestSearchRequest)
         )
     except ClipEngineCancellationError as exc:
         raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
+    except ClipEngineProviderError as exc:
+        raise _provider_error_to_http(exc) from exc
     except (
         IngestUnsupportedSourceError,
         IngestDownloadError,
@@ -5024,6 +5088,8 @@ async def ingest_feed_endpoint(request: Request, payload: IngestFeedRequest) -> 
         )
     except ClipEngineCancellationError as exc:
         raise HTTPException(status_code=499, detail="Ingestion cancelled.") from exc
+    except ClipEngineProviderError as exc:
+        raise _provider_error_to_http(exc) from exc
     except (
         IngestUnsupportedSourceError,
         IngestDownloadError,
@@ -5092,6 +5158,7 @@ def _material_preflight_query(conn, material_id: str, concept_id: str | None = N
 
 def _provider_error_to_http(exc: ClipEngineProviderError) -> HTTPException:
     status_by_code = {
+        "transcript_unavailable": 422,
         "provider_quota_exhausted": 402,
         "provider_rate_limited": 429,
         "provider_configuration": 503,
@@ -5165,9 +5232,9 @@ def can_generate_reels(request: Request, payload: ReelsGenerateRequest):
     except ClipEngineProviderError as exc:
         raise _provider_error_to_http(exc) from exc
     evidence["message"] = (
-        "YouTube search found caption-bearing candidates."
+        "YouTube search found matching candidates."
         if evidence["availability"] == "available"
-        else "No matching caption-bearing YouTube candidates were found."
+        else "No matching YouTube candidates were found."
     )
     evidence.pop("provider_called", None)
     return evidence
@@ -5220,7 +5287,7 @@ def can_generate_reels_any(request: Request, payload: ReelsCanGenerateAnyRequest
     for result in cached_results:
         if result["availability"] == "available":
             result["materials_checked"] = len(queries)
-            result["message"] = "Cached YouTube evidence contains caption-bearing candidates."
+            result["message"] = "Cached YouTube evidence contains matching candidates."
             result.pop("provider_called", None)
             return result
 
@@ -5241,7 +5308,7 @@ def can_generate_reels_any(request: Request, payload: ReelsCanGenerateAnyRequest
         cached_results[first_missing] = provider_result
         if provider_result["availability"] == "available":
             provider_result["materials_checked"] = len(queries)
-            provider_result["message"] = "YouTube search found caption-bearing candidates."
+            provider_result["message"] = "YouTube search found matching candidates."
             provider_result.pop("provider_called", None)
             return provider_result
 
@@ -5259,7 +5326,7 @@ def can_generate_reels_any(request: Request, payload: ReelsCanGenerateAnyRequest
         "filters_applied": normalize_provider_filters(filters),
         "materials_checked": len(queries),
         "message": (
-            "Cached and provider evidence found no matching caption-bearing candidates."
+            "Cached and provider evidence found no matching YouTube candidates."
             if all_known
             else "Some materials have no fresh search evidence; no more than one provider search was issued."
         ),

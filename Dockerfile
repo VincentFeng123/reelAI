@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 # Railway deploy image for the FastAPI backend.
 #
-# The backend is a durable Railway process. It uses Supadata native captions,
-# so no audio download, ffmpeg, or local Whisper runtime is installed.
+# The backend is a durable Railway process. Supadata supplies hosted timestamped
+# transcript cues (native when available, generated otherwise), so no audio
+# download, ffmpeg, or local Whisper runtime is installed.
 #
 # The `# syntax=docker/dockerfile:1` header tells BuildKit to use the latest
 # stable Dockerfile frontend (features like heredoc, RUN --mount=, etc).

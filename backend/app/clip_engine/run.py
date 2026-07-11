@@ -1,6 +1,6 @@
 # backend/app/clip_engine/run.py
 """Inline clip runner — replaces the practice clipper's job/SSE surface with a
-plain function. Supadata transcript -> one Gemini pass -> embed clip specs.
+plain function. Supadata timed transcript -> one Gemini pass -> embed clip specs.
 """
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from .metadata import extract_video_id
 
 
 def _transcribe(url: str, video_id: str, settings: dict) -> dict:
-    """Fetch a timestamped Supadata transcript as {segments, words, duration, ...}."""
+    """Fetch a hosted timestamped transcript as {segments, words, duration, ...}."""
     from .clipper.pipeline.transcribe import transcribe_supadata  # lazy
     try:
         return transcribe_supadata(url, video_id, settings)

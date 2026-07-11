@@ -459,7 +459,7 @@ def build_search_query_plan(
 
 
 def topic_signature_evidence(text: str, plan: SearchQueryPlan) -> list[str]:
-    """Return accepted plan terms found in an exact native transcript window.
+    """Return accepted plan terms found in an exact validated transcript window.
 
     Hash embeddings are never consulted. When Gemini marks the literal as
     cross-domain ambiguous, matching the root alone is insufficient: the window

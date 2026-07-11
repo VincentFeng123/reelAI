@@ -1,10 +1,10 @@
 """
-Reel ingestion pipeline for YouTube native-caption sources.
+Reel ingestion pipeline for transcript-grounded YouTube sources.
 
 This package provides a YouTube-only pipeline that:
   1. Canonicalizes YouTube video, playlist, and channel URLs.
-  2. Retrieves search metadata and native caption cues through Supadata.
-  3. Uses Gemini to propose clips grounded in exact caption cue IDs.
+  2. Retrieves search metadata and timestamped transcript cues through Supadata.
+  3. Uses Gemini to propose clips grounded in exact transcript cue IDs.
   4. Persists only clips inside the global 1-180 second safety envelope.
   5. Returns `ReelOut`-compatible payloads for the iOS and web clients.
 

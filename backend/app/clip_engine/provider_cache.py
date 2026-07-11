@@ -1,4 +1,4 @@
-"""Versioned DB caches for Supadata search evidence and native transcript artifacts."""
+"""Versioned DB caches for Supadata search evidence and timed transcript artifacts."""
 from __future__ import annotations
 
 import hashlib
@@ -22,6 +22,10 @@ SEARCH_EMPTY_TTL_SEC = 15 * 60
 TRANSCRIPT_TTL_SEC = 30 * 24 * 60 * 60
 MAX_TRANSCRIPT_DURATION_SEC = 24 * 60 * 60
 MAX_CUE_DURATION_SEC = 60 * 60
+SUPPORTED_SEARCH_FEATURES = frozenset({
+    "hd",
+    "creative-commons",
+})
 
 
 def normalize_query(value: str) -> str:
@@ -59,8 +63,8 @@ def normalize_filters(filters: Mapping[str, Any] | None) -> dict[str, Any]:
         for value in (source.get("features") or [])
         if str(value).strip()
     }
-    features = {"subtitles"}
-    if _truthy(source.get("creative_commons_only")) or "creative-commons" in raw_features:
+    features = raw_features.intersection(SUPPORTED_SEARCH_FEATURES)
+    if _truthy(source.get("creative_commons_only")):
         features.add("creative-commons")
     raw_sort = str(source.get("sortBy") or source.get("sort_by") or "relevance").strip().casefold()
     sort_by = {
@@ -208,7 +212,10 @@ def validate_transcript_payload(payload: Any) -> TranscriptArtifact | None:
     provider = str(payload.get("provider") or "").strip().casefold()
     requested = normalize_language(str(payload.get("requested_language") or ""))
     returned = normalize_language(str(payload.get("returned_language") or ""))
-    native_mode = payload.get("native_mode") is True
+    raw_native_mode = payload.get("native_mode")
+    if not isinstance(raw_native_mode, bool):
+        return None
+    native_mode = raw_native_mode
     artifact_key = str(payload.get("artifact_key") or "").strip()
     created_at = str(payload.get("created_at") or "").strip()
     raw_segments = payload.get("segments")
@@ -218,7 +225,6 @@ def validate_transcript_payload(payload: Any) -> TranscriptArtifact | None:
         or provider != "supadata"
         or not requested
         or not returned
-        or not native_mode
         or not artifact_key
         or not created_at
         or _parse_time(created_at) is None
@@ -277,7 +283,7 @@ def validate_transcript_payload(payload: Any) -> TranscriptArtifact | None:
         provider=provider,
         requested_language=requested,
         returned_language=returned,
-        native_mode=True,
+        native_mode=native_mode,
         schema_version=schema_version,
     )
     if artifact_key != expected_key:
@@ -288,7 +294,7 @@ def validate_transcript_payload(payload: Any) -> TranscriptArtifact | None:
         provider=provider,
         requested_language=requested,
         returned_language=returned,
-        native_mode=True,
+        native_mode=native_mode,
         schema_version=schema_version,
         segments=segments,
         duration_sec=duration_sec,
@@ -504,7 +510,7 @@ class DatabaseProviderCache:
                         "provider": validated.provider,
                         "requested_language": validated.requested_language,
                         "returned_language": validated.returned_language,
-                        "native_mode": 1,
+                        "native_mode": 1 if validated.native_mode else 0,
                         "schema_version": str(validated.schema_version),
                         "artifact_json": dumps_json(payload),
                         "cue_count": len(validated.segments),

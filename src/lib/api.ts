@@ -861,6 +861,11 @@ export async function generateReels(params: GenerateReelsParams): Promise<ReelsG
 }
 
 // Maps the web app's settings-friendly camelCase to the snake_case the backend expects.
+/**
+ * POST /api/ingest/url — ingests a canonical YouTube video URL using hosted
+ * timestamped transcript cues. Native captions are preferred but
+ * optional; no media download or local Whisper runtime is used.
+ */
 type IngestUrlParams = {
   sourceUrl: string;
   materialId?: string | null;
@@ -872,11 +877,6 @@ type IngestUrlParams = {
   signal?: AbortSignal;
 };
 
-/**
- * POST /api/ingest/url — ingests a canonical YouTube video, playlist, or channel
- * URL using native caption timing. Sources without native captions are rejected;
- * no media download or generated-transcript fallback is used.
- */
 type IngestSearchParams = {
   query: string;
   maxPerPlatform?: number;
@@ -891,9 +891,9 @@ type IngestSearchParams = {
 };
 
 /**
- * POST /api/ingest/search — YouTube-only discovery using native captions.
- * Videos without native captions are skipped; the backend never falls back to
- * local or generated transcription.
+ * POST /api/ingest/search — YouTube-only discovery using hosted timestamped
+ * transcript cues. Native captions are preferred but optional; no media download
+ * or local Whisper runtime is used.
  */
 export async function ingestSearch(params: IngestSearchParams): Promise<IngestSearchResult> {
   const body: IngestSearchRequest = {

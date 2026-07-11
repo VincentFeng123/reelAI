@@ -42,7 +42,7 @@ class DownloadError(IngestError):
 
 
 class TranscriptionError(IngestError):
-    """The source has no usable native captions."""
+    """The source has no usable timestamped transcript."""
 
     status_code = 502
 

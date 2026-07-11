@@ -69,6 +69,42 @@ def test_sqlite_provider_cache_round_trip_and_tombstone_filter(monkeypatch, tmp_
         schema_version=TRANSCRIPT_SCHEMA_VERSION,
     ) == artifact
 
+    auto_artifact = TranscriptArtifact(
+        artifact_key=transcript_artifact_key(
+            video_id=VIDEO_ID,
+            provider="supadata",
+            requested_language="fr",
+            returned_language="fr",
+            native_mode=False,
+        ),
+        video_id=VIDEO_ID,
+        provider="supadata",
+        requested_language="fr",
+        returned_language="fr",
+        native_mode=False,
+        schema_version=TRANSCRIPT_SCHEMA_VERSION,
+        segments=[
+            {"cue_id": "auto-0", "start": 0.0, "end": 2.0, "text": "cue auto", "lang": "fr"}
+        ],
+        duration_sec=2.0,
+        created_at=created_at,
+    )
+    cache.put_transcript(auto_artifact)
+    assert cache.get_transcript(
+        video_id=VIDEO_ID,
+        provider="supadata",
+        requested_language="fr",
+        native_mode=False,
+        schema_version=TRANSCRIPT_SCHEMA_VERSION,
+    ) == auto_artifact
+    with db.get_conn() as connection:
+        stored = db.fetch_one(
+            connection,
+            "SELECT native_mode FROM transcript_artifacts WHERE cache_key = ?",
+            (auto_artifact.artifact_key,),
+        )
+    assert int(stored["native_mode"]) == 0
+
     with db.get_conn(transactional=True) as connection:
         db.upsert(
             connection,

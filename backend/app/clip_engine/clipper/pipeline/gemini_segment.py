@@ -1,4 +1,4 @@
-"""Gemini educational segmentation over exact native-caption cue boundaries."""
+"""Gemini educational segmentation over validated timestamped cue boundaries."""
 from __future__ import annotations
 
 import re
@@ -105,7 +105,7 @@ def _prompts(lines: str, n: int, topic: str = "") -> tuple[str, str]:
             "material relevant to that context.\n"
         )
     system = (
-        "Select self-contained educational clips from native caption cues. "
+        "Select self-contained educational clips from timestamped transcript cues. "
         "Each transcript line has a local line index and an immutable cue_id. "
         "Use only the supplied lines. Do not repair, clamp, or invent indices. "
         "start_quote must occur verbatim in start_line after Unicode/case normalization; "
@@ -246,7 +246,7 @@ def _quality_order(clips: list[dict], *, max_clips: int) -> list[dict]:
 
 
 def _plan_to_clips(plan: _Plan, segs: list[dict], words: list[dict], settings: dict) -> list[dict]:
-    del words  # Native captions intentionally provide no synthetic word times.
+    del words  # Provider cues intentionally carry no synthetic word times.
     segments = _with_cue_ids(segs)
     count = len(segments)
     if not count:
@@ -438,6 +438,6 @@ def segment_clips(
         progress(1.0, f"{len(clips)} clip(s) ready")
     return (
         clips,
-        f"{len(clips)} grounded topic clip(s) from {len(segments)} native cues "
+        f"{len(clips)} grounded topic clip(s) from {len(segments)} timed cues "
         f"across {attempted_batches} Gemini batch(es).",
     )

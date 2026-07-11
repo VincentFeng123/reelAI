@@ -12,6 +12,27 @@ from .errors import ProviderBudgetExceededError
 
 ProviderOperation = Literal["search", "transcript", "segmentation"]
 GenerationMode = Literal["fast", "slow"]
+GenerationCounter = Literal[
+    "discovered_videos",
+    "usable_transcripts",
+    "transcript_failures",
+    "transcript_timeouts",
+    "gemini_empty_results",
+    "topic_rejections",
+    "persisted_clips",
+    "provider_failures",
+]
+
+GENERATION_COUNTERS: tuple[GenerationCounter, ...] = (
+    "discovered_videos",
+    "usable_transcripts",
+    "transcript_failures",
+    "transcript_timeouts",
+    "gemini_empty_results",
+    "topic_rejections",
+    "persisted_clips",
+    "provider_failures",
+)
 
 MAX_PROVIDER_RETRIES = 2
 MAX_RETRY_AFTER_SEC = 30.0
@@ -179,6 +200,9 @@ class GenerationContext:
         self.usage_sink = usage_sink
         self.cache_store = cache_store
         self._usage: list[ProviderUsageRecord] = []
+        self._counters: dict[GenerationCounter, int] = {
+            name: 0 for name in GENERATION_COUNTERS
+        }
         self._lock = threading.Lock()
 
     def reserve(self, operation: ProviderOperation) -> int:
@@ -189,6 +213,21 @@ class GenerationContext:
             self._usage.append(record)
         if self.usage_sink is not None:
             self.usage_sink(record)
+
+    def increment_counter(self, name: GenerationCounter, count: int = 1) -> int:
+        """Atomically increment a generation-stage diagnostic counter."""
+        if name not in self._counters:
+            raise ValueError(f"unknown generation counter: {name}")
+        amount = int(count)
+        if amount < 0:
+            raise ValueError("generation counters cannot be decremented")
+        with self._lock:
+            self._counters[name] += amount
+            return self._counters[name]
+
+    def counters(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._counters)
 
     def record_http(
         self,

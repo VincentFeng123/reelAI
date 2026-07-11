@@ -1,6 +1,8 @@
-"""Supadata native-caption client backed by validated transcript artifacts."""
+"""Supadata timed-transcript client backed by validated transcript artifacts."""
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
@@ -10,13 +12,13 @@ import httpx
 from . import config
 from ..cancellation import raise_if_cancelled, run_cancellable, sleep_with_probe
 from ..errors import (
-    CaptionsUnavailableError,
     ProviderAuthenticationError,
     ProviderError,
     ProviderQuotaError,
     ProviderRateLimitError,
     ProviderRequestError,
     ProviderTransientError,
+    TranscriptUnavailableError,
 )
 from ..metadata import normalize_youtube_video_id
 from ..provider_cache import (
@@ -33,6 +35,47 @@ from ..provider_runtime import (
     MAX_PROVIDER_RETRIES,
     bounded_retry_after,
 )
+
+DEFAULT_TRANSCRIPT_DEADLINE_SEC = 180.0
+TRANSCRIPT_POLL_INTERVAL_SEC = 1.0
+
+
+def _deadline_or_default(value: float | None) -> float:
+    try:
+        parsed = float(value) if value is not None else float("nan")
+    except (TypeError, ValueError):
+        parsed = float("nan")
+    if math.isfinite(parsed):
+        return parsed
+    return time.monotonic() + DEFAULT_TRANSCRIPT_DEADLINE_SEC
+
+
+def _remaining_seconds(deadline_monotonic: float) -> float:
+    return max(0.0, deadline_monotonic - time.monotonic())
+
+
+def _raise_if_deadline_exceeded(deadline_monotonic: float) -> None:
+    if _remaining_seconds(deadline_monotonic) <= 0:
+        raise ProviderTransientError(
+            "Supadata transcript retrieval timed out.",
+            provider="supadata",
+            operation="transcript",
+            detail="generation deadline exceeded",
+        )
+
+
+async def _sleep_before_retry(
+    seconds: float,
+    *,
+    should_cancel: Callable[[], bool] | None,
+    deadline_monotonic: float,
+) -> None:
+    _raise_if_deadline_exceeded(deadline_monotonic)
+    await sleep_with_probe(
+        min(max(0.0, seconds), _remaining_seconds(deadline_monotonic)),
+        should_cancel,
+    )
+    _raise_if_deadline_exceeded(deadline_monotonic)
 
 
 def _error_detail(response: httpx.Response) -> str:
@@ -62,7 +105,9 @@ def _failure(
     if status == 402:
         return ProviderQuotaError("Supadata quota is exhausted.", **kwargs)
     if status == 404:
-        return CaptionsUnavailableError("Native captions are unavailable for this video.", **kwargs)
+        return TranscriptUnavailableError(
+            "No usable timestamped transcript is available for this video.", **kwargs
+        )
     if status == 429:
         return ProviderRateLimitError(
             "Supadata transcript retrieval is rate limited.",
@@ -83,9 +128,11 @@ async def _request(
     should_cancel: Callable[[], bool] | None,
     context: GenerationContext | None,
     reserve_budget: bool,
+    deadline_monotonic: float,
 ) -> tuple[int, dict[str, Any]]:
     for retry_index in range(MAX_PROVIDER_RETRIES + 1):
         raise_if_cancelled(should_cancel)
+        _raise_if_deadline_exceeded(deadline_monotonic)
         attempt = retry_index + 1
         if reserve_budget and context is not None:
             context.reserve("transcript")
@@ -94,6 +141,7 @@ async def _request(
                 f"{config.SUPADATA_BASE}{path}",
                 params=params,
                 headers={"x-api-key": api_key, "Accept": "application/json"},
+                timeout=max(0.001, min(90.0, _remaining_seconds(deadline_monotonic))),
             )
         except httpx.RequestError as exc:
             if context is not None:
@@ -106,7 +154,11 @@ async def _request(
                     metadata={"poll": not reserve_budget},
                 )
             if retry_index < MAX_PROVIDER_RETRIES:
-                await sleep_with_probe(min(30.0, 1.2 * attempt), should_cancel)
+                await _sleep_before_retry(
+                    min(30.0, 1.2 * attempt),
+                    should_cancel=should_cancel,
+                    deadline_monotonic=deadline_monotonic,
+                )
                 continue
             raise ProviderTransientError(
                 "Could not reach Supadata transcript retrieval.",
@@ -136,9 +188,10 @@ async def _request(
         if status == 429 or 500 <= status <= 599:
             retry_after = bounded_retry_after(response.headers)
             if retry_index < MAX_PROVIDER_RETRIES:
-                await sleep_with_probe(
+                await _sleep_before_retry(
                     retry_after if retry_after is not None else min(30.0, 1.2 * attempt),
-                    should_cancel,
+                    should_cancel=should_cancel,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 continue
             raise _failure(response, retry_after=retry_after)
@@ -204,7 +257,10 @@ async def _fetch_transcript_artifact_async(
     *,
     context: GenerationContext | None,
     cache_store: ProviderCacheStore | None,
+    deadline_monotonic: float | None,
 ) -> TranscriptArtifact:
+    effective_deadline = _deadline_or_default(deadline_monotonic)
+    _raise_if_deadline_exceeded(effective_deadline)
     video_id = normalize_youtube_video_id(url)
     if video_id is None:
         raise ProviderRequestError(
@@ -220,15 +276,18 @@ async def _fetch_transcript_artifact_async(
             operation="transcript",
         )
     requested_language = normalize_language(lang) or "en"
-    cached = store.get_transcript(
-        video_id=video_id,
-        provider="supadata",
-        requested_language=requested_language,
-        native_mode=True,
-        schema_version=TRANSCRIPT_SCHEMA_VERSION,
-    )
-    if cached is not None:
-        return cached
+    # Native-only artifacts from earlier runs are the fastest and most precise
+    # cache hit. Auto-mode artifacts are the caption-optional fallback.
+    for native_mode in (True, False):
+        cached = store.get_transcript(
+            video_id=video_id,
+            provider="supadata",
+            requested_language=requested_language,
+            native_mode=native_mode,
+            schema_version=TRANSCRIPT_SCHEMA_VERSION,
+        )
+        if cached is not None:
+            return cached
     api_key = str(config.SUPADATA_API_KEY or "").strip()
     if not api_key:
         from ..config import require_supadata_key
@@ -238,10 +297,12 @@ async def _fetch_transcript_artifact_async(
     params = {
         "url": f"https://www.youtube.com/watch?v={video_id}",
         "text": "false",
-        "mode": "native",
+        "mode": "auto",
         "lang": requested_language,
     }
-    async with httpx.AsyncClient(timeout=90.0) as client:
+    async with httpx.AsyncClient(
+        timeout=max(0.001, min(90.0, _remaining_seconds(effective_deadline)))
+    ) as client:
         status, data = await _request(
             client,
             "/transcript",
@@ -250,6 +311,7 @@ async def _fetch_transcript_artifact_async(
             should_cancel=should_cancel,
             context=context,
             reserve_budget=True,
+            deadline_monotonic=effective_deadline,
         )
         if status == 202 or (data.get("jobId") and "content" not in data):
             job_id = str(data.get("jobId") or "").strip()
@@ -259,8 +321,12 @@ async def _fetch_transcript_artifact_async(
                     provider="supadata",
                     operation="transcript",
                 )
-            for _ in range(60):
-                await sleep_with_probe(3.0, should_cancel)
+            while _remaining_seconds(effective_deadline) > 0:
+                await _sleep_before_retry(
+                    TRANSCRIPT_POLL_INTERVAL_SEC,
+                    should_cancel=should_cancel,
+                    deadline_monotonic=effective_deadline,
+                )
                 _, polled = await _request(
                     client,
                     f"/transcript/{job_id}",
@@ -269,29 +335,28 @@ async def _fetch_transcript_artifact_async(
                     should_cancel=should_cancel,
                     context=context,
                     reserve_budget=False,
+                    deadline_monotonic=effective_deadline,
                 )
                 state = str(polled.get("status") or polled.get("state") or "").lower()
-                if polled.get("content") is not None or state in {"completed", "succeeded", "done"}:
-                    data = polled
+                result_payload = polled.get("result")
+                completed_payload = result_payload if isinstance(result_payload, dict) else polled
+                if completed_payload.get("content") is not None or state in {"completed", "succeeded", "done"}:
+                    data = completed_payload
                     break
                 if state in {"failed", "error", "cancelled"}:
-                    raise CaptionsUnavailableError(
-                        "Supadata could not retrieve native captions for this video.",
+                    raise TranscriptUnavailableError(
+                        "Supadata could not prepare a usable timestamped transcript for this video.",
                         provider="supadata",
                         operation="transcript",
                         detail=str(polled.get("error") or state),
                     )
             else:
-                raise ProviderTransientError(
-                    "Supadata transcript retrieval timed out.",
-                    provider="supadata",
-                    operation="transcript",
-                )
+                _raise_if_deadline_exceeded(effective_deadline)
 
     content = data.get("content")
     if isinstance(content, str):
-        raise CaptionsUnavailableError(
-            "Supadata native captions did not include cue timestamps.",
+        raise TranscriptUnavailableError(
+            "Supadata did not return timestamped transcript cues.",
             provider="supadata",
             operation="transcript",
         )
@@ -314,8 +379,8 @@ async def _fetch_transcript_artifact_async(
         returned_language=returned_language,
     )
     if not cues:
-        raise CaptionsUnavailableError(
-            "Supadata returned no usable native caption cues.",
+        raise TranscriptUnavailableError(
+            "Supadata returned no usable timestamped transcript cues.",
             provider="supadata",
             operation="transcript",
         )
@@ -328,13 +393,15 @@ async def _fetch_transcript_artifact_async(
                 provider="supadata",
                 requested_language=requested_language,
                 returned_language=returned_language,
-                native_mode=True,
+                native_mode=False,
             ),
             "video_id": video_id,
             "provider": "supadata",
             "requested_language": requested_language,
             "returned_language": returned_language,
-            "native_mode": True,
+            # `False` denotes an auto-mode request. Supadata does not expose
+            # whether auto was fulfilled from source captions or hosted ASR.
+            "native_mode": False,
             "schema_version": TRANSCRIPT_SCHEMA_VERSION,
             "segments": cues,
             "duration_sec": duration_sec,
@@ -343,7 +410,7 @@ async def _fetch_transcript_artifact_async(
     )
     if artifact is None:
         raise ProviderRequestError(
-            "Supadata returned malformed or non-monotonic native caption cues.",
+            "Supadata returned malformed or non-monotonic transcript cues.",
             provider="supadata",
             operation="transcript",
         )
@@ -364,6 +431,7 @@ def fetch_transcript_artifact(
     *,
     context: GenerationContext | None = None,
     cache_store: ProviderCacheStore | None = None,
+    deadline_monotonic: float | None = None,
 ) -> TranscriptArtifact:
     return run_cancellable(
         lambda: _fetch_transcript_artifact_async(
@@ -372,6 +440,7 @@ def fetch_transcript_artifact(
             should_cancel,
             context=context,
             cache_store=cache_store,
+            deadline_monotonic=deadline_monotonic,
         ),
         should_cancel,
     )
@@ -385,13 +454,15 @@ def fetch_transcript(
     *,
     context: GenerationContext | None = None,
     cache_store: ProviderCacheStore | None = None,
+    deadline_monotonic: float | None = None,
 ) -> list[dict[str, Any]]:
-    """Compatibility wrapper returning native cue dictionaries."""
-    del chunk_size  # Native caption timing must not be provider-rechunked.
+    """Compatibility wrapper returning timestamped transcript cue dictionaries."""
+    del chunk_size  # Provider timing must not be rechunked after retrieval.
     return fetch_transcript_artifact(
         url,
         lang,
         should_cancel,
         context=context,
         cache_store=cache_store,
+        deadline_monotonic=deadline_monotonic,
     ).segments

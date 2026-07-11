@@ -307,7 +307,7 @@ def test_schema_valid_ai_drift_is_rejected_by_semantic_validation(monkeypatch) -
     conn.close()
 
 
-def test_calculus_basics_native_window_corpus_is_fail_closed() -> None:
+def test_calculus_basics_timestamped_window_corpus_is_fail_closed() -> None:
     plan = _manual_plan()
     accepted = [
         "A limit describes the value a function approaches.",
@@ -328,7 +328,7 @@ def test_calculus_basics_native_window_corpus_is_fail_closed() -> None:
     assert not any(transcript_window_matches_topic(text, plan) for text in rejected)
 
 
-def test_final_gate_uses_exact_native_cues_and_rejects_non_native_transcripts() -> None:
+def test_final_gate_uses_exact_timestamped_cues_for_native_or_auto_transcripts() -> None:
     plan = _manual_plan()
     clips = [
         {"start": 0.0, "end": 20.0, "cue_ids": ["cue-good"]},
@@ -336,7 +336,8 @@ def test_final_gate_uses_exact_native_cues_and_rejects_non_native_transcripts() 
     ]
     transcript = {
         "source": "supadata",
-        "native_mode": True,
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:test",
         "segments": [
             {"cue_id": "cue-good", "start": 0.0, "end": 20.0, "text": "Derivatives measure rates of change."},
             {"cue_id": "cue-bad", "start": 20.0, "end": 40.0, "text": "Propositional logic uses truth tables."},
@@ -347,7 +348,15 @@ def test_final_gate_uses_exact_native_cues_and_rejects_non_native_transcripts() 
 
     assert kept == [clips[0]]
     assert kept[0]["topic_evidence_terms"]
-    assert _strict_topic_clips(clips, {**transcript, "native_mode": False}, plan) == []
+    assert _strict_topic_clips(clips, {**transcript, "native_mode": True}, plan) == [clips[0]]
+    assert _strict_topic_clips(clips, {**transcript, "artifact_key": ""}, plan) == []
+    assert _strict_topic_clips(clips, {**transcript, "source": "untrusted"}, plan) == []
+    assert _strict_topic_clips(
+        clips,
+        {**transcript, "segments": list(reversed(transcript["segments"]))},
+        plan,
+    ) == []
+    assert _strict_topic_clips([clips[1]], transcript, plan) == []
 
 
 def test_search_context_keeps_plan_and_provider_query_evidence() -> None:
@@ -438,10 +447,10 @@ def test_fast_and_slow_plans_use_three_then_six_plus_three_plus_three(monkeypatc
     search.discover("concept", limit=1, context=slow, query_plan=plan)
 
     assert calls == [
-        ["query 0", "query 1", "query 2"],
-        [f"query {index}" for index in range(6)],
-        ["query 6", "query 7", "query 8"],
-        ["query 9", "query 10", "query 11"],
+        ["Calculus Basics", "Calculus Basics", "query 1"],
+        ["Calculus Basics", "Calculus Basics", "query 1", "query 2", "query 3", "query 4"],
+        ["Calculus Basics", "Calculus Basics", "query 5"],
+        ["Calculus Basics", "Calculus Basics", "query 6"],
     ]
 
 

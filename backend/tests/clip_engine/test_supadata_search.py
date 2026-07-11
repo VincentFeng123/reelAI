@@ -65,7 +65,7 @@ def test_search_one_sends_truthful_filters_and_caches(monkeypatch):
         "  calculus ", filters, language="FR", cache_store=cache
     )
     assert calls[0]["headers"]["x-api-key"] == "sd_test"
-    assert calls[0]["params"]["features"] == ["creative-commons", "subtitles"]
+    assert calls[0]["params"]["features"] == ["creative-commons", "creative-commons"]
     assert calls[0]["params"]["type"] == "video"
     assert calls[0]["params"]["sortBy"] == "relevance"
     assert calls[0]["params"]["duration"] == "medium"
@@ -77,7 +77,7 @@ def test_search_one_sends_truthful_filters_and_caches(monkeypatch):
     assert len(calls) == 1
 
 
-def test_search_one_keeps_singleton_features_as_array_on_wire(monkeypatch):
+def test_search_one_never_turns_subtitles_into_a_requirement(monkeypatch):
     calls = []
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -85,12 +85,61 @@ def test_search_one_keeps_singleton_features_as_array_on_wire(monkeypatch):
         return _Resp(200, {"results": []})
 
     monkeypatch.setattr(ss.httpx, "get", fake_get)
-    result = ss.search_one("Calculus", cache_store=MemoryProviderCache())
+    result = ss.search_one(
+        "Calculus",
+        {"features": ["subtitles"]},
+        cache_store=MemoryProviderCache(),
+    )
 
-    assert calls[0]["features"] == ["subtitles", "subtitles"]
+    assert "features" not in calls[0]
     assert calls[0]["type"] == "video"
     assert calls[0]["sortBy"] == "relevance"
-    assert result["filters_applied"]["features"] == ["subtitles"]
+    assert result["filters_applied"]["features"] == []
+
+
+def test_search_one_keeps_hd_singleton_as_array_on_wire(monkeypatch):
+    calls = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls.append(params)
+        return _Resp(200, {"results": []})
+
+    monkeypatch.setattr(ss.httpx, "get", fake_get)
+    result = ss.search_one(
+        "Calculus",
+        {"features": ["hd"]},
+        cache_store=MemoryProviderCache(),
+    )
+
+    assert calls[0]["features"] == ["hd", "hd"]
+    assert result["filters_applied"]["features"] == ["hd"]
+
+
+def test_search_all_applies_per_request_filters_without_extra_calls(monkeypatch):
+    calls = []
+
+    def fake_one(query, filters=None, *args, **kwargs):
+        calls.append((query, filters))
+        return {"query": query, "videos": [], "billed": 0}
+
+    monkeypatch.setattr(ss, "search_one", fake_one)
+    monkeypatch.setattr(ss, "wait_with_probe", lambda *_args: None)
+
+    ss.search_all(
+        ["literal", "literal", "expansion"],
+        {"duration": "medium"},
+        request_filters=[
+            {"duration": "medium", "features": []},
+            {"duration": "medium", "features": ["hd"]},
+            {"duration": "medium", "features": ["hd"]},
+        ],
+    )
+
+    assert calls == [
+        ("literal", {"duration": "medium", "features": []}),
+        ("literal", {"duration": "medium", "features": ["hd"]}),
+        ("expansion", {"duration": "medium", "features": ["hd"]}),
+    ]
 
 
 def test_search_page_token_uses_documented_parameter_without_filters(monkeypatch):

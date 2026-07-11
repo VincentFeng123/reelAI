@@ -991,7 +991,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
                     <p className="text-sm font-semibold text-white/95">Creative Commons only</p>
-                    <SettingsInfoTooltip text="Ask Supadata for Creative Commons YouTube sources in addition to requiring native captions." />
+                    <SettingsInfoTooltip text="Ask Supadata for Creative Commons-licensed YouTube sources. This filter is independent of transcript availability." />
                   </div>
                   <p className="mt-1 text-[11px] text-white/58">
                     {creativeCommonsOnly ? "Licensed sources only" : "Any YouTube license"}
@@ -1088,11 +1088,11 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
             <div className="mt-4 flex items-start justify-between gap-4 border-t border-white/10 pt-4">
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-1.5">
-                  <p className="text-sm font-semibold text-white/95">Caption source</p>
-                  <SettingsInfoTooltip text="Study discovery is YouTube-only and requires native captions. Videos without native captions are skipped." />
+                  <p className="text-sm font-semibold text-white/95">Transcript source</p>
+                  <SettingsInfoTooltip text="Native captions are preferred but optional. Supadata supplies hosted timestamped transcript cues without media downloads or local Whisper." />
                 </div>
                 <p className="mt-1 text-[11px] text-white/58">
-                  YouTube native captions only
+                  Native captions or Supadata transcript
                 </p>
               </div>
             </div>

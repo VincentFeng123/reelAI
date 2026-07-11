@@ -135,3 +135,63 @@ def test_duplicate_video_within_one_query_counts_once() -> None:
         "videos": [{"id": "x"}, {"id": "x", "title": "duplicate"}],
     }])
     assert ranked[0]["match_count"] == 1
+
+
+def test_duplicate_literal_requests_share_one_consensus_family() -> None:
+    [result] = merge_and_rank([
+        {
+            "query": "Intro to Python",
+            "query_family": "python",
+            "query_trust": "literal",
+            "hd_preferred": False,
+            "videos": [{"id": "python"}],
+        },
+        {
+            "query": "Intro to Python",
+            "query_family": "python",
+            "query_trust": "literal",
+            "hd_preferred": True,
+            "videos": [{"id": "python"}],
+        },
+    ])
+
+    assert result["match_count"] == 1
+    assert result["trusted_match_count"] == 1
+    assert result["matched_queries"] == ["Intro to Python"]
+    assert result["hd_match"] is True
+
+
+def test_hd_is_only_a_tiebreak_after_topic_signals() -> None:
+    ranked = merge_and_rank([
+        {
+            "query": "Intro to Python",
+            "query_family": "python",
+            "query_trust": "literal",
+            "videos": [{"id": "literal-sd", "viewCount": 10}],
+        },
+        {
+            "query": "programming",
+            "query_family": "programming",
+            "query_trust": "ai",
+            "hd_preferred": True,
+            "videos": [{"id": "ai-hd", "viewCount": 10_000_000}],
+        },
+    ])
+    assert ranked[0]["id"] == "literal-sd"
+
+    tied = merge_and_rank([
+        {
+            "query": "Intro to Python",
+            "query_family": "python",
+            "query_trust": "literal",
+            "videos": [{"id": "sd", "viewCount": 10}],
+        },
+        {
+            "query": "Intro to Python",
+            "query_family": "python",
+            "query_trust": "literal",
+            "filters_applied": {"features": ["hd"]},
+            "videos": [{"id": "hd", "viewCount": 10}],
+        },
+    ])
+    assert tied[0]["id"] == "hd"

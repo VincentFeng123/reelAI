@@ -137,6 +137,11 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
 
             query_family = semantic_query_family(res.get("query") or "")
         query_trust = str(res.get("query_trust") or "trusted").strip().casefold()
+        filters_applied = res.get("filters_applied") or {}
+        hd_match = bool(
+            res.get("hd_preferred")
+            or "hd" in (filters_applied.get("features") or [])
+        )
         seen_in_query: set[str] = set()
         for rank, v in enumerate(res.get("videos") or []):
             vid = _video_id(v.get("id") or v.get("videoId") or v.get("url"))
@@ -188,6 +193,7 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
                     "canonical_match": False,
                     "trusted_match_count": 0,
                     "ai_match_count": 0,
+                    "hd_match": False,
                 }
                 by_id[vid] = entry
             else:
@@ -224,6 +230,8 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
                 entry["literal_match"] = True
             elif query_trust == "canonical":
                 entry["canonical_match"] = True
+            if hd_match:
+                entry["hd_match"] = True
             entry["best_rank"] = min(entry["best_rank"], rank)
             q = res.get("query")
             if q and q not in entry["matched_queries"]:
@@ -258,6 +266,7 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
             bool(v["canonical_match"]),
             int(v["trusted_match_count"]),
             v["score"],
+            bool(v["hd_match"]),
             v["view_count"],
         ),
         reverse=True,

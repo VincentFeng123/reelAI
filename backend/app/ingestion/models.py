@@ -74,8 +74,8 @@ class IngestTranscriptWord(BaseModel):
     """
     Legacy word-level timestamp retained only for stored-payload compatibility.
 
-    The active clipping path cuts directly on native caption cue boundaries and
-    does not synthesize word timestamps.
+    The active clipping path cuts directly on timestamped transcript cue
+    boundaries and does not synthesize word timestamps.
     """
 
     start: float = Field(ge=0.0)
@@ -200,7 +200,7 @@ class IngestSearchRequest(BaseModel):
     """
     Topic-based search, currently YouTube-only.
 
-    Discovery and ingestion are YouTube-only and require native captions.
+    Discovery and ingestion are YouTube-only; source-native captions are optional.
     """
 
     query: str = Field(min_length=1, max_length=500)
@@ -297,7 +297,9 @@ class IngestTopicCutRequest(BaseModel):
     @model_validator(mode="after")
     def validate_supported_mode(self) -> "IngestTopicCutRequest":
         if not self.use_llm:
-            raise ValueError("use_llm=false is unsupported; native-cue Gemini segmentation is required.")
+            raise ValueError(
+                "use_llm=false is unsupported; timestamped-cue Gemini segmentation is required."
+            )
         if self.query is not None:
             self.query = " ".join(self.query.split())
             if not self.query:

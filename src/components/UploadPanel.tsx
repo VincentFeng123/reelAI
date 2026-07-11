@@ -826,7 +826,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
                 />
               </div>
               <p className="px-1 text-[11px] leading-snug text-white/55">
-                Downloads, transcribes (Whisper fallback if needed), and extracts a clip with full metadata. Public reels only.
+                Uses hosted timestamped transcript cues to extract clips without downloading media or running local Whisper. Public YouTube sources only.
               </p>
             </div>
           </>

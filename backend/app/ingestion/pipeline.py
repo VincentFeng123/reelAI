@@ -4,14 +4,14 @@ IngestionPipeline — the orchestrator.
 One class, two public methods:
 
   * `ingest_url(source_url, ...) -> IngestResult`
-      Native captions → Gemini cue segmentation → persistence for one YouTube URL.
+      Timestamped transcript → Gemini cue segmentation → persistence for one YouTube URL.
 
   * `ingest_feed(feed_url, max_items=6, ...) -> IngestFeedResult`
       Resolve a YouTube channel or playlist URL to individual video URLs
       and call `ingest_url` for each with bounded concurrency.
 
 The pipeline owns:
-  * A bounded `ThreadPoolExecutor` for caption and segmentation work in `ingest_feed`.
+  * A bounded `ThreadPoolExecutor` for transcript and segmentation work in `ingest_feed`.
   * A process-wide YouTube provider rate limiter.
 
 The pipeline is stateless beyond those two things. It does NOT cache results itself —
@@ -75,11 +75,11 @@ from ..clip_engine import run as clip_engine_run, search as clip_engine_search, 
 from ..clip_engine.cancellation import is_cancelled, raise_if_cancelled
 from ..clip_engine.provider_runtime import GenerationContext
 from ..clip_engine.errors import (
-    CaptionsUnavailableError as _CaptionsUnavailableError,
     CancellationError as _ClipCancellationError,
     ClipError as _ClipError,
     ProviderError as _ClipProviderError,
     TranscriptError as _ClipTranscriptError,
+    TranscriptUnavailableError as _TranscriptUnavailableError,
     UnsupportedURLError as _ClipUnsupportedURLError,
 )
 from ..services.assessments import store_reel_assessment_question
@@ -102,14 +102,18 @@ def _run_clip(
     language: str,
     should_cancel: Callable[[], bool] | None,
     generation_context: GenerationContext | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
+    settings: dict[str, Any] = {
+        "language": language,
+        "generation_context": generation_context,
+        "provider_cache": generation_context.cache_store if generation_context is not None else None,
+    }
+    if deadline_monotonic is not None:
+        settings["deadline_monotonic"] = float(deadline_monotonic)
     kwargs = {
         "topic": topic,
-        "settings": {
-            "language": language,
-            "generation_context": generation_context,
-            "provider_cache": generation_context.cache_store if generation_context is not None else None,
-        },
+        "settings": settings,
     }
     if should_cancel is None:
         return clip_engine_run.clip(url, **kwargs)
@@ -153,17 +157,60 @@ def _discover(
     return clip_engine_search.discover(topic, **kwargs)
 
 
+def _is_valid_timestamped_supadata_transcript(transcript: dict[str, Any]) -> bool:
+    """Verify the provenance markers and cue invariants used by the final gate."""
+    if (
+        transcript.get("source") != "supadata"
+        or not str(transcript.get("artifact_key") or "").strip()
+        or not isinstance(transcript.get("native_mode"), bool)
+    ):
+        return False
+    segments = transcript.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return False
+
+    seen_ids: set[str] = set()
+    previous_start = -1.0
+    previous_end = -1.0
+    for cue in segments:
+        if not isinstance(cue, dict):
+            return False
+        cue_id = str(cue.get("cue_id") or "").strip()
+        text = " ".join(str(cue.get("text") or "").split()).strip()
+        try:
+            start = float(cue.get("start"))
+            end = float(cue.get("end"))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not cue_id
+            or cue_id in seen_ids
+            or not text
+            or not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end <= start
+            or start + 1e-9 < previous_start
+            or end + 1e-9 < previous_end
+        ):
+            return False
+        seen_ids.add(cue_id)
+        previous_start = start
+        previous_end = end
+    return True
+
+
 def _strict_topic_clips(
     clips: list[dict[str, Any]],
     transcript: dict[str, Any],
     query_plan: SearchQueryPlan | None,
 ) -> list[dict[str, Any]]:
-    """Keep only exact native-cue windows proven by the trusted topic signature."""
+    """Keep trusted timestamped windows proven by the exact topic signature."""
     if query_plan is None:
         # Compatibility for injected/mocked discover implementations. The real
         # topic search path always returns a validated plan.
         return clips
-    if transcript.get("source") != "supadata" or transcript.get("native_mode") is not True:
+    if not _is_valid_timestamped_supadata_transcript(transcript):
         return []
 
     kept: list[dict[str, Any]] = []
@@ -837,17 +884,22 @@ class IngestionPipeline:
             if str(v or "").strip()
         ]
 
-        disc = _discover(
-            topic, limit=limit, exclude_video_ids=bare_exclusions, level=knowledge_level,
-            should_cancel=should_cancel,
-            creative_commons_only=creative_commons_only,
-            preferred_video_duration=preferred_video_duration,
-            language=language,
-            generation_context=generation_context,
-            literal_topic=literal_topic or topic,
-            use_query_planner=True,
-            breadth=3 if generation_context is not None and generation_context.budget.mode == "fast" else 6,
-        )
+        try:
+            disc = _discover(
+                topic, limit=limit, exclude_video_ids=bare_exclusions, level=knowledge_level,
+                should_cancel=should_cancel,
+                creative_commons_only=creative_commons_only,
+                preferred_video_duration=preferred_video_duration,
+                language=language,
+                generation_context=generation_context,
+                literal_topic=literal_topic or topic,
+                use_query_planner=True,
+                breadth=3 if generation_context is not None and generation_context.budget.mode == "fast" else 6,
+            )
+        except _ClipProviderError:
+            if generation_context is not None:
+                generation_context.increment_counter("provider_failures")
+            raise
 
         warning = disc.get("warning")
         if warning:
@@ -869,6 +921,8 @@ class IngestionPipeline:
             if query_plan is not None:
                 discovered_video["_query_plan"] = query_plan
         resolved_video_ids = [v["id"] for v in disc["videos"]]
+        if generation_context is not None:
+            generation_context.increment_counter("discovered_videos", len(resolved_video_ids))
 
         # dry_run: discover-only viability probe — no run.clip, no DB writes.
         if dry_run:
@@ -888,6 +942,8 @@ class IngestionPipeline:
             return batch_cancelled.is_set() or is_cancelled(should_cancel)
 
         deadline = time.monotonic() + max(0.0, INGEST_TOPIC_VIDEO_TIMEOUT_SEC)
+        for video in videos:
+            video["_deadline_monotonic"] = deadline
         futures = [
             executor.submit(
                 self._clip_and_filter,
@@ -909,6 +965,8 @@ class IngestionPipeline:
                 raise
             except FutureTimeoutError:
                 batch_cancelled.set()
+                if generation_context is not None:
+                    generation_context.increment_counter("transcript_timeouts")
                 log_event(
                     logger,
                     logging.WARNING,
@@ -919,16 +977,50 @@ class IngestionPipeline:
                         f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
                     ),
                 )
-            except _CaptionsUnavailableError as exc:
+            except _TranscriptUnavailableError as exc:
+                if generation_context is not None:
+                    generation_context.increment_counter("transcript_failures")
+                    generation_context.increment_counter("provider_failures")
                 log_event(
                     logger,
                     logging.INFO,
-                    "ingest_topic_native_captions_unavailable",
+                    "ingest_topic_transcript_unavailable",
                     video_id=v.get("id"),
                     error=str(exc),
                 )
-            except _ClipProviderError:
+            except _ClipTranscriptError as exc:
+                if generation_context is not None:
+                    generation_context.increment_counter("transcript_failures")
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "ingest_topic_transcript_unavailable",
+                    video_id=v.get("id"),
+                    error=str(exc),
+                )
+            except _ClipProviderError as exc:
+                if generation_context is not None:
+                    generation_context.increment_counter("provider_failures")
+                    is_transcript_failure = (
+                        str(getattr(exc, "operation", "")).casefold() == "transcript"
+                    )
+                    if is_transcript_failure:
+                        generation_context.increment_counter("transcript_failures")
+                    message = f"{exc} {getattr(exc, 'detail', '') or ''}".casefold()
+                    if (
+                        is_transcript_failure
+                        and ("timed out" in message or "timeout" in message or "deadline" in message)
+                    ):
+                        generation_context.increment_counter("transcript_timeouts")
                 raise
+            except _ClipError as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "ingest_topic_video_failed",
+                    video_id=v.get("id"),
+                    error=str(exc),
+                )
             except Exception as exc:
                 log_event(
                     logger,
@@ -959,6 +1051,8 @@ class IngestionPipeline:
                     should_cancel=should_cancel,
                 )
                 persisted.append(reel)
+                if generation_context is not None:
+                    generation_context.increment_counter("persisted_clips")
                 if on_reel_created is not None:
                     on_reel_created(reel)
             return persisted
@@ -1002,6 +1096,10 @@ class IngestionPipeline:
                                     "shared clip fetch deadline exceeded "
                                     f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
                                 ),
+                            )
+                        if generation_context is not None:
+                            generation_context.increment_counter(
+                                "transcript_timeouts", len(pending)
                             )
                         break
 
@@ -1060,14 +1158,34 @@ class IngestionPipeline:
             v["url"], topic=topic, language=language,
             should_cancel=should_cancel,
             generation_context=generation_context,
+            deadline_monotonic=v.get("_deadline_monotonic"),
         )
-        if not engine_out["clips"]:
+        transcript = engine_out["transcript"]
+        query_plan = (
+            v.get("_query_plan")
+            if isinstance(v.get("_query_plan"), SearchQueryPlan)
+            else None
+        )
+        trusted_transcript = _is_valid_timestamped_supadata_transcript(transcript)
+        if generation_context is not None and trusted_transcript:
+            generation_context.increment_counter("usable_transcripts")
+        elif generation_context is not None and query_plan is not None:
+            generation_context.increment_counter("transcript_failures")
+
+        raw_clips = list(engine_out["clips"])
+        if not raw_clips:
+            if generation_context is not None:
+                generation_context.increment_counter("gemini_empty_results")
             return v, [], engine_out
         eligible_clips = _strict_topic_clips(
-            list(engine_out["clips"]),
-            engine_out["transcript"],
-            v.get("_query_plan") if isinstance(v.get("_query_plan"), SearchQueryPlan) else None,
+            raw_clips,
+            transcript,
+            query_plan,
         )
+        if generation_context is not None and trusted_transcript:
+            generation_context.increment_counter(
+                "topic_rejections", max(0, len(raw_clips) - len(eligible_clips))
+            )
         for clip in eligible_clips:
             relevance = clip_engine_bridge.relevance_score(
                 clip, engine_out["transcript"], topic

@@ -94,8 +94,14 @@ class ProviderRequestError(ProviderError):
     code = "provider_request_rejected"
 
 
-class CaptionsUnavailableError(ProviderError):
-    code = "native_captions_unavailable"
+class TranscriptUnavailableError(ProviderError):
+    code = "transcript_unavailable"
+
+
+# Backward-compatible import name for callers/tests that predate hosted
+# transcript generation. Availability now covers both native and generated
+# timestamped transcripts rather than source captions alone.
+CaptionsUnavailableError = TranscriptUnavailableError
 
 
 class ProviderBudgetExceededError(ProviderError):

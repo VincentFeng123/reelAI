@@ -104,11 +104,13 @@ def test_search_cache_key_normalizes_query_filters_and_language_but_not_page() -
     assert first != next_page
     assert normalize_filters(filters) == {
         "duration": "medium",
-        "features": ["creative-commons", "subtitles"],
+        "features": ["creative-commons"],
         "sort_by": "relevance",
         "upload_date": "all",
     }
-    assert normalize_filters({"creative_commons_only": "false"})["features"] == ["subtitles"]
+    assert normalize_filters({"creative_commons_only": "false"})["features"] == []
+    assert normalize_filters({"features": ["subtitles"]})["features"] == []
+    assert normalize_filters({"features": ["hd", "not-a-real-feature"]})["features"] == ["hd"]
     assert normalize_filters({"sort_by": "viewCount"})["sort_by"] == "views"
 
 
@@ -139,6 +141,21 @@ def test_transcript_validation_rejects_nonfinite_and_nonmonotonic_cues() -> None
     nonmonotonic = artifact.as_payload()
     nonmonotonic["segments"][1]["start"] = -1
     assert validate_transcript_payload(nonmonotonic) is None
+
+
+def test_transcript_validation_accepts_auto_mode_artifact() -> None:
+    payload = _artifact().as_payload()
+    payload["native_mode"] = False
+    payload["artifact_key"] = transcript_artifact_key(
+        video_id=VIDEO_ID,
+        provider="supadata",
+        requested_language="en",
+        returned_language="en-us",
+        native_mode=False,
+    )
+    artifact = validate_transcript_payload(payload)
+    assert artifact is not None
+    assert artifact.native_mode is False
 
 
 def test_transcript_cache_rejects_tombstoned_video() -> None:
