@@ -1,67 +1,107 @@
-"""Per-clip difficulty: parsed, normalized, carried — NEVER gates a clip."""
+"""Per-clip difficulty is strict, carried, and never used as a quality gate."""
+
 import pytest
+from pydantic import ValidationError
 
-from backend.pipeline.gemini_segment import (
-    _Plan,
-    _Topic,
-    _plan_to_clips,
-    _prompts,
-)
+from backend.pipeline import gemini_segment as G
 
 
-def _segs(n: int, sec: float = 30.0) -> list[dict]:
-    return [{"start": i * sec, "end": (i + 1) * sec, "text": f"line {i}"} for i in range(n)]
+def _segments() -> list[dict]:
+    return [
+        {"start": 0.0, "end": 30.0, "text": "line zero teaches easy lesson end zero"},
+        {"start": 30.0, "end": 60.0, "text": "line one teaches hard lesson end one"},
+    ]
 
 
-def _run(topics, n=10, settings=None):
-    return _plan_to_clips(
-        _Plan(topics=topics), _segs(n), [], {"segment_fine_snap": False, **(settings or {})}
+def _words() -> list[dict]:
+    out = []
+    for segment in _segments():
+        tokens = segment["text"].split()
+        width = 29.8 / len(tokens)
+        for index, token in enumerate(tokens):
+            start = segment["start"] + 0.1 + index * width
+            out.append({"word": token, "start": start, "end": start + width})
+    return out
+
+
+def _topic(**overrides) -> G._Topic:
+    data = {
+        "title": "Lesson",
+        "start_line": 0,
+        "end_line": 0,
+        "start_quote": "line zero",
+        "end_quote": "end zero",
+        "facet": "lesson",
+        "reason": "A complete lesson.",
+        "informativeness": 0.9,
+        "topic_relevance": 0.9,
+        "difficulty": 0.5,
+        "self_contained": True,
+        "uncertainty": "low",
+        "uncertainty_reasons": [],
+        "summary": "Line zero teaches an easy lesson.",
+        "takeaways": ["Line zero teaches the lesson.", "The lesson reaches end zero."],
+        "match_reason": "The easy lesson is taught directly.",
+        "assessment": {
+            "prompt": "Which lesson is taught?",
+            "options": ["Easy", "Sponsor", "Greeting", "Outro"],
+            "correct_index": 0,
+            "explanation": "The easy lesson is taught.",
+            "evidence_quote": "easy lesson",
+        },
+    }
+    data.update(overrides)
+    return G._Topic(**data)
+
+
+def _run(topics):
+    return G._plan_to_clips(
+        G._Plan(topics=topics), _segments(), _words(), {"segment_fine_snap": False},
     )
 
 
-def _topic(**overrides):
-    data = {
-        "title": "T", "start_line": 0, "end_line": 1,
-        "start_quote": "line 0", "end_quote": "line 1",
-        "kind": "content", "informativeness": 0.9,
-        "topic_relevance": 0.9, "self_contained": True,
-    }
-    data.update(overrides)
-    return _Topic(**data)
+def test_difficulty_is_carried():
+    assert _run([_topic(difficulty=0.8)])[0]["difficulty"] == pytest.approx(0.8)
 
 
-def test_difficulty_carried_on_clip():
-    t = _topic(difficulty=0.8)
-    clips = _run([t])
-    assert clips[0]["difficulty"] == pytest.approx(0.8)
+def test_difficulty_is_required():
+    data = _topic().model_dump()
+    data.pop("difficulty")
+    with pytest.raises(ValidationError):
+        G._Topic.model_validate(data)
 
 
-def test_difficulty_defaults_to_half_when_omitted():
-    # Simulate parsed JSON with no difficulty key at all (the model omitted it).
-    t = _topic()
-    clips = _run([t])
-    assert clips[0]["difficulty"] == pytest.approx(0.5)
+@pytest.mark.parametrize("value", [-0.01, 1.01, 7, 85])
+def test_misscaled_difficulty_is_rejected_not_repaired(value):
+    data = _topic().model_dump()
+    data["difficulty"] = value
+    with pytest.raises(ValidationError):
+        G._Topic.model_validate(data)
 
 
-def test_misscaled_difficulty_normalized():
-    t = _topic(difficulty=7)
-    clips = _run([t])
-    assert clips[0]["difficulty"] == pytest.approx(0.7)
-    # 0-100 scale branch
-    t = _topic(difficulty=85)
-    clips = _run([t])
-    assert clips[0]["difficulty"] == pytest.approx(0.85)
+def test_extreme_valid_difficulty_never_gates():
+    easy = _topic(title="Easy", difficulty=0.0)
+    hard = _topic(
+        title="Hard",
+        start_line=1,
+        end_line=1,
+        start_quote="line one",
+        end_quote="end one",
+        difficulty=1.0,
+        summary="Line one teaches a hard lesson.",
+        takeaways=["Line one teaches the lesson.", "The lesson reaches end one."],
+        match_reason="The hard lesson is taught directly.",
+        assessment={
+            "prompt": "Which lesson is taught?",
+            "options": ["Hard", "Sponsor", "Greeting", "Outro"],
+            "correct_index": 0,
+            "explanation": "The hard lesson is taught.",
+            "evidence_quote": "hard lesson",
+        },
+    )
+    assert {clip["title"] for clip in _run([easy, hard])} == {"Easy", "Hard"}
 
 
-def test_extreme_difficulty_never_gates():
-    hard = _topic(title="H", difficulty=1.0)
-    easy = _topic(title="E", start_line=2, end_line=3,
-                  start_quote="line 2", end_quote="line 3", difficulty=0.0)
-    clips = _run([hard, easy])
-    assert {c["title"] for c in clips} == {"H", "E"}
-
-
-def test_prompt_documents_difficulty_scale():
-    system, user = _prompts("[0] 00:00 hi", 1)
-    assert "difficulty — 0.0 to 1.0" in system
-    assert "difficulty" in user
+def test_prompt_requires_difficulty():
+    system, user = G._prompts("[0] 00:00 hi", 1)
+    assert "difficulty" in system + user

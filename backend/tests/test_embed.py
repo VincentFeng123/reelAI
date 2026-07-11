@@ -41,6 +41,13 @@ def test_build_embed_clips_preserves_milliseconds_and_selector_fields():
         "start": 1.23456, "end": 4.56789, "kind": "educational",
         "informativeness": 0.8, "topic_relevance": 0.9,
         "self_contained": True, "difficulty": 0.4,
+        "summary": "A grounded summary.",
+        "takeaways": ["One", "Two"],
+        "match_reason": "It explains the requested idea.",
+        "assessment": {
+            "prompt": "What is taught?", "options": ["A", "B", "C", "D"],
+            "correct_index": 0, "explanation": "The transcript teaches A.",
+        },
     }
     clip = _build_embed_clips([spec], "vid")[0]
     assert (clip["start"], clip["end"], clip["duration"]) == (1.235, 4.568, 3.333)
@@ -51,3 +58,7 @@ def test_build_embed_clips_preserves_milliseconds_and_selector_fields():
         "self_contained": True, "difficulty": 0.4,
     }
     assert clip["embed_url"] == "https://www.youtube.com/embed/vid?start=1&end=5&rel=0"
+    assert clip["summary"] == "A grounded summary."
+    assert clip["takeaways"] == ["One", "Two"]
+    assert clip["match_reason"].startswith("It explains")
+    assert clip["assessment"]["correct_index"] == 0

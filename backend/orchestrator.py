@@ -69,7 +69,10 @@ def _build_embed_clips(clips_spec: list[dict], video_id: str) -> list[dict]:
             "warnings": list(c.get("warnings") or []),
             "ship_flagged": bool(c.get("ship_flagged", False)),
         }
-        for key in ("kind", "informativeness", "topic_relevance", "self_contained", "difficulty"):
+        for key in (
+            "kind", "informativeness", "topic_relevance", "self_contained", "difficulty",
+            "summary", "takeaways", "match_reason", "assessment",
+        ):
             if c.get(key) is not None:
                 clip[key] = c[key]
         # VID2 edge-probe outcomes — only present when the probe ran (default OFF ⇒ absent,
@@ -400,10 +403,14 @@ async def _run_gemini_segment(job: Job, transcript: dict, video_id: str, run, em
     Renders mp4s only when ``output_mode="cut"`` (downloads the source video only then)."""
     from .pipeline.gemini_segment import segment_clips
 
-    settings = job.settings
+    settings = dict(job.settings)
+    # Cancelling the asyncio task cannot interrupt an in-flight synchronous HTTP
+    # request in the executor, but it does stop any retry/fallback after that bounded
+    # request returns.
+    settings["_segment_cancelled"] = lambda: job.status == Status.CANCELLED
     registry.publish(job, ProgressEvent("selecting", 20.0, "Reading the whole transcript…"))
     clips_spec, notes = await run(segment_clips, transcript, settings,
-                                  emit("selecting", 20, 90), job.topic or "")
+                                  emit("selecting", 20, 90), job.topic or "", video_id)
     if not clips_spec:
         return registry.fail(job, notes or "No substantive topics found to clip.", notes=notes)
 

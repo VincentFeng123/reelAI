@@ -4,6 +4,7 @@ All tunables live here so they're easy to update as Groq's free tier changes.
 """
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -62,7 +63,31 @@ TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 # topic clips {title,start,end} directly — NO punctuation / structure understanding / whisper
 # refine / multimodal. Uses the Pro model for real comprehension (section-level topics); boundaries are
 # fine-snapped onto supadata's interpolated per-word times when SEGMENT_FINE_SNAP is on.
-SEGMENT_MODEL = os.environ.get("SEGMENT_MODEL", TOPIC_MODEL)
+_segment_routing_mode = os.environ.get("SEGMENT_ROUTING_MODE", "pro_only").strip().lower()
+SEGMENT_ROUTING_MODE = (
+    _segment_routing_mode
+    if _segment_routing_mode in {"pro_only", "shadow", "hybrid"}
+    else "pro_only"
+)
+SEGMENT_FLASH_MODEL = (
+    os.environ.get("SEGMENT_FLASH_MODEL", "").strip() or "gemini-3.5-flash"
+)
+# SEGMENT_MODEL was the original Pro-only selector model. Keep it as the
+# highest-precedence migration override so existing deployments do not change models.
+_legacy_segment_model = os.environ.get("SEGMENT_MODEL", "").strip()
+SEGMENT_PRO_MODEL = (
+    _legacy_segment_model
+    or os.environ.get("SEGMENT_PRO_MODEL", "").strip()
+    or "gemini-3.1-pro-preview"
+)
+SEGMENT_MODEL = SEGMENT_PRO_MODEL
+try:
+    _segment_hybrid_percent = float(os.environ.get("SEGMENT_HYBRID_PERCENT", "0"))
+except ValueError:
+    _segment_hybrid_percent = 0.0
+if not math.isfinite(_segment_hybrid_percent):
+    _segment_hybrid_percent = 0.0
+SEGMENT_HYBRID_PERCENT = max(0.0, min(100.0, _segment_hybrid_percent))
 SEGMENT_FINE_SNAP = os.environ.get("SEGMENT_FINE_SNAP", "1") not in ("0", "false", "")
 SEGMENT_MIN_CLIP_S = 1.0                                             # fixed validity guard
 SEGMENT_MAX_CLIP_S = 180.0                                           # reject; never hard-cut

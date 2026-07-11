@@ -54,7 +54,7 @@ async def run(url: str, topic: str, profile: str = "full") -> None:
     engine = str(settings.get("clip_engine") or config.CLIP_ENGINE).lower()
     if engine == "gemini":
         from .pipeline.gemini_segment import segment_clips
-        clips_spec, notes = segment_clips(transcript, settings, _p("select"), topic)
+        clips_spec, notes = segment_clips(transcript, settings, _p("select"), topic, video_id)
         rejections = []
         sents = []
         print(f"  video_id={video_id}  {len(transcript.get('segments', []))} caption segments")
