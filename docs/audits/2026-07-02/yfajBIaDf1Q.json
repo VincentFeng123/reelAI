@@ -1,0 +1,796 @@
+{
+ "video_id": "yfajBIaDf1Q",
+ "video_title": "",
+ "duration": 324.38,
+ "detection": {
+  "domain": "tutorial",
+  "content_type": "tutorial",
+  "confidence": 1.0
+ },
+ "adapter": "TutorialAdapter",
+ "n_units": 8,
+ "has_perception": false,
+ "degraded": [],
+ "topic": "",
+ "notes": "No self-contained clips could be assembled for this topic.",
+ "n_clips": 0,
+ "n_rejections": 7,
+ "clips": [],
+ "rejections": [
+  {
+   "cand_id": "c_u0004",
+   "title": "Derivatives and Differentiation Rules",
+   "role": "definition",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "unresolved_reference",
+    "unresolved_reference",
+    "missing_prerequisite"
+   ],
+   "final_quality": null,
+   "start": 43.26,
+   "end": 324.38,
+   "duration_s": 281.1,
+   "span_text": "let's go over the entire calculus one the study of change and motion functions this is mainly learned in algebra but it is ultimately the foundation of calculus functions relate a set of inputs to a set of outputs a function that exists in 2D takes in an input in the x-axis and outputs a value in the y-axis doing this for many values gives you a graph a function must specifically have either the one-to-one relationship or many to one relationship to be considered a function you can use the vertical line test to see if a function is indeed a function simply make a vertical line through your graph and if it intersects more than one point it is not a function limits limits describe how a function behaves near a point not on the point itself there's a value that the X always approaches and gets infinitely close to but never touches the general expression of limits is this it is read as the limit of f of x as X approaches a is the value l these limits are evaluated usually by substitution or simplification then substitution if the limit is initially indeterminate continuity sometimes if these limits diverge or don't exist discontinuities are made in our graph there are three types of these discontinuities the whole discontinuity which looks like you have a continuous graph except for in one little point or whole the jump discontinuity which is continuous until a certain point where the function jumps to another value and continues from there then you have the infinite discontinuity where asymptotes Force the function to diverge functions are considered continuous at a point as long as they are defined at the point the limit exists at the point and the value of the function is the same as the value of the limit at the point derivatives derivatives are what we use in calculus to observe the rate of change of functions this is especially useful since it allows us to analyze the instantaneous slope of functions at certain points as opposed to what we used to do before calculus which was simply taking average slope derivatives are usually denoted using the LaGrange and leibness notation like this you can even take higher order derivatives which is just taking the derivative of the derivative to get the slope of the slope differentiation rules these are the rules we use to actually evaluate and take derivatives these are the constant rule constant multiple rule sum rule difference rule product rule quotient rule and chain rule applications of derivatives we can only imagine how powerful derivatives actually are they're used in many practical ways from knowing the instantaneous velocity of an object given a displacement function to optimization where you get the maximum or minimum value of a certain quantity integration integration is used to find the areas and volumes under curves by summing up infinitely small slices under the function here we see that you can slice up the area under this curve into six rectangles this gives you a rough but inaccurate area you can increase the slices to 12 which becomes slightly more accurate yet still not a hundred percent correct finally you can increase the slices to an infinite number to get the exact area under the curve which is exactly what the essence of integration is types of integrals there are two overarching types of integrals the first the indefinite integral outputs the antiderivative of a function this means that taking the antiderivative of a derivative function gives back the original function the second is the definite integral which outputs a number it is the area under the curve f of x from x equals a to x equals B and that's it some details were left out but that's essentially the gist of calculus one the start of your journey into the beautiful world of calculus",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "setup",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "The video introduces calculus as the study of change and motion, with functions as its foundation.",
+     "start": 0.0,
+     "end": 45.5
+    },
+    {
+     "unit_id": "u0001",
+     "role": "definition",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "Functions relate a set of inputs to a set of outputs.",
+     "start": 43.3,
+     "end": 87.8
+    },
+    {
+     "unit_id": "u0002",
+     "role": "explanation",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "A 2D function takes an x-axis input and outputs a y-axis value, which creates a graph when done for many values.",
+     "start": 84.8,
+     "end": 126.2
+    },
+    {
+     "unit_id": "u0003",
+     "role": "claim",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "For something to be considered a function, it must have either a one-to-one or many-to-one relationship.",
+     "start": 123.1,
+     "end": 165.5
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives represent the slope of functions at specific points, unlike average slopes calculated before calculus.",
+     "start": 162.4,
+     "end": 211.3
+    },
+    {
+     "unit_id": "u0005",
+     "role": "claim",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives are typically denoted using LaGrange and Leibniz notation.",
+     "start": 209.1,
+     "end": 255.5
+    },
+    {
+     "unit_id": "u0006",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Higher-order derivatives involve taking the derivative of a derivative to find the slope of the slope.",
+     "start": 253.5,
+     "end": 294.0
+    },
+    {
+     "unit_id": "u0007",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Differentiation rules are used to evaluate and take derivatives, including the constant rule, constant multiple rule, sum rule, difference rule, product rule, quotient rule, and chain rule.",
+     "start": 292.3,
+     "end": 324.4
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip attempts to define several calculus concepts (limits, continuity, derivatives, integration) but does so in a very superficial and incomplete manner. It uses phrases like 'the general expression of limits is this' and 'like this' without providing the actual expressions or notations, making it impossible to fully understand the definitions. The clip also assumes prior knowledge of mathematical notation and concepts without introducing them.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": false,
+     "problem_statement_complete": true,
+     "reasoning_complete": true,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "this"
+     },
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "like this"
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "",
+      "missing_concept": "Mathematical notation for limits and derivatives",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0006",
+   "title": "Derivatives and Differentiation Rules",
+   "role": "definition",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "unresolved_reference",
+    "unresolved_reference",
+    "missing_prerequisite"
+   ],
+   "final_quality": null,
+   "start": 43.26,
+   "end": 324.38,
+   "duration_s": 281.1,
+   "span_text": "let's go over the entire calculus one the study of change and motion functions this is mainly learned in algebra but it is ultimately the foundation of calculus functions relate a set of inputs to a set of outputs a function that exists in 2D takes in an input in the x-axis and outputs a value in the y-axis doing this for many values gives you a graph a function must specifically have either the one-to-one relationship or many to one relationship to be considered a function you can use the vertical line test to see if a function is indeed a function simply make a vertical line through your graph and if it intersects more than one point it is not a function limits limits describe how a function behaves near a point not on the point itself there's a value that the X always approaches and gets infinitely close to but never touches the general expression of limits is this it is read as the limit of f of x as X approaches a is the value l these limits are evaluated usually by substitution or simplification then substitution if the limit is initially indeterminate continuity sometimes if these limits diverge or don't exist discontinuities are made in our graph there are three types of these discontinuities the whole discontinuity which looks like you have a continuous graph except for in one little point or whole the jump discontinuity which is continuous until a certain point where the function jumps to another value and continues from there then you have the infinite discontinuity where asymptotes Force the function to diverge functions are considered continuous at a point as long as they are defined at the point the limit exists at the point and the value of the function is the same as the value of the limit at the point derivatives derivatives are what we use in calculus to observe the rate of change of functions this is especially useful since it allows us to analyze the instantaneous slope of functions at certain points as opposed to what we used to do before calculus which was simply taking average slope derivatives are usually denoted using the LaGrange and leibness notation like this you can even take higher order derivatives which is just taking the derivative of the derivative to get the slope of the slope differentiation rules these are the rules we use to actually evaluate and take derivatives these are the constant rule constant multiple rule sum rule difference rule product rule quotient rule and chain rule applications of derivatives we can only imagine how powerful derivatives actually are they're used in many practical ways from knowing the instantaneous velocity of an object given a displacement function to optimization where you get the maximum or minimum value of a certain quantity integration integration is used to find the areas and volumes under curves by summing up infinitely small slices under the function here we see that you can slice up the area under this curve into six rectangles this gives you a rough but inaccurate area you can increase the slices to 12 which becomes slightly more accurate yet still not a hundred percent correct finally you can increase the slices to an infinite number to get the exact area under the curve which is exactly what the essence of integration is types of integrals there are two overarching types of integrals the first the indefinite integral outputs the antiderivative of a function this means that taking the antiderivative of a derivative function gives back the original function the second is the definite integral which outputs a number it is the area under the curve f of x from x equals a to x equals B and that's it some details were left out but that's essentially the gist of calculus one the start of your journey into the beautiful world of calculus",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "setup",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "The video introduces calculus as the study of change and motion, with functions as its foundation.",
+     "start": 0.0,
+     "end": 45.5
+    },
+    {
+     "unit_id": "u0001",
+     "role": "definition",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "Functions relate a set of inputs to a set of outputs.",
+     "start": 43.3,
+     "end": 87.8
+    },
+    {
+     "unit_id": "u0002",
+     "role": "explanation",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "A 2D function takes an x-axis input and outputs a y-axis value, which creates a graph when done for many values.",
+     "start": 84.8,
+     "end": 126.2
+    },
+    {
+     "unit_id": "u0003",
+     "role": "claim",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "For something to be considered a function, it must have either a one-to-one or many-to-one relationship.",
+     "start": 123.1,
+     "end": 165.5
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives represent the slope of functions at specific points, unlike average slopes calculated before calculus.",
+     "start": 162.4,
+     "end": 211.3
+    },
+    {
+     "unit_id": "u0005",
+     "role": "claim",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives are typically denoted using LaGrange and Leibniz notation.",
+     "start": 209.1,
+     "end": 255.5
+    },
+    {
+     "unit_id": "u0006",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Higher-order derivatives involve taking the derivative of a derivative to find the slope of the slope.",
+     "start": 253.5,
+     "end": 294.0
+    },
+    {
+     "unit_id": "u0007",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Differentiation rules are used to evaluate and take derivatives, including the constant rule, constant multiple rule, sum rule, difference rule, product rule, quotient rule, and chain rule.",
+     "start": 292.3,
+     "end": 324.4
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip attempts to define several calculus concepts (limits, continuity, derivatives, integration) but does so in a very superficial and incomplete manner. It uses phrases like 'the general expression of limits is this' and 'like this' without providing the actual expressions or notations, making it impossible to fully understand the definitions. The clip also assumes prior knowledge of mathematical notation and concepts without introducing them.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": false,
+     "problem_statement_complete": true,
+     "reasoning_complete": true,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "this"
+     },
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "like this"
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "",
+      "missing_concept": "Mathematical notation for limits and derivatives",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0001",
+   "title": "Calculus 1: Functions and Their Graphs",
+   "role": "definition",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "unresolved_reference",
+    "unresolved_reference",
+    "missing_concept",
+    "missing_visual"
+   ],
+   "final_quality": null,
+   "start": 0.0,
+   "end": 294.0,
+   "duration_s": 294.0,
+   "span_text": "let's go over the entire calculus one the study of change and motion functions this is mainly learned in algebra but it is ultimately the foundation of calculus functions relate a set of inputs to a set of outputs a function that exists in 2D takes in an input in the x-axis and outputs a value in the y-axis doing this for many values gives you a graph a function must specifically have either the one-to-one relationship or many to one relationship to be considered a function you can use the vertical line test to see if a function is indeed a function simply make a vertical line through your graph and if it intersects more than one point it is not a function limits limits describe how a function behaves near a point not on the point itself there's a value that the X always approaches and gets infinitely close to but never touches the general expression of limits is this it is read as the limit of f of x as X approaches a is the value l these limits are evaluated usually by substitution or simplification then substitution if the limit is initially indeterminate continuity sometimes if these limits diverge or don't exist discontinuities are made in our graph there are three types of these discontinuities the whole discontinuity which looks like you have a continuous graph except for in one little point or whole the jump discontinuity which is continuous until a certain point where the function jumps to another value and continues from there then you have the infinite discontinuity where asymptotes Force the function to diverge functions are considered continuous at a point as long as they are defined at the point the limit exists at the point and the value of the function is the same as the value of the limit at the point derivatives derivatives are what we use in calculus to observe the rate of change of functions this is especially useful since it allows us to analyze the instantaneous slope of functions at certain points as opposed to what we used to do before calculus which was simply taking average slope derivatives are usually denoted using the LaGrange and leibness notation like this you can even take higher order derivatives which is just taking the derivative of the derivative to get the slope of the slope differentiation rules these are the rules we use to actually evaluate and take derivatives these are the constant rule constant multiple rule sum rule difference rule product rule quotient rule and chain rule applications of derivatives we can only imagine how powerful derivatives actually are they're used in many practical ways from knowing the instantaneous velocity of an object given a displacement function to optimization where you get the maximum or minimum value of a certain quantity integration integration is used to find the areas and volumes under curves by summing up infinitely small slices under the function here we see that you can slice up the area under this curve into six rectangles this gives you a rough but inaccurate area you can increase the slices to 12 which becomes slightly more accurate yet still not a hundred percent correct finally you can increase the slices to an infinite number to get the exact area under the curve which is exactly what the essence of integration is types of integrals there are two overarching types of integrals the first the indefinite integral outputs the antiderivative of a function this means that taking the antiderivative of a derivative function gives back the original function the second is the definite integral which outputs a number it is the area under the curve f of x from x equals a to x equals B and that's it some details were left out but that's essentially the gist of calculus one the start of your journey into the beautiful world of calculus",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "setup",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "The video introduces calculus as the study of change and motion, with functions as its foundation.",
+     "start": 0.0,
+     "end": 45.5
+    },
+    {
+     "unit_id": "u0001",
+     "role": "definition",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "Functions relate a set of inputs to a set of outputs.",
+     "start": 43.3,
+     "end": 87.8
+    },
+    {
+     "unit_id": "u0002",
+     "role": "explanation",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "A 2D function takes an x-axis input and outputs a y-axis value, which creates a graph when done for many values.",
+     "start": 84.8,
+     "end": 126.2
+    },
+    {
+     "unit_id": "u0003",
+     "role": "claim",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "For something to be considered a function, it must have either a one-to-one or many-to-one relationship.",
+     "start": 123.1,
+     "end": 165.5
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives represent the slope of functions at specific points, unlike average slopes calculated before calculus.",
+     "start": 162.4,
+     "end": 211.3
+    },
+    {
+     "unit_id": "u0005",
+     "role": "claim",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives are typically denoted using LaGrange and Leibniz notation.",
+     "start": 209.1,
+     "end": 255.5
+    },
+    {
+     "unit_id": "u0006",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Higher-order derivatives involve taking the derivative of a derivative to find the slope of the slope.",
+     "start": 253.5,
+     "end": 294.0
+    },
+    {
+     "unit_id": "u0007",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Differentiation rules are used to evaluate and take derivatives, including the constant rule, constant multiple rule, sum rule, difference rule, product rule, quotient rule, and chain rule.",
+     "start": 292.3,
+     "end": 324.4
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip attempts to define several calculus concepts: functions, limits, continuity, derivatives, and integration. However, it frequently uses phrases like 'the general expression of limits is this' and 'derivatives are usually denoted using the LaGrange and leibness notation like this' without providing the actual expressions or notations. It also assumes the viewer understands algebraic concepts related to functions and graphing without defining them. The explanation of integration relies on a visual of slicing an area under a curve, which is not described in the transcript.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": false,
+     "problem_statement_complete": true,
+     "reasoning_complete": false,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "this"
+     },
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "this"
+     },
+     {
+      "kind": "missing_concept",
+      "detail": "",
+      "missing_concept": "algebraic concepts related to functions and graphing",
+      "reference_text": null
+     },
+     {
+      "kind": "missing_visual",
+      "detail": "The explanation of integration relies on a visual of slicing an area under a curve, which is not described in the transcript.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0007",
+   "title": "Derivatives and Differentiation Rules",
+   "role": "definition",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.4,
+   "failure_kinds": [
+    "unresolved_reference",
+    "missing_prerequisite",
+    "missing_prerequisite"
+   ],
+   "final_quality": null,
+   "start": 162.36,
+   "end": 324.38,
+   "duration_s": 162.0,
+   "span_text": "another value and continues from there then you have the infinite discontinuity where asymptotes Force the function to diverge functions are considered continuous at a point as long as they are defined at the point the limit exists at the point and the value of the function is the same as the value of the limit at the point derivatives derivatives are what we use in calculus to observe the rate of change of functions this is especially useful since it allows us to analyze the instantaneous slope of functions at certain points as opposed to what we used to do before calculus which was simply taking average slope derivatives are usually denoted using the LaGrange and leibness notation like this you can even take higher order derivatives which is just taking the derivative of the derivative to get the slope of the slope differentiation rules these are the rules we use to actually evaluate and take derivatives these are the constant rule constant multiple rule sum rule difference rule product rule quotient rule and chain rule applications of derivatives we can only imagine how powerful derivatives actually are they're used in many practical ways from knowing the instantaneous velocity of an object given a displacement function to optimization where you get the maximum or minimum value of a certain quantity integration integration is used to find the areas and volumes under curves by summing up infinitely small slices under the function here we see that you can slice up the area under this curve into six rectangles this gives you a rough but inaccurate area you can increase the slices to 12 which becomes slightly more accurate yet still not a hundred percent correct finally you can increase the slices to an infinite number to get the exact area under the curve which is exactly what the essence of integration is types of integrals there are two overarching types of integrals the first the indefinite integral outputs the antiderivative of a function this means that taking the antiderivative of a derivative function gives back the original function the second is the definite integral which outputs a number it is the area under the curve f of x from x equals a to x equals B and that's it some details were left out but that's essentially the gist of calculus one the start of your journey into the beautiful world of calculus",
+   "units_in_span": [
+    {
+     "unit_id": "u0003",
+     "role": "claim",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "For something to be considered a function, it must have either a one-to-one or many-to-one relationship.",
+     "start": 123.1,
+     "end": 165.5
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives represent the slope of functions at specific points, unlike average slopes calculated before calculus.",
+     "start": 162.4,
+     "end": 211.3
+    },
+    {
+     "unit_id": "u0005",
+     "role": "claim",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives are typically denoted using LaGrange and Leibniz notation.",
+     "start": 209.1,
+     "end": 255.5
+    },
+    {
+     "unit_id": "u0006",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Higher-order derivatives involve taking the derivative of a derivative to find the slope of the slope.",
+     "start": 253.5,
+     "end": 294.0
+    },
+    {
+     "unit_id": "u0007",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Differentiation rules are used to evaluate and take derivatives, including the constant rule, constant multiple rule, sum rule, difference rule, product rule, quotient rule, and chain rule.",
+     "start": 292.3,
+     "end": 324.4
+    }
+   ],
+   "first_verdict": {
+    "score_10": 4,
+    "score": 0.4,
+    "understandable": false,
+    "reasoning": "The clip attempts to define calculus by introducing derivatives and integrals. However, it assumes prior knowledge of mathematical concepts like 'functions' and 'displacement function' without defining them. The explanation of derivatives and integrals is also very high-level and lacks concrete examples or worked problems, making it difficult for a new viewer to grasp the core ideas. The clip also mentions 'LaGrange and leibness notation' without showing them, and refers to 'the previous equation' which is not present.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": true,
+     "reasoning_complete": false,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "the previous equation"
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "",
+      "missing_concept": "functions",
+      "reference_text": null
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "",
+      "missing_concept": "displacement function",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0002",
+   "title": "Calculus 1: Functions and Their Graphs",
+   "role": "explanation",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "unresolved_reference",
+    "missing_prerequisite",
+    "missing_reasoning"
+   ],
+   "final_quality": null,
+   "start": 0.0,
+   "end": 126.24,
+   "duration_s": 126.2,
+   "span_text": "let's go over the entire calculus one the study of change and motion functions this is mainly learned in algebra but it is ultimately the foundation of calculus functions relate a set of inputs to a set of outputs a function that exists in 2D takes in an input in the x-axis and outputs a value in the y-axis doing this for many values gives you a graph a function must specifically have either the one-to-one relationship or many to one relationship to be considered a function you can use the vertical line test to see if a function is indeed a function simply make a vertical line through your graph and if it intersects more than one point it is not a function limits limits describe how a function behaves near a point not on the point itself there's a value that the X always approaches and gets infinitely close to but never touches the general expression of limits is this it is read as the limit of f of x as X approaches a is the value l these limits are evaluated usually by substitution or simplification then substitution if the limit is initially indeterminate continuity sometimes if these limits diverge or don't exist discontinuities are made in our graph there are three types of these discontinuities the whole discontinuity which looks like you have a continuous graph except for in one little point or whole the jump discontinuity which is continuous until a certain point where the function jumps to another value and continues from there then you have the infinite discontinuity where asymptotes Force the function to diverge functions are considered continuous at a point as long as they are defined at the point the limit exists at the point and the value of the function is the same as the value of the limit at the point derivatives derivatives are what we use in calculus to observe the rate of change of functions this is especially useful since it allows us to analyze the instantaneous",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "setup",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "The video introduces calculus as the study of change and motion, with functions as its foundation.",
+     "start": 0.0,
+     "end": 45.5
+    },
+    {
+     "unit_id": "u0001",
+     "role": "definition",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "Functions relate a set of inputs to a set of outputs.",
+     "start": 43.3,
+     "end": 87.8
+    },
+    {
+     "unit_id": "u0002",
+     "role": "explanation",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "A 2D function takes an x-axis input and outputs a y-axis value, which creates a graph when done for many values.",
+     "start": 84.8,
+     "end": 126.2
+    },
+    {
+     "unit_id": "u0003",
+     "role": "claim",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "For something to be considered a function, it must have either a one-to-one or many-to-one relationship.",
+     "start": 123.1,
+     "end": 165.5
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip attempts to explain the foundational concepts of calculus, including functions, limits, and continuity. However, it assumes prior knowledge of algebra and calculus concepts without defining them adequately. Key terms like 'one-to-one relationship' and 'many-to-one relationship' are mentioned but not fully explained in the context of functions. The explanation of limits is also incomplete, as it refers to 'this' general expression without providing it, and the explanation of continuity is cut off mid-sentence.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": true,
+     "reasoning_complete": false,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "this"
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "",
+      "missing_concept": "The clip assumes understanding of algebraic concepts and the 'one-to-one' and 'many-to-one' relationships for functions without sufficient explanation.",
+      "reference_text": null
+     },
+     {
+      "kind": "missing_reasoning",
+      "detail": "The explanation of continuity is cut off mid-sentence.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0003",
+   "title": "Calculus 1: Functions and Their Graphs",
+   "role": "claim",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.4,
+   "failure_kinds": [
+    "unresolved_reference",
+    "missing_prerequisite"
+   ],
+   "final_quality": null,
+   "start": 0.0,
+   "end": 255.48,
+   "duration_s": 255.5,
+   "span_text": "let's go over the entire calculus one the study of change and motion functions this is mainly learned in algebra but it is ultimately the foundation of calculus functions relate a set of inputs to a set of outputs a function that exists in 2D takes in an input in the x-axis and outputs a value in the y-axis doing this for many values gives you a graph a function must specifically have either the one-to-one relationship or many to one relationship to be considered a function you can use the vertical line test to see if a function is indeed a function simply make a vertical line through your graph and if it intersects more than one point it is not a function limits limits describe how a function behaves near a point not on the point itself there's a value that the X always approaches and gets infinitely close to but never touches the general expression of limits is this it is read as the limit of f of x as X approaches a is the value l these limits are evaluated usually by substitution or simplification then substitution if the limit is initially indeterminate continuity sometimes if these limits diverge or don't exist discontinuities are made in our graph there are three types of these discontinuities the whole discontinuity which looks like you have a continuous graph except for in one little point or whole the jump discontinuity which is continuous until a certain point where the function jumps to another value and continues from there then you have the infinite discontinuity where asymptotes Force the function to diverge functions are considered continuous at a point as long as they are defined at the point the limit exists at the point and the value of the function is the same as the value of the limit at the point derivatives derivatives are what we use in calculus to observe the rate of change of functions this is especially useful since it allows us to analyze the instantaneous slope of functions at certain points as opposed to what we used to do before calculus which was simply taking average slope derivatives are usually denoted using the LaGrange and leibness notation like this you can even take higher order derivatives which is just taking the derivative of the derivative to get the slope of the slope differentiation rules these are the rules we use to actually evaluate and take derivatives these are the constant rule constant multiple rule sum rule difference rule product rule quotient rule and chain rule applications of derivatives we can only imagine how powerful derivatives actually are they're used in many practical ways from knowing the instantaneous velocity of an object given a displacement function to optimization where you get the maximum or minimum value of a certain quantity integration integration is used to find the areas and volumes under curves by summing up infinitely small slices under the function here we see that you can slice up the area under this curve into six rectangles this gives you a rough but inaccurate area you can increase the slices to 12 which becomes slightly more accurate yet still not a hundred percent correct finally you can increase the slices to an infinite number to get the exact area under the curve which is exactly what the essence of integration is types of integrals there are two overarching types of integrals the first the indefinite integral outputs the antiderivative of a function",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "setup",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "The video introduces calculus as the study of change and motion, with functions as its foundation.",
+     "start": 0.0,
+     "end": 45.5
+    },
+    {
+     "unit_id": "u0001",
+     "role": "definition",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "Functions relate a set of inputs to a set of outputs.",
+     "start": 43.3,
+     "end": 87.8
+    },
+    {
+     "unit_id": "u0002",
+     "role": "explanation",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "A 2D function takes an x-axis input and outputs a y-axis value, which creates a graph when done for many values.",
+     "start": 84.8,
+     "end": 126.2
+    },
+    {
+     "unit_id": "u0003",
+     "role": "claim",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "For something to be considered a function, it must have either a one-to-one or many-to-one relationship.",
+     "start": 123.1,
+     "end": 165.5
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives represent the slope of functions at specific points, unlike average slopes calculated before calculus.",
+     "start": 162.4,
+     "end": 211.3
+    },
+    {
+     "unit_id": "u0005",
+     "role": "claim",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives are typically denoted using LaGrange and Leibniz notation.",
+     "start": 209.1,
+     "end": 255.5
+    },
+    {
+     "unit_id": "u0006",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Higher-order derivatives involve taking the derivative of a derivative to find the slope of the slope.",
+     "start": 253.5,
+     "end": 294.0
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip attempts to explain limits, discontinuities, derivatives, and integration. However, it jumps between topics without clear transitions or definitions for all terms. For example, it mentions 'substitution or simplification' for limits without explaining these methods, and it assumes the viewer knows what 'indeterminate' means. The explanation of derivatives and integration is also very brief and lacks context. The clip is not a worked problem, but it fails to fully explain the concepts it introduces.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": true,
+     "reasoning_complete": false,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes knowledge of 'substitution or simplification' for evaluating limits and the concept of 'indeterminate' limits without explanation.",
+      "missing_concept": "Methods for evaluating limits (substitution, simplification) and the concept of indeterminate forms.",
+      "reference_text": null
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The explanation of derivatives and integration is too brief and assumes prior knowledge of calculus concepts.",
+      "missing_concept": "Fundamental concepts of derivatives and integration.",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0005",
+   "title": "Derivatives and Differentiation Rules",
+   "role": "claim",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.4,
+   "failure_kinds": [
+    "unresolved_reference",
+    "missing_prerequisite"
+   ],
+   "final_quality": null,
+   "start": 0.0,
+   "end": 255.48,
+   "duration_s": 255.5,
+   "span_text": "let's go over the entire calculus one the study of change and motion functions this is mainly learned in algebra but it is ultimately the foundation of calculus functions relate a set of inputs to a set of outputs a function that exists in 2D takes in an input in the x-axis and outputs a value in the y-axis doing this for many values gives you a graph a function must specifically have either the one-to-one relationship or many to one relationship to be considered a function you can use the vertical line test to see if a function is indeed a function simply make a vertical line through your graph and if it intersects more than one point it is not a function limits limits describe how a function behaves near a point not on the point itself there's a value that the X always approaches and gets infinitely close to but never touches the general expression of limits is this it is read as the limit of f of x as X approaches a is the value l these limits are evaluated usually by substitution or simplification then substitution if the limit is initially indeterminate continuity sometimes if these limits diverge or don't exist discontinuities are made in our graph there are three types of these discontinuities the whole discontinuity which looks like you have a continuous graph except for in one little point or whole the jump discontinuity which is continuous until a certain point where the function jumps to another value and continues from there then you have the infinite discontinuity where asymptotes Force the function to diverge functions are considered continuous at a point as long as they are defined at the point the limit exists at the point and the value of the function is the same as the value of the limit at the point derivatives derivatives are what we use in calculus to observe the rate of change of functions this is especially useful since it allows us to analyze the instantaneous slope of functions at certain points as opposed to what we used to do before calculus which was simply taking average slope derivatives are usually denoted using the LaGrange and leibness notation like this you can even take higher order derivatives which is just taking the derivative of the derivative to get the slope of the slope differentiation rules these are the rules we use to actually evaluate and take derivatives these are the constant rule constant multiple rule sum rule difference rule product rule quotient rule and chain rule applications of derivatives we can only imagine how powerful derivatives actually are they're used in many practical ways from knowing the instantaneous velocity of an object given a displacement function to optimization where you get the maximum or minimum value of a certain quantity integration integration is used to find the areas and volumes under curves by summing up infinitely small slices under the function here we see that you can slice up the area under this curve into six rectangles this gives you a rough but inaccurate area you can increase the slices to 12 which becomes slightly more accurate yet still not a hundred percent correct finally you can increase the slices to an infinite number to get the exact area under the curve which is exactly what the essence of integration is types of integrals there are two overarching types of integrals the first the indefinite integral outputs the antiderivative of a function",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "setup",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "The video introduces calculus as the study of change and motion, with functions as its foundation.",
+     "start": 0.0,
+     "end": 45.5
+    },
+    {
+     "unit_id": "u0001",
+     "role": "definition",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "Functions relate a set of inputs to a set of outputs.",
+     "start": 43.3,
+     "end": 87.8
+    },
+    {
+     "unit_id": "u0002",
+     "role": "explanation",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "A 2D function takes an x-axis input and outputs a y-axis value, which creates a graph when done for many values.",
+     "start": 84.8,
+     "end": 126.2
+    },
+    {
+     "unit_id": "u0003",
+     "role": "claim",
+     "topic": "Calculus 1: Functions and Their Graphs",
+     "summary": "For something to be considered a function, it must have either a one-to-one or many-to-one relationship.",
+     "start": 123.1,
+     "end": 165.5
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives represent the slope of functions at specific points, unlike average slopes calculated before calculus.",
+     "start": 162.4,
+     "end": 211.3
+    },
+    {
+     "unit_id": "u0005",
+     "role": "claim",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Derivatives are typically denoted using LaGrange and Leibniz notation.",
+     "start": 209.1,
+     "end": 255.5
+    },
+    {
+     "unit_id": "u0006",
+     "role": "definition",
+     "topic": "Derivatives and Differentiation Rules",
+     "summary": "Higher-order derivatives involve taking the derivative of a derivative to find the slope of the slope.",
+     "start": 253.5,
+     "end": 294.0
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip attempts to explain limits, discontinuities, derivatives, and integration. However, it jumps between topics without clear transitions or definitions for all terms. For example, it mentions 'substitution or simplification' for limits without explaining these methods, and it assumes the viewer knows what 'indeterminate' means. The explanation of derivatives and integration is also very brief and lacks context. The clip is not a worked problem, but it fails to fully explain the concepts it introduces.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": true,
+     "reasoning_complete": false,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes knowledge of 'substitution or simplification' for evaluating limits and the concept of 'indeterminate' limits without explanation.",
+      "missing_concept": "Methods for evaluating limits (substitution, simplification) and the concept of indeterminate forms.",
+      "reference_text": null
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The explanation of derivatives and integration is too brief and assumes prior knowledge of calculus concepts.",
+      "missing_concept": "Fundamental concepts of derivatives and integration.",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  }
+ ]
+}

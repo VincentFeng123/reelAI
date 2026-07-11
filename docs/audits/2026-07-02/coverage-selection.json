@@ -1,0 +1,194 @@
+{
+  "angle": "coverage-selection",
+  "findings": [
+    {
+      "title": "Select anchors with a joint relevance+coverage objective, not a flat priority sort",
+      "claim": "2025 long-video work converges on formulating segment/keyframe selection as an explicit optimization over BOTH query relevance AND temporal coverage of the video, with per-segment allocation to prevent one region/type crowding out the rest: AKS (CVPR 2025) formulates keyframe selection as 'relevance between the keyframes and the prompt' + 'coverage of the keyframes over the video' with adaptive allocation between top-scored and temporally-distributed picks; MDP3 (2025, training-free) segments the video, runs a DPP within each segment for relevance+diversity, and uses a Markov decision process to allocate selection sizes ACROSS segments; F2C (2025) states the two guiding principles as relevancy + diversity ('anchors cover different parts of the video') and shows coherent clips beat isolated picks. The current select_anchors() flat sort by priority*relevance*confidence truncated at MAX_ANCHORS=12 has no such term, which is exactly why six 'claim' units crowded out practice_prompt/solution/equation_introduction.",
+      "addresses": "F3",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2502.21271",
+          "note": "AKS, CVPR 2025 (fetched abstract): keyframe selection formulated as optimization over (1) relevance to prompt and (2) coverage over the video, with an adaptive algorithm balancing top-scored frames vs temporal distribution."
+        },
+        {
+          "url": "https://arxiv.org/abs/2501.02885",
+          "note": "MDP3 (fetched abstract): training-free, model-agnostic; applies DPP to a similarity matrix for query relevance + list-wise diversity WITHIN segments, and an MDP to allocate selection sizes ACROSS segments for sequentiality \u2014 the per-chapter-quota pattern."
+        },
+        {
+          "url": "https://arxiv.org/html/2510.02262v1",
+          "note": "From Frames to Clips (fetched): selection principles quoted as '(1) Relevancy... (2) Diversity, ensuring that the selected anchors cover different parts of the video to avoid redundancy'; cites AKS and MDP3 as the relevance+coverage prior art."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In backend/pipeline/assemble/candidates.py select_anchors(): pass the Structure's ContentMap (understand/models.py ContentMap.topics()/chapters(); units already map to topics via sentence_range) and replace `scored.sort(...)[:cap]` with a two-phase greedy: phase 1 take the single best-scoring anchor from EACH topic node in temporal order (guarantees every content-map topic contributes a candidate before any topic gets a second); phase 2 fill remaining MAX_ANCHORS slots by marginal score with saturation penalties score(u) * topic_decay^k_topic * role_decay^k_role (decay\u22480.5, k = anchors already taken from that topic/role \u2014 role_decay directly stops six 'claim' anchors). Log per-topic and per-role counts into the candidates artifact, and add a 'chapter coverage' metric (fraction of ContentMap chapters with \u22651 shipped clip) to backend/eval/metrics.py so F3 regressions become measurable (also feeds the F5 golden-set effort)."
+    },
+    {
+      "title": "Per-topic quotas are a partition matroid; greedy under it is principled and there is pip-installable tooling (submodlib)",
+      "claim": "The 'at most k anchors per content-map topic' rule is exactly monotone submodular maximization under a partition matroid constraint, for which the plain greedy algorithm has classical constant-factor guarantees (a literature the fetched arXiv 1810.12861 refines with tight discriminant-based bounds) \u2014 i.e., the simple defensible heuristic is also the theoretically sanctioned one. If a learned/embedding route is wanted instead, submodlib (MIT license, C++ backend, pip-installable) implements Facility Location, Graph Cut, Log Determinant (DPP), Disparity-Sum/Min, and Set Cover with NaiveGreedy/LazyGreedy/StochasticGreedy/LazierThanLazyGreedy optimizers \u2014 facility location over unit-embedding similarity gives representativeness-aware anchor picking with a one-line objective swap.",
+      "addresses": "F3",
+      "sources": [
+        {
+          "url": "https://github.com/decile-team/submodlib",
+          "note": "Fetched: implements Facility Location, Disparity Sum/Min, Log Determinant, Set Cover, Graph Cut, Feature Based + mutual-information/conditional-gain variants; optimizers NaiveGreedy/LazyGreedy/StochasticGreedy/LazierThanLazyGreedy; MIT license; pip-installable."
+        },
+        {
+          "url": "https://arxiv.org/abs/1810.12861",
+          "note": "Fetched abstract: greedy for submodular maximization under a matroid constraint \u2014 derives tight guarantees subsuming all previously known greedy bounds (incl. curvature-based), i.e., quota-greedy sits on solid approximation-theory ground."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "Simple path (recommended first): implement the quota as a hard cap per ContentMap topic \u2014 capacity = ceil(MAX_ANCHORS / n_topics) + 1 slack \u2014 inside the finding-1 greedy loop in candidates.py; that IS partition-matroid greedy, no dependency added. Learned path (only if eval shows the heuristic leaves value): reuse the TreeSeg unit embeddings already computed for the content map, build a cosine-similarity kernel over anchor-eligible units, and run submodlib FacilityLocationFunction (or LogDeterminant for stronger anti-redundancy) with LazyGreedy at budget MAX_ANCHORS, weighting gains by anchor_priority*relevance. Keep config.MAX_ANCHORS as the budget; expose quota slack in config.py."
+    },
+    {
+      "title": "Detect problem\u2192solution arcs as first-class candidates via staged LLM segmentation with deterministic verification (MathNet recipe)",
+      "claim": "MathNet (2026) demonstrates a working LLM pipeline for extracting complete problem\u2013solution pairs from long heterogeneous sources: stage 1, Gemini-2.5-Flash identifies problem and solution segments by OUTPUTTING ONLY LINE NUMBERS; stage 2, a second model extracts the paired text even when problem and solution live in far-apart sections; stage 3, a pair is retained only if rule-based similarity checks, an LLM cross-check, and (for low-confidence cases) human review reach unanimous agreement. The transferable patterns for this pipeline: (a) find the ARC (statement\u2192steps\u2192answer) as a unit-id/line-number span rather than asking an LLM for free text (small hallucination surface, cheap deterministic containment checks); (b) pair prompts with distant solutions explicitly; (c) gate pairs on multi-mechanism agreement. This directly fixes 'complete worked example unclippable because its result units were labeled calculation' \u2014 arcs are detected from sequence shape, not from any single unit's role label.",
+      "addresses": "F3 (worked-example loss), and feeds F4 (arcs get the result contract)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2604.18584",
+          "note": "Fetched Section 3.2: 'Gemini-2.5-Flash to identify problem and solution corresponding segments by outputting only their line numbers'; GPT-4.1 extraction across far-apart sections; 3-stage verification (rule-based text-similarity vs source, LLM comparison against source screenshots, human review); 'retained only if all three verification mechanisms reach unanimous agreement'."
+        },
+        {
+          "url": "https://arxiv.org/abs/2604.18584",
+          "note": "Fetched abstract: MathNet is a 30,676-problem multimodal/multilingual benchmark built with this alignment pipeline \u2014 evidence the recipe scales across 17 languages and heterogeneous formats."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "New pass backend/pipeline/understand/arcs.py run after unit labeling: deterministic scan over time-ordered units for the grammar (example_setup|problem_givens|practice_prompt) \u2192 1+ (worked_step|calculation|derivation) \u2192 (result|solution|calculation as final step), tolerating \u22642 interleaved non-arc units; emit ArcCandidate(unit_ids). In candidates.py, arc candidates BYPASS adapter.is_anchor_role() (the fix for result-labeled-as-calculation) and enter selection as synthetic 'result'-role anchors. For practice_prompt\u2192solution pairing across distance: candidate solution = first later solution/result unit sharing \u22651 concept with the prompt (Unit.concepts_introduced/required); verify each arc/pair with ONE llm_json call that returns only unit ids confirming (problem_ids, step_ids, answer_ids) \u2014 MathNet's line-number trick \u2014 then rule-check the ids fall inside the arc; drop on disagreement. Arcs are judged under the result contract (finding 4), giving the kinematics lecture back its worked example, practice, and solution reference clips."
+    },
+    {
+      "title": "Bind the completeness contract to the ASSEMBLED span's content, and rebind after every repair mutation (instance-specific-rubric prior art)",
+      "claim": "The strongest 2025 evaluation results come from choosing grading criteria PER INSTANCE from the instance's own content rather than from a global template: HealthBench grades each response against conversation-specific physician-written rubrics (48,562 unique criteria), and Rubrics-as-Rewards shows instance-specific rubrics used as reward signals beat plain LLM-as-judge baselines by up to 31% relative on HealthBench. Applied here: the contract is the rubric, and it is currently selected by the anchor's role (contracts.py check_contract(role=...) and base.py required_verdict_fields(role)), so a claim-anchored span that swallowed a worked problem is graded with claim gates while the judge sees an incomplete problem \u2014 the exact F4 divergence (internal 0.95 vs judge 4/10). Choose the contract from the roles actually present in the final unit set, and re-choose whenever the repair loop changes the unit set.",
+      "addresses": "F4 (primary), interacts with F2 (span growth changes content, so the contract must rebind)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2505.08775",
+          "note": "Fetched abstract: 'Responses are evaluated using conversation-specific rubrics created by 262 physicians... 48,562 unique rubric criteria' \u2014 per-instance criteria selection as the evaluation design."
+        },
+        {
+          "url": "https://arxiv.org/abs/2507.17746",
+          "note": "Fetched abstract: Rubrics as Rewards \u2014 instance-specific rubrics as structured reward signals; up to 31% relative improvement on HealthBench over LLM-as-judge baselines; better alignment with smaller judges and reduced variance."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In backend/pipeline/assemble/contracts.py add choose_contract(unit_ids, units_by_id, adapter): compute roles_present of the assembled span; score every contract in adapter.completeness_contracts() by (required elements satisfiable by roles_present)/(required elements), tie-broken by specificity (more required elements wins; deterministic precedence result > derivation > solution > procedure > practice_prompt > correction > definition > claim so problem-shaped contracts dominate whenever setup+steps+answer roles are present). Store the winner on Candidate as contract_role (keep anchor role separately for provenance). Key check_contract() and BaseAdapter.required_verdict_fields() (base.py lines 194-204, incl. the _PROBLEM_ROLES gate list) off contract_role. Critically, in the assemble/validate.py repair loop, RE-RUN choose_contract after every expansion before re-judging, and compute final_quality under the same contract the judge used \u2014 this closes the F4 internal-vs-judge divergence and prevents grown spans (F2) from being graded under a stale rubric."
+    },
+    {
+      "title": "Catch music/parody with a CNN audio segmenter: inaSpeechSegmenter music fraction as a detection override",
+      "claim": "inaSpeechSegmenter is a free (MIT-adjacent open source, ina-foss) CNN toolkit that splits any ffmpeg-decodable audio into homogeneous speech/music/noise zones, explicitly tags SINGING VOICE AS MUSIC, won the MIREX 2018 speech detection challenge, ranked #1 vs 6 open-source VADs on a French TV/radio benchmark, and has been used since 2020 in the French Audiovisual Regulation Authority's annual report \u2014 i.e., it is production-grade for exactly the discrimination the parody-song case needed. A transcript-only LLM classifier cannot see that the 'lecture' is sung; a music-time fraction computed from audio can, for the cost of one CPU pass over already-downloaded audio.",
+      "addresses": "F6 (parody song detected as lecture 0.9)",
+      "sources": [
+        {
+          "url": "https://github.com/ina-foss/inaSpeechSegmenter",
+          "note": "Fetched README: speech/music/noise segmentation; 'Singing voice is tagged as music'; MIREX 2018 speech-detection winner; #1 vs 6 open-source VADs on TV/radio benchmark; CLI (ina_speech_segmenter.py) + Python Segmenter API; any ffmpeg format; CSV/TextGrid output; used in the French audiovisual regulator's annual reports since 2020."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Add backend/pipeline/detect_audio.py (or extend pipeline/download.py, which already produces audio_path): run inaSpeechSegmenter's Segmenter (gender detection off for speed) over audio_path, compute music_fraction = music_time/duration and store it on DetectionResult (adapters/detect.py). Routing rules in detect_content_type: music_fraction > 0.5 \u2192 content_type='music' regardless of the transcript LLM's label (singing-tagged-as-music catches the calculus parody even though its words sound like a lecture); 0.2\u20130.5 \u2192 set secondary_content_type='music', cap det.confidence at 0.5, and route to the entertainment/relaxed fallback of finding 9 instead of worked-problem gates. Cache the segmentation next to title.txt in the workdir so eval reruns don't repay the cost."
+    },
+    {
+      "title": "Free metadata priors: yt-dlp already exposes categories/genre/track/artist \u2014 feed them to detection",
+      "claim": "yt-dlp's documented output fields include `categories` (list): 'List of categories the video belongs to' (for YouTube this carries the platform category, e.g. Music/Entertainment/Education), plus `genre` ('Genre(s) of the track'), `track` ('Title of the track'), `artist`, and `album` \u2014 music-content fields that are populated for songs and music videos. The pipeline currently persists only the title (download.py _write_title), throwing away a zero-cost, zero-latency genre prior that would have flagged the parody-song upload before any LLM call.",
+      "addresses": "F6",
+      "sources": [
+        {
+          "url": "https://www.mankier.com/1/yt-dlp",
+          "note": "Fetched man page, output-template fields: 'categories (list): List of categories the video belongs to'; 'genre (string): Genre(s) of the track'; 'track (string): Title of the track'; 'artist (string): Artist(s) of the track'; 'album (string)'."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In backend/pipeline/download.py: request/persist the yt-dlp info dict (write-info-json or the Python API's extract_info) alongside title.txt, keeping categories, genre, track, artist, uploader. In adapters/detect.py detect_content_type(): append a 'CATEGORY: ... | TRACK/ARTIST: ...' line to the user prompt AND apply a hard prior before the LLM verdict is trusted \u2014 categories contains 'Music' OR (track and artist both present) \u2192 content_type='music' (entertainment adapter) unless finding-5's music_fraction is low (<0.1, e.g. a lecture mis-categorized by the uploader); categories='Entertainment'/'Comedy' \u2192 forbid the lecture/worked-problem contract family and require the fallback adapter. Persist the raw fields on DetectionResult.rationale for eval audits."
+    },
+    {
+      "title": "Transcript-only song tells: repetition/chorus structure is detectable from text alone; also stop sampling only head+tail",
+      "claim": "Watanabe & Goto (ISMIR 2020) show chorus sections can be detected from lyrics TEXT ONLY via sequence labeling over phrase-repetition and linguistic features, and the repetition patterns transfer across languages (a Japanese-trained model detects English choruses) \u2014 establishing that repeated-line structure is a strong, cheap, text-side signal that a transcript is a song. A degenerate version (share of duplicate normalized lines, max repeated n-gram count, plus [Music]/[Applause] caption-tag density) needs no model at all. Separately, detect.py's _sample() reads only the first 25 + last few segments (3,500 chars) \u2014 a parody song whose intro sounds expository can dodge that window entirely; repetition must be computed over the FULL transcript.",
+      "addresses": "F6",
+      "sources": [
+        {
+          "url": "https://program.ismir2020.net/poster_3-04.html",
+          "note": "Fetched: Watanabe & Goto, ISMIR 2020 \u2014 neural sequence labeling detects chorus sections from lyrics text only using phrase repetition + linguistic features; Japanese-trained model detects English choruses (repetition signal is language-general)."
+        },
+        {
+          "url": "https://archives.ismir.net/ismir2020/paper/000088.pdf",
+          "note": "Paper PDF (same work) \u2014 'A Chorus-Section Detection Method for Lyrics Text'; cited for completeness of the venue record."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "In adapters/detect.py: (1) compute full-transcript repetition features BEFORE the LLM call \u2014 normalized-line duplicate ratio, max count of any repeated 6-gram, and density of bracketed non-speech tags ([Music], [Applause]) per minute; thresholds (tune on a handful of known songs vs lectures) set song_like=True, which caps lecture-confidence and combines with findings 5-6 into the music route; (2) change _sample() to stratified head+middle+tail (e.g. 3 windows of DETECT_SAMPLE_SEGMENTS/3) so verse/refrain text reaches the classifier; (3) log the features on DetectionResult for the eval harness. Note the [Music]-tag signal is empirically well known but only blog-documented \u2014 validate the tag density threshold on your own supadata caption transcripts before trusting it (see leads)."
+    },
+    {
+      "title": "Interview vs story: decide from diarization turn statistics and speaker-role inference, not the transcript LLM",
+      "claim": "The Structured Podcast Research Corpus (SPoRC, 2024) demonstrates at 1.1M-episode scale that speaker-turn boundaries plus inferred SPEAKER ROLES (host/guest etc.) can be derived from transcripts+audio and used to characterize episode format \u2014 i.e., 'is this a two-party interview or a monologue/story' is answerable from turn structure without asking a genre LLM. This pipeline already runs diarization (understand/diarize.py, SpeakerTurn in understand/models.py), so the Tyson-interview-as-story failure is fixable with arithmetic over data it already computes: number of significant speakers and turn-switch rate separate interview from story with near-zero cost.",
+      "addresses": "F6 (interview detected as story; interviewer crosstalk uncredited)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2411.07892",
+          "note": "Fetched abstract: SPoRC \u2014 1.1M podcast transcripts with speaker turns for 370K episodes and 'speaker role inferences and other metadata for all 1.1M episodes'; foundational analysis of content/structure of the ecosystem, i.e., format characterization from turn+role features at scale."
+        },
+        {
+          "url": "https://www.assemblyai.com/blog/what-is-speaker-diarization-and-how-does-it-work",
+          "note": "Fetched via search (2026 vendor guide): production diarization context \u2014 clean two-speaker audio (podcast interviews) is the easy case (DER ~4-8%), supporting reliability of two-speaker turn statistics."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "After diarize.py, compute: n_major_speakers (speakers with >15% talk time), turn_switches_per_min, median turn length. Override rule applied on top of detect_content_type's LLM verdict (adapters/detect.py or understand/build.py where detection meets structure): \u22652 major speakers AND switches \u22651.5/min \u2192 domain='interview' regardless of the LLM's 'story' label; exactly 1 major speaker >90% talk time \u2192 interview is forbidden. Second use, inside the interview adapter: tag units overlapping a minority-speaker SpeakerTurn as question/host units so closure.py keeps the interviewer's question attached to the guest's answer (fixes 'crosstalk uncredited inside clips'). Thresholds are engineering \u2014 log them into DetectionResult and tune once the golden set (F5) exists."
+    },
+    {
+      "title": "Entertainment fallback contract: self-contained-moment gates instead of pedagogical completeness (ClipAnything pattern)",
+      "claim": "The leading commercial clipper's genre-general mode (OpusClip ClipAnything) deliberately does NOT apply genre-specific completeness rules: it scores every scene for virality/hook strength from multimodal cues and finds moments via user prompts, using 'the same underlying technology' for sports, music, vlogs, and no-dialogue video. The transferable design: when content is entertainment (or genre confidence is low), the right contract is 'self-contained engaging moment' \u2014 hook/punchline present, references resolved, quotable \u2014 not problem_statement/reasoning/result gates. Applying worked-problem gates to song verses is a category error the adapter menu currently cannot avoid because no entertainment adapter exists and detect.py maps unknown types to 'generic', which still inherits the pedagogical GENERIC_CONTRACTS.",
+      "addresses": "F6 (fallback contracts; killed best moments of the parody song), secondary F4 (contract family must match content family)",
+      "sources": [
+        {
+          "url": "https://help.opus.pro/docs/article/9947095-clip-anything",
+          "note": "Fetched: ClipAnything analyzes frames via visual/audio/sentiment cues, rates each scene's virality, and uses prompt-based moment finding; explicitly the same mechanism across genres rather than genre-specific completeness rules."
+        },
+        {
+          "url": "https://www.opus.pro/clipanything",
+          "note": "Fetched via search (product page): 'the only AI clipping model that turns any genre \u2014 vlogs, gaming, sports, interviews, explainer videos \u2014 into viral clips'; virality score ranks by hook strength, emotional flow, perceived value."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "Add backend/adapters/entertainment.py: domain='entertainment', content_types=('music','song','parody','comedy','vlog','commentary'); role pack: hook, punchline, quotable, bit, chorus_moment (anchor priorities on punchline/quotable/chorus_moment); contracts: a single 'moment' contract \u2014 E('moment', ('punchline','quotable','claim','chorus_moment'), 'required', 'within') + E('setup', ('setup','hook'), 'recommended', 'before') \u2014 and required_verdict_fields = CORE_VERDICT_FIELDS only (extend base.py so _PROBLEM_ROLES gates never attach in this domain). Register 'music','comedy','parody','vlog','commentary' in CONTENT_TYPE_TO_DOMAIN (detect.py). Low-confidence fallback: if det.confidence < 0.6 or audio/metadata signals (findings 5-7) contradict the LLM label, route to generic with every contract element downgraded to 'recommended' \u2014 when unsure, gate less, and let the judge's core gates (topic/purpose/references) carry the load instead of genre-specific completeness."
+    }
+  ],
+  "leads": [
+    "C2FVS-DPP (MDPI Symmetry 17(10):1737, 2025) \u2014 DPP video summarization jointly modeling semantic importance, visual diversity, temporal structure; MDPI returned 403 to fetches so unverified; would be the closest 2025 academic match to DPP-based clip selection: https://doi.org/10.3390/sym17101737",
+    "Gygli, Grabner, Van Gool, CVPR 2015 'Video Summarization by Learning Submodular Mixtures of Objectives' (interestingness + representativeness + uniformity, learned mixture weights, greedy budgeted maximization) \u2014 CVF openaccess and SemanticScholar fetches failed (403/empty); canonical prior art for mixing coverage objectives with importance: https://openaccess.thecvf.com/content_cvpr_2015/papers/Gygli_Video_Summarization_by_2015_CVPR_paper.pdf",
+    "seqDPP (Gong et al., NIPS 2014) \u2014 sequential DPP for supervised video summarization, respects temporal order; foundational if you go the learned-DPP route: https://www.cs.utexas.edu/~grauman/papers/nips14_seqdpp.pdf",
+    "Carbonell & Goldstein 1998 MMR \u2014 the original relevance-vs-redundancy greedy (lambda * rel - (1-lambda) * max-sim-to-selected); PDF fetched but binary-unparseable; the finding-1 saturation greedy is an MMR variant, cite this if a canonical reference is needed: https://www.cs.cmu.edu/~jgc/publication/The_Use_MMR_Diversity_Based_LTMIR_1998.pdf",
+    "OpenRubrics (arXiv 2510.07743) \u2014 Contrastive Rubric Generation: derive rubric criteria by contrasting preferred vs rejected responses; found in search, not fetched; potential recipe for auto-generating per-genre contract elements from kept-vs-rejected clip pairs once a golden set exists (ties into F5)",
+    "Learning Query-Specific Rubrics from Human Preferences for DeepResearch (arXiv 2602.03619) \u2014 2026 work on learning per-query rubrics from preferences; unfetched; same contract-by-content family as finding 4",
+    "Visual Content Detection in Educational Videos (arXiv 2506.21903, 2025) \u2014 YOLO-based detection of visual elements (equations, diagrams) in lecture frames with released benchmark; unfetched in detail; could confirm worked-example arcs visually (equation on board during steps) and complements the RESEARCH.md OCR thread",
+    "[Music] tag density in YouTube auto-captions: the official YouTube Help page on automatic captions (fetched) does NOT document sound-cue labels; only blog-level sources describe [music]/[applause] cues \u2014 verify empirically on supadata caption transcripts of known songs before shipping the finding-7 tag-density threshold",
+    "PANNs / Audio Spectrogram Transformer audio tagging as heavier-weight alternatives to inaSpeechSegmenter for music detection (AST ~85.5% genre accuracy per arXiv 2410.08321 search result; unfetched)",
+    "Watanabe & Goto follow-up 'A Method to Detect Chorus Sections in Lyrics Text' (2023) \u2014 extended journal version of the ISMIR 2020 work; unfetched: https://www.researchgate.net/publication/373596878_A_Method_to_Detect_Chorus_Sections_in_Lyrics_Text",
+    "Health-SCORE (arXiv 2601.18706) \u2014 scalable rubrics for health LLMs, 2026; unfetched; further instance-specific-rubric prior art for finding 4",
+    "Stan thermodynamics course assistant (arXiv 2603.04657) \u2014 search snippet mentioned an automated lecture-video\u2192searchable-text pipeline (ffmpeg + faster-whisper); unfetched; possible additional prior art for lecture problem-solution mining from video rather than documents"
+  ],
+  "notes": "Method: read the actual pipeline first (candidates.py select_anchors flat sort; contracts.py check_contract keyed on anchor role; base.py required_verdict_fields/_PROBLEM_ROLES; adapters/detect.py head+tail LLM-only sampling; download.py persists only title; diarize.py + SpeakerTurn already exist; ContentMap has chapter/topic nodes from TreeSeg) so every recipe names real symbols. Then ran ~12 searches and ~20 fetches; every finding's sources were actually fetched (arXiv abstracts/HTML, GitHub READMEs, man page, ISMIR poster page, Opus help doc). Failed fetches (MDPI 403, CVF 403, CMU/Gygli PDFs binary, Wikipedia MMR 404, YouTube category-ID list) were demoted to leads per instructions. Cross-cutting integration points the orchestrator should enforce: (1) findings 1-3 all land in candidates.py/understand \u2014 do finding 1's quota greedy first, it is ~30 lines and needs no new dependency; finding 3's arc detector is the only fix that recovers worked examples whose results were labeled 'calculation' (role-cap alone won't). (2) Finding 4's contract REBINDING after each repair mutation is the F2/F4 coupling \u2014 without it, any repair-loop fix still grades grown spans under stale rubrics; it also requires judging the exact contract used for final_quality, closing the 0.95-vs-4/10 divergence. (3) Findings 5-8 are ensemble inputs to one detection decision: precedence metadata(6) and audio(5) > transcript repetition(7) and diarization stats(8) > transcript LLM; ties/conflicts route to finding 9's relaxed fallback ('when unsure, gate less'). (4) Add the chapter-coverage and reference-clip-recall metrics to eval/metrics.py now so F3 fixes are measurable, and note all detection thresholds (music_fraction, turn-switch rate, repetition ratios) are currently tuned against nothing \u2014 they should be first in line for calibration when the F5 golden set lands. Nothing here duplicates RESEARCH.md (judging/segmentation/coreference/OCR threads); the submodular-selection, arc-detection, instance-rubric, and genre-signal threads are new.\"",
+  "verification": {
+    "checked": [
+      {
+        "title": "Finding 1: Joint relevance+coverage objective for anchor selection (AKS / MDP3 / F2C)",
+        "supported": true,
+        "note": "All three sources say what is attributed to them. AKS (arXiv 2502.21271, confirmed CVPR 2025) abstract literally formulates keyframe selection as 'an optimization involving (1) the relevance between the keyframes and the prompt, and (2) the coverage of the keyframes over the video' with an adaptive algorithm. MDP3 (2501.02885) abstract confirms training-free/model-agnostic, DPP within segments for 'query relevance and list-wise diversity', and MDP allocation of selection sizes across segments. F2C (2510.02262) contains the exact quoted principles including the word 'anchors' ('the selected anchors cover different parts of the video to avoid redundancy') and cites both AKS and MDP3. Minor caveats: (a) the AKS detail 'adaptive allocation between top-scored and temporally-distributed picks' is a paper-body mechanism, not verified from the abstract fetch \u2014 plausible but take as paraphrase; (b) F2C's 'coherent clips beat isolated picks' rests on Table 1 (Key Clips 65.1% @32 frames vs Key Frames 63.0% @3-4 frames on Ego4D-Haystack) \u2014 the comparison is not frame-budget-matched, so it shows clips-with-context help, not a controlled clips-vs-frames ablation at equal budget; (c) the final sentence diagnosing select_anchors()/MAX_ANCHORS=12 is the researcher's own codebase analysis, not something the sources demonstrate \u2014 the sources back the design principle, not the specific causal diagnosis."
+      },
+      {
+        "title": "Finding 2: Per-topic quotas = partition matroid; greedy is principled; submodlib tooling exists",
+        "supported": true,
+        "note": "Both sources check out. arXiv 1810.12861 abstract confirms: tight discriminant-based approximation guarantees for greedy under matroid constraints that 'subsume all the previous known results for the greedy algorithm, including the curvature based ones', and it explicitly treats the partition case ('submodular welfare maximization/partition problem') with tight offline and online bounds. submodlib (decile-team) confirms MIT license, C++ engine, and implements Facility Location, Graph Cut, Log Determinant, Disparity Sum/Min, Set Cover, Feature Based plus MI/conditional-gain variants, with NaiveGreedy/LazyGreedy/StochasticGreedy/LazierThanLazyGreedy. Two downgrades: (a) 'pip-installable' is technically true but the README's install command pulls from test.pypi.org with an extra-index-url, i.e., not a plain 'pip install submodlib' from main PyPI \u2014 packaging is rougher than the phrase implies, and repo maintenance activity could not be confirmed as recent; (b) the classical constant-factor greedy guarantee requires the objective to be monotone submodular \u2014 that framing is definitionally correct for quota constraints (the constraint IS a partition matroid), but the guarantee only applies if the chosen scoring objective is actually monotone submodular (facility location is; an arbitrary priority*relevance*confidence sum is modular, where greedy is exactly optimal anyway, which if anything strengthens the point)."
+      },
+      {
+        "title": "Finding 3: MathNet staged LLM segmentation + deterministic verification recipe",
+        "supported": true,
+        "note": "The pipeline description is accurately sourced and I verified the key sentences verbatim with a neutral (non-leading) fetch of the HTML: 'pass these pages to Gemini-2.5-Flash to identify problem and solution corresponding segments by outputting only their line numbers'; three-stage verification of '(1) a rule-based analytical checker, (2) GPT-4.1, and (3) human annotators'; 'A problem\u2013solution pair is retained only if all three verification mechanisms reach unanimous agreement.' GPT-4.1 extraction with buffer text for cross-section pairing is also confirmed. Abstract confirms ~30,676 expert-authored problems, 17 languages, ICLR 2026. Downgrades: (a) MathNet extracts problem-solution pairs from contest PDF booklets \u2014 text/document alignment, not video or transcript segmentation, so the 'transferable patterns' and 'directly fixes the unclippable worked example' portions are analogy by the researcher, not anything the source demonstrates; (b) the recipe as demonstrated includes human review as one of the three unanimous gates (for low-confidence cases), so a fully automated port drops one verification mechanism; (c) verification-gated retention means MathNet silently discards ambiguous pairs \u2014 acceptable for benchmark construction, but a clipping pipeline that must produce output for every video cannot simply drop failures."
+      },
+      {
+        "title": "Finding 4: Instance-specific rubrics (HealthBench / Rubrics-as-Rewards) justify rebinding the completeness contract to assembled content",
+        "supported": true,
+        "note": "Both citations are accurate. HealthBench (2505.08775) abstract confirms 'conversation-specific rubrics created by 262 physicians' and '48,562 unique rubric criteria'. Rubrics-as-Rewards (2507.17746) confirms instance-specific rubrics used as reward signals in on-policy RL with 'relative improvements of up to 31% on HealthBench' over Likert-based LLM-as-judge reward baselines. Downgrades: (a) the framing 'the strongest 2025 evaluation results come from per-instance criteria' is a superlative the sources do not establish \u2014 they are two prominent examples, not a survey showing per-instance rubrics dominate 2025 evaluation; (b) RaR's 31% is a training-reward result (RL post-training quality), not a claim that per-instance rubrics grade more accurately as evaluators per se; (c) HealthBench's rubrics are human-authored per conversation by physicians, whereas the proposed fix auto-selects a contract from roles present in the unit set \u2014 the sources support the design principle (grade against the instance's actual content, not a global/role template) but not the specific rebind-after-repair mechanism, which is the researcher's engineering inference; the contracts.py/F4-divergence diagnosis is likewise codebase analysis, not source-backed."
+      }
+    ],
+    "overall_note": "All four findings survive source-checking: every quoted claim was located in the cited papers/repo (Finding 3's key sentences were re-verified with a neutral verbatim fetch to guard against confirmation bias). The consistent pattern to watch is that each finding splices genuinely-sourced literature claims with the researcher's own codebase diagnoses and transfer-by-analogy applications (select_anchors() crowding, 'directly fixes' the calculation-role bug, contract rebinding) \u2014 those application clauses are reasonable engineering inferences but are not demonstrated by any source. Concrete downgrades: submodlib installs from test.pypi (not plain PyPI), F2C's clips-beat-frames evidence is not budget-matched, MathNet's recipe includes a human-review gate and applies to documents rather than video, and 'strongest 2025 evaluation results' overstates two examples as a field consensus."
+  }
+}

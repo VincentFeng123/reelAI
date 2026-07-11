@@ -1,0 +1,51 @@
+{
+  "video_id": "yfajBIaDf1Q",
+  "chapters": [
+    {
+      "start_time": 0.0,
+      "end_time": 6.0,
+      "title": "Introduction"
+    },
+    {
+      "start_time": 6.0,
+      "end_time": 55.0,
+      "title": "Functions"
+    },
+    {
+      "start_time": 55.0,
+      "end_time": 96.0,
+      "title": "Limits"
+    },
+    {
+      "start_time": 96.0,
+      "end_time": 147.0,
+      "title": "Continuity"
+    },
+    {
+      "start_time": 147.0,
+      "end_time": 189.0,
+      "title": "Derivatives"
+    },
+    {
+      "start_time": 189.0,
+      "end_time": 215.0,
+      "title": "Differentiation Rules"
+    },
+    {
+      "start_time": 215.0,
+      "end_time": 237.0,
+      "title": "Derivatives Applications"
+    },
+    {
+      "start_time": 237.0,
+      "end_time": 278.0,
+      "title": "Integration"
+    },
+    {
+      "start_time": 278.0,
+      "end_time": 323.0,
+      "title": "Types of Integrals"
+    }
+  ],
+  "chapters_provenance": "creator"
+}

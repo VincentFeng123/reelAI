@@ -4,35 +4,43 @@
 # Python
 __pycache__/
 *.pyc
+.venv/
 backend/.venv/
 backend/data/
 data/*.db
 data/*.db-shm
 data/*.db-wal
 
-# Node
+# Node and generated frontend output
 node_modules/
 .next/
+frontend/node_modules/
+frontend/dist/
+backend/static/
+tsconfig.tsbuildinfo
 
-# Env
-backend/.env
+# Environment files
+.env
 .env.local
+backend/.env
 
 # Runtime artifacts
 .logs/
 .pids/
+work/
+output/
+backend/work/
 graphify-out/cache/
 
-# clip_engine transcript cache
-backend/work/
-
-# Mass-audit ephemera (isolated sqlite workdir + per-run logs/smoke CSVs)
+# Test and audit artifacts
+.pytest_cache/
 audit_work/
+backend/audit_work/
 audit_*.log
 audit_smoke*.csv
 audit_smoke*.md
 
-# session scratch + user uploads (never commit)
+# Session scratch, linked worktrees, and user uploads
 .superpowers/
+.claude/worktrees/
 data/uploads/
-tsconfig.tsbuildinfo
