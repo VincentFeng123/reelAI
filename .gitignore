@@ -11,3 +11,4 @@ frontend/dist/
 
 .pytest_cache/
 .superpowers/
+.backup/
