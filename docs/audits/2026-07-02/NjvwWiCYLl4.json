@@ -1,0 +1,687 @@
+{
+ "video_id": "NjvwWiCYLl4",
+ "video_title": "",
+ "duration": 219.33999999999997,
+ "detection": {
+  "domain": "story",
+  "content_type": "story",
+  "confidence": 0.9
+ },
+ "adapter": "StoryAdapter",
+ "n_units": 10,
+ "has_perception": false,
+ "degraded": [],
+ "topic": "",
+ "notes": "1 clip(s).",
+ "n_clips": 1,
+ "n_rejections": 6,
+ "clips": [
+  {
+   "cand_id": "c_u0007",
+   "title": "The Language of the Universe",
+   "role": "intuition",
+   "facet": "intuition",
+   "start": 135.2,
+   "end": 177.38,
+   "duration_s": 42.2,
+   "sentence_span": [
+    12,
+    15
+   ],
+   "span_text": "is my measure of what I need to do if I encounter something which in that moment I do not understand is that any worse than you coming upon a book of Mandarin and you don't know any Chinese characters yeah I don't know any of this yeah except one and a half billion people in the world speak it so it's it can't be impossible to learn so you put in the time and slowly some of the characters Ravel that means a human or that's a home or that's a food and all of a sudden the characters start making sense it's not really any different from that and too many people think that they got to know something instantly in order",
+   "context_card": "",
+   "warnings": [],
+   "merged": false,
+   "truncated": false,
+   "judge_error": false,
+   "verdict": {
+    "score_10": 9,
+    "score": 0.9,
+    "understandable": true,
+    "reasoning": "The clip discusses the process of learning and understanding new concepts, using the analogy of learning Chinese characters. It argues against the expectation of instant understanding and promotes patience and effort. The topic and purpose are identifiable, and no dangling references or missing prerequisites are present. The clip is grounded in its own narrative.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": true,
+     "reasoning_complete": true,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [],
+    "error": false
+   },
+   "verdict_source": "validate_and_repair",
+   "judge_attempts": 1,
+   "validated_span_differs": false,
+   "scores": {
+    "completeness": 1.0,
+    "grounding": 1.0,
+    "boundary": 1.0,
+    "priority": 0.48,
+    "final_quality": 0.948
+   },
+   "prerequisite_clips": [],
+   "unit_ids": [
+    "u0007"
+   ],
+   "unit_roles": [
+    {
+     "id": "u0007",
+     "role": "intuition",
+     "topic": "The Language of the Universe"
+    }
+   ],
+   "referential": []
+  }
+ ],
+ "rejections": [
+  {
+   "cand_id": "c_u0003",
+   "title": "High School Calculus Story",
+   "role": "rising_action",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "unresolved_reference",
+    "unresolved_reference",
+    "missing_prerequisite"
+   ],
+   "final_quality": null,
+   "start": 11.61,
+   "end": 68.97,
+   "duration_s": 57.4,
+   "span_text": "through it I have a I have a I don't quite call it elevated to the level of a parable but it's a story in my life that I reference all the time right now share it with you as short I'm in high school I'm junior in high school and I want to take calculus now if you didn't know calculus is way different way more different from algebra then algebra is from arithmetic okay so whatever took you to get from arithmetic to algebra what X what number is it what could be any number how could it be any number it's in the quay it's got to be a number these these are the transition from arithmetic to algebra the transition from algebra to calculus is more okay so that's why it's generally not taught in high school you it's a college thing and even then you wouldn't necessarily have it so I'm handed the calculus book and I opened a page in the front cover and there these equations and they using squiggly lines I had never seen before half the Greek alphabet is in there I said I don't know what this is oh and I said I will never learn this that's what I said that's why I felt I said this but I need to know",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "setup",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker introduces a personal story from their life that they often reference.",
+     "start": 0.0,
+     "end": 14.0
+    },
+    {
+     "unit_id": "u0001",
+     "role": "setup",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker, as a high school junior, wanted to take calculus.",
+     "start": 11.6,
+     "end": 32.5
+    },
+    {
+     "unit_id": "u0002",
+     "role": "claim",
+     "topic": "High School Calculus Story",
+     "summary": "Calculus is significantly more different from algebra than algebra is from arithmetic, which is why it's typically a college subject.",
+     "start": 28.0,
+     "end": 58.4
+    },
+    {
+     "unit_id": "u0003",
+     "role": "rising_action",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker was given a calculus book and encountered unfamiliar equations with squiggly lines and Greek letters.",
+     "start": 55.6,
+     "end": 69.0
+    },
+    {
+     "unit_id": "u0004",
+     "role": "setup",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker initially felt overwhelmed by the language of physics, believing they would never learn it, but recognized its importance for understanding the universe.",
+     "start": 66.7,
+     "end": 93.0
+    }
+   ],
+   "first_verdict": {
+    "score_10": 2,
+    "score": 0.2,
+    "understandable": false,
+    "reasoning": "The clip is about encountering unfamiliar calculus equations with Greek letters. However, it lacks context about what these equations are for or why they are significant, making the topic and purpose unclear. There are no specific dangling references, but the mention of 'half the Greek' implies a larger context or set of symbols that are not introduced.",
+    "gates": {
+     "topic_identifiable": false,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": false
+    },
+    "failure_reasons": [
+     {
+      "kind": "other",
+      "detail": "The clip is too short and lacks context to understand the topic or purpose. The mention of 'half the Greek' implies a missing explanation of symbols or concepts.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0008",
+   "title": "The Language of the Universe",
+   "role": "claim",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.5,
+   "failure_kinds": [
+    "unresolved_reference",
+    "unresolved_reference",
+    "unresolved_reference"
+   ],
+   "final_quality": null,
+   "start": 66.66,
+   "end": 196.91,
+   "duration_s": 130.2,
+   "span_text": "handed the calculus book and I opened a page in the front cover and there these equations and they using squiggly lines I had never seen before half the Greek alphabet is in there I said I don't know what this is oh and I said I will never learn this that's what I said that's why I felt I said this but I need to know this because the universe is speaking this language I'm screaming at you sorry the level sound levels okay sorry okay you're excited this is great this is you started this yes all right so I said all right one step at a time after the first week of class I took a peek still nothing after three weeks and a month open up the side of the book is it hey I know that equation I used that the other day that's good I like that and as the week's went on it was as though this fog began to dissipate it didn't lift because that implies you now you see a night you don't and now you do it just dissipated it became more and more transparent and by month three month for every one of these quite equations became my friends hmm I said I want them if that give me more and that is my measure of what I need to do if I encounter something which in that moment I do not understand is that any worse than you coming upon a book of Mandarin and you don't know any Chinese characters yeah I don't know any of this yeah except one and a half billion people in the world speak it so it's it can't be impossible to learn so you put in the time and slowly some of the characters Ravel that means a human or that's a home or that's a food and all of a sudden the characters start making sense it's not really any different from that and too many people think that they got to know something instantly in order to ever be good at it rather than want to achieve something realize there are these hurdles work at it and every bit of yourself you invest helps to dissipate that fog mm-hmm and the more badly you want to get there the more you will work to dissipate that fog mmm and that's what happened to me and I've invoked that ever since yeah and Brandon the love with that - yeah badly want to get there and the lawyer got it out of it otherwise what's gonna keep you going",
+   "units_in_span": [
+    {
+     "unit_id": "u0003",
+     "role": "rising_action",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker was given a calculus book and encountered unfamiliar equations with squiggly lines and Greek letters.",
+     "start": 55.6,
+     "end": 69.0
+    },
+    {
+     "unit_id": "u0004",
+     "role": "setup",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker initially felt overwhelmed by the language of physics, believing they would never learn it, but recognized its importance for understanding the universe.",
+     "start": 66.7,
+     "end": 93.0
+    },
+    {
+     "unit_id": "u0005",
+     "role": "rising_action",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker decided to take on the challenge one step at a time, and after a month, started recognizing some equations.",
+     "start": 89.5,
+     "end": 117.3
+    },
+    {
+     "unit_id": "u0006",
+     "role": "rising_action",
+     "topic": "The Language of the Universe",
+     "summary": "Over time, the initial confusion began to dissipate, making the equations more transparent and eventually turning them into 'friends'.",
+     "start": 113.8,
+     "end": 140.9
+    },
+    {
+     "unit_id": "u0007",
+     "role": "intuition",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker compares learning physics to learning Mandarin, where consistent effort gradually reveals meaning in previously incomprehensible characters.",
+     "start": 135.2,
+     "end": 177.4
+    },
+    {
+     "unit_id": "u0008",
+     "role": "claim",
+     "topic": "The Language of the Universe",
+     "summary": "Many people mistakenly believe they need instant understanding to be good at something, but success comes from overcoming hurdles through sustained effort and investment.",
+     "start": 174.7,
+     "end": 196.9
+    },
+    {
+     "unit_id": "u0009",
+     "role": "resolution",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker applied this principle to their own learning, emphasizing the importance of desire and seeking help to overcome challenges.",
+     "start": 194.9,
+     "end": 219.3
+    }
+   ],
+   "first_verdict": {
+    "score_10": 4,
+    "score": 0.4,
+    "understandable": false,
+    "reasoning": "The clip discusses the process of overcoming obstacles to achieve a goal, using the metaphor of dissipating fog. While the topic is generally understandable, it lacks a specific problem statement or a clear, complete claim. The phrase 'that fog' is a dangling reference, as the specific fog being referred to is not defined within the clip.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": true,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "that fog"
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0009",
+   "title": "The Language of the Universe",
+   "role": "resolution",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.4,
+   "failure_kinds": [
+    "unresolved_reference",
+    "unresolved_reference",
+    "not_source_grounded"
+   ],
+   "final_quality": null,
+   "start": 66.66,
+   "end": 219.34,
+   "duration_s": 152.7,
+   "span_text": "handed the calculus book and I opened a page in the front cover and there these equations and they using squiggly lines I had never seen before half the Greek alphabet is in there I said I don't know what this is oh and I said I will never learn this that's what I said that's why I felt I said this but I need to know this because the universe is speaking this language I'm screaming at you sorry the level sound levels okay sorry okay you're excited this is great this is you started this yes all right so I said all right one step at a time after the first week of class I took a peek still nothing after three weeks and a month open up the side of the book is it hey I know that equation I used that the other day that's good I like that and as the week's went on it was as though this fog began to dissipate it didn't lift because that implies you now you see a night you don't and now you do it just dissipated it became more and more transparent and by month three month for every one of these quite equations became my friends hmm I said I want them if that give me more and that is my measure of what I need to do if I encounter something which in that moment I do not understand is that any worse than you coming upon a book of Mandarin and you don't know any Chinese characters yeah I don't know any of this yeah except one and a half billion people in the world speak it so it's it can't be impossible to learn so you put in the time and slowly some of the characters Ravel that means a human or that's a home or that's a food and all of a sudden the characters start making sense it's not really any different from that and too many people think that they got to know something instantly in order to ever be good at it rather than want to achieve something realize there are these hurdles work at it and every bit of yourself you invest helps to dissipate that fog mm-hmm and the more badly you want to get there the more you will work to dissipate that fog mmm and that's what happened to me and I've invoked that ever since yeah and Brandon the love with that - yeah badly want to get there and the lawyer got it out of it otherwise what's gonna keep you going yeah and don't hesitate to ask for help oh oh I've been telling my mother okay I've tutored people in my life in physics and in math I've been tutored",
+   "units_in_span": [
+    {
+     "unit_id": "u0003",
+     "role": "rising_action",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker was given a calculus book and encountered unfamiliar equations with squiggly lines and Greek letters.",
+     "start": 55.6,
+     "end": 69.0
+    },
+    {
+     "unit_id": "u0004",
+     "role": "setup",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker initially felt overwhelmed by the language of physics, believing they would never learn it, but recognized its importance for understanding the universe.",
+     "start": 66.7,
+     "end": 93.0
+    },
+    {
+     "unit_id": "u0005",
+     "role": "rising_action",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker decided to take on the challenge one step at a time, and after a month, started recognizing some equations.",
+     "start": 89.5,
+     "end": 117.3
+    },
+    {
+     "unit_id": "u0006",
+     "role": "rising_action",
+     "topic": "The Language of the Universe",
+     "summary": "Over time, the initial confusion began to dissipate, making the equations more transparent and eventually turning them into 'friends'.",
+     "start": 113.8,
+     "end": 140.9
+    },
+    {
+     "unit_id": "u0007",
+     "role": "intuition",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker compares learning physics to learning Mandarin, where consistent effort gradually reveals meaning in previously incomprehensible characters.",
+     "start": 135.2,
+     "end": 177.4
+    },
+    {
+     "unit_id": "u0008",
+     "role": "claim",
+     "topic": "The Language of the Universe",
+     "summary": "Many people mistakenly believe they need instant understanding to be good at something, but success comes from overcoming hurdles through sustained effort and investment.",
+     "start": 174.7,
+     "end": 196.9
+    },
+    {
+     "unit_id": "u0009",
+     "role": "resolution",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker applied this principle to their own learning, emphasizing the importance of desire and seeking help to overcome challenges.",
+     "start": 194.9,
+     "end": 219.3
+    }
+   ],
+   "first_verdict": {
+    "score_10": 4,
+    "score": 0.4,
+    "understandable": false,
+    "reasoning": "The clip discusses the process of learning and understanding complex subjects, using the metaphor of fog dissipating to represent overcoming confusion. It emphasizes persistence, the desire to learn, and seeking help. However, it begins mid-thought, referencing 'this fog' and 'these quite equations' without prior context, making it difficult for a new viewer to grasp the initial situation. The analogy to learning Mandarin is clear, but the core problem being solved or the specific context of the 'equations' remains undefined.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": true,
+     "result_complete": false,
+     "source_grounded": false
+    },
+    "failure_reasons": [
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "this fog"
+     },
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "these quite equations"
+     },
+     {
+      "kind": "not_source_grounded",
+      "detail": "The clip starts mid-discussion, referencing prior concepts like 'this fog' and 'these equations' without introduction.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0002",
+   "title": "High School Calculus Story",
+   "role": "claim",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "not_source_grounded"
+   ],
+   "final_quality": null,
+   "start": 0.0,
+   "end": 68.97,
+   "duration_s": 69.0,
+   "span_text": "through it I have a I have a I don't quite call it elevated to the level of a parable but it's a story in my life that I reference all the time right now share it with you as short I'm in high school I'm junior in high school and I want to take calculus now if you didn't know calculus is way different way more different from algebra then algebra is from arithmetic okay so whatever took you to get from arithmetic to algebra what X what number is it what could be any number how could it be any number it's in the quay it's got to be a number these these are the transition from arithmetic to algebra the transition from algebra to calculus is more okay so that's why it's generally not taught in high school you it's a college thing and even then you wouldn't necessarily have it so I'm handed the calculus book and I opened a page in the front cover and there these equations and they using squiggly lines I had never seen before half the Greek alphabet is in there I said I don't know what this is oh and I said I will never learn this that's what I said that's why I felt I said this but I need to know",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "setup",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker introduces a personal story from their life that they often reference.",
+     "start": 0.0,
+     "end": 14.0
+    },
+    {
+     "unit_id": "u0001",
+     "role": "setup",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker, as a high school junior, wanted to take calculus.",
+     "start": 11.6,
+     "end": 32.5
+    },
+    {
+     "unit_id": "u0002",
+     "role": "claim",
+     "topic": "High School Calculus Story",
+     "summary": "Calculus is significantly more different from algebra than algebra is from arithmetic, which is why it's typically a college subject.",
+     "start": 28.0,
+     "end": 58.4
+    },
+    {
+     "unit_id": "u0003",
+     "role": "rising_action",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker was given a calculus book and encountered unfamiliar equations with squiggly lines and Greek letters.",
+     "start": 55.6,
+     "end": 69.0
+    },
+    {
+     "unit_id": "u0004",
+     "role": "setup",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker initially felt overwhelmed by the language of physics, believing they would never learn it, but recognized its importance for understanding the universe.",
+     "start": 66.7,
+     "end": 93.0
+    }
+   ],
+   "first_verdict": {
+    "score_10": 2,
+    "score": 0.2,
+    "understandable": false,
+    "reasoning": "The clip discusses the transition from arithmetic to algebra and then to calculus, but it lacks a clear topic or purpose. It starts mid-thought with 'algebra then algebra is from arithmetic' and ends abruptly with 'so I'm', leaving the viewer without a complete idea or conclusion. There are no specific problems or claims being made that can be fully understood.",
+    "gates": {
+     "topic_identifiable": false,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": false
+    },
+    "failure_reasons": [
+     {
+      "kind": "not_source_grounded",
+      "detail": "The clip starts and ends mid-sentence, lacking a clear beginning or end to the thought being presented.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0005",
+   "title": "The Language of the Universe",
+   "role": "rising_action",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.4,
+   "failure_kinds": [
+    "unresolved_reference",
+    "unresolved_reference"
+   ],
+   "final_quality": null,
+   "start": 55.62,
+   "end": 177.38,
+   "duration_s": 121.8,
+   "span_text": "is more okay so that's why it's generally not taught in high school you it's a college thing and even then you wouldn't necessarily have it so I'm handed the calculus book and I opened a page in the front cover and there these equations and they using squiggly lines I had never seen before half the Greek alphabet is in there I said I don't know what this is oh and I said I will never learn this that's what I said that's why I felt I said this but I need to know this because the universe is speaking this language I'm screaming at you sorry the level sound levels okay sorry okay you're excited this is great this is you started this yes all right so I said all right one step at a time after the first week of class I took a peek still nothing after three weeks and a month open up the side of the book is it hey I know that equation I used that the other day that's good I like that and as the week's went on it was as though this fog began to dissipate it didn't lift because that implies you now you see a night you don't and now you do it just dissipated it became more and more transparent and by month three month for every one of these quite equations became my friends hmm I said I want them if that give me more and that is my measure of what I need to do if I encounter something which in that moment I do not understand is that any worse than you coming upon a book of Mandarin and you don't know any Chinese characters yeah I don't know any of this yeah except one and a half billion people in the world speak it so it's it can't be impossible to learn so you put in the time and slowly some of the characters Ravel that means a human or that's a home or that's a food and all of a sudden the characters start making sense it's not really any different from that and too many people think that they got to know something instantly in order to ever be good at it rather than want to achieve something realize there are these hurdles work at it and every bit of yourself you invest helps to",
+   "units_in_span": [
+    {
+     "unit_id": "u0002",
+     "role": "claim",
+     "topic": "High School Calculus Story",
+     "summary": "Calculus is significantly more different from algebra than algebra is from arithmetic, which is why it's typically a college subject.",
+     "start": 28.0,
+     "end": 58.4
+    },
+    {
+     "unit_id": "u0003",
+     "role": "rising_action",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker was given a calculus book and encountered unfamiliar equations with squiggly lines and Greek letters.",
+     "start": 55.6,
+     "end": 69.0
+    },
+    {
+     "unit_id": "u0004",
+     "role": "setup",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker initially felt overwhelmed by the language of physics, believing they would never learn it, but recognized its importance for understanding the universe.",
+     "start": 66.7,
+     "end": 93.0
+    },
+    {
+     "unit_id": "u0005",
+     "role": "rising_action",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker decided to take on the challenge one step at a time, and after a month, started recognizing some equations.",
+     "start": 89.5,
+     "end": 117.3
+    },
+    {
+     "unit_id": "u0006",
+     "role": "rising_action",
+     "topic": "The Language of the Universe",
+     "summary": "Over time, the initial confusion began to dissipate, making the equations more transparent and eventually turning them into 'friends'.",
+     "start": 113.8,
+     "end": 140.9
+    },
+    {
+     "unit_id": "u0007",
+     "role": "intuition",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker compares learning physics to learning Mandarin, where consistent effort gradually reveals meaning in previously incomprehensible characters.",
+     "start": 135.2,
+     "end": 177.4
+    },
+    {
+     "unit_id": "u0008",
+     "role": "claim",
+     "topic": "The Language of the Universe",
+     "summary": "Many people mistakenly believe they need instant understanding to be good at something, but success comes from overcoming hurdles through sustained effort and investment.",
+     "start": 174.7,
+     "end": 196.9
+    }
+   ],
+   "first_verdict": {
+    "score_10": 2,
+    "score": 0.2,
+    "understandable": false,
+    "reasoning": "The clip discusses a student's progress in understanding a class subject, referencing 'that equation' and 'that the other day' without providing context. It's unclear what the subject is, what the equation is, or what happened 'the other day,' making it impossible for a new viewer to understand the narrative or purpose.",
+    "gates": {
+     "topic_identifiable": false,
+     "purpose_identifiable": false,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": false
+    },
+    "failure_reasons": [
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "that equation"
+     },
+     {
+      "kind": "unresolved_reference",
+      "detail": "",
+      "missing_concept": null,
+      "reference_text": "that the other day"
+     },
+     {
+      "kind": "missing_concept",
+      "detail": "",
+      "missing_concept": "The subject matter of the class and the specific equation being referenced.",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0006",
+   "title": "The Language of the Universe",
+   "role": "rising_action",
+   "stage": "dedupe",
+   "reason": "overlap loser to c_u0007",
+   "judge_score": null,
+   "failure_kinds": [],
+   "final_quality": 0.855,
+   "start": 55.62,
+   "end": 196.91,
+   "duration_s": 141.3,
+   "span_text": "is more okay so that's why it's generally not taught in high school you it's a college thing and even then you wouldn't necessarily have it so I'm handed the calculus book and I opened a page in the front cover and there these equations and they using squiggly lines I had never seen before half the Greek alphabet is in there I said I don't know what this is oh and I said I will never learn this that's what I said that's why I felt I said this but I need to know this because the universe is speaking this language I'm screaming at you sorry the level sound levels okay sorry okay you're excited this is great this is you started this yes all right so I said all right one step at a time after the first week of class I took a peek still nothing after three weeks and a month open up the side of the book is it hey I know that equation I used that the other day that's good I like that and as the week's went on it was as though this fog began to dissipate it didn't lift because that implies you now you see a night you don't and now you do it just dissipated it became more and more transparent and by month three month for every one of these quite equations became my friends hmm I said I want them if that give me more and that is my measure of what I need to do if I encounter something which in that moment I do not understand is that any worse than you coming upon a book of Mandarin and you don't know any Chinese characters yeah I don't know any of this yeah except one and a half billion people in the world speak it so it's it can't be impossible to learn so you put in the time and slowly some of the characters Ravel that means a human or that's a home or that's a food and all of a sudden the characters start making sense it's not really any different from that and too many people think that they got to know something instantly in order to ever be good at it rather than want to achieve something realize there are these hurdles work at it and every bit of yourself you invest helps to dissipate that fog mm-hmm and the more badly you want to get there the more you will work to dissipate that fog mmm and that's what happened to me and I've invoked that ever since yeah and Brandon the love with that - yeah badly want to get there and the lawyer got it out of it otherwise what's gonna keep you going",
+   "units_in_span": [
+    {
+     "unit_id": "u0002",
+     "role": "claim",
+     "topic": "High School Calculus Story",
+     "summary": "Calculus is significantly more different from algebra than algebra is from arithmetic, which is why it's typically a college subject.",
+     "start": 28.0,
+     "end": 58.4
+    },
+    {
+     "unit_id": "u0003",
+     "role": "rising_action",
+     "topic": "High School Calculus Story",
+     "summary": "The speaker was given a calculus book and encountered unfamiliar equations with squiggly lines and Greek letters.",
+     "start": 55.6,
+     "end": 69.0
+    },
+    {
+     "unit_id": "u0004",
+     "role": "setup",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker initially felt overwhelmed by the language of physics, believing they would never learn it, but recognized its importance for understanding the universe.",
+     "start": 66.7,
+     "end": 93.0
+    },
+    {
+     "unit_id": "u0005",
+     "role": "rising_action",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker decided to take on the challenge one step at a time, and after a month, started recognizing some equations.",
+     "start": 89.5,
+     "end": 117.3
+    },
+    {
+     "unit_id": "u0006",
+     "role": "rising_action",
+     "topic": "The Language of the Universe",
+     "summary": "Over time, the initial confusion began to dissipate, making the equations more transparent and eventually turning them into 'friends'.",
+     "start": 113.8,
+     "end": 140.9
+    },
+    {
+     "unit_id": "u0007",
+     "role": "intuition",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker compares learning physics to learning Mandarin, where consistent effort gradually reveals meaning in previously incomprehensible characters.",
+     "start": 135.2,
+     "end": 177.4
+    },
+    {
+     "unit_id": "u0008",
+     "role": "claim",
+     "topic": "The Language of the Universe",
+     "summary": "Many people mistakenly believe they need instant understanding to be good at something, but success comes from overcoming hurdles through sustained effort and investment.",
+     "start": 174.7,
+     "end": 196.9
+    },
+    {
+     "unit_id": "u0009",
+     "role": "resolution",
+     "topic": "The Language of the Universe",
+     "summary": "The speaker applied this principle to their own learning, emphasizing the importance of desire and seeking help to overcome challenges.",
+     "start": 194.9,
+     "end": 219.3
+    }
+   ],
+   "first_verdict": {
+    "score_10": 6,
+    "score": 0.6,
+    "understandable": false,
+    "reasoning": "The clip describes a personal journey of learning calculus, starting with confusion and progressing to understanding. While the topic is identifiable as learning calculus, the purpose is more about the speaker's personal experience and motivation rather than a specific lesson. The narrative relies heavily on the speaker's internal feelings and a metaphorical 'fog' dissipating, which is understandable in context. However, it assumes the viewer has some context about the difficulty of calculus and the use of Greek letters and equations, which are not explicitly defined within the clip. The clip is not a worked problem. It is grounded in the speaker's narrative.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": true,
+     "reasoning_complete": true,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes a basic understanding of calculus and its notation (Greek letters, equations) without introducing them, making the initial confusion and subsequent understanding less impactful for a new viewer.",
+      "missing_concept": "Calculus notation and basic concepts",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  }
+ ]
+}

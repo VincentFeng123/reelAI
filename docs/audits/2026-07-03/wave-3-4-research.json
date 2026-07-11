@@ -1,0 +1,782 @@
+{
+  "areas_returned": [
+    "w4-video-judge",
+    "w4-genre",
+    "w4-frontend",
+    "w3-cards",
+    "w3-boundaries",
+    "w3-asr"
+  ],
+  "areas_failed": [],
+  "research": [
+    {
+      "key": "w4-video-judge",
+      "result": {
+        "area": "Wave 4 item 21 \u2014 video render-audit + edge-probe at the final gate (video-capable Gemini judging the actual rendered clip / source+offsets), on survivors only.",
+        "current_tool_state": "Installed SDK is google-genai 2.10.0 (verified: `.venv/bin/pip`), the same package Context7 tracks as `/googleapis/python-genai` (docs snippets at v1.33; the video API shape is unchanged and consistent with the installed types). This is the modern `client.models.generate_content` path \u2014 NOT the deprecated Interactions API \u2014 and it fully supports clipped video.\n\nVIDEO-BY-OFFSET (verified against the installed SDK): `types.VideoMetadata` fields are exactly `start_offset: Optional[str]`, `end_offset: Optional[str]`, `fps: Optional[float]` (Context7: fps defaults to 1.0, valid range (0.0, 24.0]). Offsets are duration STRINGS, e.g. \"120s\"/\"360s\". `types.Part` carries `file_data`, `inline_data`, `video_metadata`, and `media_resolution` (verified: Part.model_fields). A clipped-video Part = `types.Part(file_data=types.FileData(file_uri=<uri>, mime_type=\"video/mp4\"), video_metadata=types.VideoMetadata(start_offset=\"120s\", end_offset=\"360s\", fps=1.0))`. VideoMetadata is only valid when the video is provided inline or via a file (Context7: \"Part > videoMetadata\").\n\nINLINE vs FILES API: inline via `types.Part.from_bytes(data=..., mime_type=\"video/mp4\")` (verified signature; also accepts `media_resolution=`) \u2014 use when total request < ~20MB (Google video-understanding page: switch to Files API above 20MB; hard inline ceiling ~100MB). Files API: `client.files.upload(file=path)` returns a `File` with `.uri` and `.state`; you MUST poll `client.files.get(name=...)` until `state == FileState.ACTIVE` before generate_content (Context7: FileState enum STATE_UNSPECIFIED/PROCESSING/ACTIVE/FAILED). Files are up to 2GB free / 20GB paid, retained 48h. `client.files` exposes upload/get/list/delete/download (verified).\n\nTOKEN/COST (ai.google.dev/gemini-api/docs/video-understanding): video sampled at 1 fps; DEFAULT media resolution \u2248 258 tokens/frame + 32 tokens/s audio \u2248 ~300 tokens/s; LOW (`types.MediaResolution.MEDIA_RESOLUTION_LOW`, verified enum) \u2248 66 tokens/frame + 32 audio \u2248 ~100 tokens/s. Pricing 2026: gemini-2.5-flash $0.30/M input, $2.50/M output; flash-lite ~$0.10/M input. So a 240s clip: default \u224872k tok \u2192 ~$0.022 (flash) / ~$0.0072 (flash-lite); LOW \u224824k tok \u2192 ~$0.0072 (flash)/~$0.0024 (flash-lite) \u2014 brackets the doc's ~$0.015/clip. An 8s edge probe at LOW \u2248 800 video tok + prompt/output \u2248 ~$0.0001\u20130.0004 \u2014 matches the doc's ~$0.0006/candidate. Supported formats include video/mp4 (what cut.py emits).",
+        "environment_feasibility": "Fully feasible on darwin arm64 with the existing stack \u2014 no new native/CUDA/licensed deps. google-genai 2.10.0 is already installed; ffmpeg is present at /opt/homebrew/bin/ffmpeg (config.FFMPEG_BIN, verified). Files API upload + generate_content are pure HTTPS calls; nothing runs locally. The real constraints are cost/latency and rate limits, not installability: (1) survivors-only volume is ~1\u20138 clips/video, keeping spend in the doc's $0.01\u20130.30/video band; (2) a full-source Files upload + ACTIVE poll adds seconds of latency and 48h server retention \u2014 the edge-probe avoids upload entirely by cutting an 8s segment locally (cut.py build_cmd) and sending inline bytes (<20MB); (3) Groq has NO video input, so JUDGE_PROVIDER=\"groq\" cannot serve this \u2014 the video judge must be Gemini-only regardless of JUDGE_PROVIDER, exactly as vision.py already is (vision.py:57 calls gemini_client directly, bypassing the llm_json/Groq seam). Use JUDGE_MODEL=gemini-2.5-flash-lite for cost or gemini-2.5-flash for quality. Free-tier flash-lite RPM limits argue for gating this behind an opt-in flag (default OFF, mirroring diarization).",
+        "existing_code_audit": "GREENFIELD for video judging \u2014 grep across backend/ for VideoMetadata/files.upload/video_metadata/start_offset/edge_probe/render_audit/starts_clean returns nothing.\n\ngemini_client.py: `generate_json` (text+response_schema, thinking-off-then-on retry, backoff) and `generate_json_mm(system, parts, schema)` (multimodal \u2014 sends a list of `types.Part` as `contents`; helpers `image_part`=Part.from_bytes(image/jpeg) at :101 and `text_part` at :106). There is NO video Part helper, NO Files API upload, NO video_metadata, NO media_resolution. Adding a `generate_json_video` is a direct extension of the existing generate_json_mm config pattern (:111-142).\n\nllm.py:59 `llm_json` \u2014 the provider seam \u2014 accepts system/user STRINGS only, no media; the Gemini branch calls `gemini_client.generate_json` (text). So the video judge must NOT route through llm_json; it calls a new gemini_client.generate_json_video directly (same choice vision.py made).\n\nvalidate.py: `judge_clip` (:133) is text-only \u2014 clip_text + a visual_summary STRING \u2014 routed through llm_json with judge provider/model (:149-154). `JudgeVerdict` (:43) has boolean gates incl. `visuals_sufficient` (:98 instructs \"you cannot see the frames \u2014 set TRUE unless\u2026\"). `validate_and_repair` (:668) is the per-candidate gate run on ALL candidates during assembly (__init__.py:192) BEFORE cutting. The asymmetric quote-verified kill gate (_verify_failure_reasons :224, confirm_kill :268) and W25-E advisory pattern for single_idea (:308 _flag_unverified_atomicity \u2192 warning only, never gate) are the template for adding video gates as ADVISORY.\n\nVisual flow today: perceive.py \u2192 vision.py (keyframe IMAGE captions, Gemini) \u2192 Perception.visual_events \u2192 Structure.visual_summary(start,end) (models.py:177 \u2014 concatenated on-screen text overlapping the window), which is the `visual_summary` string fed to the text judge (__init__.py:193,254). The render-audit upgrades this from \"described visuals\" to \"actually watch frames + hear audio.\"\n\nPipeline hook point (orchestrator.py:205-238): assemble_clips [judge gate] \u2192 write_run_artifacts \u2192 refine_clip_boundaries (Whisper \u2014 SHIFTS offsets AFTER the judge, :222-225) \u2192 _build_embed_clips \u2192 cut_clips(video_path, :231). `video_path` is downloaded when want_mm (during perceive, :170) or want_cut (:198-203). So the correct render-audit hook is AFTER refine_clip_boundaries on the final clips_spec survivors, where offsets == shipped offsets and video_path exists. cut.py:42 `build_cmd(src, start_s, dur_s, out)` + finalize_output are reusable to cut an 8s edge locally.\n\nEval: metrics.py:44 passes `visual_summary=\"\"` to judge_clip (item 24's \"pass real visual_summary\" is an adjacent fix); metrics.py:313 already threads a spec's visual_summary \u2014 the surface for reporting new video-gate outcomes.",
+        "recommended_approach": "Two-tier, survivors-only, additive \u2014 do NOT touch the existing text judge/repair loop, and keep every programmatic gate (MLLM judges over-flag; VF-Eval caveat in the doc).\n\nTIER 1 \u2014 EDGE PROBE FIRST (cheap, catches the F7 mid-sentence-audio blind spot). Add gemini_client.generate_json_video supporting inline bytes. For each survivor AFTER refine_clip_boundaries: cut first ~8s and last ~8s locally with cut.py build_cmd, read the mp4 bytes, send inline (Part.from_bytes video/mp4, media_resolution=LOW) with a tiny schema {starts_clean_audio, ends_clean_audio, first_words, last_words, evidence}. ~$0.0001\u20130.0004/clip, no Files upload. Programmatic + advisory: a False nudges the boundary snap to the nearest sentence/silence edge or flags 'starts_mid_sentence_audio' \u2014 never kills. This is the highest value-per-dollar piece; ship it standalone behind EDGE_PROBE_ENABLED.\n\nTIER 2 \u2014 RENDER AUDIT on survivors (opt-in, default OFF like diarization). Upload the FULL source video ONCE via client.files.upload, poll files.get until ACTIVE, then ONE generate_content per survivor referencing file_data + VideoMetadata(start_offset/end_offset) \u2014 no re-upload per clip. media_resolution=LOW, fps=1.0. New VideoVerdict schema adds `starts_clean_audio`, `ends_clean_audio`, `visuals_referenced_are_visible` (+ short evidence). Wire results as WARNINGS and a small final_quality dock (mirror W25-E single_idea advisory at validate.py:308) \u2014 never override the asymmetric quote-verified text kill gate. Gemini-only (bypass llm_json; ignore JUDGE_PROVIDER=groq), model = new VIDEO_JUDGE_MODEL (default flash-lite).\n\nBoth call a new gemini_client.generate_json_video(system, parts, schema, media_resolution) that reuses the generate_json_mm thinking-off-then-on + _retry machinery. Surface new fields in eval/artifacts. Guardrail (doc-confirmed): this is a FINAL gate only \u2014 do not replace the transcript-anchored structure stages with whole-video VLM grounding.",
+        "proposed_tasks": [
+          {
+            "id": "T1",
+            "title": "gemini_client: generate_json_video + video Part helpers (inline bytes, Files-API upload+ACTIVE poll, video_metadata offsets, media_resolution)",
+            "files": "backend/gemini_client.py",
+            "effort": "M",
+            "risk": "low",
+            "value": "high",
+            "notes": "Enabler for both tiers. Add video_part_inline(bytes) via types.Part.from_bytes(mime_type='video/mp4', media_resolution=LOW); video_part_uri(uri,start_s,end_s,fps) via types.Part(file_data=FileData(file_uri,mime_type), video_metadata=VideoMetadata(start_offset=f'{s}s',end_offset=f'{e}s',fps=1.0)); upload_video(path)->poll files.get until FileState.ACTIVE. Reuse generate_json_mm's config + _retry. Gemini-only, do NOT go through llm.py."
+          },
+          {
+            "id": "T2",
+            "title": "Edge-probe module (cut 8s head/tail via cut.build_cmd, inline video judge, EdgeVerdict) + orchestrator hook after refine_clip_boundaries",
+            "files": "new backend/pipeline/assemble/edge_probe.py; backend/orchestrator.py (~line 227, after refine); backend/pipeline/cut.py (reuse build_cmd)",
+            "effort": "M",
+            "risk": "med",
+            "value": "high",
+            "notes": "Cheapest win, catches F7. Inline (<20MB) so no Files upload. Advisory: False \u2192 nudge snap to nearest sentence/silence edge or warn 'starts/ends_mid_sentence_audio'; never kill. Needs source video present in embed mode (download if absent)."
+          },
+          {
+            "id": "T3",
+            "title": "Render-audit on survivors (Files upload source once + per-clip offsets, VideoVerdict with visuals_referenced_are_visible)",
+            "files": "new backend/pipeline/assemble/render_audit.py; backend/orchestrator.py; backend/config.py",
+            "effort": "L",
+            "risk": "med",
+            "value": "med",
+            "notes": "Opt-in, default OFF. One upload+ACTIVE poll per video, N cheap offset calls. Warning-first + small final_quality dock (mirror W25-E single_idea advisory); MUST NOT override the asymmetric text kill gate. ~$0.01-0.30/video."
+          },
+          {
+            "id": "T4",
+            "title": "Plumb video-gate outcomes into spec warnings/final_quality/eval/artifacts",
+            "files": "backend/pipeline/assemble/validate.py or scoring.py; backend/eval/metrics.py; backend/pipeline/assemble/artifacts.py",
+            "effort": "S",
+            "risk": "low",
+            "value": "med",
+            "notes": "Add starts_clean_audio/ends_clean_audio/visuals_referenced_are_visible to shipped record + eval columns; keep them advisory (rates reported, not gating) until \u03ba/labels exist per the doc's calibration rule."
+          },
+          {
+            "id": "T5",
+            "title": "Config flags EDGE_PROBE_ENABLED / VIDEO_JUDGE_ENABLED / VIDEO_JUDGE_MODEL (+ .env docs)",
+            "files": "backend/config.py",
+            "effort": "S",
+            "risk": "low",
+            "value": "med",
+            "notes": "Default OFF (mirror DIARIZATION_ENABLED). VIDEO_JUDGE_MODEL default gemini-2.5-flash-lite; media_resolution default LOW. Gemini-only (Groq has no video)."
+          }
+        ],
+        "open_questions": [
+          "Hook ordering: audit AFTER refine_clip_boundaries guarantees audited offsets == shipped offsets, but in default OUTPUT_MODE='embed' with multimodal ON the source video IS downloaded (perceive.py:170) \u2014 confirm we don't force an extra download when want_mm is false and want_cut is false (edge-probe would need the source regardless).",
+          "Render-audit source strategy: whole-source Files upload once + per-clip offsets (cheaper upload, 1 ACTIVE poll) vs local-cut each clip then inline/upload (N handles, simpler retention). Recommend whole-source+offsets for the 240s audit, local-cut+inline for the 8s edge probe \u2014 confirm the full source (could be a long lecture) uploads within Files limits/latency budget.",
+          "With PRECISE_BOUNDARIES (Whisper) already refining supadata's synthesized word timestamps, how much residual mid-sentence-audio error remains? Measure whether the edge-probe adds signal over Whisper snapping before investing in Tier 2.",
+          "Gating strength: should any video gate ever KILL, or stay warning-only until judge-human \u03ba\u22650.4 is established (doc's calibration gate)? Recommend advisory-only initially, consistent with W25-E single_idea.",
+          "media_resolution LOW vs MEDIUM/HIGH tradeoff for reading on-screen text/equations in visuals_referenced_are_visible \u2014 LOW (~100 tok/s) may miss small text; may need MEDIUM for slide-heavy content, raising cost ~3x."
+        ],
+        "sources": [
+          "Installed SDK verified locally: google-genai 2.10.0; types.VideoMetadata fields {start_offset:Optional[str], end_offset:Optional[str], fps:Optional[float]}; types.Part fields incl. file_data/inline_data/video_metadata/media_resolution; types.FileState {PROCESSING,ACTIVE,FAILED}; types.MediaResolution {LOW,MEDIUM,HIGH}; client.files {upload,get,list,delete,download} \u2014 via .venv/bin/python introspection",
+          "Context7 /googleapis/python-genai: VideoMetadata (start/end offset clipping, fps default 1.0 range (0.0,24.0]); Part.from_bytes(data,mime_type,media_resolution); files.upload + FileState ACTIVE polling; count_tokens / usage_metadata (prompt_token_count etc.); 'Part > videoMetadata: only when video provided inline or via a file'",
+          "https://ai.google.dev/gemini-api/docs/video-understanding \u2014 ~300 tokens/s default (258/frame @1fps + 32/s audio), ~100 tokens/s low resolution; inline <100MB (Files API when request >20MB); Files API 2GB free / 20GB paid; start_offset/end_offset clipping",
+          "https://ai.google.dev/gemini-api/docs/pricing \u2014 gemini-2.5-flash $0.30/M in, $2.50/M out; flash-lite ~$0.10/M in (also pricepertoken.com gemini-2.5-flash / flash-lite 2026 pages)",
+          "Repo files: backend/gemini_client.py:66,101,106,111; backend/llm.py:59; backend/pipeline/assemble/validate.py:43,98,133,224,268,308,668; backend/pipeline/assemble/__init__.py:192,254; backend/pipeline/understand/models.py:177; backend/pipeline/understand/vision.py:57; backend/pipeline/understand/perceive.py:170; backend/orchestrator.py:205-238; backend/pipeline/cut.py:42; backend/config.py:52,149,175,299,314; backend/eval/metrics.py:44,313",
+          "docs/CLIP-QUALITY-2026-07-02-audit-and-fix-plan.md:184-197 (Wave 4 item 21) \u2014 cited targets, gates, cost, VideoJudge arXiv:2509.21451, ExtremeWhenBench guardrail"
+        ]
+      }
+    },
+    {
+      "key": "w4-genre",
+      "result": {
+        "area": "Wave 4 items 22-23 \u2014 genre detection ENSEMBLE (metadata > audio > transcript-stats > LLM) + reconciliation pass + entertainment adapter. Unblocks the \"Calculus Rhapsody\" parody (uqwC41RDPyg) that ships 0 clips because it is mis-detected as \"lecture\".",
+        "current_tool_state": "yt-dlp 2026.6.9 INSTALLED. info_dict exposes `categories`, `tags`, and (when present) `artist/track/genre/album`. GROUNDED CHECK \u2014 real metadata-only `extract_info(url, download=False)` for uqwC41RDPyg (\"Calculus Rhapsody\") returns: categories=[\"Comedy\"], artist/track/genre/album all null, tags include \"rhapsody\",\"queen\",\"bohemian rhapsody\",\"calculus\",\"math\". So `categories` IS the reliable non-lecture signal here (Comedy), but artist/track/genre are NULL for user-uploaded parodies \u2192 those music fields are UNRELIABLE; do not rely on them alone. || google-genai 2.10.0 INSTALLED (repo uses new SDK: `from google import genai`). Audio understanding confirmed current (Context7 /googleapis/python-genai): `types.Part.from_bytes(data=audio_bytes, mime_type='audio/mpeg'|'audio/wav'|'audio/pcm')` passed into `client.models.generate_content(model='gemini-2.5-flash', contents=[text, part])`; inline request cap ~20MB (short window is tiny); structured `response_schema` works alongside audio parts. The repo already does image+schema via generate_json_mm, so audio is a drop-in. || inaSpeechSegmenter (PyPI, ina-foss): install_requires = numpy, pandas, scikit-image, pyannote.core, matplotlib, Pyro4, pytextgrid, soundfile; on darwin adds UNPINNED `tensorflow` + `onnxruntime-silicon`(arm64). python_requires>=3.8, classifiers list 3.8\u20133.13 (so 3.12 nominally supported). tensorflow-metal GPU plugin 1.2.0 (Jan 2025) ships wheels ONLY for py3.9\u20133.11 (no 3.12) \u2014 CPU `tensorflow` arm64 wheel works but Metal GPU accel is dead on 3.12. || wtpsplit/SaT, parakeet-mlx, MFA, torchaudio.forced_align: not relevant to genre detection \u2014 no role in this area.",
+        "environment_feasibility": "Apple Silicon darwin arm64, Python 3.12.13, clips/.venv already holds torch 2.12.1, numpy 2.2.6, scipy 1.18.0, google-genai 2.10.0, yt-dlp 2026.6.9. RECOMMENDED tiers are all zero-new-dep and Apple-Silicon-native: (1) metadata via existing yt-dlp (free; works even in fast/supadata mode via a lightweight extract_info(download=False) ~1-2s network call); (2) Gemini-audio music check via existing Gemini client (~1 flash-lite call, no native deps). inaSpeechSegmenter is INSTALLABLE in principle (arm64 markers + 3.12 classifier) but is a HEAVY/RISKY dep: it pulls UNPINNED tensorflow (~0.5-1GB) + Pyro4 (deprecated) + pyannote.core + soundfile into the SHARED venv that already has torch 2.12 + numpy 2.2.6 \u2014 high risk of protobuf/numpy resolver churn and breaking torch/google-genai; Metal GPU wheel doesn't exist for 3.12 (CPU-only inference). RECOMMEND AGAINST adopting it; a Gemini-audio classify gives the same music-vs-speech discrimination (singing tagged as non-speech) for the cost of one LLM call and zero venv risk. Diarization tier (item 22's interview-vs-story turn stats) is UNAVAILABLE by default: pyannote.audio is NOT installed and is gated behind HF_TOKEN + accepted terms (diarize.py:9-11), DIARIZATION defaults off (config.py:317) \u2014 defer that tier. In the default full+multimodal config (MULTIMODAL default \"1\", config.py:174), download() runs before detection so audio.m4a already exists at detect time; in fast profile there is no audio, so the audio tier must silently no-op.",
+        "existing_code_audit": "detect.py:57 `detect_content_type(transcript, settings)` = ONE Gemini `llm_json` call over title + head+tail sample (config.py:182-184: 25 head segs, 8 tail segs, 3500 chars) \u2014 confirms item 22's \"samples only head+tail\" (middle never sampled). detect.py:14 DetectionResult{content_type,domain,density,confidence,secondary_content_type,rationale} \u2014 NO music_fraction/metadata fields yet. detect.py:24-36 CONTENT_TYPE_TO_DOMAIN has NO music/song/comedy/entertainment key \u2192 even if the LLM said \"comedy\" it maps to generic; detect.py:38-43 DETECT_SYSTEM label list has no music/song/comedy/entertainment option (so the LLM can't even emit it). adapters/__init__.py:34 `select_adapter(transcript, settings)` only receives transcript+settings (no audio_path, no yt-dlp meta); registry register/get_adapter at :26-31; 11 adapters registered :45-55 (generic first = fallback). Adding an adapter = one ~40-line class (see story.py) subclassing BaseAdapter with domain/content_types/_domain_role_specs()/_contracts()/labeling_hints(), then import+register() in __init__.py + a CONTENT_TYPE_TO_DOMAIN entry. base.py:145 CORE_VERDICT_FIELDS = the \"core verdict fields only\" for a relaxed contract; base.py:144 _PROBLEM_ROLES triggers the worked-problem gates (problem_statement/reasoning/result_complete) that killed the parody; base.py:187-200 anchors derive from RoleSpec.anchor_priority. Detection stored on Structure.detection (understand/models.py:156). ORCHESTRATION: orchestrator.py _run_full downloads (when want_mm, ~176) BEFORE select_adapter (:185) \u2014 so audio_path exists at detect time in default config but is NOT passed. download.py:142-148 RETURNS only {video_id,video_path,audio_path,title,duration} \u2014 it DISCARDS the yt-dlp `info` dict, so categories/tags/artist/track/genre are extracted but thrown away (surface them = a few added dict keys). Gemini multimodal already wired: gemini_client.py:111 generate_json_mm(system, parts, schema) + :101 image_part via types.Part.from_bytes(data, mime_type) \u2014 only need an audio_part helper. llm.py:67 llm_json supports model= override; judge already uses it with config.JUDGE_MODEL=gemini-2.5-flash-lite (config.py:299, validate.py:150-153). RECONCILIATION integration points: contracts.py:37 choose_contract already picks the contract by CONTENT (unit roles) not anchor; validate.py:133 judge_clip runs per-candidate; both are called in assemble/__init__.py (~246-253 selection, ~392-398 repair, ~550-557) \u2014 reconciliation slots right there.",
+        "recommended_approach": "Build the ensemble in detect.py as a WEIGHTED OVERRIDE (not a hard replace), precedence metadata > audio > transcript-stats > LLM, and add an entertainment adapter + a per-candidate reconciliation pass. Concretely: (1) Surface yt-dlp metadata: have download() return categories/tags/artist/track/genre, and add a cheap `extract_info(download=False)` metadata probe so the metadata tier also works in fast/supadata mode; thread an optional `audio_path` + `meta` dict into select_adapter()/detect_content_type(). (2) Metadata tier rules grounded in the real dump: categories\u2229{Music}\u2192music; categories\u2229{Comedy,Entertainment} OR title/tags matching music terms (rhapsody|song|parody|lyrics|feat\\.|official (music )?video|cover|remix)\u2192entertainment lean; (artist AND track non-null)\u2192music \u2014 but treat null artist/track as no-signal (parody case). (3) Audio tier = Gemini-audio, NOT inaSpeechSegmenter: add audio_part() helper (mirror image_part), ffmpeg-cut a ~30-45s MIDDLE window from audio.m4a to mp3, one flash-lite generate_json_mm call returning {is_music, is_sung, speech_vs_music} \u2192 music_fraction proxy; only runs when audio_path present, else no-op. (4) Transcript-stats tier: extend _sample to head+MIDDLE+tail; compute line/n-gram repetition + rhyme + short-line ratio \u2192 song score (pure Python, no deps; a Bohemian-Rhapsody parody has heavy chorus repetition). (5) Expand DETECT_SYSTEM label set to include music/song/comedy/parody/entertainment and add CONTENT_TYPE_TO_DOMAIN \u2192 \"entertainment\". (6) Reconcile tiers into final content_type/domain/confidence: when the LLM says lecture but metadata=Comedy or audio=music or transcript=song, route to the entertainment adapter, drop confidence, and set secondary_content_type. (7) New EntertainmentAdapter: domain \"entertainment\", single anchor role \"moment\" (hook/punchline/quotable) with a minimal contract using CORE_VERDICT_FIELDS ONLY (no _PROBLEM_ROLES gates) \u2014 \"when unsure, gate less\". (8) Reconciliation pass (item 23): per-candidate flash-lite call (reuse llm_json(model=config.JUDGE_MODEL)) beside choose_contract/judge_clip in assemble/__init__.py \u2014 cross-check global genre vs the span's ordered unit roles; on contradiction override contract_role to the entertainment \"moment\" contract so the worked-problem gates don't fire; run it only when genre confidence is low or tiers conflict to bound cost. Fastest path to un-break the 0-clip parody: T2 (entertainment adapter) + minimal metadata routing (categories=Comedy \u2192 not lecture) \u2014 that alone stops the worked-problem gates from killing every candidate.",
+        "proposed_tasks": [
+          {
+            "id": "T1",
+            "title": "Surface yt-dlp metadata + cheap metadata-only probe; thread meta/audio_path into detection",
+            "files": "backend/pipeline/download.py (return categories/tags/artist/track/genre), backend/adapters/__init__.py (select_adapter signature), backend/adapters/detect.py, backend/orchestrator.py (pass dl meta + audio_path)",
+            "effort": "S",
+            "risk": "low",
+            "value": "high",
+            "notes": "download() currently discards the yt-dlp info dict (download.py:142-148). Add extract_info(download=False) fallback so metadata works in fast/supadata mode too. Real dump: categories=['Comedy'] is the load-bearing field; artist/track/genre are null for this parody."
+          },
+          {
+            "id": "T2",
+            "title": "EntertainmentAdapter (single 'moment' contract, core verdict fields only) + register + label mapping",
+            "files": "backend/adapters/entertainment.py (new), backend/adapters/__init__.py (import+register), backend/adapters/detect.py (CONTENT_TYPE_TO_DOMAIN + DETECT_SYSTEM label set)",
+            "effort": "S",
+            "risk": "low",
+            "value": "high",
+            "notes": "~40-line class like story.py. Anchor role 'moment' (hook/punchline/quotable); contract uses CORE_VERDICT_FIELDS only (base.py:145), avoids _PROBLEM_ROLES gates (base.py:144) that killed the parody. This + T1 routing is the minimal fix for the 0-clip case."
+          },
+          {
+            "id": "T3",
+            "title": "Genre ensemble core: metadata tier + transcript-stats (repetition/rhyme) + head+middle+tail sampling + tier reconcile; extend DetectionResult",
+            "files": "backend/adapters/detect.py (DetectionResult +music_fraction/+signals, _sample middle, ensemble/reconcile logic)",
+            "effort": "M",
+            "risk": "med",
+            "value": "high",
+            "notes": "Precedence metadata>audio>transcript>LLM as weighted override. Middle sampling addresses item 22's head+tail-only gap. Pure-Python transcript stats, no deps."
+          },
+          {
+            "id": "T4",
+            "title": "Gemini-audio music-check tier (NOT inaSpeechSegmenter)",
+            "files": "backend/gemini_client.py (audio_part helper), backend/pipeline/detect_audio.py (new: ffmpeg middle-window cut + one flash-lite generate_json_mm classify), backend/adapters/detect.py (consume music_fraction)",
+            "effort": "M",
+            "risk": "low",
+            "value": "high",
+            "notes": "Zero new deps, Apple-Silicon-native; uses existing Part.from_bytes(mime_type='audio/mpeg') confirmed current. Cache result next to work/<id>/. Only runs when audio_path present. Explicitly SKIP inaSpeechSegmenter (heavy TF+Pyro4 tree, shared-venv risk)."
+          },
+          {
+            "id": "T5",
+            "title": "Reconciliation pass: per-candidate flash-lite genre-vs-role-sequence cross-check + contract/adapter override",
+            "files": "backend/pipeline/assemble/reconcile.py (new), backend/pipeline/assemble/__init__.py (wire near choose_contract/judge_clip ~246-253/392-398/550-557)",
+            "effort": "M",
+            "risk": "med",
+            "value": "med",
+            "notes": "Reuse llm_json(model=config.JUDGE_MODEL=gemini-2.5-flash-lite). Gate on low genre confidence / tier conflict to bound cost (12 candidates = 12 calls). Pattern per item 23 (arXiv:2509.16811)."
+          },
+          {
+            "id": "T6",
+            "title": "Decision spike: reject inaSpeechSegmenter for shared venv (document) OR isolated-venv eval only if Gemini-audio proves weak",
+            "files": "docs/ (decision note), no shared-venv change",
+            "effort": "S",
+            "risk": "high",
+            "value": "low",
+            "notes": "Only revisit if T4 Gemini-audio classification is insufficient in eval. Never add TF/Pyro4 to clips/.venv (torch 2.12 + numpy 2.2.6 present)."
+          }
+        ],
+        "open_questions": [
+          "Do supadata captions carry any speaker labels? If not, item 22's diarization-based interview-vs-story tier is moot by default (pyannote not installed, gated) \u2014 confirm before investing.",
+          "Acceptable latency/cost of a metadata-only extract_info(download=False) in fast/supadata mode (~1-2s network), or should it be cached per video_id like title.txt?",
+          "Should the reconciliation pass run on every candidate, or only when genre confidence < threshold OR tiers conflict, to bound the extra flash-lite calls (12-cand video = 12 calls)?",
+          "Entertainment 'moment' clip sizing: still honor the 240s cap + min-duration, and what span budget for a hook/punchline vs a worked example?",
+          "Should music_fraction thresholds match the audit's proposal (>0.5 \u2192 force music; 0.2-0.5 \u2192 secondary+cap confidence at 0.5), or be recalibrated for the Gemini-audio classifier's output rather than inaSpeech's music-time fraction?",
+          "When metadata=Comedy but audio=speech (a stand-up lecture vs a sung parody), which tier wins? The precedence says metadata>audio, but the parody needs audio to override a 'Comedy' that could also be spoken."
+        ],
+        "sources": [
+          "file: backend/adapters/detect.py:14,24-43,57 (single-LLM head+tail detection, DetectionResult, no music/entertainment mapping)",
+          "file: backend/adapters/__init__.py:26-55 (registry, select_adapter signature)",
+          "file: backend/adapters/base.py:144-145,187-217 (_PROBLEM_ROLES gates, CORE_VERDICT_FIELDS, anchor derivation)",
+          "file: backend/adapters/story.py (template for a ~40-line adapter)",
+          "file: backend/pipeline/download.py:50,142-148 (yt-dlp info dict discarded)",
+          "file: backend/orchestrator.py:176-185 (download runs before select_adapter; audio_path available, not passed)",
+          "file: backend/gemini_client.py:101-142 (image_part + generate_json_mm; Part.from_bytes)",
+          "file: backend/llm.py:59-88 (llm_json model= override, Gemini path)",
+          "file: backend/pipeline/assemble/validate.py:133-153 (judge_clip, JUDGE_MODEL usage)",
+          "file: backend/pipeline/assemble/contracts.py:37 (choose_contract by content)",
+          "file: backend/config.py:174,182-184,299,317 (MULTIMODAL default, DETECT sampling, JUDGE_MODEL=gemini-2.5-flash-lite, DIARIZATION off)",
+          "file: backend/pipeline/understand/diarize.py:9-11,26-30 (pyannote gated + optional, not installed)",
+          "grounded run: yt-dlp extract_info(download=False) for uqwC41RDPyg \u2192 categories=['Comedy'], artist/track/genre=null, tags include rhapsody/queen/bohemian",
+          "https://github.com/ina-foss/inaSpeechSegmenter/blob/master/setup.py (deps: unpinned tensorflow + Pyro4 + pyannote.core + soundfile; darwin/arm64 markers)",
+          "https://pypi.org/project/inaSpeechSegmenter/ (Python 3.8-3.13 classifiers)",
+          "https://pypi.org/project/tensorflow-metal/ (Metal GPU plugin 1.2.0 = py3.9-3.11 wheels only, no 3.12)",
+          "https://developer.apple.com/metal/tensorflow-plugin/ (Apple TF Metal plugin)",
+          "Context7 /googleapis/python-genai \u2014 Part.from_bytes(data, mime_type='audio/mpeg'|'audio/wav'|'audio/pcm') into models.generate_content(model='gemini-2.5-flash', contents=[text, part])",
+          "https://deepwiki.com/yt-dlp/yt-dlp/2.2-information-extraction-pipeline (info_dict fields: categories, tags, artist, track, genre)",
+          "file: docs/CLIP-QUALITY-2026-07-02-audit-and-fix-plan.md:198-207 (items 22-23 recipe)",
+          "file: docs/audits/2026-07-02/coverage-selection.json:77-87 (inaSpeech proposal being feasibility-checked here)"
+        ]
+      }
+    },
+    {
+      "key": "w4-frontend",
+      "result": {
+        "area": "Wave 4 item 24 \u2014 render context cards, watch-first chips, quality badges in the React frontend, and fix the embed ceil(end)+1 bleed. Backend payload whitelist + frontend render delta + one-line embed fix.",
+        "current_tool_state": "Pure frontend-toolchain area (no external ML/Gemini API touched; Context7 not needed). frontend/package.json:12-25 declares react/react-dom ^18.3.1, vite ^6.0.7, typescript ^5.6.3, tailwindcss ^3.4.17, @vitejs/plugin-react ^4.3.4, @types/react ^18.3.5. Installed on this machine (node_modules present): Vite 6.4.3, React 18.3.1, TypeScript 5.9.3, Tailwind 3.4.19; Node v26.1.0, npm 11.17.0. Build script is `vite build`; typecheck is `tsc --noEmit` (frontend/package.json:8-9). All current, all React 18 / Vite 6 \u2014 no API-shape surprises for this change.",
+        "environment_feasibility": "Fully feasible on Apple Silicon. Entirely local TS/TSX edits + a Vite build; node_modules already installed; no native build, no CUDA, no licensing, zero API cost (this area makes no LLM calls). The one operational gotcha: the frontend is PREBUILT into backend/static/ (backend/static/index.html + backend/static/assets/ exist, mtime 2026-06-29), served same-origin by FastAPI. So any types.ts/ClipCard.tsx change is invisible in the running app until you run `cd /Users/vincentfeng/Documents/practice/clips/frontend && npm run build` (optionally `npm run typecheck` first) to regenerate backend/static. Backend orchestrator.py edits take effect on server restart, no build.",
+        "existing_code_audit": "PAYLOAD (backend/orchestrator.py:45-70, `_build_embed_clips`): whitelists n, video_id, facet, reason, start, end, duration, embed_url, path, role, title, context_card, sequence_index, prerequisite_clips, notes. So context_card, prerequisite_clips, notes (the P4b \"continues clip N\" watch-first cue) and role/title are ALREADY in the payload (orchestrator.py:62-68). DROPPED though present on the spec dict: final_quality (set at assemble/__init__.py:508,529; scoring.py:47), warnings (tuple of short strings, set at boundary_adapt.py:49/93/103, refine.py:134, __init__.py:526-527/545/575 \u2014 values: trimmed_start, capped_max_duration, extended_for_min_duration, merged_overlap, merged_severed_pair, missing_context_card, unjudged, unverified_judge_concerns, single_idea_unverified, kill_confirm_unavailable), and ship_flagged (bool asymmetric-gate flag, __init__.py:308/313, boundary_adapt.py:50, integrity.py:78). IMPORTANT: there is NO literal `verdict` key in the final spec dict \u2014 the JudgeVerdict lives on cand.verdict (a Candidate attr), not carried into the spec; what survives are the derived signals ship_flagged / hard_gates_ok / n_failure_reasons / n_verified / warnings. So the doc's \"verdict\" == these signals, not a nested object; do not try to whitelist a nonexistent verdict.\nBLEED (backend/orchestrator.py:38-42, `_embed_url`): `?start={int(floor(start))}&end={int(ceil(end)) + 1}&rel=0` \u2014 the `+ 1` adds a whole extra second past ceil(end), so e.g. end=42.3 \u2192 ceil 43 \u2192 44, ~1.7s bleed into the next sentence. A proven-correct reference already exists: backend/eval/sample_for_labeling.py:59-64 uses `s=max(0,floor(start)); e=max(s+1, ceil(end))` (no +1, guarded), asserted by backend/eval/tests/test_sample_for_labeling.py:62 (end=45.2 \u2192 46). No test pins the orchestrator +1 behavior, so fixing it breaks nothing.\nFRONTEND: frontend/src/types.ts:1-17 Clip already declares role?, title?, context_card?, sequence_index?, prerequisite_clips? \u2014 but NOT notes, final_quality, warnings, ship_flagged. frontend/src/components/ClipCard.tsx:29-61 renders ONLY the facet tag, start-end \u00b7 duration, reason, and export/download button \u2014 it renders none of title, context_card, notes, prerequisite_clips, or any quality/warning signal. So context-card + watch-first data is in the payload today and dropped by the UI. ResultsGrid.tsx:4-12 just maps ClipCard; App.tsx:86 passes snap.clips \u2014 no change needed there. Reusable Tailwind classes already in ClipCard: `tag` (chip), `glass`, `btn-ghost` (ClipCard.tsx:30/43/50); a components/ui/ dir exists. prerequisite_clips values are sequence indices equal to clip.n (orchestrator.py:52/65, sequence.py), so they map cleanly to a \"watch clip N first\" link. Test to keep green: backend/eval/tests/test_wave2_columns.py:203 (whitelists_notes) \u2014 additive fields won't break it.",
+        "recommended_approach": "Minimal delta = 2 backend edits + 2 frontend edits + a rebuild. BACKEND: (1) In `_build_embed_clips` (orchestrator.py:51-69) add three keys to the emitted dict: `\"final_quality\": round(float(c.get(\"final_quality\", c.get(\"score\", 0.0))), 3)`, `\"warnings\": list(c.get(\"warnings\") or ())`, `\"ship_flagged\": bool(c.get(\"ship_flagged\", False))`. These are the doc's \"verdict/warnings/final_quality\" (no nested verdict object exists). (2) Fix `_embed_url` (orchestrator.py:38-42): replace `int(math.ceil(end)) + 1` with the guarded no-+1 form mirroring sample_for_labeling.embed_url \u2014 `s = max(0, int(math.floor(start))); e = max(s + 1, int(math.ceil(end)))`. Cleanest: import and reuse backend/eval/sample_for_labeling.embed_url (or lift it to a shared util) so the two don't drift; add a small unit test mirroring test_sample_for_labeling.py:62. FRONTEND: (3) types.ts: extend Clip with `notes?: string[]; final_quality?: number; warnings?: string[]; ship_flagged?: boolean;`. (4) ClipCard.tsx: above `reason`, render `title` as a heading when present and `context_card` as a muted intro block when present; render watch-first chip(s) from notes (\"continues clip N\") and/or prerequisite_clips (\"Watch clip N first\"); render a quality badge derived from final_quality (e.g. High \u22650.7 / OK otherwise) plus a \"Flagged\"/warning chip when ship_flagged is true or warnings is non-empty, mapping only a curated user-facing subset of warning strings to short labels and hiding internal ones. Reuse `tag`/`glass`/`btn-ghost`. (5) `cd frontend && npm run build` (optionally `npm run typecheck` first) to regenerate backend/static \u2014 REQUIRED or the served app won't change. This is a surfacing/whitelist change only; no pipeline or scoring logic is touched.",
+        "proposed_tasks": [
+          {
+            "id": "24a",
+            "title": "Whitelist final_quality, warnings, ship_flagged into embed payload",
+            "files": "/Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py:51-69 (_build_embed_clips)",
+            "effort": "S",
+            "risk": "low",
+            "value": "high",
+            "notes": "3 additive keys; frontends ignore unknown keys so no contract break. No 'verdict' object exists to add. test_wave2_columns.py:203 stays green."
+          },
+          {
+            "id": "24b",
+            "title": "Fix embed ceil(end)+1 bleed",
+            "files": "/Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py:38-42 (_embed_url); reuse pattern from backend/eval/sample_for_labeling.py:59-64",
+            "effort": "S",
+            "risk": "low",
+            "value": "high",
+            "notes": "Drop +1; add max(s+1, ceil(end)) guard. No test pins current behavior. Add a mirror test of test_sample_for_labeling.py:62. Consider sharing one embed_url helper to prevent drift."
+          },
+          {
+            "id": "24c",
+            "title": "Extend Clip type with notes/final_quality/warnings/ship_flagged",
+            "files": "/Users/vincentfeng/Documents/practice/clips/frontend/src/types.ts:1-17",
+            "effort": "S",
+            "risk": "low",
+            "value": "med",
+            "notes": "role/title/context_card/sequence_index/prerequisite_clips already declared; add the 4 missing optional fields."
+          },
+          {
+            "id": "24d",
+            "title": "Render title, context card, watch-first chips, quality/flag badges in ClipCard",
+            "files": "/Users/vincentfeng/Documents/practice/clips/frontend/src/components/ClipCard.tsx:29-61",
+            "effort": "M",
+            "risk": "low",
+            "value": "high",
+            "notes": "context_card as intro blurb; notes+prerequisite_clips as watch-first chips (prereq values == clip.n); final_quality\u2192badge; ship_flagged/warnings\u2192flag chip with a curated warning->label map. Reuse tag/glass/btn-ghost. ResultsGrid/App need no change."
+          },
+          {
+            "id": "24e",
+            "title": "Rebuild frontend into backend/static",
+            "files": "/Users/vincentfeng/Documents/practice/clips/frontend (npm run typecheck && npm run build) -> /Users/vincentfeng/Documents/practice/clips/backend/static",
+            "effort": "S",
+            "risk": "low",
+            "value": "high",
+            "notes": "Mandatory: app is served from prebuilt backend/static/. Node 26 / npm 11 / Vite 6.4.3 already installed on Apple Silicon; build is local and free."
+          }
+        ],
+        "open_questions": [
+          "Which warning strings are user-facing? Recommend an allowlist->label map (e.g. unverified_judge_concerns->'unverified', trimmed_start->'trimmed', capped_max_duration->'length-capped') and hide internal ones (merged_overlap, single_idea_unverified, missing_context_card, unjudged).",
+          "Quality badge thresholds: final_quality is a 0-1 combined score (completeness/grounding/boundary/priority), not a 0-5 judge score. Use fixed banding (>=0.7 High / else OK) or read the config quality floor?",
+          "Bias hygiene: the labeling page (sample_for_labeling.py:116-118) deliberately hides judge internals near the embed. Is showing a quality/flag badge on the production card desired, or should it be a subtle/opt-in treatment?",
+          "Flag treatment: chip vs card border tint for ship_flagged clips?",
+          "Confirm prerequisite_clips should render as a click-to-scroll 'watch clip N first' link (values equal clip.n) vs plain text."
+        ],
+        "sources": [
+          "/Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py:38-70 (_embed_url +1 bleed; _build_embed_clips whitelist)",
+          "/Users/vincentfeng/Documents/practice/clips/backend/eval/sample_for_labeling.py:59-64,84-89 (correct no-+1 embed_url; ship_flagged/warnings->flagged status pattern)",
+          "/Users/vincentfeng/Documents/practice/clips/backend/eval/tests/test_sample_for_labeling.py:61-63 (asserts end=ceil, no +1)",
+          "/Users/vincentfeng/Documents/practice/clips/backend/eval/tests/test_wave2_columns.py:203-211 (notes/prerequisite_clips whitelist test)",
+          "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/boundary_adapt.py:32,49-50 (context_card/warnings/ship_flagged on spec)",
+          "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/__init__.py:308-313,500-508,522-534,593 (ship_flagged, final_quality, context_card, sequence)",
+          "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/sequence.py:194-204 (prerequisite_clips + 'continues clip N' notes)",
+          "/Users/vincentfeng/Documents/practice/clips/frontend/src/types.ts:1-17 (Clip type; missing notes/final_quality/warnings/ship_flagged)",
+          "/Users/vincentfeng/Documents/practice/clips/frontend/src/components/ClipCard.tsx:29-61 (renders none of the extras)",
+          "/Users/vincentfeng/Documents/practice/clips/frontend/src/components/ResultsGrid.tsx:4-12; /Users/vincentfeng/Documents/practice/clips/frontend/src/App.tsx:86 (no change needed)",
+          "/Users/vincentfeng/Documents/practice/clips/frontend/package.json:6-25 (Vite 6/React 18/TS 5 toolchain, build script)",
+          "/Users/vincentfeng/Documents/practice/clips/backend/static/ (prebuilt index.html + assets \u2014 rebuild required)",
+          "/Users/vincentfeng/Documents/practice/clips/docs/CLIP-QUALITY-2026-07-02-audit-and-fix-plan.md:208-211 (item 24 recipe)"
+        ]
+      }
+    },
+    {
+      "key": "w3-cards",
+      "result": {
+        "area": "Wave 3 item 20 \u2014 orientation card generated BEFORE the accept/reject gate; judge the clip+card (align gate with eval); card-as-repair rescuing prerequisite/reference-only would-be-kills WITHOUT growing the span; suppression rule. Target: the UAM-equations clip that dies verified+confirmed on missing_prerequisite.",
+        "current_tool_state": "LLM path is entirely internal (Gemini via google-genai); no external ML research needed. Installed: google-genai 2.10.0 (verified via importlib.metadata). Current API (Context7 /googleapis/python-genai): client.models.generate_content(model=..., contents=..., config=types.GenerateContentConfig(response_mime_type='application/json', response_schema=<Pydantic BaseModel>)) \u2014 matches backend/gemini_client.py:76,:87 exactly, no migration. Model IDs current: GEMINI_MODEL='gemini-2.5-flash' (config.py:52), JUDGE_MODEL='gemini-2.5-flash-lite' (config.py:299). context_card.py and validate.py both route through backend/llm.py:59 llm_json -> gemini_client. Card-as-repair adds zero new external calls. rapidfuzz (context_card._grounded) installed and importable.",
+        "environment_feasibility": "Fully feasible on macOS Apple Silicon with the existing stack. Card-as-repair reuses two functions that already ship: generate_context_card (context_card.py:43) and judge_clip (validate.py:133) \u2014 both pure Gemini/llm_json. No new dependency, no native build, no CUDA, no licensing issue. Marginal cost: +1 card LLM call and +1 judge LLM call on the KILL path only (rare; analogous to confirm_kill which already runs post-budget on the kill path). rapidfuzz + google.genai import cleanly in .venv (verified). No environment blockers.",
+        "existing_code_audit": "Delta baseline: (1) generate_context_card(spec, units_by_id, adapter, topic) context_card.py:43 builds a <=40-word (config.py:304) grounded 'earlier in the video' preface from spec['referential'] units NOT in the clip + the anchor; returns '' when no referential units lie outside the clip (:48-49); per-sentence rapidfuzz grounding >=55 (:34-40); extractive fallback verbatim summary (:64-69). Reads a dict via .get('unit_ids'/'referential'/'anchor_id'). (2) Card is generated ONLY at STEP 6 (__init__.py:522-531) \u2014 AFTER the accept/reject gate, AFTER quality floor (:501) and AFTER max_clips truncation (:517); only survivors get a card. Also in the severed-merge branch (:581). (3) judge_clip ALREADY accepts context_card and injects it in the USER prompt (validate.py:133-134, :143). BUT JUDGE_SYSTEM (validate.py:74-116) never references the card and says 'You see ONLY the clip's transcript ... never the surrounding video' (:75-76) \u2014 so a passed card is contradictory dead-weight. (4) THE GATE JUDGES CLIP-ONLY: _judge calls judge_clip with NO card (:724-726, defaults ''); every re-judge seam hardcodes context_card='' (post-snap :255, refund-trim :400, severed-merge :559). (5) MISALIGNMENT: eval comprehension (metrics.py:44-45) judges WITH s['context_card'] while the gate judges WITHOUT. (6) TWO judge KILL gates, both verified+confirmed (unverified_kill=0 invariant): repair terminal validate.py:850-888 (:863-878) and post-snap/post-merge __init__.py:268-288 (:269-276/:277-288). UAM dies when a prereq/reference breaks the hard core (_hard_core_ok validate.py:555 = topic+purpose+grounded+all_references_resolved) verified+confirmed. (7) referential (card source pool) populated by closure with far prereqs it couldn't inline (closure.py:133,:162) \u2014 the missing prereq is usually already there. (8) A rescue-set card on the Candidate rides into the spec automatically: types.py:49 Candidate.context_card; boundary_adapt.py:32 copies it (plus judged_text_hash/hard_gates_ok) through snap. (9) Missing-card penalty: _card_warning (__init__.py:40-44) adds 'missing_context_card' -> boundary_score -0.10 (scoring.py:39). (10) NO suppression rule and NO card-as-repair exist (grep confirmed). (11) expand_candidate already maps missing_concept -> introducer unit (validate.py:390-395,:442-445) \u2014 reusable to seed the rescue card.",
+        "recommended_approach": "Deliver card-as-repair as a pure ACCEPT-SIDE rescue at the two judge kill gates plus one load-bearing prompt fix. (A) PROMPT FIX (prerequisite for everything; also fixes eval): amend JUDGE_SYSTEM (validate.py:74-116) with 'If a CONTEXT CARD is provided it is shown to the viewer immediately before the clip; treat any concept it introduces or reference it resolves as available to the viewer \u2014 such concepts satisfy prerequisites_satisfied and such references satisfy all_references_resolved.' Without this the injected card (validate.py:143) is ignored. (B) CARD-AS-REPAIR at the repair terminal gate: in validate_and_repair, after 'confirmed' is computed (validate.py:863-867) and BEFORE the 'if confirmed:' kill (:868): if confirmed and every confirmed reason is prereq/reference-family, generate a card from ship.referential (dict shim over generate_context_card) and RE-JUDGE THE SAME SPAN (ship.i_start..ship.i_end, no growth) WITH the card; if the carded verdict clears the hard core AND prerequisites_satisfied AND all_references_resolved, set ship.context_card + 'card_completed' warning, return _stamp_trims(ship),None; else fall through to the existing kill. (C) CARD-AS-REPAIR at the post-snap/post-merge gate: mirror (B) in __init__.py after confirmed (:274-276) before the Rejection (:278) \u2014 spec is a dict so generate_context_card(s,...) works directly; thread s.get('context_card','') into the post-snap judge_clip (:253-255) and refund-trim (:398-400) so a card-completed clip keeps its card when re-judged after a text change. (D) SUPPRESSION + no-clobber at step 6 (__init__.py:522-531): skip generation when the first sentence already names the subject (grounded fuzzy match of topic/anchor primary concept vs sentences[start].text); change :525 to 'if not s.get(\\\"context_card\\\"): ...' so a rescue-set card survives. INVARIANT: every insert is accept-side-only \u2014 each converts a would-be 'return None, Rejection' into 'return ship/spec, None' and never creates a new Rejection; the verified+confirmed kill logic is untouched, so unverified_kill stays structurally 0. Robustness (T5): also seed the card from the verdict's missing_concept -> introducers -> prior_introducer (reuse validate.py:390-395) when the prereq isn't in referential; keep the card grounded via context_card._grounded so it can never fabricate the missing concept \u2014 no source unit means no card and the kill correctly stands.",
+        "proposed_tasks": [
+          {
+            "id": "T1",
+            "title": "Amend JUDGE_SYSTEM to credit the CONTEXT CARD (load-bearing; also aligns eval)",
+            "files": "backend/pipeline/assemble/validate.py:74-116",
+            "effort": "S",
+            "risk": "low",
+            "value": "high",
+            "notes": "Tell the judge a provided card is shown-before-the-clip context that satisfies prerequisites_satisfied / all_references_resolved. Without it, passing a card does nothing. Changes the judge prompt -> per acceptance criterion 3 confirm judge-human kappa doesn't drop and run --freeze --runs 3 A/B (eval comprehension will shift up since eval already injects the card at metrics.py:45)."
+          },
+          {
+            "id": "T2",
+            "title": "Card-as-repair rescue at the repair terminal kill gate (THE UAM fix)",
+            "files": "backend/pipeline/assemble/validate.py:863-878 (+ new _card_rescuable/_try_card_rescue near :555)",
+            "effort": "M",
+            "risk": "low",
+            "value": "high",
+            "notes": "Insert between confirmed-computed (:867) and the kill (:868). _card_rescuable(confirmed)=all reasons prereq/reference-family (reuse _norm_kind). _try_card_rescue: generate_context_card({'unit_ids':ship.unit_ids,'referential':ship.referential,'anchor_id':ship.anchor_id},...) then judge_clip(same-span text, context_card=card); accept iff _hard_core_ok AND prerequisites_satisfied AND all_references_resolved. Success: set ship.context_card + 'card_completed', return _stamp_trims(ship),None. All deps in scope. Accept-side only -> invariant safe."
+          },
+          {
+            "id": "T3",
+            "title": "Card-as-repair at post-snap/post-merge gate + thread existing card into re-judge seams",
+            "files": "backend/pipeline/assemble/__init__.py:253-255,:274-288,:398-400,:557-559",
+            "effort": "M",
+            "risk": "low",
+            "value": "high",
+            "notes": "Mirror T2 after confirmed at :276 before the Rejection at :278 (spec dict -> generate_context_card(s,...) directly). Change context_card='' to s.get('context_card','') at :255 and :400 so a rescued clip keeps its card across a text-change re-judge. Severed-merge (:559) is a KEEP-linked-pair path (no kill) \u2014 pass the card for consistency only. Accept-side only."
+          },
+          {
+            "id": "T4",
+            "title": "Suppression rule + don't-clobber-rescued-card at step 6",
+            "files": "backend/pipeline/assemble/__init__.py:522-531 (+ new _first_sentence_names_subject helper)",
+            "effort": "S",
+            "risk": "med",
+            "value": "med",
+            "notes": "Change :525 to 'if not s.get(\"context_card\"): s[\"context_card\"]=generate_context_card(...)' so rescue cards survive. Suppress when a normalized fuzzy match of topic/anchor primary concept appears in sentences[sentence_start_idx].text. Risk is definitional ('the subject') plus SciTalk card-redundancy stop-signal \u2014 keep suppression conservative and grounded."
+          },
+          {
+            "id": "T5",
+            "title": "Robust rescue seeding from the verdict's missing_concept introducer",
+            "files": "backend/pipeline/assemble/context_card.py:43 (optional seed-units/missing_concepts param); called from T2/T3",
+            "effort": "M",
+            "risk": "med",
+            "value": "med",
+            "notes": "When the prereq's introducer isn't in referential, map missing_concept -> introducers -> prior_introducer (reuse validate.py:390-395) and add that unit to the card's allowed set, still grounded via _grounded. Makes the UAM rescue robust to closure not queueing the prereq. Grounding prevents fabrication."
+          },
+          {
+            "id": "T6",
+            "title": "Scoring/warnings for card_completed and suppressed cards",
+            "files": "backend/pipeline/assemble/scoring.py:29-40; backend/pipeline/assemble/__init__.py:40-44 (_card_warning)",
+            "effort": "S",
+            "risk": "low",
+            "value": "med",
+            "notes": "Ensure a card_completed clip isn't also tagged missing_context_card, and a deliberately SUPPRESSED card doesn't trip the -0.10 penalty (suppression is intentional). Optionally give card_completed a small completeness/boundary credit so a rescued clip clears the quality floor it was already near."
+          },
+          {
+            "id": "T7",
+            "title": "Tests: invariant regression + UAM-shape rescue fixture",
+            "files": "backend/pipeline/assemble/tests/test_repair_rework.py, test_judge_integrity.py (extend)",
+            "effort": "M",
+            "risk": "low",
+            "value": "high",
+            "notes": "Assert unverified_kill stays 0 across the new paths (a would-be kill with an empty/non-verifiable card must NOT kill and must NOT rescue). UAM fixture: hard core broken by a prereq whose introducer is in referential; card flips prerequisites_satisfied/all_references_resolved -> ship carded SAME span (i_start/i_end and unit_ids unchanged = 'without growing'). Negative: confirmed missing_result (not rescuable) still dies."
+          }
+        ],
+        "open_questions": [
+          "Truly always-on card even when referential is empty: item 20/ReelsEd wants a one-line orientation LABEL on every clip, but today's card requires referential context (returns ''). Build a separate cheap label (extractive from anchor title/topic, possibly no LLM) vs keep referential-sourced only? Risk: SciTalk acceptance criterion 4 flags card redundancy as a stop signal.",
+          "Suppression predicate: what is 'the subject' \u2014 query topic, anchor primary concept, or clip title head noun \u2014 and what fuzzy threshold? Needs a grounded, tested rule to avoid over/under-suppression.",
+          "Should the rescue re-judge count against JUDGE_MAX_REPAIR (config.py:284=3) budget, or be a free post-budget kill-path call like confirm_kill? Recommend free/post-budget, bounded to 1 card + 1 judge, since it runs only when the clip would otherwise die.",
+          "T1 changes the judge prompt: per acceptance criterion 3 gate on judge-human kappa >= 0.4 (no regression). It also moves eval comprehension upward (eval already injects the card at metrics.py:45) \u2014 is that shift an acceptable real alignment gain, and does the labeling set need re-scoring?",
+          "Does judging clip+card on the ACCEPT side of EVERY repair pass (fuller alignment) beat rescue-only-at-the-kill-boundary? Rescue-at-boundary alone removes the harmful asymmetry (eval-passes-but-gate-kills); per-pass carding adds cost + card staleness across grow/trim. Recommend deferring per-pass carding."
+        ],
+        "sources": [
+          "backend/pipeline/assemble/context_card.py:43-73 (generate_context_card; referential-sourced, grounded, empty-omitted)",
+          "backend/pipeline/assemble/validate.py:74-116 (JUDGE_SYSTEM says 'ONLY the transcript', never mentions the card)",
+          "backend/pipeline/assemble/validate.py:133-147 (judge_clip already injects context_card into the user prompt)",
+          "backend/pipeline/assemble/validate.py:707-739 (_judge calls judge_clip with NO card); :850-888 (repair terminal verified+confirmed kill gate \u2014 rescue hook)",
+          "backend/pipeline/assemble/__init__.py:192-194 (gate call); :253-288 (post-snap re-judge context_card='' + verified+confirmed kill \u2014 rescue hook); :522-531 (step 6 card generation AFTER the gate)",
+          "backend/pipeline/assemble/boundary_adapt.py:32 (cand.context_card carried into the spec dict through snap)",
+          "backend/pipeline/assemble/scoring.py:29-40 (boundary_score missing_context_card -0.10); backend/pipeline/assemble/closure.py:133,:162 (referential = far prereqs)",
+          "backend/eval/metrics.py:44-45 (eval judges clip WITH card \u2014 the alignment target)",
+          "backend/config.py:52,:284-299,:304 (gemini-2.5-flash / gemini-2.5-flash-lite; JUDGE_MAX_REPAIR=3; JUDGE_MIN_SCORE=0.70; CONTEXT_CARD_MAX_WORDS=40)",
+          "backend/gemini_client.py:14-16,:76,:87 (current google-genai generate_content + response_schema call)",
+          "docs/CLIP-QUALITY-2026-07-02-audit-and-fix-plan.md:178-182 (item 20 recipe); :262-264 (UAM equations clip dies verified+confirmed on missing_prerequisite; card-as-repair is the designed rescue)",
+          "Context7 /googleapis/python-genai (https://github.com/googleapis/python-genai/blob/main/docs/_sources/index.rst.txt) \u2014 current generate_content(response_mime_type='application/json', response_schema=Pydantic) API; google-genai 2.10.0 installed"
+        ]
+      }
+    },
+    {
+      "key": "w3-boundaries",
+      "result": {
+        "area": "Wave 3 items 18-19 \u2014 2-of-3 boundary gate {restored terminator, SaT \u00b11 word, inter-word pause \u22650.25s} + cut-inside-pause; and precise cuts by forced alignment (torchaudio.functional.forced_align / MFA) vs the current WhisperX-style pass. Verdict: forced alignment is LOW ROI and effectively blocked on this box; the residual boundary error is segmentation (wrong word), not timing (wrong millisecond).",
+        "current_tool_state": "torchaudio.functional.forced_align: signature F.forced_align(emission, targets, blank=0); emissions come from torchaudio.pipelines.MMS_FA (a wav2vec2 CTC model), CPU-supported. STATUS CONTESTED in 2026: deprecated in 2.8, slated for removal in 2.9 (matches the doc's \"pin <2.9\"); the CTC forced-alignment tutorial (docs.pytorch.org/audio/stable) now states it was \"removed in 2.9, migrate to TorchCodec,\" while another 2026 source reports forced_align was PRESERVED in 2.10 after community feedback. torchaudio latest = 2.11.0 (macOS arm64 wheels incl. cp312). Decisive fact independent of the API debate: torchaudio must match torch exactly, and this venv has torch 2.12.1 (ahead of torchaudio 2.11.0) \u2014 no matching torchaudio wheel exists. wtpsplit / wtpsplit-lite (SaT, EMNLP 2024): current, pip-installable; models sat-3l / sat-3l-sm (fast) and sat-12l / sat-12l-sm (best); wtpsplit-lite 0.2.0 is ONNX-only with minimal deps and runs on CPU by default (onnxruntime 1.27.0 already in venv). NOT installed. Montreal-Forced-Aligner 3.3.8: distributed via conda-forge (bundles Kaldi/pynini/openfst); pip-from-github possible but still needs the conda Kaldi stack; conda is NOT on this box. parakeet-mlx (item 17's \"better long-term\"): current on PyPI, Apple-Silicon-native (MLX), model mlx-community/parakeet-tdt-0.6b-v3, emits word timestamps + punctuation + capitalization, ~6% WER; installable via pip/pipx. faster-whisper 1.2.1 + ctranslate2 4.8.0 ARE installed (the engine the current boundary.py WhisperX-style pass uses). google-genai 2.10.0 installed; Context7 confirms the CURRENT API is client.models.generate_content(model=..., config=types.GenerateContentConfig(response_mime_type='application/json', response_schema=PydanticModel)) \u2014 exactly what backend/llm.py uses; a newer response_json_schema field and gemini-3.5-flash now exist, but the repo's gemini-2.5-flash (author) / gemini-2.5-flash-lite (judge) remain valid. pysbd 0.3.4 current.",
+        "environment_feasibility": "darwin arm64, Python 3.12.13, clips/.venv. (1) torchaudio forced_align (item 19): EFFECTIVELY BLOCKED. torchaudio's latest 2.11.0 pairs with torch 2.11, but this venv runs torch 2.12.1; installing torchaudio would force-downgrade torch, and torch 2.12.1 is load-bearing \u2014 it is pulled in by sentence-transformers 3.4.1 (used by backend/pipeline/understand/treeseg.py embeddings) and transformers/safetensors, i.e. the TreeSeg structure stage. Downgrading torch to satisfy torchaudio risks breaking the structure stage. Plus the forced_align API itself is on a removal/TorchCodec-migration path. Not worth it. (2) MFA (item 19 alt): conda not installed; requires a fresh miniconda + a ~GB Kaldi/pynini/openfst env; CLI-subprocess model; high friction, off-stack. Low feasibility. (3) wtpsplit-lite SaT (items 17/18 signal 2): FEASIBLE now \u2014 ONNX on CPU, onnxruntime 1.27.0 already present, one model download (~few hundred MB for sat-3l). (4) parakeet-mlx (item 17 long-term): FEASIBLE on this exact hardware (Apple Silicon MLX), but needs the audio downloaded (yt-dlp) + a model download, and re-transcribes the whole video. (5) The existing faster-whisper boundary window: deps already present (faster-whisper 1.2.1, ffmpeg at /opt/homebrew/bin/ffmpeg); its only gate is a successful yt-dlp audio download (residential-IP-dependent per the hosting-vidscout memory).",
+        "existing_code_audit": "TERMINATORS ALREADY SOLVED (why forced alignment is low-ROI): the LLM punctuation package restores terminators; sentences.py:340-373 sentences_from_punctuation converts PunctuationResult \u2192 Sentence with terminator + ends_with_period, re-guarding abbreviations via _final_period_guarded (sentences.py:357). build_sentences (punctuation/service.py:256-287) is the gated seam (punctuation \u2192 else build_sentence_index \u2192 else sentences_from_chunks). BUT sentences_from_chunks (sentences.py:376-399) FABRICATES ends_with_period=True for EVERY caption chunk \u2014 the documented boundary-neutralizer (audit trio_inspection finding 6: snapping becomes a no-op, clips start/end mid-clause yet score ends_on_period_rate=1.0). SNAPPING: refine.py:45 _snap_one (start\u2192sentence start, end\u2192_valid_end_at_or_after a real terminator, min/max dur, tail pad) via refine_and_snap (refine.py:222); structure path wraps it in assemble/boundary_adapt.py:59 snap_candidates (preserves Part-B metadata). THE WHISPERX PASS item 19 wants to replace = backend/pipeline/boundary.py:150 refine_clip_boundaries: _ensure_audio (yt-dlp, boundary.py:28) \u2192 _whisper_window (\u00b1BOUNDARY_PAD_S=10s, boundary.py:70) \u2192 build_sentence_index on a FRESH faster-whisper transcription \u2192 _pick_start/_pick_end. It IS wired (orchestrator.py:225 structure, :260 fast) but gated on config.PRECISE_BOUNDARIES (default on, config.py:62) AND source=='supadata'; returns clips unchanged on audio failure (boundary.py:158). DESIGN SMELL: it re-segments from Whisper-small's OWN punctuation, discarding the LLM-restored terminators, so it can move a good boundary to a worse Whisper one \u2014 and although the window carries REAL word times, it uses them for nothing pause-related. PAUSE SIGNAL REALITY (item 18 signal 3): chunker._pause_gaps exists (punctuation/chunker.py:18) and is used with 0.7s thresholds, but for supadata word times are SYNTHESIZED proportionally within each caption chunk (transcribe.py:163-171). I proved empirically that intra-chunk inter-word gaps are all exactly 0.0; the only nonzero gap sits at the ~180-char caption-chunk boundary (SUPADATA_CHUNK_SIZE=180, config.py:34). So the pause signal is UNAVAILABLE within a chunk on supadata. tail_pad_s=0.05 fixed (config.py:121); cut.py:74 uses cut_end=end+tail_pad. No SaT/wtpsplit, no forced alignment, no torchaudio anywhere in the repo.",
+        "recommended_approach": "Do the cheap, feasible, high-value subset of item 18 and SKIP item 19's forced alignment. The audit's own evidence (both audits: ends_on_period_rate=1.0 yet clips end mid-sentence \u2014 kinematics 'negative 20', trio 'in order') shows the DOMINANT residual boundary error is SEGMENTATION (the boundary is at the wrong word: a fabricated period from sentences_from_chunks, or an LLM period where the speaker didn't stop), not TIMING. Forced alignment only fixes timing (~20ms MFA vs ~110ms WhisperX), so it targets the wrong error, buys an imperceptible ~90ms over the already-installed faster-whisper window, and is blocked here anyway (torch 2.12.1 vs torchaudio 2.11.0; installing risks breaking sentence-transformers/TreeSeg). Concretely: (1) Land the FREE text-only guards from item 18 \u2014 reject an end boundary whose final sentence has <3 words or ends on a conjunction/preposition; kill sentences_from_chunks' fabricated terminators. (2) Add SaT (wtpsplit-lite, CPU) on the fallback/run-on paths (item 17) and use it as gate signal 2 (SaT boundary \u00b11 word) \u2014 this directly attacks the segmentation error. (3) Implement the 2-of-3 gate as {LLM terminator (free), SaT \u00b11 word, pause\u22650.25s}, but be honest that on supadata the pause signal only exists at caption-chunk boundaries \u2014 it becomes a real signal ONLY when real word times are available. (4) For real word times + cut-inside-pause, REPURPOSE the existing faster-whisper window: instead of re-segmenting via Whisper's punctuation, keep the LLM-chosen boundary word/text and use the window only to (a) re-TIME that exact boundary and (b) measure the following pause, then place the physical cut inside it (replacing fixed tail_pad_s). That is 'forced-alignment semantics' with a tool already installed, and it removes the current regression risk of overriding LLM boundaries. If, after (1)-(4), boundary PRECISION is still the bottleneck (verify against a golden set \u2014 none exists yet), the right lever is parakeet-mlx (item 17 long-term) to replace supadata's synthesized timestamps at the root, NOT torchaudio forced alignment. Everything audio-based (pause, re-timing, parakeet) is contingent on yt-dlp audio download actually succeeding on this box \u2014 confirm that first, else only the text-only signals (1)-(2) apply.",
+        "proposed_tasks": [
+          {
+            "id": "T1",
+            "title": "Cheap text-only boundary guards (item 18 subset) + kill fabricated chunk terminators",
+            "files": "backend/pipeline/refine.py (_snap_one end selection ~line 63-71), backend/pipeline/sentences.py (new is_weak_end helper; sentences_from_chunks:376-399)",
+            "effort": "S",
+            "risk": "low",
+            "value": "high",
+            "notes": "Reject an end whose final sentence has <3 words or ends on a conjunction/preposition; stop sentences_from_chunks fabricating ends_with_period=True (mark chunk_boundary ends as weak so the gate/guard can veto). FREE (no new deps), attacks the dominant mid-clause-end error the audit documents."
+          },
+          {
+            "id": "T2",
+            "title": "SaT (wtpsplit-lite) segmentation on fallback/run-on paths (item 17) + gate signal 2",
+            "files": "new backend/pipeline/sat.py; backend/pipeline/sentences.py (sentences_from_chunks/window_sentences); backend/pipeline/punctuation/service.py (build_sentences gate ~256-287); requirements",
+            "effort": "M",
+            "risk": "med",
+            "value": "high",
+            "notes": "Install wtpsplit-lite (ONNX/CPU, onnxruntime already present). Use SaT probabilities to place real sentence boundaries where captions lack punctuation, and expose SaT-boundary-\u00b11-word as the second gate signal. Auto-trigger when <20% of chunks end in terminal punctuation."
+          },
+          {
+            "id": "T3",
+            "title": "2-of-3 boundary gate {terminator, SaT \u00b11 word, pause\u22650.25s}",
+            "files": "backend/pipeline/refine.py (_snap_one), backend/pipeline/assemble/boundary_adapt.py (snap_candidates), backend/pipeline/sentences.py (Sentence gains boundary_confidence)",
+            "effort": "M",
+            "risk": "med",
+            "value": "med",
+            "notes": "Require 2 of 3 signals for a clip-grade end. Terminator is free; SaT from T2; pause is DEGRADED on supadata (proven: intra-chunk gaps=0.0) so it only counts at caption-chunk boundaries or when T4 supplies real times. Add boundary_confidence to eval so improvements are measurable."
+          },
+          {
+            "id": "T4",
+            "title": "Repurpose faster-whisper window: re-TIME the known boundary + cut-inside-pause (replaces WhisperX re-segmentation and fixed tail_pad)",
+            "files": "backend/pipeline/boundary.py (_whisper_window:70, _pick_start/_pick_end:98-127, refine_clip_boundaries:150), backend/pipeline/cut.py (cut_end:74)",
+            "effort": "M",
+            "risk": "med",
+            "value": "med",
+            "notes": "Keep the LLM-chosen boundary word/text; use the \u00b110s window ONLY to align/re-time that word and measure the following silence, then cut inside the pause. Removes the current design smell (Whisper-small re-segmentation overriding LLM terminators) and fixes supadata's large synthesized-timing error at the boundary using deps already installed. Requires yt-dlp audio."
+          },
+          {
+            "id": "T5",
+            "title": "Forced alignment via torchaudio.functional.forced_align (item 19) \u2014 NOT RECOMMENDED",
+            "files": "would add backend/pipeline/align.py (+ torchaudio, MMS_FA model)",
+            "effort": "L",
+            "risk": "high",
+            "value": "low",
+            "notes": "BLOCKED/low-ROI: torch 2.12.1 has no matching torchaudio wheel (latest 2.11.0); installing risks downgrading torch and breaking sentence-transformers/TreeSeg; forced_align is on a deprecation/TorchCodec-removal path; ~90ms gain over T4's faster-whisper is imperceptible vs the dominant segmentation error. Document the decision; do not implement."
+          },
+          {
+            "id": "T6",
+            "title": "parakeet-mlx local ASR to replace supadata synthesized timestamps (item 17 long-term) \u2014 the real alternative to forced alignment",
+            "files": "backend/pipeline/transcribe.py (new parakeet path), backend/config.py (TRANSCRIBER=parakeet), requirements",
+            "effort": "L",
+            "risk": "med",
+            "value": "high",
+            "notes": "Apple-Silicon-native; gives REAL word timestamps + native punctuation + capitalization (parakeet-tdt-0.6b-v3, ~6% WER), fixing the root cause of BOTH boundary errors instead of patching post-hoc. Needs audio download + model download; larger blast radius (new transcriber). Prefer this over T5 if precision is still the bottleneck after T1-T4."
+          }
+        ],
+        "open_questions": [
+          "Does yt-dlp audio download actually succeed in production on this Mac (residential IP per hosting-vidscout memory)? If not, T4/T6 and the pause signal never run, and only the text-only signals (T1/T2) apply \u2014 this gates the whole audio-based half of items 18-19.",
+          "No golden set with boundary_error exists yet (eval_baseline: boundary_error=NaN, no eval/golden/*.json). How do we objectively measure boundary improvement before/after, per the SciTalk stop-rule? A small boundary-labeled golden set is a prerequisite to justify any audio-based work.",
+          "Is the ~20-110ms word-boundary timing error even perceptible for short feed clips given tail_pad and the dominant segmentation error? Evidence says no \u2014 but worth a quick human A/B before investing beyond T4.",
+          "Should supadata be replaced wholesale by parakeet-mlx (fix the root synthesized-timestamp cause) rather than patched post-hoc at boundaries? This is the strategic fork between T4 (patch) and T6 (root-cause).",
+          "Would pinning torch to 2.11 to enable torchaudio be acceptable if regression-tested against sentence-transformers 3.4.1 / TreeSeg? Almost certainly not worth it, but should be explicitly ruled out."
+        ],
+        "sources": [
+          "repo: backend/pipeline/boundary.py:28,70,150,158 (WhisperX-style pass; audio gate; re-segmentation design smell)",
+          "repo: backend/pipeline/sentences.py:340-373 (sentences_from_punctuation terminators), :376-399 (sentences_from_chunks fabricates ends_with_period=True)",
+          "repo: backend/pipeline/punctuation/service.py:256-287 (build_sentences gated seam)",
+          "repo: backend/pipeline/transcribe.py:163-171 (supadata synthesizes proportional word times) \u2014 empirically proven intra-chunk gaps=0.0",
+          "repo: backend/pipeline/punctuation/chunker.py:18 (_pause_gaps), fallback.py:19 (0.7s pause threshold)",
+          "repo: backend/pipeline/refine.py:45-135 (_snap_one), backend/pipeline/assemble/boundary_adapt.py:59-114 (snap_candidates)",
+          "repo: backend/orchestrator.py:222-225,257-260 (PRECISE_BOUNDARIES + source==supadata gate); backend/config.py:34,55-63,121 (SUPADATA_CHUNK_SIZE=180, WHISPER cpu/int8/small, BOUNDARY_PAD_S=10, tail_pad_s=0.05)",
+          "repo: docs/CLIP-QUALITY-2026-07-02-audit-and-fix-plan.md:162-183 (items 17-20) and docs/audits/2026-07-02/{trio_inspection,kinematics_e2e}.json (finding 6: ends_on_period_rate=1.0 yet mid-clause ends)",
+          "venv (importlib.metadata): torch 2.12.1, torchaudio NOT installed, faster-whisper 1.2.1, ctranslate2 4.8.0, sentence-transformers 3.4.1, transformers/safetensors\u2192torch, onnxruntime 1.27.0, pysbd 0.3.4, google-genai 2.10.0, wtpsplit NOT installed",
+          "https://docs.pytorch.org/audio/stable/tutorials/ctc_forced_alignment_api_tutorial.html (forced_align signature; MMS_FA wav2vec2; removal/TorchCodec note)",
+          "https://github.com/pytorch/audio/issues/3902 (TorchAudio maintenance-phase / deprecation plan)",
+          "https://pypi.org/project/torchaudio/ (2.11.0 latest; macOS arm64 cp312 wheels; strict torch pairing)",
+          "https://github.com/segment-any-text/wtpsplit and https://github.com/superlinear-ai/wtpsplit-lite + https://pypi.org/project/wtpsplit-lite/ (SaT models; ONNX CPU)",
+          "https://montreal-forced-aligner.readthedocs.io/en/latest/installation.html + https://anaconda.org/conda-forge/montreal-forced-aligner (conda-forge/Kaldi install)",
+          "https://github.com/senstella/parakeet-mlx + https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3 (Apple Silicon ASR, word timestamps + punctuation)",
+          "Context7 /googleapis/python-genai (current generate_content + response_schema/response_json_schema API)"
+        ]
+      }
+    },
+    {
+      "key": "w3-asr",
+      "result": {
+        "area": "Wave 3 item 17 \u2014 local ASR (parakeet-tdt-0.6b-v3 via parakeet-mlx) as a substrate to replace supadata captions, with a <20%-terminal-punctuation auto-trigger.",
+        "current_tool_state": "parakeet-mlx is real, current, and Apple-Silicon-native. PyPI latest = 0.5.2 (released 2026-06-05), license Apache-2.0, requires_python >=3.10 (so 3.12 works). Install deps: dacite>=1.9.2, huggingface-hub>=0.30.2, librosa>=0.11.0, mlx>=0.22.1, numpy>=2.2.5, typer>=0.15.3 \u2014 NO torch (pure MLX). `pip install parakeet-mlx -U`; needs system ffmpeg (already have config.FFMPEG_BIN). Python API (verified from GitHub README): `from parakeet_mlx import from_pretrained; model = from_pretrained(\"mlx-community/parakeet-tdt-0.6b-v3\"); result = model.transcribe(\"audio.wav\")`. Result is `AlignedResult` with `.text` and `.sentences`; each `AlignedSentence` has text/start/end/duration/tokens; each `AlignedToken` (word-level) has text/start/end/duration. So it emits BOTH real word-level AND sentence-level timestamps natively, plus punctuation + capitalization \u2014 exactly the two things the supadata path fakes. Long audio: `model.transcribe(path, chunk_duration=120.0, overlap_duration=15.0)` handles >24min. Model mlx-community/parakeet-tdt-0.6b-v3 = 2.51 GB download to HF cache, weights CC-BY-4.0 (NVIDIA parakeet-tdt-0.6b-v3, 600M params, 25 European languages, auto language-detect, ~6.34% WER per design doc). Min 2GB unified memory. RTF \u2248 0.042 on M4 (~24x realtime, ~53-68s per hour of audio); M1/M2/M3 not officially benchmarked (will be slower but still far above faster-whisper-small-int8-on-CPU).",
+        "environment_feasibility": "Installable here with no hard blockers. Host = darwin arm64, macOS 26.5, Python 3.12.13, clips/.venv (confirmed via .venv/bin/python). mlx ships prebuilt arm64 wheels (macOS >=13.5, Apple Silicon only) \u2014 no native build, no CUDA, no compiler needed; this Mac qualifies. numpy 2.2.6 is already installed and satisfies parakeet's >=2.2.5. parakeet-mlx has NO torch dependency, so the repo's torch 2.12.1 / ctranslate2 / faster-whisper 1.2.1 stack is untouched (no conflict). Only genuinely new transitive weight: librosa (pulls numba/llvmlite/soundfile) \u2014 all have arm64 wheels, installs clean, ~tens of MB. Costs: one-time 2.51 GB model download + ~2.5 GB disk; no per-video API cost (removes supadata quota use on the ASR path). mlx is currently NOT installed (verified: `import mlx` fails). Audio input needs 16 kHz mono, which download.py already produces (TARGET_AUDIO_SR=16000, TARGET_AUDIO_CH=1). Net: feasible, medium install footprint, no licensing blocker (Apache-2.0 code, CC-BY-4.0 weights \u2192 just attribution).",
+        "existing_code_audit": "Two transcribe paths in backend/pipeline/transcribe.py. (1) transcribe_supadata() (transcribe.py:136-184) is the DEFAULT main flow: it fetches supadata captions and SYNTHESIZES per-word timestamps by evenly spacing tokens inside each ~180-char caption chunk (transcribe.py:166-171) \u2014 these fake gaps are the core weakness item 17 targets; it tags source=\"supadata\" (transcribe.py:178) and keeps raw chunks. (2) transcribe() (transcribe.py:187-219) is the local faster_whisper / Groq path, gated on config.TRANSCRIBER; _get_whisper() (transcribe.py:25-32) lazy-loads faster-whisper (device=cpu, int8, model small). config.TRANSCRIBER defaults to \"supadata\" (config.py:26); options documented as supadata|faster_whisper|groq. Orchestrator branches at orchestrator.py:86-103 (supadata\u2192transcribe_supadata, else download+transcribe); cli.py:46/50 mirrors. So the local-ASR path already EXISTS and is wired \u2014 adding \"parakeet\" is a third branch, not new plumbing. Punctuation: the LLM restoration pipeline (backend/pipeline/punctuation/, entry service.py) is gated by build_sentences() (service.py:256-287): it runs LLM restoration only when config.PUNCTUATION_ENABLED and _needs_punctuation(transcript) is true; _needs_punctuation (service.py:242-253) forces restoration for source==\"supadata\" (line 245) OR when terminal-punct/word ratio < 0.02 (line 253) \u2014 a terminal-ratio auto-trigger concept ALREADY exists, just keyed to \"should I punctuate\", not \"should I ASR\". Because restoration keys on source==\"supadata\", a parakeet transcript (source!=\"supadata\", high terminal ratio) would automatically SKIP LLM restoration and take the legacy/native sentence path (service.py:281-287) \u2014 so parakeet natively displaces the Gemini punctuation round-trip and its degraded-cache failure modes (documented in service.py:96-141, 225-232). Also note boundary.py (item 19 territory) ALREADY re-runs faster-whisper on small windows for real word timestamps at cut boundaries (boundary.py:23,80-81) \u2014 so precise CUT timing is already recovered locally; the gap parakeet fills is real word timing across the WHOLE transcript for pause detection during selection/gating. Design doc item 17 lives at docs/CLIP-QUALITY-2026-07-02-audit-and-fix-plan.md:163-168.",
+        "recommended_approach": "ADOPT, but gated + sequenced \u2014 do NOT make it the default transcriber. Add a third TRANSCRIBER value \"parakeet\" plus a cheap-probe auto-trigger, and land it alongside item 18 (the 2-of-3 boundary gate) so the real word timestamps it produces are actually consumed. Rationale for adopt (not redundant): the LLM punctuation package gives clean SENTENCES, but it runs on SYNTHESIZED word timings (transcribe.py:166-171), so item 18's inter-word-pause signal (\u22650.25s) and PUNCT_PAUSE_* thresholds are operating on fake gaps for every supadata video \u2014 parakeet is the only thing that makes that pause signal real. Parakeet also gives native punctuation, so it removes the per-video Gemini restoration call and its degraded-cache pathology for exactly the worst inputs. Rationale for gating (not default): supadata's killer feature is zero audio download (orchestrator.py:88-93) \u2014 a big latency win for well-captioned videos, which the LLM restoration already handles fine. So implement the design's auto-trigger as a PROBE-FIRST fallback: (a) fetch supadata captions (cheap), (b) compute the fraction of caption chunks ending in terminal punctuation, (c) if <20% (the doc threshold; today service.py:283-285 uses a sibling frac<0.3 chunk-fallback), download audio and re-transcribe with parakeet, yielding source=\"parakeet\" so the punctuation seam auto-skips LLM restoration and the pipeline consumes true word timings. This targets the exact low-quality regime where LLM restoration works hardest on the fakest timing, while leaving the fast path intact. Defer flipping the default to parakeet until item 18/19 ship and a golden-set A/B shows a boundary-quality win (golden set is still pending per memory). Net: medium effort, low-med risk (isolated new branch, supadata stays default, deps install clean), med-high value concentrated on bad-caption videos.",
+        "proposed_tasks": [
+          {
+            "id": "T17-1",
+            "title": "Add transcribe_parakeet() + lazy MLX model loader",
+            "files": "backend/pipeline/transcribe.py",
+            "effort": "M",
+            "risk": "low",
+            "value": "high",
+            "notes": "New function mirroring _transcribe_local(): from_pretrained(config.PARAKEET_MODEL) cached in a module global like _whisper_model (transcribe.py:22-32); call model.transcribe(audio, chunk_duration=120.0, overlap_duration=15.0); map AlignedResult.sentences/tokens \u2192 the repo's {'text','duration','words':[{word,start,end}],'segments':[{start,end,text}]} shape (words from AlignedToken, segments from AlignedSentence). Set source='parakeet' (NOT 'supadata') so punctuation restoration auto-skips. Cache to transcript.json like the others."
+          },
+          {
+            "id": "T17-2",
+            "title": "Config knobs for parakeet",
+            "files": "backend/config.py",
+            "effort": "S",
+            "risk": "low",
+            "value": "med",
+            "notes": "Add TRANSCRIBER 'parakeet' option (docstring at config.py:25), PARAKEET_MODEL default 'mlx-community/parakeet-tdt-0.6b-v3', PARAKEET_AUTO_TRIGGER float default 0.20 (the doc's <20% terminal-punct threshold), PARAKEET_CHUNK_S/OVERLAP_S. Keep TRANSCRIBER default 'supadata' (config.py:26)."
+          },
+          {
+            "id": "T17-3",
+            "title": "Probe-first auto-trigger in orchestrator",
+            "files": "backend/orchestrator.py, backend/pipeline/transcribe.py",
+            "effort": "M",
+            "risk": "med",
+            "value": "high",
+            "notes": "At orchestrator.py:86-103: keep fetching supadata captions first; compute fraction of chunks ending in .?! ; if < config.PARAKEET_AUTO_TRIGGER and mlx available, download audio (download.py already does this for boundary.py) and swap to transcribe_parakeet. Reuse/generalize the terminal-ratio logic already in punctuation/service.py:283-285 so both levers agree. Guard by language (parakeet v3 = 25 European langs only) \u2192 fall back to supadata+LLM for others. Mirror in cli.py:46-50."
+          },
+          {
+            "id": "T17-4",
+            "title": "Add deps + verify install + model prefetch",
+            "files": "requirements*.txt / pyproject, docs",
+            "effort": "S",
+            "risk": "low",
+            "value": "med",
+            "notes": "Add parakeet-mlx>=0.5.2 (pulls mlx, librosa). Verify `.venv/bin/pip install parakeet-mlx` succeeds on this arm64 box; confirm no torch/numpy conflict (numpy 2.2.6 ok). Document 2.51 GB one-time model download to HF cache + attribution (CC-BY-4.0). Consider a warm-up/prefetch so first job isn't blocked on download."
+          },
+          {
+            "id": "T17-5",
+            "title": "Golden-set A/B: parakeet vs supadata+LLM before defaulting",
+            "files": "backend/eval/run_eval.py",
+            "effort": "M",
+            "risk": "low",
+            "value": "high",
+            "notes": "Gated on the (still-pending) golden set + item 18 landing. Measure boundary-cut error and terminal-punct correctness parakeet-path vs supadata+LLM-restoration path; only then decide whether to flip the default. Uses existing eval harness (run_eval.py:41-55 already calls build_sentences)."
+          }
+        ],
+        "open_questions": [
+          "Golden set is still not built (per memory) \u2014 cannot yet A/B-validate the boundary-quality win that justifies defaulting to parakeet; adopt as opt-in/auto-trigger now, defer default flip.",
+          "Which M-series chip is the host Mac? RTF ~0.042 is verified on M4 only; on M1/M2 parakeet is slower (though still >>faster-whisper-small-int8-CPU). Need a real timing on this machine for the full profile budget.",
+          "Auto-trigger forces an audio DOWNLOAD, negating supadata's no-download latency edge. Probe-first (fetch captions, measure, only then download) mitigates it, but confirm acceptable added latency for bad-caption videos.",
+          "parakeet-tdt-0.6b-v3 covers 25 EUROPEAN languages with auto language-detect \u2014 non-European content must keep supadata/whisper fallback; wire a language guard.",
+          "parakeet emits no speaker labels; the diarization/interview path and punctuation service (service.py:55-60 reads word['speaker']) rely on speaker tags elsewhere \u2014 confirm the parakeet transcript integrates with diarization the same way the supadata/whisper transcripts do (neither of those carry speaker tags in the base transcript either).",
+          "Does replacing LLM punctuation-restoration on bad-caption videos measurably change downstream selection/arcs, or only boundaries? Worth a targeted eval slice on the low-terminal-ratio videos in work/ (several already cached)."
+        ],
+        "sources": [
+          "https://pypi.org/pypi/parakeet-mlx/json (v0.5.2, 2026-06-05, Apache-2.0, requires_python>=3.10, deps: mlx>=0.22.1, librosa>=0.11.0, numpy>=2.2.5, dacite, huggingface-hub, typer)",
+          "https://github.com/senstella/parakeet-mlx (Python API: from_pretrained + model.transcribe; AlignedResult/AlignedSentence/AlignedToken with word+sentence start/end/duration; chunk_duration/overlap_duration; needs ffmpeg)",
+          "https://huggingface.co/mlx-community/parakeet-tdt-0.6b-v3 (2.51 GB download, cc-by-4.0)",
+          "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3 (NVIDIA base model: 600M params, 25 European languages, auto language-detect, native punctuation+capitalization + word/segment timestamps, CC-BY-4.0)",
+          "https://arxiv.org/pdf/2509.14128 (Canary-1B-v2 & Parakeet-TDT-0.6B-v3 paper \u2014 multilingual ASR, punctuation/timestamps)",
+          "https://mikeesto.com/posts/parakeet-tdt-06b-v2/ and search-aggregated benchmark: RTF ~0.042 on M4 (~24x realtime, ~53-68s/hr); M1/M2/M3 unbenchmarked",
+          "file:///Users/vincentfeng/Documents/practice/clips/backend/pipeline/transcribe.py (lines 25-32, 136-184, 166-171, 178, 187-219)",
+          "file:///Users/vincentfeng/Documents/practice/clips/backend/pipeline/punctuation/service.py (lines 242-253, 256-287, 283-285)",
+          "file:///Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py (lines 86-106)",
+          "file:///Users/vincentfeng/Documents/practice/clips/backend/pipeline/boundary.py (lines 23, 80-81)",
+          "file:///Users/vincentfeng/Documents/practice/clips/backend/config.py (lines 25-26, 55-57, 325-337)",
+          "file:///Users/vincentfeng/Documents/practice/clips/docs/CLIP-QUALITY-2026-07-02-audit-and-fix-plan.md (lines 163-168, item 17)"
+        ]
+      }
+    }
+  ],
+  "plan": {
+    "executive_summary": "Most of the \"new\" work is smaller than the audit implies \u2014 the plumbing already exists; the plan is a DELTA, not a rewrite.\n\nWHAT ALREADY EXISTS (verified): (1) Frontend \u2014 context_card/role/title/prerequisite_clips/notes are ALREADY in the embed payload (orchestrator.py:62-68) and ALREADY declared on the Clip type; they are simply dropped by ClipCard.tsx. Surfacing = whitelist 3 more keys + render + rebuild. (2) Card-as-repair \u2014 reuses two SHIPPING functions, generate_context_card (context_card.py:43) and judge_clip (validate.py:133, which already injects a card into the user prompt); the only missing pieces are a JUDGE_SYSTEM line crediting the card and two accept-side rescue inserts at the existing kill gates. (3) Genre \u2014 the adapter registry, single-LLM detection, and the supadata/whisper/local transcriber branch all exist; download() already fetches the yt-dlp info dict and then THROWS AWAY categories/tags (download.py:142-148). Un-breaking the 0-clip parody = surface metadata + one ~40-line EntertainmentAdapter (CORE_VERDICT_FIELDS only, avoiding the _PROBLEM_ROLES gates that killed it) + a detect.py label/route entry. (4) Video judge is genuinely greenfield but purely additive: google-genai 2.10.0 is installed with full VideoMetadata/Files-API support; it extends the existing generate_json_mm pattern and must be Gemini-only (Groq has no video) and advisory-only.\n\nTHE BIG RE-SCOPING CALLS: (a) DROP torchaudio forced_align \u2014 blocked here (torch 2.12.1 has no matching torchaudio wheel; installing downgrades torch and risks breaking sentence-transformers 3.4.1/TreeSeg) AND it fixes the wrong error: both audits show ends_on_period_rate=1.0 yet clips end mid-clause, i.e. the dominant residual error is SEGMENTATION (wrong word), not ~90ms TIMING. Fix segmentation with FREE text-only guards. (b) DROP inaSpeechSegmenter \u2014 unpinned TensorFlow+Pyro4 into the shared torch/numpy venv, Metal dead on py3.12; a one-call Gemini-audio classify gives equivalent music-vs-speech discrimination at zero venv risk. (c) DEFER SaT/wtpsplit \u2014 largely REDUNDANT with the LLM punctuation restoration that already produces terminators for the default supadata source (service.py:245,264-277); it only helps the rare sentences_from_chunks fallback, whose highest-value fix (killing fabricated terminators) is free. (d) DEFER parakeet default-flip \u2014 adopt opt-in/auto-trigger only; the pause signal it would feed is currently fake on supadata (proven intra-chunk gaps=0.0) and there is no golden set to A/B a default flip.\n\nINVARIANT: every quality change is invariant-safe by construction \u2014 card-as-repair only converts a would-be Rejection into a ship (never creates a Rejection; empty/non-verifiable card must NOT rescue), video/edge gates are warning+dock only, and the EntertainmentAdapter gates LESS. unverified_kill stays structurally 0. This must be pinned by a regression test (CARD4).",
+    "sequenced_tasks": [
+      {
+        "wave": "4",
+        "id": "FE1",
+        "title": "Fix embed ceil(end)+1 bleed; share one guarded embed_url helper + mirror test",
+        "rationale": "orchestrator.py:41 emits end=int(ceil(end))+1, bleeding ~1-1.7s into the next sentence on every clip. A proven-correct no-+1 guarded form already exists at eval/sample_for_labeling.py:59-64 (test asserts it). Pure correctness bug, no test pins current behavior, invariant-irrelevant. Highest value/effort ratio in the whole plan.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py:38-42; /Users/vincentfeng/Documents/practice/clips/backend/eval/sample_for_labeling.py:59-64 (lift to shared util); new mirror test of backend/eval/tests/test_sample_for_labeling.py:62",
+        "effort": "S",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "none"
+      },
+      {
+        "wave": "4",
+        "id": "FE2",
+        "title": "Whitelist final_quality/warnings/ship_flagged into the embed payload",
+        "rationale": "These 3 signals are on the spec dict (__init__.py:508,529; scoring.py; boundary_adapt.py) but dropped by _build_embed_clips. There is NO nested 'verdict' object \u2014 the doc's 'verdict' == these derived signals. Frontends ignore unknown keys; test_wave2_columns.py:203 stays green. Additive, no logic touched.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py:45-70 (_build_embed_clips)",
+        "effort": "S",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "none"
+      },
+      {
+        "wave": "4",
+        "id": "GEN1",
+        "title": "Surface yt-dlp metadata + cheap extract_info(download=False) probe; thread meta/audio_path into detection",
+        "rationale": "download() (download.py:142-148) extracts categories/tags/artist/track/genre then discards them. Grounded dump for the parody: categories=['Comedy'] is the load-bearing non-lecture signal (artist/track/genre are NULL for user parodies \u2014 treat as no-signal). Add a metadata-only probe so it also works in fast/supadata mode. Enables the minimal parody fix.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/download.py:142-148; /Users/vincentfeng/Documents/practice/clips/backend/adapters/__init__.py:34 (select_adapter signature); /Users/vincentfeng/Documents/practice/clips/backend/adapters/detect.py; /Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py:176-185",
+        "effort": "S",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "none"
+      },
+      {
+        "wave": "4",
+        "id": "GEN2",
+        "title": "EntertainmentAdapter (single 'moment' role, CORE_VERDICT_FIELDS only) + register + DETECT_SYSTEM/CONTENT_TYPE_TO_DOMAIN entries",
+        "rationale": "~40-line class like story.py. Its contract avoids _PROBLEM_ROLES gates (base.py:144) that killed every parody candidate. detect.py currently can't even EMIT comedy/music/entertainment (DETECT_SYSTEM label list + CONTENT_TYPE_TO_DOMAIN have no such key). GEN1+GEN2 together are the minimal fix that stops the 0-clip parody. Gates LESS \u2192 invariant-safe.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/adapters/entertainment.py (new); /Users/vincentfeng/Documents/practice/clips/backend/adapters/__init__.py:45-55; /Users/vincentfeng/Documents/practice/clips/backend/adapters/detect.py:24-43",
+        "effort": "S",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "GEN1"
+      },
+      {
+        "wave": "4",
+        "id": "FE3",
+        "title": "Extend Clip type + render title, context card, watch-first chips, quality/flag badges in ClipCard",
+        "rationale": "types.ts already declares role/title/context_card/sequence_index/prerequisite_clips; add notes/final_quality/warnings/ship_flagged. ClipCard renders NONE of the extras today. prerequisite_clips values == clip.n (clean 'watch clip N first' links). Use a curated warning->label allowlist and hide internal warnings. Surfaces GEN2 routing + card-as-repair results to users.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/frontend/src/types.ts:1-17; /Users/vincentfeng/Documents/practice/clips/frontend/src/components/ClipCard.tsx:29-61",
+        "effort": "M",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "FE2"
+      },
+      {
+        "wave": "4",
+        "id": "FE4",
+        "title": "Rebuild frontend into backend/static (npm run typecheck && npm run build)",
+        "rationale": "App is served from PREBUILT backend/static/ (FastAPI same-origin); TS/TSX edits are invisible until rebuilt. Node 26/npm 11/Vite 6.4.3 already installed on this Apple Silicon box; build is local and free. Mandatory final step for FE1/FE3.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/frontend -> /Users/vincentfeng/Documents/practice/clips/backend/static",
+        "effort": "S",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "FE1,FE3"
+      },
+      {
+        "wave": "3",
+        "id": "CARD1",
+        "title": "Amend JUDGE_SYSTEM to credit the CONTEXT CARD (load-bearing; also aligns eval)",
+        "rationale": "judge_clip already injects the card (validate.py:143) but JUDGE_SYSTEM says 'you see ONLY the transcript' (validate.py:75) so the card is contradictory dead-weight. Tell the judge a provided card is shown-before-the-clip and satisfies prerequisites_satisfied/all_references_resolved. Prerequisite for ALL card-as-repair. Prompt change \u2192 gate on judge-human kappa>=0.4 and run --freeze --runs 3 A/B; eval comprehension will shift up (eval already injects the card at metrics.py:45), which is a real alignment gain, not noise.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/validate.py:74-116",
+        "effort": "S",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "none"
+      },
+      {
+        "wave": "3",
+        "id": "CARD2",
+        "title": "Card-as-repair rescue at the repair terminal kill gate (THE UAM/equations-clip fix)",
+        "rationale": "Insert between confirmed-computed (validate.py:867) and the kill (validate.py:868). If every confirmed reason is prereq/reference-family, generate a card from ship.referential and RE-JUDGE the SAME span with the card; accept iff hard-core + prerequisites_satisfied + all_references_resolved, set 'card_completed' warning, return _stamp_trims(ship),None; else fall through to existing kill. Accept-side only \u2192 converts a would-be Rejection to a ship, never creates one. +1 card +1 judge on the rare kill path only (like confirm_kill). The single most important quality item.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/validate.py:844-888 (+ new _card_rescuable/_try_card_rescue near :555)",
+        "effort": "M",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "CARD1"
+      },
+      {
+        "wave": "3",
+        "id": "CARD3",
+        "title": "Card-as-repair at post-snap/post-merge gate + thread existing card into re-judge seams",
+        "rationale": "Mirror CARD2 after confirmed (__init__.py:276) before the Rejection (:278) \u2014 spec is a dict so generate_context_card(s,...) works directly. Also change context_card='' to s.get('context_card','') at the post-snap judge (:255) and refund-trim (:400) re-judge seams so a rescued clip keeps its card across text-change re-judges. Accept-side only.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/__init__.py:253-288,398-400,557-559",
+        "effort": "M",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "CARD1"
+      },
+      {
+        "wave": "3",
+        "id": "CARD4",
+        "title": "Invariant regression test + UAM rescue fixture + card_completed scoring/warnings",
+        "rationale": "HARD INVARIANT gate: assert unverified_kill stays 0 across the new paths \u2014 a would-be kill with an empty/non-verifiable card must NOT kill AND must NOT rescue (negative: confirmed missing_result still dies). UAM fixture: hard core broken by a prereq whose introducer is in referential; card flips prerequisites_satisfied/all_references_resolved and ships the SAME span (i_start/i_end/unit_ids unchanged). Also ensure a card_completed clip isn't double-tagged missing_context_card (no spurious -0.10 dock). Must ship WITH CARD2/CARD3.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/tests/test_repair_rework.py, test_judge_integrity.py; /Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/scoring.py:29-40; /Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/__init__.py:40-44",
+        "effort": "M",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "CARD2,CARD3"
+      },
+      {
+        "wave": "3",
+        "id": "BND1",
+        "title": "Cheap text-only boundary guards + kill fabricated chunk terminators",
+        "rationale": "sentences_from_chunks (sentences.py:376-399) fabricates ends_with_period=True for every caption chunk \u2014 the boundary-neutralizer that makes snapping a no-op (audit: ends_on_period_rate=1.0 yet mid-clause ends). Mark chunk-boundary ends as weak; reject an end whose final sentence has <3 words or ends on a conjunction/preposition. FREE (no deps), attacks the DOMINANT segmentation error, moves boundaries (never kills a clip) \u2192 invariant-safe.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/refine.py (~:63-71 _snap_one end selection); /Users/vincentfeng/Documents/practice/clips/backend/pipeline/sentences.py:376-399",
+        "effort": "S",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "none"
+      },
+      {
+        "wave": "4",
+        "id": "GEN3",
+        "title": "Genre ensemble core: metadata tier + transcript-stats (repetition/rhyme) + head+middle+tail sampling + tier reconcile",
+        "rationale": "Weighted override (metadata>audio>transcript-stats>LLM), not a hard replace. _sample currently reads head+tail only (detect.py:47-54) \u2014 item 22's gap; add MIDDLE. Pure-Python song score (line/n-gram repetition + rhyme + short-line ratio) catches a Bohemian-Rhapsody parody's chorus repetition. Extend DetectionResult with music_fraction/signals. When LLM says lecture but metadata=Comedy/audio=music/transcript=song, route to entertainment, drop confidence, set secondary_content_type.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/adapters/detect.py:14-66",
+        "effort": "M",
+        "risk": "med",
+        "value": "high",
+        "depends_on": "GEN1,GEN2"
+      },
+      {
+        "wave": "4",
+        "id": "GEN4",
+        "title": "Gemini-audio music-check tier (audio_part helper + detect_audio module) \u2014 NOT inaSpeechSegmenter",
+        "rationale": "Add audio_part() mirroring image_part (Part.from_bytes(mime_type='audio/mpeg'), confirmed current in google-genai 2.10.0), ffmpeg-cut a ~30-45s MIDDLE window from audio.m4a to mp3, one flash-lite generate_json_mm classify -> {is_music,is_sung,speech_vs_music} music_fraction proxy. Zero new deps, Apple-Silicon-native, one LLM call. Only runs when audio_path present (no-op in fast profile). Cache next to work/<id>/. Explicitly rejects the heavy TensorFlow/Pyro4 tree.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/gemini_client.py:101-142 (audio_part); /Users/vincentfeng/Documents/practice/clips/backend/pipeline/detect_audio.py (new); /Users/vincentfeng/Documents/practice/clips/backend/adapters/detect.py",
+        "effort": "M",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "GEN3"
+      },
+      {
+        "wave": "3",
+        "id": "CARD5",
+        "title": "Robust rescue seeding from verdict missing_concept introducer + suppression/no-clobber at step 6",
+        "rationale": "When the prereq's introducer isn't in referential, map missing_concept->introducers->prior_introducer (reuse validate.py:390-395) and add that unit to the card's allowed set, still grounded via context_card._grounded so it can never fabricate (no source unit -> no card -> kill correctly stands). Also at step-6 card generation (__init__.py:522-531) change to 'if not s.get(\"context_card\")' so a rescue card survives, and suppress generation when the first sentence already names the subject (conservative grounded fuzzy match). Makes the UAM rescue robust to closure not queueing the prereq.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/context_card.py:43; /Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/__init__.py:522-531",
+        "effort": "M",
+        "risk": "med",
+        "value": "med",
+        "depends_on": "CARD2"
+      },
+      {
+        "wave": "4",
+        "id": "VID1",
+        "title": "gemini_client.generate_json_video + video Part helpers (inline bytes, Files upload+ACTIVE poll, video_metadata offsets, media_resolution)",
+        "rationale": "Enabler for both video tiers. Verified against installed SDK: video_part_inline via types.Part.from_bytes(mime_type='video/mp4', media_resolution=LOW); video_part_uri via Part(file_data=FileData(uri,mime), video_metadata=VideoMetadata(start_offset='120s',end_offset='360s',fps=1.0)); upload_video(path)->poll files.get until FileState.ACTIVE. Reuse generate_json_mm's thinking-off-then-on + _retry config. Gemini-only, MUST bypass llm.py (Groq has no video), exactly as vision.py does.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/gemini_client.py:101-142",
+        "effort": "M",
+        "risk": "low",
+        "value": "high",
+        "depends_on": "none"
+      },
+      {
+        "wave": "4",
+        "id": "VID2",
+        "title": "Edge-probe: cut 8s head/tail via cut.build_cmd, inline video judge (advisory), orchestrator hook after refine_clip_boundaries",
+        "rationale": "Cheapest video win (~$0.0001-0.0004/clip, inline <20MB, no Files upload). Catches the F7 mid-sentence-audio blind spot Whisper can't hear. Hook AFTER refine_clip_boundaries (orchestrator.py:227) so audited offsets == shipped offsets. Advisory only: False nudges the snap to the nearest sentence/silence edge or warns starts/ends_mid_sentence_audio \u2014 NEVER kills. MEASURE residual after BND1/BND2 before trusting it. Needs source video present (download if absent in embed mode).",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/edge_probe.py (new); /Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py:~227; /Users/vincentfeng/Documents/practice/clips/backend/pipeline/cut.py:42",
+        "effort": "M",
+        "risk": "med",
+        "value": "high",
+        "depends_on": "VID1,BND1"
+      },
+      {
+        "wave": "4",
+        "id": "VID4",
+        "title": "Config flags + plumb video/edge outcomes into warnings/final_quality/eval/artifacts",
+        "rationale": "EDGE_PROBE_ENABLED / VIDEO_JUDGE_ENABLED / VIDEO_JUDGE_MODEL (default gemini-2.5-flash-lite) / media_resolution default LOW, all default OFF mirroring DIARIZATION_ENABLED. Add starts_clean_audio/ends_clean_audio/visuals_referenced_are_visible to the shipped record + eval columns; keep them ADVISORY (rates reported, not gating) until per-label kappa exists. Also fixes item 24's metrics.py:44 visual_summary='' by threading the real summary.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/config.py; /Users/vincentfeng/Documents/practice/clips/backend/eval/metrics.py:44,313; /Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/artifacts.py",
+        "effort": "S",
+        "risk": "low",
+        "value": "med",
+        "depends_on": "VID2"
+      },
+      {
+        "wave": "3",
+        "id": "BND2",
+        "title": "Repurpose faster-whisper window: re-TIME the LLM-chosen boundary + cut inside the following pause (replaces WhisperX re-segmentation + fixed tail_pad)",
+        "rationale": "refine_clip_boundaries (boundary.py:150) re-segments from Whisper-small's OWN punctuation, discarding LLM-restored terminators \u2014 a design smell that can move a good boundary to a worse one. Instead keep the LLM boundary word and use the \u00b110s window ONLY to (a) re-time it and (b) measure the following silence, cutting inside the pause (replaces fixed tail_pad_s=0.05). Gets 'forced-alignment semantics' with deps already installed (faster-whisper 1.2.1). Gated on yt-dlp audio succeeding; returns unchanged on failure. Measure vs BND1 before/after on a golden set.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/boundary.py:70,98-127,150; /Users/vincentfeng/Documents/practice/clips/backend/pipeline/cut.py:74",
+        "effort": "M",
+        "risk": "med",
+        "value": "med",
+        "depends_on": "BND1"
+      },
+      {
+        "wave": "4",
+        "id": "VID3",
+        "title": "Render-audit on survivors (Files upload source once + per-clip offsets, VideoVerdict) \u2014 opt-in, default OFF",
+        "rationale": "One client.files.upload + ACTIVE poll per video, N cheap offset generate_content calls (media_resolution=LOW, fps=1.0). VideoVerdict adds starts_clean_audio/ends_clean_audio/visuals_referenced_are_visible + short evidence. Wire as WARNINGS + a small final_quality dock (mirror the W25-E single_idea advisory at validate.py:308) \u2014 MUST NOT override the asymmetric quote-verified text kill gate. ~$0.01-0.30/video, survivors only. Lower priority than edge-probe; measure whether it adds signal.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/render_audit.py (new); /Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py; /Users/vincentfeng/Documents/practice/clips/backend/config.py",
+        "effort": "L",
+        "risk": "med",
+        "value": "med",
+        "depends_on": "VID1,VID2"
+      },
+      {
+        "wave": "4",
+        "id": "GEN5",
+        "title": "Reconciliation pass: per-candidate genre-vs-role-sequence cross-check + contract/adapter override",
+        "rationale": "Reuse llm_json(model=JUDGE_MODEL=gemini-2.5-flash-lite) beside choose_contract/judge_clip (__init__.py ~246-253/392-398/550-557). Cross-check global genre vs the span's ordered unit roles; on contradiction override contract_role to the entertainment 'moment' contract so worked-problem gates don't fire. Gate on LOW genre confidence / tier conflict to bound cost (12 candidates could = 12 calls). Belt-and-suspenders for the parody once GEN2/GEN3 land; lower ROI than the detection-side fix.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/reconcile.py (new); /Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/__init__.py:246-253,392-398,550-557",
+        "effort": "M",
+        "risk": "med",
+        "value": "med",
+        "depends_on": "GEN2"
+      },
+      {
+        "wave": "3",
+        "id": "ASR1",
+        "title": "parakeet-mlx opt-in transcriber + probe-first auto-trigger + config (defer default flip)",
+        "rationale": "parakeet-mlx 0.5.2 installs clean on this arm64 box (pure MLX, no torch dep, numpy 2.2.6 satisfies >=2.2.5; only new transitive is librosa; 2.51GB one-time model). Adds a THIRD TRANSCRIBER branch (plumbing exists at transcribe.py:187-219). Probe-first: fetch supadata captions, if <20% chunks end in terminal punct AND language is one of the 25 European langs, download audio + transcribe_parakeet -> source='parakeet' auto-skips the LLM punctuation seam (service.py:245) and yields REAL word timings (the only true fix for supadata's synthesized gaps=0.0). Keep TRANSCRIBER default 'supadata'; DEFER default flip until a golden-set A/B shows a boundary win.",
+        "files": "/Users/vincentfeng/Documents/practice/clips/backend/pipeline/transcribe.py:25-32,136-219; /Users/vincentfeng/Documents/practice/clips/backend/config.py:25-26; /Users/vincentfeng/Documents/practice/clips/backend/orchestrator.py:86-103; requirements",
+        "effort": "L",
+        "risk": "med",
+        "value": "med",
+        "depends_on": "BND2"
+      }
+    ],
+    "deferred_or_dropped": [
+      "DROP torchaudio forced_align (w3-boundaries T5): torch 2.12.1 has NO matching torchaudio wheel (latest 2.11.0); installing force-downgrades torch and risks breaking sentence-transformers 3.4.1/TreeSeg (the structure stage). forced_align is also on a deprecation/TorchCodec-removal path. Worst of all it fixes the WRONG error \u2014 both audits show ends_on_period_rate=1.0 yet mid-clause ends, so the dominant residual is segmentation (wrong word), not ~90ms timing. BND1+BND2 cover the real error with already-installed deps.",
+      "DROP inaSpeechSegmenter (w4-genre T6): pulls unpinned TensorFlow (~0.5-1GB) + deprecated Pyro4 + pyannote.core into the SHARED venv holding torch 2.12/numpy 2.2.6 (high protobuf/numpy resolver-churn risk); tensorflow-metal has no py3.12 wheel so it's CPU-only anyway. GEN4 (one Gemini-audio call) gives equivalent music-vs-speech/singing discrimination at zero venv risk. Never add TF/Pyro4 to clips/.venv.",
+      "DEFER SaT/wtpsplit-lite (w3-boundaries T2 + the full 2-of-3 gate T3): largely REDUNDANT with the LLM punctuation restoration that already produces terminators for the default supadata source (service.py:245,264-277). SaT only adds value on the rare sentences_from_chunks fallback, whose highest-value fix (killing fabricated terminators) is free in BND1. The 2-of-3 gate's pause signal is also proven fake on supadata (intra-chunk gaps=0.0). Revisit only if BND1 proves insufficient on run-on captions.",
+      "DEFER diarization-based interview-vs-story genre tier (w4-genre item 22): pyannote.audio is NOT installed, gated behind HF_TOKEN + accepted terms, DIARIZATION defaults off; supadata captions likely carry no speaker labels. Low ROI until diarization is enabled.",
+      "DEFER parakeet default-flip (w3-asr T17-5): adopt opt-in/auto-trigger (ASR1) only. Do not flip TRANSCRIBER default until a golden set A/B shows a boundary-quality win \u2014 the golden set does not exist yet, and auto-trigger forces an audio download that negates supadata's no-download latency edge.",
+      "DROP per-pass carding on every repair accept (w3-cards open question): rescue-at-the-kill-boundary (CARD2/CARD3) alone removes the harmful eval-passes-but-gate-kills asymmetry; per-pass carding adds cost + card staleness across grow/trim for no additional rescue.",
+      "DEFER render-audit media_resolution MEDIUM/HIGH: keep LOW (~100 tok/s) default; only raise (3x cost) if visuals_referenced_are_visible under-detects small on-screen text/equations on slide-heavy content."
+    ],
+    "decisions_needed_from_user": [
+      "Does yt-dlp AUDIO download reliably succeed in production on this Mac (residential-IP dependency per the hosting-vidscout memory)? It GATES BND2, ASR1/parakeet, VID2/VID3 source, and GEN4's audio tier. Evidence says likely yes \u2014 PRECISE_BOUNDARIES is default-on and refine_clip_boundaries already needs audio (orchestrator.py:222-225) \u2014 but confirm before investing in the audio-based half.",
+      "Should any video/edge gate EVER kill, or stay advisory-only until judge-human kappa>=0.4 is established? Recommendation: advisory-only (warnings + small final_quality dock), consistent with the W25-E single_idea pattern \u2014 this is what keeps the unverified_kill=0 invariant intact. Confirm.",
+      "Genre precedence when metadata=Comedy but audio=speech (a stand-up/spoken 'comedy' lecture) vs a SUNG parody: which tier decides music-vs-entertainment-spoken? Recommendation: the GEN4 audio tier decides is_music/is_sung; metadata only nudges routing AWAY from lecture. Confirm the rule so a spoken-comedy talk isn't mis-forced to a music path.",
+      "CARD1 changes the JUDGE_SYSTEM prompt and will move eval comprehension UP (eval already injects the card at metrics.py:45). Approve gating this on judge-human kappa>=0.4 (no regression) and re-scoring the labeling set if needed \u2014 this is a real alignment gain, not noise.",
+      "Bias-hygiene / product call: show a quality + flag badge on the PRODUCTION clip card (FE3), or keep it subtle/opt-in? The labeling page (sample_for_labeling.py:116-118) deliberately hides judge internals near the embed. Also approve the user-facing warning->label allowlist (e.g. unverified_judge_concerns->'unverified', trimmed_start->'trimmed', capped_max_duration->'length-capped'; hide merged_overlap/single_idea_unverified/missing_context_card/unjudged).",
+      "Build a small golden set now (boundary-labeled + genre-labeled) \u2014 it is a PREREQUISITE to objectively justify BND2, VID2 Tier-2, and any parakeet default flip (eval_baseline boundary_error is currently NaN; no eval/golden/*.json). You already owe ~30 clip labels per memory; extend that pass to cover boundary + genre.",
+      "Video-judge cost/rate-limit posture: ship both tiers default OFF opt-in (mirror DIARIZATION_ENABLED) and pick VIDEO_JUDGE_MODEL \u2014 gemini-2.5-flash-lite for cost (~$0.0072/240s clip) vs gemini-2.5-flash for quality. Free-tier flash-lite RPM argues for OFF-by-default."
+    ],
+    "recommended_order": "Sprint A \u2014 product-visible quick wins, no ML, invariant-irrelevant (ship together): FE1 (embed bleed fix, best value/effort) -> FE2 (whitelist payload) -> GEN1 + GEN2 (metadata routing + EntertainmentAdapter = the minimal fix that stops the parody shipping 0 clips) -> FE3 (render title/card/watch-first/quality+flag chips) -> FE4 (mandatory rebuild into backend/static, surfacing GEN routing + all new fields).\n\nSprint B \u2014 the top quality item, invariant-critical (ship as one unit): CARD1 (judge-prompt fix, gated on kappa>=0.4) -> CARD2 (repair-terminal card-as-repair = the equations-clip/UAM rescue) -> CARD3 (post-snap/post-merge rescue + thread card into re-judge seams) -> CARD4 (unverified_kill=0 regression test + UAM fixture \u2014 MUST land with CARD2/CARD3).\n\nSprint C \u2014 cheap boundary + genre depth: BND1 (free text-only guards + kill fabricated terminators; attacks the dominant segmentation error) -> GEN3 (ensemble core: metadata + transcript-stats + middle sampling) -> GEN4 (Gemini-audio music tier, NOT inaSpeech) -> CARD5 (robust rescue seeding + suppression).\n\nSprint D \u2014 audio-gated + opt-in, MEASURE first (needs the golden set + audio-download confirmation): BND2 (faster-whisper re-time + cut-in-pause; measure residual) -> VID1 (generate_json_video enabler) -> VID2 (edge-probe, advisory) + VID4 (flags + eval plumbing) -> VID3 (render-audit, opt-in default OFF) -> GEN5 (reconciliation pass) -> ASR1 (parakeet opt-in/auto-trigger; defer default flip until golden-set A/B).\n\nCross-cutting prerequisite before Sprint D: build the small golden set. Do NOT start any torchaudio/inaSpeech/SaT work \u2014 all deferred or dropped."
+  }
+}

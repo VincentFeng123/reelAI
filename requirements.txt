@@ -1,0 +1,19 @@
+fastapi==0.115.*
+uvicorn[standard]==0.34.*
+sse-starlette==2.1.*
+pydantic==2.*
+python-dotenv==1.*
+groq==0.13.*
+google-genai>=2.0.0
+faster-whisper>=1.1
+yt-dlp==2025.*
+sentence-transformers==3.*
+torch>=2.4
+pysbd==0.3.*
+rapidfuzz==3.*
+tiktoken==0.8.*
+zipstream-ng==1.*
+numpy<2.3
+
+# dev / test
+pytest>=8.0

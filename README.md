@@ -1,51 +1,95 @@
-# ReelAI
+# Local YouTube Topic-Clipper
 
-ReelAI turns study materials into a learner-specific feed of transcript-grounded YouTube clips.
+Runs almost entirely on your Mac. Paste a YouTube URL + a **topic** (e.g. `momentum`) and
+the AI decides how many clips to make, picks the most informative moments, and cuts them
+into **separate** clips — each starting at a sentence start and **ending on a period**.
 
-## Production architecture
+Default stack: **local faster-whisper** for transcription (word-level timestamps, no cloud)
++ **Gemini's free API** only for the AI selection step. Download, sentence alignment,
+distinctness, and cutting are all local. (Groq is also supported via env vars — see below.)
 
-- Vercel hosts only the Next.js application. `RAILWAY_BACKEND_ORIGIN` configures the same-origin `/api/*` rewrite.
-- Railway hosts the durable FastAPI process and generation worker.
-- PostgreSQL stores material data, generation jobs/events, provider usage, Supadata search evidence, and native transcript artifacts.
-- Supadata supplies YouTube search and native caption cues. Instagram, TikTok, audio download, local Whisper, and synthetic word timing are not supported.
-- Gemini selects self-contained clips on exact caption-cue boundaries. `SEGMENT_FALLBACK_MODEL` is the only permitted fallback and is disabled when blank.
+## How it works
 
-## Generation contract
-
-`POST /api/reels/generate` returns either:
-
-- `200` with an already-completed matching inventory; or
-- `202` with `job_id`, `status_url`, and `stream_url`.
-
-Jobs move through `queued → running → completed | partial | exhausted | failed | cancelled`. Railway workers lease jobs for 90 seconds, heartbeat every 15 seconds, make at most two lease attempts, and enforce an eight-minute deadline. Disconnecting a client only closes its subscription.
-
-`GET /api/reels/generation-stream/{job_id}?after_seq=N` replays ordered NDJSON events:
-
-- `candidate`: provisional reel;
-- `final`: authoritative ordered/capped inventory;
-- `terminal`: final status or typed error.
-
-Every event includes `job_id`, a monotonic `seq`, and a timestamp. Status and cancellation are available at `/api/reels/generation-status/{job_id}` and `/api/reels/generation-jobs/{job_id}/cancel`.
-
-## Retrieval and duration semantics
-
-Only canonical YouTube video, playlist, and channel URLs are accepted by ingestion surfaces. Discovery always requests subtitle-bearing results; Creative Commons and source-duration filters map directly to Supadata when selected. Transcripts use `mode=native`; a video without native captions is skipped.
-
-Clip duration is a preference. Valid self-contained clips are persisted inside the global 1–180 second safety envelope. Serving ranks requested-range clips first, then fills shortages with the nearest shorter/longer clips and reports `duration_preference_met` plus `duration_fit`.
-
-Fast jobs allow three searches, three transcript requests, three segmentation calls, and one acquisition pass. Slow jobs begin with up to six searches/five videos and may make two continuation passes, with job-wide ceilings of 12 searches, 10 transcript requests, and 10 segmentation calls.
-
-## Local development
-
-```bash
-cp backend/.env.example backend/.env
-python3 -m venv backend/.venv
-backend/.venv/bin/pip install -r backend/requirements.txt
-backend/.venv/bin/uvicorn backend.app.main:app --reload --port 8000
-
-cp .env.local.example .env.local
-npm install
-npm run dev
+```
+URL + topic
+  → yt-dlp downloads 720p video + a 16 kHz mono audio track (cached per video id)
+  → faster-whisper (local) → punctuated, word-level transcript
+  → sentence index: split on real sentence boundaries (abbreviation/decimal guards),
+    aligned to word-level millisecond times
+  → AI selection: Gemini (structured JSON) picks distinct facets; a local cross-encoder
+    pre-filters long videos; sentence-transformers MMR removes near-duplicates and
+    decides the clip count from the content
+  → snap each segment: start → sentence start, end → the nearest period
+  → ffmpeg re-encodes a frame-accurate cut per clip → output/<video_id>/clip_N_<facet>.mp4
 ```
 
-For production, set `DATABASE_URL`, `DATA_DIR=/data`, `SUPADATA_API_KEY`, `GEMINI_API_KEY`, `SEGMENT_MODEL`, and optionally `SEGMENT_FALLBACK_MODEL` on Railway. Set `RAILWAY_BACKEND_ORIGIN` on Vercel. Provider-backed live smoke tests are separately gated because they consume credits; mocked provider tests are the CI requirement.
+## Prerequisites
+
+- macOS (Apple Silicon), **Python 3.12**, **Node 18+**
+- **ffmpeg**: `brew install ffmpeg`
+- A free **Gemini API key**: <https://aistudio.google.com/apikey> (no credit card)
+
+## Setup
+
+```bash
+# 1. Backend venv + deps  (use Python 3.12 — torch/sentence-transformers wheels)
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# 2. Configure your key
+cp .env.example .env
+#   then edit .env and set GEMINI_API_KEY=...
+
+# 3. Build the frontend (output lands in backend/static/)
+cd frontend && npm install && npm run build && cd ..
+
+# 4. Run
+uvicorn backend.main:app --host 0.0.0.0 --port 8000
+```
+
+Open <http://localhost:8000>. On your phone (same wifi) open `http://<your-mac-LAN-ip>:8000`.
+
+> First run downloads, once: the faster-whisper model (~0.5 GB for `small`) and ~170 MB of
+> CPU models (cross-encoder + MiniLM) into `~/.cache/huggingface`. CPU transcription of a
+> 10-min video takes a few minutes; pick a smaller `WHISPER_MODEL` (e.g. `base`) to go faster.
+
+### Using Groq instead (optional)
+Set in `.env`: `TRANSCRIBER=groq`, `LLM_PROVIDER=groq`, `GROQ_API_KEY=gsk_...` (free key at
+<https://console.groq.com>). Groq Whisper avoids the local model download and is much faster.
+
+## Dev mode (hot reload)
+
+```bash
+# Terminal A — API
+uvicorn backend.main:app --reload --port 8000
+# Terminal B — UI with hot reload (proxies API to :8000)
+cd frontend && npm run dev      # → http://localhost:5173
+```
+
+If port 8000 is busy, run uvicorn on another port (e.g. `--port 8008`) and update the
+proxy targets in `frontend/vite.config.ts`.
+
+## Settings (gear icon)
+
+- **Transcription**: Groq (offline faster-whisper is stubbed for a future release)
+- **Max resolution**: 480p / 720p
+- **Allow `?`/`!` ends**: off by default (clips end only on a period `.`)
+- **Variety ↔ Relevance**: MMR aggressiveness (lower = more distinct facets)
+
+## Notes
+
+- **Personal use only.** Downloading YouTube content may conflict with YouTube's Terms of
+  Service. Use this for local, personal clipping of content you're allowed to use — it has
+  no sharing/redistribution features by design.
+- Intermediate files cache under `./work/<video_id>/`; clips are written to
+  `./output/<video_id>/` (+ a `clips.json` manifest). Delete those folders to reclaim space.
+- Groq's free tier has a 25 MB audio upload limit and per-minute rate limits; long videos
+  are auto-downsampled to 16 kHz mono and, if still over 25 MB, chunked and merged.
+
+## Future scaling (NOT needed for local use)
+
+The MVP keeps all job state in memory and serves one machine. To host it for multiple users
+you'd add a job queue (Redis + RQ/Celery) instead of the in-memory registry + asyncio tasks,
+a database (Postgres) for job/clip persistence, object storage (S3) for outputs, and rotating
+proxies for downloads. None of that is required to run this on your own Mac.

@@ -1,0 +1,157 @@
+{
+  "angle": "repair-boundaries",
+  "findings": [
+    {
+      "title": "Add shrink/contract moves: reframe repair as bidirectional offset refinement (TimeRefine pattern)",
+      "claim": "Iterative coarse-to-fine boundary refinement that predicts OFFSETS (which can move a boundary inward or outward) outperforms direct one-shot span prediction in temporal grounding: TimeRefine (WACV 2026) reports +3.6 mIoU on ActivityNet and +5.0 mIoU on Charades-STA from reformulating grounding as 'rough prediction, then repeated self-correcting offsets' plus an auxiliary L1 head that penalizes proportionally to distance. The transferable design principle for the repair loop: refinement must be able to move both edges in BOTH directions; a grow-only operator structurally cannot fix a span whose only defect is one bad edge.",
+      "addresses": "F2",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2412.09601",
+          "note": "Fetched. Abstract + method confirmed: temporal grounding reformulated as iterative refining via predicted offsets to the target segment, repeated multiple rounds; +3.6/+5.0 mIoU on ActivityNet/Charades-STA."
+        },
+        {
+          "url": "https://openaccess.thecvf.com/content/WACV2026/papers/Wang_TimeRefine_Temporal_Grounding_with_Time_Refining_Video_LLM_WACV_2026_paper.pdf",
+          "note": "WACV 2026 camera-ready (venue confirmation; located via search, content matches the arXiv version I fetched)."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In backend/pipeline/assemble/validate.py add contract_candidate() symmetric to expand_candidate(), and make validate_and_repair alternate moves instead of grow-only. Direction is chosen from the verdict's failure kinds: coherence/multi-topic failures ('jumps between topics') -> drop the unit temporally farthest from the anchor (reuse closure.py:_gap_to_span for ordering); unresolved-reference/grounding failures -> expand as today. Hard invariants: never drop the anchor unit or any unit required by check_contract(); never expand past min(CLOSURE_MAX_SPAN_S, the 240s ship cap) so the judge never scores text that cannot ship (fixes the observed 294s judged-then-capped candidates). The existing frozenset(unit_ids) verdict cache already makes revisits free, so a grow that overshoots can be walked back at zero judge cost."
+    },
+    {
+      "title": "Judge the anchor at native size FIRST, then search the trim lattice by noisy bisection instead of linear growth",
+      "claim": "Two verified supports for cheapest-first ordering plus bisection-based trim search. (1) Karp & Kleinberg, 'Noisy binary search and its applications' (SODA 2007): with a noisy monotone oracle, the threshold-crossing point among n ordered options is found with O(log n / eps^2) queries \u2014 i.e., a limited-call unreliable judge (exactly the F1 judge) can still locate 'the largest sub-span that passes' efficiently, provided pass-probability is roughly monotone along the trim axis, with the eps^-2 factor realized as repeated queries near the suspected boundary. (2) SpotVMR (arXiv 2605.29793) demonstrates the cheap-first architecture in moment retrieval: preview with cheap indexing features, recursively select a small clip subset, and only run expensive extraction on those \u2014 8.7x speedup with accuracy GAINS (Charades-STA R@1@0.5 68.82 vs 57.53 prior). Together: evaluate the smallest/cheapest hypothesis first and let inexpensive signals order the frontier, spending the expensive oracle only near the decision boundary.",
+      "addresses": "F2 (search order and trim strategy); robustness to F1 judge noise",
+      "sources": [
+        {
+          "url": "https://www.cs.cornell.edu/~rdk/papers/karpr2.pdf",
+          "note": "Fetched and text-extracted locally. Confirmed: noisy binary search over n coins with monotone heads-probabilities; O(log n / eps^2) expected flips to locate where probability crosses the target, success probability >= 3/4."
+        },
+        {
+          "url": "https://arxiv.org/html/2605.29793v1",
+          "note": "Fetched. SpotVMR: cheap BAM indexing features + recursive binary clip selection (Gumbel-Softmax, up to B=5 steps) before expensive C3D extraction; 8.7x speedup; Charades-STA 68.82 vs 57.53, ActivityNet 52.83 vs 48.59, TACoS 48.72 vs 39.24."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "In validate.py:validate_and_repair, judge the RAW anchor span before _fill_contract inflates it (today contract-fill runs before the first judge call, so the anchor is never scored at native size \u2014 the audit's 10-60s anchors were only ever judged after inflation to 100-294s). Record that verdict as the baseline 'best'. When a grown span fails on coherence, define the trim lattice as unit-prefixes ordered by distance from the anchor and bisect between known-good (anchor) and known-bad (full span) instead of linear JUDGE_MAX_REPAIR=3 grow attempts; budget stays the same (~3-4 calls covers log2 of any realistic unit count). Caveat that keeps this at medium confidence: monotonicity of judge-pass along the trim axis is an assumption (plausible \u2014 adding off-topic tail units monotonically hurts coherence \u2014 but unvalidated; check it on the eval harness's frozen structures first). Mitigate F1 phantom verdicts exactly as Karp-Kleinberg's model prescribes: one repeated query at the suspected boundary rather than trusting a single noisy verdict."
+    },
+    {
+      "title": "Cheap pre-judge span scoring with lighthouse (Moment-DETR lineage) saliency scores",
+      "claim": "line/lighthouse (EMNLP 2024 demo; ICASSP 2025; v1.2 Nov 2025; CASTELLA accepted ICASSP 2026) is a maintained, pip-installable library exposing 8 moment-retrieval/highlight-detection models (Moment-DETR, QD-DETR, EaTR, CG-DETR, UVCOM, TR-DETR, TaskWeave, R2-Tuning) behind a 3-line API (encode_video once, then predict(query, video)) that returns predicted moment windows AND per-segment pred_saliency_scores. Inference runs on CPU (GPU recommended only for feature extraction). This gives the pipeline a sub-second, zero-LLM-call scorer for ranking candidate spans and trim variants BEFORE any Gemini judge call.",
+      "addresses": "F2 (better starting candidates and free ranking of trim variants)",
+      "sources": [
+        {
+          "url": "https://github.com/line/lighthouse",
+          "note": "Fetched README. Confirmed model list, feature sets (CLIP, CLIP+SlowFast, +PANNs audio), datasets (QVHighlights, Charades-STA, TVSum, ...), the CGDETRPredictor encode_video/predict API returning pred_saliency_scores, 'available for both CPU/GPU mode', pip install from git, and 2025-2026 release timeline."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Add an optional scorer in backend/pipeline/assemble/scoring.py: at ingest, encode each video once (CLIP features; do extraction at download time in pipeline/download.py or a new stage so per-candidate cost is a dot-product); for each candidate and each trim variant, query with the unit/anchor title+summary text and compute mean in-span saliency minus out-of-span margin. Use it (a) in candidates.py to rank anchors under MAX_ANCHORS=12, and (b) in the new contract/expand loop to pick which trim variant to send to the judge, so the judge budget is spent on the best 1-2 variants instead of a linear walk. Domain caveat (why validation is mandatory): these models are trained on QVHighlights vlogs/news \u2014 validate saliency-vs-judge correlation on lecture content via the eval harness before letting it gate anything (this also feeds the F5 calibration gap). Confidence 'high' is for what the library verifiably provides; treat its effectiveness on lecture video as an experiment."
+    },
+    {
+      "title": "Kill fabricated sentence boundaries with SaT (wtpsplit / wtpsplit-lite): punctuation-agnostic segmentation that runs in ~150ms on CPU",
+      "claim": "Segment any Text (SaT, EMNLP 2024; maintained through 2025) segments unpunctuated, uncased, ASR-style text into sentences without relying on punctuation (trained with punctuation-corruption; dedicated TED/ASR-style LoRA adapters in 81 languages). English F1: sat-3l-sm 96.5, sat-12l-sm 97.4. ONNX inference is supported; wtpsplit-lite packages inference-only SaT with just numpy+onnxruntime+tokenizers+huggingface-hub and cites ~150ms per page on CPU for sat-3l-sm \u2014 trivially affordable per video on the Mac. This directly replaces the F7 failure where the windowed fallback stamps ends_with_period=True on every ~12s word window.",
+      "addresses": "F7",
+      "sources": [
+        {
+          "url": "https://github.com/segment-any-text/wtpsplit",
+          "note": "Fetched README. Confirmed punctuation-agnostic segmentation with lowercase/unpunctuated example, model family sat-1l..sat-12l(+-sm), English F1 figures, ONNX benchmarks, and TED (ASR-style transcribed speech) LoRA modules."
+        },
+        {
+          "url": "https://github.com/superlinear-ai/wtpsplit-lite",
+          "note": "Fetched README. Confirmed inference-only fork: deps = huggingface-hub, numpy, onnxruntime, tokenizers; sat-3l-sm ~150ms/page on CPU; offline after model download; usage sat.split(text, stride=128, block_size=256)."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2406.16678",
+          "note": "SaT paper (located via search; claims cross-checked against the fetched README, which reproduces the paper's scores)."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In backend/pipeline/sentences.py, rewrite window_sentences() (the fallback that currently emits Sentence(terminator='.', ends_with_period=True, align_confidence=1.0) for every 12s window): join the caption word stream, run SaT (sat-3l-sm via wtpsplit-lite; upgrade path = full wtpsplit + sat-12l TED LoRA if quality demands), map returned sentence strings back to word indices with the existing _align/_resolve_prefix machinery, and set ends_with_period=True ONLY at SaT boundaries, with align_confidence carrying the boundary probability instead of the hard-coded 1.0. Apply the same treatment to the supadata chunk fallback and to the eval path so refine.py's snapping stops being a no-op on caption transcripts. Also add SaT as a cross-check in pipeline/punctuation/validator.py against the LLM punctuation output (disagreement = flag, see the 2-of-3 gate finding)."
+    },
+    {
+      "title": "Pause-gap veto at cut points: sentence-boundary pauses in read speech are >=250ms (88%), mostly 450-1000ms",
+      "claim": "Volskaya (ICPhS 2003), studying read Russian text with oscillogram-measured pauses, reports: at sentence boundaries 88% of pauses exceed 250ms and most fall between 450-1000ms (pauses >1000ms mark paragraph ends); at clause/phrase boundaries ~41% of 'pauses' are under 250ms (mean 173.5ms) or acoustically absent ('virtual pauses' cued by lengthening/pitch instead); 250ms is cited as the threshold for a pause reflecting a speaker's deliberate prosodic boundary marking. Practical consequence: an inter-word silence >=250-350ms at a proposed cut point is strong evidence FOR a safe boundary, but absence-of-pause does not prove absence-of-boundary, and clause-internal pauses exist \u2014 so use pause as a VETO/confirmation signal combined with textual segmentation, not as a standalone boundary detector.",
+      "addresses": "F7 (and provides evidence-based post-roll: cut inside the pause)",
+      "sources": [
+        {
+          "url": "https://www.internationalphoneticassociation.org/icphs-proceedings/ICPhS2003/papers/p15_0499.pdf",
+          "note": "Fetched PDF and text-extracted locally. Confirmed the specific numbers: 88% of sentence-boundary pauses >250ms, most 450-1000ms; <250ms pauses average 173.5ms and constitute ~41% at clause/sentence boundaries; 250ms deliberate-boundary threshold; read-speech corpus."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "In backend/pipeline/refine.py:_snap_one and assemble/boundary_adapt.py: at the chosen start/end sentence boundary, compute gap = next_word.start - last_word.end from the word timings the transcript already carries (TimedWord layer in pipeline/punctuation/types.py; caption words in transcript['words']). Accept the boundary only if (real terminator or SaT boundary) AND gap >= 0.25s (use 0.35s for END cuts, which matter most for comprehension); otherwise walk to the next valid boundary within BOUNDARY_PAD_S=10s. Place the physical cut INSIDE the pause \u2014 e.g. last_word.end + min(tail_pad_s, gap/2) \u2014 which replaces the current fixed tail_pad_s with an evidence-based post-roll and guarantees the cut never clips a word. Where word timings are chunk-level only, fall back to Silero VAD on the +/-1s boundary window (already researched in RESEARCH.md). Confidence medium because the corpus is read Russian; lecture speech is similar in register but spontaneous genres pause less syntactically \u2014 hence veto, not detector, and thresholds should be checked against the (to-be-built) golden set."
+    },
+    {
+      "title": "Word-accurate final snapping: CTC forced alignment on the +/-10s boundary window; WhisperX is measurably the WORST word-timestamp source",
+      "claim": "The MFA 3.0 benchmark paper (arXiv 2606.18466, June 2026) gives the first current, apples-to-apples word-boundary-error comparison: on TIMIT/Buckeye, mean word boundary error is ~20-25ms for MFA 3.0 pretrained (abstract: <15ms with adaptation, SOTA or near-SOTA on all four benchmarks), ~43-50ms for MMS (the model behind torchaudio's forced-alignment pipeline), ~78-89ms for NeMo Forced Aligner, and ~110ms for WhisperX \u2014 i.e., WhisperX word times are 4-5x worse than MFA and 2x worse than MMS. torchaudio provides the CPU-capable API (functional.forced_align + pipelines.Wav2Vec2FABundle) that takes audio+transcript and returns word start/end with confidence scores \u2014 but note it is deprecated in torchaudio 2.8 and removed in 2.9. For clip cutting (tolerance ~100ms, cut placed inside a >=250ms pause anyway), MMS-class accuracy is sufficient and far lighter than MFA.",
+      "addresses": "F7",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2606.18466",
+          "note": "Abstract fetched (MFA 3.0, mean boundary errors <15ms, SOTA across 4 benchmarks) AND full PDF text-extracted locally: Table 4 word-alignment mean errors TIMIT/Buckeye \u2014 MFA ARPA 3.0 19.93/21.75ms, MFA Global 3.0 22.33/25.35ms, MMS 43.06/49.54ms, NeMo 78.24/88.62ms, WhisperX 110.04/110.90ms."
+        },
+        {
+          "url": "https://docs.pytorch.org/audio/stable/tutorials/forced_alignment_tutorial.html",
+          "note": "Fetched. Confirmed torchaudio.functional.forced_align + Wav2Vec2FABundle, input = waveform + transcript, output = word segments with start/end and per-word scores, CPU fallback demonstrated; deprecation warning: deprecated in 2.8, removed in 2.9."
+        },
+        {
+          "url": "https://github.com/m-bain/whisperX/issues/1247",
+          "note": "Fetched. User report (Oct 2025) that WhisperX word timestamps are significantly off vs MFA (verified in Praat); anecdotal on its own but consistent with the MFA 3.0 benchmark numbers above."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In backend/pipeline/boundary.py, replace/supplement the 'targeted-Whisper precise pass' (referenced in boundary_adapt.py's docstring) with targeted CTC forced alignment: extract the +/-BOUNDARY_PAD_S=10s audio window around each chosen cut, run forced_align with the KNOWN caption text (no re-transcription, so timings can never contradict the shipped text), and snap the cut to the aligned word edge + pause midpoint. ~20s of audio per boundary is trivially CPU-feasible on the Mac. Engineering note: pin torchaudio<2.9 or wrap the alignment behind an interface so it can be swapped for MFA CLI (montreal-forced-aligner, conda) if the torchaudio API disappears; do NOT adopt WhisperX for this \u2014 it is the worst-measured option."
+    },
+    {
+      "title": "Punctuation restoration alone cannot certify clause-safe cuts on speech \u2014 gate ends_with_period on 2-of-3 independent signals",
+      "claim": "Even the strongest 2025-class open punctuation restorer (Cadence, ai4bharat: Gemma3-1B converted to a bidirectional token classifier over 30 punctuation classes, open weights on HuggingFace) scores 0.7924 F1 on written text but only 0.6249 on spontaneous speech transcripts \u2014 a ~0.17 F1 drop the authors attribute to disfluencies and irregular syntax \u2014 while still beating DeepMultilingualPunctuation-class baselines. Implication for this pipeline: the default-on LLM punctuation stage's terminators are a ~0.6-0.8-precision signal on speech, so a single fabricated or missed period at a cut point is EXPECTED behavior, not an edge case. Boundary certification must therefore require agreement of independent signals (model punctuation, punctuation-agnostic SaT segmentation, acoustic pause) rather than trusting any one of them \u2014 which is also exactly the invariant the F7 fallback violated by synthesizing the punctuation signal.",
+      "addresses": "F7 (and hardens the repair gate against boundary-driven judge noise feeding F1)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2506.03793v1",
+          "note": "Fetched. Confirmed architecture (Gemma3-1B, MNTP bidirectional conversion, token-level classification over 30 classes), open release as ai4bharat/Cadence, and the written-vs-speech gap: 0.7924 vs 0.6249 F1 on focus labels; beats IndicPunct 0.76-vs-0.54 and DeepMultilingualPunctuation 0.60-vs-0.54."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "Keep the existing pipeline/punctuation/ stage as-is (its TimedWord preservation invariant is good), but change what counts as a clip-grade boundary: in sentences.py:sentences_from_punctuation and the punctuation eval path, set is_valid_end True only when >=2 of 3 agree: (a) restored terminator ('.', '?', '!' after the existing abbreviation guard), (b) SaT boundary within +/-1 word, (c) inter-word pause >= 0.25s. Add two cheap unsourced-but-obvious guards in refine.py: reject an end boundary whose final sentence has <3 words, and reject boundaries where the last token is a conjunction/preposition/determiner (and, but, the, of, to...) \u2014 both catch mid-clause cuts that survive signal agreement. Log 1-signal-only boundaries to the punctuation/ cache so the eval harness can measure per-signal precision once the golden set exists (ties into F5). Confidence medium: the source strongly proves the speech-punctuation accuracy gap; the specific 2-of-3 gate is design inference from it, not itself benchmarked."
+    }
+  ],
+  "leads": [
+    "Pre/post-roll (topic 4) has NO direct peer-reviewed padding study I could verify: searches for lead-in/lead-out padding user studies returned only editing patents (fixed 10/20/30s pre-roll for editor preview, not viewer comprehension; e.g. US9564173) and general speech-comprehension work showing preceding linguistic context aids understanding (e.g. Frontiers in Psychology 2024 'Effects of linguistic context and noise type on speech comprehension', pmc.ncbi.nlm.nih.gov/articles/PMC10875108/ \u2014 not fetched). Working recommendation to verify empirically: solve cold-opens with CONTENT (snap start to a discourse-unit start, or a context card) rather than fixed padding; for post-roll, the pause-midpoint cut from the Volskaya finding replaces fixed tail_pad_s.",
+    "MarkIt: Training-Free Visual Markers for Precise Video Temporal Grounding (arXiv 2604.25886, April 2026) \u2014 training-free MLLM-based grounding; potentially a zero-shot boundary refiner without lighthouse's training-domain problem. Not fetched; heavier (needs an MLLM per call).",
+    "CoSTL (arXiv 2606.01149, June 2026) claims new QVHighlights SOTA, +3.73% avg over R2-Tuning \u2014 candidate upgrade if lighthouse's bundled models underperform on lecture content. Not fetched.",
+    "Sharp Noisy Binary Search with Monotonic Probabilities (arXiv 2311.00840) \u2014 tighter constants than Karp-Kleinberg; relevant only if the trim-search budget becomes the bottleneck. Not fetched.",
+    "Lightweight online punctuation+capitalization with two ELECTRA-small heads and 4-word lookahead (ScienceDirect S0167639325000846, 2025) \u2014 a much cheaper CPU alternative to the LLM punctuation stage for the fallback path; abstract only, not fetched.",
+    "wtpsplit's TED/ASR LoRA adapters require the full wtpsplit package (torch), not wtpsplit-lite \u2014 if base sat-3l-sm underperforms on run-on auto-captions, budget for the torch dependency or ONNX-export the LoRA-merged model.",
+    "MFA 3.0 paper section 4 notes MFA can consume WhisperX/SpeechBrain transcripts and SpeechBrain VAD for segmentation-before-alignment \u2014 a ready-made recipe if the pipeline ever needs full-video (not windowed) alignment.",
+    "The 'trim' framing in recent MR literature (SpotVMR) is clip SELECTION for efficiency, not boundary contraction \u2014 I found no 2024-2026 paper doing literal LLM-judge-guided span contraction for clip generation; the TimeRefine + noisy-binary-search combination above is a synthesis, so validate it with the eval harness's --freeze mode (frozen structures remove the REBUILD noise that would otherwise swamp the comparison).",
+    "Genre caveat chain for the pause thresholds: 'Syntactic pausing? Re-examining the associations' (degruyterbrill.com, Linguistics Vanguard) reports only ~51% of pauses at clause boundaries in spontaneous speech (search-level, 403 on fetch for MDPI sibling) \u2014 reinforces pause-as-veto-not-detector for interview/vlog genres (relevant to F6 interactions)."
+  ],
+  "notes": "Scope: F2 (grow-only repair) and F7 (fictitious boundaries), per assignment. Everything in findings was verified by fetching (or locally text-extracting) the cited source; unfetched or search-level material is in leads. Code grounding was read directly: validate.py:validate_and_repair judges only after _fill_contract inflation and expand_candidate is the sole move (F2 confirmed in code); sentences.py:window_sentences hard-codes terminator='.', ends_with_period=True, align_confidence=1.0 on every ~12s window (F7 confirmed in code); refine.py already has tail_pad_s and _snap_one where the pause veto slots in; boundary_adapt.py documents the 'targeted-Whisper precise pass' that the forced-alignment finding replaces. Suggested implementation order (dependencies): (1) SaT fallback fix + 2-of-3 boundary gate (F7, no LLM cost, unblocks meaningful snapping), (2) shrink move + anchor-first judging + bisection budget (F2, uses existing verdict cache), (3) pause veto + forced-alignment precise pass (physical cut quality), (4) lighthouse saliency ranker (experiment; requires golden-set correlation check, which also chips at F5). Interaction warning: fixing F7 will change judge inputs (clips will genuinely end on sentence ends), so re-baseline the eval harness (--freeze --runs N) before/after to avoid attributing F7 gains to the F2 changes.",
+  "verification": {
+    "checked": [
+      {
+        "title": "FINDING 1: TimeRefine bidirectional offset refinement",
+        "supported": true,
+        "note": "Verified against https://arxiv.org/abs/2412.09601 (+ HTML v2) and web search confirming the WACV 2026 open-access copy (the thecvf.com PDF itself 403s to fetchers but is indexed and listed). Confirmed: grounding reformulated as rough prediction then repeated offset prediction; offsets are signed (s = s_k + o_s^k, e = e_k + o_e^k), so boundaries can move in either direction (shrink or grow); auxiliary L1 head explicitly 'penalizes predictions more heavily when they are further from ground truth'; +3.6/+5.0 mIoU on ActivityNet/Charades-STA. Two caveats: (1) the gains are specifically from integrating TimeRefine into VTimeLLM (a direct-timestamp baseline) \u2014 on a stronger baseline, VTG-LLM, the gain is only +1.2 mIoU on Charades-STA, so effect size is baseline-dependent and the headline numbers are the best case; (2) the final sentence ('a grow-only operator structurally cannot fix...') is the researcher's own design inference, not something the paper states \u2014 reasonable, but should be labeled as inference, not a paper result."
+      },
+      {
+        "title": "FINDING 2: Cheapest-first + noisy bisection (Karp-Kleinberg + SpotVMR)",
+        "supported": false,
+        "note": "Split verdict; the compound claim as stated is not fully backed. (a) Karp & Kleinberg (PDF fetched and text-extracted from cs.cornell.edu): FULLY SUPPORTED \u2014 noisy binary search over n coins with monotone (unknown) heads probabilities, O(log n / eps^2) expected flips to locate the threshold-crossing interval, success probability >= 3/4, with matching lower bound; the stated proviso (pass-probability roughly monotone along the trim axis) is correctly acknowledged as an assumption. (b) SpotVMR (arXiv 2605.29793): architecture claims check out (BAM indexing features, Gumbel-Softmax recursive binary selection with B_max=5, cheap-first before expensive extraction; Charades-STA 68.82 vs ACRM 57.53; ActivityNet 52.83 vs MMN 48.59), BUT three problems. First, the '8.7x speedup' is NOT in the paper \u2014 Table 2 gives ~32.75s total vs 206-313s for baselines (~6.3x-9.6x depending which baseline; 8.7x appears to be a derived/averaged number presented as a paper claim). Second, 'TACoS 48.72 vs 39.24' mixes metrics: 48.72 is R@1 IoU=0.3 (best baseline 38.79); at IoU=0.5 SpotVMR gets 38.94. Third and most important, 'accuracy GAINS' is only vs 2017-2022 baselines (ACRM 2021, MMN 2022, VSLNet 2020); the paper compares no 2023-2025 SOTA, and modern Charades-STA R@1@0.5 results exceed 68.82 \u2014 so 'speedup with accuracy gains' is true only relative to dated methods. It is also a non-peer-reviewed May 2026 preprint. Downgrade to: 'a preprint demonstrates the cheap-first/recursive-selection architecture with ~6-10x wall-clock speedup and no accuracy loss vs its (dated) baselines'; the Karp-Kleinberg theoretical support stands on its own."
+      },
+      {
+        "title": "FINDING 3: lighthouse as cheap pre-judge span scorer",
+        "supported": true,
+        "note": "README at https://github.com/line/lighthouse confirms nearly everything: 8 models (Moment-DETR, QD-DETR, EaTR, CG-DETR, UVCOM, TR-DETR, TaskWeave, R2-Tuning), pip install from git, encode_video-then-predict API returning pred_relevant_windows and pred_saliency_scores, CPU/GPU support, EMNLP 2024 demo, ICASSP 2025 AMR paper, CASTELLA at ICASSP 2026, v1.2 released Nov 20 2025. Two downgrades: (1) 'sub-second' is NOT a source claim \u2014 the README makes no latency claims at all; that number is the researcher's extrapolation and should be benchmarked, especially since encode_video (feature extraction) runs per video/per trim variant and is the expensive step. (2) 'GPU recommended only for feature extraction' slightly overstates the README, which says CPU-only users should restrict to CLIP features because 'CLIP+Slowfast or CLIP+Slowfast+PANNs features are very slow without GPUs' \u2014 i.e., CPU use constrains which (typically lower-accuracy) feature set you can run, a real quality tradeoff the finding omits. Core claim (maintained, pip-installable, zero-LLM-call saliency scorer) is genuinely backed."
+      },
+      {
+        "title": "FINDING 4: SaT / wtpsplit-lite punctuation-agnostic segmentation",
+        "supported": true,
+        "note": "All three sources check out. https://github.com/segment-any-text/wtpsplit README confirms punctuation-robust segmentation of lowercase/unpunctuated text, English F1 96.5 (sat-3l-sm) and 97.4 (sat-12l-sm), ONNX support, and TED (ASR-style transcribed speech) LoRA modules in 81 languages; maintenance is actually better than claimed (v2.2.1 released April 2026, not just 'through 2025'). https://github.com/superlinear-ai/wtpsplit-lite confirms inference-only fork with exactly huggingface-hub+numpy+onnxruntime+tokenizers, ~150ms/page on CPU for sat-3l-sm, and the sat.split(text, stride=128, block_size=256) API. arXiv 2406.16678 confirms the SaT paper at EMNLP 2024 Main, with a pretraining scheme designed to reduce punctuation reliance (the finding's 'punctuation-corruption' phrasing is a fair paraphrase). Minor nits: 'offline after model download' is implied by the HF caching design but not an explicit README statement, and the ~150ms/page figure is the maintainer's own benchmark (single data point, page-of-text sized input), so per-video cost on long ASR transcripts should still be measured. The claim that this fixes the internal F7 failure (windowed fallback stamping ends_with_period=True) is a pipeline assertion, not source-checkable."
+      }
+    ],
+    "overall_note": "3 of 4 findings are genuinely backed by their sources; Finding 2 fails as stated. The single hard error found: SpotVMR's '8.7x speedup' does not appear in the paper (Table 2 implies ~6.3-9.6x depending on baseline), its TACoS comparison mixes IoU=0.3 and IoU=0.5 numbers, and its 'accuracy gains' are only against 2017-2022 baselines in a non-peer-reviewed 2026 preprint \u2014 the Karp-Kleinberg theoretical half of that finding is fully solid and can be kept independently. Recurrent softer pattern: researcher extrapolations presented alongside source facts (TimeRefine's 'grow-only operators cannot fix one bad edge' design principle, lighthouse's 'sub-second' latency, headline TimeRefine gains being the best-case VTimeLLM integration while VTG-LLM gains are only +1.2 mIoU). Sources verified: arXiv 2412.09601 (abs + HTML v2) with WACV 2026 venue confirmed via search index of openaccess.thecvf.com (direct PDF fetch 403s); Karp-Kleinberg PDF from cs.cornell.edu text-extracted locally and theorem statement confirmed verbatim; arXiv 2605.29793 HTML fetched twice with targeted table queries; GitHub READMEs for line/lighthouse, segment-any-text/wtpsplit, superlinear-ai/wtpsplit-lite; arXiv 2406.16678 abstract."
+  }
+}

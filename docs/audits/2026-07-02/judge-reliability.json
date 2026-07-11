@@ -1,0 +1,164 @@
+{
+  "angle": "judge-reliability",
+  "findings": [
+    {
+      "title": "Quote-then-verify: every failure reason must carry an exact evidence quote, deterministically checked by string containment",
+      "claim": "Requiring the judge to emit, for each failure_reason, a verbatim quote from the clip text that evidences the failure \u2014 then verifying that quote post-hoc with normalized string containment and DISCARDING reasons whose quotes are not found \u2014 directly kills the phantom-verdict class (e.g. citing 'the previous equation' when that phrase never occurs in the span). Datadog's production hallucination judge uses exactly this rubric ('for each claim, the rubric requires a quote from the context and the answer') plus structured-output enforcement, reaching F1 0.810 on HaluBench with smaller drops on hard human-labeled data than baselines. The complementary failure cause is documented in LLM code review: false rejections are driven by 'requirement hallucination' (inventing constraints) and 'unsupported assertions' \u2014 the same mechanism as the judge inventing an unresolved reference.",
+      "addresses": "F1 (hallucinated failure reasons; ~92% false-kill pressure at the repair gate)",
+      "sources": [
+        {
+          "url": "https://www.datadoghq.com/blog/ai/llm-hallucination-detection/",
+          "note": "Production LLM-as-judge for RAG faithfulness: rubric mandates a direct quote per claim ('forces the model to remain anchored in actual content'), FSM-enforced JSON, two-stage free-reasoning-then-reformat; GPT-4o F1 0.810 on HaluBench, robust on RAGTruth."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2603.00539",
+          "note": "'Are LLMs Reliable Code Reviewers? Systematic Overcorrection in Requirement Conformance Judgement' \u2014 documents systematic over-rejection of conforming code caused by requirement hallucination and unsupported assertions; the exact analogue of the clip judge inventing failure reasons."
+        },
+        {
+          "url": "https://arxiv.org/abs/2309.11495",
+          "note": "Chain-of-Verification (ACL Findings 2024): drafting then independently verifying factual claims reduces hallucination; F1 +23% (0.39\u21920.48) on MultiSpanQA \u2014 evidence that verification of generated claims as a separate step catches fabrications."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In backend/pipeline/assemble/validate.py: (1) add `evidence_quote: str` to FailureReason and extend JUDGE_SYSTEM: 'for every failure_reason, copy the EXACT contiguous words from CLIP TRANSCRIPT that show the problem (the dangling phrase, the sentence that assumes the concept); if you cannot quote it, do not emit the reason.' (2) Add a pure function `_verify_reasons(verdict, clip_text)` \u2014 normalize (lowercase, collapse whitespace, strip punctuation) both sides, check containment of evidence_quote and of reference_text; reasons that fail become `verified=False`. (3) In is_complete()/validate_and_repair(), only verified reasons may flip the gate booleans or appear in Rejection.failure_kinds; unverified reasons are logged as warnings and may still feed expand_candidate() targeting (expansion is cheap, rejection is not). (4) Fix the cache-staleness blind spot: key the verdict cache on hash of the exact judged clip_text, not frozenset(unit_ids), and re-judge after refine.py boundary snapping mutates the shipped text (the audit found a shipped text that was never judged). Zero extra LLM calls; pure-Python check."
+    },
+    {
+      "title": "Asymmetric gate: killing a clip must require strictly more evidence than passing it, because judge errors are asymmetric (TPR 96%, TNR <25%)",
+      "claim": "Measured LLM-judge error structure is strongly asymmetric \u2014 'Beyond Consensus' quantifies TPR 96% vs TNR <25% on code-feedback validation, i.e. judges almost never miss a real defect but massively over-flag; their minority-veto and bias-regression strategies beat the best 14-LLM ensemble by 2x. Refute-or-Promote operationalizes the same insight as 'kill mandates + a mandatory empirical validation gate': a defect claim only counts after it survives adversarial refutation and one deterministic test ('one test killed what 80+ agents' reasoning could not'; ~79-83% of candidate defect reports killed before disclosure). Mapped to this pipeline, where kills outnumber ships 7.7 : 0.667, the gate should be: PASS on the judge's holistic score as today, but REJECT only when (a) at least one failure reason survives the deterministic citation check of Finding 1, AND (b) the kill is confirmed by a fresh-context second pass (Finding 3). Unverified or unconfirmed failures downgrade to repair hints or ship-with-flag.",
+      "addresses": "F1 (false kills dominate), F2 indirectly (fewer needless repair expansions)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2510.11822",
+          "note": "'Beyond Consensus: Mitigating the Agreeableness Bias in LLM Judge Evaluations' \u2014 LLM validators show 96% TPR but <25% TNR; optimal minority-veto strategy plus regression-calibrated framework gives 2x improvement over the best ensemble of 14 SOTA LLMs."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2604.19049",
+          "note": "Refute-or-Promote (read from fetched PDF): 4-stage adversarial kill-mandate pipeline with mandatory empirical/deterministic validation gate; 79% retrospective / 83% prospective kill rate of false defect claims; case study where 80+ agents unanimously confirmed a nonexistent bug and a single deterministic test killed it; 'unanimity is a low-signal event'; also cites Song et al. showing fresh-context review beats same-session review (p=0.008) and extra same-session rounds degrade quality."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In validate.py validate_and_repair(): restructure the terminal branch. Today, exhausting JUDGE_MAX_REPAIR with is_complete()==False yields Rejection unless the best partial clears 4 hard booleans. Change to a 3-outcome gate: ACCEPT (is_complete true), REPAIR/WARN (failure reasons exist but none citation-verified \u2192 ship best-partial with `flags=[unverified_judge_concerns]` and let assemble/scoring.py dock final_quality instead of killing), REJECT (>=1 verified reason AND confirmation pass agrees). Log both verdict streams in the Rejection record so the eval harness (backend/eval/metrics.py) can track verified-kill vs unverified-kill rates per video. Note the direction: this intentionally trades a few bad ships for recovering good clips, which is correct while 92% of candidates die at this gate; the corruption meta-eval of Finding 5 is the guardrail that the gate hasn't gone blind."
+    },
+    {
+      "title": "Two-pass verdict confirmation: a fresh-context call must re-derive each failure reason before it can kill",
+      "claim": "Chain-of-Verification shows that answering verification questions in a FRESH context, unbiased by the original draft, catches fabrications the original generation cannot see (F1 +23%); Refute-or-Promote's related-work section independently reports that fresh-context review outperforms same-session review (p=0.008) and that additional same-session debate rounds degrade quality. For this pipeline that means: do not ask the same judge chat to double-check itself \u2014 issue one NEW llm_json call whose input is only the clip transcript plus each failure reason restated as a neutral yes/no question ('Does the phrase X occur in this transcript without an antecedent? Quote it.'). Only confirmed reasons count toward rejection. Cost: kills run ~7.7/video, so this adds ~8 short calls/video (~1-2k tokens each \u2248 $0.002 total at gemini-2.5-flash-lite $0.10/M input) \u2014 negligible next to the value of un-killing good clips.",
+      "addresses": "F1 (phantom verdicts trigger rejection)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2309.11495",
+          "note": "CoVe: plan verification questions, answer them independently of the draft so answers are not biased by it, then finalize; consistent hallucination reduction across Wikidata list QA, MultiSpanQA (+23% F1), longform generation."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2604.19049",
+          "note": "Refute-or-Promote cites Song et al. (refs 11-12): fresh-context review outperforms same-session review (p=0.008); extra rounds degrade quality \u2014 supports one-shot fresh-context confirmation over iterative self-critique."
+        },
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "note": "gemini-2.5-flash-lite: $0.10/1M input, $0.40/1M output (fetched July 2026) \u2014 confirmation-pass cost basis."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "New function `confirm_reasons(clip_text, reasons) -> list[bool]` in validate.py, called ONLY on the kill path of validate_and_repair() (asymmetry: passes are never taxed). Prompt template: transcript + numbered claims, each answered {confirmed: bool, quote: str}; run the Finding-1 containment check on the confirmation quotes too. Use the existing cross-model plumbing (config.JUDGE_PROVIDER/JUDGE_MODEL) but a different model string for the confirmer if available (e.g. confirm on gemini-2.5-flash when the judge is flash-lite) so confirmation is not a same-model echo. Store per-reason confirmed/verified bits on FailureReason for the eval harness."
+    },
+    {
+      "title": "Panels: a small cross-family panel helps in principle, but current-model panels deliver only ~2.2 effective votes \u2014 do not buy reliability with more Gemini calls",
+      "claim": "PoLL (Cohere) showed 3 small judges from disjoint families beat a single large judge at ~7x lower cost, and it remains the canonical ensemble recipe. But 'Nine Judges, Two Effective Votes' (2026) measures pairwise error correlation across 9 judges from 7 families: only 2.18 effective independent votes (24% independence), unanimous-agreement accuracy just 90.9% (vs ~99.99% if independent), the single best judge beats the full panel on SNLI/AlphaNLI, no current panel can exceed ~2.6 effective votes, and family diversity does not guarantee independence (highest correlation was a Claude x Gemini pair, phi=0.603). Since this pipeline currently has only working Gemini keys (Groq 401), a second same-family vote would be nearly pure correlation. Conclusion: cap any panel at 2 genuinely different-family judges used as a VETO structure (both must produce a citation-verified failure of the same kind to kill), and otherwise spend the budget on the deterministic checks (Findings 1-3), which are the 'empirical test' that Refute-or-Promote found beats any amount of agreeing LLMs.",
+      "addresses": "F1 (both directions), F5 (partially \u2014 panel disagreement is a cheap unreliability signal, not a calibration substitute)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2404.18796",
+          "note": "PoLL: panel of 3 small judges (disjoint families) outperforms a single large judge across 3 settings/6 datasets, >7x cheaper, less intra-model bias."
+        },
+        {
+          "url": "https://arxiv.org/html/2605.29800",
+          "note": "Nine Judges, Two Effective Votes: 9-judge/7-family panel = 2.18 effective votes (Kish n_eff, mean pairwise error correlation phi=0.391); unanimous accuracy 90.9%; panel 72.0% vs 94% predicted under independence; best single judge beats the panel on 2 of the benchmarks; asymptote ~2.6 effective votes; Claude x Gemini error correlation 0.603."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2604.19049",
+          "note": "Refute-or-Promote: 80+ agents unanimously wrong, one deterministic test right \u2014 unanimity across correlated judges is low-signal; deterministic gates are structurally complementary to LLM votes."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Do NOT add a Gemini-flavored panel to judge_clip() in validate.py. If/when a non-Google key works (Groq/Anthropic/OpenAI), add exactly one second judge as a kill-veto: on the kill path, the second family re-judges the clip; a kill stands only if both families emit a citation-verified failure of the same normalized kind (_norm_kind). Record inter-judge agreement per gate in backend/eval/metrics.py \u2014 the agreement rate doubles as a free drift alarm. Expected cost: ~8 extra calls/video (kill path only)."
+    },
+    {
+      "title": "Corruption-based meta-eval: measure the judge's per-gate TPR/TNR with auto-generated known-bad clips instead of waiting for human gold labels",
+      "claim": "LLMBar established the method of meta-evaluating judges on deliberately adversarial pairs (one correct output, one superficially-better wrong output) and showed even GPT-4-level evaluators are severely fooled by superficial quality \u2014 the same mechanism as this judge giving 9/10 to clips that start and end mid-clause. The pipeline can manufacture its own LLMBar: take clips the judge accepted, apply mechanical corruptions with known ground truth (delete the first/last sentence to force a mid-clause edge; remove the unit containing a pronoun's antecedent; splice in an off-topic unit; strip the equation-introduction unit), and require the judge to flag the corrupted variant while still passing the original. This yields per-gate sensitivity/specificity numbers with zero human labels, directly measuring both F1 failure directions, and gives the empty golden dir (F5) a machine-generated stand-in until real human calibration exists.",
+      "addresses": "F1 (blind passes AND over-kills, now measurable), F5 (unvalidated thresholds get a measurable proxy), F7 (mid-clause corruption tests the boundary gate end-to-end)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2310.07641v2",
+          "note": "LLMBar (ICLR 2024): 419 instances incl. a manually constructed Adversarial set pairing a correct output with a superficially better wrong one; LLM evaluators, even GPT-4, 'suffer severely from over-reliance on superficial quality' \u2014 validates both the blind-pass phenomenon and the adversarial meta-eval-set methodology."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2503.04474",
+          "note": "'Know Thy Judge: On the Robustness Meta-Evaluation of LLM Safety Judges' \u2014 meta-evaluates judges under perturbations/stylistic shifts, showing judge scores move under meaning-preserving changes; supports perturbation-based judge auditing."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "New module backend/eval/judge_probe.py, invoked from run_eval.py (alongside the existing --freeze/--freeze-specs machinery so probes run against frozen structures): for each frozen accepted clip, generate 4 corruptions (edge-chop start, edge-chop end, antecedent-removal using the unit graph's refers_to edges, off-topic splice) and one paraphrase control; run judge_clip() on all variants; report per-gate TPR (corrupted flagged) / TNR (original+paraphrase passed) into metrics.py. Use these curves to set JUDGE_MIN_SCORE and the Finding-2 gate thresholds empirically. Caveat (hence medium): mechanical corruptions are easier than natural failures, so treat probe TPR as an upper bound; it complements, not replaces, the F5 human golden set."
+    },
+    {
+      "title": "Video-native judging is feasible and cheap at gate scale: generateContent video input with video_metadata start/end offsets, ~$0.04-0.10 per video for 12 candidates on flash-lite",
+      "claim": "The Gemini generateContent API supports video clipping without re-encoding: attach video_metadata with start_offset/end_offset (e.g. start_offset='1250s', end_offset='1570s') and optional fps to a video part; supported 'by all models' with quality 'significantly higher with 2.5-series'; the feature shipped May 20, 2025 per the official changelog. Critical caveat verified in the docs: the NEW Interactions API does not yet support video metadata ('features from the generateContent API not yet available in the Interactions API include video metadata (for setting clipping intervals and custom frame rates)'), so this must go through generateContent \u2014 or sidestep offsets entirely by uploading the already-cut clip file. Cost basis (official docs/pricing): ~300 tokens/sec of video at default mediaResolution (258 frame + 32 audio), ~100 tokens/sec at low; gemini-2.5-flash-lite input $0.10/M (video) + $0.30/M (audio). A 120s candidate at default res is ~31k video + 3.8k audio tokens = ~$0.004/judgment; 12 candidates + ~8 repair re-judges = ~$0.09/video (default res) or ~$0.04 (low res); gemini-2.5-flash is ~3x that. One File API upload of the source video per job (the pipeline already downloads it) is reused across all candidates via the file URI with different offsets; public YouTube URLs work without upload. A cheaper 'edge probe' variant judges only the first and last ~8s of each candidate (~4.6k tokens, ~$0.0006/candidate) and asks solely 'does speech begin/end mid-sentence?' \u2014 this deterministically catches the F7/F1-blind mid-clause ships that text-only judging structurally cannot see, and full-clip video judging additionally catches visual deixis ('this equation' pointing at the board) and genre (song vs lecture).",
+      "addresses": "F1 (blind passes on mid-clause clips), F7 (fabricated boundary scores on unpunctuated transcripts), F6 (partial \u2014 the judge hears/sees the genre), F8 (partial \u2014 cold-open visual context becomes visible to the judge)",
+      "sources": [
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/video-understanding",
+          "note": "Official video-understanding guide: token rates (~300 tok/s default, 100 tok/s low res), 1 FPS default sampling, File API 20GB paid / inline <20MB, YouTube public-URL input, 1h/3h max lengths at default/low res."
+        },
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/changelog",
+          "note": "May 20, 2025 entry (retrieved via Context7 from the official docs): 'support for custom video preprocessing using clipping intervals and configurable frame rate sampling' in generateContent."
+        },
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/interactions-overview",
+          "note": "Official limitation list (retrieved via Context7): video metadata (clipping intervals, custom frame rates) is NOT yet available in the new Interactions API \u2014 only in generateContent."
+        },
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/pricing",
+          "note": "Fetched July 2026: 2.5-flash-lite $0.10/M input (text/image/video), $0.30/M audio, $0.40/M output; 2.5-flash $0.30/$1.00/$2.50; 3.1-flash-lite $0.25/$1.50; batch = 50% off \u2014 the cost-model inputs."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "Stage it: (a) EDGE PROBE first (highest value/cost ratio): in refine.py or a new validate.py post-check, after boundary snapping, call generateContent(gemini-2.5-flash-lite) with the source-video file URI + video_metadata offsets [start, start+8s] and [end-8s, end], structured output {starts_mid_sentence: bool, ends_mid_sentence: bool, quote: str}; a mid-sentence hit blocks shipping and feeds a trim/snap retry \u2014 this also bypasses the F7 fake-punctuation fallback entirely because it listens to the audio. (b) FULL-CLIP video judge as the Finding-2/3 confirmation pass on the kill path and as the final pre-ship gate for accepts (~9 calls/video), replacing text-only judging only where video adds signal (missing_visual, source_grounded, genre sanity). Wire through backend/gemini_client.py (add a video-part path using generateContent, NOT the Interactions client); orchestrator.py uploads the downloaded source once per job and passes the file URI + per-candidate offsets from Candidate.start/end. Fallback if generateContent's video_metadata gets deprecated during the Interactions migration: pipeline/cut.py already produces the physical clip \u2014 upload the cut file itself (<20MB inline or File API) and judge that; identical cost, no offsets needed. Marked medium only because the docs are mid-migration (the exact video_metadata syntax page has moved; existence is triple-confirmed but the surface may shift)."
+    }
+  ],
+  "leads": [
+    "arXiv:2510.00915 'Reinforcement Learning with Verifiable yet Noisy Rewards under Imperfect Verifiers' \u2014 abstract claims reward-only scoring 'catastrophically over-rejects faithful samples' regardless of judge strength and pairs a reward gate with a structurally complementary hallucination gate; not fetched in full \u2014 potentially a second theoretical grounding for the asymmetric two-gate design (Finding 2).",
+    "Anthropic Citations API as a citation-enforcing cross-family judge: the API constrains cited spans to come from the provided document, which would make the Finding-1 containment check API-guaranteed AND fix the same-family judge problem (F5) in one move; not fetched/verified this session \u2014 check platform.claude.com docs for citations + structured output interaction and Haiku-tier pricing before adopting.",
+    "arXiv:2512.22245 'Calibrating LLM Judges: Linear Probes for Fast and Reliable Uncertainty Estimation' \u2014 probe-based judge confidence; likely needs logits/activations unavailable via the Gemini API, but relevant if the judge ever moves to a local model; would give the Finding-2 gate a real abstention signal.",
+    "arXiv:2509.19880 'Do Before You Judge: Self-Reference as a Pathway to Better LLM Evaluation' \u2014 judge first performs the task itself (e.g., writes its own summary of the clip) before scoring; surfaced in search, not fetched; could strengthen topic_identifiable judgments.",
+    "arXiv:2603.28005 'Rethinking Atomic Decomposition for LLM Judges: A Prompt-Controlled Study of Reference-Grounded QA Evaluation' \u2014 prompt-controlled evidence on whether claim-decomposition helps reference-grounded judging; would inform how granular Finding-1's per-reason claims should be.",
+    "LettuceDetect / encoder-based token-level RAG hallucination detectors \u2014 a cheap non-LLM span-support checker that could serve as a deterministic-ish arbiter when the evidence_quote containment check is inconclusive (paraphrased quotes); not fetched.",
+    "arXiv:2507.16199 'LLM Abstention Can Be a Prompt Artifact' \u2014 warns that adding an explicit 'unsure' verdict option can inflate abstention on solvable cases; test before adding an abstain option to the judge schema.",
+    "Gemini Batch API 50% discount (pricing page) \u2014 the eval harness's --runs N variance sweeps and the Finding-5 corruption probes are offline and batchable; halves eval cost.",
+    "JudgeBench (ICLR 2025) \u2014 standardized benchmark for picking which judge model to use; could justify the flash-lite vs flash vs pro judge choice with public numbers rather than intuition."
+  ],
+  "notes": "Priority order for implementation: Finding 1 (citation-verified reasons, zero extra cost) -> Finding 2 (asymmetric 3-outcome gate) -> Finding 3 (fresh-context kill confirmation, ~$0.002/video) -> Finding 5 (corruption meta-eval to measure the effect) -> Finding 6 edge-probe (video, fixes what text cannot see) -> Finding 4 veto-judge only when a non-Google key exists. Together these attack the stated economics directly: with 7.7 kills vs 0.667 ships per video, every technique is deliberately placed on the KILL path so passes stay at 1 call. Two audit-specific engineering notes discovered while reading /Users/vincentfeng/Documents/practice/clips/backend/pipeline/assemble/validate.py: (a) the verdict cache key is frozenset(cand.unit_ids), so any later text mutation (refine.py snapping, closure trimming) ships text the judge never saw \u2014 key the cache on a hash of the exact judged text and force a final-text re-judge; this is the mechanism behind F1's 'shipped text never judged' case; (b) FailureReason already has reference_text \u2014 Finding 1 is a ~30-line change (one schema field, one prompt paragraph, one containment function) before any new calls are added. Cross-check with RESEARCH.md: nothing here duplicates the already-shipped G-Eval rubric/CoT, 1-10 scale, or cross-model judge work; Finding 4 explicitly updates RESEARCH.md's PoLL-era panel assumption with the 2026 correlated-errors result. All findings' sources were fetched and read this session (the Refute-or-Promote PDF was read page-by-page for the quantitative claims); search-snippet-only items were demoted to leads.\"",
+  "verification": {
+    "checked": [
+      {
+        "title": "Finding 1: Quote-then-verify with deterministic string-containment check",
+        "supported": false,
+        "note": "Partially supported; the headline mechanism is an unvalidated synthesis. VERIFIED: Datadog's blog does mandate 'a quote from the context and the answer' per claim, uses FSM-enforced structured JSON, a two-stage free-reasoning-then-reformat flow, reports GPT-4o F1 0.810 on HaluBench, and shows the smallest HaluBench-to-RAGTruth F1 drop (supporting robustness on harder human-labeled data). arXiv 2603.00539 is real and does attribute LLM code-review over-rejection to 'requirement hallucination' and 'unsupported assertions'. CoVe (2309.11495) confirmed: verification questions answered independently of the draft; MultiSpanQA F1 0.39->0.48, stated as '23% improvement' (paper page 7). OVERCLAIM: no cited source performs or measures the finding's core step \u2014 post-hoc normalized string-containment verification of quotes with discarding of unverified reasons. Datadog only forces quote EMISSION ('remain anchored in actual content'); the article describes no deterministic post-hoc check that quotes actually appear in the source. 'Uses exactly this rubric' therefore overstates the match, and 'directly kills the phantom-verdict class' is a plausible design inference, not a demonstrated result. Downgrade to: quote-anchoring and separate-step verification are well-evidenced; the containment-check-and-discard step and its claimed effect are the researcher's own extension with no cited empirical support."
+      },
+      {
+        "title": "Finding 2: Asymmetric gate (TPR 96% / TNR <25%; kill requires more evidence than pass)",
+        "supported": true,
+        "note": "Core evidence checks out. 'Beyond Consensus' (2510.11822) confirmed verbatim: TPR 96% vs TNR <25%; proposes minority-veto and a regression-based framework. Refute-or-Promote (2604.19049, read from full PDF) confirmed: 4-stage adversarial pipeline with kill mandates and a mandatory empirical validation gate; ~79% retrospective aggregate kill rate (~135/171) and 83% prospective (25/30); exact quote 'One test killed what 80+ agents' reasoning could not' (Bleichenbacher case, 10 dedicated reviewers unanimous among 80+ agents); section heading 'Unanimity is a low-signal event'; and the Song et al. citation (fresh-context beats same-session, p=0.008; extra rounds degrade quality). CAVEATS to note: (1) the '2x over the best 14-LLM ensemble' is attributed by the paper's abstract to the REGRESSION-calibrated approach (on 366 high-school Python programs, requiring human-annotated ground truth), not jointly to minority-veto as the finding implies \u2014 though RoP's own related-work summary loosely credits minority-veto; (2) the TPR/TNR asymmetry is measured on code-feedback validation, so transfer to clip judging is assumed; (3) RoP is a solo-operator, non-preregistered retrospective field study with acknowledged confounds and no ablations, and its 'kill rates' count killed candidates presumed false \u2014 one unanimous kill was actually a real bug (CVE-2026-41254, rescued only by human override), which supports the asymmetric-gate thesis but means the 79-83% figures are not verified false-positive rates; (4) the specific gate design and the 7.7:0.667 kill/ship ratio are the researcher's pipeline mapping, not source claims."
+      },
+      {
+        "title": "Finding 3: Two-pass fresh-context verdict confirmation",
+        "supported": true,
+        "note": "Sources genuinely support the claim as stated. CoVe (2309.11495, full PDF): factored variant answers verification questions in a context that does not attend to the original draft ('they may be prone to repeating it'), MultiSpanQA F1 0.39->0.48 = the claimed +23%, plus consistent gains on Wikidata/Wiki-Category lists and longform FactScore 55.9->71.4. Refute-or-Promote related work confirmed verbatim: 'Song [11,12] independently showed that fresh-context review outperforms same-session review (p = 0.008) and that additional rounds degrade quality' \u2014 and the finding honestly labels this as secondhand via RoP's related-work section (the underlying Song preprints, arXiv 2603.12123/2603.16244, were not independently checked). Gemini pricing page confirmed: gemini-2.5-flash-lite paid tier $0.10/1M input, $0.40/1M output. MINOR DOWNGRADES: (1) CoVe's numbers are from Llama 65B (2023); effect size on current models is unknown; (2) the finding's specific design of restating failures as neutral yes/no questions cuts slightly against CoVe's own ablation (Table 4), where model-generated yes/no verification questions underperformed open-ended general questions (0.19 vs 0.22 precision on Wiki-Category) \u2014 open-form restatement plus a quote request would hew closer to the evidence; (3) per-video cost arithmetic is internal estimation, not sourced."
+      },
+      {
+        "title": "Finding 4: Panels deliver only ~2.2 effective votes; cap at 2 cross-family veto judges",
+        "supported": true,
+        "note": "The empirical claims match the sources closely. PoLL (2404.18796) abstract confirmed: panel of smaller judges from disjoint model families outperforms a single large judge across 3 judge settings and 6 datasets, over 7x cheaper, less intra-model bias (the paper's panel is indeed 3 models). 'Nine Judges, Two Effective Votes' (2605.29800) confirmed in detail: Kish n_eff 2.18 [CI 2.07-2.31], 24.2% independence, mean pairwise error correlation phi=0.391, unanimous-item accuracy 90.9% vs ~99.99% predicted under independence, panel 72.0% vs ~94% Condorcet prediction, best single judge beats the panel on SNLI (+6.5pp) and AlphaNLI (+2.5pp), asymptotic ceiling 1/phi ~2.56 effective votes, highest-correlation pair Claude Sonnet x Gemini 2.5 Pro phi=0.603, and family diversity does not guarantee independence. Refute-or-Promote's 80+-agents-unanimously-wrong case and 'unanimity is a low-signal event' verified from the PDF. QUALIFIERS: (1) 'no current panel can exceed ~2.6 effective votes' is the paper's asymptotic extrapolation from measured mean correlation, not a test of every possible panel; (2) the same paper found same-family correlation (~0.44) only marginally above the cross-family mean (0.389), so the inference that a second Gemini vote is 'nearly pure correlation' overstates it \u2014 it adds little, but so does a cross-family vote on average; (3) 2605.29800 is a recent preprint (peer-review status unverified); (4) the 2-judge cross-family veto prescription is the researcher's design inference, not a tested configuration in any source."
+      }
+    ],
+    "overall_note": "All 8 cited URLs were fetched and live; the two arXiv PDFs that resisted summarization (Refute-or-Promote 2604.19049, CoVe 2309.11495) were read page-by-page, so every quoted number and phrase was checked against primary text. The research is unusually well-grounded: every quantitative claim (F1 0.810, 96%/25% TPR-TNR, 79%/83% kill rates, 0.39->0.48, n_eff 2.18, phi 0.603, 90.9%, ~2.56 ceiling, $0.10/$0.40 pricing) was confirmed verbatim or near-verbatim in the sources. The one genuine overclaim is Finding 1's central mechanism: Datadog enforces quote emission but never describes post-hoc deterministic string-containment verification or discarding of unverified reasons \u2014 that step and its claimed effect on phantom verdicts are the researcher's untested synthesis, so Finding 1 should be reframed as 'quote-anchoring is validated; the containment check is a proposed extension.' Cross-cutting caution: Refute-or-Promote is a solo, non-preregistered field study (self-acknowledged confounds, no ablations, kill rates are not verified FP rates), Beyond Consensus's 2x result comes from the regression approach requiring human ground truth in a code-feedback domain, and the Song et al. fresh-context evidence is cited secondhand. None of these invalidate Findings 2-4, but the pipeline recommendations rest on domain transfer from code review/security to clip judging, which no source tests directly."
+  }
+}
