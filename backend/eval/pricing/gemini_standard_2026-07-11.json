@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "pricing_version": "gemini-standard-2026-07-11",
+  "captured_on": "2026-07-11",
+  "currency": "USD",
+  "unit": "per_1m_tokens",
+  "prompt_tier_max_tokens": 200000,
+  "source": "https://ai.google.dev/gemini-api/docs/pricing",
+  "models": {
+    "gemini-3.5-flash": {
+      "input": 1.5,
+      "output_including_thoughts": 9.0
+    },
+    "gemini-3.1-pro-preview": {
+      "input": 2.0,
+      "output_including_thoughts": 12.0
+    }
+  }
+}

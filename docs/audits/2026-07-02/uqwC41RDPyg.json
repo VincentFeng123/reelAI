@@ -1,0 +1,1376 @@
+{
+ "video_id": "uqwC41RDPyg",
+ "video_title": "",
+ "duration": 365.44,
+ "detection": {
+  "domain": "lecture",
+  "content_type": "lecture",
+  "confidence": 0.9
+ },
+ "adapter": "LectureAdapter",
+ "n_units": 19,
+ "has_perception": false,
+ "degraded": [],
+ "topic": "",
+ "notes": "1 clip(s).",
+ "n_clips": 1,
+ "n_rejections": 11,
+ "clips": [
+  {
+   "cand_id": "c_u0004",
+   "title": "Calculus Song: Area Under the Curve",
+   "role": "definition",
+   "facet": "definition",
+   "start": 88.31,
+   "end": 124.95,
+   "duration_s": 36.6,
+   "sentence_span": [
+    8,
+    9
+   ],
+   "span_text": "Y prime is the derivative of y. y = x to the n dy dx = m * x to the n -1 [Music] applications of Divives apply.",
+   "context_card": "",
+   "warnings": [
+    "extended_for_min_duration"
+   ],
+   "merged": false,
+   "truncated": false,
+   "judge_error": false,
+   "verdict": {
+    "score_10": 9,
+    "score": 0.9,
+    "understandable": true,
+    "reasoning": "The clip defines 'Y prime' as the derivative of 'y'. This is a complete definition, and no external context is needed to understand it. The topic and purpose are identifiable, all references are resolved, and no prerequisites are assumed.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": true,
+     "reasoning_complete": true,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [],
+    "error": false
+   },
+   "verdict_source": "validate_and_repair",
+   "judge_attempts": 1,
+   "validated_span_differs": true,
+   "scores": {
+    "completeness": 1.0,
+    "grounding": 1.0,
+    "boundary": 0.9,
+    "priority": 0.68,
+    "final_quality": 0.948
+   },
+   "prerequisite_clips": [],
+   "unit_ids": [
+    "u0004",
+    "u0005"
+   ],
+   "unit_roles": [
+    {
+     "id": "u0004",
+     "role": "definition",
+     "topic": "Calculus Song: Area Under the Curve"
+    },
+    {
+     "id": "u0005",
+     "role": "equation_introduction",
+     "topic": "Calculus Song: Area Under the Curve"
+    }
+   ],
+   "referential": []
+  }
+ ],
+ "rejections": [
+  {
+   "cand_id": "c_u0002",
+   "title": "Calculus Song: Area Under the Curve",
+   "role": "claim",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_prerequisite",
+    "other"
+   ],
+   "final_quality": null,
+   "start": 9.03,
+   "end": 184.42,
+   "duration_s": 175.4,
+   "span_text": "[Music] is font. How do you find out? You can use the limit process approach from both sides, the left and the right and neat. I'm just a living function continuous. There's no holes, no sharp points or as totes. Any way this graph goes, it is differentable for me. for me. All year in calculus, [Music] we've learned so many things about which we are going to sing. We can find derivatives and integrals and the area close between two curves. Y prime is the derivative of y. y = x to the n dy dx = m * x to the n -1 [Music] applications of Divives apply. If y's divided or multiplied, you use the quotient two and you forget to do the dance. [Music] I s [Music] the chain before you are done. You can't remember to multiply by the chain. [Music] [Applause] I need to find the area under curve.",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "irrelevant",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The unit contains music.",
+     "start": 6.5,
+     "end": 9.0
+    },
+    {
+     "unit_id": "u0001",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The area under a curve can be found using the limit process from both sides.",
+     "start": 9.0,
+     "end": 27.7
+    },
+    {
+     "unit_id": "u0002",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "A continuous function with no holes, sharp points, or asymptotes is differentiable.",
+     "start": 28.9,
+     "end": 56.1
+    },
+    {
+     "unit_id": "u0003",
+     "role": "summary",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The song will cover derivatives, integrals, and the area between two curves, which are topics learned in calculus.",
+     "start": 59.9,
+     "end": 88.3
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "Y prime is defined as the derivative of y.",
+     "start": 88.3,
+     "end": 99.0
+    },
+    {
+     "unit_id": "u0005",
+     "role": "equation_introduction",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The power rule for derivatives is introduced: if y = x^n, then dy/dx = n * x^(n-1).",
+     "start": 99.0,
+     "end": 125.0
+    },
+    {
+     "unit_id": "u0006",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "When y is divided or multiplied, the quotient rule and chain rule must be applied for derivatives.",
+     "start": 125.0,
+     "end": 184.4
+    },
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip discusses calculus concepts like limits, continuity, differentiability, derivatives, and integrals. However, it jumps between topics without clear transitions or explanations, making it difficult to follow. Key terms like 'limit process approach' and 'differentiable' are mentioned but not defined, and the clip seems to assume prior knowledge of calculus. The purpose is unclear as it touches on various calculus topics without a specific problem or argument being presented.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes knowledge of calculus concepts like limits, continuity, and differentiability without defining them.",
+      "missing_concept": "Calculus concepts (limits, continuity, differentiability)",
+      "reference_text": null
+     },
+     {
+      "kind": "other",
+      "detail": "The clip jumps between various calculus topics (limits, continuity, derivatives, integrals) without a clear narrative or purpose, making it difficult to follow as a self-contained unit.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0015",
+   "title": "Calculus Concepts: Integration and Infinity",
+   "role": "claim",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_prerequisite",
+    "missing_problem_statement"
+   ],
+   "final_quality": null,
+   "start": 236.72,
+   "end": 295.3,
+   "duration_s": 58.6,
+   "span_text": "Can you find the area between f and g integrate f and then integrate g and subract around the yaxis [Music] square mip integral by pi taste real good with whipped cream. Oh, mama mia, mama mia, mama mia, let me go preculus. Cannot help me prepare for calculus. Help me. [Music] So you think you can find out the limit of y. Do you think you'll find zero and have it to find? Oh baby, can't define that point, baby. It's undefined. Close to positive and negative infinity. [Music] [Applause] [Music] Ooh.",
+   "units_in_span": [
+    {
+     "unit_id": "u0011",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the area between two functions f and g by integrating them and subtracting around the y-axis.",
+     "start": 218.9,
+     "end": 236.7
+    },
+    {
+     "unit_id": "u0012",
+     "role": "claim",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker claims that pre-calculus cannot help prepare for calculus.",
+     "start": 236.7,
+     "end": 249.2
+    },
+    {
+     "unit_id": "u0013",
+     "role": "administrative",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks for help.",
+     "start": 249.2,
+     "end": 251.3
+    },
+    {
+     "unit_id": "u0014",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the limit of y and if it will be zero and defined.",
+     "start": 251.3,
+     "end": 275.5
+    },
+    {
+     "unit_id": "u0015",
+     "role": "claim",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker states that the point is undefined and close to positive and negative infinity.",
+     "start": 275.5,
+     "end": 295.3
+    },
+    {
+     "unit_id": "u0016",
+     "role": "irrelevant",
+     "topic": "Musical Interlude and Reflection",
+     "summary": "The speaker makes vocalizations during a musical interlude.",
+     "start": 295.3,
+     "end": 309.7
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip is a song about limits in calculus, but it assumes the viewer knows what a limit is and how to find it. The lyrics are metaphorical and don't present a clear problem statement or solution, making the purpose and topic difficult to fully grasp without prior knowledge. The phrase 'mama mia' and the music suggest it's part of a larger piece, but the core concepts are not explained.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip discusses limits in calculus but does not explain what a limit is or how to find it, which is a necessary prerequisite for understanding the content.",
+      "missing_concept": "limits in calculus",
+      "reference_text": null
+     },
+     {
+      "kind": "missing_problem_statement",
+      "detail": "The clip is framed as a song and does not present a clear mathematical problem to be solved.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0001",
+   "title": "Calculus Song: Area Under the Curve",
+   "role": "claim",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_prerequisite",
+    "other"
+   ],
+   "final_quality": null,
+   "start": 9.03,
+   "end": 184.42,
+   "duration_s": 175.4,
+   "span_text": "[Music] is font. How do you find out? You can use the limit process approach from both sides, the left and the right and neat. I'm just a living function continuous. There's no holes, no sharp points or as totes. Any way this graph goes, it is differentable for me. for me. All year in calculus, [Music] we've learned so many things about which we are going to sing. We can find derivatives and integrals and the area close between two curves. Y prime is the derivative of y. y = x to the n dy dx = m * x to the n -1 [Music] applications of Divives apply. If y's divided or multiplied, you use the quotient two and you forget to do the dance. [Music] I s [Music] the chain before you are done. You can't remember to multiply by the chain. [Music] [Applause] I need to find the area under curve.",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "irrelevant",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The unit contains music.",
+     "start": 6.5,
+     "end": 9.0
+    },
+    {
+     "unit_id": "u0001",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The area under a curve can be found using the limit process from both sides.",
+     "start": 9.0,
+     "end": 27.7
+    },
+    {
+     "unit_id": "u0002",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "A continuous function with no holes, sharp points, or asymptotes is differentiable.",
+     "start": 28.9,
+     "end": 56.1
+    },
+    {
+     "unit_id": "u0003",
+     "role": "summary",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The song will cover derivatives, integrals, and the area between two curves, which are topics learned in calculus.",
+     "start": 59.9,
+     "end": 88.3
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "Y prime is defined as the derivative of y.",
+     "start": 88.3,
+     "end": 99.0
+    },
+    {
+     "unit_id": "u0005",
+     "role": "equation_introduction",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The power rule for derivatives is introduced: if y = x^n, then dy/dx = n * x^(n-1).",
+     "start": 99.0,
+     "end": 125.0
+    },
+    {
+     "unit_id": "u0006",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "When y is divided or multiplied, the quotient rule and chain rule must be applied for derivatives.",
+     "start": 125.0,
+     "end": 184.4
+    },
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip discusses calculus concepts like limits, continuity, differentiability, derivatives, and integrals. However, it jumps between topics without clear transitions or explanations, making it difficult to follow. Key terms like 'limit process approach' and 'differentiable' are mentioned but not defined, and the clip seems to assume prior knowledge of calculus. The purpose is unclear as it touches on various calculus topics without a specific problem or argument being presented.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes knowledge of calculus concepts like limits, continuity, and differentiability without defining them.",
+      "missing_concept": "Calculus concepts (limits, continuity, differentiability)",
+      "reference_text": null
+     },
+     {
+      "kind": "other",
+      "detail": "The clip jumps between various calculus topics (limits, continuity, derivatives, integrals) without a clear narrative or purpose, making it difficult to follow as a self-contained unit.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0008",
+   "title": "Calculus Concepts: Integration and Infinity",
+   "role": "procedure",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_problem_statement",
+    "missing_reasoning",
+    "missing_result",
+    "missing_prerequisite"
+   ],
+   "final_quality": null,
+   "start": 184.42,
+   "end": 218.92,
+   "duration_s": 34.5,
+   "span_text": "You can't remember to multiply by the chain. [Music] [Applause] I need to find the area under curve. Integrate. Integrate. You can use the integration. Find the reciprocal. Add a constant. Add a constant. Add a constant. Add a constant. Add a conant. I'm just a constant. Nobody loves me. He is just a constant. Might as well just call it C. Never forget to see. Can you find the area between f and g integrate f and then integrate g and subract around the yaxis [Music] square mip integral by pi taste real good with whipped cream.",
+   "units_in_span": [
+    {
+     "unit_id": "u0006",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "When y is divided or multiplied, the quotient rule and chain rule must be applied for derivatives.",
+     "start": 125.0,
+     "end": 184.4
+    },
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    },
+    {
+     "unit_id": "u0008",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to integrate.",
+     "start": 194.5,
+     "end": 198.5
+    },
+    {
+     "unit_id": "u0009",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to find the reciprocal.",
+     "start": 198.5,
+     "end": 200.2
+    },
+    {
+     "unit_id": "u0010",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker emphasizes adding a constant of integration, C, and not forgetting it.",
+     "start": 200.2,
+     "end": 218.9
+    },
+    {
+     "unit_id": "u0011",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the area between two functions f and g by integrating them and subtracting around the y-axis.",
+     "start": 218.9,
+     "end": 236.7
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip discusses finding the area under a curve using integration, but it lacks a specific problem statement, the actual integration steps, and a clear result. The references to 'integrate' and 'add a constant' are too vague to be understood without context. The humor about the constant 'C' is present but doesn't compensate for the missing procedural information.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_problem_statement",
+      "detail": "The clip mentions finding the area under a curve but does not state the specific function or limits of integration.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_reasoning",
+      "detail": "The clip mentions 'integrate' and 'add a constant' but does not show the actual integration process or explain how to perform it for a given problem.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_result",
+      "detail": "There is no specific result or answer presented for the area under the curve.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes the viewer knows how to integrate and what 'area under a curve' implies in a calculus context.",
+      "missing_concept": "Calculus integration and its application to finding area under a curve.",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0009",
+   "title": "Calculus Concepts: Integration and Infinity",
+   "role": "procedure",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_problem_statement",
+    "missing_reasoning",
+    "missing_result",
+    "missing_prerequisite"
+   ],
+   "final_quality": null,
+   "start": 184.42,
+   "end": 218.92,
+   "duration_s": 34.5,
+   "span_text": "You can't remember to multiply by the chain. [Music] [Applause] I need to find the area under curve. Integrate. Integrate. You can use the integration. Find the reciprocal. Add a constant. Add a constant. Add a constant. Add a constant. Add a conant. I'm just a constant. Nobody loves me. He is just a constant. Might as well just call it C. Never forget to see. Can you find the area between f and g integrate f and then integrate g and subract around the yaxis [Music] square mip integral by pi taste real good with whipped cream.",
+   "units_in_span": [
+    {
+     "unit_id": "u0006",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "When y is divided or multiplied, the quotient rule and chain rule must be applied for derivatives.",
+     "start": 125.0,
+     "end": 184.4
+    },
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    },
+    {
+     "unit_id": "u0008",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to integrate.",
+     "start": 194.5,
+     "end": 198.5
+    },
+    {
+     "unit_id": "u0009",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to find the reciprocal.",
+     "start": 198.5,
+     "end": 200.2
+    },
+    {
+     "unit_id": "u0010",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker emphasizes adding a constant of integration, C, and not forgetting it.",
+     "start": 200.2,
+     "end": 218.9
+    },
+    {
+     "unit_id": "u0011",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the area between two functions f and g by integrating them and subtracting around the y-axis.",
+     "start": 218.9,
+     "end": 236.7
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip discusses finding the area under a curve using integration, but it lacks a specific problem statement, the actual integration steps, and a clear result. The references to 'integrate' and 'add a constant' are too vague to be understood without context. The humor about the constant 'C' is present but doesn't compensate for the missing procedural information.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_problem_statement",
+      "detail": "The clip mentions finding the area under a curve but does not state the specific function or limits of integration.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_reasoning",
+      "detail": "The clip mentions 'integrate' and 'add a constant' but does not show the actual integration process or explain how to perform it for a given problem.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_result",
+      "detail": "There is no specific result or answer presented for the area under the curve.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes the viewer knows how to integrate and what 'area under a curve' implies in a calculus context.",
+      "missing_concept": "Calculus integration and its application to finding area under a curve.",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0010",
+   "title": "Calculus Concepts: Integration and Infinity",
+   "role": "procedure",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_problem_statement",
+    "missing_reasoning",
+    "missing_result",
+    "missing_prerequisite"
+   ],
+   "final_quality": null,
+   "start": 184.42,
+   "end": 218.92,
+   "duration_s": 34.5,
+   "span_text": "You can't remember to multiply by the chain. [Music] [Applause] I need to find the area under curve. Integrate. Integrate. You can use the integration. Find the reciprocal. Add a constant. Add a constant. Add a constant. Add a constant. Add a conant. I'm just a constant. Nobody loves me. He is just a constant. Might as well just call it C. Never forget to see. Can you find the area between f and g integrate f and then integrate g and subract around the yaxis [Music] square mip integral by pi taste real good with whipped cream.",
+   "units_in_span": [
+    {
+     "unit_id": "u0006",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "When y is divided or multiplied, the quotient rule and chain rule must be applied for derivatives.",
+     "start": 125.0,
+     "end": 184.4
+    },
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    },
+    {
+     "unit_id": "u0008",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to integrate.",
+     "start": 194.5,
+     "end": 198.5
+    },
+    {
+     "unit_id": "u0009",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to find the reciprocal.",
+     "start": 198.5,
+     "end": 200.2
+    },
+    {
+     "unit_id": "u0010",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker emphasizes adding a constant of integration, C, and not forgetting it.",
+     "start": 200.2,
+     "end": 218.9
+    },
+    {
+     "unit_id": "u0011",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the area between two functions f and g by integrating them and subtracting around the y-axis.",
+     "start": 218.9,
+     "end": 236.7
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip discusses finding the area under a curve using integration, but it lacks a specific problem statement, the actual integration steps, and a clear result. The references to 'integrate' and 'add a constant' are too vague to be understood without context. The humor about the constant 'C' is present but doesn't compensate for the missing procedural information.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_problem_statement",
+      "detail": "The clip mentions finding the area under a curve but does not state the specific function or limits of integration.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_reasoning",
+      "detail": "The clip mentions 'integrate' and 'add a constant' but does not show the actual integration process or explain how to perform it for a given problem.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_result",
+      "detail": "There is no specific result or answer presented for the area under the curve.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes the viewer knows how to integrate and what 'area under a curve' implies in a calculus context.",
+      "missing_concept": "Calculus integration and its application to finding area under a curve.",
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0005",
+   "title": "Calculus Song: Area Under the Curve",
+   "role": "equation_introduction",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.4,
+   "failure_kinds": [
+    "other"
+   ],
+   "final_quality": null,
+   "start": 59.92,
+   "end": 198.49,
+   "duration_s": 138.6,
+   "span_text": "All year in calculus, [Music] we've learned so many things about which we are going to sing. We can find derivatives and integrals and the area close between two curves. Y prime is the derivative of y. y = x to the n dy dx = m * x to the n -1 [Music] applications of Divives apply. If y's divided or multiplied, you use the quotient two and you forget to do the dance. [Music] I s [Music] the chain before you are done. You can't remember to multiply by the chain. [Music] [Applause] I need to find the area under curve. Integrate. Integrate. You can use the integration. Find the reciprocal.",
+   "units_in_span": [
+    {
+     "unit_id": "u0003",
+     "role": "summary",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The song will cover derivatives, integrals, and the area between two curves, which are topics learned in calculus.",
+     "start": 59.9,
+     "end": 88.3
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "Y prime is defined as the derivative of y.",
+     "start": 88.3,
+     "end": 99.0
+    },
+    {
+     "unit_id": "u0005",
+     "role": "equation_introduction",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The power rule for derivatives is introduced: if y = x^n, then dy/dx = n * x^(n-1).",
+     "start": 99.0,
+     "end": 125.0
+    },
+    {
+     "unit_id": "u0006",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "When y is divided or multiplied, the quotient rule and chain rule must be applied for derivatives.",
+     "start": 125.0,
+     "end": 184.4
+    },
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    },
+    {
+     "unit_id": "u0008",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to integrate.",
+     "start": 194.5,
+     "end": 198.5
+    },
+    {
+     "unit_id": "u0009",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to find the reciprocal.",
+     "start": 198.5,
+     "end": 200.2
+    }
+   ],
+   "first_verdict": {
+    "score_10": 4,
+    "score": 0.4,
+    "understandable": false,
+    "reasoning": "The clip introduces the concept of a derivative and provides its basic formula. However, it lacks a clear problem statement or a specific application to demonstrate the purpose of derivatives, making it difficult to fully grasp the context and importance of the information presented. The term 'y prime' is defined, but the overall purpose of introducing derivatives is not fully established.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "other",
+      "detail": "The clip introduces a concept (derivatives) and its formula but does not provide a clear problem or application to demonstrate its purpose or relevance.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0011",
+   "title": "Calculus Concepts: Integration and Infinity",
+   "role": "practice_prompt",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_problem_statement"
+   ],
+   "final_quality": null,
+   "start": 184.42,
+   "end": 275.5,
+   "duration_s": 91.1,
+   "span_text": "You can't remember to multiply by the chain. [Music] [Applause] I need to find the area under curve. Integrate. Integrate. You can use the integration. Find the reciprocal. Add a constant. Add a constant. Add a constant. Add a constant. Add a conant. I'm just a constant. Nobody loves me. He is just a constant. Might as well just call it C. Never forget to see. Can you find the area between f and g integrate f and then integrate g and subract around the yaxis [Music] square mip integral by pi taste real good with whipped cream. Oh, mama mia, mama mia, mama mia, let me go preculus. Cannot help me prepare for calculus. Help me. [Music] So you think you can find out the limit of y. Do you think you'll find zero and have it to find? Oh baby, can't define that point, baby.",
+   "units_in_span": [
+    {
+     "unit_id": "u0006",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "When y is divided or multiplied, the quotient rule and chain rule must be applied for derivatives.",
+     "start": 125.0,
+     "end": 184.4
+    },
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    },
+    {
+     "unit_id": "u0008",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to integrate.",
+     "start": 194.5,
+     "end": 198.5
+    },
+    {
+     "unit_id": "u0009",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to find the reciprocal.",
+     "start": 198.5,
+     "end": 200.2
+    },
+    {
+     "unit_id": "u0010",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker emphasizes adding a constant of integration, C, and not forgetting it.",
+     "start": 200.2,
+     "end": 218.9
+    },
+    {
+     "unit_id": "u0011",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the area between two functions f and g by integrating them and subtracting around the y-axis.",
+     "start": 218.9,
+     "end": 236.7
+    },
+    {
+     "unit_id": "u0012",
+     "role": "claim",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker claims that pre-calculus cannot help prepare for calculus.",
+     "start": 236.7,
+     "end": 249.2
+    },
+    {
+     "unit_id": "u0013",
+     "role": "administrative",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks for help.",
+     "start": 249.2,
+     "end": 251.3
+    },
+    {
+     "unit_id": "u0014",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the limit of y and if it will be zero and defined.",
+     "start": 251.3,
+     "end": 275.5
+    },
+    {
+     "unit_id": "u0015",
+     "role": "claim",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker states that the point is undefined and close to positive and negative infinity.",
+     "start": 275.5,
+     "end": 295.3
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip is a song about integration and finding the area under a curve, but it lacks a specific problem statement, making it impossible to follow the calculation or understand the purpose beyond a general musical explanation of calculus concepts. It mentions integrating f and g and subtracting, but without the functions or limits, it's incomplete.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_problem_statement",
+      "detail": "The clip discusses integration and finding the area under a curve but does not present a specific problem with functions and limits to solve.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0014",
+   "title": "Calculus Concepts: Integration and Infinity",
+   "role": "practice_prompt",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_problem_statement"
+   ],
+   "final_quality": null,
+   "start": 184.42,
+   "end": 275.5,
+   "duration_s": 91.1,
+   "span_text": "You can't remember to multiply by the chain. [Music] [Applause] I need to find the area under curve. Integrate. Integrate. You can use the integration. Find the reciprocal. Add a constant. Add a constant. Add a constant. Add a constant. Add a conant. I'm just a constant. Nobody loves me. He is just a constant. Might as well just call it C. Never forget to see. Can you find the area between f and g integrate f and then integrate g and subract around the yaxis [Music] square mip integral by pi taste real good with whipped cream. Oh, mama mia, mama mia, mama mia, let me go preculus. Cannot help me prepare for calculus. Help me. [Music] So you think you can find out the limit of y. Do you think you'll find zero and have it to find? Oh baby, can't define that point, baby.",
+   "units_in_span": [
+    {
+     "unit_id": "u0006",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "When y is divided or multiplied, the quotient rule and chain rule must be applied for derivatives.",
+     "start": 125.0,
+     "end": 184.4
+    },
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    },
+    {
+     "unit_id": "u0008",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to integrate.",
+     "start": 194.5,
+     "end": 198.5
+    },
+    {
+     "unit_id": "u0009",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to find the reciprocal.",
+     "start": 198.5,
+     "end": 200.2
+    },
+    {
+     "unit_id": "u0010",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker emphasizes adding a constant of integration, C, and not forgetting it.",
+     "start": 200.2,
+     "end": 218.9
+    },
+    {
+     "unit_id": "u0011",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the area between two functions f and g by integrating them and subtracting around the y-axis.",
+     "start": 218.9,
+     "end": 236.7
+    },
+    {
+     "unit_id": "u0012",
+     "role": "claim",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker claims that pre-calculus cannot help prepare for calculus.",
+     "start": 236.7,
+     "end": 249.2
+    },
+    {
+     "unit_id": "u0013",
+     "role": "administrative",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks for help.",
+     "start": 249.2,
+     "end": 251.3
+    },
+    {
+     "unit_id": "u0014",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the limit of y and if it will be zero and defined.",
+     "start": 251.3,
+     "end": 275.5
+    },
+    {
+     "unit_id": "u0015",
+     "role": "claim",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker states that the point is undefined and close to positive and negative infinity.",
+     "start": 275.5,
+     "end": 295.3
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip is a song about integration and finding the area under a curve, but it lacks a specific problem statement, making it impossible to follow the calculation or understand the purpose beyond a general musical explanation of calculus concepts. It mentions integrating f and g and subtracting, but without the functions or limits, it's incomplete.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_problem_statement",
+      "detail": "The clip discusses integration and finding the area under a curve but does not present a specific problem with functions and limits to solve.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0012",
+   "title": "Calculus Concepts: Integration and Infinity",
+   "role": "claim",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_prerequisite",
+    "missing_problem_statement"
+   ],
+   "final_quality": null,
+   "start": 194.49,
+   "end": 295.3,
+   "duration_s": 100.8,
+   "span_text": "[Music] [Applause] I need to find the area under curve. Integrate. Integrate. You can use the integration. Find the reciprocal. Add a constant. Add a constant. Add a constant. Add a constant. Add a conant. I'm just a constant. Nobody loves me. He is just a constant. Might as well just call it C. Never forget to see. Can you find the area between f and g integrate f and then integrate g and subract around the yaxis [Music] square mip integral by pi taste real good with whipped cream. Oh, mama mia, mama mia, mama mia, let me go preculus. Cannot help me prepare for calculus. Help me. [Music] So you think you can find out the limit of y. Do you think you'll find zero and have it to find? Oh baby, can't define that point, baby. It's undefined. Close to positive and negative infinity. [Music] [Applause] [Music] Ooh.",
+   "units_in_span": [
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    },
+    {
+     "unit_id": "u0008",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to integrate.",
+     "start": 194.5,
+     "end": 198.5
+    },
+    {
+     "unit_id": "u0009",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to find the reciprocal.",
+     "start": 198.5,
+     "end": 200.2
+    },
+    {
+     "unit_id": "u0010",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker emphasizes adding a constant of integration, C, and not forgetting it.",
+     "start": 200.2,
+     "end": 218.9
+    },
+    {
+     "unit_id": "u0011",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the area between two functions f and g by integrating them and subtracting around the y-axis.",
+     "start": 218.9,
+     "end": 236.7
+    },
+    {
+     "unit_id": "u0012",
+     "role": "claim",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker claims that pre-calculus cannot help prepare for calculus.",
+     "start": 236.7,
+     "end": 249.2
+    },
+    {
+     "unit_id": "u0013",
+     "role": "administrative",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks for help.",
+     "start": 249.2,
+     "end": 251.3
+    },
+    {
+     "unit_id": "u0014",
+     "role": "practice_prompt",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker asks if the viewer can find the limit of y and if it will be zero and defined.",
+     "start": 251.3,
+     "end": 275.5
+    },
+    {
+     "unit_id": "u0015",
+     "role": "claim",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker states that the point is undefined and close to positive and negative infinity.",
+     "start": 275.5,
+     "end": 295.3
+    },
+    {
+     "unit_id": "u0016",
+     "role": "irrelevant",
+     "topic": "Musical Interlude and Reflection",
+     "summary": "The speaker makes vocalizations during a musical interlude.",
+     "start": 295.3,
+     "end": 309.7
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip is a song about limits in calculus, but it assumes the viewer knows what a limit is and how to find it. The lyrics are metaphorical and don't present a clear problem statement or solution, making the purpose and topic difficult to fully grasp without prior knowledge. The phrase 'mama mia' and the music suggest it's part of a larger piece, but the core concepts are not explained.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip discusses limits in calculus but does not explain what a limit is or how to find it, which is a necessary prerequisite for understanding the content.",
+      "missing_concept": "limits in calculus",
+      "reference_text": null
+     },
+     {
+      "kind": "missing_problem_statement",
+      "detail": "The clip is framed as a song and does not present a clear mathematical problem to be solved.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  },
+  {
+   "cand_id": "c_u0006",
+   "title": "Calculus Song: Area Under the Curve",
+   "role": "claim",
+   "stage": "repair",
+   "reason": "judge verdict incomplete after repair budget",
+   "judge_score": 0.3,
+   "failure_kinds": [
+    "missing_prerequisite",
+    "other"
+   ],
+   "final_quality": null,
+   "start": 6.48,
+   "end": 200.2,
+   "duration_s": 193.7,
+   "span_text": "[Music] is font. How do you find out? You can use the limit process approach from both sides, the left and the right and neat. I'm just a living function continuous. There's no holes, no sharp points or as totes. Any way this graph goes, it is differentable for me. for me. All year in calculus, [Music] we've learned so many things about which we are going to sing. We can find derivatives and integrals and the area close between two curves. Y prime is the derivative of y. y = x to the n dy dx = m * x to the n -1 [Music] applications of Divives apply. If y's divided or multiplied, you use the quotient two and you forget to do the dance. [Music] I s [Music] the chain before you are done. You can't remember to multiply by the chain. [Music] [Applause] I need to find the area under curve. Integrate. Integrate. You can use the integration. Find the reciprocal. Add a constant.",
+   "units_in_span": [
+    {
+     "unit_id": "u0000",
+     "role": "irrelevant",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The unit contains music.",
+     "start": 6.5,
+     "end": 9.0
+    },
+    {
+     "unit_id": "u0001",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The area under a curve can be found using the limit process from both sides.",
+     "start": 9.0,
+     "end": 27.7
+    },
+    {
+     "unit_id": "u0002",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "A continuous function with no holes, sharp points, or asymptotes is differentiable.",
+     "start": 28.9,
+     "end": 56.1
+    },
+    {
+     "unit_id": "u0003",
+     "role": "summary",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The song will cover derivatives, integrals, and the area between two curves, which are topics learned in calculus.",
+     "start": 59.9,
+     "end": 88.3
+    },
+    {
+     "unit_id": "u0004",
+     "role": "definition",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "Y prime is defined as the derivative of y.",
+     "start": 88.3,
+     "end": 99.0
+    },
+    {
+     "unit_id": "u0005",
+     "role": "equation_introduction",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The power rule for derivatives is introduced: if y = x^n, then dy/dx = n * x^(n-1).",
+     "start": 99.0,
+     "end": 125.0
+    },
+    {
+     "unit_id": "u0006",
+     "role": "claim",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "When y is divided or multiplied, the quotient rule and chain rule must be applied for derivatives.",
+     "start": 125.0,
+     "end": 184.4
+    },
+    {
+     "unit_id": "u0007",
+     "role": "setup",
+     "topic": "Calculus Song: Area Under the Curve",
+     "summary": "The goal is to find the area under a curve.",
+     "start": 184.4,
+     "end": 194.5
+    },
+    {
+     "unit_id": "u0008",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to integrate.",
+     "start": 194.5,
+     "end": 198.5
+    },
+    {
+     "unit_id": "u0009",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker instructs to find the reciprocal.",
+     "start": 198.5,
+     "end": 200.2
+    },
+    {
+     "unit_id": "u0010",
+     "role": "procedure",
+     "topic": "Calculus Concepts: Integration and Infinity",
+     "summary": "The speaker emphasizes adding a constant of integration, C, and not forgetting it.",
+     "start": 200.2,
+     "end": 218.9
+    }
+   ],
+   "first_verdict": {
+    "score_10": 3,
+    "score": 0.3,
+    "understandable": false,
+    "reasoning": "The clip discusses calculus concepts like limits, continuity, differentiability, derivatives, and integrals. However, it jumps between topics without clear transitions or explanations, making it difficult to follow. Key terms like 'limit process approach' and 'differentiable' are mentioned but not defined, and the clip seems to assume prior knowledge of calculus. The purpose is unclear as it touches on various calculus topics without a specific problem or argument being presented.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes knowledge of calculus concepts like limits, continuity, and differentiability without defining them.",
+      "missing_concept": "Calculus concepts (limits, continuity, differentiability)",
+      "reference_text": null
+     },
+     {
+      "kind": "other",
+      "detail": "The clip jumps between various calculus topics (limits, continuity, derivatives, integrals) without a clear narrative or purpose, making it difficult to follow as a self-contained unit.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ],
+    "error": false
+   }
+  }
+ ]
+}

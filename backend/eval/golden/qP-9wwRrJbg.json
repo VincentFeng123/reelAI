@@ -1,0 +1,190 @@
+{
+  "video_id": "qP-9wwRrJbg",
+  "topics": [
+    "kinematics"
+  ],
+  "inventory": [
+    {
+      "n": 1,
+      "type": "exam_tip",
+      "start": 7.41,
+      "end": 33.52,
+      "description": "Sig figs strategy: the AP Physics 1 exam basically ignores significant figures - just use roughly 3 sig figs and move on (core claim 21.44-33.52)."
+    },
+    {
+      "n": 2,
+      "type": "worked_example",
+      "start": 36.18,
+      "end": 92.72,
+      "description": "Unit conversion worked example: convert 8,765 kg/m^3 to g/cm^3 by multiplying by factors equal to 1; cube the m->cm factor for cubic units; answer 8.77 g/cm^3."
+    },
+    {
+      "n": 3,
+      "type": "definition",
+      "start": 108.51,
+      "end": 142.08,
+      "description": "Vectors vs scalars: vectors have magnitude AND direction, scalars magnitude only; example lists (displacement, velocity, acceleration, force, momentum, torque vs time, distance, mass, speed, volume, density, work, energy)."
+    },
+    {
+      "n": 4,
+      "type": "concept",
+      "start": 142.08,
+      "end": 189.65,
+      "description": "Vector notation: three ways vectors are written (arrow over variable, subscript, boldface - boldface unlikely on the AP exam); arrows in diagrams have length proportional to magnitude (15 vs 30 m/s example)."
+    },
+    {
+      "n": 5,
+      "type": "definition",
+      "start": 189.65,
+      "end": 246.44,
+      "description": "Displacement: straight-line distance from initial to final position; delta-x = x_final - x_initial; zero for any round trip regardless of path; distance >= |displacement|; magnitude defined; 5 m North example; displacement is a vector."
+    },
+    {
+      "n": 6,
+      "type": "definition",
+      "start": 247.6,
+      "end": 304.48,
+      "description": "Speed vs velocity: average speed = distance/time-duration (scalar); average velocity = displacement/change-in-time (vector); typical units; instantaneous velocity = velocity at a specific time vs average over an interval."
+    },
+    {
+      "n": 7,
+      "type": "definition",
+      "start": 304.48,
+      "end": 344.94,
+      "description": "Acceleration: average acceleration = change in velocity / change in time; vector; units m/s^2 (the only units ever seen); instantaneous vs average acceleration. NOTE: shipped clip1 covers only 304.48-324.28 (~50%), cutting off instantaneous acceleration."
+    },
+    {
+      "n": 8,
+      "type": "equation_introduction",
+      "start": 346.06,
+      "end": 381.68,
+      "description": "UAM (kinematics) equations for constant/uniform acceleration: the 3 equations on the AP equation sheet plus a 4th worth memorizing, delta-x = 1/2(v_fx + v_ix)t."
+    },
+    {
+      "n": 9,
+      "type": "explanation",
+      "start": 381.68,
+      "end": 441.84,
+      "description": "The 5 UAM variables (a, v_f, v_i, delta-x, delta-t) and how to decode College Board equation-sheet notation: t means delta-t (t_i assumed 0), v_x means final velocity in x, x - x_0 equals displacement."
+    },
+    {
+      "n": 10,
+      "type": "explanation",
+      "start": 441.84,
+      "end": 475.28,
+      "description": "UAM sign conventions (variables are +/- by direction, e.g. downward final velocity is negative unless down is defined positive) and the counting rule: 5 variables, 4 equations, know 3 -> solve for the other 2."
+    },
+    {
+      "n": 11,
+      "type": "concept",
+      "start": 475.28,
+      "end": 485.43,
+      "description": "Both velocities in the UAM equations are instantaneous: v_initial and v_final are each at a specific point in time (natural rider on item 10 or 12)."
+    },
+    {
+      "n": 12,
+      "type": "definition",
+      "start": 485.43,
+      "end": 531.44,
+      "description": "Free fall: object near Earth's surface with air resistance ignored - only gravity acts, a = 9.81 m/s^2 downward (use 10 m/s^2 on AP exams), constant acceleration so UAM applies, and v_y = 0 at the top of the path."
+    },
+    {
+      "n": 13,
+      "type": "exam_tip",
+      "start": 531.44,
+      "end": 549.51,
+      "description": "Calculator tip: when taking a square root (especially in the UAM equation with v_f^2 and v_i^2), be smarter than your calculator - decide whether the answer should be positive or negative."
+    },
+    {
+      "n": 14,
+      "type": "concept",
+      "start": 553.35,
+      "end": 620.06,
+      "description": "Motion-graph slopes: slope of position-vs-time graph = velocity; slope of velocity-vs-time graph = acceleration; clarifies the delta-x notation collision (change in x-axis variable vs change in position)."
+    },
+    {
+      "n": 15,
+      "type": "concept",
+      "start": 620.06,
+      "end": 678.48,
+      "description": "Motion-graph areas: area between curve and time axis of a v-t graph = change in position, of an a-t graph = change in velocity (from rearranging the definitions); area above the axis is positive, below is negative."
+    },
+    {
+      "n": 16,
+      "type": "worked_example",
+      "start": 678.48,
+      "end": 883.04,
+      "description": "Worked example: build the acceleration-time and position-time graphs from a given velocity-time graph - constant negative slope -> constant negative a; key insight that a v-t graph alone gives no initial position (assume 0); slope of x-t tracks v; equal +/- triangular areas -> total displacement zero -> object returns to start; a-t area = negative delta-v."
+    },
+    {
+      "n": 17,
+      "type": "physical_interpretation",
+      "start": 883.04,
+      "end": 952.96,
+      "description": "Identify the motion from the graphs: constant negative acceleration ~ -10 m/s^2 means free fall - an object thrown upward near a planet's surface with negligible air resistance and caught at launch height; it is UAM (content ends ~948, phone-ring gag follows)."
+    },
+    {
+      "n": 18,
+      "type": "worked_example",
+      "start": 1017.43,
+      "end": 1062.62,
+      "description": "Worked example: resolve vector A at angle theta measured from the VERTICAL into components - sin(theta)=opp/hyp gives A_x = A sin(theta); cos(theta)=adj/hyp gives A_y = A cos(theta)."
+    },
+    {
+      "n": 19,
+      "type": "misconception",
+      "start": 1062.62,
+      "end": 1080.53,
+      "description": "Misconception + correction: 'x uses cosine, y uses sine' is only true when the angle is measured from the horizontal; strategy - walk through the trig definitions every single time to avoid the classic component error."
+    },
+    {
+      "n": 20,
+      "type": "definition",
+      "start": 1080.53,
+      "end": 1090.26,
+      "description": "Projectile motion definition: an object moving in two dimensions near the surface of a planet with gravity the only force acting on it (natural lead-in to item 21)."
+    },
+    {
+      "n": 21,
+      "type": "procedure",
+      "start": 1090.26,
+      "end": 1157.76,
+      "description": "Projectile-solving procedure: separate knowns into x and y; x-direction has a=0 so velocity is constant, v_x = delta-x/delta-t (3 variables, know 2 find 1); y-direction is free fall, a = -g ~ -10 m/s^2, so use UAM (5 variables, know 3 find 2)."
+    },
+    {
+      "n": 22,
+      "type": "strategy",
+      "start": 1161.8,
+      "end": 1211.52,
+      "description": "Projectile key facts: delta-t is the ONLY variable shared between x and y (time is a scalar) - solve for it in one direction and use it in the other; resolve v_initial into components unless launch is horizontal (then v_iy=0); v_y=0 at the top; same-height symmetry: t_up = t_down and v_iy = -v_fy."
+    },
+    {
+      "n": 23,
+      "type": "definition",
+      "start": 1211.52,
+      "end": 1241.2,
+      "description": "Relative motion: the description of an object's motion depends on the observer's frame of reference; it is just vector addition, and AP Physics 1 restricts it to one dimension."
+    },
+    {
+      "n": 24,
+      "type": "worked_example",
+      "start": 1241.2,
+      "end": 1340.72,
+      "description": "Relative velocity worked example: car A at 60 km/hr East and car B at 35 km/hr East (both relative to Earth); v_AB + v_BE = v_AE, so v_AB = 60 - 35 = 25 km/hr East - what a passenger in car B measures for car A."
+    },
+    {
+      "n": 25,
+      "type": "worked_example",
+      "start": 1340.72,
+      "end": 1386.48,
+      "description": "Reverse-frame extension: what does a passenger in car A measure for car B? v_BA = -v_AB = -25 km/hr East = 25 km/hr West (car B appears to move backwards). Depends on item 24 for context."
+    },
+    {
+      "n": 26,
+      "type": "exam_tip",
+      "start": 1387.68,
+      "end": 1400.78,
+      "description": "Sig figs callback: 'shouldn't it be 20 km/hr since 60 has 1 sig fig?' - No: the AP Physics exams do not concern themselves with sig figs (reinforces item 1; best folded into item 25 or item 1)."
+    }
+  ]
+}
