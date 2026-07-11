@@ -1,0 +1,1182 @@
+{
+  "generated_at": "2026-07-02T16:39:18",
+  "threshold": 0.7,
+  "videos": [
+    "8uNod-pxvXg",
+    "dHjWVlfNraM",
+    "uqwC41RDPyg",
+    "yfajBIaDf1Q"
+  ],
+  "summary": {
+    "threshold": 0.7,
+    "n_originals": 9,
+    "n_originals_passed": 2,
+    "n_original_errors": 0,
+    "tnr": 0.2222222222222222,
+    "n_variants": 27,
+    "n_variant_errors": 0,
+    "mean_original_score": 0.48888888888888893,
+    "per_corruption": {
+      "chop_start": {
+        "n": 9,
+        "n_flagged": 6,
+        "tpr": 0.6666666666666666,
+        "mean_score": 0.5444444444444445
+      },
+      "chop_end": {
+        "n": 9,
+        "n_flagged": 7,
+        "tpr": 0.7777777777777778,
+        "mean_score": 0.5555555555555556
+      },
+      "antecedent_removal": {
+        "n": 0,
+        "n_flagged": 0,
+        "tpr": null,
+        "mean_score": null
+      },
+      "offtopic_splice": {
+        "n": 9,
+        "n_flagged": 7,
+        "tpr": 0.7777777777777778,
+        "mean_score": 0.48888888888888893
+      }
+    },
+    "per_gate": {
+      "all_references_resolved": {
+        "original_true_rate": 0.8888888888888888,
+        "corrupted_false_rate": 0.1111111111111111,
+        "n_corrupted_relevant": 9
+      },
+      "prerequisites_satisfied": {
+        "original_true_rate": 0.6666666666666666,
+        "corrupted_false_rate": null,
+        "n_corrupted_relevant": 0
+      },
+      "purpose_identifiable": {
+        "original_true_rate": 0.8888888888888888,
+        "corrupted_false_rate": 0.05555555555555555,
+        "n_corrupted_relevant": 18
+      },
+      "reasoning_complete": {
+        "original_true_rate": 0.3333333333333333,
+        "corrupted_false_rate": 0.4444444444444444,
+        "n_corrupted_relevant": 9
+      },
+      "result_complete": {
+        "original_true_rate": 0.5555555555555556,
+        "corrupted_false_rate": 0.4444444444444444,
+        "n_corrupted_relevant": 9
+      },
+      "source_grounded": {
+        "original_true_rate": 1.0,
+        "corrupted_false_rate": 0.05555555555555555,
+        "n_corrupted_relevant": 18
+      },
+      "topic_identifiable": {
+        "original_true_rate": 1.0,
+        "corrupted_false_rate": 0.0,
+        "n_corrupted_relevant": 18
+      }
+    }
+  },
+  "rows": [
+    {
+      "video_id": "8uNod-pxvXg",
+      "cand_id": "c_u0003",
+      "role": "explanation",
+      "start": 16.619,
+      "end": 127.5,
+      "kind": "original",
+      "detail": "",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "all_references_resolved",
+        "prerequisites_satisfied",
+        "purpose_identifiable",
+        "reasoning_complete",
+        "result_complete",
+        "source_grounded",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_reasoning"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "8uNod-pxvXg",
+      "cand_id": "c_u0003",
+      "role": "explanation",
+      "start": 16.619,
+      "end": 127.5,
+      "kind": "chop_start",
+      "detail": "removed first sentence [1]",
+      "error": false,
+      "score": 0.3,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "source_grounded",
+        "all_references_resolved",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_reasoning",
+        "missing_prerequisite"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "8uNod-pxvXg",
+      "cand_id": "c_u0003",
+      "role": "explanation",
+      "start": 16.619,
+      "end": 127.5,
+      "kind": "chop_end",
+      "detail": "removed last sentence [7]",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "result_complete",
+        "reasoning_complete",
+        "purpose_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_reasoning"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "8uNod-pxvXg",
+      "cand_id": "c_u0003",
+      "role": "explanation",
+      "start": 16.619,
+      "end": 127.5,
+      "kind": "offtopic_splice",
+      "detail": "spliced sentences 26-26 from unit u0019 (topic c0.t2) at clip position 3",
+      "error": false,
+      "score": 0.3,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "topic_identifiable",
+        "purpose_identifiable",
+        "source_grounded"
+      ],
+      "failure_kinds": [
+        "missing_prerequisite",
+        "missing_reasoning"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "8uNod-pxvXg",
+      "cand_id": "c_u0007",
+      "role": "claim",
+      "start": 153.12,
+      "end": 235.92,
+      "kind": "original",
+      "detail": "",
+      "error": false,
+      "score": 0.3,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "all_references_resolved",
+        "prerequisites_satisfied",
+        "purpose_identifiable",
+        "reasoning_complete",
+        "result_complete",
+        "source_grounded",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_prerequisite",
+        "missing_reasoning",
+        "missing_reasoning"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "8uNod-pxvXg",
+      "cand_id": "c_u0007",
+      "role": "claim",
+      "start": 153.12,
+      "end": 235.92,
+      "kind": "chop_start",
+      "detail": "removed first sentence [10]",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": false,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "source_grounded",
+        "all_references_resolved",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_problem_statement",
+        "missing_prerequisite"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "8uNod-pxvXg",
+      "cand_id": "c_u0007",
+      "role": "claim",
+      "start": 153.12,
+      "end": 235.92,
+      "kind": "chop_end",
+      "detail": "removed last sentence [14]",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "result_complete",
+        "reasoning_complete",
+        "purpose_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_prerequisite",
+        "missing_prerequisite"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "8uNod-pxvXg",
+      "cand_id": "c_u0007",
+      "role": "claim",
+      "start": 153.12,
+      "end": 235.92,
+      "kind": "offtopic_splice",
+      "detail": "spliced sentences 26-26 from unit u0019 (topic c0.t2) at clip position 2",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": false,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "topic_identifiable",
+        "purpose_identifiable",
+        "source_grounded"
+      ],
+      "failure_kinds": [
+        "unresolved_reference",
+        "unresolved_reference",
+        "missing_prerequisite",
+        "missing_reasoning"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0000",
+      "role": "definition",
+      "start": 1.76,
+      "end": 187.76,
+      "kind": "original",
+      "detail": "",
+      "error": false,
+      "score": 0.9,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "all_references_resolved",
+        "prerequisites_satisfied",
+        "purpose_identifiable",
+        "reasoning_complete",
+        "result_complete",
+        "source_grounded",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [],
+      "flagged": false
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0000",
+      "role": "definition",
+      "start": 1.76,
+      "end": 187.76,
+      "kind": "chop_start",
+      "detail": "removed first sentence [0]",
+      "error": false,
+      "score": 1.0,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "source_grounded",
+        "all_references_resolved",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [],
+      "flagged": false
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0000",
+      "role": "definition",
+      "start": 1.76,
+      "end": 187.76,
+      "kind": "chop_end",
+      "detail": "removed last sentence [5]",
+      "error": false,
+      "score": 0.9,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "result_complete",
+        "reasoning_complete",
+        "purpose_identifiable"
+      ],
+      "failure_kinds": [],
+      "flagged": false
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0000",
+      "role": "definition",
+      "start": 1.76,
+      "end": 187.76,
+      "kind": "offtopic_splice",
+      "detail": "spliced sentences 61-61 from unit u0060 (topic c2.t15) at clip position 3",
+      "error": false,
+      "score": 0.7,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "topic_identifiable",
+        "purpose_identifiable",
+        "source_grounded"
+      ],
+      "failure_kinds": [],
+      "flagged": false
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0009",
+      "role": "claim",
+      "start": 143.12,
+      "end": 324.36,
+      "kind": "original",
+      "detail": "",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "all_references_resolved",
+        "prerequisites_satisfied",
+        "purpose_identifiable",
+        "reasoning_complete",
+        "result_complete",
+        "source_grounded",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_problem_statement",
+        "missing_reasoning",
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0009",
+      "role": "claim",
+      "start": 143.12,
+      "end": 324.36,
+      "kind": "chop_start",
+      "detail": "removed first sentence [5]",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "source_grounded",
+        "all_references_resolved",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_reasoning",
+        "missing_prerequisite"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0009",
+      "role": "claim",
+      "start": 143.12,
+      "end": 324.36,
+      "kind": "chop_end",
+      "detail": "removed last sentence [11]",
+      "error": false,
+      "score": 0.9,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "result_complete",
+        "reasoning_complete",
+        "purpose_identifiable"
+      ],
+      "failure_kinds": [],
+      "flagged": false
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0009",
+      "role": "claim",
+      "start": 143.12,
+      "end": 324.36,
+      "kind": "offtopic_splice",
+      "detail": "spliced sentences 61-61 from unit u0060 (topic c2.t15) at clip position 3",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "topic_identifiable",
+        "purpose_identifiable",
+        "source_grounded"
+      ],
+      "failure_kinds": [
+        "missing_problem_statement",
+        "missing_reasoning"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0019",
+      "role": "claim",
+      "start": 485.84,
+      "end": 694.48,
+      "kind": "original",
+      "detail": "",
+      "error": false,
+      "score": 0.5,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "all_references_resolved",
+        "prerequisites_satisfied",
+        "purpose_identifiable",
+        "reasoning_complete",
+        "result_complete",
+        "source_grounded",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_reasoning",
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0019",
+      "role": "claim",
+      "start": 485.84,
+      "end": 694.48,
+      "kind": "chop_start",
+      "detail": "removed first sentence [16]",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "source_grounded",
+        "all_references_resolved",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0019",
+      "role": "claim",
+      "start": 485.84,
+      "end": 694.48,
+      "kind": "chop_end",
+      "detail": "removed last sentence [22]",
+      "error": false,
+      "score": 0.5,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "result_complete",
+        "reasoning_complete",
+        "purpose_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_reasoning",
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0019",
+      "role": "claim",
+      "start": 485.84,
+      "end": 694.48,
+      "kind": "offtopic_splice",
+      "detail": "spliced sentences 61-61 from unit u0060 (topic c2.t15) at clip position 3",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "topic_identifiable",
+        "purpose_identifiable",
+        "source_grounded"
+      ],
+      "failure_kinds": [
+        "missing_reasoning",
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0046",
+      "role": "claim",
+      "start": 1333.84,
+      "end": 1487.32,
+      "kind": "original",
+      "detail": "",
+      "error": false,
+      "score": 0.3,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": false,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "all_references_resolved",
+        "prerequisites_satisfied",
+        "purpose_identifiable",
+        "reasoning_complete",
+        "result_complete",
+        "source_grounded",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_problem_statement",
+        "missing_reasoning",
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0046",
+      "role": "claim",
+      "start": 1333.84,
+      "end": 1487.32,
+      "kind": "chop_start",
+      "detail": "removed first sentence [42]",
+      "error": false,
+      "score": 0.2,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": false,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "source_grounded",
+        "all_references_resolved",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_problem_statement",
+        "not_source_grounded"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0046",
+      "role": "claim",
+      "start": 1333.84,
+      "end": 1487.32,
+      "kind": "chop_end",
+      "detail": "removed last sentence [46]",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "result_complete",
+        "reasoning_complete",
+        "purpose_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_concept",
+        "missing_problem_statement",
+        "missing_reasoning",
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0046",
+      "role": "claim",
+      "start": 1333.84,
+      "end": 1487.32,
+      "kind": "offtopic_splice",
+      "detail": "spliced sentences 0-0 from unit u0000 (topic c0.t0) at clip position 2",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": false,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "topic_identifiable",
+        "purpose_identifiable",
+        "source_grounded"
+      ],
+      "failure_kinds": [
+        "unresolved_reference",
+        "missing_prerequisite",
+        "missing_problem_statement",
+        "missing_reasoning",
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0060",
+      "role": "result",
+      "start": 1723.44,
+      "end": 1885.399,
+      "kind": "original",
+      "detail": "",
+      "error": false,
+      "score": 0.9,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "all_references_resolved",
+        "prerequisites_satisfied",
+        "purpose_identifiable",
+        "reasoning_complete",
+        "result_complete",
+        "source_grounded",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [],
+      "flagged": false
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0060",
+      "role": "result",
+      "start": 1723.44,
+      "end": 1885.399,
+      "kind": "chop_start",
+      "detail": "removed first sentence [56]",
+      "error": false,
+      "score": 0.9,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "source_grounded",
+        "all_references_resolved",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [],
+      "flagged": false
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0060",
+      "role": "result",
+      "start": 1723.44,
+      "end": 1885.399,
+      "kind": "chop_end",
+      "detail": "removed last sentence [61]",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "result_complete",
+        "reasoning_complete",
+        "purpose_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "dHjWVlfNraM",
+      "cand_id": "c_u0060",
+      "role": "result",
+      "start": 1723.44,
+      "end": 1885.399,
+      "kind": "offtopic_splice",
+      "detail": "spliced sentences 0-0 from unit u0000 (topic c0.t0) at clip position 3",
+      "error": false,
+      "score": 1.0,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "topic_identifiable",
+        "purpose_identifiable",
+        "source_grounded"
+      ],
+      "failure_kinds": [],
+      "flagged": false
+    },
+    {
+      "video_id": "uqwC41RDPyg",
+      "cand_id": "c_u0015",
+      "role": "claim",
+      "start": 236.724,
+      "end": 295.303,
+      "kind": "original",
+      "detail": "",
+      "error": false,
+      "score": 0.3,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "all_references_resolved",
+        "prerequisites_satisfied",
+        "purpose_identifiable",
+        "reasoning_complete",
+        "result_complete",
+        "source_grounded",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_prerequisite",
+        "missing_problem_statement",
+        "missing_reasoning",
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "uqwC41RDPyg",
+      "cand_id": "c_u0015",
+      "role": "claim",
+      "start": 236.724,
+      "end": 295.303,
+      "kind": "chop_start",
+      "detail": "removed first sentence [28]",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": false,
+        "reasoning_complete": false,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "source_grounded",
+        "all_references_resolved",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_prerequisite",
+        "missing_problem_statement",
+        "missing_reasoning"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "uqwC41RDPyg",
+      "cand_id": "c_u0015",
+      "role": "claim",
+      "start": 236.724,
+      "end": 295.303,
+      "kind": "chop_end",
+      "detail": "removed last sentence [35]",
+      "error": false,
+      "score": 0.7,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": false,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "result_complete",
+        "reasoning_complete",
+        "purpose_identifiable"
+      ],
+      "failure_kinds": [],
+      "flagged": true
+    },
+    {
+      "video_id": "uqwC41RDPyg",
+      "cand_id": "c_u0015",
+      "role": "claim",
+      "start": 236.724,
+      "end": 295.303,
+      "kind": "offtopic_splice",
+      "detail": "spliced sentences 0-0 from unit u0000 (topic c0.t0) at clip position 4",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "topic_identifiable",
+        "purpose_identifiable",
+        "source_grounded"
+      ],
+      "failure_kinds": [
+        "missing_prerequisite"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "yfajBIaDf1Q",
+      "cand_id": "c_u0007",
+      "role": "definition",
+      "start": 162.36,
+      "end": 324.38,
+      "kind": "original",
+      "detail": "",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": false,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "all_references_resolved",
+        "prerequisites_satisfied",
+        "purpose_identifiable",
+        "reasoning_complete",
+        "result_complete",
+        "source_grounded",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [
+        "unresolved_reference",
+        "missing_visual",
+        "missing_prerequisite"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "yfajBIaDf1Q",
+      "cand_id": "c_u0007",
+      "role": "definition",
+      "start": 162.36,
+      "end": 324.38,
+      "kind": "chop_start",
+      "detail": "removed first sentence [4]",
+      "error": false,
+      "score": 0.9,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": true,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "source_grounded",
+        "all_references_resolved",
+        "topic_identifiable"
+      ],
+      "failure_kinds": [],
+      "flagged": false
+    },
+    {
+      "video_id": "yfajBIaDf1Q",
+      "cand_id": "c_u0007",
+      "role": "definition",
+      "start": 162.36,
+      "end": 324.38,
+      "kind": "chop_end",
+      "detail": "removed last sentence [7]",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": true,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": true,
+        "result_complete": false,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "result_complete",
+        "reasoning_complete",
+        "purpose_identifiable"
+      ],
+      "failure_kinds": [
+        "missing_prerequisite",
+        "missing_result"
+      ],
+      "flagged": true
+    },
+    {
+      "video_id": "yfajBIaDf1Q",
+      "cand_id": "c_u0007",
+      "role": "definition",
+      "start": 162.36,
+      "end": 324.38,
+      "kind": "offtopic_splice",
+      "detail": "spliced sentences 0-0 from unit u0000 (topic c0.t0) at clip position 2",
+      "error": false,
+      "score": 0.4,
+      "gates": {
+        "all_references_resolved": false,
+        "prerequisites_satisfied": false,
+        "purpose_identifiable": true,
+        "reasoning_complete": false,
+        "result_complete": true,
+        "source_grounded": true,
+        "topic_identifiable": true
+      },
+      "relevant_gates": [
+        "topic_identifiable",
+        "purpose_identifiable",
+        "source_grounded"
+      ],
+      "failure_kinds": [
+        "unresolved_reference",
+        "missing_prerequisite",
+        "missing_visual",
+        "missing_reasoning"
+      ],
+      "flagged": true
+    }
+  ]
+}

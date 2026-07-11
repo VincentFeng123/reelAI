@@ -1,0 +1,225 @@
+{
+  "findings": [
+    {
+      "title": "Saturation-based stopping for iterative extraction: quality plateaus by iteration ~3; stop when new-item yield drops",
+      "claim": "Measured evidence exists for 'keep extracting until marginal value < threshold': in LLM entity extraction, re-running the extractor to find items 'not extracted yet' improves completeness, but from the third iteration (4 total calls) on a ~12k-char document 'the majority of scores are either getting worse or stagnating' (semantic similarity peaks at iter 3 = 0.7572 then drops; bias-avoidance degrades 0.5614->0.4247). The paper's stated principle: 'stop when additional LLM call will return no or only a few new entities', with iteration count scaling with document length. Separately, an adaptive early-stopping rule 'stop when current marginal gain falls below a fraction omega of the first-step gain' appears in 2025-26 agentic-loop work. This is the strongest verified pattern for a content-driven item count: the video's ideal clip count = size of the inventory at saturation, not a constant.",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2404.04068",
+          "note": "Fetched full text. Table 2 iteration study: quotes and numbers above verified; recommends 3 iterations for ~12k chars and stopping when few new entities are returned; explicitly notes shorter/longer texts need fewer/more iterations."
+        },
+        {
+          "url": "https://arxiv.org/html/2511.00592v1",
+          "note": "Search-level only (not fetched): agentic loop-optimization work described as using adaptive early stopping when marginal gain < omega * first-step gain; treat the omega rule as a lead until fetched."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Replace MAX_ANCHORS (config.py:210) as the binding count with a saturation-derived budget: add an 'inventory pass' before selection that repeatedly asks the extractor for 'important teachable items not yet listed' (grounded in structure.json units) and stops when a pass yields < ~15% new items vs the first pass (2-3 passes for a 15-min lecture per the 12k-char guidance). budget = clamp(len(inventory), 8, 32); pass it into candidates.py select_anchors and assemble max_clips (config.py:112 MAX_SEGMENTS becomes a safety rail, not a target). Eval: log inventory size and saturation curve per video in run_eval; for qP-9wwRrJbg the inventory should land ~18-22, directly testing gap #1/#2."
+    },
+    {
+      "title": "Variable-cardinality moment retrieval (GMR) is now an explicit task with set-completeness metrics \u2014 the field is abandoning fixed-K",
+      "claim": "Generalized (Video) Moment Retrieval, formalized at ICLR 2025 and extended by Soccer-GMR (May 2026), requires returning the COMPLETE SET of relevant moments per query \u2014 zero, one, or many \u2014 instead of a fixed top-K. Soccer-GMR ships an evaluation protocol with 'complementary metrics tailored for null-set rejection, positive-query localization, and end-to-end GMR performance', and two modeling paradigms (a lightweight adapter for discriminative models; GRPO reward fine-tuning for MLLMs). This is direct precedent for (a) threshold/set-based selection rather than top-K caps, and (b) eval metrics that penalize both missed items and hallucinated ones.",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2605.02623",
+          "note": "Fetched abstract. Verifies GMR task definition ('retrieving the complete set of relevant moments or predicting an empty set'), Soccer-GMR benchmark, null-set-rejection metrics, two baselines; code+dataset on GitHub."
+        },
+        {
+          "url": "https://openreview.net/forum?id=qdOIkeZ5e4",
+          "note": "ICLR 2025 'Generalized Video Moment Retrieval' \u2014 non-target and multi-target queries, BCANet baseline (search-level; not fetched)."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "candidates.py: convert the flat priority sort (candidates.py:106) from take-top-12 to take-all-above-threshold (score >= tau) with the cap as clamp upper bound 32; tune tau on the golden set so predicted-set size tracks golden-inventory size. Eval: replace 'N clips produced' with set metrics \u2014 inventory recall (fraction of golden items covered by any shipped clip), precision (clips matching no golden item), and a null-behavior check for genuinely thin videos. This makes gap #2 (no clip-count policy) measurable."
+    },
+    {
+      "title": "Continuous LLM saliency scoring with sliding-window batching: cross-genre, no fixed count, 6x cost cut from batching (HiVid, Feb 2026)",
+      "claim": "HiVid scores video-chunk saliency with an LLM as 'a scalable human proxy': frames grouped into windows of m=10 per call with a periodically-updated running summary as context, plus an LLM-guided merge-sort ranking for global score consistency. It produces continuous [0,1] weights with NO predetermined highlight count. Cross-category generalization is measured: PLCC 0.66 / 0.50 / 0.47 on YouTube-8M / TVSum / SumMe (+11.5% over next best), mAP@50 0.86, stable even on sensitive content, and works with open-source models (Llama, Qwen, InternVL) at modest gaps. Cost: batching 10 items/call cuts per-video cost from $8.12 to $1.35 (201s video, GPT-4o) \u2014 direct evidence that windowed batching keeps LLM scoring cost sublinear in item count.",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2602.14214",
+          "note": "Fetched full HTML. Verifies sliding-window m=10, periodic summary context, merge-sort ranking, PLCC/mAP/user-study numbers, $8.12->$1.35 batching cost comparison, open-model compatibility, no fixed highlight count."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Use as the cheap pre-filter for gap #8: one batched pass scores all 139 units (10 units/call with a running video summary = ~14 cheap calls) on a saliency rubric; only units above calibrated tau proceed to the full judge in validate.py. Also adopt merge-sort pairwise ranking to break the 27-way 0.70 priority ties in candidates.py:106 instead of list-order (front-of-video) tie-breaking. Eval: PLCC-style correlation of unit saliency vs golden-inventory membership."
+    },
+    {
+      "title": "Batch prompting makes judge cost sublinear: 30-82% cost cuts with ~3pp accuracy loss, sometimes accuracy GAINS; reasoning-token collapse 4.5x",
+      "claim": "Packing multiple independent items into one judge call is well-measured: across 7 LLMs and 6 benchmarks, batch evaluation loses only ~3.2pp absolute vs single-item (75.5%->72.3%) while cutting inference cost 30.7-82.0%; accuracy is stable for batch sizes below ~8-16 depending on task. A mid-2025 title/abstract-screening study found batch size 15 IMPROVED accuracy 75.0%->78.2% vs single-query. For reasoning models, batching suppresses overthinking (reasoning tokens 2950->710, 4.5x reduction). RoBatch (May 2026) jointly optimizes model routing + batch size along a cost-utility Pareto frontier with a batch-aware degradation proxy (Qwen3/Gemma3, six benchmarks).",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2406.10786",
+          "note": "'Evaluating LLMs with Multiple Problems at once' \u2014 source of the 3.2pp / 30.7-82% numbers (search-summary level; numbers consistent across two search hits but not independently fetched)."
+        },
+        {
+          "url": "https://www.medrxiv.org/content/10.1101/2025.09.02.25334159.full.pdf",
+          "note": "Batch-size-15 accuracy gain 75.0->78.2% in screening with mid-2025 SOTA LLMs (search-summary level)."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2511.04108",
+          "note": "Batch prompting suppresses overthinking; 2950->710 reasoning tokens (search-summary level)."
+        },
+        {
+          "url": "https://arxiv.org/abs/2605.28268",
+          "note": "Fetched abstract. RoBatch: Route-with-Batching problem, batch-aware proxy utility model + greedy Pareto scheduling; superior cost-performance frontier vs routing-only and batching-only baselines."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "validate.py: judge 5-8 candidate specs per call (shared system prompt + rubric amortized) instead of 1 judge/candidate x JUDGE_WORKERS=4. At cap ~24, first-pass judging becomes 3-5 calls (vs 24), fitting gemini-2.5-flash-lite free-tier limits; run JUDGE_MAX_REPAIR re-judges and kill-confirmations individually (only failures). Add an A/B eval: batched vs single-item verdict agreement rate before switching."
+    },
+    {
+      "title": "Cheap judges recover accuracy via criteria injection + small-model ensembles, not escalation (April 2026)",
+      "claim": "A systematic study of cost-effective LLM-judge improvements (OpenAI + Anthropic families) finds ensemble scoring + task-specific criteria injection dominates the cost-accuracy Pareto frontier \u2014 up to 85.8% accuracy, +13.5pp over baseline \u2014 with criteria injection 'virtually cost free' and small models benefiting disproportionately from ensembling. Calibration context and adaptive model escalation improve baselines but are NOT cost-competitive. Implication: scaling candidate count 12->30 does not require a bigger judge; it requires per-task criteria in the prompt and cheap self-consistency on borderline cases.",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2604.13717",
+          "note": "Fetched abstract. Verifies the four techniques, 85.8% / +13.5pp, criteria-injection-plus-ensemble Pareto dominance, cross-provider generalization, and that escalation is not cost-competitive."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "validate.py gate: inject the per-clip contract-by-content criteria (Wave 2 already produces them) directly into the judge prompt as explicit rubric lines (free accuracy). For borderline verdicts only (e.g., within epsilon of the pass threshold), take a 3-vote ensemble of the same flash-lite judge at temperature>0 rather than escalating models. Eval: track judge-verdict flip rate on the frozen-spec harness (the existing --freeze/--runs variance machinery) to confirm noise reduction."
+    },
+    {
+      "title": "Coverage-gap-driven iterative generation (CCQGen pattern): condition each new round on concepts NOT yet covered",
+      "claim": "CCQGen (WSDM 2025) generates a query set for a document by explicitly identifying 'concepts not sufficiently covered by previous queries' and conditioning subsequent generation on those gaps so each new item complements the existing set; experiments show significant gains in coverage/retrieval quality vs non-adaptive generation. This is the verified algorithmic template for both the missing dedupe-refund loop (gap #7) and exhaustive enumeration: generation/selection loops should be driven by the residual uncovered-concept set, not by a fixed quota computed once.",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2502.11181",
+          "note": "Fetched abstract. Verifies the iterative uncovered-concept conditioning mechanism and claimed significant improvements (specific numbers require full PDF)."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "assemble/__init__.py after snap_candidates/dedupe: compute residual = anchor-eligible units (and content-map nodes) not overlapped by any surviving spec; if residual non-empty and len(specs) < budget, re-run candidates.py selection restricted to residual units and assemble another round (repeat until residual empty or budget hit) \u2014 in the qP-9wwRrJbg reconstruction this refund loop alone recovers ~10-12 specs from the 63 untouched eligible units. Eval metric: node coverage = content-map nodes with >=1 shipped clip / total nodes (this video: target 12/12, actual 2/15-ish)."
+    },
+    {
+      "title": "Omission auditing with statistical guarantees: conformal risk control bounds the fraction of important content missed (CARE, June 2026)",
+      "claim": "CARE adds a post-hoc, model-agnostic 'omission controller' to summarization: it scores source sentences for importance and coverage, and uses conformal risk control over the joint (tau, gamma) threshold space to guarantee \u2014 finite-sample, distribution-free \u2014 that the expected fraction of important omissions NOT surfaced for review is bounded (target alpha=0.15 achieved with 95% confidence across 100 calibration/test resplits, using only ~100 labeled documents per domain). A 75-review clinician study showed calibrated flags improved human omission detection by +28.6pp. This is the only verified 2025-26 mechanism that answers 'how do you verify nothing was missed' with a quantitative guarantee, and it needs exactly the scale of golden set this project already plans.",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2606.08969",
+          "note": "Fetched abstract. Verifies dual hallucination/omission controllers, joint threshold calibration, alpha=0.15 @95% guarantee, ~100 labeled docs/domain, +28.6pp clinician result, five medical summarization tasks; design is model-agnostic (transfer beyond medical untested)."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Eval harness (run_eval): add an omission-audit stage \u2014 cheap importance score for every unit (reuse the HiVid-style batched scorer), then flag units above calibrated tau that no shipped clip covers; calibrate tau on the planned golden set (~100 labeled units suffices per CARE) and report 'bounded-miss rate' per run alongside the judge pass rate. This turns the user's complaint ('there has to be a lot of other stuff in there') into a monitored, guaranteed metric rather than an anecdote."
+    },
+    {
+      "title": "2024-26 educational QG/quiz pipelines use fixed per-lecture counts + deterministic pre-judge QC; none measure exhaustiveness \u2014 but two components transfer",
+      "claim": "Surveyed lecture-to-items systems do NOT solve coverage-completeness: L2Q (2026) generates a fixed 8 MCQs/lecture with a local LLM but achieves ~98% acceptance via deterministic QC (JSON schema conformance, single-correct-answer validation, numeric/constant equivalence testing, warning layer) under bounded retries \u2014 cheap rule checks BEFORE any LLM judging. COSER (2025, ~500 educator-annotated questions over 35 lectures) shows LLM-selected answer-relevant context beats using the full transcript for generation quality (best NLI 41.09 with transcript+keyframes+rewriting), i.e., focused per-item context wins. Neither measures whether all teachable content was covered \u2014 exhaustive extraction is an open niche, and coverage metrics must come from elsewhere (CCQGen/CARE patterns).",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2603.08729",
+          "note": "Fetched abstract. Verifies self-hosted pipeline, deterministic QC checks listed, 120/122 accepted (~98%), 8 questions/lecture fixed, no coverage quantification."
+        },
+        {
+          "url": "https://arxiv.org/html/2504.19406v2",
+          "note": "Fetched. Verifies COSER task, AIRC dataset (27+8 lectures, ~500 questions), CoT context selection > fixed windows, full-transcript-only suboptimal, coverage only implicit."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Two adoptions: (1) pre-judge deterministic QC in assemble \u2014 before any validate.py call, run rule checks per candidate (duration bounds, sentence-boundary alignment, contract fields present, quote-in-transcript exact match) and reject/repair without LLM cost, cutting judge load as the cap rises; (2) COSER's context finding supports Wave 2's contract-by-content: build each clip's judge context from its own span + linked prerequisite units, not the whole transcript."
+    },
+    {
+      "title": "Commercial study tools (NotebookLM, Turbo AI) expose item count as a USER control with grounding \u2014 no tool claims exhaustiveness",
+      "claim": "Google NotebookLM (flashcards/quizzes GA since Sept 2025 for Education/Workspace) lets users 'choose how many cards to make', set difficulty, and customize topic, with generation 'grounded only in your source materials'; Turbo AI (formerly TurboLearn) converts video/audio/PDF into notes+flashcards+quizzes at scale. No commercial tool documents an exhaustiveness guarantee or an automatic content-driven count \u2014 the market pattern is user-adjustable count + source grounding. This validates a product split the pipeline currently lacks (gap #9): 'give me everything important' (auto/adaptive count) vs 'search within video' (query-filtered) as distinct modes, with count as an exposed dial.",
+      "sources": [
+        {
+          "url": "https://blog.google/innovation-and-ai/models-and-research/google-labs/notebooklm-app-quizzes-flashcards/",
+          "note": "Google's announcement: flashcards/quizzes generated from sources, customizable count/difficulty/topic (search-level; consistent with support page)."
+        },
+        {
+          "url": "https://support.google.com/notebooklm/answer/16958963?hl=en",
+          "note": "Official help doc for generating flashcards/quizzes with user-set counts."
+        },
+        {
+          "url": "https://workspaceupdates.googleblog.com/2025/09/flashcards-quizzes-reports-notebook-lm-google-education.html",
+          "note": "Workspace GA rollout for education, Sept 2025."
+        },
+        {
+          "url": "https://navtools.ai/tool/turbo-ai",
+          "note": "Turbo AI marketing page: video/audio/PDF -> notes, flashcards, quizzes (no coverage guarantee documented)."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "config/API surface: make max_clips a tri-state \u2014 'auto' (saturation-derived budget, default), explicit integer (user dial, NotebookLM-style), or query mode. Fix topic-filter semantics: when the query fuzzy-matches detection.rationale/title (as 'kinematics' does here), switch to 'auto/everything' mode and short-circuit score_topic_relevance to 1.0 (the existing empty-topic path at candidates.py:62-63), eliminating the class-(c) tangential-item kills."
+    },
+    {
+      "title": "A single genre-agnostic LLM rubric generalizes across genres without genre adapters (Prompts-to-Summaries; corroborated by HiVid)",
+      "claim": "Prompts-to-Summaries (2025-26, v3) is fully training-free: scenes are described by a VideoLM, then an LLM scores each scene 1-100 against the WHOLE-VIDEO context using a five-band rubric; scores propagate to frames via consistency+uniqueness weighting. Results: SumMe F1 56.84 (beats all unsupervised methods), TVSum 62.22, competitive with supervised approaches \u2014 across the heterogeneous genres of both benchmarks with one universal rubric. HiVid independently shows stable LLM saliency across YouTube-8M's category spread. This is the best available evidence that open-vocabulary, prompt-driven importance works across arbitrary genres; note neither work compares against per-genre adapter baselines directly, so 'LLM-proposed per-video schema beats fixed ontology' remains unproven in the video domain \u2014 the verified claim is that universal prompting reaches SOTA-unsupervised without any genre specialization.",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2506.10807v3",
+          "note": "Fetched. Verifies zero-shot claim, five-band 1-100 rubric with full-video context, consistency/uniqueness propagation, SumMe 56.84 / TVSum 62.22, no training data."
+        },
+        {
+          "url": "https://arxiv.org/html/2602.14214",
+          "note": "Fetched. HiVid cross-category PLCC stability (0.66/0.50/0.47) including sensitive categories \u2014 corroborates genre-agnostic LLM importance."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2510.17501",
+          "note": "Context-aware pseudo-label LLM scene scoring for zero-shot summarization (search-level; supporting)."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "candidates.py: add a universal 'teachable-moment' rubric score (1-100, five bands, scored against a video-level summary for context) computed in the same batched pre-filter pass, and blend it with role priority (e.g., 0.5*priority + 0.5*rubric) so items the fixed taxonomy mislabels (exam tips labeled 'claim', misconception non-anchors \u2014 gap #4) can still win slots. Eval: A/B adapter-priority-only vs blended on golden inventory recall."
+    },
+    {
+      "title": "Adaptive/retrieved schemas outperform rigid fixed schemas in structured extraction (ASEE + 2025-26 KG-construction consensus)",
+      "claim": "ASEE (2025) targets 'rigid schema fixation in existing pipeline systems': it paraphrases schemas, retrieves relevant ones from hundreds of candidates (schema-RAG), then generates against the retrieved schema, 'significantly improving the accuracy of event extraction' on MD-SEE, a new 12-dataset multi-domain benchmark built specifically because no schema-adaptivity benchmark existed. The 2025-26 LLM-KG-construction literature converges on the same hybrid: predefined ontologies for precision, dynamically generated/expanded schemas for coverage of out-of-ontology content. Direct quantified head-to-head numbers (LLM-induced vs fixed, same data) were not extractable from abstracts \u2014 the mechanism-level conclusion stands; magnitudes need the MD-SEE tables.",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2505.08690",
+          "note": "Fetched abstract. Verifies schema paraphrasing + schema-RAG + targeted generation, MD-SEE (12 datasets), 'significantly improving accuracy' vs rigid pipelines; exact deltas not in abstract."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2510.20345",
+          "note": "LLM-empowered KG construction survey: frames schema-based vs open/dynamic-schema paradigms as complementary (search-level)."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "Supports Wave 2's per-video extraction plan and extends it: instead of one fixed 22-role taxonomy, maintain a LIBRARY of role schemas (lecture, cooking, golf-lesson, debate...) and let the plan pass retrieve+paraphrase the closest one, permitting plan-proposed novel roles (exam_tip, misconception_correction) that must bind to contract-by-content evidence. This addresses gap #4 without unbounded open-vocabulary noise. Eval: count of shipped clips anchored on plan-proposed (non-taxonomy) roles that pass the judge."
+    },
+    {
+      "title": "Serving evidence: <5-minute clips get measurably higher engagement in real coursework; organization evidence is KG-path-shaped but thin on RCTs",
+      "claim": "Best post-ReelsEd data found: a 3-year observational cohort (n=152 med students, 173 flipped-classroom neurosurgery videos on Edpuzzle) \u2014 videos <5 min had significantly higher audience retention (median 92% vs 91%, p=.039), much higher embedded-question response rates (51% vs 39%, p=.045), and better viewing index after regression (p=.049); authors flag retrospective design and engagement!=learning. A 2025 cross-sectional pharmacology study (n=77) is directionally consistent. For ORGANIZING 20-30 clips, the dominant 2025-26 pattern is knowledge-graph-based learning-path sequencing (survey: Electronics 2026; FKGRec adds forgetting-aware RL paths, Mar 2026), but effectiveness evidence is mostly simulation/offline \u2014 no RCT found comparing clip organizations. Net: more/shorter beats fewer/longer on engagement (medium evidence); prerequisite-ordered grouping is the consensus organization (weak outcome evidence).",
+      "sources": [
+        {
+          "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11912274/",
+          "note": "Fetched full text. Verifies n=152, 173 videos, 3 years, six engagement metrics, <5min significance (p=.039/.045/.049) and exact medians, plus stated limitations."
+        },
+        {
+          "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC12752264/",
+          "note": "2025 cross-sectional pharmacology short-video study (n=77) \u2014 directional support only (search-level)."
+        },
+        {
+          "url": "https://www.mdpi.com/2079-9292/15/1/238",
+          "note": "2026 survey: personalized learning-path recommendation on knowledge graphs \u2014 the organization pattern, evidence mostly non-RCT (search-level)."
+        },
+        {
+          "url": "https://www.sciencedirect.com/science/article/abs/pii/S0306457325003346",
+          "note": "FKGRec: forgetting-factor + KG-aware path recommendation (search-level)."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "assemble budget/config: set a soft target clip duration <=300s and make the mash-splitter (gap #6 fix) prefer splitting any multi-idea clip exceeding it (clip 1 at 217s is fine by length but fails one-idea; use both criteria). Serving: order shipped clips prerequisite-first using dependencies.py edges grouped by content-map node (chapter grouping) \u2014 which raises the priority of fixing the requires-edge starvation (gap #5, the concepts_introduced prompt nudge). Eval: report %clips<=300s and %clips with resolved prerequisites-before-them in sequence."
+    }
+  ],
+  "leads": [
+    "InfoMerge / Content-Aware Budget Allocation (https://arxiv.org/pdf/2606.02161): allocates token budget by segment-level information content (uniqueness + representational richness) instead of segment length \u2014 the closest thing found to measured 'density-based scaling'; transfer the estimator to scale clip budget with unit-information density. Not fetched; read Sec. on CABA.",
+    "Agentic Auto-Scheduling (https://arxiv.org/html/2511.00592v1): the 'stop when marginal gain < omega * first-step gain' adaptive rule \u2014 verify it's this paper and lift the omega formulation for the saturation stopping criterion.",
+    "Tuning LLM Judge Design Decisions for 1/1000 of the Cost (https://arxiv.org/abs/2501.17178): multi-objective multi-fidelity search over judge prompt/model/config; relevant if judge config is re-tuned after batching.",
+    "PAJAMA program-synthesis judges ($133-184 -> $0.053 per 60K examples, from search summary only): if real, distills judge rubrics into executable checks \u2014 extreme version of the deterministic pre-judge QC; find the primary paper.",
+    "DecMetrics (https://arxiv.org/abs/2509.04483): COMPLETENESS/CORRECTNESS/SEMANTIC-ENTROPY metrics for claim decomposition used as an RL reward for a lightweight decomposition model \u2014 the completeness formula (joint coverage of input) could become the per-video inventory-completeness metric; abstract lacks formulas, read full PDF.",
+    "Soccer-GMR code+dataset (GitHub, via https://arxiv.org/abs/2605.02623): concrete implementations of null-set-rejection and complete-set metrics to copy into run_eval.",
+    "Video-MMLU (https://arxiv.org/abs/2504.14693): lecture-video benchmark (detailed-notes + quiz tasks per search descriptions, 90+ models evaluated) \u2014 potential external benchmark for coverage of lecture content; abstract fetch did not expose the metric details, read the project page.",
+    "HiERO-StepG (https://arxiv.org/pdf/2605.31227): zero-shot step grounding, 2nd place Ego4D Step Grounding 2026 \u2014 steps/substeps emerge from co-occurrence structure without procedure annotations; candidate span-level corroboration signal for arcs.py to de-noise role-label-dependent arc detection (gap #3).",
+    "EQGBench (https://arxiv.org/pdf/2508.10005): educational QG evaluation with a 'knowledge point alignment' metric \u2014 possible template for measuring whether clips align to enumerated knowledge points.",
+    "DIAL-SUMMER (https://arxiv.org/pdf/2602.08149): hierarchical error taxonomy for dialogue summaries including omission classes \u2014 alternative omission-audit rubric if CARE-style calibration is too heavy.",
+    "CVPR 2025 'Video Summarization with Large Language Models' (https://openaccess.thecvf.com/content/CVPR2025/papers/Lee_Video_Summarization_with_Large_Language_Models_CVPR_2025_paper.pdf): LLM segment importance scores \u2014 another universal-scoring datapoint; check if it handles adaptive summary length.",
+    "Context-Aware Pseudo-Label Scoring for Zero-Shot Video Summarization (https://arxiv.org/pdf/2510.17501): reason-mining on top/bottom-scored segments \u2014 cheap explanation harvesting could feed judge criteria injection.",
+    "LVSum (https://arxiv.org/abs/2604.10024): 13-domain timestamp-aware long-video summarization benchmark with LLM-based content-relevance metrics \u2014 fetched abstract only; the human summaries' segment counts per video could empirically calibrate 'ideal clip count vs video length/density'.",
+    "No published follow-up to ReelsEd (n=62) with a proper RCT on many-short-clips vs few-long-clips learning OUTCOMES was found in 2025-26 searches \u2014 the Edpuzzle cohort (engagement, observational) is the current best; treat outcome claims as open."
+  ],
+  "notes": "Method: ~10 web searches + 14 source fetches (July 2026 vantage; arXiv IDs 26xx = 2026 papers). Confidence policy: 'high' = full text or abstract fetched and numbers verified; 'medium' = abstract-level verification or search-summary numbers consistent across multiple hits; load-bearing but unfetched items were demoted to leads. Direct answers to the four questions: (Q1) No off-the-shelf 'ideal clip count' estimator exists; the verified composite is saturation-stopped enumeration (2404.04068) to SET the budget, threshold/set-based selection instead of top-K (GMR), and continuous batched LLM saliency (HiVid) to rank \u2014 all three fetched. Cost side is the best-evidenced area: batching (30-82% cheaper, ~3pp loss or gains) + free criteria injection + deterministic pre-judge QC means 30 candidates/video can cost LESS than today's 12 individual judge calls: e.g., 14 batched scoring calls (10 units each) + 4-5 batched judge calls (6-8 specs each) + individual re-judges only on failures. (Q2) No academic or commercial system verified claims exhaustive coverage; the transferable pieces are CCQGen's uncovered-concept-conditioned iteration (= the missing dedupe-refund loop, gap #7) and CARE's conformally-calibrated omission bound (needs only ~100 labeled units \u2014 matches the planned golden set). Exhaustive extraction is a genuine open niche \u2014 a defensible product edge. (Q3) Universal prompt-rubric importance is SOTA-unsupervised across genres (Prompts-to-Summaries, HiVid) but nobody has published LLM-per-video-schema vs fixed-ontology head-to-head on VIDEO; text-side (ASEE) favors adaptive/retrieved schemas mechanically. Recommendation: schema-library retrieval + plan-proposed novel roles bound to evidence, A/B'd on golden inventory recall \u2014 do not fully abandon the adapter prior. (Q4) Engagement data favors <=5-min clips (p<.05 on three metrics, observational n=152); organization consensus is prerequisite-first KG paths but outcome RCTs are absent \u2014 so dependency-ordered chapter grouping is justified as UX, not as proven pedagogy. Gap-list mapping: findings 1-2 -> gaps #1/#2; 3-5 -> #8; 6 -> #7; 7 -> eval/verification; 8 -> pre-judge QC + contract context; 9 -> #9; 10 -> #3/#4 (partial, via rubric blend); 11 -> #4; 12 -> #5/#6. Quick-win validation from evidence: quick-wins (1) cap scaling and (5) refund loop are directly supported (findings 1, 2, 6); (2) relevance bypass is supported by the NotebookLM mode-split pattern (finding 9); (3) tie-breaking by spread is strengthened by HiVid's merge-sort global ranking (finding 3); (7) priority-floor revisit becomes necessary once selection goes threshold-based (finding 2). Caveats: Soccer-GMR is sports-domain; CARE is medical (mechanism model-agnostic, transfer unproven); batch-prompting degradation is task-dependent \u2014 run the agreement A/B before enabling; Edpuzzle cohort measures engagement, not learning outcomes. No repo files were modified; no live LLM calls made.\""
+}

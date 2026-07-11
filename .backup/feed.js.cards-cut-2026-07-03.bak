@@ -1,0 +1,418 @@
+// Clip feed: given the ranked videos[] from one /api/search call, lazily walk
+// down the queue, ask the clipper (via Node's /api/clip proxy) to cut the best
+// on-topic moments from each video, and stream the resulting embed clips into a
+// feed. Quality over quantity — the clipper drops videos with nothing on-topic,
+// and we surface only what it returns. Loaded after app.js; exposes startFeed().
+(function () {
+  'use strict';
+
+  // ---- tunables ----
+  const CONCURRENCY = 2; // simultaneous clipper jobs (shares its 4-worker pool + Supadata rate limit)
+  const POLL_MS = 2000; // status poll interval
+  const JOB_TIMEOUT_MS = 180000; // give up on a single video after ~3 min
+  const DEFAULT_CAP = 25; // soft cap on videos clipped per feed session (credit guard)
+
+  // ---- dom ----
+  const elFeed = document.getElementById('feed');
+  const elStatus = document.getElementById('feed-status');
+  const elEnd = document.getElementById('feed-end');
+  const elSentinel = document.getElementById('feed-sentinel');
+  const elBanner = document.getElementById('clipper-banner');
+
+  // ---- helpers (self-contained so feed.js doesn't depend on app.js internals) ----
+  const esc = (s) =>
+    String(s ?? '').replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]),
+    );
+
+  function clock(sec) {
+    sec = Math.max(0, Math.round(Number(sec) || 0));
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  function showBanner(msg) {
+    if (!elBanner) return;
+    elBanner.textContent = msg;
+    elBanner.classList.remove('hidden');
+  }
+
+  // ---- state ----
+  let feed = null;
+  let observer = null;
+  let pumping = false;
+
+  // ---- entry point (called by app.js after a successful, non-dry search) ----
+  window.startFeed = function startFeed(videos, topic, opts = {}) {
+    resetFeed();
+    feed = {
+      topic,
+      queue: Array.isArray(videos) ? videos : [],
+      cursor: 0, // next queue index to start
+      active: 0, // jobs in flight
+      started: 0, // jobs ever started (counts toward the cap)
+      cap: DEFAULT_CAP,
+      slots: [], // slots[i] = { el, video }
+      inflight: new Set(),
+      sentinelVisible: false,
+      // tallies
+      searchCredits: Number(opts.searchCredits) || 0,
+      clipCredits: 0, // ~1 Supadata transcript credit per job actually created
+      shown: 0, // clips rendered
+      videosWithClips: 0,
+      skipped: 0, // videos that produced nothing on-topic
+    };
+
+    elFeed.innerHTML = '';
+    elFeed.classList.remove('hidden');
+    elEnd.innerHTML = '';
+    elEnd.classList.add('hidden');
+    renderStatus();
+
+    if (!feed.queue.length) {
+      elEnd.innerHTML = '<p class="feed-note">No videos to clip. Try a broader topic or higher breadth.</p>';
+      elEnd.classList.remove('hidden');
+      return;
+    }
+
+    setupObserver();
+    pump(); // fill the first CONCURRENCY slots immediately; observer keeps it going
+  };
+
+  window.resetFeed = resetFeed;
+  function resetFeed() {
+    if (observer) {
+      observer.disconnect();
+      observer = null;
+    }
+    feed = null;
+    pumping = false;
+    if (elFeed) {
+      elFeed.innerHTML = '';
+      elFeed.classList.add('hidden');
+    }
+    if (elStatus) {
+      elStatus.innerHTML = '';
+      elStatus.classList.add('hidden');
+    }
+    if (elEnd) {
+      elEnd.innerHTML = '';
+      elEnd.classList.add('hidden');
+    }
+  }
+
+  // ---- the pump: keep CONCURRENCY jobs in flight while the user wants more ----
+  function pump() {
+    if (!feed || pumping) return;
+    pumping = true;
+    try {
+      while (
+        feed.active < CONCURRENCY &&
+        feed.cursor < feed.queue.length &&
+        feed.started < feed.cap &&
+        (feed.sentinelVisible || feed.started < CONCURRENCY) // initial fill, then lazy
+      ) {
+        const i = feed.cursor++;
+        startJob(feed.queue[i], i);
+      }
+      maybeShowEnd();
+    } finally {
+      pumping = false;
+    }
+  }
+
+  function setupObserver() {
+    if (!elSentinel || typeof IntersectionObserver === 'undefined') {
+      // No observer support → process the queue without lazy gating.
+      if (feed) feed.sentinelVisible = true;
+      return;
+    }
+    observer = new IntersectionObserver(
+      (entries) => {
+        if (!feed) return;
+        for (const e of entries) feed.sentinelVisible = e.isIntersecting;
+        if (feed.sentinelVisible) pump();
+      },
+      { root: null, rootMargin: '400px 0px', threshold: 0 },
+    );
+    observer.observe(elSentinel);
+  }
+
+  // ---- per-job lifecycle ----
+  function startJob(video, i) {
+    feed.started++;
+    feed.active++;
+    feed.inflight.add(i);
+
+    const slot = makeSlot(video, i);
+    feed.slots[i] = slot;
+    elFeed.appendChild(slot.el); // appended in cursor order → visual order = rank order
+    renderStatus();
+
+    fetch('/api/clip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: video.url, topic: feed.topic }),
+    })
+      .then(async (r) => {
+        if (r.status === 502) {
+          const d = await r.json().catch(() => ({}));
+          showBanner(d.error || 'Clipper not reachable.');
+          skipSlot(i);
+          settle(i);
+          return;
+        }
+        if (!r.ok) {
+          skipSlot(i); // bad video / validation → drop silently
+          settle(i);
+          return;
+        }
+        const { job_id } = await r.json();
+        feed.clipCredits++; // job created → its transcript fetch spends ~1 credit
+        renderStatus();
+        pollJob(job_id, i, Date.now() + JOB_TIMEOUT_MS);
+      })
+      .catch(() => {
+        showBanner('Clipper not reachable — is it running on port 8000?');
+        skipSlot(i);
+        settle(i);
+      });
+  }
+
+  function pollJob(jobId, i, deadline) {
+    if (!feed || !feed.inflight.has(i)) return; // feed reset mid-flight
+    fetch(`/api/clip/${encodeURIComponent(jobId)}`)
+      .then(async (r) => {
+        if (r.status === 404) {
+          skipSlot(i); // clipper restarted / job gone
+          settle(i);
+          return;
+        }
+        if (!r.ok) {
+          skipSlot(i);
+          settle(i);
+          return;
+        }
+        const snap = await r.json();
+        if (snap.status === 'done') {
+          fillSlot(i, snap, jobId);
+          settle(i);
+          return;
+        }
+        if (snap.status === 'error' || snap.status === 'cancelled') {
+          skipSlot(i); // topic-not-found etc. → drop silently
+          settle(i);
+          return;
+        }
+        // pending / running
+        updateSlot(i, snap);
+        if (Date.now() > deadline) {
+          skipSlot(i);
+          settle(i);
+          return;
+        }
+        setTimeout(() => pollJob(jobId, i, deadline), POLL_MS);
+      })
+      .catch(() => {
+        if (Date.now() > deadline) {
+          skipSlot(i);
+          settle(i);
+          return;
+        }
+        setTimeout(() => pollJob(jobId, i, deadline), POLL_MS); // transient blip → retry
+      });
+  }
+
+  function settle(i) {
+    if (!feed) return;
+    feed.active = Math.max(0, feed.active - 1);
+    feed.inflight.delete(i);
+    pump();
+  }
+
+  // ---- slot rendering ----
+  function makeSlot(video, i) {
+    const el = document.createElement('div');
+    el.className = 'feed-slot';
+    el.dataset.i = String(i);
+    el.innerHTML = `
+      <div class="slot-source">
+        From <a href="${esc(video.url)}" target="_blank" rel="noopener">${esc(video.title || 'video')}</a>
+        ${video.channel ? `<span class="slot-channel">· ${esc(video.channel)}</span>` : ''}
+      </div>
+      <div class="slot-status"><span class="spinner"></span><span class="slot-msg">Starting…</span></div>
+      <div class="slot-clips"></div>`;
+    return { el, video };
+  }
+
+  function updateSlot(i, snap) {
+    const slot = feed.slots[i];
+    if (!slot) return;
+    const msg = slot.el.querySelector('.slot-msg');
+    if (msg) {
+      const pct = typeof snap.pct === 'number' && snap.pct > 0 ? ` ${Math.round(snap.pct)}%` : '';
+      msg.textContent = `${snap.message || snap.stage || 'Working…'}${pct}`;
+    }
+  }
+
+  function fillSlot(i, snap, jobId) {
+    const slot = feed.slots[i];
+    if (!slot) return;
+    const clips = Array.isArray(snap.clips) ? snap.clips : [];
+    if (!clips.length) {
+      skipSlot(i); // done but nothing on-topic → drop, never pad
+      return;
+    }
+    feed.videosWithClips++;
+    feed.shown += clips.length;
+    const statusEl = slot.el.querySelector('.slot-status');
+    if (statusEl) statusEl.remove();
+    const clipsEl = slot.el.querySelector('.slot-clips');
+    for (const clip of clips) clipsEl.appendChild(makeClipCard(clip, jobId, slot.video));
+    renderStatus();
+  }
+
+  function skipSlot(i) {
+    const slot = feed.slots[i];
+    if (slot && slot.el && slot.el.parentNode) slot.el.parentNode.removeChild(slot.el);
+    feed.slots[i] = null;
+    feed.skipped++;
+    renderStatus();
+  }
+
+  // Build the Node-proxy URL for a cut clip file. download=1 → attachment; otherwise an
+  // inline, range-seekable stream for the <video> element.
+  function clipFileUrl(path, download) {
+    const parts = String(path).split('/').filter(Boolean); // ["clips", vid, file]
+    const vid = parts[parts.length - 2];
+    const file = parts[parts.length - 1];
+    return `/api/clip-file/${encodeURIComponent(vid)}/${encodeURIComponent(file)}${download ? '?download=1' : ''}`;
+  }
+
+  // ---- one clip card ----
+  function makeClipCard(clip, jobId, video) {
+    const card = document.createElement('div');
+    card.className = 'clip-card';
+    const facet = String(clip.facet || 'clip').replace(/_/g, ' ');
+    const range = `${clock(clip.start)}–${clock(clip.end)} · ${Math.round(clip.duration || 0)}s`;
+    const watchAt = `${esc(video.url)}&t=${Math.floor(clip.start || 0)}s`;
+
+    // A cut clip (output_mode=cut) plays inline as a frame-accurate mp4 — EXACT sentence-start /
+    // punctuation boundaries, no ~1s YouTube whole-second bleed. Otherwise fall back to the embed.
+    const player = clip.path
+      ? `<video class="clip-media" src="${esc(clipFileUrl(clip.path, false))}" controls playsinline preload="metadata"></video>`
+      : `<iframe
+          src="${esc(clip.embed_url)}"
+          title="Clip ${esc(clip.n)}"
+          loading="lazy"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+          allowfullscreen
+        ></iframe>`;
+
+    card.innerHTML = `
+      <div class="clip-video">${player}</div>
+      <div class="clip-body">
+        ${clip.title ? `<h4 class="clip-title">${esc(clip.title)}</h4>` : ''}
+        <div class="clip-row">
+          <span class="tag">${esc(facet)}</span>
+          <span class="clip-time">${esc(range)}</span>
+        </div>
+        ${clip.context_card ? `<p class="clip-context">${esc(clip.context_card)}</p>` : ''}
+        ${clip.reason ? `<p class="clip-reason">${esc(clip.reason)}</p>` : ''}
+        <div class="clip-actions">
+          <button class="clip-dl">Export .mp4</button>
+          <a class="clip-watch" href="${watchAt}" target="_blank" rel="noopener">Watch on YouTube ↗</a>
+        </div>
+        <p class="clip-err hidden"></p>
+      </div>`;
+
+    const btn = card.querySelector('.clip-dl');
+    const errEl = card.querySelector('.clip-err');
+
+    if (clip.path) {
+      replaceWithDownload(btn, clip.path);
+    } else {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        btn.textContent = 'Exporting… (cutting mp4)';
+        errEl.classList.add('hidden');
+        try {
+          const r = await fetch(
+            `/api/clip/${encodeURIComponent(jobId)}/clips/${encodeURIComponent(clip.n)}/export`,
+            { method: 'POST' },
+          );
+          if (!r.ok) {
+            const d = await r.json().catch(() => ({}));
+            throw new Error(d.error || 'Export failed.');
+          }
+          const { path } = await r.json();
+          replaceWithDownload(btn, path);
+        } catch (e) {
+          btn.disabled = false;
+          btn.textContent = 'Export .mp4';
+          errEl.textContent = e.message || 'Export failed.';
+          errEl.classList.remove('hidden');
+        }
+      });
+    }
+    return card;
+  }
+
+  // Turn the clipper-relative export path ("/clips/<vid>/<file>") into a Node
+  // proxy download URL and swap the button for a download link.
+  function replaceWithDownload(btn, path) {
+    const href = clipFileUrl(path, true);
+    const a = document.createElement('a');
+    a.className = 'clip-dl ready';
+    a.href = href;
+    a.setAttribute('download', '');
+    a.textContent = '↓ Download .mp4';
+    btn.replaceWith(a);
+  }
+
+  // ---- status pills + terminal state ----
+  function renderStatus() {
+    if (!feed || !elStatus) return;
+    const total = feed.searchCredits + feed.clipCredits;
+    const pills = [
+      `<span class="pill accent">clips: <b>${feed.shown}</b></span>`,
+      `<span class="pill">from <b>${feed.videosWithClips}</b> video${feed.videosWithClips === 1 ? '' : 's'}</span>`,
+      `<span class="pill">Supadata session: <b>~${total}</b> (${feed.searchCredits} search + ${feed.clipCredits} clip)</span>`,
+    ];
+    if (feed.active > 0) pills.push(`<span class="pill">clipping <b>${feed.active}</b>…</span>`);
+    if (feed.skipped > 0) pills.push(`<span class="pill note">${feed.skipped} skipped (off-topic)</span>`);
+    elStatus.innerHTML = pills.join('');
+    elStatus.classList.remove('hidden');
+  }
+
+  function maybeShowEnd() {
+    if (!feed) return;
+    const noMore = feed.cursor >= feed.queue.length || feed.started >= feed.cap;
+    if (!(noMore && feed.active === 0)) {
+      elEnd.classList.add('hidden');
+      return;
+    }
+    const cappedEarly = feed.started >= feed.cap && feed.cursor < feed.queue.length;
+    if (cappedEarly) {
+      elEnd.innerHTML = '';
+      const btn = document.createElement('button');
+      btn.className = 'feed-more';
+      btn.textContent = 'Load more clips  (~1 Supadata credit / video)';
+      btn.addEventListener('click', () => {
+        feed.cap += DEFAULT_CAP;
+        feed.sentinelVisible = true; // explicit user request to continue
+        elEnd.classList.add('hidden');
+        pump();
+      });
+      elEnd.appendChild(btn);
+      elEnd.classList.remove('hidden');
+    } else {
+      const summary = feed.shown
+        ? `Reached the end — <b>${feed.shown}</b> clip${feed.shown === 1 ? '' : 's'} from <b>${feed.videosWithClips}</b> video${feed.videosWithClips === 1 ? '' : 's'}${feed.skipped ? ` · ${feed.skipped} had no on-topic moments` : ''}.`
+        : `No on-topic clips found across ${feed.skipped} video${feed.skipped === 1 ? '' : 's'}. Try a broader or more specific topic.`;
+      elEnd.innerHTML = `<p class="feed-note">${summary}</p>`;
+      elEnd.classList.remove('hidden');
+    }
+  }
+})();

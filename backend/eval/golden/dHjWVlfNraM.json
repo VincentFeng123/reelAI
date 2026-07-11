@@ -1,0 +1,31 @@
+{
+  "video_id": "dHjWVlfNraM",
+  "chapters": [
+    {
+      "start_time": 0.0,
+      "end_time": 268.0,
+      "title": "scalar vs vector"
+    },
+    {
+      "start_time": 268.0,
+      "end_time": 495.0,
+      "title": "distance vs displacement"
+    },
+    {
+      "start_time": 495.0,
+      "end_time": 775.0,
+      "title": "speed vs velocity"
+    },
+    {
+      "start_time": 775.0,
+      "end_time": 890.0,
+      "title": "instantaneous velocity"
+    },
+    {
+      "start_time": 890.0,
+      "end_time": 1907.0,
+      "title": "formulas"
+    }
+  ],
+  "chapters_provenance": "creator"
+}

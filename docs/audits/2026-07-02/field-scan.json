@@ -1,0 +1,230 @@
+{
+  "angle": "field-scan",
+  "findings": [
+    {
+      "title": "Judge the RENDERED clip with a video-native model at the final gate \u2014 now cheap, and MLLM judges measurably beat text-only judges on video",
+      "claim": "A multimodal judge that watches the actual rendered clip (video+audio) outperforms text-only judging for video outputs (VideoJudge, 2025), and current Gemini pricing/token rates make it affordable at the accept/reject gate: video costs ~100 tokens/sec at low media resolution (~300 at default), so a max-length 240s clip is ~24K tokens \u2248 $0.012 input on Gemini 3 Flash ($0.50/M, GA since Dec 17 2025). A text-only judge structurally cannot detect mid-clause audio starts/ends, missing visual context, or that the shipped artifact differs from the judged text \u2014 exactly the F1 blindness cases (9/10 for clips starting/ending mid-clause; shipped text never judged). Caveat: MLLM video judges have their own reliability gaps (VF-Eval shows inconsistent human agreement and generic critiques), so this is an added audit layer, not a replacement for programmatic gates.",
+      "addresses": "F1 (judge blindness direction), F4 (internal vs judge divergence \u2014 audit sees the real artifact), F8 (clip+card can finally be judged as shipped)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/pdf/2509.21451",
+          "note": "VideoJudge: MLLM-as-judge for video understanding; vision-capable judges substantially outperform text-only evaluators and correlate better with human preferences; bootstrapped supervision recipe for building a video judge without mass annotation."
+        },
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/video-understanding",
+          "note": "Verified: 1 FPS sampling, ~300 tokens/sec default media resolution / ~100 tokens/sec low, MM:SS timestamp addressing, 1h (default) or 3h (low res) per 1M context, YouTube URL ingestion supported, up to 10 videos/request on Gemini 2.5+."
+        },
+        {
+          "url": "https://blog.google/products-and-platforms/products/gemini/gemini-3-flash/",
+          "note": "Gemini 3 Flash GA Dec 17 2025 in Gemini API/Vertex; $0.50/1M input, $3/1M output; strong multimodal reasoning incl. video analysis."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2505.23693",
+          "note": "VF-Eval: benchmark showing MLLM judges on video still have inconsistent human alignment, generic feedback, and systematic biases \u2014 motivates keeping programmatic gates alongside."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Add a `render_audit` step after pipeline/cut.py in pipeline/assemble/validate.py's final gate (and in eval/run_eval.py): upload the actual rendered MP4 (clip + burned-in context card) to Gemini 3 Flash via the File API, judge with the same contract rubric plus two video-only gates: `starts_clean_audio` (first utterance is a sentence start, not mid-clause) and `visuals_referenced_are_visible`. Because the model is a different generation/family-tier from the gemini-2.5-flash author, this also strengthens the self-preference mitigation in RESEARCH.md. Keep the cheap text judge inside the repair loop; run the video judge only on repair-loop survivors (~0.7-8 clips/video \u21d2 ~$0.01-0.30/video). Log text-judge vs video-judge disagreement in eval/metrics.py \u2014 F1's phantom-reference verdicts (e.g. 'that fog') are exactly the cases a judge that hears the clip should overturn."
+    },
+    {
+      "title": "Kill phantom judge verdicts with mandatory verbatim quotes + programmatic substring verification (never ask the LLM to verify its own citations)",
+      "claim": "Requiring the judge to attach a verbatim quote from the judged text for every claim, then verifying those quotes with code, is a measured, production-proven hallucination-detection pattern (Datadog: two-stage quote-grounded judging, F1 0.810 on HaluBench with best cross-benchmark generalization). Verification must be programmatic: LLMs themselves are poor at citation/quote validation, and fabricated-citation rates run 14-94% across 13 models (GhostCite). This directly targets F1's failure signature \u2014 the judge cited 'the previous equation', a phrase that does not occur in the span, and flagged 'that fog' as unresolved though it is introduced in-clip; both verdicts would be voided by a substring check.",
+      "addresses": "F1 (hallucinated failure reasons killing good clips at the repair gate)",
+      "sources": [
+        {
+          "url": "https://www.datadoghq.com/blog/ai/llm-hallucination-detection/",
+          "note": "Engineering blog with measurements: judges must quote 'relevant portions' of context and answer for each claim; claim decomposition into contradiction vs unsupported; two-stage guided summarization; F1 0.810 HaluBench, smallest HaluBench\u2192RAGTruth drop."
+        },
+        {
+          "url": "https://arxiv.org/abs/2602.06718",
+          "note": "GhostCite: 13 LLMs fabricate citations at 14.23-94.93%; 2.2M-citation corpus study; demonstrates LLM self-verification of citations is untrustworthy \u2014 verification must be mechanical."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In pipeline/assemble/validate.py's judge schema: every failed gate must carry (a) `evidence_quote` \u2014 verbatim text from the judged span, and (b) for unresolved-reference verdicts, `referring_phrase` \u2014 the exact phrase claimed to dangle. Post-process in Python: normalize whitespace/case and substring-match both fields against the span actually sent to the judge; any verdict citing absent text is VOIDED (gate treated as pass or retried once with a 'your quote was not found' message). Track `phantom_verdict_rate` as a first-class metric in eval/metrics.py; the 21-agent audit suggests it will be material, and this single change attacks the 7.7-rejections-per-video kill rate at its root. Zero new dependencies, one schema change."
+    },
+    {
+      "title": "A single whole-video video-native pass CANNOT replace the structure/boundary stages: hour-scale timestamp grounding is still unreliable in mid-2026",
+      "claim": "The newest evidence says long-video timestamp localization by video-LLMs remains a weak point: ExtremeWhenBench (2026) evaluates natural-language temporal grounding in HOUR-long videos across Qwen3-VL, InternVL 3.5, LLaVA-OneVision, GPT- and Gemini-class models and concludes they 'cannot reliably localize timestamps in hour-long videos' \u2014 grounding must be decomposed into retrieval (find the region) + local grounding (refine within a short window), i.e., a search problem. Qwen3-VL is the strongest open effort (explicit per-patch textual timestamp tokens, interleaved-MRoPE, 'second-level indexing', 2-hour video, 99.5% needle-in-haystack at 1M tokens) but needle retrieval is not boundary emission, and it is among the models the benchmark still finds unreliable. Consequence: the pipeline's transcript-anchored text-selection design (select.py anchor_quote \u2192 word timestamps) is the correct architecture and is NOT superseded; video-native models should be used on short windows (clip-level audit, unit-role labeling) where inputs are \u2264 a few minutes, never to emit boundaries over the full video.",
+      "addresses": "Angle-2 supersession question (guardrail against rearchitecting); indirectly validates the fixes for F2/F7 being boundary-side rather than model-side",
+      "sources": [
+        {
+          "url": "https://arxiv.org/pdf/2606.12300",
+          "note": "ExtremeWhenBench: hour-long NL temporal grounding benchmark + empirical decomposition; evaluated Qwen3-VL/InternVL3.5/LLaVA-OV/GPT/Gemini-class; substantial IoU degradation vs short-video benchmarks; concludes grounding is a search problem needing external retrieval."
+        },
+        {
+          "url": "https://github.com/QwenLM/Qwen3-VL",
+          "note": "Qwen3-VL: text-timestamp alignment 'beyond T-RoPE' for timestamp-grounded event localization, 256K\u21921M context, sizes 2B-235B; capability claims verified, no hour-scale grounding numbers published on page."
+        },
+        {
+          "url": "https://the-decoder.com/qwen3-vl-can-scan-two-hour-videos-and-pinpoint-nearly-every-detail/",
+          "note": "Secondary: 2-hour video processing, 100% needle accuracy at 256K / 99.5% at 1M \u2014 retrieval, not boundary-quality, evidence."
+        },
+        {
+          "url": "https://ai.google.dev/gemini-api/docs/video-understanding",
+          "note": "Gemini's 1 FPS sampling and MM:SS-second granularity caps achievable boundary precision at ~1s even before model error."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Do not replace content_map/units with a whole-video Gemini/Qwen pass. Two safe uses instead: (1) short-window audit \u2014 feed only the rendered clip (finding 1) or a \u00b160s window around a candidate boundary and ask 'is a new sentence/topic starting here?' as a cross-check for refine.py snapping; (2) semantic labeling of already-segmented units (TreeSeg stays the boundary authority per RESEARCH.md). If timestamp emission is ever needed from a VLM, adopt ExtremeWhenBench's retrieve-then-locally-ground decomposition, which is structurally what select.py already does with transcript quotes."
+    },
+    {
+      "title": "Replace the supadata caption path with local ASR (parakeet-tdt-0.6b-v3 via parakeet-mlx, or WhisperX): real punctuation + word-level timestamps on the Mac, fixing F7 at the source",
+      "claim": "NVIDIA parakeet-tdt-0.6b-v3 (CC-BY-4.0, 600M params, 6.34% avg WER on the Open ASR Leaderboard, top throughput in its class) natively outputs automatic punctuation, capitalization, and word+segment-level timestamps (`transcribe(..., timestamps=True)`), handling up to 3h audio with local attention \u2014 and parakeet-mlx runs it natively on Apple Silicon with word-level timestamps (JSON/VTT output). WhisperX (large-v3/turbo + wav2vec2 forced alignment) is the fallback for languages/edge cases. This gives the sentence-boundary logic real punctuation and real word timings instead of caption chunks, eliminating the fabricated ends_with_period=true no-op. Note: there is no 'Whisper v4' \u2014 the open line is still large-v3/turbo \u2014 and OpenAI's better-WER gpt-4o-transcribe API only returns sentence/segment-level timestamps, so it is NOT suitable for word-snapped boundaries.",
+      "addresses": "F7 (fabricated sentence boundaries on unpunctuated captions \u2192 mid-clause ships with fictitious perfect boundary score); upstream enabler for F2 trim moves and honest boundary scores",
+      "sources": [
+        {
+          "url": "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3",
+          "note": "Model card verified: automatic punctuation & capitalization; accurate word- and segment-level timestamps enabled via timestamps=True; up to 3h audio with local attention; 6.34% avg WER; CC-BY-4.0."
+        },
+        {
+          "url": "https://github.com/senstella/parakeet-mlx",
+          "note": "Parakeet on Apple Silicon via MLX; CLI + Python; word/token-level AlignedToken timestamps (start/end seconds), VTT --highlight-words, json/srt/vtt output. Local, no API key."
+        },
+        {
+          "url": "https://github.com/m-bain/whisperX",
+          "note": "WhisperX: wav2vec2 forced-alignment fixes Whisper's coarse/drifting segment timestamps to word level; diarization included \u2014 fallback path."
+        },
+        {
+          "url": "https://developers.openai.com/api/docs/guides/speech-to-text",
+          "note": "gpt-4o-transcribe: better WER than Whisper but no word-level timestamps (verbose_json gives sentence/segment level) \u2014 rules it out for boundary snapping."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Add `ASR_ENGINE=\"parakeet_mlx\"` to config.py and a branch in pipeline/transcribe.py: pipeline/download.py already pulls media via yt-dlp for cut.py, so extract audio (ffmpeg -vn -ar 16000) and run parakeet-mlx \u2192 punctuated sentences + per-word timings. pipeline/sentences.py then computes ends_with_period from real punctuation (delete the caption-chunk fallback that fabricates it), and boundary.py/refine.py snap to genuine sentence ends with word-accurate cut points. Keep supadata as the fast path when captions are creator-provided (punctuated); auto-detect: if <20% of caption chunks end in terminal punctuation, force the ASR path. Cost: ~0 (local, faster than realtime on M-series); this is the single cheapest fix in the list."
+    },
+    {
+      "title": "Give the repair loop shrink/trim moves \u2014 both-edge boundary refinement is the norm in moment-retrieval research, and grow-only is an anomaly",
+      "claim": "The moment-retrieval boundary literature supervises and refines BOTH edges of a candidate (ClipTBP 2026: margin-based ranking between clips just-inside vs just-outside each boundary + direct regression of start, end, center, and length; plug-in gains on QVHighlights R1@0.7 50.00\u219253.61 and TACoS 24.74\u219227.49), i.e., precise clips come from discriminating in/out at each edge \u2014 which includes shrinking. Production clippers likewise target 30-90s 'complete thought' units rather than inflating spans. A grow-only repair loop (observed: 10-60s anchors inflated to 100-294s, judged text exceeding the 240s ship cap, then rejected for 'jumps between topics') has no counterpart in either literature or production; 'multi-topic' verdicts are precisely the signal to drop edge sentences, not to reject.",
+      "addresses": "F2 (grow-only repair; candidates with one bad edge die); F4 sub-issue (judged text that can never ship)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2604.27591v1",
+          "note": "ClipTBP: boundary-aware learning distinguishes clips just inside vs outside segment boundaries at both edges; regresses start/end/center/length; consistent plug-in gains across UniVTG/FlashVTG/TR-DETR \u2014 demonstrates the both-edge refinement principle."
+        },
+        {
+          "url": "https://support.riverside.com/hc/en-us/articles/12124048765981-AI-Magic-Clips",
+          "note": "Riverside Magic Clips product doc: fixed 30-90s highlight targets from within the recording \u2014 production norm is short complete-thought extraction, never span inflation (selection internals not disclosed; norm is inferred from product behavior)."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "In pipeline/assemble/validate.py's repair loop add two symmetric moves alongside grow: `trim_head(n_sentences)` and `trim_tail(n_sentences)` (unit-graph-aware: never trim the anchor unit itself). Route by verdict type: unresolved-reference/missing-setup \u2192 grow toward the antecedent (as now); 'jumps between topics'/'multiple topics'/'unsatisfying tail' \u2192 trim the offending edge first; only reject after both directions are exhausted. Enforce the ship cap as a HARD constraint inside candidates.py span assembly so no judged span can exceed 240s (fixes judged-text-can-never-ship). Add a repair-iteration budget (SciTalk finding 8 shows unmonitored iteration drives runaway) and log grow:trim:reject ratios in eval/metrics.py."
+    },
+    {
+      "title": "Anchor selection needs an explicit coverage/diversity objective \u2014 importance-only ranking under a budget is a known-degenerate design in extractive video summarization",
+      "claim": "The video-summarization literature treats importance, coverage, representation, and diversity as distinct, competing objectives that cannot be served by an importance-only ranking under a selection budget (Gygli et al.-lineage analysis in 'Demystifying Multi-Faceted Video Summarization', arXiv:1901.01153; 2025 work like C2FVS-DPP still builds diversity in via determinantal point processes). Flat priority under MAX_ANCHORS=12 letting six 'claim' units crowd out practice_prompt/solution/equation_introduction entirely (F3: ~1 of 5 reference clips delivered) is the textbook failure this literature exists to prevent; the standard fixes are quota constraints per category and greedy submodular/DPP selection with redundancy penalties.",
+      "addresses": "F3 (no coverage/diversity constraint; role classes crowded out; worked example unclippable because 'calculation' isn't an anchor role)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/1901.01153",
+          "note": "Verified abstract: diversity, coverage, representation, importance are separate models with application-dependent utility \u2014 not collapsible into one importance score; guidance for choosing per domain."
+        },
+        {
+          "url": "https://doi.org/10.3390/sym17101737",
+          "note": "C2FVS-DPP (2025): current-generation summarization still jointly models semantic importance + visual diversity + temporal structure via DPP \u2014 diversity-aware selection is the living standard, not a legacy idea."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "Two changes in pipeline/assemble/candidates.py: (1) role-class quotas before priority \u2014 for genre=lecture reserve slots per pedagogical class present in the unit graph (\u22651 definition/equation_introduction, \u22651 worked-example chain, \u22651 practice_prompt+solution pair) and only fill remaining slots by priority; (2) greedy marginal-gain selection: score each next anchor as importance \u2212 \u03bb\u00b7max_similarity(existing picks' unit embeddings, sentence-transformers already installed) \u2212 \u03bc\u00b7content_map-segment overlap, so 12 anchors spread across the map instead of clustering. Separately widen anchorable roles in roles.py/contracts.py: a 'calculation'/'result' unit that terminates a problem_statement chain in graph.py must be anchorable as the chain's endpoint (the audit's unclippable worked example). Validate with the per-role delivery metric against the 5-reference-clip expectation in eval/run_eval.py."
+    },
+    {
+      "title": "Production clippers (OpusClip, Vizard, Riverside, Descript, Klap, 2026 field) run score-and-rank, NOT validation loops \u2014 but they ship an orienting hook/title on every clip, which is the fix for F8",
+      "claim": "Verified public documentation shows the market leaders select by multimodal scoring and ranking with no disclosed completeness-validation loop: OpusClip's official virality score is four signals \u2014 Hook, Flow ('flows logically... satisfying conclusion' \u2014 coherence is a RANKING feature, not a gate), Value, Trend, 0-99 \u2014 plus prompt-alignment checks in ClipAnything ('rates each scene on virality potential'; analyzes objects/actions/text/emotions per frame); Riverside targets 30-90s highlights from keyword/sentiment/energy signals; Descript's own ecosystem warns users to 'watch every clip... Underlord can hallucinate.' None of them claim educational-content handling beyond genre-agnostic prompts. Two consequences: (a) this pipeline's judge-gated architecture is ahead of production on completeness \u2014 the failure is calibration, not concept; (b) production universally ships an attention/orientation device (hook text overlay, title) on EVERY clip unconditionally, and the one academic lecture-to-reels system with learning-outcome evidence (ReelsEd, 62-student RCT: quiz 93.85% vs 79.72%, p=0.0001) likewise generates a summary+label for every reel \u2014 nobody makes orientation conditional on detected referential prerequisites.",
+      "addresses": "F8 (zero context cards shipped; cards generated after the gate); F6 partially (ClipAnything handles genre via prompt, not hard adapter binding); competitive positioning for F1-F5",
+      "sources": [
+        {
+          "url": "https://help.opus.pro/docs/article/virality-score",
+          "note": "Official OpusClip doc: Hook/Flow/Value/Trend on 0-99; Flow = logical flow + satisfying conclusion; ClipAnything adds prompt-alignment assessment. No validation loop disclosed."
+        },
+        {
+          "url": "https://www.opus.pro/clipanything",
+          "note": "Official: multimodal per-frame analysis (objects, actions, text overlays, emotional sounds, sentiment), per-scene virality rating, prompt-driven genre-agnostic clipping. Nothing on completeness validation."
+        },
+        {
+          "url": "https://arxiv.org/html/2509.05962v1",
+          "note": "ReelsEd (verified pipeline): GPT-4 picks key-moment timestamps from transcript per learning goals; every reel gets a generated short summary + clear label; NO automated self-containment validation (instructor review instead); RCT n=62: quiz 93.85% vs 79.72%, time 328.77s vs 446.23s, cognitive load unchanged."
+        },
+        {
+          "url": "https://support.riverside.com/hc/en-us/articles/12124048765981-AI-Magic-Clips",
+          "note": "Riverside official help: AI Magic Clips generates 30-90s highlights; keyword input; internals undisclosed (third-party reviews attribute keyword/sentiment/energy signals \u2014 inferred)."
+        },
+        {
+          "url": "https://help.descript.com/hc/en-us/articles/10119670449293-Create-clips-from-your-content",
+          "note": "Descript official: Underlord 'find good clips' one-click flow; ecosystem guidance says to review every clip because the model hallucinates context \u2014 even market leaders lack trustworthy validation."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "Invert the context-card policy in pipeline/assemble/context_card.py: generate a one-line orientation card for EVERY clip by default (what video, what's being worked on, one-clause setup \u2014 the ReelsEd 'summary + clear label' pattern), with a suppression rule only when the clip's own first sentence already names the subject. Move card generation BEFORE the accept/reject gate in the orchestrator so the judged artifact is clip+card (fixes F8's ordering bug) \u2014 and with finding 1, the video judge sees the burned-in card. Optionally add an OpusClip-style 'flow' ranking feature (hook strength, satisfying-conclusion) in assemble/scoring.py to order survivors, separate from gates."
+    },
+    {
+      "title": "Warning from the closest research analog: agentic feedback loops without human anchoring drift \u2014 agent scores rose while human readability fell (SciTalk)",
+      "claim": "SciTalk (2025), the closest published analog to this pipeline's repair loop (multi-LLM agents generate scientific short-form video; feedback agents watch RENDERED frames \u2014 2-60 sampled frames per scene/video \u2014 and drive 5 refinement iterations), found that agent-assigned engagement scores 'generally improved, peaking at the 4th iteration' while HUMAN-rated scene readability dropped from 3.8 to 2.2 by iteration 5: the loop optimized its own proxy and made the product worse. This is direct empirical confirmation of the F5 risk \u2014 every threshold in this pipeline (repair gate, 0.70 judge threshold, final_quality) is tuned against an unvalidated proxy, and the 92% kill rate plus 294s span inflation are consistent with proxy-chasing. It also demonstrates the mechanics of rendered-artifact feedback agents (frame sampling per sub-scene) that finding 1 operationalizes.",
+      "addresses": "F5 (no human calibration; thresholds tuned against unvalidated proxy); F2 (iteration runaway as proxy-chasing)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2504.18805v1",
+          "note": "SciTalk: feedback agents evaluate rendered video frames (10/section, 2/sub-scene, 60/full video); 5 iterations \u00d7 9 papers; agent engagement scores peaked at iteration 4 while human scene-readability fell 3.8\u21922.2 \u2014 quantified agent-human divergence in a clip-generation feedback loop."
+        },
+        {
+          "url": "https://arxiv.org/pdf/2606.19544",
+          "note": "(Already in RESEARCH.md, corroborating) consistency-bias paradox: high test-retest reliability does not imply validity \u2014 same lesson from the judge side."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Before tuning anything else on judge scores: build the golden set (backend/eval/make_golden.py exists, golden dir is empty) \u2014 ~30 clips across the audited trio + kinematics lecture, human-labeled accept/reject + reason codes (unresolved-ref / bad-edge / multi-topic / fine); compute judge-human \u03ba in eval/metrics.py and BLOCK threshold/prompt changes that don't hold or improve \u03ba (make it a run_eval gate, like --freeze). Cap repair-loop iterations (2-3) in validate.py and treat 'agent score improved but human-proxy features degraded' (span length ballooning, boundary score drops) as a stop signal. This is the only finding that de-risks all the others."
+    },
+    {
+      "title": "Hierarchical comprehension index + explicit reconciliation/audit pass (coarse\u2192fine\u2192reconcile) is the published pattern for trustworthy long-video agents \u2014 use a reconciliation pass to catch contract mis-binding and genre errors",
+      "claim": "The 2025 prompt-driven agentic video editing system (arXiv:2509.16811) indexes long video with a coarse 15-min pass (format, premise, characters) + fine 5-min pass (dialogue, speech acts, affect) + a dedicated RECONCILIATION pass that 'resolves inconsistencies, corrects hallucinations, and enriches causal inference' between local and global outputs \u2014 ablation showed the reconciliation pass was 'critical', the full index beat direct Gemini 2.0 Flash prompting with ~26\u00d7 odds of higher quality ratings, and users completed long-form edits significantly more successfully than with Descript or OpusClip. The transferable pattern for this pipeline: a cheap cross-level consistency check between global labels (genre) and local evidence (unit roles inside each candidate span) \u2014 exactly what F4 (claim-anchored clip containing a worked problem bypasses problem gates, ships 0.95 vs judge 4/10) and F6 (parody song \u2192 'lecture' 0.9; interview \u2192 'story') lack.",
+      "addresses": "F4 (contract chosen by anchor role alone), F6 (genre misdetection as single hard label)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2509.16811v1",
+          "note": "Verified architecture: 15-min coarse + 5-min fine segmentation, guided context compression, reconciliation/refinement pass (critical in ablation), timestamped-JSON clip selection with justifications; Study 1: ~26\u00d7 odds better than Gemini 2.0 Flash direct; Study 4: users beat Descript/OpusClip workflows."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "Add a single reconciliation LLM call after unit labeling and before contract binding: input = (genre + confidence from adapters/detect.py, content_map summary, the candidate span's full unit-role sequence); output = (a) contract override \u2014 if the span contains a problem_statement\u2192reasoning\u2192result chain, bind the lecture worked-example contract in assemble/contracts.py regardless of the anchor's role (fixes F4); (b) genre challenge \u2014 if fine-grained evidence contradicts the global label (rhyme/verse structure vs 'lecture'; interviewer turns vs 'story'), either re-run detect.py with the evidence attached or mark genre mixed and fall back to the generic adapter's laxer gates (fixes F6). Cost: one flash-lite call per candidate; also log internal-score vs judge-score divergence per contract as the F4 tripwire in eval/metrics.py."
+    }
+  ],
+  "leads": [
+    "TimeExpert (ICCV 2025, https://openaccess.thecvf.com/content/ICCV2025/papers/Yang_TimeExpert_An_Expert-Guided_Video_LLM_for_Video_Temporal_Grounding_ICCV_2025_paper.pdf) \u2014 expert-routed video LLM specifically for temporal grounding (separate pathways for timestamp decoding vs saliency vs text); candidate dedicated 'timestamp auditor' model if a VLM boundary cross-check (finding 3, use 2) proves useful. Not fetched in depth.",
+    "Qwen3-VL-8B locally (LM Studio lists qwen3-vl; MLX ports exist) as a free offline render-audit judge \u2014 capability verified at page level (finding 3 sources) but no published clip-level judging eval; would remove API cost from finding 1 and give true cross-family judging vs the Gemini author. Benchmark on the golden set first.",
+    "yt-dlp 'most replayed' heatmap (github.com/yt-dlp/yt-dlp/issues/3888; Apify extractors return normalized intensity + start/end millis) \u2014 audience-replay intensity as a free anchor-selection prior in candidates.py (importance term in finding 6's greedy objective). Current yt-dlp support status unverified \u2014 check `--dump-json` for a `heatmap` field on modern yt-dlp.",
+    "Gemini videoMetadata clip offsets (start_offset/end_offset, custom fps) for auditing a clip directly against the SOURCE YouTube URL without rendering/uploading \u2014 mentioned in ecosystem docs but NOT confirmed in the fetched ai.google.dev video-understanding page; verify against current API reference before relying on it (upload-the-rendered-MP4 works regardless).",
+    "Reap.video 'State of Top AI Video Clipping Tools 2026' (https://reap.video/reports/state-of-top-ai-video-clipping-tools-2026) \u2014 claims 9 tools benchmarked; fetch returned title only (likely JS-rendered). If retrievable, may contain the only public cross-tool data on clip completeness/mid-sentence rates \u2014 exactly the F1/F7 comparison baseline.",
+    "GPT-Realtime-Whisper (reported May 7 2026 OpenAI Realtime audio family, via diyai.io review) \u2014 streaming transcript deltas; not verified against an OpenAI announcement; irrelevant to word-timestamp needs (finding 4) but track for live use.",
+    "Lotus (IUI 2025, arXiv:2502.07096) \u2014 hybrid abstractive (generated narration + matched footage) + extractive shorts; abstract verified, PDF unparseable. Its abstractive mode is an alternative to context cards: synthesize a 1-sentence spoken lead-in over the clip's first seconds instead of a text card (F8), at the cost of leaving 'preserve instructor-authored material' territory that ReelsEd's RCT supports.",
+    "JAVEDIT (arXiv:2606.03168) \u2014 agentic closed-loop video editing that detects failures, diagnoses root causes, patches pipeline code/parameters, and stores verified fixes for reuse; a more aggressive template for the repair loop than grow/trim moves. Only search-level summary; fetch before use.",
+    "VidChapters-7M (NeurIPS 2023 dataset) \u2014 817K YouTube videos with creator-written chapters; free large-scale gold for evaluating content_map boundaries (Pk/WindowDiff against human chapter marks) beyond the 3-video A/B in RESEARCH.md. Known from training data; not re-verified this session.",
+    "SpotVMR (arXiv:2605.29793) \u2014 preview-with-cheap-features then selectively process clips (8\u00d7 speedup on moment retrieval); relevant only if the pipeline ever adds visual moment search over long videos (8uNod visual-heavy class).",
+    "Descript help center deep pages and Vizard docs.vizard.ai/docs/advanced expose API parameters (clip length prefs, keyword steering) but no pipeline internals \u2014 dead end for angle 1(b); every production completeness mechanism beyond scoring remains undisclosed (treat all third-party 'how it works' explanations as inferred).",
+    "Third-party claim that YouTube auto-chapters run at 40-60% timing accuracy (instantviews.net, Dec 2025, n=1000 videos) \u2014 SEO-blog quality, methodology unpublished; useful only as a hint that even YouTube-internal models don't solve boundary quality, consistent with finding 3."
+  ],
+  "notes": "Method: ~15 web searches + 19 page fetches (2026-07-02); every finding cites at least one directly-fetched source; product-pipeline internals beyond official docs are explicitly marked inferred. Big picture for the orchestrator: (1) Nothing supersedes the pipeline's structure-first architecture \u2014 mid-2026 evidence (ExtremeWhenBench) says video-native LLMs still cannot emit reliable timestamps over hour-long video, so understand-then-assemble with transcript-anchored boundaries stands; what HAS changed is that judging the rendered \u2264240s clip with a video-native model is now cheap (~$0.01/clip on Gemini 3 Flash) and demonstrably better-aligned than text-only judging (VideoJudge) \u2014 the highest-leverage new capability for F1/F4/F8. (2) The cheapest fixes are non-ML: programmatic quote verification of judge verdicts (F1), trim moves + hard ship-cap in the repair loop (F2), quotas + marginal-gain anchor selection (F3), always-on context cards generated before the gate (F8), local parakeet-mlx ASR replacing unpunctuated captions (F7). (3) Production systems validate nothing \u2014 they score and rank (OpusClip Hook/Flow/Value/Trend) and tell users to review every clip; this pipeline's gate architecture is ahead of the market IF calibrated, which makes (4) the golden set non-negotiable: SciTalk shows an uncalibrated agentic loop optimizing its own scores while human quality degrades \u2014 the exact F5 trajectory this pipeline is on with 92% kills and 294s span inflation. Suggested sequencing: finding 8 (golden set) \u2192 2 (quote verification) \u2192 4 (ASR) \u2192 5 (trim) \u2192 7 (cards) \u2192 6 (quotas) \u2192 1 (video judge) \u2192 9 (reconciliation). File touchpoints named per finding: backend/pipeline/assemble/{validate.py,candidates.py,contracts.py,scoring.py,context_card.py}, backend/pipeline/{transcribe.py,sentences.py,boundary.py,refine.py}, backend/adapters/detect.py, backend/roles.py, backend/eval/{run_eval.py,metrics.py,make_golden.py}, backend/config.py.",
+  "verification": {
+    "checked": [
+      {
+        "title": "FINDING 1: Video-native MLLM judge at the final gate \u2014 cheap, and beats text-only judging",
+        "supported": true,
+        "note": "Core claims verified. VideoJudge (arXiv 2509.21451) abstract states 'LLM judges (Qwen3) models perform worse than MLLM judges (Qwen2.5-VL)... indicating that providing video inputs is crucial for evaluation of video understanding tasks,' and the intro adds VideoJudge matches/surpasses larger models 'while correlating more strongly with human ratings' \u2014 so both the text-only-vs-MLLM comparison and the human-correlation claim are genuinely in the paper. Gemini docs confirm ~300 tokens/sec default (~258/frame + 32/sec audio) and ~100 tokens/sec low res (66/frame + 32/sec audio), 1 FPS, MM:SS timestamps, 1h/3h per 1M context, YouTube ingestion, 10 videos/request on 2.5+. Gemini 3 Flash blog confirms GA Dec 17 2025 at $0.50/1M input, $3/1M output. VF-Eval confirms the stated caveat (inconsistent human alignment, generic feedback, systematic biases). Minor downgrades: (1) 'substantially outperform' is the researcher's intensifier \u2014 the abstract says 'perform worse,' no effect size given, and the evidence is from Qwen-family 3B\u201372B judges on text-responses-about-video, not Gemini judging rendered clips, so it's an analogy, not a direct test of this deployment. (2) The Gemini 3 Flash blog lists audio input at $1/1M, so a 240s clip WITH audio at low res is ~$0.015 (15.8K video tokens @ $0.50/M + 7.7K audio tokens @ $1/M), not $0.012 \u2014 still ~1.5 cents, conclusion unchanged. (3) VF-Eval is specifically about feedback on AI-GENERATED videos (Lavie/OpenSora/T2V), a slightly different domain than judging edited real-video clips; fine as a caveat citation."
+      },
+      {
+        "title": "FINDING 2: Verbatim quotes + programmatic substring verification is a measured, production-proven pattern",
+        "supported": false,
+        "note": "Partially supported; the headline overclaims what the sources measured. Datadog's blog DOES confirm: judge must include 'a quote from the context and the answer, showing the relevant portions' for each claim; contradiction-vs-unsupported decomposition; two-stage (free-form rubric then structured-output conversion); F1 0.810 on HaluBench; smallest HaluBench\u2192RAGTruth F1 drop. However, Datadog's pipeline contains NO programmatic/substring verification of those quotes \u2014 the quotes are a prompting device to keep the judge grounded, and the second stage is format conversion by a smaller LLM, not code checking. So 'quote + verify with code' is NOT the measured pattern; only the quoting half is measured, and it's a vendor engineering blog benchmark, not 'production-proven.' GhostCite (arXiv 2602.06718) confirms 13 models fabricating citations at 14.23\u201394.93% over a 2.2M-citation corpus, but it measures generation-side fabrication of ACADEMIC bibliography citations \u2014 the fetched content does not address whether LLMs can verify citations/quotes, so 'LLMs themselves are poor at citation/quote validation' and 'demonstrates LLM self-verification is untrustworthy' are inferences the source does not make; verifying a substring in a provided text is also a different (much easier) task than validating bibliography entries. The proposed design is still sensible \u2014 substring checks are trivially sound by construction and would void the F1 phantom verdicts \u2014 but it should be framed as a novel extension of Datadog's quote-grounding plus an obvious mechanical check, not as a measured, production-proven pattern from these sources."
+      },
+      {
+        "title": "FINDING 3: Whole-video video-native pass cannot replace structure/boundary stages; hour-scale grounding unreliable",
+        "supported": true,
+        "note": "Strongly supported by the primary source, with one model-list overstatement. ExtremeWhenBench (arXiv 2606.12300; 2,273 queries, 194 videos, mean 75.7 min) shows monolithic Video-LLM grounding gets 0.053 mIoU on full 76-min videos vs 0.354 for a retrieve-then-ground hybrid (6.7x, using only 6 min of Video-LLM context); an 85% share of failures are search failures ('picking the wrong window of the long video'); conclusion: 'Open Video-LLMs collapse' and grounding should be split into retrieval + local grounding \u2014 exactly the finding's architecture claim. The paper also shows localization within short (30s) windows is intact (Qwen 0.572, Gemini 0.578 vs 0.579 ceiling), which directly supports 'use video-native models on short windows, never to emit boundaries over the full video.' Caveats: (1) the evaluated grounders visible in the paper are Qwen3.5-9B and Gemini-3.5-flash plus a CLIP baseline (with Qwen3-VL/InternVL3.5/LLaVA-OneVision referenced and Qwen3-VL-8B used as the caption source); GPT-class models (gpt-5-mini/5.1/5.4) appear as ANNOTATION-pipeline components, not clearly as evaluated grounders \u2014 so 'evaluates ... GPT-class models' is overstated. (2) 'cannot reliably localize timestamps in hour-long videos' is a fair paraphrase, not a quote. Qwen3-VL GitHub claims verified as described (text-timestamp alignment beyond T-RoPE, Interleaved-MRoPE, 256K\u21921M, second-level indexing, 2B\u2013235B; no hour-scale grounding numbers published \u2014 matching the finding's own hedge). Decoder article confirms 2-hour video, 100%@256K / 99.5%@1M needle accuracy, and the finding correctly labels this retrieval evidence, not boundary evidence. Gemini 1 FPS / MM:SS granularity confirmed."
+      },
+      {
+        "title": "FINDING 4: Replace supadata captions with local ASR (parakeet-tdt-0.6b-v3 via parakeet-mlx, WhisperX fallback)",
+        "supported": true,
+        "note": "Essentially all verified, with two small corrections that make the conclusion stronger, not weaker. HF model card confirms: automatic punctuation & capitalization; char/word/segment timestamps via timestamps=True; up to 3h audio with local attention (24 min full attention); 6.34% avg WER on Open ASR Leaderboard sets; CC-BY-4.0; 600M params. parakeet-mlx repo confirms Apple Silicon/MLX, CLI + Python, AlignedToken word/token timestamps with start/end seconds, txt/srt/vtt/json output, --highlight-words, and the DEFAULT model is mlx-community/parakeet-tdt-0.6b-v3. WhisperX confirms wav2vec2 forced alignment to word level plus diarization (turbo not explicitly named in README \u2014 large-v2/v3 are). OpenAI docs corrections: (1) the doc says gpt-4o-transcribe supports only json/text response formats and 'timestamp_granularities[] is only supported for whisper-1' \u2014 so gpt-4o-transcribe does not offer verbose_json at all; the finding's 'verbose_json gives sentence/segment level' misstates the mechanism, but the operative conclusion (no word-level timestamps, unsuitable for boundary snapping) is correct and actually understated. (2) The doc says 'higher quality' vs whisper-1 without explicit WER numbers, so 'better WER' is a mild paraphrase. Unverified frills: 'top throughput in its class' (leaderboard claim, not on the card as fetched) and 'no Whisper v4' (negative claim, consistent with all sources but not provable from them). One practical caveat worth surfacing: parakeet-tdt-0.6b-v3 supports 25 EUROPEAN languages only \u2014 the WhisperX fallback is load-bearing for any non-European-language content."
+      }
+    ],
+    "overall_note": "3 of 4 findings are genuinely backed by their sources. Finding 1 checks out (pricing/token math confirmed; ~$0.012 should be ~$0.015 once audio tokens at $1/M are counted; VideoJudge evidence is analogical \u2014 small Qwen judges, not Gemini on rendered clips). Finding 3 is the strongest: ExtremeWhenBench's numbers (0.053 mIoU monolithic vs 0.354 hybrid, 85% search failures) directly support keeping transcript-anchored boundary selection and restricting video-native models to short windows; only the 'GPT-class evaluated' item is overstated (GPT models are annotation-pipeline components in that paper). Finding 4 is fully verified with a minor mechanism error about gpt-4o-transcribe (no verbose_json at all, which strengthens the exclusion) and a language-coverage caveat (Parakeet v3 = 25 European languages). Finding 2 is the one to downgrade: the quote-then-code-verify pattern is a sound design, but neither source measures it \u2014 Datadog measured quote-grounded judging WITHOUT programmatic verification (blog benchmark, not 'production-proven'), and GhostCite measures citation fabrication in academic writing, not LLMs' inability to verify quotes. The recommendation can stand on first principles (substring checks are mechanically sound), but its evidential framing is overclaimed."
+  }
+}

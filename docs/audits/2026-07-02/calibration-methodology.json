@@ -1,0 +1,192 @@
+{
+  "angle": "calibration-methodology",
+  "findings": [
+    {
+      "title": "n=50-150 labels gives coarse but decision-grade kappa; power the rare class, not the total",
+      "claim": "At n=50 balanced binary labels, a 95% bootstrap CI on Cohen's kappa is roughly +/-0.10-0.16; at n=100-150 roughly +/-0.08-0.12. Pinning kappa to +/-0.05 (CI width 0.1) requires N=574-1,394 items (kappa=0.6, observed agreement 0.70-0.85, per the Cohen/Fleiss/Flack variance formulas) \u2014 unreachable for a one-person team, so do NOT aim for precise kappa. Aim for a coarse decision: kappa<0.4 = judge unusable/replace, kappa>=0.6 = trust and tune. Required n is governed by minority-class count, not total: each failure kind needs >=10-15 human labels of the positive class (at a ~6-10% base rate that is 150-250 random clips, so oversample kills deliberately rather than sampling randomly). Always report kappa with a bootstrap CI plus per-class precision/recall; raw percent agreement and bare kappa both mislead at this n.",
+      "addresses": "F5 (primary); reporting discipline also scopes F1 (per-verdict validity stats)",
+      "sources": [
+        {
+          "url": "https://www.ncss.com/wp-content/themes/ncss/pdf/Procedures/PASS/Confidence_Intervals_for_Kappa.pdf",
+          "note": "PASS Chapter 819 (verified via pdftotext): worked example solving sample size for kappa=0.6, 95% CI width 0.1 gives N=574 (PO=0.70), 738 (0.75), 984 (0.80), 1394 (0.85); formulas from Cohen 1960, Fleiss et al 1969, Flack et al 1988. Establishes that tight kappa CIs are out of reach at n<=150, and width scales ~1/sqrt(N) so n=50-150 yields +/-0.10-0.20."
+        },
+        {
+          "url": "https://dev.to/maya_andersson_dev/calibration-set-size-for-llm-as-judge-when-50-traces-is-enough-and-when-200-is-mandatory-d1d",
+          "note": "Technical practitioner article (verified content, cites Cohen 1960/Wilson 1927, includes bootstrap code): 50 stratified traces pin kappa to ~+/-0.10-0.15 for balanced binary criteria; with a 6% minority class 50 traces contain ~3 minority examples and 200+ are mandatory; recommends per-class precision/recall and Wilson intervals; warns 95% observed agreement can coexist with kappa near zero."
+        },
+        {
+          "url": "https://eugeneyan.com/writing/llm-evaluators/",
+          "note": "Meta-review of LLM-evaluator studies (verified): recommends Cohen's kappa as primary alignment metric over correlations; interpretation bands (0.41-0.60 moderate, >0.8 strong); cites GPT-4 kappa 0.84 / Llama-3-70B 0.79 vs humans on QA grading; recommends binary evaluator outputs to enable classification metrics."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Add backend/eval/judge_calibration.py: join human labels (extend eval/golden/<video_id>.json with a per-clip 'human' block {understandable: bool, failure_kinds: [...], critique: str} \u2014 golden.py already tolerates optional fields) against the judge verdicts logged by pipeline/assemble/validate.py. In eval/metrics.py compute kappa + 1000-resample bootstrap CI + per-failure-kind precision/recall, and refuse to print any per-kind stat backed by <10 minority labels (mirror the existing NaN-gold behavior instead of printing a misleading number). Budget: 100 random-stratified clips for the headline kappa, plus targeted top-ups per failure kind (see active-sampling finding)."
+    },
+    {
+      "title": "Hamel-protocol for one-expert calibration: ~30 binary labels + written critiques per criterion, iterate judge prompt to >90% agreement",
+      "claim": "The best-documented practitioner recipe for exactly this situation (single domain expert, small budget): (1) the one principal expert labels ~30 diverse examples per criterion as binary pass/fail \u2014 explicitly NOT Likert \u2014 each with a detailed written critique; (2) keep labeling until no new failure modes appear; (3) build the judge prompt using the expert's critiques as few-shot examples; (4) iterate prompt vs expert until agreement >90% (the Honeycomb case study reached it in 3 iterations); (5) do error analysis by root cause and split out specialized judges per failure mode if needed. The critique field is the key asset: it is simultaneously prompt material and a direct audit of the judge's stated reasons.",
+      "addresses": "F5 (protocol); F1 (critiques expose phantom failure reasons directly, since the human states the REAL reason)",
+      "sources": [
+        {
+          "url": "https://hamel.dev/blog/posts/llm-judge/",
+          "note": "Verified: full 7-step process; explicit numbers '~30 examples, keep going until no new failure modes'; binary pass/fail advocated over Likert; critiques must be detailed enough to reuse as few-shot; >90% expert agreement achieved in 3 iterations in the Honeycomb case study."
+        },
+        {
+          "url": "https://arxiv.org/abs/2404.12272",
+          "note": "EvalGen (UIST 2024, verified): system that selects evaluator implementations by alignment with human grades on a graded sample \u2014 peer-reviewed support for the same align-judge-to-small-human-sample workflow."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "pipeline/assemble/validate.py already emits per-gate booleans + reasons \u2014 export them side-by-side with the exact judged clip text into a labeling sheet (one row per candidate, including REJECTED candidates from the repair gate, since F1 says that is where good clips die). User marks binary 'understandable in isolation', marks each judge-cited reason real/phantom, writes a one-line critique. After ~30 labels: mine disagreements, add 3-5 critiques as few-shot examples to the validate.py judge prompt, re-run with run_eval --freeze-specs (already exists, preserves determinism), repeat until agreement plateaus. Track agreement per iteration in eval/metrics.py."
+    },
+    {
+      "title": "PPI++/EIF converts ~100 human labels + judge labels on everything into unbiased pipeline metrics with valid CIs",
+      "claim": "Threshold calibration alone wastes the labels. With judge verdicts on ALL clips plus a small RANDOM human-labeled subset, prediction-powered inference (PPI++) or efficient-influence-function (EIF) estimators produce unbiased estimates of true pass/comprehension rates with valid confidence intervals. Verified label-budget results: at m=20 gold labels the naive Rogan-Gladen misclassification correction breaks (class imbalance leaves ~3 minority observations, RMSE 0.3 on sensitivity) while PPI++/EIF stay stable and give intervals up to 10x narrower when the judge is weak (q0=q1=0.6); m=100 (5% of 2,000) was stable across all tested settings; PPI++/EIF intervals are 35-55% narrower than standard PPI when judge quality is high. Caveat from a second paper: classical PPI++ can underperform plain classical inference in the very-few-label regime; robust-regression PPI variants fix this. Hard requirement: the human subset must be a random (or importance-weighted) draw from the judged population.",
+      "addresses": "F5 (trustworthy metrics from few labels); F4 (measures true quality despite internal-score/judge divergence)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/html/2601.05420v1",
+          "note": "'Efficient Inference for Noisy LLM-as-a-Judge Evaluation' (Jan 2026, verified HTML): experiments at exactly m=20/100/200 human labels; Rogan-Gladen bias at m=20; PPI++/EIF 10x narrower CIs under weak judges; estimator-selection guidance by judge quality; open-source implementation on GitHub."
+        },
+        {
+          "url": "https://arxiv.org/abs/2411.12665",
+          "note": "'Regression for the Mean' (ICML 2025, verified abstract): shows PPI++ can perform worse than classical inference when labels are scarce; proposes robust-regressor PPI variants for the few-label regime."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "In backend/eval/run_eval.py, after the judge pass, compute PPI++-corrected 'true keep rate' and 'true comprehension rate' using the frozen random 100-clip human subset (the same labels as the kappa finding \u2014 dual use). Vendor the 2601.05420 reference implementation into eval/metrics.py. Keep the labeled subset pinned with --freeze so human labels stay attached to byte-identical clip text (the audit found a clip whose shipped text was never judged \u2014 freezing prevents label/text drift too)."
+    },
+    {
+      "title": "Actively chosen labels beat random for label efficiency \u2014 but keep a random core or you void kappa and PPI",
+      "claim": "Targeted selection of what to label is established as more sample-efficient than random: Active Testing (ICML 2021) shows acquisition-driven test-point selection with the LURE estimator removes the selection bias while REDUCING estimator variance; tinyBenchmarks (ICML 2024) estimates LLM performance on 14K-example MMLU within ~2% error from 100 curated examples; Active Evaluation Acquisition (2024) beats random by modeling cross-example dependencies. Transferable design for judge calibration on a 100-150 budget: split it \u2014 a random stratified core (unbiased kappa + PPI) plus a targeted tranche of (a) clips where two judge configs disagree, (b) borderline scores (4-7 band), (c) per-failure-kind kill strata. The specific borderline/disagreement recipe is an uncertainty-acquisition analogy, not directly benchmarked for judge calibration in any fetched source.",
+      "addresses": "F5 (label efficiency); F1 (judge-disagreement sampling surfaces phantom verdicts fastest, and forces labeling of rejected candidates, where the 92% die-off lives)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2103.05331",
+          "note": "Active Testing (ICML 2021, verified abstract): sample-efficient model EVALUATION (not training) via tailored acquisition; LURE removes active-selection bias while reducing variance."
+        },
+        {
+          "url": "https://arxiv.org/abs/2410.05952",
+          "note": "Active Evaluation Acquisition (verified abstract): selecting evaluation examples via learned policies significantly reduces labels needed vs random while maintaining accurate performance estimates."
+        },
+        {
+          "url": "https://www.emergentmind.com/papers/2402.14992",
+          "note": "tinyBenchmarks (ICML 2024): 100 IRT-curated examples estimate MMLU performance with <2% average error \u2014 concrete evidence that ~100 well-chosen items characterize a system."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "New backend/eval/sample_for_labeling.py: pull ALL judged candidates (accepted and repair-gate-rejected) from output/ run artifacts; emit 50 random stratified by video/genre/anchor-role (the unbiased core) + 50-100 targeted: judge-config disagreement (run validate.py once with the flash-lite judge and once with a different-family judge and flag verdict flips), score band 4-7, and >=10 clips per kill reason. Feed the random core to kappa/PPI in metrics.py; use the targeted tranche only for per-failure-kind precision (finding on trust weights), never for the headline kappa."
+    },
+    {
+      "title": "Operationalize 'understandable in isolation' as FEASIBLE/INFEASIBLE + minimal-fix note; expect kappa ~0.5 between experts, not 0.8",
+      "claim": "The closest research operationalization of the clip criterion is sentence decontextualization (Choi et al., TACL 2021): annotators judge whether text 'can be interpreted out of context / stand alone' (FEASIBLE vs INFEASIBLE), then specify the minimal edits (bridging references, adding scoping phrases, background) needed to make it stand alone. Measured agreement on that binary category: Fleiss kappa 0.51 among EXPERT annotators, 0.30 among crowdworkers, 85% raw binary agreement, INFEASIBLE base rate ~10-12%. Two implications: (1) a judge-human kappa of ~0.5 on this criterion is near the human expert ceiling \u2014 do not set 0.8 as the bar or you will churn judge prompts forever chasing noise; (2) the 'what minimal addition would fix it' annotation is exactly a context-card gold label. Pitfall to control: criteria drift \u2014 EvalGen documented that graders redefine their criterion as they observe outputs, so a single annotator must freeze rubric decisions in writing and re-label an overlap set later to measure intra-rater consistency.",
+      "addresses": "F5 (labeling protocol + realistic agreement targets); F8 (minimal-fix annotations are gold for context_card.py, and card-need labeling is independent of the referential-prerequisite trigger)",
+      "sources": [
+        {
+          "url": "https://aclanthology.org/2021.tacl-1.27.pdf",
+          "note": "Verified via pdftotext of the TACL PDF: FEASIBLE/INFEASIBLE annotation scheme with enumerated edit types; 'Fleiss' kappa on category classification is 0.51 among expert annotators, and is 0.30 among the crowd annotators (binary agreement is at 85%)'; INFEASIBLE ~10-12% of examples."
+        },
+        {
+          "url": "https://arxiv.org/abs/2404.12272",
+          "note": "EvalGen (verified): 'users need criteria to grade outputs, but grading outputs helps users define criteria' \u2014 criteria drift is an observed phenomenon in human grading of LLM outputs; alignment must be iterative."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Labeling UI = one static HTML page under backend/static/ that plays the cut clip (pipeline/cut.py output) with zero surrounding context and asks exactly three things: Q1 binary 'could someone who has not seen the video follow this?'; Q2 if no, pick the failure kind from validate.py's own taxonomy (missing prerequisite / unresolved reference / starts mid-thought / ends unresolved / boundary garbage) \u2014 this doubles as F1 verdict-validity gold; Q3 free text 'what one line would you need to be told first?' \u2014 gold for assemble/context_card.py and for deciding when cards should fire on cold-opens. Write answers straight into eval/golden/<video_id>.json. Re-present 10 already-labeled clips after ~2 weeks; if self-agreement <85% (the expert binary ceiling), tighten the written rubric before trusting any kappa computed from these labels."
+    },
+    {
+      "title": "YouTube chapters are proven weak-gold for transcript segmentation (YTSeg precedent) \u2014 Pk/WindowDiff on 5-10 videos at near-zero labeling cost",
+      "claim": "Chapters-as-labels has direct peer-reviewed precedent: YTSeg (EACL 2024) built a 19,299-video segmentation benchmark entirely from creator-provided YouTube chapters. Their construction rules are reusable verbatim: use only creator-provided (not auto-generated) chapters \u2014 yt-dlp exposes provenance; map chapter timestamps to sentence-level boundaries by assigning sentences spanning two chapters to the chapter with greater time-based overlap; add synthetic Intro/Outro chapters where captions extend past the first/last chapter; drop videos with unfixable timestamps, empty captions, or unpunctuated transcripts (4.7% dropped). Evaluated with standard Pk/WindowDiff; their best model gets Pk ~27-28 on YTSeg vs 17.6 on Wiki-727K \u2014 i.e., chapters are noisy but are accepted as segmentation ground truth in the literature. VidChapters-7M (NeurIPS 2023) did the same at 817K-video scale with no manual verification and successfully trained/evaluated chaptering models on it.",
+      "addresses": "F5 (segmentation gold for free); F7 (YTSeg's caption-to-sentence mapping rules are exactly what refine.py snapping must be tested against, and their exclusion of unpunctuated transcripts flags the same hazard the audit found); F3 (a video's chapter list is a free coverage reference: 8 chapters but clips from only 2 = coverage failure)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2402.17633",
+          "note": "YTSeg paper (verified via pdftotext of full PDF): collection via yt-dlp restricted to creator-provided captions+chapters; sentence-overlap boundary assignment; Intro/Outro patching; 4.7% exclusion rate; 19,299 videos / 393 channels; MiniSeg Pk 28.7/27.1 on YTSeg."
+        },
+        {
+          "url": "https://arxiv.org/abs/2309.13952",
+          "note": "VidChapters-7M (verified abstract): 817K videos / 7M user-annotated chapters scraped without manual annotation; used to train and benchmark chapter generation and grounding \u2014 scale precedent for chapters as supervision."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "Extend backend/eval/make_golden.py: yt-dlp --dump-json (already the downloader in pipeline/download.py) returns chapters[{start_time,end_time,title}] \u2014 write them into eval/golden/<video_id>.json as weak boundary-only 'units' (role unknown), tagging provenance creator vs auto. In eval/metrics.py add Pk and WindowDiff (segeval or nltk.metrics.segmentation) comparing understand/content_map.py + treeseg.py partitions against chapter boundaries using YTSeg's greater-overlap assignment rule; this un-NaNs the gold metrics for boundaries without any human labeling. Select 5-10 eval videos that have creator chapters. Bonus regression check: no shipped clip should straddle a chapter boundary \u2014 cheap detector for F2-style bloated spans."
+    },
+    {
+      "title": "Spending the calibration: re-fit the 0.70 gate by alignment sweep, add per-failure-kind trust weights, and treat judge scores as ranks",
+      "claim": "Three verified-source moves once labels exist. (1) Threshold: sweep the ship cutoff over judge scores and pick the value maximizing kappa/balanced accuracy against human keep/kill labels \u2014 this is EvalGen's select-by-alignment-with-human-grades applied to one judge's threshold. (2) Ranks not absolutes: 'Judging the Judges' found even the best judges (13 models tested vs humans) deviate up to 5 points from human-assigned scores while still providing reliable RANKING signal, show systematic leniency, and that high percent agreement can mask divergent scoring (use kappa, not percent agreement) \u2014 so use the judge score to order candidates within a video and calibrate only the binary ship decision, not the 1-10 value. (3) Per-failure-kind trust weights: compute a confusion matrix per kill reason from the labels; where humans overturn a majority of a category's kills (the audit suggests missing_prerequisite/unresolved-reference phantoms), demote that gate from auto-kill to flag until the judge prompt is fixed. The demote-to-flag rule is design inference from (1)+(2), not itself benchmarked.",
+      "addresses": "F5 (using the measurement); F1 (phantom-verdict categories lose kill authority); F4 (binary ship decision recalibrated against humans instead of the diverging internal score)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2406.12624",
+          "note": "Judging the Judges (verified): 13 judge models vs human labels; only largest judges align and still differ up to 5 points from human scores; leniency bias; explicit recommendation to use alignment metrics beyond percent agreement; smaller judges give reasonable RANKING signal despite poor absolute scoring."
+        },
+        {
+          "url": "https://arxiv.org/abs/2404.12272",
+          "note": "EvalGen (verified): selecting evaluator implementations by alignment with human grades on a small graded sample \u2014 the template for threshold/variant selection by human-agreement maximization."
+        }
+      ],
+      "confidence": "high",
+      "adoption": "pipeline/assemble/validate.py: load a calibration JSON (written by eval/judge_calibration.py) of {failure_kind: {precision, n}}; repair-gate kills fire only for kinds with precision >=0.7 on >=10 labels \u2014 otherwise the verdict downgrades to a logged warning on the clip (directly attacks the 7.7-rejections-per-video die-off). Recompute the 0.70 ship threshold as argmax balanced-accuracy over the labeled set and store it in backend/config.py as a calibrated constant with provenance; re-sweep after every judge-prompt change via run_eval --freeze-specs. Within-video candidate ordering in assemble/scoring.py can keep using raw judge scores (rank signal is the part judges do well)."
+    },
+    {
+      "title": "If kappa stays low: cascade to a stronger judge on low-trust verdicts, and A/B the grading scale (0-5 evidence) before switching wholesale",
+      "claim": "Escape hatches when the calibrated flash-lite judge is below kappa 0.4-0.6 after prompt iteration. (a) Judge competence varies enormously by model: JudgeBench (ICLR 2025) shows even the strongest judges reach only ~64% on hard response pairs with small judges far worse; Judging the Judges found only GPT-4-class judges hit kappa ~0.84 (Llama-3-70B 0.79) vs humans. A cheap same-tier swap will not fix a fundamentally misaligned judge \u2014 budget for a stronger model. (b) You do not need the strong judge on every clip: Cascaded Selective Evaluation (ICLR 2025) runs a cheap judge when its calibrated confidence (via 'simulated annotators') is high and escalates only low-confidence cases, achieving provable human-agreement guarantees \u2014 over 80% human agreement at ~80% coverage even with Mistral-7B as the base judge. (c) Scale choice measurably moves alignment: a Jan 2026 six-benchmark study found human-LLM agreement (ICC) is highest on a 0-5 scale \u2014 the current anchored 1-10 rubric is itself a calibration variable worth A/B-ing on the same labeled set.",
+      "addresses": "F5 (model-switch decision rule); F1 (escalation targets exactly the low-confidence/phantom-verdict region)",
+      "sources": [
+        {
+          "url": "https://arxiv.org/abs/2410.12784",
+          "note": "JudgeBench (ICLR 2025, verified): rigorous ground-truth pairs; strongest judge ~64% accuracy; large spread across judge models \u2014 evidence that judge model choice dominates."
+        },
+        {
+          "url": "https://arxiv.org/abs/2407.18370",
+          "note": "Trust or Escalate / Cascaded Selective Evaluation (ICLR 2025, verified abstract): confidence-gated cascade from cheap to strong judge with provable human-agreement guarantees; >80% human agreement at ~80% coverage with Mistral-7B base."
+        },
+        {
+          "url": "https://arxiv.org/abs/2601.03444",
+          "note": "Grading-scale study (Jan 2026, verified abstract): 0-5 scale yields highest human-LLM alignment (ICC) across six benchmarks; scale choice shifts agreement even when panel reliability is high; authors caveat benchmark heterogeneity."
+        }
+      ],
+      "confidence": "medium",
+      "adoption": "Add JUDGE_ESCALATE_MODEL to backend/config.py (must be cross-family per the existing RESEARCH.md self-preference finding; note the Groq key is dead so the realistic strong option is a paid non-Google API or Gemini Pro-tier acknowledged as same-family second-best). In pipeline/assemble/validate.py: when a verdict lands in the calibrated distrust zone (score 4-7 band, or a failure kind with low measured precision), re-judge with the escalation model and take its verdict; log escalation rate in run_eval (target <=20-30% per the cascade paper's coverage numbers). During calibration, score the same 100 labeled clips with a 0-5 rubric variant and the current 1-10 rubric; keep whichever maximizes kappa \u2014 one afternoon of API calls, no new labels needed."
+    }
+  ],
+  "leads": [
+    "Trust or Escalate's calibration-set size for its guarantee (conformal-style simulated-annotators calibration) was not extractable from the abstract \u2014 read Sec. 3-4 of arXiv 2407.18370 before implementing the guaranteed variant; the guarantee may need more human-agreement data than this team has.",
+    "'Noisy but Valid: Robust Statistical Evaluation of LLMs with Imperfect Judges' (arXiv 2601.20913, Jan 2026) \u2014 appears to give robust bounds when judge error rates are unknown/unstable; not fetched, complements the PPI finding.",
+    "'Calibrating LLM Judges: Linear Probes for Fast and Reliable Uncertainty Estimation' (arXiv 2512.22245) \u2014 needs hidden-state access so inapplicable to the Gemini API judge, but relevant if a local (Llama-class) judge is ever adopted for the cascade base.",
+    "kappaSize R package (Rotondi & Donner) \u2014 exact CI-based sample-size calculators for kappa (CIBinary etc.); use it to generate the report table instead of PASS if precise planning numbers are wanted.",
+    "'Statistically Reliable LLM-Based Ranking Evaluation via Prediction-Powered Inference' (arXiv 2606.05308) \u2014 PPI for rankings; relevant if the pipeline moves to pairwise clip comparison instead of absolute scoring.",
+    "2025-26 active-evaluation follow-ups not fetched: ProEval (arXiv 2604.23099, proactive failure discovery + performance estimation), Generative Active Testing (arXiv 2603.19264), DISCO sample condensation (arXiv 2510.07959) \u2014 mine if the 150-label budget ever grows.",
+    "'LLM-as-a-Judge in Healthcare: scoping analysis' (arXiv 2605.25273) \u2014 reports 64-68% expert-task human-LLM agreement gaps, below inter-expert baselines; a source of reporting-practice templates for the calibration write-up.",
+    "Sim & Wright 2005 (Physical Therapy 85:257-268) \u2014 the canonical citable kappa CI/sample-size reference; full text paywalled so numbers were verified via the PASS chapter instead; cite Sim & Wright in any write-up.",
+    "VidChapters-7M paper body (not just abstract) may quantify chapter noise rates \u2014 useful if chapter-gold Pk numbers look suspiciously bad on the chosen eval videos.",
+    "Eugene Yan's AlignEval (mentioned alongside his evaluator write-ups) \u2014 a hands-on app for aligning evaluators with small labeled sets; could be cribbed for the labeling UI instead of building from scratch.",
+    "'LLM as judge won't beat twice the data' (OpenReview NO6Tv6QcDs) \u2014 apparent theoretical result bounding the value of judge labels vs simply collecting more human labels; would sharpen the PPI-vs-more-labels tradeoff if verified."
+  ],
+  "notes": "Recommended budget allocation for 100-150 labels, synthesized across findings: (1) 30 labels, Hamel-style binary+critique on judge-rejected AND accepted candidates, iterate the validate.py prompt until agreement plateaus \u2014 this alone attacks the F1 phantom-verdict die-off; (2) then 70-100 more via sample_for_labeling.py: 50 random-stratified (the only labels usable for headline kappa + PPI) + the rest targeted at judge-config disagreements, the 4-7 score band, and >=10 per kill reason; (3) segmentation gold costs ~zero labels via YouTube chapters (YTSeg recipe) and un-NaNs Pk/WindowDiff immediately. Key statistical cautions verified: kappa CIs at this n are +/-0.10-0.20, so the decision rule is coarse (kappa<0.4 replace judge, >=0.6 trust); minority-class counts, not total n, gate per-failure-kind claims (>=10-15 positives each); PPI/kappa require the random core \u2014 labeling only disagreements without importance weighting biases everything; and the human expert ceiling on 'stands alone' is itself only Fleiss kappa ~0.51 (decontextualization), so kappa ~0.5 vs the single human labeler is success, not failure. All findings were verified by fetching the cited sources (two PDFs extracted locally via pdftotext: YTSeg 2402.17633 and TACL 2021.tacl-1.27; PASS chapter 819 table read from extracted text). GoDaddy's calibration blog was fetched and found too thin to cite as evidence. Relevant existing scaffolding: eval/golden/ dir is empty but golden.py already defines the JSON schema with optional fields, make_golden.py exists as the natural home for the chapter importer, and run_eval already has --freeze/--freeze-specs which is exactly what keeps labels attached to byte-identical clip text across judge iterations.",
+  "verification": {
+    "checked": [
+      {
+        "title": "FINDING 1: n=50-150 labels gives coarse but decision-grade kappa; power the rare class, not the total",
+        "supported": true,
+        "note": "Core citations check out. PASS Chapter (pdftotext on the fetched PDF) confirms exactly: solving for kappa=0.6, 95% CI width 0.1 yields N=574 (PO=0.70), 738, 984, 1394, using Cohen 1960 / Fleiss et al 1969 / Flack et al 1988 formulas \u2014 so 'tight kappa CIs are unreachable at n<=150' is genuinely backed. The dev.to article verbatim confirms '50 stratified traces... 95 percent bootstrap interval on the order of +/-0.10 to 0.15', the 6%-minority/~3-examples/200+-mandatory math, Wilson intervals, per-class precision/recall, and the 95%-agreement-with-near-zero-kappa warning. Eugeneyan confirms kappa preference over correlations, the 0.41-0.60 band, GPT-4 0.84 / Llama-3-70B 0.79 (from 'Judging the Judges'), and binary outputs. Downgrades: (a) the specific '+/-0.08-0.12 at n=100-150' and the '+/-0.16' upper figure at n=50 appear in NO source \u2014 they are 1/sqrt(N) extrapolations from the PASS formulas (reasonable but derived, not cited); (b) the '>=10-15 positive labels per failure kind' rule and the '150-250 clips, oversample kills' recipe are the researcher's synthesis \u2014 dev.to only says ~3 minority examples at 6%/50 traces and '200+ mandatory'; (c) dev.to is a practitioner blog whose interval figures come from the author's own runs ('in my runs'), not a power-analysis study \u2014 heuristic-grade evidence, though consistent with the PASS math; (d) eugeneyan does not crown kappa 'the primary' metric universally, he recommends it for binary/categorical data and is skeptical of correlations. The kappa<0.4/>=0.6 decision thresholds are a synthesis from standard interpretation bands, not a rule any source states."
+      },
+      {
+        "title": "FINDING 2: Hamel-protocol for one-expert calibration: ~30 binary labels + written critiques, iterate to >90% agreement",
+        "supported": true,
+        "note": "Almost fully verbatim-backed by hamel.dev: 7-step process; single principal domain expert ('usually one (maybe two) key individuals'); 'I start with around 30 examples and keep going until I do not see any new failure modes'; binary pass/fail with explicit anti-Likert stance ('scores on a 1-5 scale is often a sign of a bad eval process'); 'the critique should be detailed enough so that you can use it in a few-shot prompt for a LLM judge'; 'It took us only three iterations to achieve > 90% agreement between the LLM and Phillip' (Honeycomb); error analysis + specialized judges are steps 6-7. EvalGen (arXiv 2404.12272, 'Who Validates the Validators?') confirmed as a system that selects evaluator implementations by alignment with human grades on a graded sample \u2014 genuine peer-reviewed support for the align-to-small-human-sample workflow (the arXiv abstract page does not state the UIST 2024 venue, minor unverified detail). Two small precision downgrades: Hamel's ~30 is a starting heuristic for the dataset overall, not a stated '~30 per criterion' quota; and >90% is what the case study achieved, presented as a target, not a validated threshold. Also note EvalGen's own finding of 'criteria drift' slightly complicates the clean recipe framing."
+      },
+      {
+        "title": "FINDING 3: PPI++/EIF converts ~100 human labels + judge labels on everything into unbiased metrics with valid CIs",
+        "supported": true,
+        "note": "The strongest-checked finding. arXiv 2601.05420 ('Efficient Inference for Noisy LLM-as-a-Judge Evaluation') confirms every number: m in {20, 100, 200} = 1/5/10% of N=2,000; at m=20 the positive class has m1~3 observations giving RMSE 0.3 for sensitivity (vs 0.1 for specificity), breaking Rogan-Gladen; 'at q0=q1=0.6, RG intervals are roughly 10x wider than those of EIF/PPI++' (the finding's direction \u2014 PPI++/EIF 10x narrower \u2014 is correct, and it correctly identifies the comparator as Rogan-Gladen, not classical inference); m=100 stable across settings; 'EIF and PPI++ produce... typically 35-55% narrower than standard PPI' \u2014 though the paper's quote says 'consistently shortest,' the finding's 'when judge quality is high' conditioner on the 35-55% figure was not confirmed in my fetch; estimator-ordering guidance and GitHub code confirmed. 'Regression for the Mean' (ICML 2025) confirmed: PPI++ can underperform classical inference with scarce labels; robust-regression variants proposed. Caveats: 2601.05420 is a Jan 2026 arXiv preprint, not yet peer-reviewed; the 'hard requirement' that the human subset be a random/importance-weighted draw is a correct statement of PPI assumptions but was asserted by the researcher, not a quoted result I verified."
+      },
+      {
+        "title": "FINDING 4: Actively chosen labels beat random for label efficiency \u2014 but keep a random core or you void kappa and PPI",
+        "supported": true,
+        "note": "All three sources say what is claimed, and the finding already self-flags its main inferential leap. Active Testing (ICML 2021) abstract confirmed: sample-efficient model EVALUATION via tailored acquisition, and 'we further show how to remove this bias while reducing the variance of the estimator at the same time' (the estimator name LURE was not visible on the abstract page but the substantive claim is confirmed). Active Evaluation Acquisition (arXiv 2410.05952, Oct 2024) confirmed: learned selection policies, explicit modeling of dependencies between examples, 'significantly reduces the number of evaluation prompts required while maintaining accurate performance estimates' \u2014 note it is an arXiv preprint with no confirmed peer-reviewed venue. tinyBenchmarks confirmed: 100 IRT-curated examples estimate MMLU (14K) performance with average error under 2% \u2014 but the source fetched is emergentmind.com, a third-party AI-generated summary site, not the paper; the numbers match the actual ICML 2024 paper, but the citation should point to arXiv 2402.14992 directly. Two scope cautions the caller should preserve: (1) all three sources are about estimating aggregate model/benchmark performance, not judge calibration \u2014 transfer to the kappa/PPI split-budget design is the researcher's analogy, which the finding honestly discloses; (2) tinyBenchmarks' 2% error relies on IRT models fit on many other LLMs' response patterns, an asset that does not exist for a bespoke clip-judge, so '100 well-chosen items characterize a system' overstates its transferability."
+      }
+    ],
+    "overall_note": "All four findings are genuinely backed by their cited sources \u2014 no fabricated citations, misread directions, or marketing-as-evidence were found; the PASS worked example (N=574-1,394), the Hamel quotes (~30 examples, >90% in 3 iterations), and the m=20/100/200 PPI++/EIF numbers were verified against source text nearly verbatim. The consistent pattern to downgrade is synthesis presented adjacent to citation: Finding 1's precise CI widths for n=100-150 (+/-0.08-0.12) and the 10-15-positives-per-failure-kind rule are the researcher's extrapolations, not source statements; Finding 2's 'per criterion' quota and 90% threshold are firmer than Hamel wrote them; Finding 4's split-budget recipe is an acknowledged analogy from benchmark-compression papers whose IRT machinery won't transfer directly. Evidence-quality tiering: the PASS chapter and the four arXiv papers are solid (though 2601.05420 and 2410.05952 are unreviewed preprints); the dev.to article is a practitioner blog with self-reported numbers (consistent with the PASS math but heuristic); emergentmind is a secondary summary site and should be swapped for the arXiv 2402.14992 original."
+  }
+}

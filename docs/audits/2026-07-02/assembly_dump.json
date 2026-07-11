@@ -1,0 +1,2574 @@
+{
+ "video_id": "dHjWVlfNraM",
+ "title": "",
+ "duration": 1908.399,
+ "detection": {
+  "domain": "lecture",
+  "confidence": 0.95,
+  "adapter": "LectureAdapter"
+ },
+ "content_map_engine": "treeseg",
+ "has_perception": true,
+ "degraded": [],
+ "n_sentences": 63,
+ "notes": "4 clip(s).",
+ "chapters": [
+  {
+   "node_id": "c0",
+   "level": "chapter",
+   "title": "Introduction to Kinematics",
+   "start": 1.76,
+   "end": 531.04,
+   "summary": ""
+  },
+  {
+   "node_id": "c0.t0",
+   "level": "topic",
+   "title": "Introduction to Kinematics",
+   "start": 1.76,
+   "end": 89.03999999999999,
+   "summary": "This video introduces kinematics, focusing on one-dimensional motion along the x-axis, and briefly mentions the distinction from two-dimensional kinematics like projectile motion."
+  },
+  {
+   "node_id": "c0.t1",
+   "level": "topic",
+   "title": "Understanding Displacement as a Vector Quantity",
+   "start": 90.079,
+   "end": 187.76,
+   "summary": "Displacement is defined as a vector quantity, combining distance with direction, differentiating it from scalar distance."
+  },
+  {
+   "node_id": "c0.t2",
+   "level": "topic",
+   "title": "Temperature as a Scalar Quantity",
+   "start": 185.76,
+   "end": 268.199,
+   "summary": "Temperature is explained as a scalar quantity because it does not have an associated direction, unlike vector quantities."
+  },
+  {
+   "node_id": "c0.t3",
+   "level": "topic",
+   "title": "Calculating Distance with Direction",
+   "start": 269.28,
+   "end": 398.4,
+   "summary": "This segment demonstrates how to calculate distance when an object moves in different directions, introducing the concept of negative signs for movement in the opposite direction (e.g., west on the x-axis)."
+  },
+  {
+   "node_id": "c0.t4",
+   "level": "topic",
+   "title": "Displacement: Final Minus Initial Position",
+   "start": 399.84,
+   "end": 531.04,
+   "summary": "Displacement is further explained as the change in position, calculated by subtracting the initial position from the final position, and can be positive or negative depending on the direction."
+  },
+  {
+   "node_id": "c1",
+   "level": "chapter",
+   "title": "Average Speed vs. Average Velocity",
+   "start": 529.519,
+   "end": 1336.48,
+   "summary": ""
+  },
+  {
+   "node_id": "c1.t5",
+   "level": "topic",
+   "title": "Average Speed vs. Average Velocity",
+   "start": 529.519,
+   "end": 817.6,
+   "summary": "The segment defines and differentiates average speed (total distance over time) from average velocity (displacement over time), illustrating with an example of a particle's movement."
+  },
+  {
+   "node_id": "c1.t6",
+   "level": "topic",
+   "title": "Instantaneous Velocity and Limits",
+   "start": 819.199,
+   "end": 942.4799999999999,
+   "summary": "Instantaneous velocity is introduced as the limit of displacement over time as the change in time approaches zero, providing the formula without delving into detailed calculations."
+  },
+  {
+   "node_id": "c1.t7",
+   "level": "topic",
+   "title": "Constant Speed vs. Constant Acceleration",
+   "start": 942.88,
+   "end": 1040.1599999999999,
+   "summary": "This section discusses the relationship between instantaneous and average velocity for objects moving at constant speed, and then transitions to the concept of constant acceleration."
+  },
+  {
+   "node_id": "c1.t8",
+   "level": "topic",
+   "title": "Average Velocity and Displacement Formulas",
+   "start": 1046.48,
+   "end": 1210.8799999999999,
+   "summary": "The segment explains how to calculate average velocity as the average of initial and final velocities, and derives a formula for displacement using average velocity and time."
+  },
+  {
+   "node_id": "c1.t9",
+   "level": "topic",
+   "title": "Kinematic Equations for Constant Acceleration",
+   "start": 1205.36,
+   "end": 1336.48,
+   "summary": "Additional kinematic equations for constant acceleration are introduced, including formulas relating final velocity, initial velocity, acceleration, displacement, and time."
+  },
+  {
+   "node_id": "c2",
+   "level": "chapter",
+   "title": "Distinguishing Velocity Notations for Constant Speed vs. Acceleration",
+   "start": 1333.84,
+   "end": 1908.399,
+   "summary": ""
+  },
+  {
+   "node_id": "c2.t10",
+   "level": "topic",
+   "title": "Distinguishing Velocity Notations for Constant Speed vs. Acceleration",
+   "start": 1333.84,
+   "end": 1399.1200000000001,
+   "summary": "The importance of using 'v bar' for average velocity in constant acceleration scenarios is highlighted to avoid confusion with 'v' for constant speed, where they are interchangeable."
+  },
+  {
+   "node_id": "c2.t11",
+   "level": "topic",
+   "title": "Unit Conversion for Kinematic Problems",
+   "start": 1401.039,
+   "end": 1532.24,
+   "summary": "This segment emphasizes the necessity of converting units to a consistent form before applying kinematic formulas, using an example involving meters per second, miles, and hours."
+  },
+  {
+   "node_id": "c2.t12",
+   "level": "topic",
+   "title": "Converting Units: Seconds to Hours",
+   "start": 1529.84,
+   "end": 1605.12,
+   "summary": "This segment explains how to convert seconds to minutes and then minutes to hours by multiplying by conversion factors."
+  },
+  {
+   "node_id": "c2.t13",
+   "level": "topic",
+   "title": "Calculating Time Using Distance and Speed",
+   "start": 1606.559,
+   "end": 1688.96,
+   "summary": "The segment demonstrates how to calculate the time taken for a journey using the formula distance equals velocity times time, given distance and speed."
+  },
+  {
+   "node_id": "c2.t14",
+   "level": "topic",
+   "title": "Setting Up Part B: Average Velocity Problem",
+   "start": 1693.52,
+   "end": 1786.0,
+   "summary": "This segment introduces part B of the problem, which involves calculating the average velocity of a bus moving between two positions relative to a city."
+  },
+  {
+   "node_id": "c2.t15",
+   "level": "topic",
+   "title": "Calculating Average Velocity: Displacement Over Time",
+   "start": 1788.08,
+   "end": 1908.399,
+   "summary": "The segment outlines the formula for average velocity as displacement over time, defining displacement as the change in final and initial positions."
+  }
+ ],
+ "units": [
+  {
+   "unit_id": "u0000",
+   "role": "definition",
+   "start": 1.76,
+   "end": 41.28,
+   "sentence_range": [
+    0,
+    0
+   ],
+   "topic": "Introduction to Kinematics",
+   "summary": "Kinematics describes how objects move without reference to force.",
+   "equations": [],
+   "concepts_introduced": [
+    "kinematics"
+   ],
+   "concepts_required": []
+  },
+  {
+   "unit_id": "u0001",
+   "role": "setup",
+   "start": 42.079,
+   "end": 83.2,
+   "sentence_range": [
+    1,
+    1
+   ],
+   "topic": "Introduction to Kinematics",
+   "summary": "The video will focus on one-dimensional kinematics, primarily along the x-axis, but also along the y-axis.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": []
+  },
+  {
+   "unit_id": "u0002",
+   "role": "exception",
+   "start": 84.24,
+   "end": 89.03999999999999,
+   "sentence_range": [
+    2,
+    2
+   ],
+   "topic": "Introduction to Kinematics",
+   "summary": "Two-dimensional kinematics, which includes projectile motion, will be covered in a separate discussion.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "projectile motion",
+    "two-dimensional kinematics"
+   ]
+  },
+  {
+   "unit_id": "u0003",
+   "role": "definition",
+   "start": 90.079,
+   "end": 132.319,
+   "sentence_range": [
+    3,
+    3
+   ],
+   "topic": "Understanding Displacement as a Vector Quantity",
+   "summary": "Displacement is defined as a vector quantity, which is distance with direction.",
+   "equations": [],
+   "concepts_introduced": [
+    "displacement (vector quantity)"
+   ],
+   "concepts_required": [
+    "vector quantity",
+    "distance (scalar quantity)"
+   ]
+  },
+  {
+   "unit_id": "u0004",
+   "role": "definition",
+   "start": 128.399,
+   "end": 141.56,
+   "sentence_range": [
+    4,
+    4
+   ],
+   "topic": "Understanding Displacement as a Vector Quantity",
+   "summary": "Displacement is technically the change in an object's position, described as final position minus initial position along the x-axis.",
+   "equations": [
+    "d = Xf - Xo"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "displacement (vector quantity)",
+    "position"
+   ]
+  },
+  {
+   "unit_id": "u0005",
+   "role": "definition",
+   "start": 143.12,
+   "end": 187.76,
+   "sentence_range": [
+    5,
+    5
+   ],
+   "topic": "Understanding Displacement as a Vector Quantity",
+   "summary": "Speed is a scalar quantity describing how fast an object moves, while velocity is a vector quantity, which is speed with direction.",
+   "equations": [],
+   "concepts_introduced": [
+    "speed (scalar quantity)",
+    "velocity (vector quantity)"
+   ],
+   "concepts_required": [
+    "scalar quantity",
+    "vector quantity",
+    "magnitude",
+    "direction"
+   ]
+  },
+  {
+   "unit_id": "u0006",
+   "role": "practice_prompt",
+   "start": 185.76,
+   "end": 195.76,
+   "sentence_range": [
+    6,
+    6
+   ],
+   "topic": "Temperature as a Scalar Quantity",
+   "summary": "The speaker asks whether temperature is a scalar or vector quantity.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "temperature",
+    "scalar quantity",
+    "vector quantity"
+   ]
+  },
+  {
+   "unit_id": "u0007",
+   "role": "claim",
+   "start": 197.68,
+   "end": 223.59900000000002,
+   "sentence_range": [
+    7,
+    7
+   ],
+   "topic": "Temperature as a Scalar Quantity",
+   "summary": "The speaker explains that temperature is a scalar quantity because direction does not apply to it.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "temperature",
+    "scalar quantity",
+    "vector quantity"
+   ]
+  },
+  {
+   "unit_id": "u0008",
+   "role": "explanation",
+   "start": 224.799,
+   "end": 241.84,
+   "sentence_range": [
+    8,
+    8
+   ],
+   "topic": "Temperature as a Scalar Quantity",
+   "summary": "The speaker reiterates that temperature is scalar because only its magnitude matters, then introduces acceleration as a vector quantity.",
+   "equations": [],
+   "concepts_introduced": [
+    "acceleration"
+   ],
+   "concepts_required": [
+    "temperature",
+    "scalar quantity",
+    "vector quantity"
+   ]
+  },
+  {
+   "unit_id": "u0009",
+   "role": "claim",
+   "start": 244.0,
+   "end": 268.199,
+   "sentence_range": [
+    9,
+    9
+   ],
+   "topic": "Temperature as a Scalar Quantity",
+   "summary": "The speaker defines acceleration as a vector quantity, explaining it describes how fast velocity changes and can have a direction.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "acceleration",
+    "vector quantity",
+    "velocity"
+   ]
+  },
+  {
+   "unit_id": "u0010",
+   "role": "example_setup",
+   "start": 269.28,
+   "end": 278.15999999999997,
+   "sentence_range": [
+    10,
+    10
+   ],
+   "topic": "Calculating Distance with Direction",
+   "summary": "The problem describes a person traveling 13 meters east.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "distance",
+    "direction"
+   ]
+  },
+  {
+   "unit_id": "u0011",
+   "role": "example_setup",
+   "start": 280.0,
+   "end": 324.36,
+   "sentence_range": [
+    11,
+    11
+   ],
+   "topic": "Calculating Distance with Direction",
+   "summary": "The person then travels 4 meters west, which is represented with a negative sign, and the problem asks to calculate the distance and displacement.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "direction",
+    "x-axis",
+    "y-axis",
+    "distance",
+    "displacement"
+   ]
+  },
+  {
+   "unit_id": "u0012",
+   "role": "worked_step",
+   "start": 327.12,
+   "end": 373.84000000000003,
+   "sentence_range": [
+    12,
+    12
+   ],
+   "topic": "Calculating Distance with Direction",
+   "summary": "The total distance traveled is 17 meters, which is the sum of the two movements, and distance is always positive as it is a scalar quantity.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "distance",
+    "scalar quantity"
+   ]
+  },
+  {
+   "unit_id": "u0013",
+   "role": "exception",
+   "start": 371.44,
+   "end": 398.4,
+   "sentence_range": [
+    13,
+    13
+   ],
+   "topic": "Calculating Distance with Direction",
+   "summary": "Temperature is an exception to scalar quantities always being positive, as it can have negative values in Fahrenheit and Celsius scales, but not in Kelvin.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "scalar quantity",
+    "temperature",
+    "fahrenheit",
+    "celsius",
+    "kelvin"
+   ]
+  },
+  {
+   "unit_id": "u0014",
+   "role": "definition",
+   "start": 399.84,
+   "end": 446.0,
+   "sentence_range": [
+    14,
+    14
+   ],
+   "topic": "Displacement: Final Minus Initial Position",
+   "summary": "Displacement can be positive or negative depending on direction, calculated as final position minus initial position, representing the change in position.",
+   "equations": [
+    "d = XF - Xi"
+   ],
+   "concepts_introduced": [
+    "displacement"
+   ],
+   "concepts_required": []
+  },
+  {
+   "unit_id": "u0015",
+   "role": "physical_interpretation",
+   "start": 442.8,
+   "end": 488.24,
+   "sentence_range": [
+    15,
+    15
+   ],
+   "topic": "Displacement: Final Minus Initial Position",
+   "summary": "The displacement of +9 indicates the person ended up nine meters east from their starting point.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "displacement"
+   ]
+  },
+  {
+   "unit_id": "u0016",
+   "role": "demonstration",
+   "start": 485.84,
+   "end": 531.04,
+   "sentence_range": [
+    16,
+    16
+   ],
+   "topic": "Displacement: Final Minus Initial Position",
+   "summary": "Using a number line, the person starts at zero, travels 13 meters east (+13), then 4 meters west (-4), ending at position 9, resulting in a displacement of 9 meters east.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "displacement",
+    "number line"
+   ]
+  },
+  {
+   "unit_id": "u0017",
+   "role": "definition",
+   "start": 529.519,
+   "end": 540.64,
+   "sentence_range": [
+    17,
+    17
+   ],
+   "topic": "Average Speed vs. Average Velocity",
+   "summary": "Average speed is defined as the total distance traveled divided by the elapsed time.",
+   "equations": [
+    "average speed = distance / time"
+   ],
+   "concepts_introduced": [
+    "average speed"
+   ],
+   "concepts_required": [
+    "distance",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0018",
+   "role": "definition",
+   "start": 542.32,
+   "end": 549.839,
+   "sentence_range": [
+    18,
+    18
+   ],
+   "topic": "Average Speed vs. Average Velocity",
+   "summary": "Average velocity is defined as displacement over time.",
+   "equations": [
+    "average velocity = displacement / time"
+   ],
+   "concepts_introduced": [
+    "average velocity"
+   ],
+   "concepts_required": [
+    "displacement",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0019",
+   "role": "claim",
+   "start": 554.56,
+   "end": 583.68,
+   "sentence_range": [
+    19,
+    19
+   ],
+   "topic": "Average Speed vs. Average Velocity",
+   "summary": "Speed is always positive, while velocity can be positive or negative depending on direction.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "speed",
+    "velocity",
+    "direction"
+   ]
+  },
+  {
+   "unit_id": "u0020",
+   "role": "definition",
+   "start": 584.959,
+   "end": 608.88,
+   "sentence_range": [
+    20,
+    20
+   ],
+   "topic": "Average Speed vs. Average Velocity",
+   "summary": "Average velocity is the velocity calculated over a time interval.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "average velocity",
+    "time interval"
+   ]
+  },
+  {
+   "unit_id": "u0021",
+   "role": "example_setup",
+   "start": 610.0,
+   "end": 657.36,
+   "sentence_range": [
+    21,
+    21
+   ],
+   "topic": "Average Speed vs. Average Velocity",
+   "summary": "A particle travels 100 meters east, then 150 meters west, all in 5 seconds, and the task is to calculate its average speed and average velocity.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "average speed",
+    "average velocity",
+    "distance",
+    "displacement",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0022",
+   "role": "worked_step",
+   "start": 654.48,
+   "end": 694.48,
+   "sentence_range": [
+    22,
+    22
+   ],
+   "topic": "Average Speed vs. Average Velocity",
+   "summary": "To calculate average speed, first find the total distance traveled by adding the individual distances.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "average speed",
+    "distance"
+   ]
+  },
+  {
+   "unit_id": "u0023",
+   "role": "calculation",
+   "start": 691.36,
+   "end": 737.839,
+   "sentence_range": [
+    23,
+    23
+   ],
+   "topic": "Average Speed vs. Average Velocity",
+   "summary": "The total distance traveled is 100 meters east plus 150 meters west, which equals 250 meters.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "distance"
+   ]
+  },
+  {
+   "unit_id": "u0024",
+   "role": "calculation",
+   "start": 734.639,
+   "end": 780.32,
+   "sentence_range": [
+    24,
+    24
+   ],
+   "topic": "Average Speed vs. Average Velocity",
+   "summary": "The average speed is calculated by dividing the total distance of 250 meters by the time of 5 seconds, resulting in 50 meters per second.",
+   "equations": [
+    "S = 250m / 5s = 50m/s"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "average speed",
+    "distance",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0025",
+   "role": "worked_step",
+   "start": 778.639,
+   "end": 817.6,
+   "sentence_range": [
+    25,
+    25
+   ],
+   "topic": "Average Speed vs. Average Velocity",
+   "summary": "The average velocity is different from average speed because displacement is different, and there are two ways to calculate displacement.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "average velocity",
+    "displacement"
+   ]
+  },
+  {
+   "unit_id": "u0026",
+   "role": "definition",
+   "start": 819.199,
+   "end": 862.7199999999999,
+   "sentence_range": [
+    26,
+    26
+   ],
+   "topic": "Instantaneous Velocity and Limits",
+   "summary": "Instantaneous velocity is defined as the limit of displacement over time as the change in time approaches zero.",
+   "equations": [
+    "V = lim Δt->0 ΔX / Δt"
+   ],
+   "concepts_introduced": [
+    "instantaneous velocity"
+   ],
+   "concepts_required": [
+    "limits",
+    "displacement",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0027",
+   "role": "explanation",
+   "start": 859.68,
+   "end": 889.279,
+   "sentence_range": [
+    27,
+    27
+   ],
+   "topic": "Instantaneous Velocity and Limits",
+   "summary": "The video will not cover instantaneous velocity in detail but provides the formula for those interested.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "instantaneous velocity"
+   ]
+  },
+  {
+   "unit_id": "u0028",
+   "role": "variable_definition",
+   "start": 891.519,
+   "end": 897.0,
+   "sentence_range": [
+    28,
+    28
+   ],
+   "topic": "Instantaneous Velocity and Limits",
+   "summary": "The symbol delta (Δ) represents the change in a quantity, and delta x (ΔX) specifically denotes the change in position, calculated as final position minus initial position.",
+   "equations": [
+    "ΔX = XF - X0"
+   ],
+   "concepts_introduced": [
+    "delta (δ)",
+    "change in position (δx)"
+   ],
+   "concepts_required": [
+    "position"
+   ]
+  },
+  {
+   "unit_id": "u0029",
+   "role": "definition",
+   "start": 899.199,
+   "end": 942.4799999999999,
+   "sentence_range": [
+    29,
+    29
+   ],
+   "topic": "Instantaneous Velocity and Limits",
+   "summary": "Delta x (ΔX) is defined as the displacement along the x-axis, and similarly, displacement can occur along the y-axis.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "displacement",
+    "x-axis",
+    "y-axis"
+   ]
+  },
+  {
+   "unit_id": "u0030",
+   "role": "claim",
+   "start": 942.88,
+   "end": 961.92,
+   "sentence_range": [
+    30,
+    30
+   ],
+   "topic": "Constant Speed vs. Constant Acceleration",
+   "summary": "For objects moving at constant speed, the instantaneous velocity is equal to the average velocity because the velocity is not changing.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "constant speed",
+    "instantaneous velocity",
+    "average velocity"
+   ]
+  },
+  {
+   "unit_id": "u0031",
+   "role": "transition",
+   "start": 963.519,
+   "end": 970.639,
+   "sentence_range": [
+    31,
+    31
+   ],
+   "topic": "Constant Speed vs. Constant Acceleration",
+   "summary": "The speaker transitions to discussing objects moving with constant acceleration.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": []
+  },
+  {
+   "unit_id": "u0032",
+   "role": "definition",
+   "start": 975.92,
+   "end": 1024.6399999999999,
+   "sentence_range": [
+    32,
+    32
+   ],
+   "topic": "Constant Speed vs. Constant Acceleration",
+   "summary": "The speaker reminds that displacement is the final position minus the initial position, distinguishing it from distance.",
+   "equations": [
+    "d = x_f - x_o"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "displacement",
+    "final position",
+    "initial position",
+    "distance"
+   ]
+  },
+  {
+   "unit_id": "u0033",
+   "role": "equation_introduction",
+   "start": 1022.079,
+   "end": 1040.1599999999999,
+   "sentence_range": [
+    33,
+    33
+   ],
+   "topic": "Constant Speed vs. Constant Acceleration",
+   "summary": "For constant acceleration, the displacement is equal to the average velocity multiplied by time.",
+   "equations": [
+    "d = v̄t"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "constant acceleration",
+    "displacement",
+    "average velocity",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0034",
+   "role": "definition",
+   "start": 1046.48,
+   "end": 1096.72,
+   "sentence_range": [
+    34,
+    34
+   ],
+   "topic": "Average Velocity and Displacement Formulas",
+   "summary": "The average velocity is defined as the average of the initial and final velocities, expressed as (v_o + v_f) / 2 or 1/2(v_o + v_f).",
+   "equations": [
+    "v̄ = (v_o + v_f) / 2",
+    "v̄ = 1/2(v_o + v_f)"
+   ],
+   "concepts_introduced": [
+    "average velocity"
+   ],
+   "concepts_required": [
+    "initial velocity",
+    "final velocity"
+   ]
+  },
+  {
+   "unit_id": "u0035",
+   "role": "derivation",
+   "start": 1094.799,
+   "end": 1103.039,
+   "sentence_range": [
+    35,
+    35
+   ],
+   "topic": "Average Velocity and Displacement Formulas",
+   "summary": "Substituting the average velocity definition into the displacement formula yields d = 1/2(v_initial + v_final)t.",
+   "equations": [
+    "d = 1/2[v_o + v_f]t"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "average velocity",
+    "displacement",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0036",
+   "role": "exception",
+   "start": 1105.36,
+   "end": 1145.039,
+   "sentence_range": [
+    36,
+    36
+   ],
+   "topic": "Average Velocity and Displacement Formulas",
+   "summary": "Clarifies that if 'd' represents distance, 'v initial' and 'v final' are speeds, but if 'd' represents displacement, they are velocities.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "distance",
+    "displacement",
+    "speed",
+    "velocity"
+   ]
+  },
+  {
+   "unit_id": "u0037",
+   "role": "administrative",
+   "start": 1148.0,
+   "end": 1167.6,
+   "sentence_range": [
+    37,
+    37
+   ],
+   "topic": "Average Velocity and Displacement Formulas",
+   "summary": "Advises students to add the derived equation to their list for upcoming tests.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": []
+  },
+  {
+   "unit_id": "u0038",
+   "role": "definition",
+   "start": 1168.799,
+   "end": 1210.8799999999999,
+   "sentence_range": [
+    38,
+    38
+   ],
+   "topic": "Average Velocity and Displacement Formulas",
+   "summary": "Average velocity is defined as displacement (final position minus initial position) divided by time.",
+   "equations": [
+    "v̄ = (x_f - x_o) / t"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "average velocity",
+    "displacement",
+    "final position",
+    "initial position",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0039",
+   "role": "equation_introduction",
+   "start": 1205.36,
+   "end": 1255.28,
+   "sentence_range": [
+    39,
+    39
+   ],
+   "topic": "Kinematic Equations for Constant Acceleration",
+   "summary": "The speaker introduces two more kinematic equations for constant acceleration: v final squared equals v initial squared plus two times a d, and displacement equals v initial t plus one half a t squared.",
+   "equations": [
+    "VF^2 = Vo^2 + 2 ad",
+    "d = Vot + 1/2 at^2"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "kinematic equations",
+    "constant acceleration"
+   ]
+  },
+  {
+   "unit_id": "u0040",
+   "role": "derivation",
+   "start": 1252.96,
+   "end": 1299.76,
+   "sentence_range": [
+    40,
+    40
+   ],
+   "topic": "Kinematic Equations for Constant Acceleration",
+   "summary": "The speaker explains that displacement (d) can be replaced with x final minus x initial, leading to the equation for final position along the x-axis.",
+   "equations": [
+    "XF = Xo + Vot + 1/2 at^2"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "displacement",
+    "final position",
+    "initial position"
+   ]
+  },
+  {
+   "unit_id": "u0041",
+   "role": "exception",
+   "start": 1301.6,
+   "end": 1336.48,
+   "sentence_range": [
+    41,
+    41
+   ],
+   "topic": "Kinematic Equations for Constant Acceleration",
+   "summary": "The speaker notes that these equations, while shown for the x-axis, can also be applied to the y-axis, especially in projectile motion, by changing x to y and a to gravitational acceleration.",
+   "equations": [
+    "y final = y initial + v y initial t + 1/2 a t squared"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "projectile motion",
+    "gravitational acceleration"
+   ]
+  },
+  {
+   "unit_id": "u0042",
+   "role": "claim",
+   "start": 1333.84,
+   "end": 1375.9189999999999,
+   "sentence_range": [
+    42,
+    42
+   ],
+   "topic": "Distinguishing Velocity Notations for Constant Speed vs. Acceleration",
+   "summary": "The speaker clarifies that 'v' and 'v bar' are interchangeable for constant speed but 'v bar' should be used for average velocity in constant acceleration to avoid confusion.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "constant speed",
+    "constant acceleration",
+    "average velocity"
+   ]
+  },
+  {
+   "unit_id": "u0043",
+   "role": "transition",
+   "start": 1373.12,
+   "end": 1391.6789999999999,
+   "sentence_range": [
+    43,
+    43
+   ],
+   "topic": "Distinguishing Velocity Notations for Constant Speed vs. Acceleration",
+   "summary": "The speaker transitions to a new problem, stating that a bus is traveling at a constant speed of 40 meters per second.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": []
+  },
+  {
+   "unit_id": "u0044",
+   "role": "example_setup",
+   "start": 1394.24,
+   "end": 1399.1200000000001,
+   "sentence_range": [
+    44,
+    44
+   ],
+   "topic": "Distinguishing Velocity Notations for Constant Speed vs. Acceleration",
+   "summary": "The speaker asks what formula to use and identifies the given speed as 40 m/s, which can be represented by 'v' or 's'.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "speed"
+   ]
+  },
+  {
+   "unit_id": "u0045",
+   "role": "setup",
+   "start": 1401.039,
+   "end": 1444.24,
+   "sentence_range": [
+    45,
+    45
+   ],
+   "topic": "Unit Conversion for Kinematic Problems",
+   "summary": "The problem requires finding time in hours, given distance in miles and speed in meters per second, and the only applicable formula is distance equals velocity times time.",
+   "equations": [
+    "d = vt"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "constant speed",
+    "distance",
+    "velocity",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0046",
+   "role": "claim",
+   "start": 1441.52,
+   "end": 1487.32,
+   "sentence_range": [
+    46,
+    46
+   ],
+   "topic": "Unit Conversion for Kinematic Problems",
+   "summary": "The units for speed (meters per second), distance (miles), and desired time (hours) do not match, requiring unit conversion before using the formula.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "unit consistency"
+   ]
+  },
+  {
+   "unit_id": "u0047",
+   "role": "procedure",
+   "start": 1487.52,
+   "end": 1532.24,
+   "sentence_range": [
+    47,
+    47
+   ],
+   "topic": "Unit Conversion for Kinematic Problems",
+   "summary": "The best approach is to convert the speed from meters per second to miles per hour to match the units of distance and time.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "unit conversion"
+   ]
+  },
+  {
+   "unit_id": "u0048",
+   "role": "worked_step",
+   "start": 1529.84,
+   "end": 1546.08,
+   "sentence_range": [
+    48,
+    48
+   ],
+   "topic": "Converting Units: Seconds to Hours",
+   "summary": "The speaker converts seconds to minutes by multiplying by the conversion factor of 60 seconds per minute.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "unit conversion",
+    "seconds",
+    "minutes"
+   ]
+  },
+  {
+   "unit_id": "u0049",
+   "role": "worked_step",
+   "start": 1547.279,
+   "end": 1559.039,
+   "sentence_range": [
+    49,
+    49
+   ],
+   "topic": "Converting Units: Seconds to Hours",
+   "summary": "The speaker converts minutes to hours by multiplying by the conversion factor of 60 minutes per hour.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "unit conversion",
+    "minutes",
+    "hours"
+   ]
+  },
+  {
+   "unit_id": "u0050",
+   "role": "calculation",
+   "start": 1561.36,
+   "end": 1605.12,
+   "sentence_range": [
+    50,
+    50
+   ],
+   "topic": "Converting Units: Seconds to Hours",
+   "summary": "The speaker performs the calculation to convert 40 m/s to miles per hour, resulting in 89.5 mph.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "unit conversion",
+    "multiplication",
+    "division"
+   ]
+  },
+  {
+   "unit_id": "u0051",
+   "role": "worked_step",
+   "start": 1606.559,
+   "end": 1620.0,
+   "sentence_range": [
+    51,
+    51
+   ],
+   "topic": "Calculating Time Using Distance and Speed",
+   "summary": "The problem uses the formula d = vt, where d is 200 miles.",
+   "equations": [
+    "d = vt"
+   ],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "distance",
+    "speed",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0052",
+   "role": "problem_givens",
+   "start": 1621.12,
+   "end": 1629.52,
+   "sentence_range": [
+    52,
+    52
+   ],
+   "topic": "Calculating Time Using Distance and Speed",
+   "summary": "The speed (v) is 89.5 miles per hour.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "speed"
+   ]
+  },
+  {
+   "unit_id": "u0053",
+   "role": "worked_step",
+   "start": 1630.559,
+   "end": 1641.84,
+   "sentence_range": [
+    53,
+    53
+   ],
+   "topic": "Calculating Time Using Distance and Speed",
+   "summary": "To calculate t, divide both sides of the equation by 89.5 miles per hour.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "algebraic manipulation"
+   ]
+  },
+  {
+   "unit_id": "u0054",
+   "role": "result",
+   "start": 1653.76,
+   "end": 1688.96,
+   "sentence_range": [
+    54,
+    54
+   ],
+   "topic": "Calculating Time Using Distance and Speed",
+   "summary": "The time taken is 2.23 hours, as the miles units cancel out, leaving hours.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "unit cancellation"
+   ]
+  },
+  {
+   "unit_id": "u0055",
+   "role": "example_setup",
+   "start": 1693.52,
+   "end": 1719.76,
+   "sentence_range": [
+    55,
+    55
+   ],
+   "topic": "Setting Up Part B: Average Velocity Problem",
+   "summary": "The problem asks for the average velocity of a bus that moves from 50 miles east of city XYZ to 90 miles west of city XYZ in five hours.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "average velocity"
+   ]
+  },
+  {
+   "unit_id": "u0056",
+   "role": "problem_givens",
+   "start": 1723.44,
+   "end": 1775.2,
+   "sentence_range": [
+    56,
+    57
+   ],
+   "topic": "Setting Up Part B: Average Velocity Problem",
+   "summary": "The initial position of the bus is 50 miles east of city XYZ, and the final position is 90 miles west of city XYZ, with city XYZ at the origin.",
+   "equations": [],
+   "concepts_introduced": [
+    "initial position",
+    "final position"
+   ],
+   "concepts_required": [
+    "coordinate system"
+   ]
+  },
+  {
+   "unit_id": "u0057",
+   "role": "physical_interpretation",
+   "start": 1777.36,
+   "end": 1786.0,
+   "sentence_range": [
+    58,
+    58
+   ],
+   "topic": "Setting Up Part B: Average Velocity Problem",
+   "summary": "Since the bus is traveling west, its average velocity should be a negative value.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "average velocity",
+    "direction (west)"
+   ]
+  },
+  {
+   "unit_id": "u0058",
+   "role": "procedure",
+   "start": 1788.08,
+   "end": 1836.6399999999999,
+   "sentence_range": [
+    59,
+    59
+   ],
+   "topic": "Calculating Average Velocity: Displacement Over Time",
+   "summary": "The speaker explains how to calculate average velocity using the formula displacement over time, defining displacement as the change in position (final minus initial).",
+   "equations": [
+    "average velocity = displacement / time",
+    "displacement = x_final - x_initial"
+   ],
+   "concepts_introduced": [
+    "average velocity",
+    "displacement"
+   ],
+   "concepts_required": [
+    "initial position",
+    "final position",
+    "time"
+   ]
+  },
+  {
+   "unit_id": "u0059",
+   "role": "worked_step",
+   "start": 1834.159,
+   "end": 1851.64,
+   "sentence_range": [
+    60,
+    60
+   ],
+   "topic": "Calculating Average Velocity: Displacement Over Time",
+   "summary": "The speaker substitutes the given final and initial positions and time into the displacement formula, calculating the displacement as -140.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "final position",
+    "initial position",
+    "time",
+    "displacement"
+   ]
+  },
+  {
+   "unit_id": "u0060",
+   "role": "result",
+   "start": 1852.88,
+   "end": 1885.3990000000001,
+   "sentence_range": [
+    61,
+    61
+   ],
+   "topic": "Calculating Average Velocity: Displacement Over Time",
+   "summary": "The speaker calculates the average velocity by dividing the displacement (-140 miles) by the time (5 hours), resulting in -28 miles per hour.",
+   "equations": [],
+   "concepts_introduced": [],
+   "concepts_required": [
+    "displacement",
+    "time",
+    "average velocity"
+   ]
+  }
+ ],
+ "dependency_edges": [
+  {
+   "source": "u0004",
+   "target": "u0003",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0009",
+   "target": "u0008",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0011",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0015",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0016",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0018",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0020",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0021",
+   "target": "u0017",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0021",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0021",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0022",
+   "target": "u0017",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0024",
+   "target": "u0017",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0025",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0025",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0026",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0027",
+   "target": "u0026",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0029",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0030",
+   "target": "u0026",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0030",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0032",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0032",
+   "target": "u0056",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0033",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0033",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0035",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0035",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0035",
+   "target": "u0034",
+   "relation": "refers_to",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0036",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0038",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0038",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0038",
+   "target": "u0056",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0040",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0040",
+   "target": "u0056",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0040",
+   "target": "u0014",
+   "relation": "refers_to",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0042",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0055",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0057",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0058",
+   "target": "u0056",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0059",
+   "target": "u0056",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0059",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0060",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0060",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0001",
+   "target": "u0000",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0002",
+   "target": "u0001",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0004",
+   "target": "u0003",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0005",
+   "target": "u0004",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0007",
+   "target": "u0006",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0008",
+   "target": "u0007",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0009",
+   "target": "u0008",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0011",
+   "target": "u0010",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0012",
+   "target": "u0011",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0013",
+   "target": "u0012",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0015",
+   "target": "u0014",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0016",
+   "target": "u0015",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0018",
+   "target": "u0017",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0019",
+   "target": "u0018",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0020",
+   "target": "u0019",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0021",
+   "target": "u0020",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0022",
+   "target": "u0021",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0023",
+   "target": "u0022",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0024",
+   "target": "u0023",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0025",
+   "target": "u0024",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0027",
+   "target": "u0026",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0028",
+   "target": "u0027",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0029",
+   "target": "u0028",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0031",
+   "target": "u0030",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0032",
+   "target": "u0031",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0033",
+   "target": "u0032",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0035",
+   "target": "u0034",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0036",
+   "target": "u0035",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0037",
+   "target": "u0036",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0038",
+   "target": "u0037",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0040",
+   "target": "u0039",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0041",
+   "target": "u0040",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0043",
+   "target": "u0042",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0044",
+   "target": "u0043",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0046",
+   "target": "u0045",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0047",
+   "target": "u0046",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0049",
+   "target": "u0048",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0050",
+   "target": "u0049",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0052",
+   "target": "u0051",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0053",
+   "target": "u0052",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0054",
+   "target": "u0053",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0056",
+   "target": "u0055",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0057",
+   "target": "u0056",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0059",
+   "target": "u0058",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0060",
+   "target": "u0059",
+   "relation": "continues",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0007",
+   "target": "u0005",
+   "relation": "visually_depends_on",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0012",
+   "target": "u0011",
+   "relation": "visually_depends_on",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0015",
+   "target": "u0014",
+   "relation": "visually_depends_on",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0018",
+   "target": "u0017",
+   "relation": "visually_depends_on",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0040",
+   "target": "u0039",
+   "relation": "visually_depends_on",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0042",
+   "target": "u0040",
+   "relation": "visually_depends_on",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0044",
+   "target": "u0043",
+   "relation": "visually_depends_on",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0049",
+   "target": "u0048",
+   "relation": "visually_depends_on",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0051",
+   "target": "u0050",
+   "relation": "visually_depends_on",
+   "derivation": "rule"
+  },
+  {
+   "source": "u0001",
+   "target": "u0000",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0002",
+   "target": "u0000",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0019",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0019",
+   "target": "u0017",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0020",
+   "target": "u0017",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0022",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0023",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0024",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0025",
+   "target": "u0017",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0027",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0031",
+   "target": "u0008",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0032",
+   "target": "u0008",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0033",
+   "target": "u0026",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0033",
+   "target": "u0008",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0034",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0036",
+   "target": "u0018",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0037",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0038",
+   "target": "u0008",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0039",
+   "target": "u0014",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0039",
+   "target": "u0008",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0040",
+   "target": "u0008",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0041",
+   "target": "u0008",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0042",
+   "target": "u0008",
+   "relation": "requires",
+   "derivation": "bridge"
+  },
+  {
+   "source": "u0007",
+   "target": "u0006",
+   "relation": "answers",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0008",
+   "target": "u0007",
+   "relation": "explains",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0016",
+   "target": "u0015",
+   "relation": "illustrates",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0019",
+   "target": "u0005",
+   "relation": "explains",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0023",
+   "target": "u0022",
+   "relation": "summarizes",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0024",
+   "target": "u0022",
+   "relation": "summarizes",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0025",
+   "target": "u0021",
+   "relation": "explains",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0029",
+   "target": "u0028",
+   "relation": "explains",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0030",
+   "target": "u0018",
+   "relation": "explains",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0034",
+   "target": "u0033",
+   "relation": "explains",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0035",
+   "target": "u0033",
+   "relation": "explains",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0046",
+   "target": "u0045",
+   "relation": "explains",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0047",
+   "target": "u0046",
+   "relation": "answers",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0050",
+   "target": "u0047",
+   "relation": "summarizes",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0051",
+   "target": "u0044",
+   "relation": "answers",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0054",
+   "target": "u0053",
+   "relation": "summarizes",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0058",
+   "target": "u0055",
+   "relation": "answers",
+   "derivation": "llm"
+  },
+  {
+   "source": "u0060",
+   "target": "u0059",
+   "relation": "summarizes",
+   "derivation": "llm"
+  }
+ ],
+ "clips": [
+  {
+   "sequence_index": 1,
+   "cand_id": "c_u0000",
+   "anchor_id": "u0000",
+   "title": "Introduction to Kinematics",
+   "role": "definition",
+   "start": 1.76,
+   "end": 187.76,
+   "duration": 186.0,
+   "sentence_span": [
+    0,
+    5
+   ],
+   "unit_ids": [
+    "u0000",
+    "u0001",
+    "u0002",
+    "u0003",
+    "u0004",
+    "u0005"
+   ],
+   "referential": [
+    [
+     "u0008",
+     "contract:unpacking"
+    ]
+   ],
+   "merged": false,
+   "context_card": "Kinematics describes how objects move without reference to force. Temperature is a scalar, but acceleration is a vector quantity.",
+   "warnings": [],
+   "final_quality": 0.968,
+   "completeness_score": 1.0,
+   "grounding_score": 1.0,
+   "boundary_score": 1.0,
+   "priority": 0.68,
+   "prerequisite_clips": [],
+   "judge_verdict": {
+    "score_10": 9,
+    "score": 0.9,
+    "understandable": true,
+    "error": false,
+    "reasoning": "The clip defines kinematics and distinguishes between scalar and vector quantities, providing clear examples for each. It introduces concepts like distance, displacement, speed, and velocity, explaining their differences and relationships. The definitions are complete and well-illustrated, making the clip understandable on its own.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": true,
+     "reasoning_complete": true,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": []
+   },
+   "full_text": "in this video we're going to talk about kinematics which basically describes how objects move without any references to force now we're going to focus on kinematics in one dimension mostly along the x-axis but we can also work on some problems along the y-axis when you get into two-dimensional kinematics it covers projectile motion which is a topic for another day now the first thing we need to talk about is the difference between a scalar quantity and a vector quantity a scalar quantity is something that has magnitude only whereas the vector quantity has both magnitude and direction so for instance mass is a scalar quantity you could say that a book has two kilograms of mass the two kilograms would be the magnitude of the mass of the book but you wouldn't say the book has two kilograms of mass east direction wouldn't apply for mass so mass cannot be a vector quantity distance is a scalar quantity and displacement is a vector quantity displacement you can think of it as distance with direction so let's say if a person traveled 15 meters you're basically describing the person's distance because you didn't mention direction but let's say if someone traveled 15 meters east now you're describing displacement you describe in not only how far he traveled but also where he traveled so think of displacement as distance with direction now technically displacement is really the change in the position of an object so along the x-axis you could describe displacement as the final position minus the initial position speed is a scalar quantity speed describes how fast an object is moving velocity is a vector quantity velocity is speed with direction so if you were to say a person is traveling at uh 20 meters per second you're describing the speed of the person this is the magnitude but let's say if a person is moving that 30 meters per second north you're describing velocity because you've mentioned his speed along with the direction so you have both magnitude and direction which makes it a vector quantity"
+  },
+  {
+   "sequence_index": 2,
+   "cand_id": "c_u0009",
+   "anchor_id": "u0009",
+   "title": "Temperature as a Scalar Quantity",
+   "role": "claim",
+   "start": 143.12,
+   "end": 373.84,
+   "duration": 230.72,
+   "sentence_span": [
+    5,
+    12
+   ],
+   "unit_ids": [
+    "u0005",
+    "u0006",
+    "u0007",
+    "u0008",
+    "u0009",
+    "u0010",
+    "u0011",
+    "u0012"
+   ],
+   "referential": [
+    [
+     "u0014",
+     "requires"
+    ]
+   ],
+   "merged": true,
+   "context_card": "Earlier, the speaker defined acceleration as a vector quantity, explaining it describes how fast velocity changes and can have a direction.",
+   "warnings": [
+    "merged_overlap",
+    "trimmed_start"
+   ],
+   "final_quality": 0.95,
+   "completeness_score": 1.0,
+   "grounding_score": 1.0,
+   "boundary_score": 0.9,
+   "priority": 0.7,
+   "prerequisite_clips": [],
+   "judge_verdict": {
+    "score_10": 4,
+    "score": 0.4,
+    "understandable": false,
+    "error": false,
+    "reasoning": "The clip defines scalar and vector quantities using examples of speed, velocity, temperature, and acceleration. It then poses a problem about calculating distance and displacement, but the problem statement is incomplete, and the solution is presented without clear reasoning. The context card mentions acceleration as a vector, which is consistent with the clip, but the clip itself is not fully self-contained due to the incomplete problem statement and missing reasoning for the distance/displacement calculation.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_problem_statement",
+      "detail": "The problem asks to calculate distance and displacement but does not provide the specific values for the initial eastward travel, only stating '13 meters east' in the solution part.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_reasoning",
+      "detail": "The calculation for distance and displacement is presented as a given result without showing the steps or reasoning behind it.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "missing_result",
+      "detail": "The clip states the total distance is 17 meters and implies a displacement calculation, but the final displacement value is not explicitly stated.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ]
+   },
+   "full_text": "speed is a scalar quantity speed describes how fast an object is moving velocity is a vector quantity velocity is speed with direction so if you were to say a person is traveling at uh 20 meters per second you're describing the speed of the person this is the magnitude but let's say if a person is moving that 30 meters per second north you're describing velocity because you've mentioned his speed along with the direction so you have both magnitude and direction which makes it a vector quantity now what about temperature would you say that temperature is a scalar quantity or would you describe it as a vector quantity so think of units of temperature like let's say it's uh 80 degrees fahrenheit outside or 25 degrees celsius you wouldn't say it's 80 degrees fahrenheit north direction doesn't apply for temperature so because you can't describe the direction of temperature it's not relevant temperature is a scalar quantity you can only mention its magnitude such as how hot it is 80 degrees fahrenheit but you can attach direction to temperature which makes it scalar now acceleration that is a vector quantity acceleration tells you how fast the velocity is changing and you could say a car is accelerating at two meters per second squared east you can put direction to it so acceleration is the vector quantity now let's talk more about the difference between distance and displacement so let's say a person walk let's say a person traveled 30 meters east and then he turns around and travels four meters west we're going to add a negative sign to this because he's going towards the left and just to review direction north and south is along the y-axis east and west they're along the x-axis so east is along the positive x-axis west is along the negative x-axis so given a situation calculate the distance and the displacement of this individual that uh traveled here let's put a person so the total distance that this person traveled is 17 meters it's basically the sum of these two numbers he traveled 13 meters east and then 4 meters west so a total distance of 17 meters distance being scalar it's always positive now there is an exception to this specifically temperature depending on the units you're dealing with even though temperature is a scalar quantity you could have negative values especially for units such as fahrenheit and celsius so some places can be negative 20"
+  },
+  {
+   "sequence_index": 3,
+   "cand_id": "c_u0042",
+   "anchor_id": "u0042",
+   "title": "Distinguishing Velocity Notations for Constant Speed vs. Acceleration",
+   "role": "claim",
+   "start": 1252.96,
+   "end": 1487.32,
+   "duration": 234.36,
+   "sentence_span": [
+    40,
+    46
+   ],
+   "unit_ids": [
+    "u0040",
+    "u0041",
+    "u0042",
+    "u0043",
+    "u0044",
+    "u0045",
+    "u0046"
+   ],
+   "referential": [
+    [
+     "u0018",
+     "requires"
+    ],
+    [
+     "u0008",
+     "requires"
+    ]
+   ],
+   "merged": false,
+   "context_card": "Average velocity is defined as displacement over time. The speaker clarifies that 'v' and 'v bar' are interchangeable for constant speed but 'v bar' should be used for average velocity in constant acceleration to avoid confusion.",
+   "warnings": [],
+   "final_quality": 0.85,
+   "completeness_score": 0.7000000000000001,
+   "grounding_score": 1.0,
+   "boundary_score": 1.0,
+   "priority": 0.7,
+   "prerequisite_clips": [],
+   "judge_verdict": {
+    "score_10": 4,
+    "score": 0.4,
+    "understandable": false,
+    "error": false,
+    "reasoning": "The clip begins mid-explanation of kinematic equations and then transitions to a word problem about a bus. While the context card provides a definition of average velocity, the clip itself assumes prior knowledge of kinematic equations and their application. The problem statement is clear, but the solution is not reached within the clip, as it stops during the unit conversion explanation. The distinction between 'v' and 'v bar' is mentioned, but the clip doesn't fully resolve this or complete the problem.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": true,
+     "all_references_resolved": false,
+     "prerequisites_satisfied": false,
+     "visuals_sufficient": true,
+     "problem_statement_complete": true,
+     "reasoning_complete": false,
+     "result_complete": false,
+     "source_grounded": false
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_prerequisite",
+      "detail": "The clip assumes familiarity with kinematic equations and their application, which are not fully explained within the clip.",
+      "missing_concept": "Kinematic equations",
+      "reference_text": null
+     },
+     {
+      "kind": "missing_reasoning",
+      "detail": "The clip stops during the unit conversion process and does not complete the calculation to find the time.",
+      "missing_concept": null,
+      "reference_text": null
+     },
+     {
+      "kind": "unresolved_reference",
+      "detail": "The clip refers to 'this formula' and 'these formulas' without explicitly stating them at the beginning of the clip, relying on prior context or unshown visuals.",
+      "missing_concept": null,
+      "reference_text": "this formula"
+     }
+    ]
+   },
+   "full_text": "final position is equal to initial position plus v initial t plus one half a t squared now because this is x we're dealing with motion along the x axis but when you go into projectile motion you can apply motion along the y axis as well so you might see this variation of this formula y final equals y initial plus v y initial t so that's initial velocity but in the y direction plus one half a t squared where a is like the gravitational acceleration in the y direction so just understand that you can apply these formulas in the x direction or in the y direction so it might be a lot to keep track of but as you begin to work problems uh the use of these formulas will begin to make more sense but you may want to write these down for your reference now before we work on a few example problems there's something i do want to mention when dealing with constant speed you could use this formula x final is equal to x initial plus v t so you don't need to write v bar because v and v bar are the same uh when dealing with constant speed but for constant acceleration it's good to keep in mind that this represents average velocity so it's better to write v bar instead of v so there's no confusion because these two they're not necessarily the same when dealing with constant acceleration so just be aware of that little detail let's start with this one a bus is traveling at a constant speed of 40 meters per second how many hours will it take to travel a distance of 200 miles so what formula do we need to use so we're given a speed which we can use as a symbol v or s and we know the distance which is 200 miles the only formula that we could use since the bus is moving at constant speed is this one d is equal to vt now before we use that formula we need to take a look at the units here we have meters per second and here we have mouse and we want to find a time in hours so we're looking for t the units they don't match so before we can use the formula we need to convert the units into an appropriate form so what do you recommend that we need to do we have the distance in mouse and we want to find the time in hours the best thing we can do is convert the speed from meters per second to miles per hour once we do that then it will match with the unit hours and the unit miles so we can now use that formula so let's go ahead and convert 40 meters per second to miles per hour so let's get an overview of how we're going to do this let's convert meters to kilometers and then kilometers to miles and then we're going to convert seconds to minutes and then minutes to hours"
+  },
+  {
+   "sequence_index": 4,
+   "cand_id": "c_u0054",
+   "anchor_id": "u0054",
+   "title": "Calculating Time Using Distance and Speed",
+   "role": "result",
+   "start": 1529.84,
+   "end": 1688.96,
+   "duration": 159.12,
+   "sentence_span": [
+    48,
+    54
+   ],
+   "unit_ids": [
+    "u0048",
+    "u0049",
+    "u0050",
+    "u0051",
+    "u0052",
+    "u0053",
+    "u0054"
+   ],
+   "referential": [
+    [
+     "u0059",
+     "prerequisite"
+    ],
+    [
+     "u0044",
+     "answers"
+    ],
+    [
+     "u0046",
+     "contract:relevant_principle"
+    ],
+    [
+     "u0057",
+     "contract:interpretation"
+    ]
+   ],
+   "merged": false,
+   "context_card": "The speaker identifies the given speed as 40 m/s, which can be represented by 'v' or 's'. However, the units for speed, distance, and desired time do not match, requiring unit conversion.",
+   "warnings": [],
+   "final_quality": 0.77,
+   "completeness_score": 0.475,
+   "grounding_score": 1.0,
+   "boundary_score": 1.0,
+   "priority": 0.8,
+   "prerequisite_clips": [],
+   "judge_verdict": {
+    "score_10": 4,
+    "score": 0.4,
+    "understandable": false,
+    "error": false,
+    "reasoning": "The clip attempts to solve a physics problem involving unit conversion and calculating time. However, the problem statement itself (what is being asked to find) is not explicitly stated within the clip. While the context card mentions a speed of 40 m/s, the clip jumps directly into unit conversions without clearly defining the initial problem or the question to be answered. The calculation steps and result are present, but without a clear problem statement, the overall purpose and solution are incomplete.",
+    "gates": {
+     "topic_identifiable": true,
+     "purpose_identifiable": false,
+     "all_references_resolved": true,
+     "prerequisites_satisfied": true,
+     "visuals_sufficient": true,
+     "problem_statement_complete": false,
+     "reasoning_complete": true,
+     "result_complete": true,
+     "source_grounded": true
+    },
+    "failure_reasons": [
+     {
+      "kind": "missing_problem_statement",
+      "detail": "The clip does not explicitly state the problem being solved, only the context card mentions an initial speed and the need for unit conversion.",
+      "missing_concept": null,
+      "reference_text": null
+     }
+    ]
+   },
+   "full_text": "let's convert seconds to minutes since we have seconds on the bottom we want to put seconds on top and then minutes on the bottom one minute is equal to 60 seconds so now we can cross out this unit and now let's convert minutes to hours one hour is equivalent to 60 minutes and so we could cancel the unit minutes so now let's do the math we're going to multiply by all the numbers that are on the top but we're going to divide by the numbers on the bottom so it's going to be 40 divided by a thousand take that result divided by 1.609 and then multiply that by 60 and then by another 60. so for the velocity or rather the speed you should get 89.5 if you round it miles per hour which we can write mph so that's how we can convert meters per second to miles per hour now let's go ahead and finish this problem so let's use the formula d is equal to vt in this case d is going to represent the distance which is 200 miles v is going to be the speed which is 89.5 miles per hour and then now we can calculate t so to get t by itself we need to divide both sides by 89.5 miles per hour 200 divided by 89.5 gives us this answer 2.23 hours now looking at the units we can see that the unit miles cancel leaving behind the unit hours which is what we want the final answer to be in so when dealing with these problems always check to make sure that the units match if they don't match you need to convert one unit into another so just keep that in mind"
+  }
+ ],
+ "rejections": [
+  {
+   "stage": "repair",
+   "cand_id": "c_u0035",
+   "title": "Average Velocity and Displacement Formulas",
+   "role": "derivation",
+   "reason": "judge verdict incomplete after repair budget",
+   "score": 0.4,
+   "failure_kinds": [
+    "missing_prerequisite",
+    "unresolved_reference",
+    "missing_problem_statement"
+   ],
+   "final_quality": null,
+   "start": 1022.079,
+   "end": 1299.76,
+   "text_gist": "and by the way remember if you're using displacement displacement is the final position minus the initial position but if you're dealing with distance you don't have to worry about […] v y initial t so that's initial velocity but in the y direction plus one half a t squared where a is like the gravitational acceleration in the y direction"
+  },
+  {
+   "stage": "repair",
+   "cand_id": "c_u0040",
+   "title": "Kinematic Equations for Constant Acceleration",
+   "role": "derivation",
+   "reason": "judge verdict incomplete after repair budget",
+   "score": 0.4,
+   "failure_kinds": [
+    "missing_prerequisite",
+    "missing_reasoning",
+    "missing_result"
+   ],
+   "final_quality": null,
+   "start": 1046.48,
+   "end": 1299.76,
+   "text_gist": "so that's we need to use v bar now average velocity is the average of the initial velocity and the final velocity so it's basically the sum of the initial […] v y initial t so that's initial velocity but in the y direction plus one half a t squared where a is like the gravitational acceleration in the y direction"
+  },
+  {
+   "stage": "repair",
+   "cand_id": "c_u0060",
+   "title": "Calculating Average Velocity: Displacement Over Time",
+   "role": "result",
+   "reason": "judge verdict incomplete after repair budget",
+   "score": 0.5,
+   "failure_kinds": [
+    "missing_problem_statement",
+    "missing_prerequisite",
+    "missing_visual"
+   ],
+   "final_quality": null,
+   "start": 1693.52,
+   "end": 1885.3990000000001,
+   "text_gist": "now let's move on to part b of this problem if the bus moved from a position that is 50 miles east of city xyz to a position that is […] average velocity is going to be negative 28 miles per hour which we can write as mph so that's how we can calculate the average velocity for this particular problem"
+  },
+  {
+   "stage": "repair",
+   "cand_id": "c_u0030",
+   "title": "Constant Speed vs. Constant Acceleration",
+   "role": "claim",
+   "reason": "judge verdict incomplete after repair budget",
+   "score": 0.7,
+   "failure_kinds": [
+    "other"
+   ],
+   "final_quality": null,
+   "start": 942.88,
+   "end": 961.92,
+   "text_gist": "now for objects moving at constant speed you need to know that the instantaneous velocity is the same as the average velocity because the velocity is not changing so whether you use v or v bar it'll have the same effect"
+  },
+  {
+   "stage": "repair",
+   "cand_id": "c_u0019",
+   "title": "Average Speed vs. Average Velocity",
+   "role": "claim",
+   "reason": "judge verdict incomplete after repair budget",
+   "score": 0.3,
+   "failure_kinds": [
+    "missing_visual",
+    "missing_reasoning"
+   ],
+   "final_quality": null,
+   "start": 399.84,
+   "end": 694.48,
+   "text_gist": "now displacement can be positive or negative dependent on the direction if you were to combine these two including the negative 4 value it would be 13 minus 4 so […] way too but i prefer to simply add the displacement of each individual part of the problem to get the final displacement so the final displacement is negative 50 meters"
+  },
+  {
+   "stage": "dedupe",
+   "cand_id": "c_u0003",
+   "title": "Understanding Displacement as a Vector Quantity",
+   "role": "definition",
+   "reason": "overlap loser to c_u0000",
+   "score": null,
+   "failure_kinds": [],
+   "final_quality": 0.968,
+   "start": 1.76,
+   "end": 187.76,
+   "text_gist": "in this video we're going to talk about kinematics which basically describes how objects move without any references to force now we're going to focus on kinematics in one dimension […] and direction which makes it a vector quantity now what about temperature would you say that temperature is a scalar quantity or would you describe it as a vector quantity"
+  },
+  {
+   "stage": "dedupe",
+   "cand_id": "c_u0046",
+   "title": "Unit Conversion for Kinematic Problems",
+   "role": "claim",
+   "reason": "overlap loser to c_u0042",
+   "score": null,
+   "failure_kinds": [],
+   "final_quality": 0.85,
+   "start": 1333.84,
+   "end": 1487.32,
+   "text_gist": "so just understand that you can apply these formulas in the x direction or in the y direction so it might be a lot to keep track of but as […] how we're going to do this let's convert meters to kilometers and then kilometers to miles and then we're going to convert seconds to minutes and then minutes to hours"
+  }
+ ]
+}
