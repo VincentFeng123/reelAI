@@ -3376,22 +3376,9 @@ class MediumRegressionTests(unittest.TestCase):
             self.assertEqual(len(caption_calls), 3)
         conn.close()
 
-    def test_ranked_feed_enriches_short_cached_video_descriptions_from_youtube_details(self) -> None:
+    def test_ranked_feed_never_calls_legacy_youtube_details(self) -> None:
         conn = self._build_ranked_feed_test_conn()
         youtube_service = mock.Mock()
-        full_description = (
-            "A full description of cell signaling pathways with receptors, second messengers, and example pathways."
-        )
-        youtube_service.video_details.return_value = {
-            "vidRanked01": {
-                "title": "Cell signaling explainer",
-                "channel_title": "Bio Channel",
-                "description": full_description,
-                "duration_sec": 180,
-                "view_count": 100,
-                "license": "youtube",
-            }
-        }
         service = ReelService(embedding_service=None, youtube_service=youtube_service)
 
         def fake_score_text_relevance(*args, **kwargs):
@@ -3411,19 +3398,12 @@ class MediumRegressionTests(unittest.TestCase):
         with mock.patch.object(service, "_score_text_relevance", side_effect=fake_score_text_relevance):
             ranked = service.ranked_feed(conn, "material-ranked", fast_mode=True)
 
-        # The ranked row gets the enriched description in-memory so the current
-        # request sees richer metadata …
-        self.assertEqual(ranked[0]["video_description"], full_description)
-        # … but ranked_feed is a read path and must NOT mutate the `videos`
-        # table. Persistence of enriched YouTube metadata belongs in the
-        # ingestion / refinement pipelines, where write-backs can't race two
-        # concurrent ranking calls against each other or regress
-        # `is_creative_commons` from a partial details payload.
+        self.assertEqual(ranked[0]["video_description"], original_description)
         unchanged_description = conn.execute(
             "SELECT description FROM videos WHERE id = ?", ("vidRanked01",)
         ).fetchone()
         self.assertEqual(unchanged_description[0], original_description)
-        youtube_service.video_details.assert_called_once_with(["vidRanked01"])
+        youtube_service.video_details.assert_not_called()
         conn.close()
 
     def test_quick_candidate_metadata_gate_rejects_off_topic_risky_video(self) -> None:

@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 PRACTICE_FAST_EXPAND_MODEL = "gemini-3.5-flash"
 PRACTICE_FAST_EXPAND_FALLBACK_MODEL = "gemini-3.1-pro-preview"
+PRACTICE_FAST_EXPAND_TIMEOUT_MS = 8_000
 
 
 class _PracticeFastExpansion(BaseModel):
@@ -126,7 +127,7 @@ async def _practice_fast_gemini_raw_async(
     client = genai.Client(
         api_key=key,
         http_options=types.HttpOptions(
-            timeout=120_000,
+            timeout=PRACTICE_FAST_EXPAND_TIMEOUT_MS,
             retry_options=types.HttpRetryOptions(attempts=1),
         ),
     )

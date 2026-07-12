@@ -1,5 +1,8 @@
 # backend/tests/clip_engine/test_search.py
+import pytest
+
 from backend.app.clip_engine import search
+from backend.app.clip_engine.errors import ProviderBudgetExceededError
 from backend.app.services.search_query_plan import (
     PlannedSearchQuery,
     SearchQueryPlan,
@@ -229,59 +232,22 @@ def test_slow_context_requires_all_six_initial_queries(monkeypatch):
     }
 
 
-def test_slow_context_uses_three_queries_for_each_continuation(monkeypatch):
+def test_slow_context_rejects_continuation_passes():
     from backend.app.clip_engine.provider_runtime import GenerationContext
 
     context = GenerationContext("slow")
     context.budget.reserve_pass()
-    context.budget.reserve_pass(no_growth=True)
-    seen = {}
-    monkeypatch.setattr(search, "_load_query_plan", lambda *_args: _plan())
-
-    def fake_search_all(queries, filters=None, **kwargs):
-        seen.update(queries=queries, minimum_queries=kwargs["minimum_queries"])
-        return {"per_query": [], "credits_used": 0, "warning": None}
-
-    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
-    search.discover("calc", limit=1, context=context)
-    assert seen == {"queries": ["calc", "q6", "q7"], "minimum_queries": 3}
-
-    context.budget.reserve_pass(no_growth=True)
-    search.discover("calc", limit=1, context=context)
-    assert seen == {"queries": ["calc", "q8", "q9"], "minimum_queries": 3}
+    with pytest.raises(ProviderBudgetExceededError):
+        context.budget.reserve_pass(no_growth=True)
 
 
-def test_slow_final_continuation_survives_empty_query_plan(monkeypatch):
+def test_slow_context_stays_one_pass_with_empty_query_plan():
     from backend.app.clip_engine.provider_runtime import GenerationContext
 
     context = GenerationContext("slow")
     context.budget.reserve_pass()
-    context.budget.reserve_pass(no_growth=True)
-    context.budget.reserve_pass(no_growth=True)
-    full_plan = _plan("Intro to Python")
-    literal_only = full_plan.model_copy(
-        update={
-            "queries": [],
-            "ai_status": "unavailable",
-            "one_word_topic": "",
-            "one_word_synonyms": [],
-        }
-    )
-    seen = {}
-    monkeypatch.setattr(search, "_load_query_plan", lambda *_args: literal_only)
-
-    def fake_search_all(queries, filters=None, **kwargs):
-        seen.update(queries=queries, minimum_queries=kwargs["minimum_queries"])
-        return {"per_query": [], "credits_used": 0, "warning": None}
-
-    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
-
-    search.discover("Intro to Python", limit=1, context=context)
-
-    assert seen == {
-        "queries": ["Intro to Python", "Intro to Python"],
-        "minimum_queries": 2,
-    }
+    with pytest.raises(ProviderBudgetExceededError):
+        context.budget.reserve_pass(no_growth=True)
 
 
 def test_intro_to_python_searches_literal_before_hd_ai_terms(monkeypatch):

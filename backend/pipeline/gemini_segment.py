@@ -60,11 +60,11 @@ SEGMENT_PROFILES = (
     FLASH_SPLIT_PROFILE,
 )
 
-_TOTAL_DEADLINE_S = 300.0
-_FLASH_SINGLE_TIMEOUT_S = 90.0
-_FLASH_BOUNDARY_TIMEOUT_S = 90.0
-_FLASH_ENRICH_TIMEOUT_S = 45.0
-_PRO_TIMEOUT_S = 180.0
+_TOTAL_DEADLINE_S = 150.0
+_FLASH_SINGLE_TIMEOUT_S = 45.0
+_FLASH_BOUNDARY_TIMEOUT_S = 45.0
+_FLASH_ENRICH_TIMEOUT_S = 25.0
+_PRO_TIMEOUT_S = 90.0
 _SELECTION_OUTPUT_TOKENS = 24_576
 _BOUNDARY_OUTPUT_TOKENS = 12_288
 _ENRICH_OUTPUT_TOKENS = 24_576
@@ -1367,7 +1367,13 @@ def segment_clips_detailed(
             _disable_flash(str(flash_error))
             _emit(sink, "route_rollback", video_id=video_id or None,
                   reason="flash_model_access_or_configuration_failure")
-        if flash.classification == "green" and not flash.error:
+        accept_partial_flash = bool(
+            isinstance(settings, dict)
+            and settings.get("segment_accept_partial_flash")
+            and flash.clips
+            and not flash.error
+        )
+        if (flash.classification == "green" and not flash.error) or accept_partial_flash:
             result = flash
             result.route = "hybrid_flash"
         else:

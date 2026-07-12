@@ -10,7 +10,7 @@ def test_defaults_are_gemini_embed(monkeypatch):
     assert cfg.OUTPUT_MODE == "embed"
     assert cfg.PRECISE_BOUNDARIES is False
     assert cfg.SEGMENT_FINE_SNAP is True
-    assert cfg.CLIP_SEARCH_MAX_VIDEOS == 12
+    assert cfg.CLIP_SEARCH_MAX_VIDEOS == 5
 
 
 def test_segment_model_defaults_to_flash_with_pro_fallback(monkeypatch):
@@ -35,10 +35,10 @@ def test_curation_gate_defaults(monkeypatch):
     assert cfg.SEGMENT_TOPIC_RELEVANCE_MIN == 0.6
 
 
-def test_search_breadth_uses_high_coverage_default(monkeypatch):
+def test_search_breadth_uses_fast_coverage_default(monkeypatch):
     monkeypatch.delenv("CLIP_SEARCH_BREADTH", raising=False)
     cfg = importlib.reload(importlib.import_module("backend.app.clip_engine.config"))
-    assert cfg.SEARCH_BREADTH == 8
+    assert cfg.SEARCH_BREADTH == 3
 
 
 def test_extract_video_id_accepts_v_param_anywhere():

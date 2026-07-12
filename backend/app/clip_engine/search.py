@@ -350,7 +350,7 @@ def discover_practice_fast(
     use_query_planner: bool = True,
     query_plan: "SearchQueryPlan | None" = None,
 ) -> dict:
-    """Opt-in practice retrieval: Flash expand -> sequential search -> simple rank.
+    """Practice retrieval: bounded Flash/Pro expand -> Supadata search -> simple rank.
 
     The signature intentionally matches ``discover`` so live wiring can switch paths
     without dropping cancellation, budgets, provider caching, filters, or exclusions.
@@ -376,6 +376,8 @@ def discover_practice_fast(
 
     raise_if_cancelled(should_cancel)
     expansion_topic = " ".join(str(literal_topic or topic).split()) or topic
+    # Keep correction/level-aware query ordering, but each expansion attempt
+    # has a hard eight-second ceiling before its deterministic fallback.
     expansion = expand.expand_query_practice_fast(
         expansion_topic,
         query_count,

@@ -8,6 +8,7 @@ import pytest
 
 from backend.app.db import SCHEMA
 from backend.app.clip_engine import rank, search
+from backend.app.clip_engine.errors import ProviderBudgetExceededError
 from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.app.ingestion import pipeline as pipeline_module
 from backend.app.ingestion.pipeline import (
@@ -600,7 +601,7 @@ def test_durable_topic_and_ingest_search_share_practice_fast_discovery(monkeypat
     assert captured[1]["breadth"] == 3
 
 
-def test_fast_and_slow_plans_use_three_then_six_plus_three_plus_three(monkeypatch) -> None:
+def test_fast_and_slow_plans_use_one_bounded_pass(monkeypatch) -> None:
     plan = _manual_plan()
     calls: list[list[str]] = []
 
@@ -617,10 +618,8 @@ def test_fast_and_slow_plans_use_three_then_six_plus_three_plus_three(monkeypatc
     slow = GenerationContext("slow")
     slow.budget.reserve_pass()
     search.discover("concept", limit=1, context=slow, query_plan=plan)
-    slow.budget.reserve_pass()
-    search.discover("concept", limit=1, context=slow, query_plan=plan)
-    slow.budget.reserve_pass()
-    search.discover("concept", limit=1, context=slow, query_plan=plan)
+    with pytest.raises(ProviderBudgetExceededError):
+        slow.budget.reserve_pass()
 
     assert calls == [
         ["Calculus Basics", "Calculus", "Derivative"],
@@ -632,8 +631,6 @@ def test_fast_and_slow_plans_use_three_then_six_plus_three_plus_three(monkeypatc
             "Limit",
             "Antiderivative",
         ],
-        ["Calculus Basics", "Differentiation", "Integration"],
-        ["Calculus Basics", "Slope", "Area"],
     ]
 
 

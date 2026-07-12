@@ -6,9 +6,8 @@ TDD flow:
   GREEN — after implementing resolve_feed_urls + rewriting ingest_feed, confirm they pass.
 
 Strategy mirrors test_clip_engine_search.py:
-  - mock clip_engine_meta.resolve_feed_urls (1 url returned)
-  - mock clip_engine_run.clip (1 clip + transcript)
-  - mock clip_engine_meta.youtube_metadata ({})
+  - pass one direct YouTube video URL
+  - mock clip_engine_run.clip (Supadata transcript + Gemini clips)
   - _persist_ingest writes to a temp SQLite DB via main_module.ingestion_pipeline
 """
 
@@ -117,23 +116,11 @@ class ClipEngineFeedTests(unittest.TestCase):
     # ------------------------------------------------------------------ #
 
     def test_ingest_feed_happy_path(self) -> None:
-        with (
-            mock.patch.object(
-                pipeline_module.clip_engine_meta,
-                "resolve_feed_urls",
-                return_value=[_VIDEO_URL],
-            ),
-            mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
-            mock.patch.object(
-                pipeline_module.clip_engine_meta,
-                "youtube_metadata",
-                return_value={},
-            ),
-        ):
+        with mock.patch.object(pipeline_module, "clip_engine_run") as mock_run:
             mock_run.clip.return_value = _FAKE_ENGINE_OUT
 
             result = main_module.ingestion_pipeline.ingest_feed(
-                feed_url="https://www.youtube.com/@chan",
+                feed_url=_VIDEO_URL,
                 max_items=6,
                 material_id="m1",
                 concept_id=None,
@@ -185,23 +172,11 @@ class ClipEngineFeedTests(unittest.TestCase):
             "notes": "",
         }
 
-        with (
-            mock.patch.object(
-                pipeline_module.clip_engine_meta,
-                "resolve_feed_urls",
-                return_value=[_VIDEO_URL],
-            ),
-            mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
-            mock.patch.object(
-                pipeline_module.clip_engine_meta,
-                "youtube_metadata",
-                return_value={},
-            ),
-        ):
+        with mock.patch.object(pipeline_module, "clip_engine_run") as mock_run:
             mock_run.clip.return_value = empty_out
 
             result = main_module.ingestion_pipeline.ingest_feed(
-                feed_url="https://www.youtube.com/@chan",
+                feed_url=_VIDEO_URL,
                 max_items=6,
                 material_id="m1",
                 concept_id=None,
@@ -221,18 +196,11 @@ class ClipEngineFeedTests(unittest.TestCase):
     # ------------------------------------------------------------------ #
 
     def test_per_url_exception_is_non_fatal(self) -> None:
-        with (
-            mock.patch.object(
-                pipeline_module.clip_engine_meta,
-                "resolve_feed_urls",
-                return_value=[_VIDEO_URL],
-            ),
-            mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
-        ):
+        with mock.patch.object(pipeline_module, "clip_engine_run") as mock_run:
             mock_run.clip.side_effect = RuntimeError("network timeout")
 
             result = main_module.ingestion_pipeline.ingest_feed(
-                feed_url="https://www.youtube.com/@chan",
+                feed_url=_VIDEO_URL,
                 max_items=6,
                 material_id="m1",
                 concept_id=None,
@@ -247,6 +215,15 @@ class ClipEngineFeedTests(unittest.TestCase):
         self.assertEqual(len(result.items), 1)
         self.assertEqual(result.items[0].status, "error")
         self.assertIn("network timeout", result.items[0].error)
+
+    def test_channel_feed_is_rejected_in_supadata_only_mode(self) -> None:
+        with self.assertRaises(pipeline_module.UnsupportedSourceError):
+            main_module.ingestion_pipeline.ingest_feed(
+                feed_url="https://www.youtube.com/@chan",
+                max_items=6,
+                material_id="m1",
+                concept_id=None,
+            )
 
 
 # --------------------------------------------------------------------- #

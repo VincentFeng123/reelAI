@@ -81,10 +81,10 @@ def _call_v3(monkeypatch, fake, **overrides):
 @pytest.mark.parametrize(
     "operation,level,cap,timeout_s,model",
     [
-        ("flash_single", "medium", 24_576, 90.0, "gemini-3.5-flash"),
-        ("flash_boundary", "medium", 12_288, 90.0, "gemini-3.5-flash"),
-        ("flash_enrichment", "low", 24_576, 45.0, "gemini-3.5-flash"),
-        ("pro_fallback", "high", 24_576, 180.0, "gemini-3.1-pro-preview"),
+        ("flash_single", "medium", 24_576, 45.0, "gemini-3.5-flash"),
+        ("flash_boundary", "medium", 12_288, 45.0, "gemini-3.5-flash"),
+        ("flash_enrichment", "low", 24_576, 25.0, "gemini-3.5-flash"),
+        ("pro_fallback", "high", 24_576, 90.0, "gemini-3.1-pro-preview"),
     ],
 )
 def test_gemini3_operation_config_omits_sampling_and_sdk_retries(

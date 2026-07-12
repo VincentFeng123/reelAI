@@ -406,6 +406,24 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
 
+    def test_safe_batch_uses_progressive_uncapped_ingest(self) -> None:
+        with mock.patch.object(
+            main_module.ingestion_pipeline,
+            "ingest_topic",
+            return_value=([], [VIDEO_ID]),
+        ) as ingest_topic:
+            with db_module.get_conn() as conn:
+                main_module.reel_service.generate_reels(
+                    conn,
+                    material_id=MATERIAL_ID,
+                    concept_id=None,
+                    num_reels=20,
+                    creative_commons_only=False,
+                    generation_id="gen-progressive",
+                )
+
+        self.assertIsNone(ingest_topic.call_args.kwargs["max_reels"])
+
     def test_material_inventory_never_exceeds_300_reels(self) -> None:
         existing_video_id = "inventory-video"
         with db_module.get_conn(transactional=True) as conn:

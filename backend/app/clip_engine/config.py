@@ -43,8 +43,8 @@ SEGMENT_MAX_INPUT_TOKENS = int(os.environ.get("SEGMENT_MAX_INPUT_TOKENS", "12000
 SEGMENT_BATCH_MAX_CUES = int(os.environ.get("SEGMENT_BATCH_MAX_CUES", "160"))
 SEGMENT_BATCH_OVERLAP_CUES = int(os.environ.get("SEGMENT_BATCH_OVERLAP_CUES", "4"))
 
-CLIP_SEARCH_MAX_VIDEOS = int(os.environ.get("CLIP_SEARCH_MAX_VIDEOS", "12"))
-SEARCH_BREADTH = int(os.environ.get("CLIP_SEARCH_BREADTH", "8"))
+CLIP_SEARCH_MAX_VIDEOS = int(os.environ.get("CLIP_SEARCH_MAX_VIDEOS", "5"))
+SEARCH_BREADTH = int(os.environ.get("CLIP_SEARCH_BREADTH", "3"))
 
 
 def require_supadata_key() -> str:

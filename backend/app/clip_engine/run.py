@@ -62,6 +62,9 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     settings = dict(settings or {})
     settings.setdefault("segment_fine_snap", config.SEGMENT_FINE_SNAP)
     settings.setdefault("segment_min_clip_s", config.SEGMENT_MIN_CLIP_S)
+    # Practice's hard validators already discard unsafe clips. Ship surviving
+    # Flash clips immediately; reserve Pro for an empty/failed Flash response.
+    settings.setdefault("segment_accept_partial_flash", True)
     settings["should_cancel"] = should_cancel
 
     canonical_url = f"https://www.youtube.com/watch?v={video_id}"

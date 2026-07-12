@@ -13,7 +13,6 @@ import threading
 import time
 import uuid
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -110,14 +109,12 @@ from .services import llm_router
 from .services.assessments import AssessmentCancelledError, AssessmentService
 from .services.email import send_welcome_email
 from .services.embeddings import EmbeddingService
-from .services.liveness import is_video_alive
 from .services.material_intelligence import MaterialIntelligenceService
 from .services.parsers import ParseError, extract_text_from_file
 from .services.reels import GenerationCancelledError, ReelService
 from .services.search_query_plan import build_search_query_plan
 from .services.storage import get_storage
 from .services.text_utils import chunk_text, normalize_whitespace
-from .services.youtube import YouTubeApiRequestError, YouTubeService, parse_iso8601_duration
 
 from .ingestion.errors import (
     DownloadError as IngestDownloadError,
@@ -134,6 +131,7 @@ from .clip_engine.provider_cache import DatabaseProviderCache
 from .clip_engine.provider_cache import normalize_filters as normalize_provider_filters
 from .clip_engine.provider_cache import search_cache_key
 from .clip_engine.provider_runtime import GenerationContext, ProviderUsageRecord
+from .clip_engine.clipper.supadata_client import fetch_transcript_artifact
 from .clip_engine.supadata_search import search_one as supadata_search_one
 from .clip_engine.metadata import canonicalize_youtube_url
 from .ingestion.models import (
@@ -324,18 +322,19 @@ app.add_middleware(
 storage = get_storage()
 embedding_service = EmbeddingService()
 material_intelligence_service = MaterialIntelligenceService()
-youtube_service = YouTubeService()
 # The Python service runs as a durable Railway process. Next.js remains on
 # Vercel and proxies API traffic here; request-scoped serverless execution is
 # intentionally unsupported for provider-backed generation.
 SERVERLESS_MODE = False
 ingestion_pipeline = IngestionPipeline(
-    youtube_service=youtube_service,
     embedding_service=embedding_service,
     settings=settings,
     serverless_mode=SERVERLESS_MODE,
 )
-reel_service = ReelService(embedding_service=embedding_service, youtube_service=youtube_service, ingestion_pipeline=ingestion_pipeline)
+reel_service = ReelService(
+    embedding_service=embedding_service,
+    ingestion_pipeline=ingestion_pipeline,
+)
 assessment_service = AssessmentService()
 
 
@@ -1391,6 +1390,17 @@ def _normalize_duration_seconds(value: object) -> float | None:
     return round(parsed, 1)
 
 
+def _parse_iso8601_duration(value: str) -> int:
+    match = re.match(
+        r"^P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$",
+        str(value or ""),
+    )
+    if not match:
+        return 0
+    days, hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
 def _extract_duration_from_html(html: str) -> float | None:
     """Pull a video's duration (in seconds) out of raw HTML.
 
@@ -1446,7 +1456,7 @@ def _extract_duration_from_html(html: str) -> float | None:
         raw = itemprop_match.group(1).strip()
         # Could be either an ISO-8601 duration ("PT1M30S") or a plain number.
         if raw.upper().startswith("P"):
-            iso_seconds = parse_iso8601_duration(raw)
+            iso_seconds = _parse_iso8601_duration(raw)
             duration = _normalize_duration_seconds(iso_seconds)
             if duration is not None:
                 return duration
@@ -1469,7 +1479,7 @@ def _extract_duration_from_html(html: str) -> float | None:
     # starting with "P" (e.g. "PT1M30S" = 1 minute 30 seconds).
     json_ld_duration = re.search(r'"duration"\s*:\s*"((?:P|PT)[^"]+)"', html, flags=re.IGNORECASE)
     if json_ld_duration:
-        iso_duration = parse_iso8601_duration(json_ld_duration.group(1))
+        iso_duration = _parse_iso8601_duration(json_ld_duration.group(1))
         duration = _normalize_duration_seconds(iso_duration)
         if duration is not None:
             return duration
@@ -1629,12 +1639,14 @@ def _resolve_community_reel_duration_sec(source_url: str) -> float | None:
     host = (parsed.hostname or "").lower()
 
     if "youtube.com" in host or "youtu.be" in host:
-        video_id = youtube_service.extract_video_id_from_url(normalized_source_url)
-        if video_id:
-            details = youtube_service.video_details([video_id])
-            duration = _normalize_duration_seconds((details.get(video_id) or {}).get("duration_sec"))
-            if duration is not None:
-                return duration
+        try:
+            artifact = fetch_transcript_artifact(
+                normalized_source_url,
+                deadline_monotonic=time.monotonic() + 30.0,
+            )
+        except ClipEngineProviderError:
+            return None
+        return _normalize_duration_seconds(artifact.duration_sec)
 
     return _fetch_duration_from_source_page(normalized_source_url)
 
@@ -2851,26 +2863,6 @@ def _ranked_request_reels(
             if str(reel.get("reel_id") or "") not in excluded_reel_id_set
         ]
 
-    unique_vids = {
-        str(reel.get("video_id") or "").strip()
-        for reel in ranked
-        if str(reel.get("video_id") or "").strip()
-    }
-    if unique_vids:
-        alive_map: dict[str, bool] = {}
-        with ThreadPoolExecutor(max_workers=min(8, len(unique_vids))) as pool:
-            futures = {pool.submit(is_video_alive, vid, conn=conn): vid for vid in unique_vids}
-            for future in futures:
-                vid = futures[future]
-                try:
-                    alive_map[vid] = bool(future.result())
-                except Exception:
-                    alive_map[vid] = True  # fail open so a probe error never hides a reel
-        ranked = [
-            reel for reel in ranked
-            if alive_map.get(str(reel.get("video_id") or "").strip(), True)
-        ]
-
     if page <= 1:
         shaped = _shape_request_page_reels(
             ranked,
@@ -3326,12 +3318,12 @@ def _run_leased_generation_job(
                 if mode == "fast":
                     pass_video_budget = 3
                 elif pass_index == 0:
-                    pass_video_budget = 12
+                    pass_video_budget = 5
                 else:
                     pass_video_budget = max(
                         1,
                         min(
-                            4,
+                            3,
                             context.budget.remaining("transcript"),
                             context.budget.remaining("segmentation"),
                         ),

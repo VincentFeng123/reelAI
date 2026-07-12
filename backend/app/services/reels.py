@@ -34,6 +34,7 @@ from ..clip_engine.cancellation import raise_if_cancelled as _raise_if_clip_canc
 from ..clip_engine.errors import CancellationError as _ClipEngineCancellationError
 from ..clip_engine.errors import ProviderError as _ClipEngineProviderError
 from ..clip_engine.config import SEGMENT_MAX_CLIP_S as _SEGMENT_MAX_CLIP_S
+from ..clip_engine.config import SEGMENT_MAX_CLIPS as _SEGMENT_MAX_CLIPS
 from ..clip_engine.metadata import extract_video_id as _extract_embed_video_id
 from ..clip_engine.metadata import normalize_youtube_video_id
 from ..clip_engine.provider_cache import validate_transcript_payload
@@ -84,10 +85,10 @@ REEL_PAD_END_SEC = 0.3
 STRICT_WORD_BOUNDARY_PRE_ROLL_SEC = 0.08
 STRICT_WORD_BOUNDARY_POST_ROLL_SEC = 0.08
 
-# High-volume guardrails for the clip-engine material->reels path. The initial
-# slow pass may evaluate twelve sources, with two bounded continuation passes.
-MATERIAL_MAX_VIDEOS_PER_CONCEPT = 12
-MATERIAL_GEN_MAX_VIDEOS = 20
+# One small Supadata batch can still yield many clips per source while keeping
+# first-result latency bounded.
+MATERIAL_MAX_VIDEOS_PER_CONCEPT = 5
+MATERIAL_GEN_MAX_VIDEOS = 12
 MATERIAL_REEL_INVENTORY_LIMIT = 300
 
 
@@ -1191,10 +1192,12 @@ class ReelService:
     NEED_HELP_CONCEPT_STEP = 0.06
     GLOBAL_FEEDBACK_WINDOW = 12
     GLOBAL_FEEDBACK_MIN_ROWS = 3
-    def __init__(self, embedding_service, youtube_service, ingestion_pipeline=None) -> None:
+    def __init__(self, embedding_service, youtube_service=None, ingestion_pipeline=None) -> None:
         settings = get_settings()
         self.embedding_service = embedding_service
-        self.youtube_service = youtube_service
+        # Retained as a compatibility argument for older tests/callers. Reel
+        # retrieval and ranking never call Google's YouTube API.
+        del youtube_service
         self.ingestion_pipeline = ingestion_pipeline
         self.chat_model = settings.gemini_model
         self.retrieval_engine_v2_enabled = bool(settings.retrieval_engine_v2_enabled)
@@ -1836,7 +1839,12 @@ class ReelService:
                     language="en",
                     knowledge_level=material_knowledge_level,
                     max_videos=video_budget,
-                    max_reels=remaining_reel_capacity,
+                    max_reels=(
+                        None
+                        if video_budget * max(0, min(40, int(_SEGMENT_MAX_CLIPS)))
+                        <= remaining_reel_capacity
+                        else remaining_reel_capacity
+                    ),
                     on_reel_created=(None if dry_run else _stream),
                     dry_run=dry_run,
                     should_cancel=should_cancel,
@@ -6463,39 +6471,6 @@ class ReelService:
             """,
             (learner_id, *reel_params),
         )
-
-        if self.youtube_service:
-            enrichable_video_ids = sorted(
-                {
-                    str(row.get("video_id") or "").strip()
-                    for row in reel_rows
-                    if str(row.get("video_id") or "").strip()
-                    and len(str(row.get("video_description") or "").strip()) < 240
-                }
-            )
-            if enrichable_video_ids:
-                details_by_id = self.youtube_service.video_details(enrichable_video_ids)
-                for row in reel_rows:
-                    video_id = str(row.get("video_id") or "").strip()
-                    if not video_id:
-                        continue
-                    detail = details_by_id.get(video_id) or {}
-                    detail_description = self._clean_video_description(str(detail.get("description") or ""))
-                    current_description = self._clean_video_description(str(row.get("video_description") or ""))
-                    if len(detail_description) <= len(current_description):
-                        continue
-                    # In-memory only: patch the row we're about to rank so this
-                    # request sees the richer metadata, but do NOT persist back
-                    # to the `videos` table from a read path. Persistence was
-                    # causing concurrent-read-path races (two requests each
-                    # hitting the YouTube API + upserting) and could also
-                    # regress fields like `is_creative_commons` when `detail`
-                    # was partially populated. Write-back belongs in the
-                    # ingestion / refinement pipelines, not here.
-                    row["video_title"] = str(detail.get("title") or row.get("video_title") or "").strip()
-                    row["video_channel_title"] = str(detail.get("channel_title") or row.get("video_channel_title") or "").strip()
-                    row["video_description"] = detail_description
-                    row["video_duration_sec"] = int(detail.get("duration_sec") or row.get("video_duration_sec") or 0)
 
         concept_signal_totals: dict[str, list[float]] = {}
         for row in reel_rows:

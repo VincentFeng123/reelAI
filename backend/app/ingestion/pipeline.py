@@ -93,7 +93,7 @@ logger: logging.Logger = get_ingest_logger(__name__)
 
 # Shared wall-clock budget for one topic's concurrent clip+filter batch. A
 # pathological set of videos must not multiply this deadline by video count.
-INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "3600"))
+INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "180"))
 
 
 def _run_clip(
@@ -327,12 +327,13 @@ class IngestionPipeline:
     def __init__(
         self,
         *,
-        youtube_service: Any,
         embedding_service: Any,
+        youtube_service: Any = None,
         settings: Any = None,
         rate_limiter: _PlatformRateLimiter | None = None,
         serverless_mode: bool | None = None,
     ) -> None:
+        # Compatibility-only test seam. Production retrieval is Supadata-only.
         self._youtube_service = youtube_service
         self._embedding_service = embedding_service
         self._settings = settings
@@ -400,9 +401,7 @@ class IngestionPipeline:
         best = clip_engine_bridge.pick_best_clip(clips, target_clip_duration_sec, target_clip_duration_max_sec)
 
         raise_if_cancelled(should_cancel)
-        meta = clip_engine_meta.youtube_metadata(video_id) or {}
-        if not meta.get("duration_sec"):
-            meta["duration_sec"] = engine_out["transcript"].get("duration")
+        meta = {"duration_sec": engine_out["transcript"].get("duration")}
 
         adapter_result = clip_engine_bridge.synth_adapter_result(video_id, source_url)
         metadata = clip_engine_bridge.to_metadata(video_id, meta, source_url)
@@ -514,7 +513,7 @@ class IngestionPipeline:
             engine_out["clips"], engine_out["transcript"], query
         )
 
-        meta = clip_engine_meta.youtube_metadata(video_id) or {}
+        meta: dict[str, Any] = {}
         duration = float(
             meta.get("duration_sec") or engine_out["transcript"].get("duration") or 0.0
         )
@@ -597,11 +596,11 @@ class IngestionPipeline:
         log_event(logger, logging.INFO, "ingest_feed_start", feed_url=feed_url)
         self._rate_limiter.acquire("yt")
 
-        urls = (
-            [feed_url]
-            if clip_engine_meta.extract_video_id(feed_url)
-            else clip_engine_meta.resolve_feed_urls(feed_url, max_items)
-        )
+        if not clip_engine_meta.extract_video_id(feed_url):
+            raise UnsupportedSourceError(
+                "Supadata-only feed ingestion requires a direct YouTube video URL."
+            )
+        urls = [feed_url]
         raise_if_cancelled(should_cancel)
 
         items: list[IngestFeedItem] = []
@@ -621,9 +620,7 @@ class IngestionPipeline:
 
                 best = clip_engine_bridge.pick_best_clip(engine_out["clips"], target_clip_duration_sec, target_clip_duration_max_sec)
 
-                meta = clip_engine_meta.youtube_metadata(video_id) or {}
-                if not meta.get("duration_sec"):
-                    meta["duration_sec"] = engine_out["transcript"].get("duration")
+                meta = {"duration_sec": engine_out["transcript"].get("duration")}
 
                 adapter_result = clip_engine_bridge.synth_adapter_result(video_id, url)
                 metadata = clip_engine_bridge.to_metadata(video_id, meta, url)
@@ -1603,16 +1600,12 @@ def _cli_main(argv: list[str] | None = None) -> int:  # pragma: no cover
     from .. import db as db_module
     from ..config import get_settings
     from ..services.embeddings import EmbeddingService
-    from ..services.youtube import YouTubeService
 
     settings = get_settings()
     db_module.init_db()
 
     embedding_service = EmbeddingService()
-    youtube_service = YouTubeService(settings=settings)
-
     pipeline = IngestionPipeline(
-        youtube_service=youtube_service,
         embedding_service=embedding_service,
         settings=settings,
     )

@@ -54,7 +54,6 @@ class RankedExclusionNormalizationTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(main_module.reel_service, "ranked_feed", return_value=ranked),
-            mock.patch.object(main_module, "is_video_alive", return_value=True),
             mock.patch.object(main_module, "_shape_request_page_reels", side_effect=lambda r, **kw: r),
             db_module.get_conn() as conn,
         ):
@@ -88,7 +87,6 @@ class RankedExclusionNormalizationTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(main_module.reel_service, "ranked_feed", return_value=ranked),
-            mock.patch.object(main_module, "is_video_alive", return_value=True),
             mock.patch.object(main_module, "_shape_request_page_reels", side_effect=lambda r, **kw: r),
             db_module.get_conn() as conn,
         ):
@@ -121,7 +119,6 @@ class RankedExclusionNormalizationTests(unittest.TestCase):
                 "adaptive_curriculum_order",
                 side_effect=lambda conn, material_id, learner_id, rows, **kwargs: rows,
             ) as adaptive_order,
-            mock.patch.object(main_module, "is_video_alive", return_value=True),
             mock.patch.object(main_module, "_shape_request_page_reels", side_effect=lambda r, **kw: r),
             db_module.get_conn() as conn,
         ):

@@ -29,6 +29,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
     )
 
     assert expand.PRACTICE_FAST_EXPAND_MODEL == "gemini-3.5-flash"
+    assert expand.PRACTICE_FAST_EXPAND_TIMEOUT_MS == 8_000
     assert result == {
         "corrected": "Calculus",
         "queries": ["Calculus", "Derivatives", "Limits"],

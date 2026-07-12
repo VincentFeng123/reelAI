@@ -79,6 +79,29 @@ class CommunityReelDurationSecurityTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json(), {"duration_sec": 27.0})
 
+    def test_youtube_duration_uses_supadata_only(self) -> None:
+        artifact = mock.Mock(duration_sec=321.0)
+        with (
+            mock.patch.object(
+                main_module,
+                "fetch_transcript_artifact",
+                return_value=artifact,
+            ) as fetch_transcript,
+            mock.patch.object(
+                main_module.requests,
+                "get",
+                side_effect=AssertionError("YouTube must not be queried directly"),
+            ),
+        ):
+            response = self.client.get(
+                "/api/community/reels/duration",
+                params={"source_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"duration_sec": 321.0})
+        fetch_transcript.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()
