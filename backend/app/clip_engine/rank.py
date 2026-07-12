@@ -260,6 +260,24 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
             + edu
             + _level_score(v, level)
         )
+        trust_score = (
+            1.0 if v["literal_match"]
+            else 0.85 if v["canonical_match"]
+            else 0.70 if int(v["trusted_match_count"]) > 0
+            else 0.45
+        )
+        education_score = (edu + 3.0) / 6.0
+        popularity_score = min(1.0, view_score / 7.0)
+        v["retrieval_score"] = max(
+            0.0,
+            min(
+                1.0,
+                0.45 * trust_score
+                + 0.25 * rank_score
+                + 0.20 * education_score
+                + 0.10 * popularity_score,
+            ),
+        )
     items.sort(
         key=lambda v: (
             bool(v["literal_match"]),

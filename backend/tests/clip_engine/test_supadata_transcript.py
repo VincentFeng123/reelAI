@@ -87,9 +87,17 @@ def test_auto_transcript_preserves_cue_times_language_and_caches(monkeypatch) ->
     assert context.usage()[0]["billable_requests"] == 1
 
     monkeypatch.setattr(supadata_client.config, "SUPADATA_API_KEY", "")
-    cached = supadata_client.fetch_transcript_artifact(VIDEO_URL, "es", cache_store=cache)
+    cached = supadata_client.fetch_transcript_artifact(
+        VIDEO_URL,
+        "es",
+        context=context,
+        cache_store=cache,
+    )
     assert cached == artifact
     assert len(calls) == 1
+    assert context.usage()[-1]["metadata"]["cache_hit"] is True
+    assert context.usage()[-1]["operation"] == "transcript"
+    assert context.usage_payload()["summary"]["cache_hits"] == 1
 
 
 def test_synchronous_auto_generated_transcript_is_accepted(monkeypatch) -> None:
@@ -135,12 +143,13 @@ def test_transcription_adapter_matches_practice_chunk_and_word_timing(monkeypatc
         VIDEO_ID,
         {"language": "en", "provider_cache": MemoryProviderCache()},
     )
-    assert calls[0][1]["chunkSize"] == "180"
+    assert calls[0][1]["chunkSize"] == "50"
     assert result["words"] == [
-        {"word": "native", "start": 0.0, "end": pytest.approx(2 / 3)},
-        {"word": "cue", "start": pytest.approx(2 / 3), "end": pytest.approx(4 / 3)},
-        {"word": "words", "start": pytest.approx(4 / 3), "end": 2.0},
+        {"word": "native", "start": 0.0, "end": pytest.approx(2 / 3), "timing_source": "interpolated"},
+        {"word": "cue", "start": pytest.approx(2 / 3), "end": pytest.approx(4 / 3), "timing_source": "interpolated"},
+        {"word": "words", "start": pytest.approx(4 / 3), "end": 2.0, "timing_source": "interpolated"},
     ]
+    assert result["word_timing_source"] == "interpolated"
     assert result["segments"][0]["start"] == 0.0
     assert result["segments"][0]["end"] == 2.0
     assert result["native_mode"] is False

@@ -2420,6 +2420,11 @@ def _shape_reels_for_request_context(
 ) -> list[dict[str, Any]]:
     if not reels:
         return []
+    if all(bool(reel.get("_selection_ordered")) for reel in reels):
+        # The confidence-contract scheduler already applied global priority and
+        # prerequisite topology. Request-keyword sorting, similarity filters,
+        # and source caps can only corrupt that order or remove a prerequisite.
+        return [dict(reel) for reel in reels]
 
     root_terms, companion_terms, page_one_companion_terms = _request_root_anchor_terms(subject_tag)
     curated_broad_topic = bool(page_one_companion_terms)
@@ -2752,6 +2757,34 @@ def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
     return ordered
 
 
+def _finalize_request_reel_order(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+    rows: list[dict[str, Any]],
+    previous_video_id: str,
+) -> list[dict[str, Any]]:
+    """Do not reapply legacy chronology to an already versioned feed order."""
+    versioned_order = bool(rows) and all(
+        bool(row.get("_selection_ordered")) for row in rows
+    )
+    cleaned: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item.pop("_selection_ordered", None)
+        cleaned.append(item)
+    if versioned_order:
+        return cleaned
+    return reel_service.adaptive_curriculum_order(
+        conn,
+        material_id,
+        learner_id,
+        cleaned,
+        previous_video_id=previous_video_id,
+    )
+
+
 def _ranked_request_reels(
     conn,
     *,
@@ -2877,11 +2910,11 @@ def _ranked_request_reels(
             target_clip_duration_min_sec=target_clip_duration_min_sec,
             target_clip_duration_max_sec=target_clip_duration_max_sec,
         )
-        return reel_service.adaptive_curriculum_order(
+        return _finalize_request_reel_order(
             conn,
-            material_id,
-            learner_id,
-            shaped,
+            material_id=material_id,
+            learner_id=learner_id,
+            rows=shaped,
             previous_video_id=previous_video_id,
         )
 
@@ -2907,11 +2940,11 @@ def _ranked_request_reels(
                 target_clip_duration_max_sec=target_clip_duration_max_sec,
             )
         )
-    return reel_service.adaptive_curriculum_order(
+    return _finalize_request_reel_order(
         conn,
-        material_id,
-        learner_id,
-        _merge_request_reel_lists(*cumulative_batches),
+        material_id=material_id,
+        learner_id=learner_id,
+        rows=_merge_request_reel_lists(*cumulative_batches),
         previous_video_id=previous_video_id,
     )
 
@@ -3365,7 +3398,7 @@ def _run_leased_generation_job(
                     lease_owner=lease_owner,
                     phase="ranking",
                     progress=min(0.85, 0.25 + 0.2 * (pass_index + 1)),
-                    usage=context.budget.snapshot(),
+                    usage=context.usage_payload(),
                 ):
                     raise JobLeaseLostError(
                         f"generation job lease is no longer active: {job_id}"
@@ -3400,6 +3433,7 @@ def _run_leased_generation_job(
 
             usage_records = context.usage()
             stage_counters = context.counters()
+            usage_payload = context.usage_payload()
             model_records = [
                 row
                 for row in usage_records
@@ -3434,11 +3468,7 @@ def _run_leased_generation_job(
                 lease_owner=lease_owner,
                 model_used=model_used,
                 quality_degraded=quality_degraded,
-                usage={
-                    "budget": context.budget.snapshot(),
-                    "provider_calls": usage_records,
-                    "counters": stage_counters,
-                },
+                usage=usage_payload,
                 error_code="inventory_exhausted" if terminal_status == "exhausted" else None,
                 error_message=(
                     _generation_exhaustion_message(stage_counters)
@@ -3468,11 +3498,7 @@ def _run_leased_generation_job(
                 status="failed",
                 result_generation_id=generation_id or None,
                 lease_owner=lease_owner,
-                usage={
-                    "budget": context.budget.snapshot(),
-                    "provider_calls": context.usage(),
-                    "counters": context.counters(),
-                },
+                usage=context.usage_payload(),
                 error_code=exc.code,
                 error_message=str(exc),
                 error_detail={**exc.as_dict(), "counters": context.counters()},
@@ -3488,11 +3514,7 @@ def _run_leased_generation_job(
                 status="failed",
                 result_generation_id=generation_id or None,
                 lease_owner=lease_owner,
-                usage={
-                    "budget": context.budget.snapshot(),
-                    "provider_calls": context.usage(),
-                    "counters": context.counters(),
-                },
+                usage=context.usage_payload(),
                 error_code="generation_failed",
                 error_message=str(exc),
                 error_detail={"counters": context.counters()},

@@ -180,44 +180,31 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
         **kwargs: Any,
     ):
         gemini_calls.append({"system": system, "user": user, **kwargs})
-        assert schema is gemini_segment._Plan
+        assert schema is gemini_segment._BoundaryPlan
         plan = schema.model_validate(
             {
                 "topics": [
-                    {
-                        "title": "Python variables and assignment",
+                        {
+                            "candidate_id": "python-variables",
+                            "title": "Python variables and assignment",
+                            "learning_objective": (
+                                "Understand how Python variables store and print values."
+                            ),
                         "start_line": 0,
                         "end_line": 2,
                         "start_quote": "Python variables store values",
                         "end_quote": "first Python program easy to understand",
                         "reason": "A complete beginner explanation.",
                         "facet": "variables",
-                        "informativeness": 0.95,
-                        "topic_relevance": 0.99,
-                        "self_contained": True,
+                            "informativeness": 0.95,
+                            "topic_relevance": 0.99,
+                            "educational_importance": 0.97,
+                            "self_contained": True,
+                            "is_standalone": True,
+                            "prerequisite_candidate_ids": [],
                         "difficulty": 0.1,
                         "uncertainty": "low",
                         "uncertainty_reasons": [],
-                        "summary": "Python variables store numbers and strings.",
-                        "takeaways": [
-                            "Python variables store values.",
-                            "Assign a variable with equals.",
-                        ],
-                        "match_reason": "Python variables make a first Python program easy.",
-                        "assessment": {
-                            "prompt": "What can Python variables store?",
-                            "options": [
-                                "Numbers and strings",
-                                "Only comments",
-                                "Video titles",
-                                "Nothing",
-                            ],
-                            "correct_index": 0,
-                            "explanation": "Python variables store numbers and strings.",
-                            "evidence_quote": (
-                                "Python variables store values such as numbers and strings."
-                            ),
-                        },
                     }
                 ]
             }
@@ -263,13 +250,17 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
         reel = reels[0]
         assert reel.video_url == (
             f"https://www.youtube.com/embed/{VIDEO_ID}"
-            "?start=5&end=45&modestbranding=1&rel=0&playsinline=1"
+            "?start=4&end=45&modestbranding=1&rel=0&playsinline=1"
         )
-        assert (reel.t_start, reel.t_end) == (5.0, 45.0)
-        assert [cue.model_dump() for cue in reel.captions] == [
-            {"start": 0.0, "end": 10.0, "text": "Python variables store values such as numbers and strings."},
-            {"start": 10.0, "end": 25.0, "text": "In Python, assign a variable with equals and print the value."},
-            {"start": 25.0, "end": 40.0, "text": "This makes a first Python program easy to understand."},
+        assert (reel.t_start, reel.t_end) == (4.7, 45.0)
+        captions = [cue.model_dump() for cue in reel.captions]
+        for cue in captions:
+            cue["start"] = round(float(cue["start"]), 3)
+            cue["end"] = round(float(cue["end"]), 3)
+        assert captions == [
+            {"start": 0.3, "end": 10.3, "text": "Python variables store values such as numbers and strings."},
+            {"start": 10.3, "end": 25.3, "text": "In Python, assign a variable with equals and print the value."},
+            {"start": 25.3, "end": 40.3, "text": "This makes a first Python program easy to understand."},
         ]
 
         assert provider_calls[0][0].endswith("/transcript")
@@ -278,7 +269,7 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
             "text": "false",
             "mode": "auto",
             "lang": "en",
-            "chunkSize": "180",
+            "chunkSize": "50",
         }
         assert provider_calls[1][0].endswith("/transcript/captionless-job")
         assert gemini_calls[0]["prompt_version"] == gemini_segment.PRODUCTION_FLASH_PROFILE
@@ -299,7 +290,7 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
             )
         assert persisted is not None
         assert persisted["video_url"] == reel.video_url
-        assert (persisted["t_start"], persisted["t_end"]) == (5.0, 45.0)
+        assert (persisted["t_start"], persisted["t_end"]) == (4.7, 45.0)
         assert "Python variables" in persisted["transcript_snippet"]
     finally:
         db_module._db_ready = False

@@ -90,7 +90,7 @@ def test_generation_stage_counters_are_thread_safe() -> None:
     with ThreadPoolExecutor(max_workers=8) as executor:
         list(executor.map(lambda _index: context.increment_counter("topic_rejections"), range(800)))
 
-    assert context.counters() == {
+    expected = {
         "discovered_videos": 0,
         "usable_transcripts": 0,
         "transcript_failures": 0,
@@ -103,6 +103,7 @@ def test_generation_stage_counters_are_thread_safe() -> None:
         "segmentation_cache_hits": 0,
         "expansion_cache_hits": 0,
     }
+    assert {key: context.counters()[key] for key in expected} == expected
     with pytest.raises(ValueError):
         context.increment_counter("topic_rejections", -1)
 
@@ -140,10 +141,38 @@ def test_ingest_topic_records_stage_counts_and_propagates_shared_deadline(
     counters = context.counters()
     assert counters["discovered_videos"] == 1
     assert counters["usable_transcripts"] == 1
-    assert counters["gemini_empty_results"] == 1
+    assert counters["gemini_empty_results"] == 2
 
 
-def test_ingest_topic_reorders_without_hard_topic_rejection(monkeypatch) -> None:
+def test_ingest_topic_uses_literal_identity_for_segmentation(monkeypatch) -> None:
+    captured_topics: list[str] = []
+    discovery = {
+        "corrected": "Calculus",
+        "topic_terms": ["calclus", "Calculus"],
+        "videos": [_video()],
+        "credits_used": 0,
+        "warning": None,
+    }
+
+    def fake_clip(_url, *, topic, **_kwargs):
+        captured_topics.append(topic)
+        return {"clips": [], "transcript": _transcript(), "notes": ""}
+
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: discovery)
+    monkeypatch.setattr(pipeline_module, "_run_clip", fake_clip)
+
+    _pipeline().ingest_topic(
+        topic="derivative intuition",
+        literal_topic="calclus",
+        material_id="material",
+        concept_id="concept",
+        max_videos=1,
+    )
+
+    assert captured_topics == ["calclus"]
+
+
+def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypatch) -> None:
     engine_out = {
         "clips": [
             {"start": 0.0, "end": 10.0, "cue_ids": ["python"], "informativeness": 0.9},
@@ -170,11 +199,11 @@ def test_ingest_topic_reorders_without_hard_topic_rejection(monkeypatch) -> None
         max_videos=1,
     )
 
-    assert reels == ["persisted-reel", "persisted-reel"]
+    assert reels == ["persisted-reel"]
     counters = context.counters()
     assert counters["usable_transcripts"] == 1
-    assert counters["topic_rejections"] == 0
-    assert counters["persisted_clips"] == 2
+    assert counters["topic_rejections"] == 1
+    assert counters["persisted_clips"] == 1
 
 
 @pytest.mark.parametrize(
@@ -212,6 +241,265 @@ def test_practice_clips_are_reordered_for_learner_level(
     assert clips[0]["start"] == expected_start
 
 
+def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None:
+    engine_out = {
+        "clips": [{
+            "start": 0.0,
+            "end": 10.0,
+            "cue_ids": ["python"],
+            "informativeness": 0.7,
+            "topic_relevance": 0.8,
+            "educational_importance": 0.9,
+            "boundary_confidence": 0.85,
+            "is_standalone": True,
+            "chain_id": "python-functions",
+            "chain_position": 2,
+            "selection_candidate_id": "python-functions-2",
+            "prerequisite_ids": [],
+            "difficulty": 0.95,
+        }],
+        "transcript": _transcript(),
+        "notes": "",
+    }
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    pipeline = _pipeline()
+
+    scores = []
+    for level in ("beginner", "advanced"):
+        video = {**_video(), "_knowledge_level": level}
+        _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
+        scores.append(clips[0]["score"])
+        context = clips[0]["search_context"]
+        assert context["selection_contract_version"] == "confidence_v1"
+        assert context["boundary_confidence"] == 0.85
+        assert context["is_standalone"] is True
+        assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
+        assert context["chain_position"] == 2
+        assert context["selection_candidate_id"] == "dQw4w9WgXcQ::python-functions-2"
+        assert context["prerequisite_ids"] == []
+
+    assert scores == pytest.approx([0.815, 0.815])
+
+
+def test_filter_orders_prerequisite_before_higher_score_dependent(monkeypatch) -> None:
+    engine_out = {
+        "clips": [
+            {
+                "start": 0.0,
+                "end": 10.0,
+                "cue_ids": ["python"],
+                "informativeness": 0.7,
+                "topic_relevance": 0.7,
+                "educational_importance": 0.61,
+                "boundary_confidence": 0.9,
+                "is_standalone": True,
+                "selection_candidate_id": "root",
+                "prerequisite_ids": [],
+                "difficulty": 0.5,
+            },
+            {
+                "start": 0.0,
+                "end": 9.0,
+                "cue_ids": ["python"],
+                "informativeness": 0.95,
+                "topic_relevance": 0.95,
+                "educational_importance": 0.99,
+                "boundary_confidence": 0.9,
+                "is_standalone": False,
+                "selection_candidate_id": "dependent",
+                "prerequisite_ids": ["root"],
+                "difficulty": 0.5,
+            },
+        ],
+        "transcript": _transcript(),
+        "notes": "",
+    }
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+
+    _, clips, _ = _pipeline()._clip_and_filter(_video(), "Intro to Python", "en")
+
+    assert [clip["selection_candidate_id"] for clip in clips] == [
+        "dQw4w9WgXcQ::root",
+        "dQw4w9WgXcQ::dependent",
+    ]
+
+
+def test_joint_one_plus_one_initial_yield_uses_one_aggregate_pro_fallback(
+    monkeypatch,
+) -> None:
+    first = _video()
+    second = {
+        **_video(),
+        "id": "9bZkp7q19f0",
+        "url": "https://www.youtube.com/watch?v=9bZkp7q19f0",
+    }
+    discovery = {**_discovery(), "videos": [first, second]}
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: discovery)
+    pipeline = _pipeline()
+
+    def clip_and_filter(video, *_args, engine_out_override=None, **_kwargs):
+        if engine_out_override is not None:
+            return video, [
+                {
+                    "start": 0.0,
+                    "end": 9.0,
+                    "score": 0.9,
+                    "selection_candidate_id": "root",
+                    "prerequisite_ids": [],
+                },
+                {
+                    "start": 20.0,
+                    "end": 30.0,
+                    "score": 0.9,
+                    "selection_candidate_id": "dependent",
+                    "prerequisite_ids": ["root"],
+                },
+                {
+                    "start": 40.0,
+                    "end": 50.0,
+                    "score": 0.9,
+                    "selection_candidate_id": "orphan",
+                    "prerequisite_ids": ["missing"],
+                },
+            ], engine_out_override
+        return (
+            video,
+            [{
+                "start": 0.0,
+                "end": 10.0,
+                "score": 0.8,
+                "selection_candidate_id": "root",
+                "prerequisite_ids": [],
+            }],
+            {"transcript": _transcript(), "clips": []},
+        )
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    pro_fallback = mock.Mock(return_value={
+        "transcript": _transcript(),
+        "clips": [{"start": 20.0, "end": 30.0}],
+        "notes": "fallback",
+    })
+    monkeypatch.setattr(pipeline_module.clip_engine_run, "pro_boundary_fallback", pro_fallback)
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(side_effect=lambda **kwargs: (
+            f"{kwargs['v']['id']}:{kwargs['clip']['start']}",
+            mock.sentinel.metadata,
+        )),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        max_videos=2,
+        max_reels=3,
+        generation_context=GenerationContext("slow"),
+    )
+
+    assert len(reels) == 3
+    assert any(str(reel).endswith(":20.0") for reel in reels)
+    assert not any(str(reel).endswith(":40.0") for reel in reels)
+    pro_fallback.assert_called_once()
+
+
+def test_aggregate_pro_fallback_targets_lowest_yield_initial_video(
+    monkeypatch,
+) -> None:
+    first = _video()
+    second = {
+        **_video(),
+        "id": "9bZkp7q19f0",
+        "url": "https://www.youtube.com/watch?v=9bZkp7q19f0",
+    }
+    discovery = {**_discovery(), "videos": [first, second]}
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: discovery)
+    pipeline = _pipeline()
+
+    def clip_and_filter(video, *_args, engine_out_override=None, **_kwargs):
+        if engine_out_override is not None:
+            return video, [{"start": 20.0, "end": 30.0, "score": 0.9}], engine_out_override
+        clips = (
+            [
+                {"start": 0.0, "end": 8.0, "score": 0.8},
+                {"start": 10.0, "end": 18.0, "score": 0.8},
+            ]
+            if video["id"] == first["id"]
+            else []
+        )
+        return video, clips, {"transcript": _transcript(), "clips": []}
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    pro_fallback = mock.Mock(return_value={
+        "transcript": _transcript(),
+        "clips": [{"start": 20.0, "end": 30.0}],
+        "notes": "fallback",
+    })
+    monkeypatch.setattr(pipeline_module.clip_engine_run, "pro_boundary_fallback", pro_fallback)
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(side_effect=lambda **kwargs: (
+            f"{kwargs['v']['id']}:{kwargs['clip']['start']}",
+            mock.sentinel.metadata,
+        )),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        max_videos=2,
+        max_reels=3,
+        generation_context=GenerationContext("slow"),
+    )
+
+    assert len(reels) == 3
+    assert pro_fallback.call_args.kwargs["video_id"] == second["id"]
+
+
+def test_unusable_initial_transcripts_do_not_consume_aggregate_pro_slot(
+    monkeypatch,
+) -> None:
+    first = _video()
+    second = {
+        **_video(),
+        "id": "9bZkp7q19f0",
+        "url": "https://www.youtube.com/watch?v=9bZkp7q19f0",
+    }
+    discovery = {**_discovery(), "videos": [first, second]}
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: discovery)
+    pipeline = _pipeline()
+    invalid_transcript = {"source": "supadata", "segments": _transcript()["segments"]}
+    monkeypatch.setattr(
+        pipeline,
+        "_clip_and_filter",
+        lambda video, *_args, **_kwargs: (
+            video,
+            [],
+            {"transcript": invalid_transcript, "clips": []},
+        ),
+    )
+    pro_fallback = mock.Mock()
+    monkeypatch.setattr(pipeline_module.clip_engine_run, "pro_boundary_fallback", pro_fallback)
+    context = GenerationContext("slow")
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        max_videos=2,
+        max_reels=3,
+        generation_context=context,
+    )
+
+    assert reels == []
+    pro_fallback.assert_not_called()
+    assert context.claim_aggregate_pro_fallback(validated_count=0) is True
+
+
 def test_ingest_topic_counts_shared_clip_fetch_timeout_separately(monkeypatch) -> None:
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
     monkeypatch.setattr(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.001)
@@ -235,6 +523,45 @@ def test_ingest_topic_counts_shared_clip_fetch_timeout_separately(monkeypatch) -
     assert reels == []
     assert context.counters()["clip_fetch_timeouts"] == 1
     assert context.counters()["transcript_timeouts"] == 0
+
+
+def test_fast_generation_retains_backfill_pool_without_exceeding_analysis_budget(
+    monkeypatch,
+) -> None:
+    videos = [
+        {**_video(), "id": f"video-{index}", "url": f"https://youtu.be/video-{index}"}
+        for index in range(5)
+    ]
+    discover_limits: list[int] = []
+    analyzed: list[str] = []
+
+    def discover(*_args, **kwargs):
+        discover_limits.append(kwargs["limit"])
+        return {
+            "corrected": "Intro to Python",
+            "videos": videos,
+            "credits_used": 0,
+            "warning": None,
+        }
+
+    def clip_and_filter(video, *_args):
+        analyzed.append(video["id"])
+        return video, [], {"transcript": {}}
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline_module, "_discover", discover)
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+
+    pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext("fast"),
+        max_videos=5,
+    )
+
+    assert discover_limits == [5]
+    assert len(analyzed) == 3
 
 
 def test_ingest_topic_distinguishes_unavailable_transcript_from_provider_failure(

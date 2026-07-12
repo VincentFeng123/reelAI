@@ -406,7 +406,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
 
-    def test_safe_batch_uses_progressive_uncapped_ingest(self) -> None:
+    def test_safe_batch_caps_progressive_ingest_to_requested_buffer(self) -> None:
         with mock.patch.object(
             main_module.ingestion_pipeline,
             "ingest_topic",
@@ -422,7 +422,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                     generation_id="gen-progressive",
                 )
 
-        self.assertIsNone(ingest_topic.call_args.kwargs["max_reels"])
+        self.assertEqual(ingest_topic.call_args.kwargs["max_reels"], 22)
 
     def test_material_inventory_never_exceeds_300_reels(self) -> None:
         existing_video_id = "inventory-video"
@@ -725,7 +725,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 11)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 12)
 
 
 if __name__ == "__main__":

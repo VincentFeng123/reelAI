@@ -698,6 +698,14 @@ def test_events_are_ordered_replayable_and_terminal_transition_persists_usage() 
             "final",
             "terminal",
         ]
+        terminal_payload = all_events[-1]["payload"]
+        assert terminal_payload["model_used"] == "gemini-primary"
+        assert terminal_payload["quality_degraded"] is False
+        assert terminal_payload["usage"] == {
+            "searches": 1,
+            "transcripts": 1,
+            "segmentations": 1,
+        }
         assert [event["seq"] for event in jobs.replay_events(conn, job_id=job["id"], after_seq=1)] == [
             2,
             3,

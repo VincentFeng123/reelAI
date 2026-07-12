@@ -350,12 +350,12 @@ def discover_practice_fast(
     use_query_planner: bool = True,
     query_plan: "SearchQueryPlan | None" = None,
 ) -> dict:
-    """Practice retrieval: bounded Flash/Pro expand -> Supadata search -> simple rank.
+    """Literal-first retrieval with conditional, Flash-only expansion.
 
     The signature intentionally matches ``discover`` so live wiring can switch paths
     without dropping cancellation, budgets, provider caching, filters, or exclusions.
-    Planner arguments are accepted for compatibility but do not alter this reference
-    path's Gemini-generated query list.
+    Planner arguments remain a compatibility surface; the user's literal text is the
+    retrieval and downstream relevance identity.
     """
     del use_query_planner
     topic = " ".join(str(topic or "").split())
@@ -375,42 +375,113 @@ def discover_practice_fast(
         raise SearchError("search budget exhausted")
 
     raise_if_cancelled(should_cancel)
-    expansion_topic = " ".join(str(literal_topic or topic).split()) or topic
-    # Keep correction/level-aware query ordering, but each expansion attempt
-    # has a hard eight-second ceiling before its deterministic fallback.
-    expansion = expand.expand_query_practice_fast(
-        expansion_topic,
-        query_count,
-        level=level,
-        should_cancel=should_cancel,
-        context=context,
-    )
-    queries = list(expansion.get("queries") or [])[:query_count]
-    if not queries:
-        raise SearchError("query expansion returned no usable queries")
+    literal_query = " ".join(str(literal_topic or topic).split()) or topic
+    tutorial_query = f"{literal_query} explained tutorial"
+    initial_queries: list[str] = []
+    seen_query_keys: set[str] = set()
+    for candidate in (literal_query, tutorial_query):
+        key = " ".join(candidate.casefold().split())
+        if key and key not in seen_query_keys:
+            seen_query_keys.add(key)
+            initial_queries.append(candidate)
+        if len(initial_queries) >= query_count:
+            break
 
-    result = supadata_search.search_all(
-        queries,
+    initial = supadata_search.search_all(
+        initial_queries,
         filters,
         should_cancel=should_cancel,
         language=language,
         context=context,
         cache_store=cache_store,
+        parallel_prefix=len(initial_queries),
     )
     raise_if_cancelled(should_cancel)
+
+    from ..services.search_query_plan import semantic_query_family
+
+    root_family = semantic_query_family(literal_query)
+
+    def annotate(result_sets: list[dict], *, expanded: bool = False) -> None:
+        for result_set in result_sets:
+            query = " ".join(str(result_set.get("query") or "").split())
+            is_literal = query.casefold() == literal_query.casefold()
+            result_set.update(
+                query_family=(semantic_query_family(query) or root_family),
+                query_trust=("literal" if is_literal else "ai" if expanded else "trusted"),
+                query_provenance=("literal" if is_literal else "gemini" if expanded else "deterministic"),
+                hd_preferred=False,
+            )
+
+    per_query = list(initial.get("per_query") or [])
+    annotate(per_query)
     excluded = {
         normalize_youtube_video_id(video_id) or str(video_id or "").strip()
         for video_id in (exclude_video_ids or [])
     }
-    ranked = rank.merge_and_rank_practice_fast(result["per_query"])
+    initial_ranked = rank.merge_and_rank(per_query, level=level)
+    good_candidates = sum(
+        1
+        for video in initial_ranked
+        if video.get("id") not in excluded
+        and float(video.get("retrieval_score") or 0.0) >= 0.60
+    )
+
+    expansion: dict[str, object] = {
+        "corrected": literal_query,
+        "queries": [],
+        "provider_used": "skipped",
+    }
+    remaining_queries = max(0, query_count - len(initial_queries))
+    expansion_queries: list[str] = []
+    expansion_result = {"per_query": [], "credits_used": 0, "warning": None}
+    if good_candidates < 4 and remaining_queries > 0:
+        expansion = expand.expand_query_practice_fast(
+            literal_query,
+            min(8, remaining_queries + 2),
+            level=level,
+            should_cancel=should_cancel,
+            context=context,
+        )
+        for candidate in expansion.get("queries") or []:
+            query = " ".join(str(candidate or "").split())
+            key = " ".join(query.casefold().split())
+            if not key or key in seen_query_keys:
+                continue
+            seen_query_keys.add(key)
+            expansion_queries.append(query)
+            if len(expansion_queries) >= remaining_queries:
+                break
+        if expansion_queries:
+            expansion_result = supadata_search.search_all(
+                expansion_queries,
+                filters,
+                should_cancel=should_cancel,
+                language=language,
+                context=context,
+                cache_store=cache_store,
+            )
+            annotate(expansion_result["per_query"], expanded=True)
+            per_query.extend(expansion_result["per_query"])
+
+    ranked = rank.merge_and_rank(per_query, level=level)
     top_n = max(0, int(limit))
     videos = [video for video in ranked if video.get("id") not in excluded][:top_n]
+    corrected = " ".join(str(expansion.get("corrected") or literal_query).split()) or literal_query
+    topic_terms = []
+    seen_terms: set[str] = set()
+    for term in (literal_query, corrected, *expansion_queries):
+        key = " ".join(str(term or "").casefold().split())
+        if key and key not in seen_terms:
+            seen_terms.add(key)
+            topic_terms.append(str(term))
     return {
-        "corrected": expansion.get("corrected") or topic,
-        "queries": queries,
+        "corrected": corrected,
+        "queries": [*initial_queries, *expansion_queries],
+        "topic_terms": topic_terms,
         "provider_used": expansion.get("provider_used") or "deterministic",
         "videos": videos,
-        "credits_used": result["credits_used"],
-        "warning": result["warning"],
+        "credits_used": int(initial.get("credits_used") or 0) + int(expansion_result.get("credits_used") or 0),
+        "warning": expansion_result.get("warning") or initial.get("warning"),
         "query_plan": query_plan,
     }

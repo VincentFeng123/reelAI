@@ -42,7 +42,7 @@ DEFAULT_HEARTBEAT_SECONDS = 15
 DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
-REQUEST_SCHEMA_VERSION = "generation-request-v2"
+REQUEST_SCHEMA_VERSION = "generation-request-v3-confidence-clipping"
 
 
 class JobLeaseLostError(RuntimeError):
@@ -334,6 +334,9 @@ def _terminal_payload(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": str(row.get("status") or ""),
         "result_generation_id": str(row.get("result_generation_id") or "") or None,
+        "model_used": str(row.get("model_used") or "") or None,
+        "quality_degraded": bool(row.get("quality_degraded")),
+        "usage": loads_json(str(row.get("usage_json") or "{}"), default={}),
         "error": {
             "code": str(row.get("terminal_error_code") or "") or None,
             "message": str(row.get("terminal_error_message") or "") or None,

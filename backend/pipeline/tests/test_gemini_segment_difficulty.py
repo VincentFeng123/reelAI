@@ -26,7 +26,12 @@ def _words() -> list[dict]:
 
 def _topic(**overrides) -> G._Topic:
     data = {
+        "candidate_id": (
+            f"candidate-{overrides.get('title', 'Lesson')}-"
+            f"{overrides.get('start_line', 0)}"
+        ),
         "title": "Lesson",
+        "learning_objective": "Understand the lesson.",
         "start_line": 0,
         "end_line": 0,
         "start_quote": "line zero",
@@ -35,8 +40,11 @@ def _topic(**overrides) -> G._Topic:
         "reason": "A complete lesson.",
         "informativeness": 0.9,
         "topic_relevance": 0.9,
+        "educational_importance": 0.9,
         "difficulty": 0.5,
         "self_contained": True,
+        "is_standalone": True,
+        "prerequisite_candidate_ids": [],
         "uncertainty": "low",
         "uncertainty_reasons": [],
         "summary": "Line zero teaches an easy lesson.",

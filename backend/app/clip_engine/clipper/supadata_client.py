@@ -288,6 +288,15 @@ async def _fetch_transcript_artifact_async(
             schema_version=TRANSCRIPT_SCHEMA_VERSION,
         )
         if cached is not None:
+            if context is not None:
+                context.record_cache_hit(
+                    provider="supadata",
+                    operation="transcript",
+                    metadata={
+                        "artifact_key": cached.artifact_key,
+                        "native_mode": cached.native_mode,
+                    },
+                )
             return cached
     api_key = str(config.SUPADATA_API_KEY or "").strip()
     if not api_key:

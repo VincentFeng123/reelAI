@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time  # compatibility surface retained for callers that import it
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import httpx
@@ -263,11 +264,48 @@ def search_all(
     language: str = "en",
     context: GenerationContext | None = None,
     cache_store: ProviderCacheStore | None = None,
+    parallel_prefix: int = 0,
 ) -> dict[str, Any]:
     credits_used = 0
     per_query: list[dict] = []
     warning: str | None = None
-    for index, query in enumerate(queries):
+
+    prefix_count = min(len(queries), max(0, int(parallel_prefix)))
+    if prefix_count > 1:
+        with ThreadPoolExecutor(max_workers=prefix_count) as executor:
+            futures = []
+            for index, query in enumerate(queries[:prefix_count]):
+                effective_filters = (
+                    request_filters[index]
+                    if request_filters is not None and index < len(request_filters)
+                    else filters
+                )
+                futures.append(
+                    executor.submit(
+                        search_one,
+                        query,
+                        effective_filters,
+                        should_cancel,
+                        language=language,
+                        context=context,
+                        cache_store=cache_store,
+                    )
+                )
+            for future in futures:
+                raise_if_cancelled(should_cancel)
+                try:
+                    result = future.result()
+                except ProviderBudgetExceededError:
+                    if not per_query:
+                        raise
+                    warning = "Search budget exhausted after partial results."
+                    break
+                credits_used += int(result.get("billed") or 0)
+                per_query.append(result)
+
+    start_index = prefix_count if prefix_count > 1 else 0
+    for index in range(start_index, len(queries)):
+        query = queries[index]
         raise_if_cancelled(should_cancel)
         effective_filters = (
             request_filters[index]

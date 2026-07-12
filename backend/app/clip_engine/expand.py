@@ -31,9 +31,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 PRACTICE_FAST_EXPAND_MODEL = "gemini-3.5-flash"
-PRACTICE_FAST_EXPAND_FALLBACK_MODEL = "gemini-3.1-pro-preview"
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 8_000
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 1
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 2
 PRACTICE_FAST_EXPAND_CACHE_TTL_SEC = 6 * 60 * 60
 
 
@@ -60,8 +59,7 @@ def _expansion_cache_key(topic: str, n: int, level: str | None) -> str:
         "topic": topic,
         "count": int(n),
         "level": " ".join(str(level or "").split()),
-        "primary_model": PRACTICE_FAST_EXPAND_MODEL,
-        "fallback_model": PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
+        "model": PRACTICE_FAST_EXPAND_MODEL,
         "prompt_sha256": hashlib.sha256(_PRACTICE_FAST_SYSTEM.encode("utf-8")).hexdigest(),
         "schema": _PracticeFastExpansion.model_json_schema(),
     }
@@ -238,26 +236,63 @@ async def _practice_fast_gemini_raw_async(
         f"User topic: {topic!r}\nN = {max(1, int(n))}{level_line}\n"
         "Return corrected and queries as JSON."
     )
+    reservation: dict[str, object] = {}
     try:
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=user,
-            config=types.GenerateContentConfig(
-                system_instruction=_PRACTICE_FAST_SYSTEM,
-                response_mime_type="application/json",
-                response_json_schema=_PracticeFastExpansion.model_json_schema(),
-                temperature=0.2,
+        if context is not None:
+            reserved = context.reserve_gemini_call(
+                operation="expansion",
+                model=model,
+                prompt_text=user,
                 max_output_tokens=2048,
-            ),
-        )
+            )
+            if isinstance(reserved, dict):
+                reservation = dict(reserved)
+        try:
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=user,
+                config=types.GenerateContentConfig(
+                    system_instruction=_PRACTICE_FAST_SYSTEM,
+                    response_mime_type="application/json",
+                    response_json_schema=_PracticeFastExpansion.model_json_schema(),
+                    temperature=0.2,
+                    max_output_tokens=2048,
+                ),
+            )
+        except Exception as exc:
+            if context is not None:
+                context.record_gemini(
+                    operation="expansion",
+                    attempt=1,
+                    model_used=model,
+                    quality_degraded=False,
+                    usage={**reservation, "dispatched": True},
+                    status_code=None,
+                    error_code=f"dispatch_failed:{type(exc).__name__}",
+                )
+            raise
         raise_if_cancelled(should_cancel)
         if context is not None:
+            raw_usage = getattr(response, "usage_metadata", None)
+
+            def usage_field(name: str) -> object:
+                if isinstance(raw_usage, dict):
+                    return raw_usage.get(name, 0)
+                return getattr(raw_usage, name, 0)
+
             context.record_gemini(
                 operation="expansion",
                 attempt=1,
                 model_used=str(getattr(response, "model_version", "") or model),
                 quality_degraded=model != PRACTICE_FAST_EXPAND_MODEL,
-                usage=getattr(response, "usage_metadata", None),
+                usage={
+                    "prompt_token_count": usage_field("prompt_token_count"),
+                    "candidates_token_count": usage_field("candidates_token_count"),
+                    "thoughts_token_count": usage_field("thoughts_token_count"),
+                    "total_token_count": usage_field("total_token_count"),
+                    **reservation,
+                    "dispatched": True,
+                },
             )
         text = str(getattr(response, "text", "") or "").strip()
         if not text:
@@ -309,7 +344,7 @@ def expand_query_practice_fast(
     *,
     context: "GenerationContext | None" = None,
 ) -> dict:
-    """Practice-compatible Gemini expansion with deterministic fail-soft behavior.
+    """One-Flash-call expansion with deterministic fail-soft behavior.
 
     Expansion deliberately does not reserve the Supadata search budget tracked by
     ``context``. The context enables durable cache reuse and usage accounting.
@@ -341,35 +376,34 @@ def expand_query_practice_fast(
                 metadata={"cache_key": cache_key},
             )
             return cached
-        for model in (PRACTICE_FAST_EXPAND_MODEL, PRACTICE_FAST_EXPAND_FALLBACK_MODEL):
-            try:
-                kwargs = {
-                    "model": model,
-                    "level": level,
-                    "should_cancel": should_cancel,
-                }
-                if context is not None:
-                    kwargs["context"] = context
-                raw = _practice_fast_gemini_raw(topic, count, **kwargs)
-                parsed = _PracticeFastExpansion.model_validate_json(raw)
-                corrected = " ".join(str(parsed.corrected or topic).split()) or topic
-                queries = _normalize([corrected, *parsed.queries], count)
-                if not queries:
-                    raise ValueError("Gemini returned no usable search queries")
-                raise_if_cancelled(should_cancel)
-                result = {
-                    "corrected": corrected,
-                    "queries": queries,
-                    "provider_used": "gemini",
-                }
-                if cache_key:
-                    _write_cached_expansion(cache_key, result)
-                return result
-            except CancellationError:
-                raise
-            except Exception as exc:
-                raise_if_cancelled(should_cancel)
-                errors.append(f"{model}: {exc}")
+        try:
+            kwargs = {
+                "model": PRACTICE_FAST_EXPAND_MODEL,
+                "level": level,
+                "should_cancel": should_cancel,
+            }
+            if context is not None:
+                kwargs["context"] = context
+            raw = _practice_fast_gemini_raw(topic, count, **kwargs)
+            parsed = _PracticeFastExpansion.model_validate_json(raw)
+            corrected = " ".join(str(parsed.corrected or topic).split()) or topic
+            queries = _normalize([corrected, *parsed.queries], count)
+            if not queries:
+                raise ValueError("Gemini returned no usable search queries")
+            raise_if_cancelled(should_cancel)
+            result = {
+                "corrected": corrected,
+                "queries": queries,
+                "provider_used": "gemini",
+            }
+            if cache_key:
+                _write_cached_expansion(cache_key, result)
+            return result
+        except CancellationError:
+            raise
+        except Exception as exc:
+            raise_if_cancelled(should_cancel)
+            errors.append(f"{PRACTICE_FAST_EXPAND_MODEL}: {exc}")
     logger.info(
         "practice-fast Gemini expansion unavailable; using deterministic fallback: %s",
         "; ".join(errors),

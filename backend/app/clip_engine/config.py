@@ -18,7 +18,7 @@ def _flag(name: str, default: bool) -> bool:
 SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY", "")
 SUPADATA_BASE = os.environ.get("SUPADATA_BASE", "https://api.supadata.ai/v1")
 SUPADATA_SEARCH_URL = f"{SUPADATA_BASE}/youtube/search"
-SUPADATA_CHUNK_SIZE = int(os.environ.get("SUPADATA_CHUNK_SIZE", "180"))
+SUPADATA_CHUNK_SIZE = int(os.environ.get("SUPADATA_CHUNK_SIZE", "50"))
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")

@@ -150,8 +150,18 @@ class _ChainBufferingEmitter:
         self._downstream = downstream
         self._buffers: dict[str, list[dict[str, Any]]] = {}
 
-    def emit(self, reel: dict[str, Any], *, chain_id: str) -> None:
+    def emit(
+        self,
+        reel: dict[str, Any],
+        *,
+        chain_id: str,
+        prerequisite_safe: bool = False,
+    ) -> None:
         if self._downstream is None:
+            return
+        if prerequisite_safe:
+            self._flush_others(active_chain_id=None)
+            self._forward(reel)
             return
         if not chain_id:
             self._flush_others(active_chain_id=None)
@@ -1186,7 +1196,7 @@ class ReelService:
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
-    RANKED_FEED_CACHE_VERSION = 11
+    RANKED_FEED_CACHE_VERSION = 12
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -1821,9 +1831,18 @@ class ReelService:
 
             def _stream(reel_obj, _concept=concept, _idx=idx):
                 if chain_emitter is not None:
+                    streamed = self._reel_attribution_to_dict(
+                        reel_obj,
+                        _concept,
+                        _idx,
+                        total_concepts,
+                    )
                     chain_emitter.emit(
-                        self._reel_attribution_to_dict(reel_obj, _concept, _idx, total_concepts),
-                        chain_id="",
+                        streamed,
+                        chain_id=str(streamed.get("chain_id") or ""),
+                        prerequisite_safe=bool(
+                            streamed.get("selection_contract_version")
+                        ),
                     )
 
             try:
@@ -1839,11 +1858,9 @@ class ReelService:
                     language="en",
                     knowledge_level=material_knowledge_level,
                     max_videos=video_budget,
-                    max_reels=(
-                        None
-                        if video_budget * max(0, min(40, int(_SEGMENT_MAX_CLIPS)))
-                        <= remaining_reel_capacity
-                        else remaining_reel_capacity
+                    max_reels=min(
+                        remaining_reel_capacity,
+                        max(3, num_reels - len(generated)) + 2,
                     ),
                     on_reel_created=(None if dry_run else _stream),
                     dry_run=dry_run,
@@ -2271,6 +2288,23 @@ class ReelService:
                 getattr(reel_obj, "clip_duration_sec", None) or max(0.0, t_end - t_start)
             ),
             "difficulty": float(getattr(reel_obj, "difficulty", 0.5) or 0.5),
+            "selection_contract_version": (
+                getattr(reel_obj, "selection_contract_version", None)
+            ),
+            "boundary_confidence": getattr(
+                reel_obj, "boundary_confidence", None
+            ),
+            "is_standalone": bool(getattr(reel_obj, "is_standalone", True)),
+            "chain_id": str(getattr(reel_obj, "chain_id", "") or ""),
+            "chain_position": float(
+                getattr(reel_obj, "chain_position", 0.0) or 0.0
+            ),
+            "selection_candidate_id": str(
+                getattr(reel_obj, "selection_candidate_id", "") or ""
+            ),
+            "prerequisite_ids": list(
+                getattr(reel_obj, "prerequisite_ids", None) or []
+            ),
         }
 
     def _finalize_generated_reels(
@@ -5292,6 +5326,201 @@ class ReelService:
         except (TypeError, ValueError):
             return 0.5
 
+    @staticmethod
+    def _selection_number(value: Any, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = float(default)
+        return max(0.0, min(1.0, parsed))
+
+    @classmethod
+    def _selection_metadata(cls, value: Any) -> dict[str, Any]:
+        """Read the versioned selection contract stored with a persisted reel."""
+        if isinstance(value, dict):
+            parsed = dict(value)
+        else:
+            try:
+                parsed = json.loads(str(value or "{}"))
+            except (TypeError, json.JSONDecodeError):
+                return {}
+        if not isinstance(parsed, dict):
+            return {}
+        nested = parsed.get("selection_metadata") or parsed.get("selection")
+        if isinstance(nested, dict):
+            parsed = {**parsed, **nested}
+        version = str(parsed.get("selection_contract_version") or "").strip()
+        if not version or version.lower() in {"0", "legacy", "none"}:
+            return {}
+
+        prerequisites = parsed.get("prerequisite_ids")
+        if prerequisites is None:
+            prerequisites = parsed.get("prerequisite_reel_ids")
+        if prerequisites is None:
+            prerequisites = parsed.get("prerequisite_candidate_ids")
+        if not isinstance(prerequisites, list):
+            prerequisites = []
+
+        standalone = parsed.get("is_standalone", parsed.get("standalone", False))
+        if isinstance(standalone, str):
+            standalone = standalone.strip().lower() in {"1", "true", "yes", "on"}
+
+        metadata: dict[str, Any] = {
+            "_selection_contract_version": version,
+            "_selection_boundary_confidence": cls._selection_number(
+                parsed.get("boundary_confidence"), 0.0
+            ),
+            "_selection_is_standalone": bool(standalone),
+            "_selection_chain_id": str(parsed.get("chain_id") or "").strip(),
+            "_selection_prerequisite_ids": [
+                str(item).strip() for item in prerequisites if str(item).strip()
+            ],
+            "_selection_candidate_id": str(
+                parsed.get("selection_candidate_id") or parsed.get("candidate_id") or ""
+            ).strip(),
+        }
+        try:
+            metadata["_selection_chain_position"] = float(
+                parsed.get("chain_position") or 0.0
+            )
+        except (TypeError, ValueError):
+            metadata["_selection_chain_position"] = 0.0
+
+        if parsed.get("content_score") is not None:
+            metadata["_selection_content_score"] = cls._selection_number(
+                parsed.get("content_score")
+            )
+        else:
+            topic_relevance = cls._selection_number(parsed.get("topic_relevance"), 0.0)
+            importance = cls._selection_number(
+                parsed.get("educational_importance", parsed.get("importance")), 0.0
+            )
+            informativeness = cls._selection_number(parsed.get("informativeness"), 0.0)
+            metadata["_selection_content_score"] = (
+                0.45 * topic_relevance
+                + 0.35 * importance
+                + 0.20 * informativeness
+            )
+        return metadata
+
+    @staticmethod
+    def _has_selection_contract(item: dict[str, Any]) -> bool:
+        return bool(str(item.get("_selection_contract_version") or "").strip())
+
+    def _selection_contract_order(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        level_target: float,
+        concept_adjustments: dict[str, float],
+        previous_video_id: str,
+    ) -> list[dict[str, Any]]:
+        """Priority topological sort for confidence-gated selection rows."""
+        nodes: dict[str, dict[str, Any]] = {}
+        aliases: dict[str, str] = {}
+        for index, raw in enumerate(items):
+            item = dict(raw)
+            reel_id = str(item.get("reel_id") or "").strip()
+            node_id = reel_id or f"selection-node-{index}"
+            item["_selection_node_id"] = node_id
+            concept_id = str(item.get("concept_id") or "")
+            concept_target = max(
+                0.0,
+                min(1.0, level_target + concept_adjustments.get(concept_id, 0.0)),
+            )
+            level_fit = 1.0 - abs(self._difficulty(item) - concept_target)
+            content_score = self._selection_number(
+                item.get("_selection_content_score"), 0.0
+            )
+            boundary_confidence = self._selection_number(
+                item.get("_selection_boundary_confidence"), 0.0
+            )
+            item["score"] = (
+                0.65 * content_score
+                + 0.25 * level_fit
+                + 0.10 * boundary_confidence
+            )
+            nodes[node_id] = item
+            aliases[node_id] = node_id
+            candidate_id = str(item.get("_selection_candidate_id") or "").strip()
+            if candidate_id:
+                aliases[candidate_id] = node_id
+
+        dependencies: dict[str, set[str]] = {node_id: set() for node_id in nodes}
+        for node_id, item in nodes.items():
+            raw_prerequisites = item.get("_selection_prerequisite_ids") or []
+            for prerequisite in raw_prerequisites:
+                prerequisite_id = str(prerequisite or "").strip()
+                if not prerequisite_id:
+                    continue
+                dependencies[node_id].add(
+                    aliases.get(prerequisite_id, f"missing:{prerequisite_id}")
+                )
+
+        chains: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+        for node_id, item in nodes.items():
+            chain_id = str(item.get("_selection_chain_id") or "").strip()
+            if chain_id:
+                chains[chain_id].append((node_id, item))
+        for chain in chains.values():
+            chain.sort(
+                key=lambda pair: (
+                    float(pair[1].get("_selection_chain_position") or 0.0),
+                    float(pair[1].get("t_start") or 0.0),
+                    pair[0],
+                )
+            )
+            for previous, current in zip(chain, chain[1:]):
+                dependencies[current[0]].add(previous[0])
+
+        remaining = set(nodes)
+        satisfied: set[str] = set()
+        ordered: list[dict[str, Any]] = []
+        last_video = str(previous_video_id or "")
+        while remaining:
+            eligible = [
+                node_id
+                for node_id in remaining
+                if dependencies[node_id].issubset(satisfied)
+            ]
+            if not eligible:
+                break
+            if not ordered:
+                eligible = [
+                    node_id
+                    for node_id in eligible
+                    if bool(nodes[node_id].get("_selection_is_standalone"))
+                    and self._selection_number(
+                        nodes[node_id].get("_selection_boundary_confidence"), 0.0
+                    ) >= 0.80
+                ]
+                if not eligible:
+                    return []
+
+            def priority(node_id: str) -> tuple[float, float, str, str]:
+                row = nodes[node_id]
+                base = float(row.get("score") or 0.0)
+                same_video_penalty = (
+                    0.08
+                    if last_video
+                    and str(row.get("video_id") or "") == last_video
+                    else 0.0
+                )
+                return (
+                    base - same_video_penalty,
+                    base,
+                    str(row.get("created_at") or ""),
+                    node_id,
+                )
+
+            chosen_id = max(eligible, key=priority)
+            chosen = nodes[chosen_id]
+            ordered.append(chosen)
+            remaining.remove(chosen_id)
+            satisfied.add(chosen_id)
+            last_video = str(chosen.get("video_id") or "")
+        return ordered
+
     def adaptive_curriculum_order(
         self,
         conn,
@@ -5301,7 +5530,12 @@ class ReelService:
         previous_video_id: str = "",
     ) -> list[dict[str, Any]]:
         """Interleave source/concept queues while preserving each source's chronology."""
-        if len(items) <= 1:
+        if not items:
+            return []
+        uses_selection_contract = any(
+            self._has_selection_contract(item) for item in items
+        )
+        if not uses_selection_contract and len(items) <= 1:
             return list(items)
         try:
             coverage, adjustments, latest, level_target = self._learner_adaptation_context(
@@ -5309,6 +5543,34 @@ class ReelService:
             )
         except ValueError:
             return list(items)
+        if uses_selection_contract:
+            versioned_items: list[dict[str, Any]] = []
+            for raw in items:
+                if self._has_selection_contract(raw):
+                    versioned_items.append(raw)
+                    continue
+                legacy = dict(raw)
+                video_id = str(legacy.get("video_id") or "unknown")
+                legacy.update(
+                    _selection_contract_version="legacy-bridge",
+                    _selection_content_score=self._selection_number(
+                        legacy.get("score"), 0.0
+                    ),
+                    _selection_boundary_confidence=0.80,
+                    _selection_is_standalone=True,
+                    _selection_chain_id=f"legacy-source:{video_id}",
+                    _selection_chain_position=float(
+                        legacy.get("t_start") or 0.0
+                    ),
+                    _selection_prerequisite_ids=[],
+                )
+                versioned_items.append(legacy)
+            return self._selection_contract_order(
+                versioned_items,
+                level_target=level_target,
+                concept_adjustments=adjustments,
+                previous_video_id=previous_video_id,
+            )
         queues: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for raw in items:
             item = dict(raw)
@@ -6428,6 +6690,7 @@ class ReelService:
                 r.model_used,
                 r.quality_degraded,
                 r.selected_cue_ids_json,
+                r.search_context_json,
                 COALESCE(SUM(f.helpful), 0) AS helpful_votes,
                 COALESCE(SUM(f.confusing), 0) AS confusing_votes,
                 COALESCE(AVG(f.rating), 3.0) AS avg_rating,
@@ -6467,6 +6730,7 @@ class ReelService:
                 r.model_used,
                 r.quality_degraded,
                 r.selected_cue_ids_json,
+                r.search_context_json,
                 r.created_at
             """,
             (learner_id, *reel_params),
@@ -6544,6 +6808,7 @@ class ReelService:
             if not isinstance(selected_cue_ids, list):
                 selected_cue_ids = []
             selected_cue_ids = [str(cue_id) for cue_id in selected_cue_ids if str(cue_id).strip()]
+            selection_metadata = self._selection_metadata(row.get("search_context_json"))
             video_title = str(row.get("video_title") or "").strip()
             video_description = self._clean_video_description(str(row.get("video_description") or ""))
             transcript_snippet = str(row.get("transcript_snippet") or "")
@@ -6629,22 +6894,36 @@ class ReelService:
                 min(1.0, level_target + concept_adjustments.get(str(row["concept_id"]), 0.0)),
             )
             learner_signal = learner_coverage.get(str(row["concept_id"]), {})
-            score = (
-                float(row["base_score"])
-                + 0.18 * float(row["helpful_votes"])
-                - 0.22 * float(row["confusing_votes"])
-                + 0.06 * (float(row["avg_rating"] or 3.0) - 3.0)
-                + 0.05 * float(row["saves"])
-                + 0.04 * concept_helpful
-                - 0.06 * concept_confusing
-                + 0.22 * float(relevance_context.get("score") or 0.0)
-                - 0.12 * float(relevance.get("off_topic_penalty") or 0.0)
-                + 0.04 * float(self.SOURCE_SURFACE_PRIOR.get(str(retrieval_candidate.get("source_surface") or ""), 0.82))
-                + 0.12 * (1.0 - 2.0 * abs(_diff - concept_target))
-                + 0.05 * (1.0 - _diff) * max(0.0, 1.0 - (safe_page_hint - 1) / 2.0)
-                - 0.04 * float(learner_signal.get("helpful") or 0.0)
-                + 0.04 * float(learner_signal.get("confusing") or 0.0)
-            )
+            if selection_metadata:
+                content_score = self._selection_number(
+                    selection_metadata.get("_selection_content_score"), 0.0
+                )
+                boundary_confidence = self._selection_number(
+                    selection_metadata.get("_selection_boundary_confidence"), 0.0
+                )
+                current_level_fit = 1.0 - abs(_diff - concept_target)
+                score = (
+                    0.65 * content_score
+                    + 0.25 * current_level_fit
+                    + 0.10 * boundary_confidence
+                )
+            else:
+                score = (
+                    float(row["base_score"])
+                    + 0.18 * float(row["helpful_votes"])
+                    - 0.22 * float(row["confusing_votes"])
+                    + 0.06 * (float(row["avg_rating"] or 3.0) - 3.0)
+                    + 0.05 * float(row["saves"])
+                    + 0.04 * concept_helpful
+                    - 0.06 * concept_confusing
+                    + 0.22 * float(relevance_context.get("score") or 0.0)
+                    - 0.12 * float(relevance.get("off_topic_penalty") or 0.0)
+                    + 0.04 * float(self.SOURCE_SURFACE_PRIOR.get(str(retrieval_candidate.get("source_surface") or ""), 0.82))
+                    + 0.12 * (1.0 - 2.0 * abs(_diff - concept_target))
+                    + 0.05 * (1.0 - _diff) * max(0.0, 1.0 - (safe_page_hint - 1) / 2.0)
+                    - 0.04 * float(learner_signal.get("helpful") or 0.0)
+                    + 0.04 * float(learner_signal.get("confusing") or 0.0)
+                )
             scored.append(
                 {
                     "reel_id": row["reel_id"],
@@ -6684,6 +6963,7 @@ class ReelService:
                     "quality_degraded": bool(row.get("quality_degraded")),
                     "selected_cue_ids": selected_cue_ids,
                     "created_at": row["created_at"],
+                    **selection_metadata,
                 }
             )
 
@@ -6743,6 +7023,14 @@ class ReelService:
         response_rows: list[dict[str, Any]] = []
         for item in deduped:
             clean_item = dict(item)
+            selection_ordered = self._has_selection_contract(clean_item)
+            for internal_key in [
+                key for key in clean_item if key.startswith("_selection_")
+            ]:
+                clean_item.pop(internal_key, None)
+            # Request shaping preserves relative order, so main can avoid
+            # accidentally applying the legacy chronological scheduler again.
+            clean_item["_selection_ordered"] = selection_ordered
             # Keep video_id on the response row so downstream filters (notably
             # main._ranked_request_reels's exclude_video_ids filter) can match
             # on it. Stripping it here silently defeated client pagination.

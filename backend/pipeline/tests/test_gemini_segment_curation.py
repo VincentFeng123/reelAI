@@ -42,7 +42,9 @@ def _assessment(line: int = 0) -> dict:
 
 def _topic(start_line: int, end_line: int, **overrides) -> G._Topic:
     data = {
+        "candidate_id": f"candidate-{start_line}-{end_line}",
         "title": "Lesson",
+        "learning_objective": "Understand the complete lesson.",
         "start_line": start_line,
         "end_line": end_line,
         "start_quote": f"line {start_line}",
@@ -51,8 +53,11 @@ def _topic(start_line: int, end_line: int, **overrides) -> G._Topic:
         "reason": "This is a complete lesson.",
         "informativeness": 0.9,
         "topic_relevance": 0.9,
+        "educational_importance": 0.9,
         "difficulty": 0.5,
         "self_contained": True,
+        "is_standalone": True,
+        "prerequisite_candidate_ids": [],
         "uncertainty": "low",
         "uncertainty_reasons": [],
         "summary": f"Line {start_line} explains lesson {start_line} completely.",
@@ -81,9 +86,11 @@ def _run(topics: list[G._Topic], segments: list[dict] | None = None,
 @pytest.mark.parametrize(
     "field",
     [
-        "start_line", "end_line", "start_quote", "end_quote", "title", "facet", "reason",
-        "informativeness", "topic_relevance", "difficulty", "self_contained", "uncertainty",
-        "uncertainty_reasons", "summary", "takeaways", "match_reason", "assessment",
+        "candidate_id", "start_line", "end_line", "start_quote", "end_quote", "title",
+        "learning_objective", "facet", "reason", "informativeness", "topic_relevance",
+        "educational_importance", "difficulty", "self_contained", "is_standalone",
+        "prerequisite_candidate_ids", "uncertainty", "uncertainty_reasons", "summary",
+        "takeaways", "match_reason", "assessment",
     ],
 )
 def test_every_single_pass_field_is_required(field):
@@ -93,7 +100,13 @@ def test_every_single_pass_field_is_required(field):
         G._Topic.model_validate(data)
 
 
-@pytest.mark.parametrize("field", ["title", "facet", "reason", "start_quote", "end_quote"])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "candidate_id", "title", "learning_objective", "facet", "reason",
+        "start_quote", "end_quote",
+    ],
+)
 def test_required_text_fields_reject_blank_values(field):
     data = _topic(0, 1).model_dump()
     data[field] = "   "
@@ -194,14 +207,14 @@ def test_explicit_max_clips_is_respected_below_forty_ceiling():
 
 
 @pytest.mark.parametrize(
-    "overrides,reason",
+    "overrides,rejected_reason",
     [
-        ({"informativeness": 0.7}, "quality_score_below_green"),
+        ({"informativeness": 0.7}, None),
         ({"uncertainty": "medium", "uncertainty_reasons": ["boundary_ambiguous"]},
-         "medium_uncertainty"),
+         "proposal_1:medium_uncertainty"),
     ],
 )
-def test_truncation_cannot_hide_uncertain_validated_candidates(overrides, reason):
+def test_lower_ranked_candidate_never_poison_independent_kept_clip(overrides, rejected_reason):
     segments = _segs(2)
     plan = G._Plan(topics=[
         _topic(0, 0, title="kept", informativeness=0.95, topic_relevance=0.95),
@@ -215,11 +228,12 @@ def test_truncation_cannot_hide_uncertain_validated_candidates(overrides, reason
     classification = G._classify_flash(
         report, segments, "", enrichment_required=False,
     )
-    assert classification.status == "uncertain"
-    assert reason in classification.reasons
+    assert classification == G._Classification("green", ())
+    if rejected_reason:
+        assert rejected_reason in report.rejected_reasons
 
 
-def test_truncation_cannot_hide_long_validated_candidate():
+def test_lower_ranked_long_candidate_never_poison_independent_kept_clip():
     segments = _segs(3, seconds=75.0)
     plan = G._Plan(topics=[
         _topic(0, 0, title="kept", informativeness=0.95, topic_relevance=0.95),
@@ -233,8 +247,7 @@ def test_truncation_cannot_hide_long_validated_candidate():
     classification = G._classify_flash(
         report, segments, "", enrichment_required=False,
     )
-    assert classification.status == "uncertain"
-    assert "long_clip" in classification.reasons
+    assert classification == G._Classification("green", ())
 
 
 def test_schema_enforces_forty_proposal_ceiling():
