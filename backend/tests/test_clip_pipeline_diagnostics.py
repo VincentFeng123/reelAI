@@ -95,6 +95,7 @@ def test_generation_stage_counters_are_thread_safe() -> None:
         "usable_transcripts": 0,
         "transcript_failures": 0,
         "transcript_timeouts": 0,
+        "clip_fetch_timeouts": 0,
         "gemini_empty_results": 0,
         "topic_rejections": 800,
         "persisted_clips": 0,
@@ -172,6 +173,31 @@ def test_ingest_topic_counts_topic_rejections_and_persisted_clips(monkeypatch) -
     assert counters["usable_transcripts"] == 1
     assert counters["topic_rejections"] == 1
     assert counters["persisted_clips"] == 1
+
+
+def test_ingest_topic_counts_shared_clip_fetch_timeout_separately(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
+    monkeypatch.setattr(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.001)
+    pipeline = _pipeline()
+
+    def slow_clip_and_filter(*_args, **_kwargs):
+        time.sleep(0.05)
+        return _video(), [], {"clips": [], "transcript": _transcript(), "notes": ""}
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", slow_clip_and_filter)
+    context = GenerationContext("slow")
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        max_videos=1,
+    )
+
+    assert reels == []
+    assert context.counters()["clip_fetch_timeouts"] == 1
+    assert context.counters()["transcript_timeouts"] == 0
 
 
 def test_ingest_topic_distinguishes_unavailable_transcript_from_provider_failure(
@@ -266,13 +292,26 @@ def test_exhaustion_messages_are_stage_specific_and_source_neutral() -> None:
     topic = main._generation_exhaustion_message(
         {"discovered_videos": 2, "usable_transcripts": 2, "topic_rejections": 3}
     )
+    mixed = main._generation_exhaustion_message(
+        {
+            "discovered_videos": 3,
+            "usable_transcripts": 1,
+            "clip_fetch_timeouts": 2,
+            "topic_rejections": 1,
+        }
+    )
 
     assert "discovered" in search
     assert "usable timestamped transcript" in transcript
     assert "deadline" in deadline
     assert "content quality" in quality
     assert "topic and quality" in topic
-    assert all("native caption" not in message.casefold() for message in (search, transcript, deadline, quality, topic))
+    assert "did not finish before" in mixed
+    assert "topic and quality" in mixed
+    assert all(
+        "native caption" not in message.casefold()
+        for message in (search, transcript, deadline, quality, topic, mixed)
+    )
 
 
 def test_generation_status_exposes_counters_in_backward_compatible_error_detail() -> None:
@@ -281,6 +320,7 @@ def test_generation_status_exposes_counters_in_backward_compatible_error_detail(
         "usable_transcripts": 1,
         "transcript_failures": 2,
         "transcript_timeouts": 0,
+        "clip_fetch_timeouts": 0,
         "gemini_empty_results": 1,
         "topic_rejections": 0,
         "persisted_clips": 0,

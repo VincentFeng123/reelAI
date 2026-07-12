@@ -2,6 +2,7 @@ import pytest
 
 from backend.app.clip_engine import supadata_search as ss
 from backend.app.clip_engine.errors import (
+    ProviderBudgetExceededError,
     ProviderQuotaError,
     ProviderRateLimitError,
     ProviderTransientError,
@@ -140,6 +141,56 @@ def test_search_all_applies_per_request_filters_without_extra_calls(monkeypatch)
         ("literal", {"duration": "medium", "features": ["hd"]}),
         ("expansion", {"duration": "medium", "features": ["hd"]}),
     ]
+
+
+def test_search_all_returns_primary_result_when_optional_query_exhausts_budget(monkeypatch):
+    calls = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls.append(params["query"])
+        return _Resp(200, {"results": [{"id": params["query"], "type": "video"}]})
+
+    monkeypatch.setattr(ss.httpx, "get", fake_get)
+    context = GenerationContext("fast", cache_store=MemoryProviderCache())
+    context.reserve("search")
+    context.reserve("search")
+
+    result = ss.search_all(["primary", "optional"], context=context)
+
+    assert calls == ["primary"]
+    assert [item["query"] for item in result["per_query"]] == ["primary"]
+    assert result["warning"] == "Search budget exhausted after partial results."
+
+
+def test_search_all_raises_when_budget_exhausts_before_primary_succeeds(monkeypatch):
+    monkeypatch.setattr(
+        ss.httpx,
+        "get",
+        lambda *args, **kwargs: _Resp(503, {"message": "try again"}),
+    )
+    context = GenerationContext("fast", cache_store=MemoryProviderCache())
+    context.reserve("search")
+
+    with pytest.raises(ProviderBudgetExceededError):
+        ss.search_all(["primary", "optional"], context=context)
+
+
+def test_search_all_keeps_primary_when_optional_retries_consume_budget(monkeypatch):
+    responses = iter(
+        [
+            _Resp(200, {"results": [{"id": "primary", "type": "video"}]}),
+            _Resp(503, {"message": "try again"}),
+            _Resp(503, {"message": "try again"}),
+        ]
+    )
+    monkeypatch.setattr(ss.httpx, "get", lambda *args, **kwargs: next(responses))
+    context = GenerationContext("fast", cache_store=MemoryProviderCache())
+
+    result = ss.search_all(["primary", "optional"], context=context)
+
+    assert [item["query"] for item in result["per_query"]] == ["primary"]
+    assert context.budget.remaining("search") == 0
+    assert result["warning"] == "Search budget exhausted after partial results."
 
 
 def test_search_page_token_uses_documented_parameter_without_filters(monkeypatch):

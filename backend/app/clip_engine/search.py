@@ -28,19 +28,24 @@ def _request_filters(filters: dict | None, *, prefer_hd: bool) -> dict:
     ]
     if prefer_hd:
         features.append("hd")
-    return {**normalized, "features": features}
+    request_filters = {**normalized}
+    request_filters.pop("features", None)
+    if features:
+        request_filters["features"] = features
+    return request_filters
 
 
 def _planned_query_offset(context: GenerationContext | None) -> int:
-    """Count expansion slots consumed by earlier slow acquisition passes."""
+    """Count AI-term slots consumed by earlier slow acquisition passes."""
     if context is None or context.budget.mode != "slow":
         return 0
     pass_count = max(1, int(context.budget.snapshot().get("passes") or 0))
     if pass_count <= 1:
         return 0
-    # The six-call initial pass spends two slots on literal coverage, leaving
-    # four expansions. Each earlier three-call continuation leaves one.
-    return 4 + max(0, pass_count - 2)
+    # Every pass starts with one unrestricted primary query. The six-call
+    # initial pass therefore consumes five AI terms, and each earlier
+    # three-call continuation consumes two more.
+    return 5 + max(0, pass_count - 2) * 2
 
 
 def _select_ranked_candidates(ranked: list[dict], *, limit: int, excluded: set[str]) -> list[dict]:
@@ -172,7 +177,7 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
         normalize_youtube_video_id(video_id) or str(video_id)
         for video_id in (exclude_video_ids or [])
     }
-    from ..services.search_query_plan import semantic_query_family
+    from ..services.search_query_plan import normalize_query, semantic_query_family
 
     literal_query = " ".join(
         str(
@@ -181,46 +186,96 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
             else literal_topic or topic
         ).split()
     ) or topic
-    literal_key = " ".join(literal_query.casefold().split())
+    literal_key = normalize_query(literal_query)
     literal_plan = next(
         (item for item in planned_queries if item.trust == "literal"),
         None,
     )
-    literal_metadata = {
-        "query": literal_query,
+    planned_by_key = {
+        normalize_query(item.text): item
+        for item in planned_queries
+        if normalize_query(item.text)
+    }
+    use_ai_plan = effective_plan is not None and effective_plan.ai_status == "validated"
+    primary_query = literal_query
+    if effective_plan is not None and len(literal_key.split()) > 12:
+        planned_primary = " ".join(
+            str(effective_plan.primary_search_query or "").split()
+        )
+        if normalize_query(planned_primary):
+            primary_query = planned_primary
+    primary_key = normalize_query(primary_query)
+    primary_plan = planned_by_key.get(primary_key)
+    primary_is_literal = primary_key == literal_key
+    root_query_family = semantic_query_family(
+        effective_plan.one_word_topic
+        if use_ai_plan and normalize_query(effective_plan.one_word_topic)
+        else primary_query
+    )
+    primary_metadata = {
+        "query": primary_query,
         "query_family": (
-            literal_plan.family if literal_plan is not None
-            else semantic_query_family(literal_query)
+            primary_plan.family if primary_plan is not None
+            else root_query_family
         ),
+        # The first practical request remains the ranking anchor even when a
+        # long literal is summarized for retrieval. The unsummarized literal
+        # stays on the plan as the final relevance identity.
         "query_trust": "literal",
         "query_provenance": (
-            literal_plan.provenance if literal_plan is not None else "literal"
+            "literal" if primary_is_literal else "ai_summary"
         ),
         "hd_preferred": False,
     }
-    requests = [literal_metadata]
-    if n >= 2:
-        requests.append({**literal_metadata, "hd_preferred": True})
+    if primary_is_literal and literal_plan is not None:
+        primary_metadata.update(
+            query_family=literal_plan.family,
+            query_trust="literal",
+            query_provenance=literal_plan.provenance,
+        )
 
-    expansion_candidates = [
-        item
-        for item in planned_queries
-        if item.trust != "literal"
-        and " ".join(item.text.casefold().split()) != literal_key
-    ]
+    expansion_candidates: list[dict[str, object]] = []
+    seen_query_keys = {literal_key, primary_key}
+    if use_ai_plan:
+        one_word_topic = effective_plan.one_word_topic
+        raw_synonyms = effective_plan.one_word_synonyms
+        ordered_ai_terms = [(one_word_topic, "canonical"), *(
+            (synonym, "ai") for synonym in raw_synonyms
+        )]
+        for raw_query, query_trust in ordered_ai_terms:
+            query = " ".join(str(raw_query or "").split())
+            query_key = normalize_query(query)
+            if (
+                not query_key
+                or len(query_key.split()) != 1
+                or query_key in seen_query_keys
+            ):
+                continue
+            seen_query_keys.add(query_key)
+            planned = planned_by_key.get(query_key)
+            expansion_candidates.append(
+                {
+                    "query": query,
+                    # Canonical and synonym requests are alternate surface
+                    # forms of one retrieval identity, not independent topic
+                    # evidence. Sharing a family prevents false consensus.
+                    "query_family": root_query_family,
+                    "query_trust": query_trust,
+                    "query_provenance": (
+                        planned.provenance if planned is not None else "ai"
+                    ),
+                    "hd_preferred": True,
+                }
+            )
+
+    requests = [primary_metadata]
     expansion_offset = _planned_query_offset(context)
     for planned in expansion_candidates[expansion_offset:]:
         if len(requests) >= n:
             break
-        requests.append(
-            {
-                "query": planned.text,
-                "query_family": planned.family,
-                "query_trust": planned.trust,
-                "query_provenance": planned.provenance,
-                "hd_preferred": True,
-            }
-        )
+        requests.append(planned)
+    if len(requests) < n:
+        requests.append({**primary_metadata, "hd_preferred": True})
 
     def annotate_result_sets(per_query: list[dict]) -> None:
         for result_set, request in zip(per_query, requests):

@@ -966,12 +966,18 @@ class IngestionPipeline:
             except FutureTimeoutError:
                 batch_cancelled.set()
                 if generation_context is not None:
-                    generation_context.increment_counter("transcript_timeouts")
+                    generation_context.increment_counter("clip_fetch_timeouts")
                 log_event(
                     logger,
                     logging.WARNING,
                     "ingest_topic_video_failed",
                     video_id=v.get("id"),
+                    topic=topic,
+                    concept_id=concept_id,
+                    generation_id=generation_id,
+                    literal_query=(v.get("_search_context") or {}).get("literal_query"),
+                    matched_queries=(v.get("_search_context") or {}).get("matched_queries"),
+                    query_plan_ai_status=(v.get("_search_context") or {}).get("query_plan_ai_status"),
                     error=(
                         "shared clip fetch deadline exceeded "
                         f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
@@ -1092,6 +1098,12 @@ class IngestionPipeline:
                                 logging.WARNING,
                                 "ingest_topic_video_failed",
                                 video_id=v.get("id"),
+                                topic=topic,
+                                concept_id=concept_id,
+                                generation_id=generation_id,
+                                literal_query=(v.get("_search_context") or {}).get("literal_query"),
+                                matched_queries=(v.get("_search_context") or {}).get("matched_queries"),
+                                query_plan_ai_status=(v.get("_search_context") or {}).get("query_plan_ai_status"),
                                 error=(
                                     "shared clip fetch deadline exceeded "
                                     f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
@@ -1099,7 +1111,7 @@ class IngestionPipeline:
                             )
                         if generation_context is not None:
                             generation_context.increment_counter(
-                                "transcript_timeouts", len(pending)
+                                "clip_fetch_timeouts", len(pending)
                             )
                         break
 

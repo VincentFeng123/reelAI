@@ -3121,14 +3121,21 @@ def _generation_exhaustion_message(counters: dict[str, int]) -> str:
     discovered = int(counters.get("discovered_videos") or 0)
     transcripts = int(counters.get("usable_transcripts") or 0)
     transcript_failures = int(counters.get("transcript_failures") or 0)
-    timeouts = int(counters.get("transcript_timeouts") or 0)
+    transcript_timeouts = int(counters.get("transcript_timeouts") or 0)
+    clip_fetch_timeouts = int(counters.get("clip_fetch_timeouts") or 0)
+    timeouts = transcript_timeouts + clip_fetch_timeouts
     gemini_empty_results = int(counters.get("gemini_empty_results") or 0)
     topic_rejections = int(counters.get("topic_rejections") or 0)
 
     if discovered <= 0:
         return "No matching YouTube videos were discovered for this topic."
     if transcripts <= 0:
-        if timeouts > 0:
+        if clip_fetch_timeouts > 0:
+            return (
+                "Matching YouTube videos were discovered, but transcript and clip "
+                "analysis did not complete before the generation deadline."
+            )
+        if transcript_timeouts > 0:
             return (
                 "Matching YouTube videos were discovered, but no usable timestamped "
                 "transcripts were available before the generation deadline."
@@ -3141,6 +3148,22 @@ def _generation_exhaustion_message(counters: dict[str, int]) -> str:
         return (
             "Matching YouTube videos were discovered, but transcript retrieval did not "
             "complete."
+        )
+    if timeouts > 0 and topic_rejections > 0:
+        return (
+            "Some video analyses did not finish before the generation deadline; clips "
+            "from the completed timestamped transcripts did not pass the topic and "
+            "quality checks."
+        )
+    if timeouts > 0 and gemini_empty_results > 0:
+        return (
+            "Some video analyses did not finish before the generation deadline; the "
+            "completed videos produced no clips that passed the content quality checks."
+        )
+    if timeouts > 0:
+        return (
+            "Some video analyses did not finish before the generation deadline, and "
+            "the completed videos produced no valid clips."
         )
     if topic_rejections > 0:
         return (

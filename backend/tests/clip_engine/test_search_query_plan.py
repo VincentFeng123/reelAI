@@ -47,6 +47,18 @@ def _manual_plan() -> SearchQueryPlan:
     return SearchQueryPlan(
         literal_query="Calculus Basics",
         canonical_query="Calculus",
+        primary_search_query="Calculus Basics",
+        one_word_topic="Calculus",
+        one_word_synonyms=[
+            "Derivative",
+            "Integral",
+            "Limit",
+            "Antiderivative",
+            "Differentiation",
+            "Integration",
+            "Slope",
+            "Area",
+        ],
         accepted_subtopics=terms[2:],
         trusted_signature=terms,
         literal_is_ambiguous=True,
@@ -67,6 +79,21 @@ def _manual_plan() -> SearchQueryPlan:
     )
 
 
+def _ai_json(**overrides) -> str:
+    payload = {
+        "search_summary": "",
+        "one_word_topic": "Calculus",
+        "one_word_synonyms": [],
+        "canonical_query": "Calculus",
+        "literal_is_ambiguous": False,
+        "aliases": [],
+        "subtopics": [],
+        "related_terms": [],
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
 def test_plan_runs_one_structured_expansion_and_caches_by_normalized_literal(monkeypatch) -> None:
     conn = _conn()
     ai_calls = 0
@@ -75,14 +102,12 @@ def test_plan_runs_one_structured_expansion_and_caches_by_normalized_literal(mon
         nonlocal ai_calls
         ai_calls += 1
         assert kwargs["response_schema"] is query_plan_module.AIQueryExpansion
-        return json.dumps(
-            {
-                "canonical_query": "Calculus",
-                "literal_is_ambiguous": True,
-                "aliases": ["differential and integral calculus"],
-                "subtopics": ["limits", "derivatives", "integrals"],
-                "related_terms": ["college admissions"],
-            }
+        return _ai_json(
+            literal_is_ambiguous=True,
+            one_word_synonyms=["Analysis", "Mathematics", "differential calculus"],
+            aliases=["differential and integral calculus"],
+            subtopics=["limits", "derivatives", "integrals"],
+            related_terms=["college admissions"],
         )
 
     monkeypatch.setattr(query_plan_module.llm_router, "chat_completion", fake_ai)
@@ -101,21 +126,27 @@ def test_plan_runs_one_structured_expansion_and_caches_by_normalized_literal(mon
     assert ai_calls == 1
     assert first == second
     assert first.literal_query == "Calculus Basics"
+    assert first.primary_search_query == "Calculus Basics"
+    assert first.one_word_topic == "Calculus"
+    assert first.one_word_synonyms == ["Analysis", "Mathematics"]
     assert first.queries[0].text == "Calculus Basics"
     assert first.literal_is_ambiguous is True
     assert [item.text for item in first.queries] == [
         "Calculus Basics",
         "Calculus",
-        "differential and integral calculus",
-        "limits",
-        "derivatives",
-        "integrals",
+        "Analysis",
+        "Mathematics",
     ]
-    assert all(item.provenance == "ai" for item in first.queries[1:])
+    assert all(item.provenance == "ai_retrieval" for item in first.queries[1:])
+    assert first.accepted_aliases == ["differential and integral calculus"]
+    assert first.accepted_subtopics == ["limits", "derivatives", "integrals"]
+    assert "Analysis" not in first.trusted_signature
+    assert "limits" in first.trusted_signature
     assert not any(item.trust == "template" for item in first.queries)
+    assert any("exactly one normalized token" in reason for reason in first.rejection_reasons)
     assert any("low-value intent" in reason for reason in first.rejection_reasons)
     assert conn.execute(
-        "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'search_query_plan:v2:%'"
+        "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'search_query_plan:v3:%'"
     ).fetchone()[0] == 1
     conn.close()
 
@@ -125,15 +156,7 @@ def test_stale_last_good_plan_survives_transient_model_unavailability(monkeypatc
     monkeypatch.setattr(
         query_plan_module.llm_router,
         "chat_completion",
-        lambda **_kwargs: json.dumps(
-            {
-                "canonical_query": "Calculus",
-                "literal_is_ambiguous": False,
-                "aliases": [],
-                "subtopics": ["calculus differentiation"],
-                "related_terms": [],
-            }
-        ),
+        lambda **_kwargs: _ai_json(subtopics=["calculus differentiation"]),
     )
     monkeypatch.setattr(
         query_plan_module,
@@ -146,7 +169,7 @@ def test_stale_last_good_plan_survives_transient_model_unavailability(monkeypatc
     good = build_search_query_plan(conn, literal_query="Calculus Basics")
     conn.execute(
         "UPDATE llm_cache SET created_at = '2020-01-01T00:00:00+00:00' "
-        "WHERE cache_key LIKE 'search_query_plan:v2:%'"
+        "WHERE cache_key LIKE 'search_query_plan:v3:%'"
     )
     monkeypatch.setattr(
         query_plan_module.llm_router,
@@ -166,15 +189,7 @@ def test_stale_last_good_plan_survives_invalid_structured_expansion(monkeypatch)
     monkeypatch.setattr(
         query_plan_module.llm_router,
         "chat_completion",
-        lambda **_kwargs: json.dumps(
-            {
-                "canonical_query": "Calculus",
-                "literal_is_ambiguous": False,
-                "aliases": [],
-                "subtopics": ["calculus differentiation"],
-                "related_terms": [],
-            }
-        ),
+        lambda **_kwargs: _ai_json(subtopics=["calculus differentiation"]),
     )
     monkeypatch.setattr(
         query_plan_module,
@@ -187,7 +202,7 @@ def test_stale_last_good_plan_survives_invalid_structured_expansion(monkeypatch)
     good = build_search_query_plan(conn, literal_query="Calculus Basics")
     conn.execute(
         "UPDATE llm_cache SET created_at = '2020-01-01T00:00:00+00:00' "
-        "WHERE cache_key LIKE 'search_query_plan:v2:%'"
+        "WHERE cache_key LIKE 'search_query_plan:v3:%'"
     )
     monkeypatch.setattr(
         query_plan_module.llm_router,
@@ -218,6 +233,9 @@ def test_model_unavailable_plan_uses_literal_only_and_short_cache(monkeypatch) -
     assert first.accepted_aliases == []
     assert first.accepted_subtopics == []
     assert first.accepted_related_terms == []
+    assert first.primary_search_query == "Calculus Basics"
+    assert first.one_word_topic == ""
+    assert first.one_word_synonyms == []
     assert first.trusted_signature == ["Calculus Basics"]
     assert [query.text for query in first.queries] == ["Calculus Basics"]
     assert transcript_window_matches_topic(
@@ -236,6 +254,164 @@ def test_model_unavailable_plan_uses_literal_only_and_short_cache(monkeypatch) -
                 )
             ],
         ),
+    )
+    conn.close()
+
+
+def test_intro_to_python_fallback_signature_keeps_the_domain_anchor(monkeypatch) -> None:
+    conn = _conn()
+    monkeypatch.setattr(
+        query_plan_module.llm_router,
+        "chat_completion",
+        lambda **_kwargs: None,
+    )
+
+    plan = build_search_query_plan(conn, literal_query="Intro to Python")
+
+    assert plan.ai_status == "unavailable"
+    assert transcript_window_matches_topic(
+        "Python functions package reusable instructions.",
+        plan,
+    )
+    assert not transcript_window_matches_topic(
+        "Calculus derivatives measure rates of change.",
+        plan,
+    )
+    conn.close()
+
+
+def test_long_literal_uses_directionally_anchored_summary_without_embeddings(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    literal = (
+        "Python programming languages explain variables functions loops classes modules "
+        "exceptions and testing so learners can build reusable software development instructions while understanding "
+        "data flow debugging package design and maintainable application structure."
+    )
+    summary = "Python functions loops and reusable software"
+    monkeypatch.setattr(
+        query_plan_module.llm_router,
+        "chat_completion",
+        lambda **_kwargs: _ai_json(
+            search_summary=summary,
+            canonical_query="Programming Languages",
+            aliases=["software development"],
+            subtopics=["functions and loops"],
+            related_terms=["debugging"],
+            one_word_topic="Python",
+            one_word_synonyms=["Programming"],
+        ),
+    )
+    monkeypatch.setattr(
+        query_plan_module,
+        "_semantic_relevance_scores",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("extractive summary and retrieval terms must anchor lexically")
+        ),
+    )
+
+    plan = build_search_query_plan(conn, literal_query=literal)
+
+    assert plan.literal_query == literal
+    assert len(plan.literal_query) > 160
+    assert plan.primary_search_query == summary
+    assert len(plan.primary_search_query) <= 160
+    assert plan.one_word_topic == "Python"
+    assert plan.one_word_synonyms == ["Programming"]
+    assert [query.text for query in plan.queries] == [summary, "Python", "Programming"]
+    assert plan.queries[0].trust == "literal"
+    assert plan.queries[0].provenance == "ai_summary"
+    assert summary in plan.trusted_signature
+    assert "Python" not in plan.trusted_signature
+    assert "Programming" not in plan.trusted_signature
+    assert not transcript_window_matches_topic("Python is a large snake.", plan)
+    assert transcript_window_matches_topic(
+        "Python functions and loops help build reusable software.",
+        plan,
+    )
+    assert plan.as_topic_expansion() == {
+        "canonical_topic": "Programming Languages",
+        "aliases": ["software development"],
+        "subtopics": ["functions and loops"],
+        "related_terms": ["debugging"],
+    }
+    conn.close()
+
+
+def test_long_literal_fallback_preserves_identity_and_bounds_provider_query(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    literal = " ".join(
+        [
+            "photosynthesis",
+            "chlorophyll",
+            "sunlight",
+            "carbon",
+            "dioxide",
+            "water",
+            "glucose",
+            "oxygen",
+        ]
+        * 60
+    )
+    monkeypatch.setattr(
+        query_plan_module.llm_router,
+        "chat_completion",
+        lambda **_kwargs: None,
+    )
+
+    plan = build_search_query_plan(conn, literal_query=literal)
+
+    assert len(plan.literal_query) == 2_000
+    assert plan.literal_query == literal[:2_000]
+    assert plan.primary_search_query == plan.literal_query[:160]
+    assert len(plan.primary_search_query) == 160
+    assert [query.text for query in plan.queries] == [plan.primary_search_query]
+    assert plan.queries[0].trust == "literal"
+    assert plan.queries[0].provenance == "literal"
+    conn.close()
+
+
+def test_multiword_retrieval_topic_rejects_synonyms_and_uses_literal_fallback(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    monkeypatch.setattr(
+        query_plan_module.llm_router,
+        "chat_completion",
+        lambda **_kwargs: _ai_json(
+            canonical_query="Python",
+            subtopics=["Python functions"],
+            one_word_topic="Python programming",
+            one_word_synonyms=["Coding", "software development"],
+        ),
+    )
+    monkeypatch.setattr(
+        query_plan_module,
+        "_semantic_relevance_scores",
+        lambda _anchors, candidates: {
+            query_plan_module.normalize_query(candidate): 0.9
+            for candidate in candidates
+        },
+    )
+
+    plan = build_search_query_plan(conn, literal_query="Intro to Python")
+
+    assert plan.canonical_query == "Python"
+    assert plan.accepted_subtopics == ["Python functions"]
+    assert plan.primary_search_query == "Intro to Python"
+    assert plan.one_word_topic == ""
+    assert plan.one_word_synonyms == []
+    assert [query.text for query in plan.queries] == ["Intro to Python"]
+    assert any(
+        reason == "one_word_topic: must contain exactly one normalized token"
+        for reason in plan.rejection_reasons
+    )
+    assert any(
+        "one-word topic was rejected" in reason
+        for reason in plan.rejection_reasons
     )
     conn.close()
 
@@ -277,14 +453,13 @@ def test_schema_valid_ai_drift_is_rejected_by_semantic_validation(monkeypatch) -
     monkeypatch.setattr(
         query_plan_module.llm_router,
         "chat_completion",
-        lambda **_kwargs: json.dumps(
-            {
-                "canonical_query": "Propositional Logic",
-                "literal_is_ambiguous": True,
-                "aliases": [],
-                "subtopics": ["truth tables"],
-                "related_terms": ["logical connectives"],
-            }
+        lambda **_kwargs: _ai_json(
+            canonical_query="Propositional Logic",
+            literal_is_ambiguous=True,
+            one_word_topic="Logic",
+            one_word_synonyms=["Reasoning"],
+            subtopics=["truth tables"],
+            related_terms=["logical connectives"],
         ),
     )
     monkeypatch.setattr(
@@ -447,10 +622,17 @@ def test_fast_and_slow_plans_use_three_then_six_plus_three_plus_three(monkeypatc
     search.discover("concept", limit=1, context=slow, query_plan=plan)
 
     assert calls == [
-        ["Calculus Basics", "Calculus Basics", "query 1"],
-        ["Calculus Basics", "Calculus Basics", "query 1", "query 2", "query 3", "query 4"],
-        ["Calculus Basics", "Calculus Basics", "query 5"],
-        ["Calculus Basics", "Calculus Basics", "query 6"],
+        ["Calculus Basics", "Calculus", "Derivative"],
+        [
+            "Calculus Basics",
+            "Calculus",
+            "Derivative",
+            "Integral",
+            "Limit",
+            "Antiderivative",
+        ],
+        ["Calculus Basics", "Differentiation", "Integration"],
+        ["Calculus Basics", "Slope", "Area"],
     ]
 
 

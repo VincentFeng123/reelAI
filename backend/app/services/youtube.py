@@ -51,8 +51,8 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 # helper builds a fresh Session per video with its own target pick.
 _IMPERSONATE_TARGETS = [
     "chrome131",
-    "chrome133",
-    "chrome140",
+    "chrome136",
+    "chrome142",
     "chrome146",  # most recent free-tier target in curl_cffi 0.15
 ]
 

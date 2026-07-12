@@ -22,14 +22,14 @@ from . import llm_router
 from .embeddings import EmbeddingService
 
 
-PLAN_VERSION = 2
+PLAN_VERSION = 3
 PLAN_TTL_SEC = 24 * 60 * 60
 FALLBACK_PLAN_TTL_SEC = 15 * 60
 
 _GENERIC_QUERY_WORDS = {
     "a", "an", "and", "basics", "beginner", "beginners", "course", "deep",
-    "dive", "explained", "for", "fundamentals", "how", "introduction", "lecture",
-    "of", "overview", "the", "to", "tutorial", "works",
+    "dive", "explained", "for", "fundamentals", "how", "intro", "introduction",
+    "introductory", "lecture", "of", "overview", "the", "to", "tutorial", "works",
 }
 _GENERIC_TERMS = {
     "basics", "foundations", "introduction", "overview", "problem solving",
@@ -76,6 +76,9 @@ class AIQueryExpansion(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    search_summary: str = Field(max_length=160)
+    one_word_topic: str = Field(max_length=160)
+    one_word_synonyms: list[str] = Field(max_length=8)
     canonical_query: str = Field(max_length=160)
     literal_is_ambiguous: bool
     aliases: list[str] = Field(max_length=8)
@@ -100,6 +103,9 @@ class SearchQueryPlan(BaseModel):
     version: int = PLAN_VERSION
     literal_query: str
     canonical_query: str
+    primary_search_query: str = ""
+    one_word_topic: str = ""
+    one_word_synonyms: list[str] = Field(default_factory=list)
     accepted_aliases: list[str] = Field(default_factory=list)
     accepted_subtopics: list[str] = Field(default_factory=list)
     accepted_related_terms: list[str] = Field(default_factory=list)
@@ -201,6 +207,25 @@ def _ai_term_rejection(term: object) -> str | None:
     return None
 
 
+def _one_word_ai_term_rejection(term: object) -> str | None:
+    rejection = _ai_term_rejection(term)
+    if rejection is not None:
+        return rejection
+    if len(normalize_query(_clean(term)).split()) != 1:
+        return "must contain exactly one normalized token"
+    return None
+
+
+def _search_summary_rejection(summary: object) -> str | None:
+    rejection = _ai_term_rejection(summary)
+    if rejection is not None:
+        return rejection
+    word_count = len(normalize_query(_clean(summary)).split())
+    if word_count < 3 or word_count > 12:
+        return "must contain 3-12 normalized words"
+    return None
+
+
 def _lexically_coherent(anchor: object, candidate: object) -> bool:
     anchor_key = normalize_query(anchor)
     candidate_key = normalize_query(candidate)
@@ -213,6 +238,8 @@ def _lexically_coherent(anchor: object, candidate: object) -> bool:
     if not anchor_tokens or not candidate_tokens:
         return False
     overlap = len(anchor_tokens.intersection(candidate_tokens))
+    if overlap / len(candidate_tokens) >= 0.67:
+        return True
     return overlap / max(len(anchor_tokens), len(candidate_tokens)) >= 0.67
 
 
@@ -243,15 +270,15 @@ def _semantic_relevance_scores(
 def _planned_queries(
     *,
     literal: str,
-    canonical: str,
-    ai_aliases: list[str],
-    ai_subtopics: list[str],
-    ai_related: list[str],
+    primary: str,
+    primary_from_ai: bool,
+    one_word_topic: str,
+    one_word_synonyms: list[str],
     provenance: dict[str, list[str]],
 ) -> list[PlannedSearchQuery]:
     planned: list[PlannedSearchQuery] = []
     seen: set[str] = set()
-    root_family = semantic_query_family(canonical or literal)
+    root_family = semantic_query_family(one_word_topic or primary or literal)
 
     def add(value: str, trust: str, source: str, *, root: bool = False) -> None:
         text = _clean(value)
@@ -267,19 +294,17 @@ def _planned_queries(
         if source not in provenance[key]:
             provenance[key].append(source)
 
-    add(literal, "literal", "literal", root=True)
-    if normalize_query(canonical) != normalize_query(literal):
-        add(canonical, "canonical", "ai", root=True)
+    add(
+        primary,
+        "literal",
+        "ai_summary" if primary_from_ai else "literal",
+        root=True,
+    )
+    if normalize_query(one_word_topic) != normalize_query(primary):
+        add(one_word_topic, "canonical", "ai_retrieval", root=True)
 
-    # Gemini owns every non-literal query. Interleave its categories so fast
-    # mode does not spend both expansion slots on near-identical aliases.
-    for index in range(max(len(ai_aliases), len(ai_subtopics), len(ai_related))):
-        if index < len(ai_aliases):
-            add(ai_aliases[index], "ai", "ai", root=True)
-        if index < len(ai_subtopics):
-            add(ai_subtopics[index], "ai", "ai")
-        if index < len(ai_related):
-            add(ai_related[index], "ai", "ai")
+    for synonym in one_word_synonyms:
+        add(synonym, "ai", "ai_retrieval", root=True)
     return planned[:12]
 
 
@@ -291,9 +316,10 @@ def build_search_query_plan(
 ) -> SearchQueryPlan:
     """Build or load exactly one validated plan per normalized literal topic."""
     raise_if_cancelled(should_cancel)
-    literal = _clean(literal_query)
+    literal = _clean(literal_query, max_length=2_000)
     if not normalize_query(literal):
         raise ValueError("literal_query must contain non-whitespace text")
+    literal_is_long = len(normalize_query(literal).split()) > 12
 
     cached, age_sec = _read_cached_plan(conn, literal)
     if cached is not None:
@@ -302,6 +328,10 @@ def build_search_query_plan(
             return cached
 
     provenance: dict[str, list[str]] = {normalize_query(literal): ["literal"]}
+    primary_search_query = _clean(literal)
+    search_summary = ""
+    one_word_topic = ""
+    one_word_synonyms: list[str] = []
     canonical = literal
     aliases: list[str] = []
     subtopics: list[str] = []
@@ -312,22 +342,24 @@ def build_search_query_plan(
     seen_ai_terms: set[str] = {normalize_query(literal)}
 
     system = (
-        "Create a strict educational search expansion for one literal topic. "
-        "Return only the requested JSON schema. Do not change domains, infer learner intent, "
-        "or add rankings, admissions, entertainment, or generic pedagogy terms."
+        "Create a strict educational expansion and retrieval plan for one literal topic. "
+        "Return only the requested JSON schema. Preserve the subject domain. canonical_query, "
+        "aliases, subtopics, and related_terms support curriculum context. Separately, "
+        "one_word_topic and every one_word_synonym must each normalize to exactly one token, "
+        "and synonyms must be genuine synonyms of that topic. For long input, search_summary "
+        "must be one simple 3-12 word phrase sentence. Do not add rankings, admissions, "
+        "entertainment, or generic pedagogy terms."
     )
     user = (
         f"Literal topic: {literal}\n"
-        "Provide its canonical search query, concise aliases, concrete subtopics, "
-        "and tightly related search terms. Set literal_is_ambiguous when the literal "
-        "has common meanings in different subject domains. Every non-literal query "
-        "used by the application will come only from this response."
+        "Provide its canonical search concept, concise aliases, concrete subtopics, and tightly "
+        "related curriculum terms. Also provide a one-word retrieval topic and up to eight "
+        "one-word synonyms. If the literal is a long paragraph, summarize it as a simple 3-12 "
+        "word search_summary; otherwise return an empty search_summary. Set "
+        "literal_is_ambiguous when the literal has common meanings in different domains."
     )
     ai_status: Literal["validated", "unavailable", "invalid"] = "unavailable"
     rejection_reasons: list[str] = []
-    ai_aliases: list[str] = []
-    ai_subtopics: list[str] = []
-    ai_related: list[str] = []
     literal_is_ambiguous = False
     try:
         raw = llm_router.chat_completion(
@@ -344,6 +376,32 @@ def build_search_query_plan(
             payload = AIQueryExpansion.model_validate_json(raw)
             ai_status = "validated"
             literal_is_ambiguous = bool(payload.literal_is_ambiguous)
+
+            if literal_is_long:
+                candidate_summary = _clean(payload.search_summary)
+                summary_rejection = _search_summary_rejection(candidate_summary)
+                summary_scores = (
+                    {}
+                    if summary_rejection is not None
+                    or _lexically_coherent(literal, candidate_summary)
+                    else _semantic_relevance_scores([literal], [candidate_summary])
+                )
+                summary_score = float(
+                    (summary_scores or {}).get(normalize_query(candidate_summary), 0.0)
+                )
+                if summary_rejection is None and (
+                    _lexically_coherent(literal, candidate_summary)
+                    or summary_score >= 0.34
+                ):
+                    search_summary = candidate_summary
+                    primary_search_query = candidate_summary
+                    provenance.setdefault(normalize_query(candidate_summary), []).append(
+                        "ai_summary"
+                    )
+                else:
+                    reason = summary_rejection or "not semantically anchored to literal topic"
+                    rejection_reasons.append(f"search_summary: {reason}")
+
             ai_canonical = _clean(payload.canonical_query)
             canonical_rejection = _ai_term_rejection(ai_canonical) if ai_canonical else None
             canonical_scores = (
@@ -351,7 +409,9 @@ def build_search_query_plan(
                 if not ai_canonical or _lexically_coherent(literal, ai_canonical)
                 else _semantic_relevance_scores([literal], [ai_canonical])
             )
-            canonical_score = float((canonical_scores or {}).get(normalize_query(ai_canonical), 0.0))
+            canonical_score = float(
+                (canonical_scores or {}).get(normalize_query(ai_canonical), 0.0)
+            )
             canonical_coherent = (
                 not ai_canonical
                 or _lexically_coherent(literal, ai_canonical)
@@ -366,24 +426,24 @@ def build_search_query_plan(
                 reason = canonical_rejection or "not semantically anchored to literal topic"
                 rejection_reasons.append(f"canonical_query: {reason}")
 
-            raw_term_groups = (
-                ("aliases", payload.aliases, aliases, ai_aliases, seen_aliases, 0.34),
-                ("subtopics", payload.subtopics, subtopics, ai_subtopics, seen_subtopics, 0.28),
-                ("related_terms", payload.related_terms, related, ai_related, seen_related, 0.30),
+            curriculum_groups = (
+                ("aliases", payload.aliases, aliases, seen_aliases, 0.34),
+                ("subtopics", payload.subtopics, subtopics, seen_subtopics, 0.28),
+                ("related_terms", payload.related_terms, related, seen_related, 0.30),
             )
-            semantic_candidates = [
+            curriculum_candidates = [
                 _clean(term)
-                for _field, values, _destination, _ai_destination, _seen, _threshold in raw_term_groups
+                for _field, values, _destination, _seen, _threshold in curriculum_groups
                 for term in values
                 if _ai_term_rejection(term) is None
                 and not any(_lexically_coherent(anchor, term) for anchor in (literal, canonical))
             ]
-            semantic_scores = _semantic_relevance_scores(
-                [literal, canonical],
-                semantic_candidates,
-            ) if semantic_candidates else {}
-
-            for field_name, values, destination, ai_destination, seen, threshold in raw_term_groups:
+            curriculum_scores = (
+                _semantic_relevance_scores([literal, canonical], curriculum_candidates)
+                if curriculum_candidates
+                else {}
+            )
+            for field_name, values, destination, seen, threshold in curriculum_groups:
                 for index, raw_term in enumerate(values):
                     term = _clean(raw_term)
                     rejection = _ai_term_rejection(term)
@@ -393,10 +453,11 @@ def build_search_query_plan(
                     if normalize_query(term) in seen_ai_terms:
                         continue
                     lexical_match = any(
-                        _lexically_coherent(anchor, term)
-                        for anchor in (literal, canonical)
+                        _lexically_coherent(anchor, term) for anchor in (literal, canonical)
                     )
-                    semantic_score = float((semantic_scores or {}).get(normalize_query(term), 0.0))
+                    semantic_score = float(
+                        (curriculum_scores or {}).get(normalize_query(term), 0.0)
+                    )
                     if not lexical_match and semantic_score < threshold:
                         rejection_reasons.append(
                             f"{field_name}[{index}]: not semantically anchored to literal topic"
@@ -406,13 +467,83 @@ def build_search_query_plan(
                     if not accepted:
                         continue
                     seen_ai_terms.add(normalize_query(accepted))
-                    ai_destination.append(accepted)
                     provenance.setdefault(normalize_query(accepted), []).append("ai")
+
+            retrieval_anchors = [
+                literal,
+                search_summary,
+                canonical,
+                *aliases,
+                *subtopics,
+                *related,
+            ]
+            retrieval_topic = _clean(payload.one_word_topic)
+            retrieval_rejection = _one_word_ai_term_rejection(retrieval_topic)
+            retrieval_scores = (
+                {}
+                if retrieval_rejection is not None
+                or any(_lexically_coherent(anchor, retrieval_topic) for anchor in retrieval_anchors)
+                else _semantic_relevance_scores(retrieval_anchors, [retrieval_topic])
+            )
+            retrieval_score = float(
+                (retrieval_scores or {}).get(normalize_query(retrieval_topic), 0.0)
+            )
+            if retrieval_rejection is None and (
+                any(_lexically_coherent(anchor, retrieval_topic) for anchor in retrieval_anchors)
+                or retrieval_score >= 0.34
+            ):
+                one_word_topic = retrieval_topic
+                provenance.setdefault(normalize_query(retrieval_topic), []).append("ai_retrieval")
+            else:
+                reason = retrieval_rejection or "not semantically anchored to literal topic"
+                rejection_reasons.append(f"one_word_topic: {reason}")
+
+            synonym_anchors = [*retrieval_anchors, one_word_topic]
+            synonym_candidates = [
+                _clean(term)
+                for term in payload.one_word_synonyms
+                if one_word_topic
+                and _one_word_ai_term_rejection(term) is None
+                and not any(_lexically_coherent(anchor, term) for anchor in synonym_anchors)
+            ]
+            synonym_scores = (
+                _semantic_relevance_scores(synonym_anchors, synonym_candidates)
+                if synonym_candidates
+                else {}
+            )
+            synonym_seen = {
+                normalize_query(primary_search_query),
+                normalize_query(one_word_topic),
+            }
+            for index, raw_term in enumerate(payload.one_word_synonyms):
+                synonym = _clean(raw_term)
+                rejection = _one_word_ai_term_rejection(synonym)
+                if not one_word_topic:
+                    rejection = rejection or "one-word topic was rejected"
+                if rejection is not None:
+                    rejection_reasons.append(f"one_word_synonyms[{index}]: {rejection}")
+                    continue
+                lexical_match = any(
+                    _lexically_coherent(anchor, synonym) for anchor in synonym_anchors
+                )
+                semantic_score = float(
+                    (synonym_scores or {}).get(normalize_query(synonym), 0.0)
+                )
+                if not lexical_match and semantic_score < 0.40:
+                    rejection_reasons.append(
+                        f"one_word_synonyms[{index}]: not semantically anchored to topic"
+                    )
+                    continue
+                accepted = _append_unique(one_word_synonyms, synonym, synonym_seen)
+                if accepted:
+                    provenance.setdefault(normalize_query(accepted), []).append("ai_retrieval")
+
             if (
                 normalize_query(canonical) == normalize_query(literal)
                 and not aliases
                 and not subtopics
                 and not related
+                and not one_word_topic
             ):
                 ai_status = "invalid"
                 rejection_reasons.append("ai_expansion: response contained no usable expansion")
@@ -429,20 +560,23 @@ def build_search_query_plan(
 
     signature: list[str] = []
     signature_seen: set[str] = set()
-    for raw in [literal, canonical, *aliases, *subtopics, *related]:
+    for raw in [literal, search_summary, canonical, *aliases, *subtopics, *related]:
         _append_unique(signature, raw, signature_seen)
 
     planned = _planned_queries(
         literal=literal,
-        canonical=canonical,
-        ai_aliases=ai_aliases,
-        ai_subtopics=ai_subtopics,
-        ai_related=ai_related,
+        primary=primary_search_query,
+        primary_from_ai=bool(search_summary),
+        one_word_topic=one_word_topic,
+        one_word_synonyms=one_word_synonyms,
         provenance=provenance,
     )
     plan = SearchQueryPlan(
         literal_query=literal,
+        primary_search_query=primary_search_query,
         canonical_query=canonical,
+        one_word_topic=one_word_topic,
+        one_word_synonyms=one_word_synonyms,
         accepted_aliases=aliases[:8],
         accepted_subtopics=subtopics[:16],
         accepted_related_terms=related[:8],

@@ -36,7 +36,7 @@ Every event includes `job_id`, a monotonic `seq`, and a timestamp. Status and ca
 
 ### Retrieval and duration semantics
 
-Only canonical YouTube video, playlist, and channel URLs are accepted by ingestion surfaces. Discovery always includes an unrestricted literal query, while duplicate and expanded searches may prefer HD sources. Creative Commons and source-duration filters map directly to Supadata when selected. Transcripts use `mode=auto`: native captions are used when available and Supadata generates hosted timestamped cues otherwise.
+Only canonical YouTube video, playlist, and channel URLs are accepted by ingestion surfaces. Short topics search the exact user text first. Inputs longer than 12 words use a validated AI phrase summary as the practical first query while retaining the original text for final relevance checks. Remaining search calls use a validated AI one-word topic and its one-word synonyms; these non-primary requests prefer HD sources. Creative Commons and source-duration filters map directly to Supadata when selected. Transcripts use `mode=auto`: native captions are used when available and Supadata generates hosted timestamped cues otherwise.
 
 Clip duration is a preference. Valid self-contained clips are persisted inside the global 1–180 second safety envelope. Serving ranks requested-range clips first, then fills shortages with the nearest shorter/longer clips and reports `duration_preference_met` plus `duration_fit`.
 

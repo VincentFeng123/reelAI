@@ -11,6 +11,7 @@ from . import config
 from .cancellation import raise_if_cancelled, run_cancellable, sleep_with_probe, wait_with_probe
 from .errors import (
     ProviderAuthenticationError,
+    ProviderBudgetExceededError,
     ProviderError,
     ProviderQuotaError,
     ProviderRateLimitError,
@@ -265,6 +266,7 @@ def search_all(
 ) -> dict[str, Any]:
     credits_used = 0
     per_query: list[dict] = []
+    warning: str | None = None
     for index, query in enumerate(queries):
         raise_if_cancelled(should_cancel)
         effective_filters = (
@@ -272,14 +274,20 @@ def search_all(
             if request_filters is not None and index < len(request_filters)
             else filters
         )
-        result = search_one(
-            query,
-            effective_filters,
-            should_cancel,
-            language=language,
-            context=context,
-            cache_store=cache_store,
-        )
+        try:
+            result = search_one(
+                query,
+                effective_filters,
+                should_cancel,
+                language=language,
+                context=context,
+                cache_store=cache_store,
+            )
+        except ProviderBudgetExceededError:
+            if not per_query:
+                raise
+            warning = "Search budget exhausted after partial results."
+            break
         credits_used += int(result.get("billed") or 0)
         per_query.append(result)
         if (
@@ -290,4 +298,4 @@ def search_all(
             break
         if index < len(queries) - 1:
             wait_with_probe(0.25, should_cancel)
-    return {"per_query": per_query, "credits_used": credits_used, "warning": None}
+    return {"per_query": per_query, "credits_used": credits_used, "warning": warning}
