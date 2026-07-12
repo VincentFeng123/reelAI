@@ -2798,22 +2798,27 @@ def _verified_cross_request_source_generation(
     concept_id: str | None,
 ) -> str | None:
     """Return the newest other-request inventory only when its whole chain is verified."""
+    concept_clause = "AND concept_id IS NULL"
+    candidate_params: tuple[Any, ...] = (material_id, learner_id, request_key)
+    if concept_id is not None:
+        concept_clause = "AND concept_id = ?"
+        candidate_params = (*candidate_params, concept_id)
     candidate = fetch_one(
         conn,
-        """
+        f"""
         SELECT result_generation_id
         FROM reel_generation_jobs
         WHERE material_id = ?
           AND learner_id = ?
           AND request_key <> ?
-          AND ((? IS NULL AND concept_id IS NULL) OR concept_id = ?)
+          {concept_clause}
           AND status IN ('completed', 'partial')
           AND result_generation_id IS NOT NULL
           AND TRIM(result_generation_id) <> ''
         ORDER BY completed_at DESC, updated_at DESC, created_at DESC, id DESC
         LIMIT 1
         """,
-        (material_id, learner_id, request_key, concept_id, concept_id),
+        candidate_params,
     )
     generation_id = str((candidate or {}).get("result_generation_id") or "").strip()
     if not generation_id:

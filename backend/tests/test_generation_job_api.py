@@ -1233,6 +1233,42 @@ def test_feed_reuses_verified_prior_level_inventory_and_still_queues_bootstrap(
         conn.close()
 
 
+@pytest.mark.parametrize(
+    ("concept_id", "expected_clause", "expected_params"),
+    [
+        (None, "AND concept_id IS NULL", ("m1", "learner-1", "new-request")),
+        ("c1", "AND concept_id = ?", ("m1", "learner-1", "new-request", "c1")),
+    ],
+)
+def test_cross_request_source_query_avoids_untyped_null_parameters(
+    monkeypatch,
+    concept_id: str | None,
+    expected_clause: str,
+    expected_params: tuple[str, ...],
+) -> None:
+    observed: dict[str, object] = {}
+
+    def record_candidate_query(_conn, sql, params):
+        observed["sql"] = sql
+        observed["params"] = params
+        return None
+
+    monkeypatch.setattr(main, "fetch_one", record_candidate_query)
+
+    result = main._verified_cross_request_source_generation(
+        object(),
+        material_id="m1",
+        learner_id="learner-1",
+        request_key="new-request",
+        concept_id=concept_id,
+    )
+
+    assert result is None
+    assert expected_clause in str(observed["sql"])
+    assert "? IS NULL" not in str(observed["sql"])
+    assert observed["params"] == expected_params
+
+
 def test_cross_level_reservoir_rejects_unverified_or_implicit_surface_rows() -> None:
     conn = _conn()
     completed_at = datetime.now(timezone.utc).isoformat()
