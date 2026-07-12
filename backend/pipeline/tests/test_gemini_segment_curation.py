@@ -359,6 +359,72 @@ def test_production_biology_range_repairs_around_channel_bump():
     assert "have a great day" not in clip_text
 
 
+def test_production_biology_fragment_expands_to_question_and_complete_list():
+    raw_cues = [
+        (74.120, 77.600, "Ok, so enzymes make life possible by speeding up chemical reactions,"),
+        (77.600, 83.760, "but what even is…life? Scientists don't really seem to agree, but obviously a cat is different"),
+        (83.760, 88.200, "from a rock. The cat can produce energy by metabolizing food, it can grow and develop,"),
+        (88.200, 92.320, "reproduce, and it responds to the environment, whereas the rock does not."),
+        (92.320, 95.960, "Also, unlike rocks, every living thing on earth is made of cells, of which there's"),
+        (95.960, 101.240, "two main categories: Eukaryotes and prokaryotes. Eukaryotes have fancy organelles which are bound"),
+        (101.240, 106.040, "by membranes, like the nucleus, inside of which is DNA. Prokaryotes have none of those organelles,"),
+        (106.040, 110.120, "and the DNA is just kind of chilling there, like freely floating around."),
+        (110.120, 113.320, "This is why Prokaryotes are just single cell organisms like bacteria"),
+        (113.320, 117.760, "and archea whereas eukaryotes can form complex organisms like protists, fungi,"),
+        (117.760, 121.920, "plants and animals. These are what's known as kingdoms, which is a taxonomic rank,"),
+        (121.920, 126.040, "so basically, how we classify different living things and how they're related to one another."),
+    ]
+    segments = [
+        {"cue_id": f"3tisOnOkwzo:cue:{index + 15}", "start": start, "end": end, "text": text}
+        for index, (start, end, text) in enumerate(raw_cues)
+    ]
+    proposal = G._BoundaryTopic(
+        candidate_id="biology-cell-types",
+        start_line=3,
+        end_line=9,
+        start_quote="reproduce, and it responds to the environment",
+        end_quote="complex organisms like protists, fungi",
+        title="Eukaryotic and prokaryotic cell structures",
+        learning_objective="Distinguish eukaryotic and prokaryotic cells.",
+        facet="cell structure",
+        reason="Explains the two cell categories and their organelles.",
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.3,
+        directly_teaches_topic=True,
+        substantive=True,
+        topic_evidence_quote="every living thing on earth is made of cells, of which there's two main categories",
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {
+            "_segment_target_sec": 40,
+            "_segment_target_min_sec": 20,
+            "_segment_target_max_sec": 55,
+            "_segment_ignore_caption_case": True,
+        },
+        topic="biology",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["cue_ids"][0] == "3tisOnOkwzo:cue:16"
+    assert clip["cue_ids"][-1] == "3tisOnOkwzo:cue:26"
+    assert clip["end"] - clip["start"] <= 55
+    clip_text = G._cue_clip_text(segments, clip["_start_line"], clip["_end_line"])
+    assert clip_text.startswith("but what even is…life?")
+    assert clip_text.endswith("related to one another.")
+
+
 def test_structural_filler_is_rejected_even_when_scores_are_high():
     segments = [{
         "start": 0.0,

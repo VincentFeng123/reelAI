@@ -16,6 +16,21 @@ def test_however_continuation_is_weak():
     assert opens_mid_thought("However we do have a subscript next to O and it's a two.")
 
 
+def test_dialogue_reply_and_mid_list_ordinal_are_weak():
+    assert opens_mid_thought("Yeah- They like it.")
+    assert opens_mid_thought("Yes, that's correct.")
+    assert opens_mid_thought("Exactly, that's the point.")
+    assert opens_mid_thought("Second, it needs to exhibit traits that affect survival.")
+
+
+def test_ordinal_and_reply_words_are_valid_when_they_are_subjects():
+    assert is_onset("Second law relates force, mass, and acceleration.")
+    assert is_onset("No force acts on the object after release.")
+    assert is_onset("Right triangles satisfy the Pythagorean theorem.")
+    assert is_onset("Exactly one solution exists for this equation.")
+    assert is_onset("Yes votes determine the result of the referendum.")
+
+
 def test_back_to_prior_context_is_weak():
     assert opens_mid_thought("Back to the cycle!")
 

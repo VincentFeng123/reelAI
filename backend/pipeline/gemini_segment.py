@@ -665,6 +665,54 @@ def _cue_opens_mid_thought(text: str, *, ignore_caption_case: bool) -> bool:
     )
 
 
+def _cue_opens_mid_thought_at(
+    segments: list[dict],
+    index: int,
+    *,
+    ignore_caption_case: bool,
+) -> bool:
+    """Use the preceding cue to recover reliable lowercase-fragment evidence."""
+    text = str(segments[index].get("text") or "").strip()
+    if _cue_opens_mid_thought(
+        text, ignore_caption_case=ignore_caption_case
+    ):
+        return True
+    opening_terminator = re.search(r"[.!?]", text)
+    if (
+        not ignore_caption_case
+        or index <= 0
+        or not text[:1].islower()
+        or (
+            opening_terminator is not None
+            and opening_terminator.group(0) == "?"
+        )
+    ):
+        return False
+
+    previous_text = str(segments[index - 1].get("text") or "").strip()
+    if re.search(r"[,;:\-—][\"')\]]*$", previous_text):
+        return True
+    words = _toks(text)
+    if words and words[0] in {
+        "by", "during", "from", "into", "of", "onto", "to", "while", "with",
+        "without",
+    }:
+        return True
+
+    from .sentences import classify_terminator
+
+    previous_words = _toks(previous_text)
+    explicit_closure_words = {
+        "answer", "answered", "complete", "completed", "completely", "conclusion",
+        "end", "ended", "final", "finished", "finishes", "result", "solved",
+    }
+    return bool(
+        len(previous_words) >= 5
+        and not classify_terminator(previous_text)
+        and not explicit_closure_words.intersection(previous_words[-5:])
+    )
+
+
 def _cue_has_weak_end(
     text: str,
     next_text: str,
@@ -675,7 +723,10 @@ def _cue_has_weak_end(
     from .refine import _is_weak_end
     from .sentences import Sentence, classify_terminator
 
-    guarded = _guard_text(text, ignore_caption_case=ignore_caption_case)
+    raw_text = str(text or "").strip()
+    if re.search(r"[,;:\-—][\"')\]]*$", raw_text):
+        return True
+    guarded = _guard_text(raw_text, ignore_caption_case=ignore_caption_case)
     terminator = classify_terminator(guarded)
     sentence = Sentence(
         idx=0,
@@ -755,8 +806,9 @@ def _close_cue_context(
     original_start = start_line
     original_end = end_line
     for _ in range(cue_limit):
-        if not _cue_opens_mid_thought(
-            str(segments[start_line].get("text") or ""),
+        if not _cue_opens_mid_thought_at(
+            segments,
+            start_line,
             ignore_caption_case=ignore_caption_case,
         ):
             break
@@ -770,8 +822,9 @@ def _close_cue_context(
         if movement > _CONTEXT_WINDOW_S + 1e-9:
             break
         start_line = candidate
-    if _cue_opens_mid_thought(
-        str(segments[start_line].get("text") or ""),
+    if _cue_opens_mid_thought_at(
+        segments,
+        start_line,
         ignore_caption_case=ignore_caption_case,
     ):
         return start_line, end_line, "unresolved_weak_start"
@@ -854,8 +907,9 @@ def _repair_oversized_cue_range(
         start_shift = candidate_start_time - float(
             segments[start_line].get("start", 0.0)
         )
-        if _cue_opens_mid_thought(
-            str(segments[candidate_start].get("text") or ""),
+        if _cue_opens_mid_thought_at(
+            segments,
+            candidate_start,
             ignore_caption_case=ignore_caption_case,
         ):
             continue

@@ -20,7 +20,14 @@ CONTINUATION_MARKERS: frozenset[str] = frozenset({
     "anyway", "anyways", "also", "plus", "or", "nor", "yet", "then", "well",
     "okay", "ok", "alright", "actually", "basically", "meanwhile", "however",
     "moreover", "furthermore", "additionally", "consequently", "again",
+    "yeah", "yep",
 })
+
+_MID_LIST_OR_REPLY_RE = re.compile(
+    r"^(?:(?:second|third|fourth)(?:ly)?|finally|no|right|yes|exactly)"
+    r"(?:\s*[,;:]|\s*[-–—]\s+)",
+    re.IGNORECASE,
+)
 
 # Bare anaphora that, as the first word before a verb/aux, lack an in-clip antecedent.
 ANAPHORS: frozenset[str] = frozenset({
@@ -90,6 +97,9 @@ def opens_mid_thought(text: str) -> bool:
     #    (post-punctuation-restoration sentences are capitalized at true onsets)
     stripped = (text or "").lstrip()
     if stripped and stripped[0].islower():
+        return True
+
+    if _MID_LIST_OR_REPLY_RE.match(stripped):
         return True
 
     framing = _is_framing_or_question(text, words)

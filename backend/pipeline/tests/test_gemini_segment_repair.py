@@ -97,6 +97,91 @@ def test_unpunctuated_fixed_size_cue_edges_are_not_marked_clean() -> None:
         "covalent bonds share pairs of electrons",
         ignore_caption_case=True,
     ) is False
+    assert G._cue_has_weak_end(
+        "complex organisms like protists, fungi,",
+        "plants and animals complete the list.",
+        ignore_caption_case=True,
+    ) is True
+
+
+def test_lowercase_fragment_uses_previous_unfinished_cue_as_evidence() -> None:
+    segments = [
+        {"text": "it can grow and develop,"},
+        {"text": "reproduce, and it responds to the environment."},
+        {"text": "a new sentence starts after a complete thought."},
+    ]
+
+    assert G._cue_opens_mid_thought_at(
+        segments, 1, ignore_caption_case=True
+    ) is True
+    assert G._cue_opens_mid_thought_at(
+        segments, 2, ignore_caption_case=True
+    ) is False
+
+
+def test_production_gene_clip_includes_the_first_selection_criterion() -> None:
+    segments = [
+        {
+            "start": 1024.640,
+            "end": 1048.640,
+            "text": (
+                "Genes are the core unit of natural selection. For something to "
+                "undergo selection, it needs three characteristics. First, it needs "
+                "to make near identical copies of itself."
+            ),
+        },
+        {
+            "start": 1048.640,
+            "end": 1074.960,
+            "text": (
+                "Second, it needs traits that affect its interaction with the "
+                "environment and its probability of survival and reproduction. "
+                "What about something bigger, like a chromosome?"
+            ),
+        },
+        {
+            "start": 1074.960,
+            "end": 1101.200,
+            "text": "This is why the gene is the unit of natural selection.",
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        1,
+        2,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 2, None)
+
+
+def test_production_dialogue_reply_is_rejected_when_context_exceeds_repair_window() -> None:
+    segments = [
+        {
+            "start": 0.080,
+            "end": 30.555,
+            "text": "Why does poop smell bad? How do you think it smells to flies?",
+        },
+        {
+            "start": 30.555,
+            "end": 58.640,
+            "text": (
+                "Yeah- They like it. Animals love stinky things. Poop smells good "
+                "to flies because it is food, but dangerous bacteria make humans "
+                "avoid it."
+            ),
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        1,
+        1,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (1, 1, "unresolved_weak_start")
 
 
 def test_dirty_edges_use_one_localized_low_thinking_flash_batch(monkeypatch):
