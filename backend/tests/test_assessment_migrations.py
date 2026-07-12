@@ -34,6 +34,7 @@ def test_fresh_sqlite_schema_contains_assessment_tables_and_private_keys() -> No
         assert {"correct_index", "explanation", "fingerprint"} <= _columns(
             conn, "reel_assessment_questions"
         )
+        assert "scrolled_at" in _columns(conn, "learner_reel_progress")
     finally:
         conn.close()
 
@@ -62,6 +63,13 @@ def test_existing_sqlite_reels_and_history_are_migrated_idempotently() -> None:
                 "feed_query TEXT, active_index INTEGER, active_reel_id TEXT, "
                 "PRIMARY KEY(account_id, material_id))"
             )
+            conn.execute(
+                "CREATE TABLE learner_reel_progress ("
+                "learner_id TEXT NOT NULL, reel_id TEXT NOT NULL, material_id TEXT NOT NULL, "
+                "max_fraction REAL NOT NULL DEFAULT 0.0, completed_at TEXT, "
+                "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                "PRIMARY KEY(learner_id, reel_id))"
+            )
             conn.commit()
             conn.close()
 
@@ -74,6 +82,12 @@ def test_existing_sqlite_reels_and_history_are_migrated_idempotently() -> None:
                     migrated, "reels"
                 )
                 assert "recall_json" in _columns(migrated, "community_material_history")
+                assert "scrolled_at" in _columns(migrated, "learner_reel_progress")
+                indexes = {
+                    str(row[1])
+                    for row in migrated.execute("PRAGMA index_list(learner_reel_progress)")
+                }
+                assert "idx_learner_reel_progress_material_scrolled" in indexes
             finally:
                 migrated.close()
         finally:
@@ -98,3 +112,4 @@ def test_postgres_schema_contains_matching_assessment_contract() -> None:
         assert f"CREATE TABLE IF NOT EXISTS {table}" in sql
     assert "WHERE status = 'pending'" in sql
     assert "correct_index INTEGER NOT NULL" in sql
+    assert "scrolled_at TEXT" in sql

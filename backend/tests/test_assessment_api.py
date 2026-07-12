@@ -54,7 +54,7 @@ class TestAssessmentApi:
                 "VALUES (?, 'physics', 'physics', 'topic', 'beginner', ?)",
                 (MATERIAL, "2026-07-09T00:00:00+00:00"),
             )
-            for index in range(3):
+            for index in range(5):
                 concept_id = f"api-concept-{index}"
                 video_id = f"api-video-{index}"
                 reel_id = f"api-reel-{index}"
@@ -94,26 +94,13 @@ class TestAssessmentApi:
                 )
 
     def test_progress_next_pending_answer_contract_and_privacy(self) -> None:
-        first = self.client.post(
+        progress = self.client.post(
             "/api/reels/api-reel-0/progress",
             headers=self.headers_a,
             json={"max_fraction": 1.0},
         )
-        second = self.client.post(
-            "/api/reels/api-reel-1/progress",
-            headers=self.headers_a,
-            json={"max_fraction": 1.0},
-        )
-        third = self.client.post(
-            "/api/reels/api-reel-2/progress",
-            headers=self.headers_a,
-            json={"max_fraction": 1.0},
-        )
-        assert first.status_code == 200
-        assert second.status_code == 200
-        assert third.status_code == 200
-        assert second.json()["assessment_ready"] is False
-        assert third.json()["assessment_ready"] is True
+        assert progress.status_code == 200
+        assert progress.json()["assessment_ready"] is False
         assert {
             "reel_id",
             "completed",
@@ -121,7 +108,35 @@ class TestAssessmentApi:
             "assessment_ready",
             "information_units",
             "readiness_threshold",
-        } == set(third.json())
+        } == set(progress.json())
+
+        scrolls = []
+        for index in range(5):
+            response = self.client.post(
+                f"/api/reels/api-reel-{index}/scroll",
+                headers=self.headers_a,
+            )
+            assert response.status_code == 200
+            scrolls.append(response.json())
+            if scrolls[-1]["assessment_ready"]:
+                break
+        assert scrolls[-1]["assessment_ready"] is True
+        assert scrolls[-1]["scroll_count"] == scrolls[-1]["cadence_target"]
+        assert 2 <= scrolls[-1]["cadence_target"] <= 5
+        assert {
+            "reel_id",
+            "material_id",
+            "newly_scrolled",
+            "assessment_ready",
+            "scroll_count",
+            "cadence_target",
+        } == set(scrolls[-1])
+        duplicate = self.client.post(
+            "/api/reels/api-reel-0/scroll", headers=self.headers_a
+        )
+        assert duplicate.status_code == 200
+        assert duplicate.json()["newly_scrolled"] is False
+        assert duplicate.json()["scroll_count"] == scrolls[-1]["scroll_count"]
 
         created = self.client.post(
             "/api/assessments/next",
@@ -172,13 +187,17 @@ class TestAssessmentApi:
         assert float(progress["global_adjustment"]) == 0.16
 
     def test_other_learner_cannot_resume_or_answer_session(self) -> None:
-        for index in range(3):
+        ready = False
+        for index in range(5):
             response = self.client.post(
-                f"/api/reels/api-reel-{index}/progress",
+                f"/api/reels/api-reel-{index}/scroll",
                 headers=self.headers_a,
-                json={"max_fraction": 1.0},
             )
             assert response.status_code == 200
+            ready = bool(response.json()["assessment_ready"])
+            if ready:
+                break
+        assert ready is True
         created = self.client.post(
             "/api/assessments/next",
             headers=self.headers_a,
@@ -209,3 +228,8 @@ class TestAssessmentApi:
             json={"max_fraction": 1.0},
         )
         assert response.status_code == 404
+        scroll = self.client.post(
+            "/api/reels/community-only/scroll",
+            headers=self.headers_a,
+        )
+        assert scroll.status_code == 404

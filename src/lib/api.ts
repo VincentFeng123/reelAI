@@ -19,6 +19,7 @@ import type {
   MaterialResponse,
   Reel,
   ReelProgressResponse,
+  ReelScrollResponse,
   ReelsCanGenerateAnyResponse,
   ReelsCanGenerateResponse,
   ReelsGenerateResponse,
@@ -1352,6 +1353,20 @@ export async function reportReelProgress(params: {
     signal: params.signal,
   });
   return parseJsonResponse<ReelProgressResponse>(res);
+}
+
+export async function reportReelScroll(params: {
+  reelId: string;
+  signal?: AbortSignal;
+}): Promise<ReelScrollResponse> {
+  const res = await safeFetch(apiUrl(`/reels/${encodeURIComponent(params.reelId)}/scroll`), {
+    method: "POST",
+    headers: {
+      ...communityRequestHeaders(),
+    },
+    signal: params.signal,
+  });
+  return parseJsonResponse<ReelScrollResponse>(res);
 }
 
 export async function fetchPendingAssessment(params: {

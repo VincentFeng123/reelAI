@@ -93,9 +93,11 @@ def _seed_reel(
 
 
 def _complete(service: AssessmentService, conn, reel_id: str, learner: str = LEARNER):
-    return service.record_progress(
+    progress = service.record_progress(
         conn, learner_id=learner, reel_id=reel_id, max_fraction=1.0
     )
+    scroll = service.record_scroll(conn, learner_id=learner, reel_id=reel_id)
+    return {**progress, **scroll}
 
 
 def _seed_completed_accuracy(
@@ -143,104 +145,158 @@ def test_progress_is_idempotent_and_rejects_non_study_reels(conn) -> None:
     assert second["completed"] is True and second["newly_completed"] is True
     assert third["completed"] is True and third["newly_completed"] is False
     row = conn.execute(
-        "SELECT max_fraction, completed_at FROM learner_reel_progress "
+        "SELECT max_fraction, scrolled_at, completed_at FROM learner_reel_progress "
         "WHERE learner_id = ? AND reel_id = 'r1'",
         (LEARNER,),
     ).fetchone()
     assert float(row["max_fraction"]) == pytest.approx(0.8)
+    assert row["scrolled_at"] is None
+    assert service.pending(
+        conn, learner_id=LEARNER, material_id=MATERIAL
+    )["assessment_ready"] is False
     with pytest.raises(ValueError, match="reel_id not found"):
         service.record_progress(
             conn, learner_id=LEARNER, reel_id="community-only", max_fraction=1.0
         )
 
 
-def test_no_history_becomes_ready_after_three_completed_videos(conn) -> None:
-    service = AssessmentService(question_generator=lambda *_args: None)
-    results = []
-    for index in range(3):
-        reel_id = f"short-{index}"
-        _seed_reel(
-            conn,
-            reel_id=reel_id,
-            concept_id=f"short-c{index}",
-            video_id=f"short-v{index}",
-            duration=20.0,
-            informativeness=0.6,
-        )
-        results.append(_complete(service, conn, reel_id))
-    assert [result["assessment_ready"] for result in results] == [False, False, True]
-    assert results[-1]["readiness_threshold"] == 3.0
-
-
-def test_low_recent_accuracy_becomes_ready_after_two_completed_videos(conn) -> None:
-    _seed_completed_accuracy(
-        conn, session_id="low-accuracy", correct_count=6
-    )
+def test_progress_preserves_scroll_written_after_its_initial_read(conn, monkeypatch) -> None:
+    _seed_reel(conn, reel_id="progress-scroll-race", concept_id="race-c", video_id="race-v")
     service = AssessmentService()
-    results = []
-    for index in range(2):
-        reel_id = f"low-{index}"
-        _seed_reel(
-            conn,
-            reel_id=reel_id,
-            concept_id=f"low-c{index}",
-            video_id=f"low-v{index}",
-        )
-        results.append(_complete(service, conn, reel_id))
-    assert [result["assessment_ready"] for result in results] == [False, True]
-    assert results[-1]["readiness_threshold"] == 2.0
-
-
-def test_mid_recent_accuracy_becomes_ready_after_three_completed_videos(conn) -> None:
-    _seed_completed_accuracy(
-        conn, session_id="mid-accuracy", correct_count=8
-    )
-    service = AssessmentService()
-    results = []
-    for index in range(3):
-        reel_id = f"mid-{index}"
-        _seed_reel(
-            conn,
-            reel_id=reel_id,
-            concept_id=f"mid-c{index}",
-            video_id=f"mid-v{index}",
-        )
-        results.append(_complete(service, conn, reel_id))
-    assert [result["assessment_ready"] for result in results] == [False, False, True]
-    assert results[-1]["readiness_threshold"] == 3.0
-
-
-def test_two_high_accuracy_sessions_defer_until_four_completed_videos(conn) -> None:
-    _seed_completed_accuracy(
+    service.record_progress(
         conn,
-        session_id="high-older",
-        correct_count=9,
-        completed_at="2026-07-08T00:00:00+00:00",
+        learner_id=LEARNER,
+        reel_id="progress-scroll-race",
+        max_fraction=0.25,
     )
-    _seed_completed_accuracy(
+    original_upsert = assessments_module.upsert
+    injected_scroll_at = "2026-07-09T12:00:00+00:00"
+
+    def interleaved_upsert(target_conn, table, data, pk="id"):
+        if table == "learner_reel_progress":
+            target_conn.execute(
+                "UPDATE learner_reel_progress SET scrolled_at = ? "
+                "WHERE learner_id = ? AND reel_id = ?",
+                (injected_scroll_at, LEARNER, "progress-scroll-race"),
+            )
+        return original_upsert(target_conn, table, data, pk=pk)
+
+    monkeypatch.setattr(assessments_module, "upsert", interleaved_upsert)
+    service.record_progress(
         conn,
-        session_id="high-newer",
-        correct_count=10,
-        completed_at="2026-07-08T01:00:00+00:00",
+        learner_id=LEARNER,
+        reel_id="progress-scroll-race",
+        max_fraction=0.8,
     )
+
+    row = conn.execute(
+        "SELECT scrolled_at FROM learner_reel_progress "
+        "WHERE learner_id = ? AND reel_id = ?",
+        (LEARNER, "progress-scroll-race"),
+    ).fetchone()
+    assert row["scrolled_at"] == injected_scroll_at
+
+
+def test_completion_does_not_drive_quiz_readiness(conn) -> None:
     service = AssessmentService()
-    results = []
-    for index in range(4):
-        reel_id = f"high-{index}"
+    for index in range(5):
+        reel_id = f"completed-only-{index}"
         _seed_reel(
             conn,
             reel_id=reel_id,
-            concept_id=f"high-c{index}",
-            video_id=f"high-v{index}",
+            concept_id=f"completed-only-c{index}",
+            video_id=f"completed-only-v{index}",
         )
-        results.append(_complete(service, conn, reel_id))
-    assert [result["assessment_ready"] for result in results] == [
-        False,
-        False,
-        False,
-        True,
-    ]
-    assert results[-1]["readiness_threshold"] == 4.0
+        result = service.record_progress(
+            conn, learner_id=LEARNER, reel_id=reel_id, max_fraction=1.0
+        )
+        assert result["completed"] is True
+        assert result["assessment_ready"] is False
+
+
+def test_scroll_is_idempotent_and_preserves_partial_watch_analytics(conn) -> None:
+    _seed_reel(conn, reel_id="idempotent-scroll", concept_id="scroll-c", video_id="scroll-v")
+    service = AssessmentService()
+    service.record_progress(
+        conn, learner_id=LEARNER, reel_id="idempotent-scroll", max_fraction=0.25
+    )
+    first = service.record_scroll(
+        conn, learner_id=LEARNER, reel_id="idempotent-scroll"
+    )
+    second = service.record_scroll(
+        conn, learner_id=LEARNER, reel_id="idempotent-scroll"
+    )
+    assert first["newly_scrolled"] is True
+    assert second["newly_scrolled"] is False
+    assert second["scroll_count"] == 1
+    row = conn.execute(
+        "SELECT max_fraction, scrolled_at, completed_at FROM learner_reel_progress "
+        "WHERE learner_id = ? AND reel_id = 'idempotent-scroll'",
+        (LEARNER,),
+    ).fetchone()
+    assert float(row["max_fraction"]) == pytest.approx(0.25)
+    assert row["scrolled_at"]
+    assert row["completed_at"] is None
+
+
+def test_scroll_cadence_is_deterministic_adaptive_and_bounded(conn) -> None:
+    service = AssessmentService()
+    changed = [{"concept_id": "a"}, {"concept_id": "b"}]
+    same = [{"concept_id": "a"}, {"concept_id": "a"}]
+    common = {
+        "learner_id": LEARNER,
+        "material_id": MATERIAL,
+        "window_cutoff": "",
+    }
+    neutral = service._cadence_target(
+        **common, recent_accuracy=None, scroll_rows=changed
+    )
+    assert neutral == service._cadence_target(
+        **common, recent_accuracy=None, scroll_rows=changed
+    )
+    low = service._cadence_target(
+        **common, recent_accuracy=0.4, scroll_rows=changed
+    )
+    strong = service._cadence_target(
+        **common, recent_accuracy=1.0, scroll_rows=changed
+    )
+    continuous = service._cadence_target(
+        **common, recent_accuracy=None, scroll_rows=same
+    )
+    assert neutral == service._cadence_target(
+        **common,
+        recent_accuracy=None,
+        scroll_rows=[*changed, {"concept_id": "b"}],
+    )
+    assert 2 <= low <= neutral <= strong <= 5
+    assert neutral <= continuous <= 5
+
+
+def test_distinct_scrolls_become_ready_at_backend_owned_target(conn) -> None:
+    service = AssessmentService()
+    results = []
+    for index in range(5):
+        reel_id = f"scroll-{index}"
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id="continuous-concept",
+            video_id=f"scroll-v{index}",
+        )
+        results.append(service.record_scroll(conn, learner_id=LEARNER, reel_id=reel_id))
+        if results[-1]["assessment_ready"]:
+            break
+    final = results[-1]
+    assert final["assessment_ready"] is True
+    assert final["scroll_count"] == final["cadence_target"]
+    assert 2 <= final["cadence_target"] <= 5
+    rows = conn.execute(
+        "SELECT max_fraction, completed_at FROM learner_reel_progress "
+        "WHERE learner_id = ? AND scrolled_at IS NOT NULL",
+        (LEARNER,),
+    ).fetchall()
+    assert rows and all(float(row["max_fraction"]) == 0.0 for row in rows)
+    assert all(row["completed_at"] is None for row in rows)
 
 
 def test_dense_clips_create_and_resume_private_question_session(conn) -> None:
@@ -290,7 +346,7 @@ def test_session_uses_two_distinct_watched_reels_and_concepts(conn) -> None:
     assert {question["reel_id"] for question in session["questions"]} <= set(reel_ids[:3])
 
 
-def test_question_backfill_fills_a_second_recent_concept(conn) -> None:
+def test_next_session_backfill_fills_a_second_recent_concept(conn) -> None:
     generated_reels: list[str] = []
 
     def generator(rows, _should_cancel=None):
@@ -313,6 +369,7 @@ def test_question_backfill_fills_a_second_recent_concept(conn) -> None:
         ("same-concept-0", "shared-concept", True),
         ("same-concept-1", "shared-concept", True),
         ("second-concept", "distinct-concept", False),
+        ("same-concept-2", "shared-concept", True),
     ]
     for index, (reel_id, concept_id, with_question) in enumerate(specs):
         _seed_reel(
@@ -324,10 +381,11 @@ def test_question_backfill_fills_a_second_recent_concept(conn) -> None:
         )
         _complete(service, conn, reel_id)
 
-    assert generated_reels == ["second-concept"]
+    assert generated_reels == []
     session = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)[
         "session"
     ]
+    assert generated_reels == ["second-concept"]
     assert {question["concept_id"] for question in session["questions"]} == {
         "shared-concept",
         "distinct-concept",
@@ -354,11 +412,12 @@ def test_due_session_uses_one_question_when_only_one_is_grounded(conn) -> None:
         progress = _complete(service, conn, f"fallback-{index}")
 
     assert progress["assessment_ready"] is True
+    assert calls == 0
     created = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
     assert created["status"] == "ready"
     assert created["session"]["question_count"] == 1
     assert created["session"]["questions"][0]["reel_id"] == "fallback-0"
-    assert calls == 2
+    assert calls == 1
 
 
 def test_transient_generation_failure_keeps_due_state_and_retries(conn) -> None:
@@ -398,6 +457,10 @@ def test_transient_generation_failure_keeps_due_state_and_retries(conn) -> None:
         progress = _complete(service, conn, f"retry-{index}")
 
     assert progress["assessment_ready"] is True
+    assert calls == 0
+    first = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+    assert first["status"] == "not_ready"
+    assert first["assessment_ready"] is True
     created = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
     assert calls == 2
     assert created["status"] == "ready"
@@ -490,6 +553,9 @@ def test_answer_reveals_key_then_applies_concept_outcomes_once(conn) -> None:
     assert final["session"]["score"] == pytest.approx(0.5)
     assert len(final["session"]["understood_concepts"]) == 1
     assert len(final["session"]["revisit_concepts"]) == 1
+    reset_state = service._readiness_state(conn, LEARNER, MATERIAL)
+    assert reset_state["scroll_count"] == 0
+    assert reset_state["assessment_ready"] is False
     outcomes = conn.execute(
         "SELECT adjustment FROM assessment_concept_outcomes "
         "WHERE session_id = ? ORDER BY adjustment",
@@ -656,13 +722,19 @@ def test_snooze_requires_new_information_without_penalty(conn) -> None:
         (LEARNER,),
     ).fetchone()[0] == 0
 
-    _seed_reel(
-        conn,
-        reel_id="snooze-new",
-        concept_id="snooze-new-c",
-        video_id="snooze-new-v",
-    )
-    progress = _complete(service, conn, "snooze-new")
+    progress = None
+    for index in range(5):
+        reel_id = f"snooze-new-{index}"
+        _seed_reel(
+            conn,
+            reel_id=reel_id,
+            concept_id=f"snooze-new-c{index}",
+            video_id=f"snooze-new-v{index}",
+        )
+        progress = _complete(service, conn, reel_id)
+        if progress["assessment_ready"]:
+            break
+    assert progress is not None
     assert progress["assessment_ready"] is True
 
 
@@ -697,7 +769,7 @@ def test_snooze_reports_an_already_completed_session_as_completed(conn) -> None:
     ) == {"status": "completed", "assessment_ready": False}
 
 
-def test_malformed_backfill_is_isolated_and_retried_with_later_progress(conn) -> None:
+def test_malformed_backfill_cache_is_isolated_and_retried_at_next_session(conn) -> None:
     _seed_completed_accuracy(conn, session_id="backfill-history", correct_count=5)
     calls: list[list[str]] = []
 
@@ -745,35 +817,56 @@ def test_malformed_backfill_is_isolated_and_retried_with_later_progress(conn) ->
             with_question=False,
         )
         _complete(service, conn, f"legacy-{index}")
+    assert calls == []
+    first = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+    assert first["status"] == "ready"
+    assert first["session"]["question_count"] == 1
     assert len(calls) == 1
     assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 1
     assert conn.execute(
         "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'assessment_question_backfill:%'"
     ).fetchone()[0] == 2
 
-    service._ensure_question_pool(
+    cached_learner = "owner:learner-b"
+    _seed_completed_accuracy(
         conn,
-        learner_id=LEARNER,
-        material_id=MATERIAL,
-        completion_rows=service._completed_rows(conn, LEARNER, MATERIAL),
-        should_cancel=None,
+        session_id="cached-backfill-history",
+        correct_count=5,
+        learner=cached_learner,
     )
+    for index in range(2):
+        service.record_scroll(
+            conn, learner_id=cached_learner, reel_id=f"legacy-{index}"
+        )
+    cached = service.next_session(
+        conn, learner_id=cached_learner, material_id=MATERIAL
+    )
+    assert cached["status"] == "ready"
+    assert cached["session"]["question_count"] == 1
     assert len(calls) == 1
+
     conn.execute(
         "UPDATE llm_cache SET created_at = '2020-01-01T00:00:00+00:00' "
         "WHERE response_json LIKE '%null%'"
     )
 
-    _seed_reel(
+    retry_learner = "owner:backfill-retry"
+    _seed_completed_accuracy(
         conn,
-        reel_id="legacy-2",
-        concept_id="legacy-c2",
-        video_id="legacy-v2",
-        with_question=False,
+        session_id="retry-backfill-history",
+        correct_count=5,
+        learner=retry_learner,
     )
-    progress = _complete(service, conn, "legacy-2")
+    for index in range(2):
+        service.record_scroll(
+            conn, learner_id=retry_learner, reel_id=f"legacy-{index}"
+        )
+    retried = service.next_session(
+        conn, learner_id=retry_learner, material_id=MATERIAL
+    )
     assert len(calls) == 2
-    assert progress["assessment_ready"] is True
+    assert retried["status"] == "ready"
+    assert retried["session"]["question_count"] == 2
     assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 2
 
 
@@ -808,18 +901,19 @@ def test_legacy_backfill_scans_past_cached_old_rows(conn) -> None:
         timestamp = f"2026-07-09T00:01:{index:02d}+00:00"
         conn.execute(
             "INSERT INTO learner_reel_progress "
-            "(learner_id, reel_id, material_id, max_fraction, completed_at, created_at, updated_at) "
-            "VALUES (?, ?, ?, 1.0, ?, ?, ?)",
-            (LEARNER, reel_id, MATERIAL, timestamp, timestamp, timestamp),
+            "(learner_id, reel_id, material_id, max_fraction, scrolled_at, "
+            "completed_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, 1.0, ?, ?, ?, ?)",
+            (LEARNER, reel_id, MATERIAL, timestamp, timestamp, timestamp, timestamp),
         )
-    rows = service._completed_rows(conn, LEARNER, MATERIAL)
+    rows = service._scrolled_rows(conn, LEARNER, MATERIAL)
     for row in rows[:12]:
         service._write_cached_backfill(conn, _question_fingerprint(row), None)
     service._ensure_question_pool(
         conn,
         learner_id=LEARNER,
         material_id=MATERIAL,
-        completion_rows=rows,
+        source_rows=rows,
         should_cancel=None,
     )
     assert calls == [["starved-13", "starved-12"]]
@@ -845,6 +939,77 @@ def test_question_count_is_two_distinct_reels_with_one_reel_fallback(conn) -> No
         {"id": "q2", "reel_id": "r2", "concept_id": "c1"},
     ]
     assert service._desired_question_count(conn, state) == 1
+
+
+@pytest.mark.parametrize("winner_status", ["completed", "snoozed"])
+def test_next_session_does_not_reopen_a_stale_cadence_window(
+    conn, monkeypatch, winner_status
+) -> None:
+    _seed_completed_accuracy(conn, session_id="race-history", correct_count=5)
+    service = AssessmentService()
+    for index in range(2):
+        _seed_reel(
+            conn,
+            reel_id=f"race-{index}",
+            concept_id=f"race-c{index}",
+            video_id=f"race-v{index}",
+        )
+        _complete(service, conn, f"race-{index}")
+
+    original_execute = assessments_module.execute_modify
+    injected_winner = False
+    running_winner = False
+
+    def interleaving_execute(connection, query, params=()):
+        nonlocal injected_winner, running_winner
+        if (
+            "INSERT INTO assessment_sessions" in query
+            and not injected_winner
+            and not running_winner
+        ):
+            injected_winner = True
+            running_winner = True
+            try:
+                winner = service.next_session(
+                    connection, learner_id=LEARNER, material_id=MATERIAL
+                )
+                assert winner["status"] == "ready"
+                session = winner["session"]
+                if winner_status == "snoozed":
+                    terminal = service.snooze(
+                        connection, learner_id=LEARNER, session_id=session["id"]
+                    )
+                    assert terminal["status"] == "snoozed"
+                else:
+                    answer = None
+                    for question in session["questions"]:
+                        answer = service.answer(
+                            connection,
+                            learner_id=LEARNER,
+                            session_id=session["id"],
+                            question_id=question["id"],
+                            choice_index=0,
+                        )
+                    assert answer is not None
+                    assert answer["session"]["status"] == "completed"
+            finally:
+                running_winner = False
+        return original_execute(connection, query, params)
+
+    monkeypatch.setattr(assessments_module, "execute_modify", interleaving_execute)
+    stale = service.next_session(conn, learner_id=LEARNER, material_id=MATERIAL)
+
+    assert injected_winner is True
+    assert stale["status"] == "not_ready"
+    assert stale["assessment_ready"] is False
+    assert stale["session"] is None
+    assert conn.execute(
+        "SELECT COUNT(*) FROM assessment_sessions WHERE status = 'pending'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM assessment_sessions WHERE status = ?",
+        (winner_status,),
+    ).fetchone()[0] >= 1
 
 
 def test_session_creation_cancels_before_writes_and_rolls_back_child_failure(
@@ -910,7 +1075,7 @@ def test_default_backfill_forwards_the_cancellation_probe(monkeypatch) -> None:
     assert observed["probe"] is probe
 
 
-def test_backfill_observes_cancellation_before_any_cache_or_question_write(conn) -> None:
+def test_next_session_backfill_observes_cancellation_before_any_write(conn) -> None:
     _seed_completed_accuracy(conn, session_id="cancel-history", correct_count=5)
     for index in range(2):
         _seed_reel(
@@ -928,18 +1093,20 @@ def test_backfill_observes_cancellation_before_any_cache_or_question_write(conn)
         return {"questions": []}
 
     service = AssessmentService(question_generator=generator)
-    service.record_progress(
-        conn, learner_id=LEARNER, reel_id="cancel-0", max_fraction=1.0
-    )
+    service.record_scroll(conn, learner_id=LEARNER, reel_id="cancel-0")
+    service.record_scroll(conn, learner_id=LEARNER, reel_id="cancel-1")
+    assert cancelled is False
     with pytest.raises(AssessmentCancelledError):
-        service.record_progress(
+        service.next_session(
             conn,
             learner_id=LEARNER,
-            reel_id="cancel-1",
-            max_fraction=1.0,
+            material_id=MATERIAL,
             should_cancel=lambda: cancelled,
         )
     assert conn.execute("SELECT COUNT(*) FROM reel_assessment_questions").fetchone()[0] == 0
     assert conn.execute(
         "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'assessment_question_backfill:%'"
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM assessment_sessions WHERE status = 'pending'"
     ).fetchone()[0] == 0

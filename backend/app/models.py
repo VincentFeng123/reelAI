@@ -233,6 +233,15 @@ class ReelProgressResponse(BaseModel):
     readiness_threshold: float
 
 
+class ReelScrollResponse(BaseModel):
+    reel_id: str
+    material_id: str
+    newly_scrolled: bool
+    assessment_ready: bool
+    scroll_count: int
+    cadence_target: int
+
+
 class AssessmentQuestionOut(BaseModel):
     id: str
     reel_id: str

@@ -195,6 +195,15 @@ export type ReelProgressResponse = {
   readiness_threshold: number;
 };
 
+export type ReelScrollResponse = {
+  reel_id: string;
+  material_id: string;
+  newly_scrolled: boolean;
+  assessment_ready: boolean;
+  scroll_count: number;
+  cadence_target: number;
+};
+
 export type AssessmentQuestion = {
   id: string;
   reel_id: string;

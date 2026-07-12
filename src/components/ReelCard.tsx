@@ -13,11 +13,9 @@ type Props = {
   autoplayEnabled: boolean;
   onAutoplayEnabledChange: (nextEnabled: boolean) => void;
   playbackRate: number;
-  playbackRestartToken?: number;
   onPlaybackRateChange: (nextRate: number) => void;
   onRequestNextReel?: () => void;
   onPlaybackProgress?: (maxFraction: number, naturalEnd: boolean) => void;
-  onClipBoundary?: () => boolean;
   onOpenContent?: () => void;
 };
 
@@ -140,11 +138,9 @@ export function ReelCard({
   autoplayEnabled,
   onAutoplayEnabledChange,
   playbackRate,
-  playbackRestartToken = 0,
   onPlaybackRateChange,
   onRequestNextReel,
   onPlaybackProgress,
-  onClipBoundary,
   onOpenContent,
 }: Props) {
   const hostContainerRef = useRef<HTMLDivElement | null>(null);
@@ -340,14 +336,6 @@ export function ReelCard({
       }
       if (now >= clipEnd) {
         onPlaybackProgress?.(1, true);
-        if (!didHandleClipEndRef.current && onClipBoundary?.()) {
-          didHandleClipEndRef.current = true;
-          setIsPlaying(false);
-          setIsResumeMaskVisible(false);
-          setCurrentSec(clipDuration);
-          stopProgressTimer();
-          return;
-        }
         if (autoplayEnabledRef.current && isActive && onRequestNextReel && !didHandleClipEndRef.current) {
           didHandleClipEndRef.current = true;
           setIsPlaying(false);
@@ -365,7 +353,7 @@ export function ReelCard({
       const rel = clamp(now - clipStart, 0, clipDuration);
       setCurrentSec(rel);
     }, 160);
-  }, [clipDuration, clipEnd, clipStart, isActive, onClipBoundary, onPlaybackProgress, onRequestNextReel, stopProgressTimer]);
+  }, [clipDuration, clipEnd, clipStart, isActive, onPlaybackProgress, onRequestNextReel, stopProgressTimer]);
 
   useEffect(() => {
     if (!isYouTubeVideo || !isActive || !isReady || !isPlaying) {
@@ -627,14 +615,6 @@ export function ReelCard({
               } else if (state === playerState.ENDED) {
                 clearAutoplayRetryTimer();
                 onPlaybackProgress?.(1, true);
-                if (!didHandleClipEndRef.current && onClipBoundary?.()) {
-                  didHandleClipEndRef.current = true;
-                  setIsPlaying(false);
-                  setIsResumeMaskVisible(false);
-                  setCurrentSec(clipDuration);
-                  stopProgressTimer();
-                  return;
-                }
                 if (autoplayEnabledRef.current && isActive && onRequestNextReel) {
                   didHandleClipEndRef.current = true;
                   setIsPlaying(false);
@@ -712,10 +692,8 @@ export function ReelCard({
     syncProgress,
     videoId,
     isYouTubeVideo,
-    onClipBoundary,
     onPlaybackProgress,
     onRequestNextReel,
-    playbackRestartToken,
     destroyPlayerSafely,
     clearAutoplayRetryTimer,
   ]);

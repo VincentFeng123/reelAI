@@ -25,9 +25,8 @@ from ..clip_engine.errors import CancellationError, ProviderError
 
 
 COMPLETION_FRACTION = 0.80
-LOW_ACCURACY_COMPLETION_TARGET = 2
-DEFAULT_COMPLETION_TARGET = 3
-HIGH_ACCURACY_COMPLETION_TARGET = 4
+MIN_CADENCE_TARGET = 2
+MAX_CADENCE_TARGET = 5
 SESSION_QUESTION_TARGET = 2
 CONCEPT_ADJUSTMENT_BOUND = 0.25
 BACKFILL_CACHE_PREFIX = "assessment_question_backfill:"
@@ -275,16 +274,49 @@ class AssessmentService:
         return total
 
     @staticmethod
-    def _completed_reel_target(
-        recent_accuracy: float | None, recent_sessions: list[float]
+    def _cadence_target(
+        *,
+        learner_id: str,
+        material_id: str,
+        window_cutoff: str,
+        recent_accuracy: float | None,
+        scroll_rows: list[dict[str, Any]],
     ) -> int:
-        if len(recent_sessions) >= 2 and all(
-            accuracy >= 0.90 for accuracy in recent_sessions[:2]
-        ):
-            return HIGH_ACCURACY_COMPLETION_TARGET
-        if recent_accuracy is not None and float(recent_accuracy) < 0.70:
-            return LOW_ACCURACY_COMPLETION_TARGET
-        return DEFAULT_COMPLETION_TARGET
+        """Choose a stable 2-5 reel cadence, then adapt it to current evidence."""
+        seed = f"{learner_id}|{material_id}|{window_cutoff or 'initial'}"
+        digest = hashlib.sha256(seed.encode("utf-8")).digest()
+        target = MIN_CADENCE_TARGET + digest[0] % (
+            MAX_CADENCE_TARGET - MIN_CADENCE_TARGET + 1
+        )
+        if recent_accuracy is not None:
+            if float(recent_accuracy) < 0.70:
+                target -= 1
+            elif float(recent_accuracy) >= 0.90:
+                target += 1
+        if len(scroll_rows) >= 2:
+            # Lock the continuity adjustment to the window's opening pair so
+            # readiness cannot flap as later scroll events arrive.
+            previous_concept = str(scroll_rows[0].get("concept_id") or "")
+            current_concept = str(scroll_rows[1].get("concept_id") or "")
+            if previous_concept and current_concept:
+                target += 1 if previous_concept == current_concept else -1
+        return max(MIN_CADENCE_TARGET, min(MAX_CADENCE_TARGET, target))
+
+    @staticmethod
+    def _cadence_session_id(
+        *, learner_id: str, material_id: str, cadence_cutoff: str
+    ) -> str:
+        window_key = json.dumps(
+            [learner_id, material_id, cadence_cutoff],
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"studyreels-assessment-session:{window_key}",
+            )
+        )
 
     def _accuracy_stats(
         self, conn: Any, learner_id: str, material_id: str
@@ -358,6 +390,36 @@ class AssessmentService:
         )
 
     @staticmethod
+    def _scrolled_rows(
+        conn: Any, learner_id: str, material_id: str, after: str = ""
+    ) -> list[dict[str, Any]]:
+        return fetch_all(
+            conn,
+            """
+            SELECT
+                p.scrolled_at,
+                r.id AS reel_id,
+                r.concept_id,
+                r.video_id,
+                r.t_start,
+                r.t_end,
+                r.transcript_snippet,
+                r.informativeness,
+                r.difficulty,
+                c.title AS concept_title
+            FROM learner_reel_progress p
+            JOIN reels r ON r.id = p.reel_id
+            JOIN concepts c ON c.id = r.concept_id
+            WHERE p.learner_id = ?
+              AND p.material_id = ?
+              AND p.scrolled_at IS NOT NULL
+              AND (? = '' OR p.scrolled_at > ?)
+            ORDER BY p.scrolled_at ASC, r.id ASC
+            """,
+            (learner_id, material_id, after, after),
+        )
+
+    @staticmethod
     def _pending_row(conn: Any, learner_id: str, material_id: str) -> dict[str, Any] | None:
         return fetch_one(
             conn,
@@ -388,7 +450,7 @@ class AssessmentService:
                 r.video_id,
                 r.difficulty,
                 c.title AS concept_title,
-                p.completed_at
+                p.scrolled_at
             FROM reel_assessment_questions q
             JOIN reels r ON r.id = q.reel_id
             JOIN concepts c ON c.id = r.concept_id
@@ -396,14 +458,14 @@ class AssessmentService:
               ON p.reel_id = r.id
              AND p.learner_id = ?
             WHERE r.material_id = ?
-              AND p.completed_at IS NOT NULL
-              AND (? = '' OR p.completed_at > ?)
+              AND p.scrolled_at IS NOT NULL
+              AND (? = '' OR p.scrolled_at > ?)
               AND NOT EXISTS (
                   SELECT 1
                   FROM assessment_attempts a
                   WHERE a.learner_id = ? AND a.question_id = q.id
               )
-            ORDER BY p.completed_at DESC, q.created_at DESC, q.id ASC
+            ORDER BY p.scrolled_at DESC, q.created_at DESC, q.id ASC
             """,
             (learner_id, material_id, after, after, learner_id),
         )
@@ -420,22 +482,21 @@ class AssessmentService:
         recent_accuracy, rolling_accuracy, recent_sessions = self._accuracy_stats(
             conn, learner_id, material_id
         )
-        completion_target = self._completed_reel_target(
-            recent_accuracy, recent_sessions
-        )
         completed_cutoff = self._latest_cutoff(conn, learner_id, material_id, "completed")
-        rows = self._completed_rows(conn, learner_id, material_id, completed_cutoff)
-        total_units = self._information_units(rows)
-
         snoozed_cutoff = self._latest_cutoff(conn, learner_id, material_id, "snoozed")
-        cadence_rows = rows
-        if snoozed_cutoff and snoozed_cutoff > completed_cutoff:
-            cadence_rows = self._completed_rows(
-                conn, learner_id, material_id, snoozed_cutoff
-            )
-            completion_target = 1
+        cadence_cutoff = max(completed_cutoff, snoozed_cutoff)
+        completed_rows = self._completed_rows(conn, learner_id, material_id, completed_cutoff)
+        total_units = self._information_units(completed_rows)
+        scroll_rows = self._scrolled_rows(conn, learner_id, material_id, cadence_cutoff)
+        cadence_target = self._cadence_target(
+            learner_id=learner_id,
+            material_id=material_id,
+            window_cutoff=cadence_cutoff,
+            recent_accuracy=recent_accuracy,
+            scroll_rows=scroll_rows,
+        )
 
-        available = self._available_questions(conn, learner_id, material_id, completed_cutoff)
+        available = self._available_questions(conn, learner_id, material_id, cadence_cutoff)
         question_reels = {
             str(row.get("reel_id") or "")
             for row in available
@@ -446,18 +507,18 @@ class AssessmentService:
             for row in available
             if str(row.get("concept_id") or "")
         }
-        completion_concepts = {
+        scroll_concepts = {
             str(row.get("concept_id") or "")
-            for row in rows
+            for row in scroll_rows
             if str(row.get("concept_id") or "")
         }
-        question_target = min(SESSION_QUESTION_TARGET, len(completion_concepts))
+        question_target = min(SESSION_QUESTION_TARGET, len(scroll_concepts))
         question_pool_complete = (
             question_target > 0
             and len(question_reels) >= question_target
             and len(question_concepts) >= question_target
         )
-        numeric_due = len(cadence_rows) >= completion_target
+        numeric_due = len(scroll_rows) >= cadence_target
         # Readiness is the durable due state. Question availability is handled
         # separately so a transient provider failure cannot erase that state.
         ready = bool(pending) or numeric_due
@@ -465,11 +526,13 @@ class AssessmentService:
             "assessment_ready": ready,
             "numeric_due": numeric_due,
             "information_units": total_units,
-            # Preserve the legacy field while reporting the cadence actually
-            # used by readiness (completed reels, not clip-duration units).
-            "readiness_threshold": float(completion_target),
+            "readiness_threshold": float(cadence_target),
+            "cadence_target": cadence_target,
+            "scroll_count": len(scroll_rows),
             "completed_cutoff": completed_cutoff,
-            "completion_rows": rows,
+            "cadence_cutoff": cadence_cutoff,
+            "completion_rows": completed_rows,
+            "scroll_rows": scroll_rows,
             "available_questions": available,
             "question_pool_complete": question_pool_complete,
             "pending": pending,
@@ -519,18 +582,6 @@ class AssessmentService:
             pk=["learner_id", "reel_id"],
         )
         state = self._readiness_state(conn, learner_id, str(reel["material_id"]))
-        if (
-            state["numeric_due"]
-            and not bool(state["question_pool_complete"])
-        ):
-            self._ensure_question_pool(
-                conn,
-                learner_id=learner_id,
-                material_id=str(reel["material_id"]),
-                completion_rows=state["completion_rows"],
-                should_cancel=should_cancel,
-            )
-            state = self._readiness_state(conn, learner_id, str(reel["material_id"]))
         return {
             "reel_id": reel_id,
             "completed": bool(completed_at),
@@ -538,6 +589,55 @@ class AssessmentService:
             "assessment_ready": bool(state["assessment_ready"]),
             "information_units": round(float(state["information_units"]), 4),
             "readiness_threshold": round(float(state["readiness_threshold"]), 4),
+        }
+
+    def record_scroll(
+        self,
+        conn: Any,
+        *,
+        learner_id: str,
+        reel_id: str,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        """Record one distinct forward navigation without changing watch analytics."""
+        _check_cancelled(should_cancel)
+        reel = fetch_one(conn, "SELECT id, material_id FROM reels WHERE id = ?", (reel_id,))
+        if not reel:
+            raise ValueError("reel_id not found")
+        material_id = str(reel["material_id"])
+        timestamp = now_iso()
+        inserted = execute_modify(
+            conn,
+            """
+            INSERT INTO learner_reel_progress (
+                learner_id, reel_id, material_id, max_fraction,
+                scrolled_at, completed_at, created_at, updated_at
+            ) VALUES (?, ?, ?, 0.0, ?, NULL, ?, ?)
+            ON CONFLICT(learner_id, reel_id) DO NOTHING
+            """,
+            (learner_id, reel_id, material_id, timestamp, timestamp, timestamp),
+        )
+        updated = 0
+        if inserted <= 0:
+            updated = execute_modify(
+                conn,
+                """
+                UPDATE learner_reel_progress
+                SET scrolled_at = ?, updated_at = ?
+                WHERE learner_id = ? AND reel_id = ? AND scrolled_at IS NULL
+                """,
+                (timestamp, timestamp, learner_id, reel_id),
+            )
+        newly_scrolled = inserted > 0 or updated > 0
+        _check_cancelled(should_cancel)
+        state = self._readiness_state(conn, learner_id, material_id)
+        return {
+            "reel_id": reel_id,
+            "material_id": material_id,
+            "newly_scrolled": newly_scrolled,
+            "assessment_ready": bool(state["assessment_ready"]),
+            "scroll_count": int(state["scroll_count"]),
+            "cadence_target": int(state["cadence_target"]),
         }
 
     def _load_cached_backfill(self, conn: Any, fingerprint: str) -> tuple[bool, object]:
@@ -620,14 +720,14 @@ class AssessmentService:
         *,
         learner_id: str,
         material_id: str,
-        completion_rows: list[dict[str, Any]],
+        source_rows: list[dict[str, Any]],
         should_cancel: Callable[[], bool] | None,
     ) -> None:
         del learner_id, material_id  # content is reel-scoped; eligibility is learner-scoped.
         uncached: list[dict[str, Any]] = []
         satisfied_reels: set[str] = set()
         satisfied_concepts: set[str] = set()
-        newest_first = list(reversed(completion_rows))
+        newest_first = list(reversed(source_rows))
         distinct_concepts: list[dict[str, Any]] = []
         repeated_concepts: list[dict[str, Any]] = []
         seen_concepts: set[str] = set()
@@ -667,7 +767,7 @@ class AssessmentService:
         candidates.sort(
             key=lambda row: (
                 int(str(row.get("concept_id") or "") not in satisfied_concepts),
-                str(row.get("completed_at") or ""),
+                str(row.get("scrolled_at") or ""),
             ),
             reverse=True,
         )
@@ -722,8 +822,8 @@ class AssessmentService:
         except CancellationError as exc:
             raise AssessmentCancelledError(str(exc)) from exc
         except ProviderError:
-            # Progress is already durable (the API uses autocommit). Leave the
-            # due state intact and retry generation on the next session call.
+            # The due state is already durable. Leave it intact and retry generation
+            # on the next session call.
             return
         _check_cancelled(should_cancel)
         if generated is None:
@@ -801,7 +901,7 @@ class AssessmentService:
                 distinct_rows,
                 key=lambda row: (
                     int(str(row.get("video_id") or "") not in videos),
-                    str(row.get("completed_at") or ""),
+                    str(row.get("scrolled_at") or ""),
                     str(row.get("id") or ""),
                 ),
             )
@@ -848,7 +948,7 @@ class AssessmentService:
                 conn,
                 learner_id=learner_id,
                 material_id=material_id,
-                completion_rows=state["completion_rows"],
+                source_rows=state["scroll_rows"],
                 should_cancel=should_cancel,
             )
             state = self._readiness_state(conn, learner_id, material_id)
@@ -871,7 +971,11 @@ class AssessmentService:
                 "rolling_accuracy": state["rolling_accuracy"],
             }
         timestamp = now_iso()
-        session_id = str(uuid.uuid4())
+        session_id = self._cadence_session_id(
+            learner_id=learner_id,
+            material_id=material_id,
+            cadence_cutoff=str(state["cadence_cutoff"]),
+        )
         _check_cancelled(should_cancel)
         with _atomic_write(conn):
             _check_cancelled(should_cancel)
@@ -898,14 +1002,32 @@ class AssessmentService:
                 ),
             )
             if inserted <= 0:
-                pending = self._pending_row(conn, learner_id, material_id)
+                _check_cancelled(should_cancel)
+                refreshed_state = self._readiness_state(
+                    conn, learner_id, material_id
+                )
+                pending = refreshed_state["pending"]
                 if pending:
                     return {
                         "status": "pending",
                         "assessment_ready": True,
                         "session": self._serialize_session(conn, pending),
-                        "recent_accuracy": state["recent_accuracy"],
-                        "rolling_accuracy": state["rolling_accuracy"],
+                        "recent_accuracy": refreshed_state["recent_accuracy"],
+                        "rolling_accuracy": refreshed_state["rolling_accuracy"],
+                    }
+                if (
+                    str(refreshed_state["cadence_cutoff"])
+                    != str(state["cadence_cutoff"])
+                    or not refreshed_state["assessment_ready"]
+                ):
+                    return {
+                        "status": "not_ready",
+                        "assessment_ready": bool(
+                            refreshed_state["assessment_ready"]
+                        ),
+                        "session": None,
+                        "recent_accuracy": refreshed_state["recent_accuracy"],
+                        "rolling_accuracy": refreshed_state["rolling_accuracy"],
                     }
                 raise RuntimeError("assessment session conflict without a pending session")
             for position, question in enumerate(selected):

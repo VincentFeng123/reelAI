@@ -287,6 +287,7 @@ CREATE TABLE IF NOT EXISTS learner_reel_progress (
     reel_id TEXT NOT NULL,
     material_id TEXT NOT NULL,
     max_fraction REAL NOT NULL DEFAULT 0.0,
+    scrolled_at TEXT,
     completed_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -1054,6 +1055,33 @@ def _migrate_reel_learning_content_sqlite(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE reels ADD COLUMN informativeness REAL")
 
 
+def _migrate_assessment_scroll_sqlite(conn: sqlite3.Connection) -> None:
+    """Keep forward-scroll cadence separate from watch completion analytics."""
+    columns = {
+        str(row[1])
+        for row in conn.execute("PRAGMA table_info(learner_reel_progress)").fetchall()
+    }
+    if "scrolled_at" not in columns:
+        conn.execute("ALTER TABLE learner_reel_progress ADD COLUMN scrolled_at TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_learner_reel_progress_material_scrolled "
+        "ON learner_reel_progress(learner_id, material_id, scrolled_at)"
+    )
+
+
+def _migrate_assessment_scroll_postgres(conn: Any) -> None:
+    """Idempotently add the scroll-cadence field to deployed PostgreSQL."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE learner_reel_progress "
+            "ADD COLUMN IF NOT EXISTS scrolled_at TEXT"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_learner_reel_progress_material_scrolled "
+            "ON learner_reel_progress(learner_id, material_id, scrolled_at)"
+        )
+
+
 _DURABLE_JOB_SQLITE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("content_fingerprint", "TEXT NOT NULL DEFAULT ''"),
     ("learner_id", f"TEXT NOT NULL DEFAULT '{LEGACY_LEARNER_ID}'"),
@@ -1397,6 +1425,7 @@ def init_db() -> None:
             _migrate_durable_generation_foundation_postgres(conn)
             _migrate_reels_unique_clip_index_postgres(conn)
             _migrate_reel_feedback_uniqueness_postgres(conn)
+            _migrate_assessment_scroll_postgres(conn)
             conn.commit()
         _db_ready = True
         return
@@ -1596,6 +1625,7 @@ def init_db() -> None:
         _migrate_knowledge_level_sqlite(conn)
         _migrate_reel_learning_content_sqlite(conn)
         _migrate_reel_feedback_uniqueness_sqlite(conn)
+        _migrate_assessment_scroll_sqlite(conn)
         conn.commit()
     finally:
         conn.close()

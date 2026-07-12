@@ -104,6 +104,7 @@ from .models import (
     ReelsGenerateResponse,
     ReelProgressRequest,
     ReelProgressResponse,
+    ReelScrollResponse,
 )
 from .services import llm_router
 from .services.assessments import AssessmentCancelledError, AssessmentService
@@ -5616,8 +5617,7 @@ async def record_reel_progress(request: Request, reel_id: str, payload: ReelProg
         with get_conn() as conn:
             learner_id = _resolve_learner_identity(conn, request)
         def work(should_cancel: Callable[[], bool]):
-            # Autocommit keeps the legacy-question provider call outside a
-            # long-lived SQLite write transaction.
+            # Keep the monotonic watch-analytics write on a short connection.
             with get_conn() as conn:
                 return assessment_service.record_progress(
                     conn,
@@ -5626,6 +5626,34 @@ async def record_reel_progress(request: Request, reel_id: str, payload: ReelProg
                     max_fraction=payload.max_fraction,
                     should_cancel=should_cancel,
                 )
+        return await _run_disconnect_cancellable(request, work)
+    except AssessmentCancelledError as exc:
+        raise HTTPException(status_code=499, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/reels/{reel_id}/scroll", response_model=ReelScrollResponse)
+async def record_reel_scroll(request: Request, reel_id: str):
+    _enforce_rate_limit(
+        request, "reel-scroll", limit=ASSESSMENT_PROGRESS_RATE_LIMIT_PER_WINDOW
+    )
+    clean_reel_id = str(reel_id or "").strip()
+    if not clean_reel_id or len(clean_reel_id) > 160:
+        raise HTTPException(status_code=400, detail="Invalid reel_id.")
+    try:
+        with get_conn() as conn:
+            learner_id = _resolve_learner_identity(conn, request)
+
+        def work(should_cancel: Callable[[], bool]):
+            with get_conn() as conn:
+                return assessment_service.record_scroll(
+                    conn,
+                    learner_id=learner_id,
+                    reel_id=clean_reel_id,
+                    should_cancel=should_cancel,
+                )
+
         return await _run_disconnect_cancellable(request, work)
     except AssessmentCancelledError as exc:
         raise HTTPException(status_code=499, detail=str(exc)) from exc

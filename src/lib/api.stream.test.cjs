@@ -17,6 +17,7 @@ const {
   fetchGenerationStatus,
   generateReels,
   generateReelsStream,
+  reportReelScroll,
 } = require("./api.ts");
 const TEST_OPTIONS = { timeout: 1_000 };
 
@@ -30,6 +31,58 @@ function queuedGenerationResponse() {
     headers: { "Content-Type": "application/json" },
   });
 }
+
+test("scroll reporting uses the bodyless forward-scroll contract", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  let requestUrl;
+  let requestInit;
+  const localValues = new Map();
+  const sessionValues = new Map();
+  const storage = (values) => ({
+    getItem: (key) => values.get(key) ?? null,
+    setItem: (key, value) => values.set(key, String(value)),
+    removeItem: (key) => values.delete(key),
+  });
+
+  global.window = {
+    location: { hostname: "localhost" },
+    localStorage: storage(localValues),
+    sessionStorage: storage(sessionValues),
+  };
+  global.fetch = async (url, init = {}) => {
+    requestUrl = String(url);
+    requestInit = init;
+    return new Response(JSON.stringify({
+      reel_id: "reel/scroll-test",
+      material_id: "material-scroll-test",
+      newly_scrolled: true,
+      assessment_ready: false,
+      scroll_count: 1,
+      cadence_target: 4,
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    const response = await reportReelScroll({ reelId: "reel/scroll-test" });
+    assert.match(requestUrl, /\/api\/reels\/reel%2Fscroll-test\/scroll$/);
+    assert.equal(requestInit.method, "POST");
+    assert.equal(requestInit.body, undefined);
+    assert.ok(new Headers(requestInit.headers).get("X-StudyReels-Owner-Key"));
+    assert.equal(response.cadence_target, 4);
+    assert.equal(response.material_id, "material-scroll-test");
+  } finally {
+    global.fetch = originalFetch;
+    if (originalWindow === undefined) {
+      delete global.window;
+    } else {
+      global.window = originalWindow;
+    }
+  }
+});
 
 test("generation submission timeout remains active after response headers", TEST_OPTIONS, async () => {
   const originalFetch = global.fetch;
