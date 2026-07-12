@@ -54,6 +54,9 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             ),
         ),
         "enrich_clips": bool(settings.get("segment_enrich_clips", False)),
+        "target_sec": settings.get("_segment_target_sec"),
+        "target_min_sec": settings.get("_segment_target_min_sec"),
+        "target_max_sec": settings.get("_segment_target_max_sec"),
     }
 
 
@@ -179,6 +182,12 @@ def _valid_clips(
     if bounds is None:
         return None
     transcript_start, transcript_end = bounds
+    requested_max = policy["target_max_sec"]
+    hard_max = (
+        180.0
+        if requested_max is None
+        else min(180.0, float(requested_max))
+    )
     clips: list[dict[str, Any]] = []
     previous_start = -1.0
     for index, raw in enumerate(value, start=1):
@@ -243,7 +252,7 @@ def _valid_clips(
             or start < transcript_start - 0.001
             or end > transcript_end + 0.001
             or start < previous_start
-            or not 1 <= end - start <= 180
+            or not 1 <= end - start <= hard_max
             or not 0 <= informativeness <= 1
             or not 0 <= topic_relevance <= 1
             or not 0 <= educational_importance <= 1

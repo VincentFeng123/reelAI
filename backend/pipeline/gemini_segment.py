@@ -41,6 +41,13 @@ CancelledCb = Optional[Callable[[], bool]]
 log = logging.getLogger("clipper.segment")
 
 _WORD_RE = re.compile(r"[a-z0-9']+", re.IGNORECASE)
+_STRUCTURAL_FILLER_RE = re.compile(
+    r"\b(?:welcome(?: back)? to|thanks? for watching|have a great day|"
+    r"see you next time|like and subscribe|please subscribe|"
+    r"subscribe to (?:this|the|my|our) channel|sponsored by|"
+    r"today'?s sponsor)\b",
+    re.IGNORECASE,
+)
 _NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 PRODUCTION_PRO_PROFILE = "production_pro_v0"
@@ -84,7 +91,6 @@ _BOUNDARY_PAD_S = 0.3
 _LONG_RANGE_REPAIR_MIN_S = 20.0
 _LONG_RANGE_REPAIR_TARGET_S = 75.0
 _LONG_RANGE_REPAIR_MAX_S = 150.0
-_LONG_RANGE_REPAIR_START_SCAN_S = 30.0
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
@@ -366,6 +372,9 @@ def _boundary_prompts(
     *,
     max_candidates: int = _PRODUCTION_MAX_CANDIDATES,
     learner_level: str = "",
+    target_sec: float | None = None,
+    target_min_sec: float | None = None,
+    target_max_sec: float | None = None,
 ) -> tuple[str, str]:
     system = (
         "You select self-contained educational clip boundaries from timestamped transcripts.\n\n"
@@ -373,6 +382,29 @@ def _boundary_prompts(
     )
     learner_rule = _learner_rule(learner_level)
     learner_line = f"{learner_rule}\n" if learner_rule else ""
+    if target_max_sec is None:
+        duration_rule = (
+            "the selected source span must be at most 150 seconds and should usually "
+            "be 20 to 90 seconds. The shorter limit leaves room for deterministic "
+            "context repair while keeping the final clip inside the hard 180-second "
+            "envelope."
+        )
+    else:
+        requested_max = max(_MIN_CLIP_S, min(_MAX_CLIP_S, float(target_max_sec)))
+        requested_min = max(
+            _MIN_CLIP_S,
+            min(requested_max, float(target_min_sec or _MIN_CLIP_S)),
+        )
+        requested_target = max(
+            requested_min,
+            min(requested_max, float(target_sec or requested_max)),
+        )
+        duration_rule = (
+            f"the requested range is {requested_min:g} to {requested_max:g} seconds "
+            f"with a {requested_target:g}-second target. The selected source span MUST "
+            f"be at most {requested_max:g} seconds; the minimum is a preference, not a "
+            "rejection rule."
+        )
     user = (
         f"{_topic_rule(topic)}\n{learner_line}"
         f"Line IDs must be between 0 and {n - 1}.\n\n"
@@ -380,11 +412,11 @@ def _boundary_prompts(
         "Choose the strongest educational moments globally from anywhere in the transcript. "
         "Do not favor the beginning and do not return every chronological section. Rank the "
         "strongest, most educational, self-contained moments first; sequencing happens later. "
-        "For every moment, verify the displayed start/end timestamps before returning it: the "
-        "selected source span must be at most 150 seconds and should usually be 20 to 90 seconds. "
-        "The shorter limit leaves room for deterministic context repair while keeping the final "
-        "clip inside the hard 180-second envelope. If a section is longer, choose one smaller "
-        "complete sub-explanation or omit it; never return the whole long section. "
+        "For every moment, verify the displayed start/end timestamps before returning it: "
+        f"{duration_rule} If a section is longer, choose one smaller complete "
+        "sub-explanation or omit it; never return the whole long section. If a useful "
+        "section contains a greeting, channel plug, sponsor, or outro, select a complete "
+        "teaching unit before or after that interruption rather than including it. "
         f"Return at most {max(1, min(_PRODUCTION_MAX_CANDIDATES, int(max_candidates)))} "
         "moments when boundaries and context have low or medium uncertainty; omit only "
         "high-uncertainty moments. "
@@ -808,18 +840,20 @@ def _repair_oversized_cue_range(
     *,
     ignore_caption_case: bool,
     anchor_text: str = "",
+    minimum_duration: float = _LONG_RANGE_REPAIR_MIN_S,
+    target_duration: float = _LONG_RANGE_REPAIR_TARGET_S,
+    maximum_duration: float = _LONG_RANGE_REPAIR_MAX_S,
 ) -> tuple[int, int] | None:
     """Choose a complete cue-level subunit without making another model call."""
     anchor_tokens = _content_tokens(anchor_text)
-    original_start = float(segments[start_line].get("start", 0.0))
-    candidates: list[tuple[float, float, float, float, int, int]] = []
+    candidates: list[tuple[float, float, float, float, float, int, int]] = []
     for candidate_start in range(start_line, end_line + 1):
         candidate_start_time = float(
-            segments[candidate_start].get("start", original_start)
+            segments[candidate_start].get("start", 0.0)
         )
-        start_shift = candidate_start_time - original_start
-        if start_shift > _LONG_RANGE_REPAIR_START_SCAN_S:
-            break
+        start_shift = candidate_start_time - float(
+            segments[start_line].get("start", 0.0)
+        )
         if _cue_opens_mid_thought(
             str(segments[candidate_start].get("text") or ""),
             ignore_caption_case=ignore_caption_case,
@@ -837,13 +871,17 @@ def _repair_oversized_cue_range(
             for offset, segment in enumerate(opening_segments)
         )
         for candidate_end in range(candidate_start, end_line + 1):
+            if _cue_range_contains_structural_filler(
+                segments, candidate_start, candidate_end
+            ):
+                break
             start, end = _padded_cue_bounds(
                 segments, candidate_start, candidate_end
             )
             duration = end - start
-            if duration > _LONG_RANGE_REPAIR_MAX_S:
+            if duration > maximum_duration:
                 break
-            if duration < _LONG_RANGE_REPAIR_MIN_S:
+            if duration < minimum_duration:
                 continue
             next_text = (
                 str(segments[candidate_end + 1].get("text") or "")
@@ -857,9 +895,13 @@ def _repair_oversized_cue_range(
             ):
                 continue
             candidates.append((
+                0.0 if re.search(
+                    r"[.!?][\"')\]]*$",
+                    str(segments[candidate_end].get("text") or "").strip(),
+                ) else 1.0,
                 -float(anchor_overlap),
                 start_shift,
-                abs(duration - _LONG_RANGE_REPAIR_TARGET_S),
+                abs(duration - target_duration),
                 -duration,
                 candidate_start,
                 candidate_end,
@@ -867,7 +909,7 @@ def _repair_oversized_cue_range(
     if not candidates:
         return None
     best = min(candidates)
-    return best[4], best[5]
+    return best[5], best[6]
 
 
 def _cue_clip_text(segments: list[dict], start_line: int, end_line: int) -> str:
@@ -876,6 +918,15 @@ def _cue_clip_text(segments: list[dict], start_line: int, end_line: int) -> str:
         for segment in segments[start_line:end_line + 1]
         if str(segment.get("text") or "").strip()
     ).strip()
+
+
+def _cue_range_contains_structural_filler(
+    segments: list[dict], start_line: int, end_line: int,
+) -> bool:
+    return any(
+        _STRUCTURAL_FILLER_RE.search(str(segment.get("text") or ""))
+        for segment in segments[start_line:end_line + 1]
+    )
 
 
 def _near_duplicate(a: dict, b: dict, threshold: float = _DUPLICATE_OVERLAP) -> bool:
@@ -1031,6 +1082,27 @@ def _configured_clip_limit(settings: dict) -> int:
     return max(0, min(_MAX_CLIPS, limit))
 
 
+def _requested_duration_policy(settings: dict) -> tuple[float, float, float]:
+    """Return advisory min/target and the requested hard maximum."""
+    raw_max = settings.get("_segment_target_max_sec")
+    maximum = (
+        _MAX_CLIP_S
+        if raw_max is None
+        else max(_MIN_CLIP_S, min(_MAX_CLIP_S, float(raw_max)))
+    )
+    raw_min = settings.get("_segment_target_min_sec")
+    minimum = max(
+        _MIN_CLIP_S,
+        min(maximum, float(_LONG_RANGE_REPAIR_MIN_S if raw_min is None else raw_min)),
+    )
+    raw_target = settings.get("_segment_target_sec")
+    target = max(
+        minimum,
+        min(maximum, float(_LONG_RANGE_REPAIR_TARGET_S if raw_target is None else raw_target)),
+    )
+    return minimum, target, maximum
+
+
 def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
     """Dedupe and limit while candidates remain quality-ranked."""
     quality_order = sorted(
@@ -1171,6 +1243,9 @@ def _plan_to_report(
         return report
 
     ignore_caption_case = bool(settings.get("_segment_ignore_caption_case", True))
+    requested_min, requested_target, requested_max = _requested_duration_policy(
+        settings
+    )
     raw: list[dict] = []
     seen_candidate_ids: set[str] = set()
 
@@ -1283,7 +1358,7 @@ def _plan_to_report(
             continue
         start, end = round(start, 3), round(end, 3)
         duration = round(end - start, 3)
-        if duration > _MAX_CLIP_S:
+        if duration > requested_max:
             repaired_range = _repair_oversized_cue_range(
                 segments,
                 a,
@@ -1296,16 +1371,25 @@ def _plan_to_report(
                         getattr(proposal, "learning_objective", ""),
                         proposal.facet,
                         proposal.reason,
+                        getattr(proposal, "topic_evidence_quote", ""),
+                        topic,
                     )
                 ),
+                minimum_duration=requested_min,
+                target_duration=requested_target,
+                maximum_duration=requested_max,
             )
             if repaired_range is not None:
                 a, b = repaired_range
                 start, end = _padded_cue_bounds(segments, a, b)
                 start, end = round(start, 3), round(end, 3)
                 duration = round(end - start, 3)
-        if duration < _MIN_CLIP_S or duration > _MAX_CLIP_S:
+        if duration < _MIN_CLIP_S or duration > requested_max:
             report.rejected_reasons.append(f"{prefix}:invalid_duration")
+            continue
+
+        if _cue_range_contains_structural_filler(segments, a, b):
+            report.rejected_reasons.append(f"{prefix}:contains_filler")
             continue
 
         clip_text = _cue_clip_text(segments, a, b)
@@ -1762,6 +1846,10 @@ def _run_selection_profile(
         or settings.get("learner_level")
         or ""
     )
+    requested_min, requested_target, requested_max = _requested_duration_policy(
+        settings
+    )
+    has_requested_duration = settings.get("_segment_target_max_sec") is not None
 
     if profile == PRODUCTION_PRO_PROFILE:
         system, user = _legacy_prompts(rendered, len(segments), topic)
@@ -1795,6 +1883,9 @@ def _run_selection_profile(
                 max(1, int(settings.get("max_clips") or _PRODUCTION_MAX_CANDIDATES)),
             ),
             learner_level=learner_level,
+            target_sec=requested_target if has_requested_duration else None,
+            target_min_sec=requested_min if has_requested_duration else None,
+            target_max_sec=requested_max if has_requested_duration else None,
         )
         schema = _BoundaryPlan
         model = config.SEGMENT_FLASH_MODEL
@@ -1810,6 +1901,9 @@ def _run_selection_profile(
                 max(1, int(settings.get("max_clips") or _PRODUCTION_MAX_CANDIDATES)),
             ),
             learner_level=learner_level,
+            target_sec=requested_target if has_requested_duration else None,
+            target_min_sec=requested_min if has_requested_duration else None,
+            target_max_sec=requested_max if has_requested_duration else None,
         )
         schema = _BoundaryPlan
         model = config.SEGMENT_PRO_MODEL

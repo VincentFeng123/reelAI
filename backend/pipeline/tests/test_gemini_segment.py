@@ -550,6 +550,22 @@ def test_production_flash_is_compact_global_boundary_first():
     assert "learning details and assessments are generated later" in prompt
 
 
+def test_production_flash_receives_requested_duration_contract():
+    _system, user = G._boundary_prompts(
+        "[0] 00:00 lesson",
+        1,
+        "chemistry",
+        target_sec=40,
+        target_min_sec=10,
+        target_max_sec=55,
+    )
+
+    assert "requested range is 10 to 55 seconds" in user
+    assert "40-second target" in user
+    assert "MUST be at most 55 seconds" in user
+    assert "minimum is a preference, not a rejection rule" in user
+
+
 def test_budget_is_reserved_once_before_dispatch_and_provider_retry_is_disabled(monkeypatch):
     order = []
     payload = {}

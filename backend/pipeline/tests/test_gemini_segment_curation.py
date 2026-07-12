@@ -285,6 +285,104 @@ def test_oversized_repair_prefers_title_grounded_opening_within_setup_window():
     assert repaired == (3, 17)
 
 
+def test_production_biology_range_repairs_around_channel_bump():
+    raw_cues = [
+        (354.960, 359.240, "Cool! There's just one issue: Your DNA and its information is in the nucleus,"),
+        (359.240, 362.680, "but proteins are made in organelles called the ribosomes. How do we get the"),
+        (362.680, 367.320, "information from A to B? The answer is RNA. It's kind of like DNA, just that it's most"),
+        (367.320, 372.720, "often a single strand, it uses a ribose instead of deoxyribose and instead of Thymine it uses Uracil,"),
+        (372.720, 376.960, "which makes it less stable, but that's besides the point, here's what RNA actually does:"),
+        (376.960, 380.360, "Let's say you want to make the protein coded for by this gene. An enzyme called"),
+        (380.360, 384.880, "RNA polymerase will split the DNA and make a strand of RNA with the complementary bases,"),
+        (384.880, 389.720, "essentially copying the information from the DNA to the RNA. This is called transcription."),
+        (389.720, 393.320, "The new strand is called messenger RNA or mRNA, because it carries this"),
+        (393.320, 397.400, "message out of the nucleus to a ribosome. Remember how I said that a gene is like a"),
+        (397.400, 402.480, "recipe for a protein? Well, on the mRNA, which carries the same base sequence as that gene,"),
+        (402.480, 406.920, "every group of three bases, which is called a codon, codes for a specific amino acid,"),
+        (406.920, 408.819, "which are the building blocks for proteins. Welcome to Biology Pro Tips Season 1, if you want"),
+        (408.819, 408.920, "to decode a sequence of RNA, there is actually a chart for that! Yeah that's all have a great day."),
+        (408.920, 413.160, "These amino acids are carried by special molecules called transfer RNA or tRNA,"),
+        (413.160, 418.160, "which have a unique anticodon that can only attach to its matching codon on the mRNA."),
+        (418.160, 423.360, "The job of the ribosome is to read over codons on the mRNA and attach the matching tRNA molecules,"),
+        (423.360, 428.040, "which then leave behind their amino acid. As the ribosome moves along the mRNA and attaches more"),
+        (428.040, 433.920, "tRNA, which happens a couple thousand times, the amino acids combine into a polypeptide chain,"),
+        (433.920, 437.200, "which is just a really long chain of amino acids, that can be bunched up,"),
+        (437.200, 443.160, "creased, smacked and folded into a protein. Okay, let's recap: A gene is copied onto mRNA,"),
+        (443.160, 446.680, "which is then used to build proteins by assembling a chain of amino acids."),
+    ]
+    segments = [
+        {"cue_id": f"3tisOnOkwzo:cue:{index + 78}", "start": start, "end": end, "text": text}
+        for index, (start, end, text) in enumerate(raw_cues)
+    ]
+    proposal = G._BoundaryTopic(
+        candidate_id="biology-transcription",
+        start_line=0,
+        end_line=len(segments) - 1,
+        start_quote="Cool! There's just one issue",
+        end_quote="assembling a chain of amino acids",
+        title="RNA polymerase transcribes DNA into messenger RNA",
+        learning_objective="Understand how RNA polymerase transcribes DNA into messenger RNA.",
+        facet="transcription",
+        reason="Explains transcription from DNA to messenger RNA.",
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.3,
+        directly_teaches_topic=True,
+        substantive=True,
+        topic_evidence_quote="An enzyme called RNA polymerase will split the DNA and make a strand of RNA",
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {
+            "_segment_target_sec": 40,
+            "_segment_target_min_sec": 10,
+            "_segment_target_max_sec": 55,
+        },
+        topic="biology",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["end"] - clip["start"] <= 55
+    clip_text = G._cue_clip_text(segments, clip["_start_line"], clip["_end_line"])
+    assert clip_text.rstrip().endswith((".", "!", "?"))
+    assert "Welcome to Biology Pro Tips" not in clip_text
+    assert "have a great day" not in clip_text
+
+
+def test_structural_filler_is_rejected_even_when_scores_are_high():
+    segments = [{
+        "start": 0.0,
+        "end": 10.0,
+        "text": "Welcome to Biology Pro Tips. Today cells are the basic unit of life.",
+    }]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Welcome to Biology Pro Tips",
+            end_quote="basic unit of life",
+            topic_evidence_quote="Today cells are the basic unit of life",
+        )]),
+        segments,
+        [],
+        {},
+        topic="biology",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:contains_filler"]
+
+
 def test_explicit_max_clips_is_respected_below_forty_ceiling():
     segments = _segs(4)
     clips = _run([_topic(i, i, title=f"T{i}") for i in range(4)], segments, {"max_clips": 2})

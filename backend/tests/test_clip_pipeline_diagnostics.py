@@ -736,6 +736,9 @@ def test_bootstrap_clip_call_closes_pro_fallback_gate(monkeypatch) -> None:
         language="en",
         should_cancel=None,
         retrieval_profile="bootstrap",
+        target_clip_duration_sec=40,
+        target_clip_duration_min_sec=10,
+        target_clip_duration_max_sec=55,
     )
 
     fallback_gate = captured.get("_segment_pro_fallback_gate")
@@ -743,6 +746,9 @@ def test_bootstrap_clip_call_closes_pro_fallback_gate(monkeypatch) -> None:
     assert fallback_gate(accepted_count=0, video_id="dQw4w9WgXcQ") is False
     assert captured["_segment_routing_mode"] == "flash_only"
     assert captured["_segment_thinking_level"] == "low"
+    assert captured["_segment_target_sec"] == 40
+    assert captured["_segment_target_min_sec"] == 10
+    assert captured["_segment_target_max_sec"] == 55
 
 
 def test_aggregate_pro_fallback_targets_lowest_yield_initial_video(

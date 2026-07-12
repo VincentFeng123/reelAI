@@ -116,6 +116,9 @@ def _run_clip(
     max_clips: int | None = None,
     retrieval_profile: str = "deep",
     knowledge_level: str | None = None,
+    target_clip_duration_sec: int | None = None,
+    target_clip_duration_min_sec: int | None = None,
+    target_clip_duration_max_sec: int | None = None,
 ) -> dict[str, Any]:
     settings: dict[str, Any] = {
         "language": language,
@@ -124,6 +127,12 @@ def _run_clip(
     }
     if knowledge_level:
         settings["_knowledge_level"] = str(knowledge_level).strip().lower()
+    if target_clip_duration_sec is not None:
+        settings["_segment_target_sec"] = int(target_clip_duration_sec)
+    if target_clip_duration_min_sec is not None:
+        settings["_segment_target_min_sec"] = int(target_clip_duration_min_sec)
+    if target_clip_duration_max_sec is not None:
+        settings["_segment_target_max_sec"] = int(target_clip_duration_max_sec)
     if candidate_rank is not None:
         settings["_segment_candidate_rank"] = int(candidate_rank)
     if max_clips is not None:
@@ -1102,6 +1111,15 @@ class IngestionPipeline:
             discovered_video["_knowledge_level"] = knowledge_level
             discovered_video["_topic_terms"] = topic_terms
             discovered_video["_literal_topic"] = authoritative_topic
+            discovered_video["_target_clip_duration_sec"] = int(
+                target_clip_duration_sec
+            )
+            discovered_video["_target_clip_duration_min_sec"] = int(
+                target_clip_duration_min_sec
+            )
+            discovered_video["_target_clip_duration_max_sec"] = int(
+                target_clip_duration_max_sec
+            )
             discovered_video["_search_context"] = _retrieval_search_context(
                 requested_topic=authoritative_topic,
                 corrected_topic=corrected_topic,
@@ -1587,6 +1605,13 @@ class IngestionPipeline:
                     settings={
                         "generation_context": generation_context,
                         "deadline_monotonic": deadline,
+                        "_segment_target_sec": int(target_clip_duration_sec),
+                        "_segment_target_min_sec": int(
+                            target_clip_duration_min_sec
+                        ),
+                        "_segment_target_max_sec": int(
+                            target_clip_duration_max_sec
+                        ),
                         "max_clips": min(
                             8,
                             max(1, inventory_cap - initial_validated + 2),
@@ -1854,6 +1879,13 @@ class IngestionPipeline:
                 max_clips=v.get("_segment_max_candidates"),
                 retrieval_profile=str(v.get("_retrieval_profile") or "deep"),
                 knowledge_level=str(v.get("_knowledge_level") or ""),
+                target_clip_duration_sec=v.get("_target_clip_duration_sec"),
+                target_clip_duration_min_sec=v.get(
+                    "_target_clip_duration_min_sec"
+                ),
+                target_clip_duration_max_sec=v.get(
+                    "_target_clip_duration_max_sec"
+                ),
             )
         transcript = engine_out["transcript"]
         query_plan = (

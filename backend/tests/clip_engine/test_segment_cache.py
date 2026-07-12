@@ -82,6 +82,18 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
     assert _key(transcript, topic="Physics") != baseline
     assert _key(transcript, {"segment_accept_partial_flash": False}) == baseline
     assert _key(transcript, {"max_clips": 0}) != _key(transcript, {})
+    duration_policy = {
+        "_segment_target_sec": 38,
+        "_segment_target_min_sec": 20,
+        "_segment_target_max_sec": 55,
+    }
+    duration_key = _key(transcript, duration_policy)
+    for field, value in (
+        ("_segment_target_sec", 39),
+        ("_segment_target_min_sec", 21),
+        ("_segment_target_max_sec", 56),
+    ):
+        assert _key(transcript, {**duration_policy, field: value}) != duration_key
     assert _key(transcript, {"segment_enrich_clips": True}) != _key(
         transcript,
         {"segment_enrich_clips": False},
@@ -153,6 +165,30 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
     assert segment_cache._valid_clips(
         [_clip(), duplicate], transcript=transcript, settings=settings
     ) is None
+
+
+def test_segment_cache_rejects_clip_over_requested_max() -> None:
+    transcript = _transcript()
+    transcript["segments"] = [{
+        "cue_id": "long-cue",
+        "start": 0.0,
+        "end": 70.0,
+        "text": "The first lesson explains how forces change an object's motion.",
+    }]
+    transcript["duration"] = 70.0
+    clip = _clip()
+    clip.update({"start": 0.0, "end": 60.0})
+
+    assert segment_cache._valid_clips(
+        [clip],
+        transcript=transcript,
+        settings={"_segment_target_max_sec": 55},
+    ) is None
+    assert segment_cache._valid_clips(
+        [clip],
+        transcript=transcript,
+        settings={"_segment_target_max_sec": 60},
+    ) == [clip]
 
 
 def test_segment_cache_disables_shadow_and_unversioned_releases(monkeypatch) -> None:
