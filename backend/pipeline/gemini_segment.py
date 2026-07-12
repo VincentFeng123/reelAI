@@ -265,8 +265,9 @@ def _selection_fields(*, enriched: bool) -> str:
     if enriched:
         fields += (
             ", summary, takeaways (2-4 distinct grounded points), match_reason, and "
-            "assessment {prompt, exactly four distinct options, correct_index, explanation, "
-            "evidence_quote copied exactly from the selected clip}"
+            "assessment {prompt (at most 16 words), exactly four distinct options "
+            "(at most 8 words each), correct_index, explanation (one sentence, at most "
+            "24 words), evidence_quote copied exactly from the selected clip}"
         )
     return fields
 

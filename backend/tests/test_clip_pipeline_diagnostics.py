@@ -100,6 +100,8 @@ def test_generation_stage_counters_are_thread_safe() -> None:
         "topic_rejections": 800,
         "persisted_clips": 0,
         "provider_failures": 0,
+        "segmentation_cache_hits": 0,
+        "expansion_cache_hits": 0,
     }
     with pytest.raises(ValueError):
         context.increment_counter("topic_rejections", -1)

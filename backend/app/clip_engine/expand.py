@@ -8,9 +8,13 @@ uses one Gemini Flash call and falls back to those deterministic templates.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import unicodedata
 from collections.abc import Callable
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -18,6 +22,8 @@ from pydantic import BaseModel
 from . import config
 from .cancellation import raise_if_cancelled, run_cancellable
 from .errors import CancellationError
+from .singleflight import singleflight
+from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 if TYPE_CHECKING:
     from .provider_runtime import GenerationContext
@@ -27,6 +33,8 @@ logger = logging.getLogger(__name__)
 PRACTICE_FAST_EXPAND_MODEL = "gemini-3.5-flash"
 PRACTICE_FAST_EXPAND_FALLBACK_MODEL = "gemini-3.1-pro-preview"
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 8_000
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 1
+PRACTICE_FAST_EXPAND_CACHE_TTL_SEC = 6 * 60 * 60
 
 
 class _PracticeFastExpansion(BaseModel):
@@ -44,6 +52,98 @@ Do this:
    important sub-topics, and useful educational phrase variants such as tutorials or explainers.
 
 Return only the requested JSON object. Put the corrected topic first in queries."""
+
+
+def _expansion_cache_key(topic: str, n: int, level: str | None) -> str:
+    contract = {
+        "version": PRACTICE_FAST_EXPAND_CACHE_VERSION,
+        "topic": topic,
+        "count": int(n),
+        "level": " ".join(str(level or "").split()),
+        "primary_model": PRACTICE_FAST_EXPAND_MODEL,
+        "fallback_model": PRACTICE_FAST_EXPAND_FALLBACK_MODEL,
+        "prompt_sha256": hashlib.sha256(_PRACTICE_FAST_SYSTEM.encode("utf-8")).hexdigest(),
+        "schema": _PracticeFastExpansion.model_json_schema(),
+    }
+    encoded = json.dumps(
+        contract,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return (
+        f"practice-fast-expansion:v{PRACTICE_FAST_EXPAND_CACHE_VERSION}:"
+        f"{hashlib.sha256(encoded).hexdigest()}"
+    )
+
+
+def _cache_age_seconds(created_at: object) -> float:
+    try:
+        parsed = datetime.fromisoformat(str(created_at or "").replace("Z", "+00:00"))
+    except ValueError:
+        return float("inf")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return max(
+        0.0,
+        (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds(),
+    )
+
+
+def _read_cached_expansion(cache_key: str, count: int) -> dict | None:
+    try:
+        with get_conn() as conn:
+            row = fetch_one(
+                conn,
+                "SELECT response_json, created_at FROM llm_cache WHERE cache_key = ?",
+                (cache_key,),
+            )
+    except Exception as exc:
+        logger.debug("Practice expansion cache read unavailable: %s", exc)
+        return None
+    if not row or _cache_age_seconds(row.get("created_at")) >= PRACTICE_FAST_EXPAND_CACHE_TTL_SEC:
+        return None
+    try:
+        payload = json.loads(str(row.get("response_json") or "{}"))
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != PRACTICE_FAST_EXPAND_CACHE_VERSION:
+        return None
+    raw_queries = payload.get("queries")
+    if not isinstance(raw_queries, list) or not all(isinstance(query, str) for query in raw_queries):
+        return None
+    corrected = " ".join(str(payload.get("corrected") or "").split())
+    queries = _normalize(raw_queries, count)
+    if not corrected or not queries or _key(corrected) != _key(queries[0]):
+        return None
+    return {
+        "corrected": corrected,
+        "queries": queries,
+        "provider_used": "gemini",
+    }
+
+
+def _write_cached_expansion(cache_key: str, result: dict) -> None:
+    try:
+        with get_conn(transactional=True) as conn:
+            upsert(
+                conn,
+                "llm_cache",
+                {
+                    "cache_key": cache_key,
+                    "response_json": dumps_json(
+                        {
+                            "version": PRACTICE_FAST_EXPAND_CACHE_VERSION,
+                            "corrected": result["corrected"],
+                            "queries": result["queries"],
+                        }
+                    ),
+                    "created_at": now_iso(),
+                },
+                pk="cache_key",
+            )
+    except Exception as exc:
+        logger.debug("Practice expansion cache write unavailable: %s", exc)
 
 
 def _key(value: object) -> str:
@@ -117,6 +217,7 @@ async def _practice_fast_gemini_raw_async(
     model: str,
     level: str | None,
     should_cancel: Callable[[], bool] | None,
+    context: "GenerationContext | None" = None,
 ) -> str:
     """Make the path's single provider call. There is intentionally no model fallback."""
     raise_if_cancelled(should_cancel)
@@ -150,6 +251,14 @@ async def _practice_fast_gemini_raw_async(
             ),
         )
         raise_if_cancelled(should_cancel)
+        if context is not None:
+            context.record_gemini(
+                operation="expansion",
+                attempt=1,
+                model_used=str(getattr(response, "model_version", "") or model),
+                quality_degraded=model != PRACTICE_FAST_EXPAND_MODEL,
+                usage=getattr(response, "usage_metadata", None),
+            )
         text = str(getattr(response, "text", "") or "").strip()
         if not text:
             raise ValueError("Gemini returned an empty query expansion")
@@ -177,6 +286,7 @@ def _practice_fast_gemini_raw(
     model: str = PRACTICE_FAST_EXPAND_MODEL,
     level: str | None = None,
     should_cancel: Callable[[], bool] | None = None,
+    context: "GenerationContext | None" = None,
 ) -> str:
     return run_cancellable(
         lambda: _practice_fast_gemini_raw_async(
@@ -185,6 +295,7 @@ def _practice_fast_gemini_raw(
             model=model,
             level=level,
             should_cancel=should_cancel,
+            context=context,
         ),
         should_cancel,
     )
@@ -200,41 +311,65 @@ def expand_query_practice_fast(
 ) -> dict:
     """Practice-compatible Gemini expansion with deterministic fail-soft behavior.
 
-    ``context`` is accepted for direct compatibility with the live discovery call.
-    Expansion deliberately does not reserve the Supadata search budget tracked by it.
+    Expansion deliberately does not reserve the Supadata search budget tracked by
+    ``context``. The context enables durable cache reuse and usage accounting.
     """
-    del context
     topic = " ".join(str(topic or "").split())
     count = max(0, int(n))
     if not topic or count == 0:
         return deterministic_expand(topic, count, level=level)
     raise_if_cancelled(should_cancel)
+    cache_key = _expansion_cache_key(topic, count, level) if context is not None else ""
+    cached = _read_cached_expansion(cache_key, count) if cache_key else None
+    if cached is not None:
+        context.increment_counter("expansion_cache_hits")
+        context.record_cache_hit(
+            provider="gemini",
+            operation="expansion",
+            metadata={"cache_key": cache_key},
+        )
+        return cached
+
     errors: list[str] = []
-    for model in (PRACTICE_FAST_EXPAND_MODEL, PRACTICE_FAST_EXPAND_FALLBACK_MODEL):
-        try:
-            raw = _practice_fast_gemini_raw(
-                topic,
-                count,
-                model=model,
-                level=level,
-                should_cancel=should_cancel,
+    with singleflight(cache_key, should_cancel) if cache_key else nullcontext():
+        cached = _read_cached_expansion(cache_key, count) if cache_key else None
+        if cached is not None:
+            context.increment_counter("expansion_cache_hits")
+            context.record_cache_hit(
+                provider="gemini",
+                operation="expansion",
+                metadata={"cache_key": cache_key},
             )
-            parsed = _PracticeFastExpansion.model_validate_json(raw)
-            corrected = " ".join(str(parsed.corrected or topic).split()) or topic
-            queries = _normalize([corrected, *parsed.queries], count)
-            if not queries:
-                raise ValueError("Gemini returned no usable search queries")
-            raise_if_cancelled(should_cancel)
-            return {
-                "corrected": corrected,
-                "queries": queries,
-                "provider_used": "gemini",
-            }
-        except CancellationError:
-            raise
-        except Exception as exc:
-            raise_if_cancelled(should_cancel)
-            errors.append(f"{model}: {exc}")
+            return cached
+        for model in (PRACTICE_FAST_EXPAND_MODEL, PRACTICE_FAST_EXPAND_FALLBACK_MODEL):
+            try:
+                kwargs = {
+                    "model": model,
+                    "level": level,
+                    "should_cancel": should_cancel,
+                }
+                if context is not None:
+                    kwargs["context"] = context
+                raw = _practice_fast_gemini_raw(topic, count, **kwargs)
+                parsed = _PracticeFastExpansion.model_validate_json(raw)
+                corrected = " ".join(str(parsed.corrected or topic).split()) or topic
+                queries = _normalize([corrected, *parsed.queries], count)
+                if not queries:
+                    raise ValueError("Gemini returned no usable search queries")
+                raise_if_cancelled(should_cancel)
+                result = {
+                    "corrected": corrected,
+                    "queries": queries,
+                    "provider_used": "gemini",
+                }
+                if cache_key:
+                    _write_cached_expansion(cache_key, result)
+                return result
+            except CancellationError:
+                raise
+            except Exception as exc:
+                raise_if_cancelled(should_cancel)
+                errors.append(f"{model}: {exc}")
     logger.info(
         "practice-fast Gemini expansion unavailable; using deterministic fallback: %s",
         "; ".join(errors),

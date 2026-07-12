@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from . import config
+from . import segment_cache
 from .cancellation import raise_if_cancelled
 from .clipper import embed
+from .singleflight import singleflight
 from ...pipeline import gemini_segment
 from .errors import (
     CancellationError,
@@ -42,11 +44,24 @@ def _wire_segment_runtime(settings: dict, video_id: str) -> None:
             existing_sink(event)
         if context is None or event.get("event") != "model_call":
             return
+        has_provider_response = bool(
+            event.get("finish_reason")
+            or event.get("prompt_tokens")
+            or event.get("prompt_token_count")
+            or event.get("candidate_tokens")
+            or event.get("candidates_token_count")
+            or event.get("thought_tokens")
+            or event.get("thoughts_token_count")
+            or event.get("total_tokens")
+            or event.get("total_token_count")
+        )
         context.record_gemini(
             attempt=max(1, int(event.get("retries") or 0) + 1),
             model_used=str(event.get("model") or ""),
             quality_degraded=str(event.get("operation") or "").startswith("pro_fallback"),
             usage=event,
+            status_code=200 if has_provider_response else None,
+            error_code="" if has_provider_response else "model_call_failed",
         )
 
     settings["_segment_telemetry"] = sink
@@ -74,13 +89,52 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
         raise TranscriptError(f"Empty transcript for {video_id}")
 
     try:
-        _wire_segment_runtime(settings, video_id)
-        clips, notes = gemini_segment.segment_clips(
-            transcript,
-            settings,
-            topic=topic or "",
-            video_id=video_id,
-        )
+        def run_segmenter() -> tuple[list[dict], str]:
+            _wire_segment_runtime(settings, video_id)
+            return gemini_segment.segment_clips(
+                transcript,
+                settings,
+                topic=topic or "",
+                video_id=video_id,
+            )
+
+        if not segment_cache.cache_enabled():
+            clips, notes = run_segmenter()
+        else:
+            cache_key = segment_cache.segment_cache_key(
+                video_id=video_id,
+                topic=topic or "",
+                transcript=transcript,
+                settings=settings,
+            )
+            with singleflight(cache_key, should_cancel):
+                cached = segment_cache.load_segment_result(
+                    cache_key,
+                    video_id=video_id,
+                    transcript=transcript,
+                    settings=settings,
+                )
+                if cached is not None:
+                    clips, notes = cached
+                    context = settings.get("generation_context") or settings.get("provider_context")
+                    if context is not None:
+                        context.increment_counter("segmentation_cache_hits")
+                        context.record_cache_hit(
+                            provider="gemini",
+                            operation="segmentation",
+                            metadata={"cache_key": cache_key},
+                        )
+                else:
+                    clips, notes = run_segmenter()
+                    if clips:
+                        segment_cache.store_segment_result(
+                            cache_key,
+                            clips,
+                            notes,
+                            video_id=video_id,
+                            transcript=transcript,
+                            settings=settings,
+                        )
         raise_if_cancelled(should_cancel)
     except CancellationError:
         raise
