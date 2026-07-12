@@ -25,12 +25,12 @@ def test_authoring_model_is_flash_topic_model_is_pro():
     assert config.TOPIC_MODEL == "gemini-3.1-pro-preview"
 
 
-def test_segment_router_defaults_are_fail_closed_and_pro_compatible():
-    assert config.SEGMENT_ROUTING_MODE == "pro_only"
+def test_segment_router_defaults_to_guarded_flash_canary():
+    assert config.SEGMENT_ROUTING_MODE == "hybrid"
     assert config.SEGMENT_FLASH_MODEL == "gemini-3.5-flash"
     assert config.SEGMENT_PRO_MODEL == "gemini-3.1-pro-preview"
     assert config.SEGMENT_MODEL == config.SEGMENT_PRO_MODEL
-    assert config.SEGMENT_HYBRID_PERCENT == 0.0
+    assert config.SEGMENT_HYBRID_PERCENT == 1.0
 
 
 def _reload_segment_config(monkeypatch, **values):

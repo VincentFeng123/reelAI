@@ -1,9 +1,9 @@
 """Guarded Gemini educational clip segmentation.
 
-Production remains Pro-authoritative by default.  Shadow mode compares a strict
-Gemini 3.5 Flash candidate against the same transcript, while hybrid mode admits
-only deterministic ``green`` Flash results and reruns every uncertain or invalid
-request with the configured Pro model.
+Production starts with a guarded Flash-first canary. Hybrid mode admits only
+deterministic ``green`` Gemini 3.5 Flash results and reruns every uncertain or
+invalid request with the configured Pro model. Shadow and Pro-only modes remain
+available as explicit overrides.
 
 The public contract stays ``segment_clips(...) -> (clips, notes)``.  Model names,
 routing decisions, and call telemetry are logged internally and never added to a
@@ -47,8 +47,8 @@ PRODUCTION_PRO_PROFILE = "production_pro_v0"
 CORRECTED_PRO_PROFILE = "corrected_pro_v1"
 FLASH_SINGLE_PROFILE = "flash_single_v1"
 FLASH_SPLIT_PROFILE = "flash_split_v1"
-# Promotion changes this one internal constant to the first Flash profile that
-# clears every offline gate. Until then routing defaults to Pro-only.
+# The guarded hybrid route uses this Flash profile. Profile changes remain gated
+# independently from the routing rollout.
 PRODUCTION_FLASH_PROFILE = FLASH_SINGLE_PROFILE
 # Corrected Pro replaces this authority only after its own baseline gate clears.
 # Every Pro route (control, shadow, fallback, rollback) uses the same selection.
