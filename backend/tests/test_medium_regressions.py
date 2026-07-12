@@ -1319,7 +1319,7 @@ class MediumRegressionTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_ranked_request_reels_rejects_unplanned_alias_without_transcript_evidence(self) -> None:
+    def test_ranked_request_reels_keeps_practice_valid_alias_without_literal_anchor(self) -> None:
         conn = self._build_generation_test_conn()
         conn.execute(
             "UPDATE materials SET subject_tag = ?, source_type = ? WHERE id = ?",
@@ -1357,7 +1357,7 @@ class MediumRegressionTests(unittest.TestCase):
                     limit=5,
                 )
 
-            self.assertEqual(page_one, [])
+            self.assertEqual([item["reel_id"] for item in page_one], ["good-alias"])
         finally:
             conn.close()
 
@@ -3229,6 +3229,68 @@ class MediumRegressionTests(unittest.TestCase):
         self.assertEqual(len(html_calls), 2)
         self.assertEqual(data_api_calls, ["binary search trees"])
 
+    def test_ranked_feed_topic_keeps_weak_lexical_match_and_score_orders_it(self) -> None:
+        conn = self._build_ranked_feed_test_conn()
+        conn.execute(
+            "UPDATE materials SET source_type = 'topic' WHERE id = ?",
+            ("material-ranked",),
+        )
+        conn.execute(
+            """
+            INSERT INTO videos (
+                id, title, channel_title, description, duration_sec, view_count,
+                is_creative_commons, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "vidWeakMatch01",
+                "An unfamiliar worked example",
+                "Teaching Channel",
+                "A transcript-grounded lesson selected upstream.",
+                180,
+                100,
+                0,
+                "2026-03-13T00:02:30+00:00",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO reels (
+                id, generation_id, material_id, concept_id, video_id, video_url,
+                t_start, t_end, transcript_snippet, takeaways_json, base_score,
+                difficulty, model_used, quality_degraded, selected_cue_ids_json,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "reel-weak-match",
+                None,
+                "material-ranked",
+                "concept-ranked",
+                "vidWeakMatch01",
+                "https://www.youtube.com/watch?v=vidWeakMatch01",
+                10.0,
+                40.0,
+                "A validated explanation selected from the transcript.",
+                '["A useful worked example"]',
+                1.2,
+                0.5,
+                "gemini-3.5-flash",
+                0,
+                '["cue-weak-1"]',
+                "2026-03-13T00:03:30+00:00",
+            ),
+        )
+        service = ReelService(embedding_service=None, youtube_service=None)
+        ranked = service.ranked_feed(conn, "material-ranked", fast_mode=True)
+
+        self.assertEqual(
+            [item["reel_id"] for item in ranked],
+            ["reel-ranked", "reel-weak-match"],
+        )
+        self.assertGreater(ranked[0]["score"], ranked[1]["score"])
+        conn.close()
+
     def test_ranked_feed_cache_reuses_results_and_invalidates_on_feedback_and_transcript_updates(self) -> None:
         conn = self._build_ranked_feed_test_conn()
         service = ReelService(embedding_service=None, youtube_service=None)
@@ -3559,7 +3621,7 @@ class MediumRegressionTests(unittest.TestCase):
         )
         self.assertFalse(result["passes"])
 
-    def test_shape_reels_for_request_context_rejects_unplanned_companion_anchor(self) -> None:
+    def test_shape_reels_for_request_context_keeps_unanchored_practice_clip(self) -> None:
         shaped = main_module._shape_reels_for_request_context(
             [
                 {
@@ -3583,7 +3645,7 @@ class MediumRegressionTests(unittest.TestCase):
             strict_topic_only=True,
         )
 
-        self.assertEqual(shaped, [])
+        self.assertEqual([item["reel_id"] for item in shaped], ["reel-1"])
 
     def test_request_source_surface_allowed_opens_related_results_on_page_two(self) -> None:
         reel = {"source_surface": "youtube_related"}

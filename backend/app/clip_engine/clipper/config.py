@@ -26,6 +26,7 @@ GEMINI_MODEL = _engine.GEMINI_MODEL
 GEMINI_API_KEY = _engine.GEMINI_API_KEY
 SUPADATA_API_KEY = _engine.SUPADATA_API_KEY
 SUPADATA_BASE = _engine.SUPADATA_BASE
+SUPADATA_CHUNK_SIZE = _engine.SUPADATA_CHUNK_SIZE
 
 # ── LLM provider ──────────────────────────────────────────────────────────────
 LLM_PROVIDER = "gemini"

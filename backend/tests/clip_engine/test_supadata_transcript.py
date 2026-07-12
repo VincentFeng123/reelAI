@@ -119,11 +119,14 @@ def test_synchronous_auto_generated_transcript_is_accepted(monkeypatch) -> None:
     }]
 
 
-def test_transcription_adapter_does_not_synthesize_word_times(monkeypatch) -> None:
+def test_transcription_adapter_matches_practice_chunk_and_word_timing(monkeypatch) -> None:
+    calls = []
+
     def responder(url, params, headers):
+        calls.append((url, params))
         return _Response(200, {
             "lang": "en",
-            "content": [{"offset": 0, "duration": 2000, "text": "native cue"}],
+            "content": [{"offset": 0, "duration": 2000, "text": "native cue words"}],
         })
 
     _install_client(monkeypatch, responder)
@@ -132,7 +135,12 @@ def test_transcription_adapter_does_not_synthesize_word_times(monkeypatch) -> No
         VIDEO_ID,
         {"language": "en", "provider_cache": MemoryProviderCache()},
     )
-    assert result["words"] == []
+    assert calls[0][1]["chunkSize"] == "180"
+    assert result["words"] == [
+        {"word": "native", "start": 0.0, "end": pytest.approx(2 / 3)},
+        {"word": "cue", "start": pytest.approx(2 / 3), "end": pytest.approx(4 / 3)},
+        {"word": "words", "start": pytest.approx(4 / 3), "end": 2.0},
+    ]
     assert result["segments"][0]["start"] == 0.0
     assert result["segments"][0]["end"] == 2.0
     assert result["native_mode"] is False

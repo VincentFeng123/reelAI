@@ -42,7 +42,7 @@ bgutil-ytdlp-pot-provider>=0.7.0
 # first use; the module auto-falls-back to the hash embedder if the model
 # cannot load.
 sentence-transformers>=3.0.0
-google-genai==1.73.1
+google-genai>=2.0.0,<3
 tiktoken==0.8.0
 rapidfuzz==3.10.1
 # Third-tier LLM fallback (after Gemini). Cerebras serves Llama 3.3

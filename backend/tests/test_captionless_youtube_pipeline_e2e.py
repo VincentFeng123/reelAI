@@ -10,14 +10,13 @@ from typing import Any
 
 from backend.app import db as db_module
 from backend.app.clip_engine.clipper import supadata_client
-from backend.app.clip_engine.clipper.llm import StructuredResult
-from backend.app.clip_engine.clipper.pipeline import gemini_segment
 from backend.app.clip_engine.provider_cache import MemoryProviderCache
 from backend.app.clip_engine.provider_runtime import GenerationContext
 from backend.app.config import get_settings
 from backend.app.ingestion import pipeline as pipeline_module
 from backend.app.ingestion.pipeline import IngestionPipeline, _PlatformRateLimiter
 from backend.app.services.search_query_plan import PlannedSearchQuery, SearchQueryPlan
+from backend.pipeline import gemini_segment
 
 
 VIDEO_ID = "PyIntro0001"
@@ -172,15 +171,16 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
     monkeypatch.setattr(supadata_client, "sleep_with_probe", no_poll_delay)
     monkeypatch.setattr(supadata_client.config, "SUPADATA_API_KEY", "sd_test")
 
-    gemini_prompts: list[str] = []
+    gemini_calls: list[dict[str, Any]] = []
 
-    def fake_gemini(
+    def fake_model_call(
         system: str,
         user: str,
         schema,
-        **_kwargs: Any,
-    ) -> StructuredResult:
-        gemini_prompts.append(system + "\n" + user)
+        **kwargs: Any,
+    ):
+        gemini_calls.append({"system": system, "user": user, **kwargs})
+        assert schema is gemini_segment._Plan
         plan = schema.model_validate(
             {
                 "topics": [
@@ -192,22 +192,50 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
                         "end_quote": "first Python program easy to understand",
                         "reason": "A complete beginner explanation.",
                         "facet": "variables",
-                        "kind": "educational",
                         "informativeness": 0.95,
                         "topic_relevance": 0.99,
                         "self_contained": True,
                         "difficulty": 0.1,
+                        "uncertainty": "low",
+                        "uncertainty_reasons": [],
+                        "summary": "Python variables store numbers and strings.",
+                        "takeaways": [
+                            "Python variables store values.",
+                            "Assign a variable with equals.",
+                        ],
+                        "match_reason": "Python variables make a first Python program easy.",
+                        "assessment": {
+                            "prompt": "What can Python variables store?",
+                            "options": [
+                                "Numbers and strings",
+                                "Only comments",
+                                "Video titles",
+                                "Nothing",
+                            ],
+                            "correct_index": 0,
+                            "explanation": "Python variables store numbers and strings.",
+                            "evidence_quote": (
+                                "Python variables store values such as numbers and strings."
+                            ),
+                        },
                     }
                 ]
             }
         )
-        return StructuredResult(
-            value=plan,
-            model_used="gemini-test",
-            quality_degraded=False,
-        )
+        return plan, {
+            "model": kwargs["model"],
+            "operation": kwargs["operation"],
+            "prompt_version": kwargs["prompt_version"],
+            "prompt_token_count": 100,
+            "candidates_token_count": 20,
+            "total_token_count": 120,
+            "retries": 0,
+        }
 
-    monkeypatch.setattr(gemini_segment, "llm_json_result", fake_gemini)
+    monkeypatch.setattr(gemini_segment, "_call_model", fake_model_call)
+    monkeypatch.setattr(gemini_segment, "_flash_disabled_reason", None)
+    monkeypatch.setattr(gemini_segment.config, "SEGMENT_ROUTING_MODE", "hybrid")
+    monkeypatch.setattr(gemini_segment.config, "SEGMENT_HYBRID_PERCENT", 100.0)
 
     cache = MemoryProviderCache()
     context = GenerationContext("fast", cache_store=cache)
@@ -250,9 +278,12 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
             "text": "false",
             "mode": "auto",
             "lang": "en",
+            "chunkSize": "180",
         }
         assert provider_calls[1][0].endswith("/transcript/captionless-job")
-        assert "timestamped transcript cues" in gemini_prompts[0]
+        assert gemini_calls[0]["prompt_version"] == gemini_segment.PRODUCTION_FLASH_PROFILE
+        assert "timestamped transcripts" in gemini_calls[0]["system"]
+        assert "[0] 00:05 Python variables store values" in gemini_calls[0]["user"]
 
         artifacts = list(cache.transcript_rows.values())
         assert len(artifacts) == 1

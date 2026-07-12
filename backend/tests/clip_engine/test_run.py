@@ -18,8 +18,9 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
                "words": [], "duration": 5.0}
     seen: dict = {}
 
-    def fake_segment(transcript, settings, progress=None, topic=""):
+    def fake_segment(transcript, settings, progress=None, topic="", video_id=""):
         seen["topic"] = topic
+        seen["video_id"] = video_id
         return ([{"start": 1.0, "end": 4.0, "cut_end": 4.15, "title": "Bit",
                   "facet": "concept", "reason": "", "sequence_index": 1}], "1 clip")
 
@@ -36,7 +37,12 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
     assert out["video_id"] == "dQw4w9WgXcQ"
     assert out["clips"][0]["embed_url"] == "https://www.youtube.com/embed/dQw4w9WgXcQ?start=1&end=4&rel=0"
     assert seen["topic"] == "topic"
+    assert seen["video_id"] == "dQw4w9WgXcQ"
     assert seen["transcript_url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+def test_live_runner_uses_the_canonical_practice_segmenter():
+    assert run.gemini_segment.__name__ == "backend.pipeline.gemini_segment"
 
 
 def test_transcript_provider_error_is_re_raised_unchanged(monkeypatch):

@@ -1,8 +1,9 @@
-"""Hosted timestamped-transcript adapter; local ASR is intentionally unsupported."""
+"""Practice fast-path Supadata transcript adapter; local ASR is unsupported."""
 from __future__ import annotations
 
 from typing import Callable, Optional
 
+from .. import config
 from ...cancellation import raise_if_cancelled
 
 ProgressCb = Optional[Callable[[float, str], None]]
@@ -14,7 +15,7 @@ def transcribe_supadata(
     settings: dict,
     progress: ProgressCb = None,
 ) -> dict:
-    """Fetch timestamped cues without downloading media or inventing word times."""
+    """Fetch timed cues and interpolate the word timeline used by practice."""
     del video_id
 
     def emit(fraction: float, message: str = "") -> None:
@@ -33,12 +34,27 @@ def transcribe_supadata(
         context=settings.get("generation_context") or settings.get("provider_context"),
         cache_store=settings.get("provider_cache"),
         deadline_monotonic=settings.get("deadline_monotonic"),
+        chunk_size=config.SUPADATA_CHUNK_SIZE,
     )
     segments = [dict(cue) for cue in artifact.segments]
+    words: list[dict] = []
+    for segment in segments:
+        tokens = str(segment.get("text") or "").split()
+        count = max(1, len(tokens))
+        start = float(segment["start"])
+        duration = max(0.01, float(segment["end"]) - start)
+        for index, token in enumerate(tokens):
+            words.append(
+                {
+                    "word": token,
+                    "start": start + duration * index / count,
+                    "end": start + duration * (index + 1) / count,
+                }
+            )
     result = {
         "text": " ".join(segment["text"] for segment in segments),
         "duration": artifact.duration_sec,
-        "words": [],
+        "words": words,
         "segments": segments,
         "source": "supadata",
         "chunks": segments,

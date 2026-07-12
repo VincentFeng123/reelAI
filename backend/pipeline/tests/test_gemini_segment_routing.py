@@ -420,13 +420,13 @@ def test_schema_failure_preserves_successful_call_usage_telemetry(monkeypatch):
     "profile,expected",
     [
         (G.PRODUCTION_PRO_PROFILE,
-         ("high", 24_576, 90.0, "pro_authoritative", "gemini-3.1-pro-preview")),
+         ("high", 24_576, 180.0, "pro_authoritative", "gemini-3.1-pro-preview")),
         (G.CORRECTED_PRO_PROFILE,
-         ("high", 24_576, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
+         ("high", 24_576, 180.0, "pro_fallback", "gemini-3.1-pro-preview")),
         (G.FLASH_SINGLE_PROFILE,
-         ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
+         ("medium", 24_576, 90.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("medium", 12_288, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
+         ("medium", 12_288, 90.0, "flash_boundary_selector", "gemini-3.5-flash")),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -517,9 +517,9 @@ def test_split_invalid_item_retries_only_its_excerpt_with_pro(monkeypatch):
         G.config.SEGMENT_FLASH_MODEL, G.config.SEGMENT_PRO_MODEL,
     ]
     assert (calls[0][0]["thinking_level"], calls[0][0]["max_output_tokens"],
-            calls[0][0]["timeout_s"]) == ("low", 24_576, 25.0)
+            calls[0][0]["timeout_s"]) == ("low", 24_576, 45.0)
     assert (calls[1][0]["thinking_level"], calls[1][0]["max_output_tokens"],
-            calls[1][0]["timeout_s"]) == ("high", 24_576, 90.0)
+            calls[1][0]["timeout_s"]) == ("high", 24_576, 180.0)
     assert "clip-a" not in calls[1][1] and "alpha lesson" not in calls[1][1]
     assert "clip-b" in calls[1][1] and "beta lesson" in calls[1][1]
     assert enriched[0]["summary"] and enriched[1]["summary"]

@@ -16,7 +16,7 @@ from .metadata import normalize_youtube_video_id
 logger = logging.getLogger(__name__)
 
 SEARCH_SCHEMA_VERSION = 2
-TRANSCRIPT_SCHEMA_VERSION = 2
+TRANSCRIPT_SCHEMA_VERSION = 3
 SEARCH_POSITIVE_TTL_SEC = 6 * 60 * 60
 SEARCH_EMPTY_TTL_SEC = 15 * 60
 TRANSCRIPT_TTL_SEC = 30 * 24 * 60 * 60

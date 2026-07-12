@@ -210,6 +210,7 @@ class ClipEngineSearchTests(unittest.TestCase):
             cache_store=None,
             literal_topic="calc",
             use_query_planner=True,
+            practice_fast=True,
             breadth=3,
         )
 

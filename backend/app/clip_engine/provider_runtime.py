@@ -93,8 +93,10 @@ class GenerationBudget:
     """Atomic, job-wide provider ceilings plus acquisition-pass controls."""
 
     _LIMITS: dict[GenerationMode, dict[ProviderOperation, int]] = {
+        # Slow-mode search/transcript reservations count provider attempts,
+        # including retries. The intentionally small fast path remains fixed.
         "fast": {"search": 3, "transcript": 3, "segmentation": 3},
-        "slow": {"search": 12, "transcript": 10, "segmentation": 10},
+        "slow": {"search": 72, "transcript": 60, "segmentation": 20},
     }
     _PASS_LIMITS: dict[GenerationMode, tuple[int, int]] = {
         "fast": (1, 0),

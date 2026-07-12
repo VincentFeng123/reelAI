@@ -491,7 +491,9 @@ def test_deadline_and_lease_windows_are_bounded_by_contract() -> None:
             now=BASE_TIME,
             deadline_seconds=10_000,
         )
-        assert datetime.fromisoformat(job["deadline_at"]) == BASE_TIME + timedelta(minutes=8)
+        assert datetime.fromisoformat(job["deadline_at"]) == BASE_TIME + timedelta(
+            seconds=jobs.DEFAULT_DEADLINE_SECONDS
+        )
 
         leased = jobs.lease_job(
             conn,

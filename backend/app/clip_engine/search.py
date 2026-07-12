@@ -5,7 +5,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from . import rank, supadata_search
+from . import expand, rank, supadata_search
 from .cancellation import raise_if_cancelled
 from .errors import SearchError
 from .metadata import normalize_youtube_video_id
@@ -147,7 +147,24 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
              cache_store: ProviderCacheStore | None = None,
              literal_topic: str | None = None,
              use_query_planner: bool = True,
-             query_plan: "SearchQueryPlan | None" = None) -> dict:
+             query_plan: "SearchQueryPlan | None" = None,
+             practice_fast: bool = False) -> dict:
+    if practice_fast:
+        return discover_practice_fast(
+            topic,
+            limit,
+            exclude_video_ids,
+            breadth,
+            level,
+            should_cancel,
+            filters=filters,
+            language=language,
+            context=context,
+            cache_store=cache_store,
+            literal_topic=literal_topic,
+            use_query_planner=use_query_planner,
+            query_plan=query_plan,
+        )
     topic = " ".join(str(topic or "").split())
     if not topic:
         raise SearchError("topic must contain non-whitespace text")
@@ -315,3 +332,83 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
     return {"corrected": topic, "videos": videos,
             "credits_used": res["credits_used"], "warning": res["warning"],
             "query_plan": effective_plan}
+
+
+def discover_practice_fast(
+    topic: str,
+    limit: int,
+    exclude_video_ids: list[str] | None = None,
+    breadth: int | None = None,
+    level: str | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    *,
+    filters: dict | None = None,
+    language: str = "en",
+    context: GenerationContext | None = None,
+    cache_store: ProviderCacheStore | None = None,
+    literal_topic: str | None = None,
+    use_query_planner: bool = True,
+    query_plan: "SearchQueryPlan | None" = None,
+) -> dict:
+    """Opt-in practice retrieval: Flash expand -> sequential search -> simple rank.
+
+    The signature intentionally matches ``discover`` so live wiring can switch paths
+    without dropping cancellation, budgets, provider caching, filters, or exclusions.
+    Planner arguments are accepted for compatibility but do not alter this reference
+    path's Gemini-generated query list.
+    """
+    del use_query_planner
+    topic = " ".join(str(topic or "").split())
+    if not topic:
+        raise SearchError("topic must contain non-whitespace text")
+
+    try:
+        requested = int(breadth if breadth is not None else 8)
+    except (TypeError, ValueError, OverflowError):
+        requested = 8
+    query_count = max(1, min(12, requested))
+    if context is not None:
+        if context.budget.mode == "fast":
+            query_count = min(query_count, 3)
+        query_count = min(query_count, context.budget.remaining("search"))
+    if query_count <= 0:
+        raise SearchError("search budget exhausted")
+
+    raise_if_cancelled(should_cancel)
+    expansion_topic = " ".join(str(literal_topic or topic).split()) or topic
+    expansion = expand.expand_query_practice_fast(
+        expansion_topic,
+        query_count,
+        level=level,
+        should_cancel=should_cancel,
+        context=context,
+    )
+    queries = list(expansion.get("queries") or [])[:query_count]
+    if not queries:
+        raise SearchError("query expansion returned no usable queries")
+
+    result = supadata_search.search_all(
+        queries,
+        filters,
+        should_cancel=should_cancel,
+        language=language,
+        context=context,
+        cache_store=cache_store,
+    )
+    raise_if_cancelled(should_cancel)
+    excluded = {
+        normalize_youtube_video_id(video_id) or str(video_id or "").strip()
+        for video_id in (exclude_video_ids or [])
+    }
+    ranked = rank.merge_and_rank_practice_fast(result["per_query"])
+    top_n = max(0, int(limit))
+    videos = [video for video in ranked if video.get("id") not in excluded][:top_n]
+    return {
+        "corrected": expansion.get("corrected") or topic,
+        "queries": queries,
+        "provider_used": expansion.get("provider_used") or "deterministic",
+        "videos": videos,
+        "credits_used": result["credits_used"],
+        "warning": result["warning"],
+        "query_plan": query_plan,
+    }

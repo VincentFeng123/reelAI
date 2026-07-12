@@ -2460,13 +2460,9 @@ def _shape_reels_for_request_context(
                     or len([term for term in matched_terms if str(term or "").strip()]) >= 2
                 )
             )
-            if page <= 1:
-                if not has_root_anchor and not (
-                    has_page_one_companion_anchor and (educational_support or topical_short_support)
-                ):
-                    continue
-            elif not has_root_anchor and not (has_companion_anchor and (educational_support or topical_short_support)):
-                continue
+            # The practice selector has already grounded and quality-checked
+            # the clip against its transcript. These request-context signals
+            # only reorder topic reels; they must not erase valid inventory.
 
         shaped = dict(reel)
         shaped["_request_rank_score"] = _request_rank_score(
@@ -3009,7 +3005,7 @@ def _generation_job_reels(conn, job_row: dict[str, Any]) -> list[dict[str, Any]]
     if not generation_id:
         return []
     params = _job_request_params(job_row)
-    requested = max(1, min(60, int(params.get("num_reels") or 8)))
+    requested = max(1, min(MAX_REELS_PER_MATERIAL, int(params.get("num_reels") or 20)))
     return _ranked_request_reels(
         conn,
         material_id=str(job_row.get("material_id") or ""),
@@ -3186,7 +3182,10 @@ def _run_leased_generation_job(
     lease_owner = str(job_row.get("lease_owner") or "")
     params = _job_request_params(job_row)
     mode: Literal["fast", "slow"] = "fast" if params.get("generation_mode") == "fast" else "slow"
-    requested_count = max(1, min(60, int(params.get("num_reels") or 8)))
+    requested_count = max(
+        1,
+        min(MAX_REELS_PER_MATERIAL, int(params.get("num_reels") or 20)),
+    )
     material_id = str(job_row.get("material_id") or "")
     concept_id = str(job_row.get("concept_id") or "") or None
     learner_id = str(job_row.get("learner_id") or LEGACY_LEARNER_ID)
@@ -3250,6 +3249,9 @@ def _run_leased_generation_job(
                 )
             generation_id = str(job_row.get("result_generation_id") or "").strip()
             if not _fetch_generation_row(setup_conn, generation_id):
+                source_generation_id = (
+                    str(job_row.get("source_generation_id") or "").strip() or None
+                )
                 generation_id = _create_generation_row(
                     setup_conn,
                     material_id=material_id,
@@ -3257,7 +3259,7 @@ def _run_leased_generation_job(
                     request_key=str(job_row.get("request_key") or ""),
                     generation_mode=mode,
                     retrieval_profile="unified",
-                    source_generation_id=None,
+                    source_generation_id=source_generation_id,
                 )
                 attached_at = now_iso()
                 attached = execute_modify(
@@ -3281,6 +3283,14 @@ def _run_leased_generation_job(
                     )
 
         with get_conn() as conn:
+            source_generation_ids = _response_generation_ids(
+                conn,
+                str(job_row.get("source_generation_id") or "").strip() or None,
+            )
+            source_reel_count = sum(
+                _count_generation_reels(conn, source_id)
+                for source_id in source_generation_ids
+            )
             emitted: set[tuple[str, str]] = set()
 
             def on_candidate(reel: dict[str, Any]) -> None:
@@ -3298,7 +3308,9 @@ def _run_leased_generation_job(
                     lease_owner=lease_owner,
                 )
 
-            previous_count = _count_generation_reels(conn, generation_id)
+            previous_count = source_reel_count + _count_generation_reels(
+                conn, generation_id
+            )
             last_growth: int | None = None
             for pass_index in range(context.budget.max_passes):
                 if previous_count >= requested_count:
@@ -3314,12 +3326,12 @@ def _run_leased_generation_job(
                 if mode == "fast":
                     pass_video_budget = 3
                 elif pass_index == 0:
-                    pass_video_budget = 5
+                    pass_video_budget = 12
                 else:
                     pass_video_budget = max(
                         1,
                         min(
-                            3,
+                            4,
                             context.budget.remaining("transcript"),
                             context.budget.remaining("segmentation"),
                         ),
@@ -3331,6 +3343,7 @@ def _run_leased_generation_job(
                     num_reels=requested_count,
                     creative_commons_only=bool(params.get("creative_commons_only")),
                     exclude_video_ids=list(params.get("exclude_video_ids") or []),
+                    exclude_generation_ids=source_generation_ids,
                     fast_mode=mode == "fast",
                     preferred_video_duration=_normalize_preferred_video_duration(
                         str(params.get("preferred_video_duration") or "any")
@@ -3350,7 +3363,9 @@ def _run_leased_generation_job(
                     max_generation_videos=pass_video_budget,
                     acquisition_concept_offset=pass_index,
                 )
-                current_count = _count_generation_reels(conn, generation_id)
+                current_count = source_reel_count + _count_generation_reels(
+                    conn, generation_id
+                )
                 if not update_generation_progress(
                     conn,
                     job_id=job_id,
@@ -3367,8 +3382,10 @@ def _run_leased_generation_job(
                 last_growth = max(0, current_count - previous_count)
                 previous_count = current_count
 
-            raw_count = _count_generation_reels(conn, generation_id)
-            if raw_count:
+            cumulative_count = source_reel_count + _count_generation_reels(
+                conn, generation_id
+            )
+            if cumulative_count:
                 _activate_generation(
                     conn,
                     material_id=material_id,
@@ -3896,7 +3913,11 @@ def admin_health() -> dict:
         "supadata_configured": bool(os.getenv("SUPADATA_API_KEY", "").strip()),
         "gemini_primary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
         "gemini_chat_configured": bool(os.getenv("GEMINI_API_KEY_2", "").strip()),
-        "gemini_fallback_model": os.getenv("SEGMENT_FALLBACK_MODEL", "").strip() or None,
+        "gemini_fallback_model": (
+            os.getenv("SEGMENT_PRO_MODEL", "").strip()
+            or os.getenv("SEGMENT_FALLBACK_MODEL", "").strip()
+            or "gemini-3.1-pro-preview"
+        ),
         "text_llm_available": bool(text_llm["available"]),
         "text_llm_provider": text_llm["provider"],
         "text_llm_providers": text_llm["providers"],
@@ -4674,6 +4695,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             target_clip_duration_min_sec=safe_target_clip_min_sec,
             target_clip_duration_max_sec=safe_target_clip_max_sec,
         )
+        source_generation_id: str | None = None
         completed_job = find_completed_generation_job(conn, request_key)
         if completed_job:
             cached_reels = _generation_job_reels(conn, completed_job)
@@ -4683,6 +4705,9 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                     "generation_id": str(completed_job.get("result_generation_id") or "") or None,
                     "response_profile": "unified",
                 }
+            source_generation_id = (
+                str(completed_job.get("result_generation_id") or "").strip() or None
+            )
         request_params = {
             "material_id": payload.material_id,
             "concept_id": payload.concept_id,
@@ -4705,6 +4730,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             content_fingerprint=content_fingerprint,
             learner_id=learner_id,
             request_params=request_params,
+            source_generation_id=source_generation_id,
         )
     job_id = str(job_row.get("id") or "")
     status = str(job_row.get("status") or "queued")
@@ -5476,8 +5502,11 @@ def feed(
         )
         if autofill and sparse and material_count < MAX_REELS_PER_MATERIAL:
             target_total = min(
-                MAX_REELS_PER_MATERIAL - material_count,
-                max(limit, page_end + prefetch),
+                MAX_REELS_PER_MATERIAL,
+                max(
+                    page_end + prefetch,
+                    material_count + max(limit, prefetch),
+                ),
             )
             active_job, _created = submit_generation_job(
                 conn,

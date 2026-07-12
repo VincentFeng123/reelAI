@@ -67,7 +67,7 @@ const FEED_SESSION_STORAGE_KEY = "studyreels-feed-sessions";
 const MAX_SAVED_FEED_PROGRESS = 240;
 const MAX_SAVED_FEED_SESSIONS = 24;
 const MAX_HISTORY_ITEMS = 120;
-const MAX_REELS_PER_FEED_SESSION = 80;
+const MAX_REELS_PER_FEED_SESSION = 300;
 const COMPACT_REELS_PER_FEED_SESSION = 48;
 const MINIMAL_REELS_PER_FEED_SESSION = 20;
 const RECOVERY_RETRY_BASE_MS = 1_200;
@@ -1937,7 +1937,7 @@ function FeedPageInner() {
     }
     const searchScope = activeSearchScopeRef.current;
     const tuning = getFeedTuningSettings();
-    const batchSize = 14;
+    const batchSize = 24;
     const perTopicBatch = Math.max(1, Math.ceil(batchSize / feedMaterialIds.length));
     isGeneratingRef.current = true;
     setGeneratingMore(true);
@@ -1954,7 +1954,7 @@ function FeedPageInner() {
         feedMaterialIds.map(async (id) => {
           const streamedReels: Reel[] = [];
           const currentCount = countReelsForMaterial(id);
-          const initialTarget = 5;
+          const initialTarget = 20;
           // Keep extending the requested total upward so broad topics do not stall at a client-side cap.
           const targetTotal = currentCount > 0 ? currentCount + perTopicBatch : initialTarget;
           try {

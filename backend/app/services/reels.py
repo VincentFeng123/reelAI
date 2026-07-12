@@ -84,11 +84,11 @@ REEL_PAD_END_SEC = 0.3
 STRICT_WORD_BOUNDARY_PRE_ROLL_SEC = 0.08
 STRICT_WORD_BOUNDARY_POST_ROLL_SEC = 0.08
 
-# Latency/cost guardrail for the clip-engine material->reels path: bound the
-# number of paid discover / run.clip (Gemini) calls per generation so a single
-# request can't fan out into an unbounded number of engine invocations.
-MATERIAL_MAX_VIDEOS_PER_CONCEPT = 5   # Supadata candidate cap per acquisition pass
-MATERIAL_GEN_MAX_VIDEOS = 12          # hard ceiling on run.clip calls per generation
+# High-volume guardrails for the clip-engine material->reels path. The initial
+# slow pass may evaluate twelve sources, with two bounded continuation passes.
+MATERIAL_MAX_VIDEOS_PER_CONCEPT = 12
+MATERIAL_GEN_MAX_VIDEOS = 20
+MATERIAL_REEL_INVENTORY_LIMIT = 300
 
 
 # A2: ratio-based auto-punctuation gate. Restoration fires on transcripts
@@ -1185,7 +1185,7 @@ class ReelService:
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
-    RANKED_FEED_CACHE_VERSION = 10
+    RANKED_FEED_CACHE_VERSION = 11
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -1556,7 +1556,6 @@ class ReelService:
             0.0, min(1.0, float(min_relevance_threshold))
         )
         safe_page_hint = max(1, int(page_hint or 1))
-        safe_retrieval_profile = self._normalize_retrieval_profile(retrieval_profile)
         params: tuple[Any, ...] = (material_id,)
         concept_where = "WHERE material_id = ?"
         if concept_id:
@@ -1588,13 +1587,15 @@ class ReelService:
         strict_topic_only = str((material or {}).get("source_type") or "").strip().lower() == "topic"
         strict_topic_expansion: dict[str, Any] | None = None
         if strict_topic_only and subject_tag:
-            strict_topic_expansion = run_pre_ingestion(
-                lambda: self._topic_expansion_from_query_plan(
-                    conn,
-                    subject_tag=subject_tag,
-                    should_cancel=should_cancel,
-                )
-            )
+            # The practice retrieval path owns query expansion. Keep material
+            # generation anchored to the user's literal topic so a second AI
+            # planner cannot delay or redirect the request before video search.
+            strict_topic_expansion = {
+                "canonical_topic": subject_tag,
+                "aliases": [],
+                "subtopics": [],
+                "related_terms": [],
+            }
         if not concepts and strict_topic_only and subject_tag:
             concepts = run_pre_ingestion(
                 lambda: self._build_topic_only_concepts_from_expansion(
@@ -1609,40 +1610,19 @@ class ReelService:
             return []
         root_topic_terms: list[str] = []
         if strict_topic_only and subject_tag:
-            strict_topic_expansion = strict_topic_expansion or {
-                "canonical_topic": subject_tag,
-                "aliases": [],
-                "subtopics": [],
-                "related_terms": [],
-            }
             concepts = run_pre_ingestion(
-                lambda: self._sync_topic_expansion_concepts(
-                    conn,
-                    material_id=material_id,
+                lambda: self._bootstrap_topic_retrieval_concepts(
+                    conn=conn,
                     concepts=concepts,
                     subject_tag=subject_tag,
+                    material_id=material_id,
                     expansion=strict_topic_expansion,
                     should_cancel=should_cancel,
                 )
             )
             if not concepts:
                 return []
-            root_topic_terms = self._topic_root_anchor_terms(
-                subject_tag=subject_tag,
-                expansion=strict_topic_expansion,
-                concepts=concepts,
-            )
-            if safe_retrieval_profile == "bootstrap":
-                concepts = run_pre_ingestion(
-                    lambda: self._bootstrap_topic_retrieval_concepts(
-                        conn=conn,
-                        concepts=concepts,
-                        subject_tag=subject_tag,
-                        material_id=material_id,
-                        expansion=strict_topic_expansion,
-                        should_cancel=should_cancel,
-                    )
-                )
+            root_topic_terms = [subject_tag]
         concepts = self._order_concepts(conn, material_id, concepts, learner_id)
         if generation_context is not None and concepts:
             # One concept/query family per durable acquisition pass keeps the
@@ -1765,6 +1745,17 @@ class ReelService:
                     row.get("reel_count") or 0
                 )
         generated: list[dict[str, Any]] = []
+        material_reel_count = int(
+            (
+                fetch_one(
+                    conn,
+                    "SELECT COUNT(*) AS reel_count FROM reels WHERE material_id = ?",
+                    (material_id,),
+                )
+                or {}
+            ).get("reel_count")
+            or 0
+        )
         accumulated_exclusions: list[str] = list(exclude_video_ids or [])
         # Finding #3: exclude videos we've already clipped for this generation and
         # videos from the excluded prior generations (exclude_generation_ids) so
@@ -1805,9 +1796,14 @@ class ReelService:
 
         for idx, concept in enumerate(concepts):
             raise_if_cancelled()
-            # RAW-PRACTICE: no `len(generated) >= num_reels` break — persistence
-            # of engine clips is no longer truncated by num_reels; only the COST
-            # guardrail below (MATERIAL_GEN_MAX_VIDEOS) bounds the paid work.
+            # Persistence is never truncated by the requested response page;
+            # only the material-wide inventory ceiling and provider budgets bound it.
+            remaining_reel_capacity = max(
+                0,
+                MATERIAL_REEL_INVENTORY_LIMIT - material_reel_count - len(generated),
+            )
+            if remaining_reel_capacity <= 0:
+                break
             if videos_processed >= generation_video_limit:
                 break
             topic = self._concept_topic_query(concept)
@@ -1840,7 +1836,7 @@ class ReelService:
                     language="en",
                     knowledge_level=material_knowledge_level,
                     max_videos=video_budget,
-                    max_reels=None,
+                    max_reels=remaining_reel_capacity,
                     on_reel_created=(None if dry_run else _stream),
                     dry_run=dry_run,
                     should_cancel=should_cancel,
@@ -2266,6 +2262,7 @@ class ReelService:
             "clip_duration_sec": float(
                 getattr(reel_obj, "clip_duration_sec", None) or max(0.0, t_end - t_start)
             ),
+            "difficulty": float(getattr(reel_obj, "difficulty", 0.5) or 0.5),
         }
 
     def _finalize_generated_reels(
@@ -6608,7 +6605,7 @@ class ReelService:
                 concept_embedding=concept_embedding,
                 subject_tag=subject_tag,
             )
-            if self._is_hard_blocked_low_value_video(
+            if not strict_topic_only and self._is_hard_blocked_low_value_video(
                 title=video_title,
                 description=video_description,
                 channel_title=str(row.get("video_channel_title") or ""),
@@ -6620,22 +6617,16 @@ class ReelService:
                 require_context=bool(context_terms),
                 fast_mode=fast_mode,
             )
-            if strict_topic_only:
-                direct_topic_support = (
-                    len(relevance.get("concept_hits") or []) >= 1
-                    or float(relevance.get("concept_overlap") or 0.0) >= (0.08 if fast_mode else 0.06)
-                    or float(relevance.get("subject_overlap") or 0.0) >= 0.04
-                )
-                if not direct_topic_support:
-                    continue
-                if float(relevance.get("off_topic_penalty") or 0.0) >= 0.12 and float(relevance.get("subject_overlap") or 0.0) < 0.04:
-                    continue
-            if not relevance["passes"] and (
+            if not strict_topic_only and not relevance["passes"] and (
                 float(relevance.get("off_topic_penalty") or 0.0) >= 0.24
                 or float(relevance.get("score") or -1.0) < 0.02
             ):
                 # Hide strongly off-topic clips that can still exist from older generations.
                 continue
+            # Topic materials already passed practice's transcript-grounded clip
+            # validation. ReelAI only reorders those clips for relevance and the
+            # learner level; it must not collapse the result set with a second
+            # lexical hard gate.
             relevance_context = self._merge_relevance_context(relevance, relevance)
 
             ai_summary = str(row.get("ai_summary") or "").strip()

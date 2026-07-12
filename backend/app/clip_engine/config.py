@@ -18,14 +18,13 @@ def _flag(name: str, default: bool) -> bool:
 SUPADATA_API_KEY = os.environ.get("SUPADATA_API_KEY", "")
 SUPADATA_BASE = os.environ.get("SUPADATA_BASE", "https://api.supadata.ai/v1")
 SUPADATA_SEARCH_URL = f"{SUPADATA_BASE}/youtube/search"
+SUPADATA_CHUNK_SIZE = int(os.environ.get("SUPADATA_CHUNK_SIZE", "180"))
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") or os.environ.get("GOOGLE_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-# Comprehension (segmentation) runs on the Pro tier like the practice engine:
-# SEGMENT_MODEL falls back to TOPIC_MODEL, NOT to the cheaper GEMINI_MODEL.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash")
 TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
-SEGMENT_MODEL = os.environ.get("SEGMENT_MODEL", TOPIC_MODEL)
-SEGMENT_FALLBACK_MODEL = os.environ.get("SEGMENT_FALLBACK_MODEL", "").strip()
+SEGMENT_MODEL = os.environ.get("SEGMENT_MODEL", GEMINI_MODEL)
+SEGMENT_FALLBACK_MODEL = os.environ.get("SEGMENT_FALLBACK_MODEL", TOPIC_MODEL).strip()
 # Query-expansion uses the cheaper lite tier; segmentation keeps its own model.
 EXPAND_MODEL = os.environ.get("EXPAND_MODEL", "gemini-2.5-flash-lite")
 
@@ -44,8 +43,8 @@ SEGMENT_MAX_INPUT_TOKENS = int(os.environ.get("SEGMENT_MAX_INPUT_TOKENS", "12000
 SEGMENT_BATCH_MAX_CUES = int(os.environ.get("SEGMENT_BATCH_MAX_CUES", "160"))
 SEGMENT_BATCH_OVERLAP_CUES = int(os.environ.get("SEGMENT_BATCH_OVERLAP_CUES", "4"))
 
-CLIP_SEARCH_MAX_VIDEOS = int(os.environ.get("CLIP_SEARCH_MAX_VIDEOS", "5"))
-SEARCH_BREADTH = int(os.environ.get("CLIP_SEARCH_BREADTH", "6"))
+CLIP_SEARCH_MAX_VIDEOS = int(os.environ.get("CLIP_SEARCH_MAX_VIDEOS", "12"))
+SEARCH_BREADTH = int(os.environ.get("CLIP_SEARCH_BREADTH", "8"))
 
 
 def require_supadata_key() -> str:

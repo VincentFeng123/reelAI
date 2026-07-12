@@ -558,7 +558,7 @@ def test_search_context_keeps_plan_and_provider_query_evidence() -> None:
     assert context["matched_query_provenance"]["derivatives"] == "ai"
 
 
-def test_durable_topic_and_ingest_search_share_planner_enabled_discovery(monkeypatch) -> None:
+def test_durable_topic_and_ingest_search_share_practice_fast_discovery(monkeypatch) -> None:
     captured: list[dict] = []
 
     def fake_discover(topic, **kwargs):
@@ -593,7 +593,8 @@ def test_durable_topic_and_ingest_search_share_planner_enabled_discovery(monkeyp
     )
 
     assert len(captured) == 2
-    assert all(call["use_query_planner"] is True for call in captured)
+    assert captured[0]["use_query_planner"] is False
+    assert all(call["practice_fast"] is True for call in captured)
     assert captured[0]["literal_topic"] == "Calculus Basics"
     assert captured[1]["literal_topic"] == "Calculus Basics"
     assert captured[1]["breadth"] == 3

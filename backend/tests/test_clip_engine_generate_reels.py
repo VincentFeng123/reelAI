@@ -406,6 +406,58 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
 
+    def test_material_inventory_never_exceeds_300_reels(self) -> None:
+        existing_video_id = "inventory-video"
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute(
+                "INSERT INTO videos (id, title, channel_title, duration_sec, created_at) "
+                "VALUES (?, 'Existing inventory', 'Channel', 1000, '2026-07-06T00:01:00+00:00')",
+                (existing_video_id,),
+            )
+            conn.executemany(
+                "INSERT INTO reels "
+                "(id, generation_id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+                "transcript_snippet, takeaways_json, base_score, created_at) "
+                "VALUES (?, 'gen-existing', ?, ?, ?, '', ?, ?, 'existing', '[]', 0.5, "
+                "'2026-07-06T00:02:00+00:00')",
+                [
+                    (
+                        f"existing-reel-{index}",
+                        MATERIAL_ID,
+                        CONCEPT_ID,
+                        existing_video_id,
+                        float(index * 2),
+                        float(index * 2 + 1),
+                    )
+                    for index in range(299)
+                ],
+            )
+
+        self._patched_engine(_multi_clip_engine_out())
+        with db_module.get_conn() as conn:
+            main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=None,
+                num_reels=20,
+                creative_commons_only=False,
+                generation_id="gen-inventory-limit",
+            )
+
+        with db_module.get_conn() as conn:
+            total = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM reels WHERE material_id = ?",
+                (MATERIAL_ID,),
+            )
+            added = db_module.fetch_one(
+                conn,
+                "SELECT COUNT(*) AS count FROM reels WHERE generation_id = ?",
+                ("gen-inventory-limit",),
+            )
+        self.assertEqual(int(total["count"]), 300)
+        self.assertEqual(int(added["count"]), 1)
+
     # ------------------------------------------------------------------ #
     # Curation: clips outside the global 1-180 second safety envelope are
     # rejected before persistence and therefore cannot be served.
@@ -655,7 +707,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 10)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 11)
 
 
 if __name__ == "__main__":

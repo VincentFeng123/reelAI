@@ -275,3 +275,107 @@ def merge_and_rank(per_query: list[dict], level: str | None = None) -> list[dict
         v.pop("best_rank", None)
         v.pop("_family_trust", None)
     return items
+
+
+def merge_and_rank_practice_fast(per_query: list[dict]) -> list[dict]:
+    """The intentionally simple merge used by the practice retrieval path.
+
+    A video's strongest signal is how many distinct expanded queries returned it.
+    Views and best provider rank break ties; no planner trust, HD, education, or
+    viewer-level bonuses participate in this reference score.
+    """
+    by_id: dict[str, dict] = {}
+    for result_set in per_query or []:
+        query = str(result_set.get("query") or "").strip()
+        seen_in_query: set[str] = set()
+        for position, video in enumerate(result_set.get("videos") or []):
+            if not isinstance(video, dict):
+                continue
+            video_id = _video_id(video.get("id") or video.get("videoId") or video.get("url"))
+            if not video_id or video_id in seen_in_query:
+                continue
+            seen_in_query.add(video_id)
+
+            channel = video.get("channel") if isinstance(video.get("channel"), dict) else {}
+            channel_name = _first_nonblank(
+                _channel_name(video), video.get("channelTitle"), video.get("author_name")
+            )
+            channel_id = _first_nonblank(
+                video.get("channelId"), video.get("channel_id"), channel.get("id")
+            )
+            channel_url = _first_nonblank(
+                video.get("channelUrl"), video.get("channel_url"), channel.get("url")
+            )
+            title = _first_nonblank(video.get("title"))
+            description = _first_nonblank(video.get("description"))
+            thumbnail = _first_nonblank(
+                video.get("thumbnail"), video.get("thumbnailUrl"), video.get("thumbnail_url")
+            )
+            published_at = _first_nonblank(
+                video.get("publishedAt"),
+                video.get("published_at"),
+                video.get("uploadDate"),
+                video.get("upload_date"),
+            )
+            duration = _duration(video.get("duration", video.get("duration_sec")))
+            view_count = _integer(video.get("viewCount", video.get("view_count")))
+
+            entry = by_id.get(video_id)
+            if entry is None:
+                entry = {
+                    "id": video_id,
+                    "title": title or "(untitled)",
+                    "description": description,
+                    "channel": channel_name,
+                    "channel_id": channel_id,
+                    "channel_url": channel_url,
+                    "thumbnail": thumbnail,
+                    "duration": duration,
+                    "view_count": view_count,
+                    "upload_date": published_at,
+                    "published_at": published_at,
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "match_count": 0,
+                    "matched_queries": [],
+                    "_best_rank": position,
+                }
+                by_id[video_id] = entry
+            else:
+                if entry["title"] == "(untitled)" and title:
+                    entry["title"] = title
+                for field, value in (
+                    ("description", description),
+                    ("channel", channel_name),
+                    ("channel_id", channel_id),
+                    ("channel_url", channel_url),
+                    ("thumbnail", thumbnail),
+                    ("upload_date", published_at),
+                    ("published_at", published_at),
+                ):
+                    if not entry.get(field) and value:
+                        entry[field] = value
+                if entry.get("duration") is None and duration is not None:
+                    entry["duration"] = duration
+                entry["view_count"] = max(int(entry.get("view_count") or 0), view_count)
+
+            entry["match_count"] += 1
+            entry["_best_rank"] = min(int(entry["_best_rank"]), position)
+            if query and query not in entry["matched_queries"]:
+                entry["matched_queries"].append(query)
+
+    items = list(by_id.values())
+    for video in items:
+        view_score = math.log10((video["view_count"] or 0) + 10)
+        rank_score = 1 / (1 + int(video["_best_rank"]))
+        video["score"] = video["match_count"] * 10 + view_score + rank_score * 2
+    items.sort(
+        key=lambda video: (
+            int(video["match_count"]),
+            float(video["score"]),
+            int(video["view_count"]),
+        ),
+        reverse=True,
+    )
+    for video in items:
+        video.pop("_best_rank", None)
+    return items

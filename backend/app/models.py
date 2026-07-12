@@ -39,7 +39,7 @@ def _validate_clip_duration_bounds(
 class ReelsGenerateRequest(BaseModel):
     material_id: str = Field(min_length=1, max_length=128)
     concept_id: str | None = Field(default=None, max_length=128)
-    num_reels: int = Field(default=8, ge=1, le=60)
+    num_reels: int = Field(default=20, ge=1, le=300)
     exclude_video_ids: list[str] = Field(default_factory=list, max_length=500)
     creative_commons_only: bool = False
     generation_mode: Literal["slow", "fast"] = "slow"

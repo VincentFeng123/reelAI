@@ -255,6 +255,7 @@ async def _fetch_transcript_artifact_async(
     lang: str,
     should_cancel: Callable[[], bool] | None,
     *,
+    chunk_size: int | None,
     context: GenerationContext | None,
     cache_store: ProviderCacheStore | None,
     deadline_monotonic: float | None,
@@ -300,6 +301,8 @@ async def _fetch_transcript_artifact_async(
         "mode": "auto",
         "lang": requested_language,
     }
+    if chunk_size:
+        params["chunkSize"] = str(max(1, int(chunk_size)))
     async with httpx.AsyncClient(
         timeout=max(0.001, min(90.0, _remaining_seconds(effective_deadline)))
     ) as client:
@@ -429,6 +432,7 @@ def fetch_transcript_artifact(
     lang: str = "en",
     should_cancel: Callable[[], bool] | None = None,
     *,
+    chunk_size: int | None = None,
     context: GenerationContext | None = None,
     cache_store: ProviderCacheStore | None = None,
     deadline_monotonic: float | None = None,
@@ -438,6 +442,7 @@ def fetch_transcript_artifact(
             url,
             lang,
             should_cancel,
+            chunk_size=chunk_size,
             context=context,
             cache_store=cache_store,
             deadline_monotonic=deadline_monotonic,
@@ -457,11 +462,11 @@ def fetch_transcript(
     deadline_monotonic: float | None = None,
 ) -> list[dict[str, Any]]:
     """Compatibility wrapper returning timestamped transcript cue dictionaries."""
-    del chunk_size  # Provider timing must not be rechunked after retrieval.
     return fetch_transcript_artifact(
         url,
         lang,
         should_cancel,
+        chunk_size=chunk_size,
         context=context,
         cache_store=cache_store,
         deadline_monotonic=deadline_monotonic,

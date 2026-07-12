@@ -8,12 +8,20 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 from fastapi.responses import JSONResponse
+import pytest
 
 from backend.app import db
 from backend.app import main
 from backend.app.models import ReelsGenerateRequest
 from backend.app.ingestion.models import IngestRequest
 from backend.app.services import generation_jobs
+
+
+def test_generate_request_supports_full_material_inventory() -> None:
+    assert ReelsGenerateRequest(material_id="m1").num_reels == 20
+    assert ReelsGenerateRequest(material_id="m1", num_reels=300).num_reels == 300
+    with pytest.raises(ValueError):
+        ReelsGenerateRequest(material_id="m1", num_reels=301)
 
 
 def _conn() -> sqlite3.Connection:
@@ -320,6 +328,91 @@ def test_generation_worker_reuses_attached_generation_after_lease_reclaim(
         conn.close()
 
 
+def test_generation_worker_propagates_the_full_source_generation_chain(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    root_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="source-root",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="source-parent",
+        generation_mode="slow",
+        retrieval_profile="unified",
+        source_generation_id=root_generation_id,
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="source-chain-worker",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "slow", "num_reels": 1},
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-source-chain",
+        now=now,
+    )
+    assert leased
+    generation_calls: list[dict] = []
+
+    def create_one_reel(worker_conn, **kwargs) -> None:
+        generation_calls.append(kwargs)
+        worker_conn.execute(
+            "INSERT INTO videos (id, title, channel_title, duration_sec, created_at) "
+            "VALUES ('source-chain-video', 'Source chain video', 'Test', 120, ?)",
+            (now.isoformat(),),
+        )
+        worker_conn.execute(
+            "INSERT INTO reels "
+            "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+            "transcript_snippet, takeaways_json, base_score, generation_id, created_at) "
+            "VALUES ('source-chain-reel', 'm1', 'c1', 'source-chain-video', '', "
+            "0, 30, '', '[]', 1, ?, ?)",
+            (str(kwargs["generation_id"]), now.isoformat()),
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", create_one_reel)
+    monkeypatch.setattr(
+        main,
+        "_generation_job_reels",
+        lambda *_args, **_kwargs: [{"reel_id": "source-chain-reel"}],
+    )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        completed_job = generation_jobs.get_job(conn, job["id"])
+        assert completed_job and completed_job["status"] == "completed"
+        result_generation_id = str(completed_job["result_generation_id"])
+        result_generation = conn.execute(
+            "SELECT source_generation_id FROM reel_generations WHERE id = ?",
+            (result_generation_id,),
+        ).fetchone()
+        assert result_generation["source_generation_id"] == source_generation_id
+        assert len(generation_calls) == 1
+        assert generation_calls[0]["exclude_generation_ids"] == [
+            root_generation_id,
+            source_generation_id,
+        ]
+    finally:
+        conn.close()
+
+
 def test_status_and_stream_terminalize_stale_queue_without_duplicate_events(
     monkeypatch,
 ) -> None:
@@ -387,6 +480,49 @@ def test_generate_returns_202_and_idempotently_reuses_active_job(monkeypatch) ->
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_jobs WHERE status IN ('queued', 'running')"
         ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_generate_top_up_uses_completed_result_as_the_new_job_source(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    payload = ReelsGenerateRequest(material_id="m1", concept_id="c1", num_reels=5)
+    try:
+        first = asyncio.run(main.generate_reels(object(), payload))
+        first_job_id = json.loads(first.body)["job_id"]
+        first_job = generation_jobs.get_job(conn, first_job_id)
+        assert first_job
+        source_generation_id = main._create_generation_row(
+            conn,
+            material_id="m1",
+            concept_id="c1",
+            request_key=str(first_job["request_key"]),
+            generation_mode="slow",
+            retrieval_profile="unified",
+        )
+        completed_at = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE reel_generation_jobs SET status = 'completed', phase = 'terminal', "
+            "progress = 1.0, result_generation_id = ?, completed_at = ?, updated_at = ? "
+            "WHERE id = ?",
+            (source_generation_id, completed_at, completed_at, first_job_id),
+        )
+        monkeypatch.setattr(
+            main,
+            "_generation_job_reels",
+            lambda *_args, **_kwargs: [{"reel_id": "only-existing-reel"}],
+        )
+
+        top_up = asyncio.run(main.generate_reels(object(), payload))
+
+        assert isinstance(top_up, JSONResponse)
+        assert top_up.status_code == 202
+        top_up_job_id = json.loads(top_up.body)["job_id"]
+        assert top_up_job_id != first_job_id
+        top_up_job = generation_jobs.get_job(conn, top_up_job_id)
+        assert top_up_job and top_up_job["status"] == "queued"
+        assert top_up_job["source_generation_id"] == source_generation_id
     finally:
         conn.close()
 

@@ -459,11 +459,11 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_10(self) -> None:
+    def test_ranked_feed_cache_version_is_11(self) -> None:
         """Cache rows must predate neither learner nor assessment adaptation."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            10,
+            11,
             "Assessment outcomes must not reuse stale pre-recall ranked-feed rows.",
         )
 

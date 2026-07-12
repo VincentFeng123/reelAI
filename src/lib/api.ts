@@ -830,7 +830,7 @@ function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<stri
   return {
     material_id: params.materialId,
     concept_id: params.conceptId,
-    num_reels: params.numReels ?? 7,
+    num_reels: params.numReels ?? 20,
     exclude_video_ids: normalizeVideoIdList(params.excludeVideoIds),
     creative_commons_only: params.creativeCommonsOnly === true,
     generation_mode: params.generationMode ?? "slow",
@@ -1023,9 +1023,9 @@ async function consumeGenerationJob(
 ): Promise<ReelsGenerateResponse> {
   let afterSeq = 0;
   let finalResponse: ReelsGenerateResponse | null = null;
-  // Backend permits up to eight minutes queued plus a fresh eight-minute
+  // Backend permits an eight-minute queue window plus a one-hour quality-first
   // execution window. Keep one minute of transport slack, but stay finite.
-  const deadline = Date.now() + 17 * 60_000;
+  const deadline = Date.now() + 69 * 60_000;
 
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1_000, deadline - Date.now());

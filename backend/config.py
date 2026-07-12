@@ -61,9 +61,10 @@ TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 # ── Gemini-segment clip engine (default) ────────────────────────────────────
 # A single Gemini pass reads the timestamped supadata transcript and returns substantive
 # topic clips {title,start,end} directly — NO punctuation / structure understanding / whisper
-# refine / multimodal. Uses the Pro model for real comprehension (section-level topics); boundaries are
-# fine-snapped onto supadata's interpolated per-word times when SEGMENT_FINE_SNAP is on.
-_segment_routing_mode = os.environ.get("SEGMENT_ROUTING_MODE", "pro_only").strip().lower()
+# refine / multimodal. Flash is attempted first for every video; uncertain or
+# invalid output falls back to Pro. Boundaries are fine-snapped onto Supadata's
+# interpolated per-word times when SEGMENT_FINE_SNAP is on.
+_segment_routing_mode = os.environ.get("SEGMENT_ROUTING_MODE", "hybrid").strip().lower()
 SEGMENT_ROUTING_MODE = (
     _segment_routing_mode
     if _segment_routing_mode in {"pro_only", "shadow", "hybrid"}
@@ -82,7 +83,7 @@ SEGMENT_PRO_MODEL = (
 )
 SEGMENT_MODEL = SEGMENT_PRO_MODEL
 try:
-    _segment_hybrid_percent = float(os.environ.get("SEGMENT_HYBRID_PERCENT", "0"))
+    _segment_hybrid_percent = float(os.environ.get("SEGMENT_HYBRID_PERCENT", "100"))
 except ValueError:
     _segment_hybrid_percent = 0.0
 if not math.isfinite(_segment_hybrid_percent):

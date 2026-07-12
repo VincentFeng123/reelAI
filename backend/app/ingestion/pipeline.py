@@ -87,12 +87,13 @@ from ..services.search_query_plan import (
     SearchQueryPlan,
     topic_signature_evidence,
 )
+from ..services.knowledge_level import effective_level_target
 
 logger: logging.Logger = get_ingest_logger(__name__)
 
 # Shared wall-clock budget for one topic's concurrent clip+filter batch. A
 # pathological set of videos must not multiply this deadline by video count.
-INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "180"))
+INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "3600"))
 
 
 def _run_clip(
@@ -147,6 +148,7 @@ def _discover(
         "cache_store": generation_context.cache_store if generation_context is not None else None,
         "literal_topic": literal_topic or topic,
         "use_query_planner": bool(use_query_planner),
+        "practice_fast": True,
     }
     if breadth is not None:
         kwargs["breadth"] = max(1, int(breadth))
@@ -893,8 +895,8 @@ class IngestionPipeline:
                 language=language,
                 generation_context=generation_context,
                 literal_topic=literal_topic or topic,
-                use_query_planner=True,
-                breadth=3 if generation_context is not None and generation_context.budget.mode == "fast" else 6,
+                use_query_planner=False,
+                breadth=clip_engine_config.SEARCH_BREADTH,
             )
         except _ClipProviderError:
             if generation_context is not None:
@@ -910,6 +912,7 @@ class IngestionPipeline:
         if not isinstance(query_plan, SearchQueryPlan):
             query_plan = None
         for discovered_video in disc["videos"]:
+            discovered_video["_knowledge_level"] = knowledge_level
             discovered_video["_search_context"] = _retrieval_search_context(
                 requested_topic=topic,
                 corrected_topic=corrected_topic,
@@ -1189,29 +1192,40 @@ class IngestionPipeline:
             if generation_context is not None:
                 generation_context.increment_counter("gemini_empty_results")
             return v, [], engine_out
-        eligible_clips = _strict_topic_clips(
-            raw_clips,
-            transcript,
-            query_plan,
-        )
-        if generation_context is not None and trusted_transcript:
-            generation_context.increment_counter(
-                "topic_rejections", max(0, len(raw_clips) - len(eligible_clips))
-            )
-        for clip in eligible_clips:
-            relevance = clip_engine_bridge.relevance_score(
+        # Practice already asks Gemini to select clips for the requested topic.
+        # Keep every valid engine clip and use ReelAI's topic/level signals only
+        # to order it; the old exact-term gate collapsed useful result sets.
+        level_target = effective_level_target(v.get("_knowledge_level"), 0.0)
+        for clip in raw_clips:
+            lexical_relevance = clip_engine_bridge.relevance_score(
                 clip, engine_out["transcript"], topic
             )
             raw_info = clip.get("informativeness")
             informativeness = (
                 0.5 if raw_info is None else max(0.0, min(1.0, float(raw_info)))
             )
-            clip["score"] = relevance * (0.5 + 0.5 * informativeness)
+            raw_topic_relevance = clip.get("topic_relevance")
+            topic_relevance = (
+                lexical_relevance
+                if raw_topic_relevance is None
+                else max(0.0, min(1.0, float(raw_topic_relevance)))
+            )
+            raw_difficulty = clip.get("difficulty")
+            difficulty = (
+                0.5 if raw_difficulty is None else max(0.0, min(1.0, float(raw_difficulty)))
+            )
+            level_fit = 1.0 - abs(difficulty - level_target)
+            clip["score"] = (
+                0.55 * topic_relevance
+                + 0.25 * informativeness
+                + 0.15 * level_fit
+                + 0.05 * lexical_relevance
+            )
             clip["search_context"] = {
                 **dict(v.get("_search_context") or {}),
                 "topic_evidence_terms": list(clip.get("topic_evidence_terms") or [])[:8],
             }
-        kept = sorted(eligible_clips, key=lambda c: c["score"], reverse=True)
+        kept = sorted(raw_clips, key=lambda c: c["score"], reverse=True)
         return v, kept, engine_out
 
     def _ensure_search_material(self, query: str) -> str:

@@ -141,7 +141,7 @@ def test_ingest_topic_records_stage_counts_and_propagates_shared_deadline(
     assert counters["gemini_empty_results"] == 1
 
 
-def test_ingest_topic_counts_topic_rejections_and_persisted_clips(monkeypatch) -> None:
+def test_ingest_topic_reorders_without_hard_topic_rejection(monkeypatch) -> None:
     engine_out = {
         "clips": [
             {"start": 0.0, "end": 10.0, "cue_ids": ["python"], "informativeness": 0.9},
@@ -168,11 +168,46 @@ def test_ingest_topic_counts_topic_rejections_and_persisted_clips(monkeypatch) -
         max_videos=1,
     )
 
-    assert reels == ["persisted-reel"]
+    assert reels == ["persisted-reel", "persisted-reel"]
     counters = context.counters()
     assert counters["usable_transcripts"] == 1
-    assert counters["topic_rejections"] == 1
-    assert counters["persisted_clips"] == 1
+    assert counters["topic_rejections"] == 0
+    assert counters["persisted_clips"] == 2
+
+
+@pytest.mark.parametrize(
+    ("knowledge_level", "expected_start"),
+    [("beginner", 0.0), ("advanced", 10.0)],
+)
+def test_practice_clips_are_reordered_for_learner_level(
+    monkeypatch, knowledge_level: str, expected_start: float
+) -> None:
+    engine_out = {
+        "clips": [
+            {
+                "start": 0.0,
+                "end": 10.0,
+                "informativeness": 0.9,
+                "topic_relevance": 0.9,
+                "difficulty": 0.1,
+            },
+            {
+                "start": 10.0,
+                "end": 20.0,
+                "informativeness": 0.9,
+                "topic_relevance": 0.9,
+                "difficulty": 0.9,
+            },
+        ],
+        "transcript": _transcript(),
+        "notes": "",
+    }
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    video = {**_video(), "_knowledge_level": knowledge_level}
+
+    _, clips, _ = _pipeline()._clip_and_filter(video, "Intro to Python", "en")
+
+    assert clips[0]["start"] == expected_start
 
 
 def test_ingest_topic_counts_shared_clip_fetch_timeout_separately(monkeypatch) -> None:
