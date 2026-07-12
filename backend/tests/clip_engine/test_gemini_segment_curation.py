@@ -7,7 +7,6 @@ import json
 
 import pytest
 
-from backend.app.clip_engine.clipper.pipeline import gemini_segment
 from backend.app.clip_engine.clipper.pipeline.gemini_segment import (
     _norm_informativeness,
     _Plan,
@@ -17,7 +16,6 @@ from backend.app.clip_engine.clipper.pipeline.gemini_segment import (
     _prompts,
     segment_clips,
 )
-from backend.app.clip_engine.clipper.llm import StructuredResult
 
 
 def test_developer_api_schema_omits_unsupported_additional_properties():
@@ -239,17 +237,10 @@ class TestTopicThreading:
         system, _ = _prompts("[0] 00:00 hi", 1)
         assert "viewer is studying" not in system
 
-    def test_segment_clips_passes_topic_to_prompt(self, monkeypatch):
-        seen: dict = {}
+    def test_segment_clips_is_live_compatibility_reexport(self):
+        from backend.pipeline import gemini_segment as live_segmenter
 
-        def fake_llm_json(system, user, schema, **kw):
-            seen["system"] = system
-            return StructuredResult(_Plan(topics=[]), "gemini-test", False)
-
-        monkeypatch.setattr(gemini_segment, "llm_json_result", fake_llm_json)
-        tx = {"segments": _segs(2), "words": [], "duration": 60.0}
-        segment_clips(tx, {}, topic="linear algebra")
-        assert "linear algebra" in seen["system"]
+        assert segment_clips is live_segmenter.segment_clips
 
 
 class TestLearningDetailsContract:

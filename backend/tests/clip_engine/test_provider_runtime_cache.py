@@ -1,10 +1,14 @@
 from datetime import datetime, timedelta, timezone
+import threading
+import time
 
 import pytest
 
+from backend.app.clip_engine import config as clip_engine_config
 from backend.app.clip_engine.errors import ProviderBudgetExceededError
 from backend.app.clip_engine.provider_cache import (
     MemoryProviderCache,
+    TRANSCRIPT_PROFILE,
     TRANSCRIPT_SCHEMA_VERSION,
     TranscriptArtifact,
     normalize_filters,
@@ -44,6 +48,14 @@ def _artifact() -> TranscriptArtifact:
         ],
         duration_sec=3.0,
         created_at=created_at,
+    )
+
+
+def test_transcript_cache_version_invalidates_coarser_cue_artifacts() -> None:
+    assert TRANSCRIPT_SCHEMA_VERSION == 4
+    assert TRANSCRIPT_PROFILE == f"chunk{clip_engine_config.SUPADATA_CHUNK_SIZE}-auto"
+    assert _artifact().artifact_key.startswith(
+        f"native-transcript:v4:{TRANSCRIPT_PROFILE}:"
     )
 
 
@@ -118,6 +130,135 @@ def test_generation_context_maps_live_gemini_telemetry_and_cache_hits() -> None:
     assert cache_hit["billable_requests"] == 0
     assert cache_hit["metadata"] == {"provider_call": False, "cache_hit": True}
     assert context.counters()["segmentation_cache_hits"] == 1
+
+
+def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> None:
+    context = GenerationContext("fast", generation_id="job-budget")
+    for _ in range(3):
+        context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            prompt_text="short transcript",
+            max_output_tokens=4096,
+        )
+    with pytest.raises(ProviderBudgetExceededError):
+        context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            prompt_text="another transcript",
+            max_output_tokens=4096,
+        )
+
+    pro_context = GenerationContext("slow", generation_id="job-pro-budget")
+    for _ in range(2):
+        pro_context.reserve_gemini_call(
+            operation="pro_authoritative",
+            model="gemini-3.1-pro-preview",
+            prompt_text="transcript",
+            max_output_tokens=4096,
+        )
+    pro_context.reserve_gemini_call(
+        operation="pro_fallback",
+        model="gemini-3.1-pro-preview",
+        prompt_text="transcript",
+        max_output_tokens=4096,
+    )
+    with pytest.raises(ProviderBudgetExceededError):
+        pro_context.reserve_gemini_call(
+            operation="pro_fallback",
+            model="gemini-3.1-pro-preview",
+            prompt_text="transcript",
+            max_output_tokens=4096,
+        )
+
+    budget = pro_context.budget.snapshot()["gemini"]
+    assert budget["pro_fallback_calls"] == 1
+    assert budget["pro_fallback_call_limit"] == 1
+
+
+def test_pro_fallback_gate_waits_for_joint_initial_flash_yield() -> None:
+    context = GenerationContext("slow", generation_id="job-fallback-gate")
+    context.configure_pro_fallback_gate(2)
+
+    decisions: list[bool] = []
+    first = threading.Thread(
+        target=lambda: decisions.append(
+            context.allow_pro_fallback(
+                accepted_count=0,
+                video_id="first",
+                candidate_rank=0,
+                deadline_monotonic=time.monotonic() + 1.0,
+            )
+        )
+    )
+    first.start()
+    context.record_pro_fallback_cohort_result(
+        candidate_rank=1,
+        accepted_count=2,
+        fallback_eligible=False,
+    )
+    first.join(timeout=1.0)
+    assert decisions == [True]
+    assert context.allow_pro_fallback(accepted_count=0, video_id="later") is False
+
+    sufficient = GenerationContext("slow", generation_id="job-no-fallback")
+    sufficient.configure_pro_fallback_gate(2)
+    sufficient.record_pro_fallback_cohort_result(
+        candidate_rank=0,
+        accepted_count=1,
+        fallback_eligible=False,
+    )
+    assert sufficient.allow_pro_fallback(
+        accepted_count=2,
+        video_id="second",
+        candidate_rank=1,
+    ) is False
+    assert sufficient.allow_pro_fallback(accepted_count=0, video_id="later") is False
+
+
+def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -> None:
+    context = GenerationContext("fast", generation_id="job-summary")
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.5-flash",
+        quality_degraded=False,
+        stage="selection",
+        usage={
+            "prompt_tokens": 100,
+            "candidate_tokens": 20,
+            "thought_tokens": 10,
+            "total_tokens": 130,
+        },
+    )
+    context.record_segment_event({"event": "pro_fallback", "reason": "invalid_edges"})
+    context.increment_counter("persisted_clips", 2)
+
+    payload = context.usage_payload()
+    assert payload["summary"]["gemini_calls"] == 1
+    assert payload["summary"]["input_tokens"] == 100
+    assert payload["summary"]["output_tokens"] == 30
+    assert payload["summary"]["thought_tokens"] == 10
+    assert payload["summary"]["accepted_clips"] == 2
+    assert payload["summary"]["fallback_reasons"] == ["invalid_edges"]
+    assert payload["by_stage"]["selection"]["calls"] == 1
+    assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.25
+
+
+def test_one_physical_pro_fallback_counts_once_for_multiple_reasons() -> None:
+    context = GenerationContext("fast")
+
+    context.record_segment_event(
+        {"event": "pro_fallback", "video_id": "video-a", "reason": "invalid_edges"}
+    )
+    context.record_segment_event(
+        {"event": "pro_fallback", "video_id": "video-a", "reason": "low_confidence"}
+    )
+
+    assert context.counters()["pro_fallbacks"] == 1
+    assert context.usage_payload()["summary"]["fallback_reasons"] == [
+        "invalid_edges",
+        "low_confidence",
+    ]
 
 
 def test_generation_context_usage_persistence_is_fail_open() -> None:

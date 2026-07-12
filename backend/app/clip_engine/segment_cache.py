@@ -16,7 +16,7 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_CACHE_VERSION = 1
+SEGMENT_CACHE_VERSION = 2
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
 
 
@@ -52,7 +52,7 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
                 int(pipeline_config.SEGMENT_MAX_CLIPS if max_clips is None else max_clips),
             ),
         ),
-        "accept_partial_flash": bool(settings.get("segment_accept_partial_flash")),
+        "enrich_clips": bool(settings.get("segment_enrich_clips", False)),
     }
 
 
@@ -122,7 +122,6 @@ def _transcript_bounds(transcript: Mapping[str, Any]) -> tuple[float, float] | N
     segments = transcript.get("segments")
     if not isinstance(segments, list) or not segments:
         return None
-    starts: list[float] = []
     ends: list[float] = []
     for segment in segments:
         if not isinstance(segment, Mapping):
@@ -134,9 +133,9 @@ def _transcript_bounds(transcript: Mapping[str, Any]) -> tuple[float, float] | N
             return None
         if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
             return None
-        starts.append(start)
         ends.append(end)
-    return min(starts), max(ends)
+    # A finalized clip may include bounded silence before the first spoken cue.
+    return 0.0, max(ends)
 
 
 def _valid_assessment(value: object) -> bool:

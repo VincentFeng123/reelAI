@@ -788,7 +788,7 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertTrue(all(event.wait(0.1) for event in finished))
         self.assertTrue(all(event.is_set() for event in cancelled))
 
-    def test_capped_result_keeps_discover_order_when_later_video_finishes_first(self) -> None:
+    def test_capped_result_streams_later_video_when_it_finishes_first(self) -> None:
         pipeline = self._pipeline()
         slow = self._video("slow-video")
         fast = self._video("fast-video")
@@ -832,8 +832,8 @@ class IngestTopicProgressTests(unittest.TestCase):
                 on_reel_created=seen.append,
             )
 
-        self.assertEqual(reels, ["slow-video"])
-        self.assertEqual(seen, ["slow-video"])
+        self.assertEqual(reels, ["fast-video"])
+        self.assertEqual(seen, ["fast-video"])
 
     def test_provider_error_after_progress_keeps_completed_reel(self) -> None:
         pipeline = self._pipeline()
@@ -884,6 +884,49 @@ class IngestTopicProgressTests(unittest.TestCase):
 
         self.assertEqual(reels, ["success-video"])
         self.assertEqual(seen, ["success-video"])
+
+    def test_initial_pair_backfills_one_at_a_time_and_stops_at_buffer_cap(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video(f"video-{index}") for index in range(5)]
+        calls: list[str] = []
+        discover_limit: list[int] = []
+
+        def discover(*_args, **kwargs):
+            discover_limit.append(kwargs["limit"])
+            return {
+                "corrected": TOPIC,
+                "videos": videos,
+                "credits_used": 0,
+                "warning": None,
+            }
+
+        def clip_and_filter(video, *_args):
+            calls.append(video["id"])
+            clips = [] if video["id"] in {"video-0", "video-1"} else [
+                {"title": f"clip-{index}"} for index in range(5)
+            ]
+            return video, clips, {"transcript": {}}
+
+        with (
+            mock.patch.object(pipeline_module, "_discover", side_effect=discover),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (kwargs["v"]["id"], mock.sentinel.metadata),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=4,
+            )
+
+        self.assertEqual(discover_limit, [pipeline_module.clip_engine_config.CLIP_SEARCH_MAX_VIDEOS])
+        self.assertEqual(set(calls[:2]), {"video-0", "video-1"})
+        self.assertEqual(calls[2:], ["video-2"])
+        self.assertEqual(reels, ["video-2"] * 5)
 
 
 if __name__ == "__main__":

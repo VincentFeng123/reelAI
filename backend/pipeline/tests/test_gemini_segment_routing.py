@@ -15,7 +15,12 @@ def _segments(duration: float = 100.0) -> list[dict]:
 
 
 def test_provider_schemas_avoid_unsupported_additional_properties():
-    for schema in (G._Plan, G._BoundaryPlan, G._EnrichmentPlan):
+    for schema in (
+        G._Plan,
+        G._BoundaryPlan,
+        G._BoundaryRepairPlan,
+        G._EnrichmentPlan,
+    ):
         assert "additionalProperties" not in str(GC._gemini3_json_schema(schema))
 
 
@@ -48,39 +53,33 @@ def _report(**overrides) -> G._Conversion:
     return G._Conversion(**data)
 
 
-@pytest.mark.parametrize(
-    "report,topic,expected,reason",
-    [
-        (_report(), "alpha lesson", "green", None),
-        (_report(clips=[_clip(informativeness=0.749)]), "alpha", "uncertain", "quality_score_below_green"),
-        (_report(clips=[_clip(_uncertainty="medium")]), "alpha", "uncertain", "medium_uncertainty"),
-        (_report(clips=[_clip(end=150.0)]), "alpha", "uncertain", "long_clip"),
-        (_report(near_duplicate=True), "alpha", "uncertain", "near_duplicate"),
-        (_report(), "beta", "uncertain", "zero_direct_topic_support"),
-        (_report(rejected_reasons=["proposal_0:bad_index"]), "alpha", "invalid", "proposal_0:bad_index"),
-        (_report(clips=[], proposed_count=1), "alpha", "invalid", "all_proposals_rejected"),
-    ],
-)
-def test_flash_classification_triggers(report, topic, expected, reason):
+@pytest.mark.parametrize("report,topic", [
+    (_report(), "alpha lesson"),
+    (_report(clips=[_clip(informativeness=0.61)]), "alpha"),
+    (_report(clips=[_clip(end=150.0)]), "alpha"),
+    (_report(near_duplicate=True), "alpha"),
+    (_report(), "beta"),
+    (_report(rejected_reasons=["proposal_0:bad_index"]), "alpha"),
+])
+def test_flash_classification_keeps_any_independently_valid_candidate(report, topic):
     classified = G._classify_flash(report, _segments(), topic, enrichment_required=False)
-    assert classified.status == expected
-    if reason:
-        assert reason in classified.reasons
+    assert classified == G._Classification("green", ())
 
 
-def test_zero_clips_is_invalid_only_for_long_transcript():
+def test_zero_valid_candidates_is_invalid_at_any_transcript_length():
     empty = G._Conversion(proposed_count=0)
-    assert G._classify_flash(empty, _segments(119.9), "", enrichment_required=False).status == "green"
-    classified = G._classify_flash(empty, _segments(120.0), "", enrichment_required=False)
-    assert classified.status == "invalid"
-    assert "zero_clips_long_transcript" in classified.reasons
+    for duration in (30.0, 120.0):
+        classified = G._classify_flash(
+            empty, _segments(duration), "", enrichment_required=False,
+        )
+        assert classified.status == "invalid"
+        assert "zero_valid_candidates" in classified.reasons
 
 
-def test_single_pass_invalid_enrichment_is_hard_invalid():
+def test_optional_enrichment_errors_do_not_invalidate_boundaries():
     report = _report(enrichment_errors=["clip-001:assessment_invalid"])
     classified = G._classify_flash(report, _segments(), "alpha", enrichment_required=True)
-    assert classified.status == "invalid"
-    assert "clip-001:assessment_invalid" in classified.reasons
+    assert classified == G._Classification("green", ())
 
 
 @pytest.mark.parametrize("topic", ["AI", "ML", "R", "Go", "C++"])
@@ -119,7 +118,7 @@ def _result(profile: str, status: str, *, title: str, error: str | None = None) 
     )
 
 
-def test_pro_only_calls_only_frozen_pro_profile(monkeypatch):
+def test_pro_only_calls_only_boundary_pro_profile(monkeypatch):
     seen = []
 
     def fake_run(transcript, settings, profile, **kwargs):
@@ -128,7 +127,7 @@ def test_pro_only_calls_only_frozen_pro_profile(monkeypatch):
 
     monkeypatch.setattr(G, "run_segment_profile", fake_run)
     result = G.segment_clips_detailed(_transcript(), {}, video_id="video", routing_mode="pro_only")
-    assert seen == [G.PRODUCTION_PRO_PROFILE]
+    assert seen == [G.AUTHORITATIVE_PRO_PROFILE]
     assert result.clips[0]["title"] == "pro"
 
 
@@ -137,7 +136,7 @@ def test_all_authoritative_pro_calls_use_selected_baseline(monkeypatch):
     monkeypatch.setattr(G, "AUTHORITATIVE_PRO_PROFILE", G.CORRECTED_PRO_PROFILE)
 
     def fake_run(transcript, settings, profile, **kwargs):
-        seen.append(profile)
+        seen.append((profile, settings.get("_segment_operation")))
         return _result(profile, "green", title="pro")
 
     monkeypatch.setattr(G, "run_segment_profile", fake_run)
@@ -147,7 +146,10 @@ def test_all_authoritative_pro_calls_use_selected_baseline(monkeypatch):
     fallback = G._authoritative_pro(
         _transcript(), {}, "", time.monotonic() + 10, None, fallback=True,
     )
-    assert seen == [G.CORRECTED_PRO_PROFILE, G.CORRECTED_PRO_PROFILE]
+    assert seen == [
+        (G.CORRECTED_PRO_PROFILE, "pro_authoritative"),
+        (G.PRO_BOUNDARY_PROFILE, "pro_fallback"),
+    ]
     assert authoritative.calls[0]["operation"] == "pro_authoritative"
     assert fallback.calls[0]["operation"] == "pro_fallback"
 
@@ -184,14 +186,48 @@ def test_green_hybrid_flash_never_calls_pro(monkeypatch):
     assert result.route == "hybrid_flash" and result.clips[0]["title"] == "flash"
 
 
+def test_generation_gate_defers_non_green_flash_without_shipping_it(monkeypatch):
+    seen = []
+    gate_calls = []
+    events = []
+    monkeypatch.setattr(G.config, "SEGMENT_HYBRID_PERCENT", 100.0)
+
+    def fake_run(transcript, settings, profile, **kwargs):
+        seen.append(profile)
+        return _result(profile, "invalid", title="unsafe flash")
+
+    def gate(**kwargs):
+        gate_calls.append(kwargs)
+        return False
+
+    monkeypatch.setattr(G, "run_segment_profile", fake_run)
+    result = G.segment_clips_detailed(
+        _transcript(),
+        {
+            "_segment_pro_fallback_gate": gate,
+            "_segment_telemetry": events.append,
+        },
+        video_id="video",
+        routing_mode="hybrid",
+    )
+
+    assert seen == [G.PRODUCTION_FLASH_PROFILE]
+    assert gate_calls == [{"accepted_count": 1, "video_id": "video"}]
+    assert result.route == "hybrid_flash_deferred"
+    assert result.clips == []
+    assert not any(event["event"] == "pro_fallback" for event in events)
+
+
 @pytest.mark.parametrize("classification", ["uncertain", "invalid"])
-def test_live_adapter_accepts_surviving_flash_without_pro(monkeypatch, classification):
+def test_live_adapter_rejects_partial_flash_and_uses_pro(monkeypatch, classification):
     seen = []
     monkeypatch.setattr(G.config, "SEGMENT_HYBRID_PERCENT", 100.0)
 
     def fake_run(transcript, settings, profile, **kwargs):
         seen.append(profile)
-        return _result(profile, classification, title="flash")
+        if profile == G.PRODUCTION_FLASH_PROFILE:
+            return _result(profile, classification, title="flash")
+        return _result(profile, "green", title="pro")
 
     monkeypatch.setattr(G, "run_segment_profile", fake_run)
     result = G.segment_clips_detailed(
@@ -200,9 +236,9 @@ def test_live_adapter_accepts_surviving_flash_without_pro(monkeypatch, classific
         video_id="video",
         routing_mode="hybrid",
     )
-    assert seen == [G.PRODUCTION_FLASH_PROFILE]
-    assert result.route == "hybrid_flash"
-    assert result.clips[0]["title"] == "flash"
+    assert seen == [G.PRODUCTION_FLASH_PROFILE, G.PRO_BOUNDARY_PROFILE]
+    assert result.route == "hybrid_pro_fallback"
+    assert result.clips[0]["title"] == "pro"
 
 
 def test_live_adapter_uses_pro_when_flash_has_no_surviving_clip(monkeypatch):
@@ -222,7 +258,7 @@ def test_live_adapter_uses_pro_when_flash_has_no_surviving_clip(monkeypatch):
         video_id="video",
         routing_mode="hybrid",
     )
-    assert seen == [G.PRODUCTION_FLASH_PROFILE, G.AUTHORITATIVE_PRO_PROFILE]
+    assert seen == [G.PRODUCTION_FLASH_PROFILE, G.PRO_BOUNDARY_PROFILE]
     assert result.route == "hybrid_pro_fallback"
     assert result.clips[0]["title"] == "pro"
 
@@ -240,7 +276,7 @@ def test_non_green_flash_calls_corrected_pro_exactly_once(monkeypatch, classific
 
     monkeypatch.setattr(G, "run_segment_profile", fake_run)
     result = G.segment_clips_detailed(_transcript(), {}, video_id="video", routing_mode="hybrid")
-    assert seen == [G.PRODUCTION_FLASH_PROFILE, G.AUTHORITATIVE_PRO_PROFILE]
+    assert seen == [G.PRODUCTION_FLASH_PROFILE, G.PRO_BOUNDARY_PROFILE]
     assert result.route == "hybrid_pro_fallback"
     assert result.clips[0]["title"] == "pro"
     assert result.fallback_reasons == ["quality_score_below_green"]
@@ -286,8 +322,8 @@ def test_flash_model_access_failure_rolls_process_back_to_pro_only(monkeypatch):
     assert second.route == "pro_only"
     assert seen == [
         G.PRODUCTION_FLASH_PROFILE,
+        G.PRO_BOUNDARY_PROFILE,
         G.AUTHORITATIVE_PRO_PROFILE,
-        G.PRODUCTION_PRO_PROFILE,
     ]
 
 
@@ -336,7 +372,7 @@ def test_shadow_always_returns_pro_and_records_flash_comparison(monkeypatch):
 
     def fake_run(transcript, settings, profile, **kwargs):
         seen.append(profile)
-        if profile == G.PRODUCTION_PRO_PROFILE:
+        if profile == G.AUTHORITATIVE_PRO_PROFILE:
             return _result(profile, "green", title="pro")
         return _result(profile, "invalid", title="shadow-flash")
 
@@ -351,7 +387,7 @@ def test_shadow_always_returns_pro_and_records_flash_comparison(monkeypatch):
         video_id="video", routing_mode="shadow",
     )
     assert shadow_done.wait(timeout=1)
-    assert set(seen) == {G.PRODUCTION_PRO_PROFILE, G.PRODUCTION_FLASH_PROFILE}
+    assert set(seen) == {G.AUTHORITATIVE_PRO_PROFILE, G.PRODUCTION_FLASH_PROFILE}
     assert result.clips[0]["title"] == "pro"
     assert any(event["event"] == "shadow_comparison" for event in events)
 
@@ -455,8 +491,36 @@ def test_schema_failure_preserves_successful_call_usage_telemetry(monkeypatch):
             operation="flash_single_candidate", prompt_version=G.FLASH_SINGLE_PROFILE,
             cancelled=None,
         )
-    assert exc_info.value.telemetry is telemetry
     assert G._exception_telemetry(exc_info.value)["total_tokens"] == 130
+    assert G._exception_telemetry(exc_info.value)["dispatched"] is True
+
+
+def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
+    monkeypatch.setattr(
+        GC,
+        "generate_json_v3",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("transport down")),
+    )
+
+    with pytest.raises(G._ModelCallError) as exc_info:
+        G._call_model(
+            "system",
+            "user",
+            G._BoundaryPlan,
+            model=G.config.SEGMENT_FLASH_MODEL,
+            thinking_level="medium",
+            max_output_tokens=4_096,
+            timeout_s=45.0,
+            deadline_monotonic=time.monotonic() + 10,
+            operation="flash_boundary_selector",
+            prompt_version=G.FLASH_SPLIT_PROFILE,
+            cancelled=None,
+        )
+
+    telemetry = G._exception_telemetry(exc_info.value)
+    assert telemetry["dispatched"] is True
+    assert telemetry["operation"] == "flash_boundary_selector"
+    assert telemetry["model"] == G.config.SEGMENT_FLASH_MODEL
 
 
 @pytest.mark.parametrize(
@@ -469,7 +533,9 @@ def test_schema_failure_preserves_successful_call_usage_telemetry(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("medium", 12_288, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
+         ("medium", 4_096, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
+        (G.PRO_BOUNDARY_PROFILE,
+         ("high", 4_096, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -492,6 +558,60 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         captured["thinking_level"], captured["max_output_tokens"],
         captured["timeout_s"], captured["operation"], captured["model"],
     ) == (level, cap, timeout, operation, expected_model)
+
+
+def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatch):
+    segments = [
+        {
+            "cue_id": f"c{index}",
+            "start": index * 10.0,
+            "end": (index + 1) * 10.0,
+            "text": f"line {index} teaches concept {index} and finishes end {index}",
+        }
+        for index in range(9)
+    ]
+    topics = [
+        G._BoundaryTopic(
+            candidate_id=f"candidate-{index}",
+            start_line=index,
+            end_line=index,
+            start_quote=f"line {index}",
+            end_quote=f"end {index}",
+            title=f"T{index}",
+            learning_objective=f"Understand concept {index}.",
+            facet="concept",
+            reason="Complete educational moment.",
+            informativeness=0.80 + index * 0.02,
+            topic_relevance=0.80 + index * 0.02,
+            educational_importance=0.80 + index * 0.02,
+            difficulty=0.5,
+            self_contained=True,
+            is_standalone=True,
+            prerequisite_candidate_ids=[],
+            uncertainty="low",
+            uncertainty_reasons=[],
+        )
+        for index in range(9)
+    ]
+    monkeypatch.setattr(
+        G,
+        "_call_model",
+        lambda *args, **kwargs: (G._BoundaryPlan(topics=topics), {}),
+    )
+
+    report, classification, _ = G._run_selection_profile(
+        G.PRODUCTION_FLASH_PROFILE,
+        {"segments": segments, "words": [], "source": "supadata"},
+        "",
+        {"max_clips": 40},
+        deadline=time.monotonic() + 10,
+        cancelled=None,
+    )
+
+    assert classification.status == "green"
+    assert len(report.clips) == 8
+    assert "T0" not in {clip["title"] for clip in report.clips}
+    assert "T8" in {clip["title"] for clip in report.clips}
 
 
 def test_production_profile_preserves_optional_learning_detail_schema(monkeypatch):
@@ -537,40 +657,31 @@ def _enrichment(clip_id: str, text: str, evidence: str) -> G._EnrichmentItem:
     )
 
 
-def test_split_invalid_item_retries_only_its_excerpt_with_pro(monkeypatch):
+def test_split_invalid_item_is_cleared_without_pro_retry(monkeypatch):
     clips = [_private_clip("clip-a", "alpha lesson"), _private_clip("clip-b", "beta lesson")]
     calls = []
 
     def fake_call(system, user, schema, **kwargs):
         calls.append((kwargs, user))
-        if len(calls) == 1:
-            return G._EnrichmentPlan(items=[
-                _enrichment("clip-a", "alpha lesson", "alpha lesson"),
-                _enrichment("clip-b", "beta lesson", "not in beta"),
-            ]), {"model": kwargs["model"]}
         return G._EnrichmentPlan(items=[
-            _enrichment("clip-b", "beta lesson", "beta lesson"),
+            _enrichment("clip-a", "alpha lesson", "alpha lesson"),
+            _enrichment("clip-b", "beta lesson", "not in beta"),
         ]), {"model": kwargs["model"]}
 
     monkeypatch.setattr(G, "_call_model", fake_call)
     enriched, _telemetry, reasons, configuration_error = G._enrich_split(
         clips, "", deadline=time.monotonic() + 10, cancelled=None,
     )
-    assert [kwargs["model"] for kwargs, _user in calls] == [
-        G.config.SEGMENT_FLASH_MODEL, G.config.SEGMENT_PRO_MODEL,
-    ]
+    assert [kwargs["model"] for kwargs, _user in calls] == [G.config.SEGMENT_FLASH_MODEL]
     assert (calls[0][0]["thinking_level"], calls[0][0]["max_output_tokens"],
-            calls[0][0]["timeout_s"]) == ("low", 24_576, 25.0)
-    assert (calls[1][0]["thinking_level"], calls[1][0]["max_output_tokens"],
-            calls[1][0]["timeout_s"]) == ("high", 24_576, 90.0)
-    assert "clip-a" not in calls[1][1] and "alpha lesson" not in calls[1][1]
-    assert "clip-b" in calls[1][1] and "beta lesson" in calls[1][1]
-    assert enriched[0]["summary"] and enriched[1]["summary"]
-    assert reasons == ["invalid_enrichment:clip-b"]
+            calls[0][0]["timeout_s"]) == ("low", 2_048, 25.0)
+    assert enriched[0]["summary"]
+    assert enriched[1]["summary"] == ""
+    assert reasons == []
     assert configuration_error is None
 
 
-def test_split_both_enrichment_models_fail_preserves_clip_without_details(monkeypatch):
+def test_split_enrichment_failure_preserves_clip_without_details(monkeypatch):
     clips = [_private_clip("clip-a", "alpha lesson")]
 
     def fail(*args, **kwargs):
@@ -583,11 +694,11 @@ def test_split_both_enrichment_models_fail_preserves_clip_without_details(monkey
     assert enriched[0]["summary"] == ""
     assert enriched[0]["takeaways"] == []
     assert enriched[0]["assessment"] is None
-    assert "pro_enrichment_failure" in reasons
+    assert reasons == []
     assert configuration_error is None
 
 
-def test_semantically_invalid_pro_enrichment_is_reported(monkeypatch):
+def test_semantically_invalid_enrichment_is_nonfatal_without_pro(monkeypatch):
     clips = [_private_clip("clip-a", "alpha lesson")]
     attempts = 0
 
@@ -602,32 +713,29 @@ def test_semantically_invalid_pro_enrichment_is_reported(monkeypatch):
     enriched, _calls, reasons, configuration_error = G._enrich_split(
         clips, "", deadline=time.monotonic() + 10, cancelled=None,
     )
-    assert attempts == 2
-    assert "pro_enrichment_failure" in reasons
+    assert attempts == 1
+    assert reasons == []
     assert enriched[0]["assessment"] is None
     assert configuration_error is None
 
 
-def test_split_enrichment_configuration_failure_survives_successful_pro_retry(monkeypatch):
+def test_split_enrichment_configuration_failure_does_not_invalidate_boundaries(monkeypatch):
     clips = [_private_clip("clip-a", "alpha lesson")]
     attempts = 0
 
     def fake_call(system, user, schema, **kwargs):
         nonlocal attempts
         attempts += 1
-        if attempts == 1:
-            raise RuntimeError("400 INVALID_ARGUMENT. Invalid value at model")
-        return G._EnrichmentPlan(items=[
-            _enrichment("clip-a", "alpha lesson", "alpha lesson"),
-        ]), {"model": kwargs["model"]}
+        raise RuntimeError("400 INVALID_ARGUMENT. Invalid value at model")
 
     monkeypatch.setattr(G, "_call_model", fake_call)
     enriched, _calls, reasons, configuration_error = G._enrich_split(
         clips, "", deadline=time.monotonic() + 10, cancelled=None,
     )
-    assert enriched[0]["summary"]
-    assert reasons == ["invalid_enrichment:clip-a"]
-    assert "INVALID_ARGUMENT" in configuration_error
+    assert attempts == 1
+    assert enriched[0]["summary"] == ""
+    assert reasons == []
+    assert configuration_error is None
 
 
 def test_uncertain_split_boundaries_skip_enrichment(monkeypatch):
@@ -650,6 +758,28 @@ def test_uncertain_split_boundaries_skip_enrichment(monkeypatch):
     )
     result = G.run_segment_profile(_transcript(), {}, G.FLASH_SPLIT_PROFILE)
     assert result.classification == "uncertain"
+
+
+def test_green_split_skips_synchronous_enrichment_by_default(monkeypatch):
+    report = _report(clips=[{
+        **_clip(),
+        **_private_clip("clip-a", "alpha lesson"),
+    }])
+
+    monkeypatch.setattr(
+        G,
+        "_run_selection_profile",
+        lambda *args, **kwargs: (report, G._Classification("green", ()), []),
+    )
+    monkeypatch.setattr(
+        G, "_enrich_split",
+        lambda *args, **kwargs: pytest.fail("default selector must not enrich synchronously"),
+    )
+
+    result = G.run_segment_profile(_transcript(), {}, G.FLASH_SPLIT_PROFILE)
+
+    assert result.classification == "green"
+    assert result.clips[0]["summary"] == ""
 
 
 def test_short_zero_clip_split_skips_empty_enrichment_call(monkeypatch):
@@ -703,7 +833,7 @@ def test_cancelled_worker_never_publishes_late_boundary_or_done_progress(monkeyp
     assert [fraction for fraction, _message in progress] == [0.1]
 
 
-def test_clip_grounding_text_is_limited_to_delivered_snapped_window():
+def test_clip_grounding_text_matches_the_delivered_complete_cue_window():
     segments = [{
         "start": 0.0,
         "end": 180.0,
@@ -720,11 +850,15 @@ def test_clip_grounding_text_is_limited_to_delivered_snapped_window():
         {"word": "after", "start": 121.0, "end": 122.0},
     ]
     proposal = G._Topic(
+        candidate_id="candidate-alpha",
         start_line=0, end_line=0,
         start_quote="alpha lesson", end_quote="closes cleanly",
-        title="Alpha", facet="lesson", reason="A complete alpha lesson.",
-        informativeness=0.9, topic_relevance=0.9, difficulty=0.5,
-        self_contained=True, uncertainty="low", uncertainty_reasons=[],
+        title="Alpha", learning_objective="Understand the alpha lesson.",
+        facet="lesson", reason="A complete alpha lesson.",
+        informativeness=0.9, topic_relevance=0.9,
+        educational_importance=0.9, difficulty=0.5,
+        self_contained=True, is_standalone=True,
+        prerequisite_candidate_ids=[], uncertainty="low", uncertainty_reasons=[],
         summary="The alpha lesson closes cleanly.",
         takeaways=["The alpha lesson is taught.", "The lesson closes cleanly."],
         match_reason="The alpha lesson is directly relevant.",
@@ -740,5 +874,4 @@ def test_clip_grounding_text_is_limited_to_delivered_snapped_window():
         G._Plan(topics=[proposal]), segments, words,
         {"segment_fine_snap": True}, topic="alpha", require_enrichment=True,
     )
-    assert report.clips[0]["_clip_text"] == "alpha lesson closes cleanly"
-    assert "outside" not in report.clips[0]["_clip_text"]
+    assert report.clips[0]["_clip_text"] == segments[0]["text"]

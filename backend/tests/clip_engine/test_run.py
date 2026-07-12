@@ -46,7 +46,7 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
     assert out["clips"][0]["embed_url"] == "https://www.youtube.com/embed/dQw4w9WgXcQ?start=1&end=4&rel=0"
     assert seen["topic"] == "topic"
     assert seen["video_id"] == "dQw4w9WgXcQ"
-    assert seen["accept_partial_flash"] is True
+    assert seen["accept_partial_flash"] is False
     assert seen["transcript_url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 
@@ -100,6 +100,62 @@ def test_segment_cache_hit_skips_gemini_and_budget(monkeypatch):
     assert context.budget.snapshot()["used"]["segmentation"] == 0
     assert context.counters()["segmentation_cache_hits"] == 1
     assert context.usage()[0]["metadata"]["cache_hit"] is True
+
+
+def test_segment_cache_miss_reserves_generic_and_per_dispatch_budgets(monkeypatch):
+    transcript = {
+        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "words": [],
+        "duration": 5.0,
+    }
+    context = GenerationContext("slow")
+
+    def fake_segment(_transcript, settings, **_kwargs):
+        settings["_segment_budget_reserve"](
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            max_output_tokens=4096,
+            prompt_text="short transcript",
+        )
+        return ([{"start": 1.0, "end": 4.0, "title": "Bit"}], "one")
+
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(run.gemini_segment, "segment_clips", fake_segment)
+
+    run.clip(
+        "https://youtu.be/dQw4w9WgXcQ",
+        "topic",
+        settings={"generation_context": context},
+    )
+
+    budget = context.budget.snapshot()
+    assert budget["used"]["segmentation"] == 1
+    assert budget["gemini"]["flash_selector_calls"] == 1
+
+
+def test_boundary_repair_usage_is_recorded_in_repair_stage():
+    context = GenerationContext("slow")
+    settings = {"generation_context": context}
+    run._wire_segment_runtime(settings, "video")
+
+    settings["_segment_telemetry"]({
+        "event": "model_call",
+        "operation": "flash_boundary_repair",
+        "model": "gemini-3.5-flash",
+        "prompt_tokens": 100,
+        "candidate_tokens": 20,
+        "thought_tokens": 10,
+        "total_tokens": 130,
+    })
+    settings["_segment_telemetry"]({
+        "event": "boundary_repair",
+        "attempted_count": 2,
+        "accepted_count": 1,
+    })
+
+    usage = context.usage_payload()
+    assert usage["by_stage"]["repair"]["calls"] == 1
+    assert usage["counters"]["boundary_repairs"] == 1
 
 
 def test_shadow_routing_bypasses_segment_cache(monkeypatch):

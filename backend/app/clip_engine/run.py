@@ -18,6 +18,23 @@ from .errors import (
 from .metadata import extract_video_id
 
 
+def _segment_usage_stage(operation: object) -> str:
+    normalized = str(operation or "").casefold()
+    if normalized == "flash_boundary_repair":
+        return "repair"
+    if "enrichment" in normalized:
+        return "enrichment"
+    if normalized in {
+        "flash_boundary_selector",
+        "flash_single_candidate",
+        "boundary_selection",
+        "pro_authoritative",
+        "pro_fallback",
+    }:
+        return "selection"
+    return normalized or "selection"
+
+
 def _transcribe(url: str, video_id: str, settings: dict) -> dict:
     """Fetch a hosted timestamped transcript as {segments, words, duration, ...}."""
     from .clipper.pipeline.transcribe import transcribe_supadata  # lazy
@@ -31,18 +48,45 @@ def _transcribe(url: str, video_id: str, settings: dict) -> dict:
         raise TranscriptError(f"Supadata transcript failed for {video_id}: {exc}") from exc
 
 
-def _wire_segment_runtime(settings: dict, video_id: str) -> None:
+def _wire_segment_runtime(
+    settings: dict,
+    video_id: str,
+    *,
+    reserve_segmentation: bool = True,
+) -> None:
     """Bridge the hosted job ledger into practice's unchanged segment router."""
     context = settings.get("generation_context") or settings.get("provider_context")
     if context is not None:
-        context.reserve("segmentation")
+        if reserve_segmentation:
+            context.reserve("segmentation")
+        reserve = getattr(context, "reserve_gemini_call", None)
+        if callable(reserve):
+            settings.setdefault("_segment_budget_reserve", reserve)
+        fallback_gate = getattr(context, "allow_pro_fallback", None)
+        if callable(fallback_gate):
+            def gated_fallback(*, accepted_count: int, video_id: str = "") -> bool:
+                return bool(
+                    fallback_gate(
+                        accepted_count=accepted_count,
+                        video_id=video_id,
+                        candidate_rank=settings.get("_segment_candidate_rank"),
+                        deadline_monotonic=settings.get("deadline_monotonic"),
+                    )
+                )
+
+            settings.setdefault("_segment_pro_fallback_gate", gated_fallback)
 
     existing_sink = settings.get("_segment_telemetry")
 
     def sink(event: dict) -> None:
         if callable(existing_sink):
             existing_sink(event)
-        if context is None or event.get("event") != "model_call":
+        if context is None:
+            return
+        record_event = getattr(context, "record_segment_event", None)
+        if callable(record_event):
+            record_event(event)
+        if event.get("event") != "model_call":
             return
         has_provider_response = bool(
             event.get("finish_reason")
@@ -56,6 +100,7 @@ def _wire_segment_runtime(settings: dict, video_id: str) -> None:
             or event.get("total_token_count")
         )
         context.record_gemini(
+            stage=_segment_usage_stage(event.get("operation")),
             attempt=max(1, int(event.get("retries") or 0) + 1),
             model_used=str(event.get("model") or ""),
             quality_degraded=str(event.get("operation") or "").startswith("pro_fallback"),
@@ -77,9 +122,8 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     settings = dict(settings or {})
     settings.setdefault("segment_fine_snap", config.SEGMENT_FINE_SNAP)
     settings.setdefault("segment_min_clip_s", config.SEGMENT_MIN_CLIP_S)
-    # Practice's hard validators already discard unsafe clips. Ship surviving
-    # Flash clips immediately; reserve Pro for an empty/failed Flash response.
-    settings.setdefault("segment_accept_partial_flash", True)
+    # A Flash response with any rejected proposal is not safe to ship partially.
+    settings.setdefault("segment_accept_partial_flash", False)
     settings["should_cancel"] = should_cancel
 
     canonical_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -147,3 +191,42 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
         raise_if_cancelled(should_cancel)
         c["embed_url"] = embed.embed_url(video_id, c["start"], c["end"])
     return {"video_id": video_id, "clips": clips, "transcript": transcript, "notes": notes}
+
+
+def pro_boundary_fallback(
+    transcript: dict,
+    *,
+    topic: str,
+    video_id: str,
+    settings: dict | None = None,
+    should_cancel=None,
+) -> dict:
+    """Run aggregate Pro selection without retrieving or re-timestamping transcript data."""
+    raise_if_cancelled(should_cancel)
+    runtime_settings = dict(settings or {})
+    runtime_settings["should_cancel"] = should_cancel
+    _wire_segment_runtime(
+        runtime_settings,
+        video_id,
+        reserve_segmentation=False,
+    )
+    result = gemini_segment.pro_boundary_fallback_detailed(
+        transcript,
+        runtime_settings,
+        topic=topic,
+        video_id=video_id,
+    )
+    clips = list(result.clips)
+    for clip in clips:
+        clip["embed_url"] = embed.embed_url(
+            video_id,
+            clip["start"],
+            clip["end"],
+        )
+    return {
+        "video_id": video_id,
+        "clips": clips,
+        "transcript": transcript,
+        "notes": result.notes,
+        "route": result.route,
+    }

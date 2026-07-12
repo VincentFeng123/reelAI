@@ -88,6 +88,7 @@ from ..services.search_query_plan import (
     topic_signature_evidence,
 )
 from ..services.knowledge_level import effective_level_target
+from ...pipeline import gemini_segment as live_gemini_segment
 
 logger: logging.Logger = get_ingest_logger(__name__)
 
@@ -104,12 +105,18 @@ def _run_clip(
     should_cancel: Callable[[], bool] | None,
     generation_context: GenerationContext | None = None,
     deadline_monotonic: float | None = None,
+    candidate_rank: int | None = None,
+    max_clips: int | None = None,
 ) -> dict[str, Any]:
     settings: dict[str, Any] = {
         "language": language,
         "generation_context": generation_context,
         "provider_cache": generation_context.cache_store if generation_context is not None else None,
     }
+    if candidate_rank is not None:
+        settings["_segment_candidate_rank"] = int(candidate_rank)
+    if max_clips is not None:
+        settings["max_clips"] = max(1, min(8, int(max_clips)))
     if deadline_monotonic is not None:
         settings["deadline_monotonic"] = float(deadline_monotonic)
     kwargs = {
@@ -231,6 +238,34 @@ def _strict_topic_clips(
         clip["topic_evidence_terms"] = evidence[:8]
         kept.append(clip)
     return kept
+
+
+def _topic_evidence(
+    text: str,
+    topic_terms: list[str],
+    *,
+    semantic_score: float | None = None,
+) -> list[str]:
+    """Return transcript-grounded lexical evidence or a strong semantic verdict."""
+    from ..services.search_query_plan import semantic_query_family
+
+    text_family = semantic_query_family(text)
+    text_tokens = set(text_family.split())
+    evidence: list[str] = []
+    for raw_term in topic_terms:
+        term = " ".join(str(raw_term or "").split())
+        term_tokens = set(semantic_query_family(term).split())
+        if not term_tokens:
+            continue
+        overlap = len(term_tokens.intersection(text_tokens))
+        required = 1 if len(term_tokens) == 1 else math.ceil(0.67 * len(term_tokens))
+        if overlap >= required:
+            evidence.append(term)
+    if evidence:
+        return evidence[:8]
+    if semantic_score is not None and semantic_score >= 0.72 and text.strip():
+        return [f"semantic:{semantic_score:.2f}"]
+    return []
 
 
 def _retrieval_search_context(
@@ -861,16 +896,31 @@ class IngestionPipeline:
         `dry_run`).
 
         Cost/latency guardrail: `max_videos` bounds the paid `run.clip` calls.
-        Without `max_reels`, each video's clips persist as soon as that video
-        finishes; the returned list is restored to discover order. With
-        `max_reels`, fetch and persistence stay in discover order so the capped
-        selection remains deterministic.
+        The first two videos run concurrently; later candidates start one at a
+        time only while the requested clip cap is unmet. Completed valid clips
+        persist and stream immediately, and the returned list is restored to
+        discover order.
         """
         topic = " ".join(str(topic or "").split())
         if not topic:
             raise UnsupportedSourceError("A non-blank YouTube search topic is required.")
         raise_if_cancelled(should_cancel)
-        limit = min(int(max_videos), clip_engine_config.CLIP_SEARCH_MAX_VIDEOS)
+        provider_analysis_limit = int(max_videos)
+        if generation_context is not None and not dry_run:
+            provider_analysis_limit = min(
+                provider_analysis_limit,
+                generation_context.budget.remaining("segmentation"),
+            )
+        analysis_limit = max(
+            0,
+            min(provider_analysis_limit, clip_engine_config.CLIP_SEARCH_MAX_VIDEOS),
+        )
+        if analysis_limit <= 0:
+            return [], []
+        discovery_limit = min(
+            clip_engine_config.CLIP_SEARCH_MAX_VIDEOS,
+            max(analysis_limit, analysis_limit * 2),
+        )
 
         self._rate_limiter.acquire("yt")
 
@@ -885,7 +935,7 @@ class IngestionPipeline:
 
         try:
             disc = _discover(
-                topic, limit=limit, exclude_video_ids=bare_exclusions, level=knowledge_level,
+                topic, limit=discovery_limit, exclude_video_ids=bare_exclusions, level=knowledge_level,
                 should_cancel=should_cancel,
                 creative_commons_only=creative_commons_only,
                 preferred_video_duration=preferred_video_duration,
@@ -904,14 +954,33 @@ class IngestionPipeline:
         if warning:
             log_event(logger, logging.WARNING, "ingest_topic_warning", warning=warning)
 
-        corrected_topic = " ".join(str(disc.get("corrected") or topic).split()) or topic
+        authoritative_topic = " ".join(str(literal_topic or topic).split()) or topic
+        corrected_topic = " ".join(str(disc.get("corrected") or authoritative_topic).split()) or authoritative_topic
         query_plan = disc.get("query_plan")
         if not isinstance(query_plan, SearchQueryPlan):
             query_plan = None
+        topic_terms = [
+            " ".join(str(term or "").split())
+            for term in (disc.get("topic_terms") or [])
+            if " ".join(str(term or "").split())
+        ]
+        if query_plan is not None:
+            topic_terms.extend(
+                term
+                for term in (
+                    query_plan.literal_query,
+                    query_plan.canonical_query,
+                    *query_plan.trusted_signature,
+                )
+                if term
+            )
+        topic_terms = list(dict.fromkeys(topic_terms))
         for discovered_video in disc["videos"]:
             discovered_video["_knowledge_level"] = knowledge_level
+            discovered_video["_topic_terms"] = topic_terms
+            discovered_video["_literal_topic"] = authoritative_topic
             discovered_video["_search_context"] = _retrieval_search_context(
-                requested_topic=topic,
+                requested_topic=authoritative_topic,
                 corrected_topic=corrected_topic,
                 video=discovered_video,
                 query_plan=query_plan,
@@ -920,7 +989,7 @@ class IngestionPipeline:
             )
             if query_plan is not None:
                 discovered_video["_query_plan"] = query_plan
-        resolved_video_ids = [v["id"] for v in disc["videos"]]
+        resolved_video_ids = [v["id"] for v in disc["videos"][:analysis_limit]]
         if generation_context is not None:
             generation_context.increment_counter("discovered_videos", len(resolved_video_ids))
 
@@ -933,32 +1002,69 @@ class IngestionPipeline:
         if not videos:
             return [], resolved_video_ids
 
-        # FETCH stage: clip + relevance-filter each video concurrently under one
-        # shared deadline. shutdown(wait=False) abandons stuck worker threads.
-        executor = ThreadPoolExecutor(max_workers=min(4, len(videos)))
+        requested_count = 3 if max_reels is None else max(0, int(max_reels))
+        if requested_count == 0:
+            return [], resolved_video_ids
+        inventory_cap = requested_count + 2 if max_reels is None else requested_count
+        minimum_valid = inventory_cap
+
+        # Start with two videos. Additional candidates are backfilled one at a
+        # time only when the completed batch has not produced enough valid clips.
+        executor = ThreadPoolExecutor(max_workers=min(2, len(videos)))
+        enrichment_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="clip-enrichment")
+            if generation_context is not None
+            else None
+        )
+        enrichment_buffer: list[dict[str, Any]] = []
+        enrichment_futures: list[Any] = []
         batch_cancelled = threading.Event()
 
         def fetch_should_cancel() -> bool:
             return batch_cancelled.is_set() or is_cancelled(should_cancel)
 
         deadline = time.monotonic() + max(0.0, INGEST_TOPIC_VIDEO_TIMEOUT_SEC)
-        for video in videos:
+        for index, video in enumerate(videos):
             video["_deadline_monotonic"] = deadline
-        futures = [
-            executor.submit(
+            video["_segment_candidate_rank"] = index
+
+        def submit_video(index: int):
+            videos[index]["_segment_max_candidates"] = min(
+                8,
+                max(1, inventory_cap - valid_clip_count + 2),
+            )
+            return executor.submit(
                 self._clip_and_filter,
-                v,
-                corrected_topic,
+                videos[index],
+                authoritative_topic,
                 language,
                 fetch_should_cancel,
                 generation_context,
             )
-            for v in videos
-        ]
 
         def fetch_result(v: dict[str, Any], future: Any, timeout: float):
+            completed = False
             try:
-                return future.result(timeout=timeout)
+                result = future.result(timeout=timeout)
+                completed = True
+                if generation_context is not None:
+                    record_cohort = getattr(
+                        generation_context,
+                        "record_pro_fallback_cohort_result",
+                        None,
+                    )
+                    if callable(record_cohort):
+                        accepted_count = (
+                            len(result[1])
+                            if isinstance(result, tuple) and len(result) > 1
+                            else 0
+                        )
+                        record_cohort(
+                            candidate_rank=int(v.get("_segment_candidate_rank") or 0),
+                            accepted_count=accepted_count,
+                            fallback_eligible=False,
+                        )
+                return result
             except _ClipCancellationError:
                 if batch_cancelled.is_set() and not is_cancelled(should_cancel):
                     return None
@@ -1035,7 +1141,100 @@ class IngestionPipeline:
                     video_id=v.get("id"),
                     error=str(exc),
                 )
+            finally:
+                if not completed and generation_context is not None:
+                    record_cohort = getattr(
+                        generation_context,
+                        "record_pro_fallback_cohort_result",
+                        None,
+                    )
+                    if callable(record_cohort):
+                        record_cohort(
+                            candidate_rank=int(v.get("_segment_candidate_rank") or 0),
+                            accepted_count=0,
+                            fallback_eligible=False,
+                        )
             return None
+
+        def enrich_persisted_batch(batch: list[dict[str, Any]]) -> None:
+            if generation_context is None or not batch:
+                return
+            settings = {"_segment_budget_reserve": generation_context.reserve_gemini_call}
+            updates, calls = live_gemini_segment.enrich_accepted_clips(
+                batch,
+                topic=authoritative_topic,
+                settings=settings,
+                deadline_monotonic=deadline,
+                cancelled=should_cancel,
+            )
+            for call in calls:
+                has_provider_response = bool(
+                    call.get("finish_reason")
+                    or call.get("prompt_tokens")
+                    or call.get("prompt_token_count")
+                    or call.get("candidate_tokens")
+                    or call.get("candidates_token_count")
+                    or call.get("thought_tokens")
+                    or call.get("thoughts_token_count")
+                    or call.get("total_tokens")
+                    or call.get("total_token_count")
+                )
+                generation_context.record_gemini(
+                    stage="enrichment",
+                    attempt=max(1, int(call.get("retries") or 0) + 1),
+                    model_used=str(call.get("model") or ""),
+                    quality_degraded=False,
+                    usage=call,
+                    status_code=200 if has_provider_response else None,
+                    error_code="" if has_provider_response else "model_call_failed",
+                )
+            if not updates:
+                return
+            try:
+                with get_conn(transactional=True) as conn:
+                    for reel_id, details in updates.items():
+                        conn.execute(
+                            """
+                            UPDATE reels
+                            SET ai_summary = ?, takeaways_json = ?, match_reason = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                str(details.get("summary") or "")[:700],
+                                dumps_json(list(details.get("takeaways") or [])[:4]),
+                                str(details.get("match_reason") or "")[:700],
+                                reel_id,
+                            ),
+                        )
+            except Exception:
+                logger.warning("accepted clip enrichment persistence failed", exc_info=True)
+
+        def queue_enrichment(
+            reel: ReelOutWithAttribution,
+            clip: dict[str, Any],
+            engine_out: dict[str, Any],
+        ) -> None:
+            if enrichment_executor is None:
+                return
+            reel_id = str(getattr(reel, "reel_id", "") or "").strip()
+            if not reel_id:
+                return
+            clip_text = (
+                clip_engine_bridge.cue_text(
+                    engine_out["transcript"], clip.get("cue_ids")
+                )
+                or clip_engine_bridge.window_text(
+                    engine_out["transcript"],
+                    float(clip.get("start") or 0.0),
+                    float(clip.get("end") or 0.0),
+                )
+            )
+            enrichment_buffer.append({
+                "clip_id": reel_id,
+                "title": str(clip.get("title") or ""),
+                "learning_objective": str(clip.get("learning_objective") or ""),
+                "text": clip_text[:5000],
+            })
 
         def persist_result(
             result: tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
@@ -1061,89 +1260,265 @@ class IngestionPipeline:
                     generation_context.increment_counter("persisted_clips")
                 if on_reel_created is not None:
                     on_reel_created(reel)
+                queue_enrichment(reel, clip, engine_out)
             return persisted
 
-        fetched: list[tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]] = []
         reels_by_video: dict[int, list[ReelOutWithAttribution]] = {}
+        completed_results: dict[
+            int,
+            tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
+        ] = {}
+        initial_resolved: set[int] = set()
+        aggregate_fallback_checked = False
         provider_errors: list[_ClipProviderError] = []
-        try:
-            # A numeric cap preserves the prior discover-order selection contract.
-            if max_reels is not None:
-                for v, future in zip(videos, futures):
-                    raise_if_cancelled(should_cancel)
-                    remaining = max(0.0, deadline - time.monotonic())
-                    result = fetch_result(v, future, remaining)
-                    if result is not None:
-                        fetched.append(result)
-            else:
-                # Uncapped primary generation persists each completed video now.
-                pending = {
-                    future: (index, v)
-                    for index, (v, future) in enumerate(zip(videos, futures))
-                }
-                while pending:
-                    raise_if_cancelled(should_cancel)
-                    remaining = max(0.0, deadline - time.monotonic())
-                    done, _ = wait(
-                        pending,
-                        timeout=min(0.01, remaining),
-                        return_when=FIRST_COMPLETED,
-                    )
-                    if not done:
-                        if time.monotonic() < deadline:
-                            continue
-                        for _, v in pending.values():
-                            log_event(
-                                logger,
-                                logging.WARNING,
-                                "ingest_topic_video_failed",
-                                video_id=v.get("id"),
-                                topic=topic,
-                                concept_id=concept_id,
-                                generation_id=generation_id,
-                                literal_query=(v.get("_search_context") or {}).get("literal_query"),
-                                matched_queries=(v.get("_search_context") or {}).get("matched_queries"),
-                                query_plan_ai_status=(v.get("_search_context") or {}).get("query_plan_ai_status"),
-                                error=(
-                                    "shared clip fetch deadline exceeded "
-                                    f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
-                                ),
-                            )
-                        if generation_context is not None:
-                            generation_context.increment_counter(
-                                "clip_fetch_timeouts", len(pending)
-                            )
-                        break
+        initial_count = min(2, len(videos), analysis_limit)
+        if generation_context is not None:
+            configure_fallback = getattr(
+                generation_context, "configure_pro_fallback_gate", None
+            )
+            if callable(configure_fallback):
+                configure_fallback(initial_count)
+        valid_clip_count = 0
+        persisted_count = 0
 
-                    for future in sorted(done, key=lambda item: pending[item][0]):
-                        index, v = pending.pop(future)
-                        try:
-                            result = fetch_result(v, future, 0.0)
-                        except _ClipProviderError as exc:
-                            provider_errors.append(exc)
-                            log_event(
-                                logger,
-                                logging.WARNING,
-                                "ingest_topic_video_failed",
-                                video_id=v.get("id"),
-                                error=str(exc),
-                            )
-                            continue
-                        if result is not None:
-                            reels_by_video[index] = persist_result(result)
+        def clips_temporally_overlap(a: dict[str, Any], b: dict[str, Any]) -> bool:
+            start = max(float(a.get("start") or 0.0), float(b.get("start") or 0.0))
+            end = min(float(a.get("end") or 0.0), float(b.get("end") or 0.0))
+            overlap = end - start
+            if overlap <= 0:
+                return False
+            shorter = min(
+                float(a.get("end") or 0.0) - float(a.get("start") or 0.0),
+                float(b.get("end") or 0.0) - float(b.get("start") or 0.0),
+            )
+            return shorter > 0 and overlap / shorter >= 0.8
+
+        def maybe_run_aggregate_fallback() -> None:
+            nonlocal aggregate_fallback_checked, valid_clip_count, persisted_count
+            if aggregate_fallback_checked or len(initial_resolved) < initial_count:
+                return
+            aggregate_fallback_checked = True
+            initial_validated = sum(
+                len(completed_results[index][1])
+                for index in range(initial_count)
+                if index in completed_results
+            )
+            if generation_context is None or initial_validated >= 3:
+                return
+            viable_candidates = [
+                index
+                for index in range(initial_count)
+                if index in completed_results
+                and _is_valid_timestamped_supadata_transcript(
+                    completed_results[index][2].get("transcript") or {}
+                )
+            ]
+            if not viable_candidates:
+                # Leave the Pro budget untouched so a later backfill selector can
+                # still claim it after obtaining a usable transcript.
+                return
+            candidate_index = min(
+                viable_candidates,
+                key=lambda index: (len(completed_results[index][1]), index),
+            )
+            claim_fallback = getattr(
+                generation_context,
+                "claim_aggregate_pro_fallback",
+                None,
+            )
+            if not callable(claim_fallback) or not claim_fallback(
+                validated_count=initial_validated
+            ):
+                return
+            v, existing_clips, engine_out = completed_results[candidate_index]
+            try:
+                fallback_out = clip_engine_run.pro_boundary_fallback(
+                    engine_out["transcript"],
+                    topic=authoritative_topic,
+                    video_id=str(v.get("id") or ""),
+                    settings={
+                        "generation_context": generation_context,
+                        "deadline_monotonic": deadline,
+                        "max_clips": min(
+                            8,
+                            max(1, inventory_cap - initial_validated + 2),
+                        ),
+                    },
+                    should_cancel=should_cancel,
+                )
+                fallback_result = self._clip_and_filter(
+                    v,
+                    authoritative_topic,
+                    language,
+                    should_cancel,
+                    generation_context,
+                    engine_out_override=fallback_out,
+                    record_transcript_usage=False,
+                )
+            except (_ClipError, _ClipProviderError) as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "aggregate_pro_fallback_failed",
+                    video_id=v.get("id"),
+                    error=str(exc),
+                )
+                return
+            accepted_candidate_ids = {
+                str(clip.get("selection_candidate_id") or "").strip()
+                for clip in existing_clips
+                if str(clip.get("selection_candidate_id") or "").strip()
+            }
+            novelty_candidates = [
+                clip
+                for clip in fallback_result[1]
+                if not any(
+                    clips_temporally_overlap(clip, existing)
+                    for existing in existing_clips
+                )
+            ]
+            novel_clips: list[dict[str, Any]] = []
+            pending_novel = list(novelty_candidates)
+            satisfied_ids = set(accepted_candidate_ids)
+            while pending_novel:
+                deferred: list[dict[str, Any]] = []
+                progress = False
+                for clip in pending_novel:
+                    prerequisite_ids = {
+                        str(value).strip()
+                        for value in (clip.get("prerequisite_ids") or [])
+                        if str(value).strip()
+                    }
+                    if not prerequisite_ids.issubset(satisfied_ids):
+                        deferred.append(clip)
+                        continue
+                    novel_clips.append(clip)
+                    candidate_id = str(
+                        clip.get("selection_candidate_id") or ""
+                    ).strip()
+                    if candidate_id:
+                        satisfied_ids.add(candidate_id)
+                    progress = True
+                if not progress:
+                    break
+                pending_novel = deferred
+            if not novel_clips:
+                return
+            novel_result = (fallback_result[0], novel_clips, fallback_result[2])
+            valid_clip_count += len(novel_clips)
+            if persisted_count < inventory_cap:
+                persisted = persist_result(
+                    novel_result,
+                    limit=inventory_cap - persisted_count,
+                )
+                reels_by_video.setdefault(candidate_index, []).extend(persisted)
+                persisted_count += len(persisted)
+
+        pending = {
+            submit_video(index): (index, videos[index])
+            for index in range(initial_count)
+        }
+        all_futures = list(pending)
+        next_index = initial_count
+        try:
+            while pending:
+                raise_if_cancelled(should_cancel)
+                remaining = max(0.0, deadline - time.monotonic())
+                done, _ = wait(
+                    pending,
+                    timeout=min(0.01, remaining),
+                    return_when=FIRST_COMPLETED,
+                )
+                if not done:
+                    if time.monotonic() < deadline:
+                        continue
+                    for _, v in pending.values():
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "ingest_topic_video_failed",
+                            video_id=v.get("id"),
+                            topic=topic,
+                            concept_id=concept_id,
+                            generation_id=generation_id,
+                            literal_query=(v.get("_search_context") or {}).get("literal_query"),
+                            matched_queries=(v.get("_search_context") or {}).get("matched_queries"),
+                            query_plan_ai_status=(v.get("_search_context") or {}).get("query_plan_ai_status"),
+                            error=(
+                                "shared clip fetch deadline exceeded "
+                                f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
+                            ),
+                        )
+                    if generation_context is not None:
+                        generation_context.increment_counter("clip_fetch_timeouts", len(pending))
+                    break
+
+                for future in sorted(done, key=lambda item: pending[item][0]):
+                    index, v = pending.pop(future)
+                    if index < initial_count:
+                        initial_resolved.add(index)
+                    try:
+                        result = fetch_result(v, future, 0.0)
+                    except _ClipProviderError as exc:
+                        provider_errors.append(exc)
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "ingest_topic_video_failed",
+                            video_id=v.get("id"),
+                            error=str(exc),
+                        )
+                        continue
+                    if result is None:
+                        continue
+                    completed_results[index] = result
+                    valid_clip_count += len(result[1])
+                    if persisted_count < inventory_cap:
+                        persisted = persist_result(
+                            result,
+                            limit=inventory_cap - persisted_count,
+                        )
+                        reels_by_video[index] = persisted
+                        persisted_count += len(persisted)
+
+                maybe_run_aggregate_fallback()
+
+                if (
+                    not pending
+                    and valid_clip_count < minimum_valid
+                    and valid_clip_count < inventory_cap
+                    and next_index < min(len(videos), analysis_limit)
+                ):
+                    future = submit_video(next_index)
+                    pending[future] = (next_index, videos[next_index])
+                    all_futures.append(future)
+                    next_index += 1
         finally:
             batch_cancelled.set()
-            for future in futures:
+            for future in all_futures:
                 future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
 
-        if max_reels is not None:
-            reels: list[ReelOutWithAttribution] = []
-            for result in fetched:
-                if len(reels) >= max_reels:
-                    break
-                reels.extend(persist_result(result, limit=max_reels - len(reels)))
-            return reels, resolved_video_ids
+        if enrichment_executor is not None:
+            while enrichment_buffer:
+                batch = enrichment_buffer[:3]
+                del enrichment_buffer[:3]
+                enrichment_futures.append(
+                    enrichment_executor.submit(
+                        enrich_persisted_batch,
+                        batch,
+                    )
+                )
+            for future in enrichment_futures:
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0:
+                    future.cancel()
+                    continue
+                try:
+                    future.result(timeout=remaining)
+                except Exception:
+                    logger.warning("accepted clip enrichment failed", exc_info=True)
+            enrichment_executor.shutdown(wait=False, cancel_futures=True)
 
         # Progressive callbacks reflect availability; restore discover order in
         # the final result for deterministic downstream inventory.
@@ -1160,18 +1535,24 @@ class IngestionPipeline:
         self, v: dict[str, Any], topic: str, language: str,
         should_cancel: Callable[[], bool] | None = None,
         generation_context: GenerationContext | None = None,
+        engine_out_override: dict[str, Any] | None = None,
+        record_transcript_usage: bool = True,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
         """Fetch ONE discovered video's clips, score each (query relevance
         blended with the engine's informativeness so one-word topics still get
         a ranking signal). Returns `(v, scored_clips,
         engine_out)`, scored_clips sorted by score DESCENDING. Empty `clips`
         yields no clips (video is skipped)."""
-        engine_out = _run_clip(
-            v["url"], topic=topic, language=language,
-            should_cancel=should_cancel,
-            generation_context=generation_context,
-            deadline_monotonic=v.get("_deadline_monotonic"),
-        )
+        engine_out = engine_out_override
+        if engine_out is None:
+            engine_out = _run_clip(
+                v["url"], topic=topic, language=language,
+                should_cancel=should_cancel,
+                generation_context=generation_context,
+                deadline_monotonic=v.get("_deadline_monotonic"),
+                candidate_rank=v.get("_segment_candidate_rank"),
+                max_clips=v.get("_segment_max_candidates"),
+            )
         transcript = engine_out["transcript"]
         query_plan = (
             v.get("_query_plan")
@@ -1179,9 +1560,13 @@ class IngestionPipeline:
             else None
         )
         trusted_transcript = _is_valid_timestamped_supadata_transcript(transcript)
-        if generation_context is not None and trusted_transcript:
+        if generation_context is not None and trusted_transcript and record_transcript_usage:
             generation_context.increment_counter("usable_transcripts")
-        elif generation_context is not None and query_plan is not None:
+        elif (
+            generation_context is not None
+            and record_transcript_usage
+            and (query_plan is not None or v.get("_topic_terms"))
+        ):
             generation_context.increment_counter("transcript_failures")
 
         raw_clips = list(engine_out["clips"])
@@ -1189,41 +1574,199 @@ class IngestionPipeline:
             if generation_context is not None:
                 generation_context.increment_counter("gemini_empty_results")
             return v, [], engine_out
-        # Practice already asks Gemini to select clips for the requested topic.
-        # Keep every valid engine clip and use ReelAI's topic/level signals only
-        # to order it; the old exact-term gate collapsed useful result sets.
+        topic_terms = [str(term) for term in (v.get("_topic_terms") or []) if str(term).strip()]
         level_target = effective_level_target(v.get("_knowledge_level"), 0.0)
-        for clip in raw_clips:
+
+        def unit(value: object, default: float) -> float:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return default
+            return max(0.0, min(1.0, parsed)) if math.isfinite(parsed) else default
+
+        transcript_texts = [
+            (
+                clip_engine_bridge.cue_text(transcript, clip.get("cue_ids"))
+                or clip_engine_bridge.window_text(
+                    transcript,
+                    float(clip.get("start") or 0.0),
+                    float(clip.get("end") or 0.0),
+                )
+            )
+            for clip in raw_clips
+        ]
+        semantic_scores: list[float | None] = [None] * len(raw_clips)
+        if (
+            topic_terms
+            and trusted_transcript
+            and self._embedding_service is not None
+            and getattr(self._embedding_service, "semantic_available", False) is True
+        ):
+            try:
+                vectors = self._embedding_service.embed_semantic([*topic_terms, *transcript_texts])
+                anchor_count = len(topic_terms)
+                if vectors is not None and len(vectors) == anchor_count + len(raw_clips):
+                    for index, vector in enumerate(vectors[anchor_count:]):
+                        semantic_scores[index] = max(
+                            float(vector.dot(anchor)) for anchor in vectors[:anchor_count]
+                        )
+            except Exception:
+                logger.warning("semantic topic gate unavailable; using lexical evidence")
+
+        kept: list[dict[str, Any]] = []
+        for index, clip in enumerate(raw_clips):
             lexical_relevance = clip_engine_bridge.relevance_score(
                 clip, engine_out["transcript"], topic
             )
-            raw_info = clip.get("informativeness")
-            informativeness = (
-                0.5 if raw_info is None else max(0.0, min(1.0, float(raw_info)))
-            )
+            informativeness = unit(clip.get("informativeness"), 0.5)
             raw_topic_relevance = clip.get("topic_relevance")
             topic_relevance = (
                 lexical_relevance
                 if raw_topic_relevance is None
-                else max(0.0, min(1.0, float(raw_topic_relevance)))
+                else unit(raw_topic_relevance, lexical_relevance)
             )
-            raw_difficulty = clip.get("difficulty")
-            difficulty = (
-                0.5 if raw_difficulty is None else max(0.0, min(1.0, float(raw_difficulty)))
+            evidence = _topic_evidence(
+                transcript_texts[index],
+                topic_terms,
+                semantic_score=semantic_scores[index],
+            ) if topic_terms and trusted_transcript else []
+            if topic_terms and not evidence:
+                if generation_context is not None:
+                    generation_context.increment_counter("topic_rejections")
+                continue
+            clip["topic_evidence_terms"] = evidence
+
+            has_selector_metadata = any(
+                key in clip
+                for key in (
+                    "educational_importance",
+                    "boundary_confidence",
+                    "is_standalone",
+                    "chain_id",
+                    "prerequisite_ids",
+                )
             )
-            level_fit = 1.0 - abs(difficulty - level_target)
-            clip["score"] = (
-                0.55 * topic_relevance
-                + 0.25 * informativeness
-                + 0.15 * level_fit
-                + 0.05 * lexical_relevance
-            )
-            clip["search_context"] = {
+            search_context = {
                 **dict(v.get("_search_context") or {}),
-                "topic_evidence_terms": list(clip.get("topic_evidence_terms") or [])[:8],
+                "topic_evidence_terms": evidence[:8],
             }
-        kept = sorted(raw_clips, key=lambda c: c["score"], reverse=True)
-        return v, kept, engine_out
+            if has_selector_metadata:
+                importance = unit(clip.get("educational_importance"), 0.5)
+                boundary_confidence = unit(clip.get("boundary_confidence"), 0.5)
+                content_score = (
+                    0.45 * topic_relevance
+                    + 0.35 * importance
+                    + 0.20 * informativeness
+                )
+                clip["score"] = content_score
+                prerequisite_ids = clip.get("prerequisite_ids")
+                source_namespace = str(v.get("id") or "unknown-video").strip()
+
+                def namespaced_selection_id(value: object) -> str:
+                    raw_value = str(value or "").strip()
+                    if not raw_value:
+                        return ""
+                    prefix = f"{source_namespace}::"
+                    return raw_value if raw_value.startswith(prefix) else f"{prefix}{raw_value}"
+
+                selection_candidate_id = namespaced_selection_id(
+                    clip.get("selection_candidate_id")
+                )
+                namespaced_prerequisites = (
+                    [
+                        namespaced_selection_id(item)
+                        for item in prerequisite_ids
+                        if str(item).strip()
+                    ]
+                    if isinstance(prerequisite_ids, list)
+                    else []
+                )
+                raw_chain_id = str(clip.get("chain_id") or "").strip()
+                chain_id = namespaced_selection_id(raw_chain_id) if raw_chain_id else ""
+                clip["selection_candidate_id"] = selection_candidate_id
+                clip["prerequisite_ids"] = namespaced_prerequisites
+                clip["chain_id"] = chain_id
+                search_context.update(
+                    selection_contract_version="confidence_v1",
+                    content_score=content_score,
+                    topic_relevance=topic_relevance,
+                    educational_importance=importance,
+                    boundary_confidence=boundary_confidence,
+                    is_standalone=bool(clip.get("is_standalone", True)),
+                    chain_id=chain_id,
+                    chain_position=clip.get("chain_position"),
+                    selection_candidate_id=selection_candidate_id,
+                    prerequisite_ids=namespaced_prerequisites,
+                )
+            else:
+                difficulty = unit(clip.get("difficulty"), 0.5)
+                level_fit = 1.0 - abs(difficulty - level_target)
+                clip["score"] = (
+                    0.55 * topic_relevance
+                    + 0.25 * informativeness
+                    + 0.15 * level_fit
+                    + 0.05 * lexical_relevance
+                )
+            clip["search_context"] = search_context
+            kept.append(clip)
+
+        nodes: dict[str, dict[str, Any]] = {}
+        source_order: dict[str, int] = {}
+        aliases: dict[str, str] = {}
+        for clip_index, clip in enumerate(kept):
+            node_id = f"clip-node-{clip_index}"
+            nodes[node_id] = clip
+            source_order[node_id] = clip_index
+            candidate_id = str(clip.get("selection_candidate_id") or "").strip()
+            if candidate_id:
+                aliases[candidate_id] = node_id
+        dependencies: dict[str, set[str]] = {node_id: set() for node_id in nodes}
+        for node_id, clip in nodes.items():
+            for prerequisite in clip.get("prerequisite_ids") or []:
+                prerequisite_id = str(prerequisite or "").strip()
+                if prerequisite_id:
+                    dependencies[node_id].add(
+                        aliases.get(prerequisite_id, f"missing:{prerequisite_id}")
+                    )
+        remaining_nodes = set(nodes)
+        satisfied_nodes: set[str] = set()
+        ordered_kept: list[dict[str, Any]] = []
+        while remaining_nodes:
+            eligible_nodes = [
+                node_id
+                for node_id in remaining_nodes
+                if dependencies[node_id].issubset(satisfied_nodes)
+            ]
+            if not eligible_nodes:
+                break
+            if not ordered_kept:
+                safe_first = [
+                    node_id
+                    for node_id in eligible_nodes
+                    if (
+                        not nodes[node_id].get("search_context", {}).get(
+                            "selection_contract_version"
+                        )
+                        or (
+                            bool(nodes[node_id].get("is_standalone"))
+                            and unit(nodes[node_id].get("boundary_confidence"), 0.0) >= 0.80
+                        )
+                    )
+                ]
+                if not safe_first:
+                    break
+                eligible_nodes = safe_first
+            chosen_id = max(
+                eligible_nodes,
+                key=lambda node_id: (
+                    float(nodes[node_id].get("score") or 0.0),
+                    -source_order[node_id],
+                ),
+            )
+            ordered_kept.append(nodes[chosen_id])
+            remaining_nodes.remove(chosen_id)
+            satisfied_nodes.add(chosen_id)
+        return v, ordered_kept, engine_out
 
     def _ensure_search_material(self, query: str) -> str:
         """
@@ -1404,7 +1947,12 @@ class IngestionPipeline:
             if clip_title:
                 takeaways = ([clip_title] + [t for t in takeaways if t != clip_title])[:3]
 
+        learning_objective = " ".join(
+            str(details.get("learning_objective") or "").split()
+        ).strip()[:700]
         ai_summary = " ".join(str(details.get("summary") or "").split()).strip()[:700]
+        if not ai_summary:
+            ai_summary = learning_objective
         if not ai_summary:
             ai_summary = fallback_ai_summary(
                 concept_title=clip_title or metadata.title or "",
@@ -1414,6 +1962,10 @@ class IngestionPipeline:
                 takeaways=takeaways,
             )
         match_reason = " ".join(str(details.get("match_reason") or "").split()).strip()[:700]
+        if not match_reason:
+            match_reason = " ".join(
+                str(details.get("reason") or learning_objective).split()
+            ).strip()[:700]
         if not match_reason:
             matched_idea = clip_title or (takeaways[0] if takeaways else "") or metadata.title or "this topic"
             match_reason = f"This clip directly explains {matched_idea[:180]} using the source transcript."
@@ -1534,6 +2086,15 @@ class IngestionPipeline:
             )
 
         attribution = format_attribution(metadata)
+        selection_context = (
+            dict(details.get("search_context") or {})
+            if isinstance(details.get("search_context"), dict)
+            else {}
+        )
+        try:
+            chain_position = float(selection_context.get("chain_position") or 0.0)
+        except (TypeError, ValueError):
+            chain_position = 0.0
 
         return ReelOutWithAttribution(
             reel_id=reel_id,
@@ -1571,6 +2132,26 @@ class IngestionPipeline:
                 str(cue_id)
                 for cue_id in (details.get("cue_ids") or [])
                 if str(cue_id or "").strip()
+            ],
+            selection_contract_version=(
+                str(selection_context.get("selection_contract_version") or "").strip()
+                or None
+            ),
+            boundary_confidence=(
+                float(selection_context["boundary_confidence"])
+                if selection_context.get("boundary_confidence") is not None
+                else None
+            ),
+            is_standalone=bool(selection_context.get("is_standalone", True)),
+            chain_id=str(selection_context.get("chain_id") or ""),
+            chain_position=chain_position,
+            selection_candidate_id=str(
+                selection_context.get("selection_candidate_id") or ""
+            ),
+            prerequisite_ids=[
+                str(value)
+                for value in (selection_context.get("prerequisite_ids") or [])
+                if str(value).strip()
             ],
             source_attribution=attribution,
         )

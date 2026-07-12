@@ -9,7 +9,7 @@ from typing import Callable, Optional
 from pydantic import BaseModel, Field
 
 from .. import config
-from ..llm import llm_json_result
+from .....pipeline.gemini_segment import segment_clips
 
 ProgressCb = Optional[Callable[[float, str], None]]
 _TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
@@ -373,71 +373,3 @@ def _cue_batches(
             break
         start = max(start + 1, end - overlap_cues)
     return batches
-
-
-def segment_clips(
-    transcript: dict,
-    settings: dict,
-    progress: ProgressCb = None,
-    topic: str = "",
-) -> tuple[list[dict], str]:
-    segments = _with_cue_ids(transcript.get("segments") or [])
-    if not segments:
-        return [], "No transcript segments to segment."
-    batches = _cue_batches(
-        segments,
-        max_cues=int(settings.get("segment_batch_max_cues") or config.SEGMENT_BATCH_MAX_CUES),
-        max_input_tokens=int(settings.get("segment_max_input_tokens") or config.SEGMENT_MAX_INPUT_TOKENS),
-        overlap_cues=int(settings.get("segment_batch_overlap_cues") or config.SEGMENT_BATCH_OVERLAP_CUES),
-    )
-    context = settings.get("generation_context") or settings.get("provider_context")
-    model = settings.get("segment_model") or config.SEGMENT_MODEL
-    fallback_model = settings.get("segment_fallback_model")
-    if fallback_model is None:
-        fallback_model = config.SEGMENT_FALLBACK_MODEL
-    candidates: list[dict] = []
-    attempted_batches = 0
-    for batch_index, (offset, raw_batch) in enumerate(batches):
-        if context is not None and context.budget.remaining("segmentation") <= 0:
-            break
-        batch = _with_cue_ids(raw_batch, offset=offset)
-        lines = "\n".join(
-            f"[{index}|{cue['cue_id']}] {_mmss(cue.get('start', 0.0))} {_clean_text(cue.get('text'))}"
-            for index, cue in enumerate(batch)
-        )
-        system, user = _prompts(lines, len(batch), topic)
-        if progress:
-            progress(
-                min(0.8, 0.05 + 0.7 * batch_index / max(1, len(batches))),
-                f"Understanding transcript batch {batch_index + 1} of {len(batches)}…",
-            )
-        result = llm_json_result(
-            system,
-            user,
-            _Plan,
-            temperature=0.2,
-            model=model,
-            fallback_model=fallback_model or None,
-            max_output_tokens=config.SEGMENT_MAX_OUTPUT_TOKENS,
-            should_cancel=settings.get("should_cancel"),
-            context=context,
-        )
-        attempted_batches += 1
-        batch_settings = {
-            **settings,
-            "max_clips": 40,
-            "_model_used": result.model_used,
-            "_quality_degraded": result.quality_degraded,
-        }
-        candidates.extend(_plan_to_clips(result.value, batch, [], batch_settings))
-    if progress:
-        progress(0.85, "Selecting the strongest grounded clips…")
-    max_clips = min(40, max(0, int(settings.get("max_clips") or config.SEGMENT_MAX_CLIPS)))
-    clips = _quality_order(candidates, max_clips=max_clips)
-    if progress:
-        progress(1.0, f"{len(clips)} clip(s) ready")
-    return (
-        clips,
-        f"{len(clips)} grounded topic clip(s) from {len(segments)} timed cues "
-        f"across {attempted_batches} Gemini batch(es).",
-    )

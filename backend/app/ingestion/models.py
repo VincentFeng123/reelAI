@@ -164,6 +164,13 @@ class ReelOutWithAttribution(ReelOut):
     """
 
     source_attribution: str | None = None
+    selection_contract_version: str | None = None
+    boundary_confidence: float | None = None
+    is_standalone: bool = True
+    chain_id: str = ""
+    chain_position: float = 0.0
+    selection_candidate_id: str = ""
+    prerequisite_ids: list[str] = Field(default_factory=list)
 
 
 class IngestResult(BaseModel):

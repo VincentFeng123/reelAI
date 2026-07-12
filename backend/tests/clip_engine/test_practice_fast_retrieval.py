@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 
 import pytest
@@ -8,6 +9,24 @@ from backend.app.clip_engine import expand, rank, search
 from backend.app.clip_engine.errors import CancellationError
 from backend.app.clip_engine.provider_cache import MemoryProviderCache
 from backend.app.clip_engine.provider_runtime import GenerationContext
+
+
+class _FakeGeminiClient:
+    def __init__(self, generate):
+        class _Models:
+            async def generate_content(_self, **kwargs):
+                return await generate(**kwargs)
+
+        class _Aio:
+            models = _Models()
+
+            async def aclose(_self):
+                return None
+
+        self.aio = _Aio()
+
+    def close(self):
+        return None
 
 
 def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypatch):
@@ -41,7 +60,74 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
     }
 
 
-def test_practice_fast_expansion_falls_back_from_flash_to_pro(monkeypatch):
+def test_failed_expansion_dispatch_is_recorded_once(monkeypatch):
+    from google import genai
+
+    async def fail(**_kwargs):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(expand.config, "require_gemini_key", lambda: "gemini-test")
+    monkeypatch.setattr(genai, "Client", lambda **_kwargs: _FakeGeminiClient(fail))
+    context = GenerationContext("fast")
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        asyncio.run(
+            expand._practice_fast_gemini_raw_async(
+                "physics",
+                3,
+                model=expand.PRACTICE_FAST_EXPAND_MODEL,
+                level=None,
+                should_cancel=None,
+                context=context,
+            )
+        )
+
+    assert len(context.usage()) == 1
+    usage = context.usage()[0]
+    assert usage["operation"] == "expansion"
+    assert usage["status_code"] is None
+    assert usage["error_code"] == "dispatch_failed:RuntimeError"
+    summary = context.usage_payload()["summary"]
+    assert summary["billing_unknown_calls"] == 1
+    assert summary["reserved_worst_case_cost_usd"] > 0
+
+
+def test_successful_expansion_dispatch_is_not_double_recorded(monkeypatch):
+    from google import genai
+
+    class _Response:
+        text = '{"corrected":"Physics","queries":["Physics"]}'
+        model_version = "gemini-flash-test"
+        usage_metadata = {
+            "prompt_token_count": 10,
+            "candidates_token_count": 5,
+            "total_token_count": 15,
+        }
+
+    async def succeed(**_kwargs):
+        return _Response()
+
+    monkeypatch.setattr(expand.config, "require_gemini_key", lambda: "gemini-test")
+    monkeypatch.setattr(genai, "Client", lambda **_kwargs: _FakeGeminiClient(succeed))
+    context = GenerationContext("fast")
+
+    result = asyncio.run(
+        expand._practice_fast_gemini_raw_async(
+            "physics",
+            1,
+            model=expand.PRACTICE_FAST_EXPAND_MODEL,
+            level=None,
+            should_cancel=None,
+            context=context,
+        )
+    )
+
+    assert result == _Response.text
+    assert len(context.usage()) == 1
+    assert context.usage()[0]["status_code"] == 200
+
+
+def test_practice_fast_expansion_never_falls_back_to_pro(monkeypatch):
     calls = []
 
     def flash_then_pro(*args, model, **kwargs):
@@ -54,15 +140,15 @@ def test_practice_fast_expansion_falls_back_from_flash_to_pro(monkeypatch):
 
     result = expand.expand_query_practice_fast("physics", 3)
 
-    assert calls == ["gemini-3.5-flash", "gemini-3.1-pro-preview"]
+    assert calls == ["gemini-3.5-flash"]
     assert result == {
-        "corrected": "Physics",
-        "queries": ["Physics", "mechanics", "waves"],
-        "provider_used": "gemini",
+        "corrected": "physics",
+        "queries": ["physics", "physics explained", "physics lecture"],
+        "provider_used": "deterministic",
     }
 
 
-def test_practice_fast_expansion_uses_deterministic_fallback_after_both_models(monkeypatch):
+def test_practice_fast_expansion_uses_deterministic_fallback_after_flash(monkeypatch):
     calls = []
 
     def failed_models(*args, model, **kwargs):
@@ -73,7 +159,7 @@ def test_practice_fast_expansion_uses_deterministic_fallback_after_both_models(m
 
     result = expand.expand_query_practice_fast("physics", 3)
 
-    assert calls == ["gemini-3.5-flash", "gemini-3.1-pro-preview"]
+    assert calls == ["gemini-3.5-flash"]
     assert result == {
         "corrected": "physics",
         "queries": ["physics", "physics explained", "physics lecture"],
@@ -181,7 +267,7 @@ def test_practice_fast_rank_is_the_simple_practice_formula():
 def test_discover_practice_fast_threads_runtime_args_and_applies_exclude_top_n(monkeypatch):
     context = GenerationContext("slow")
     cache = MemoryProviderCache()
-    seen = {}
+    seen = []
     cancel_probe = lambda: False
 
     monkeypatch.setattr(
@@ -195,18 +281,25 @@ def test_discover_practice_fast_threads_runtime_args_and_applies_exclude_top_n(m
     )
 
     def fake_search_all(queries, filters=None, **kwargs):
-        seen.update(queries=list(queries), filters=filters, **kwargs)
+        seen.append({"queries": list(queries), "filters": filters, **kwargs})
+        if len(seen) == 1:
+            assert list(queries) == ["calclus", "calclus explained tutorial"]
+            return {
+                "per_query": [
+                    {"query": "calclus", "videos": [
+                        {"id": "excluded", "viewCount": 10_000},
+                        {"id": "keep", "viewCount": 10},
+                    ]},
+                    {"query": "calclus explained tutorial", "videos": []},
+                ],
+                "credits_used": 2,
+                "warning": None,
+            }
         return {
             "per_query": [
-                {"query": "Calculus", "videos": [
-                    {"id": "excluded", "viewCount": 10_000},
-                    {"id": "keep", "viewCount": 10},
-                    {"id": "third", "viewCount": 1},
-                ]},
                 {"query": "Derivatives", "videos": [{"id": "keep", "viewCount": 10}]},
-                {"query": "Limits", "videos": [{"id": "third", "viewCount": 1}]},
             ],
-            "credits_used": 3,
+            "credits_used": 1,
             "warning": None,
         }
 
@@ -231,14 +324,16 @@ def test_discover_practice_fast_threads_runtime_args_and_applies_exclude_top_n(m
     assert result["corrected"] == "Calculus"
     assert [video["id"] for video in result["videos"]] == ["keep"]
     assert result["credits_used"] == 3
-    assert seen.pop("should_cancel") is cancel_probe
-    assert seen == {
-        "queries": ["Calculus", "Derivatives", "Limits"],
+    assert seen[0].pop("should_cancel") is cancel_probe
+    assert seen[0].pop("parallel_prefix") == 2
+    assert seen[0] == {
+        "queries": ["calclus", "calclus explained tutorial"],
         "filters": {"duration": "medium"},
         "language": "es",
         "context": context,
         "cache_store": cache,
     }
+    assert seen[1]["queries"] == ["Calculus"]
 
 
 def test_discover_practice_fast_respects_remaining_search_budget(monkeypatch):
@@ -265,7 +360,7 @@ def test_discover_practice_fast_respects_remaining_search_budget(monkeypatch):
 
     search.discover_practice_fast("physics", limit=1, breadth=8, context=context)
 
-    assert seen["n"] == 2
+    assert "n" not in seen
 
 
 def test_discover_practice_fast_defaults_to_eight_queries(monkeypatch):
@@ -291,3 +386,59 @@ def test_discover_practice_fast_defaults_to_eight_queries(monkeypatch):
     search.discover_practice_fast("physics", limit=1)
 
     assert seen["n"] == 8
+
+
+def test_discover_practice_fast_skips_gemini_when_literal_pool_is_strong(monkeypatch):
+    calls = []
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        calls.append(list(queries))
+        return {
+            "per_query": [
+                {
+                    "query": "physics",
+                    "videos": [
+                        {"id": f"video-{index}", "title": "Physics lecture", "viewCount": 10}
+                        for index in range(4)
+                    ],
+                },
+                {"query": "physics explained tutorial", "videos": []},
+            ],
+            "credits_used": 2,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda *_args, **_kwargs: pytest.fail("strong literal results must skip Gemini"),
+    )
+
+    result = search.discover_practice_fast("physics", limit=4, breadth=3)
+
+    assert calls == [["physics", "physics explained tutorial"]]
+    assert result["provider_used"] == "skipped"
+    assert len(result["videos"]) == 4
+    assert all(video["retrieval_score"] >= 0.60 for video in result["videos"])
+
+
+def test_search_all_runs_requested_prefix_concurrently(monkeypatch):
+    barrier = threading.Barrier(2)
+
+    def fake_search_one(query, *_args, **_kwargs):
+        barrier.wait(timeout=1.0)
+        return {"query": query, "videos": [], "billed": 1}
+
+    monkeypatch.setattr(search.supadata_search, "search_one", fake_search_one)
+
+    result = search.supadata_search.search_all(
+        ["literal", "literal explained tutorial"],
+        parallel_prefix=2,
+    )
+
+    assert [item["query"] for item in result["per_query"]] == [
+        "literal",
+        "literal explained tutorial",
+    ]
+    assert result["credits_used"] == 2

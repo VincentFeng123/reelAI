@@ -15,7 +15,7 @@ def transcribe_supadata(
     settings: dict,
     progress: ProgressCb = None,
 ) -> dict:
-    """Fetch timed cues and interpolate the word timeline used by practice."""
+    """Fetch timed cues and retain an explicitly untrusted word approximation."""
     del video_id
 
     def emit(fraction: float, message: str = "") -> None:
@@ -49,12 +49,14 @@ def transcribe_supadata(
                     "word": token,
                     "start": start + duration * index / count,
                     "end": start + duration * (index + 1) / count,
+                    "timing_source": "interpolated",
                 }
             )
     result = {
         "text": " ".join(segment["text"] for segment in segments),
         "duration": artifact.duration_sec,
         "words": words,
+        "word_timing_source": "interpolated",
         "segments": segments,
         "source": "supadata",
         "chunks": segments,

@@ -11,12 +11,14 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping, Protocol
 
+from . import config
 from .metadata import normalize_youtube_video_id
 
 logger = logging.getLogger(__name__)
 
 SEARCH_SCHEMA_VERSION = 2
-TRANSCRIPT_SCHEMA_VERSION = 3
+TRANSCRIPT_SCHEMA_VERSION = 4
+TRANSCRIPT_PROFILE = f"chunk{max(1, int(config.SUPADATA_CHUNK_SIZE))}-auto"
 SEARCH_POSITIVE_TTL_SEC = 6 * 60 * 60
 SEARCH_EMPTY_TTL_SEC = 15 * 60
 TRANSCRIPT_TTL_SEC = 30 * 24 * 60 * 60
@@ -141,9 +143,10 @@ def transcript_artifact_key(
         "returned_language": normalize_language(returned_language),
         "native_mode": bool(native_mode),
         "schema_version": int(schema_version),
+        "transcript_profile": TRANSCRIPT_PROFILE,
     }
     digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
-    return f"native-transcript:v{schema_version}:{digest}"
+    return f"native-transcript:v{schema_version}:{TRANSCRIPT_PROFILE}:{digest}"
 
 
 def _parse_time(value: Any) -> datetime | None:
