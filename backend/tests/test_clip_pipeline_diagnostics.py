@@ -270,10 +270,9 @@ def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypat
     assert counters["persisted_clips"] == 1
 
 
-def test_acoustic_gate_stores_deferred_but_emits_only_verified_valid_clip(
+def test_topic_generation_uses_supadata_boundaries_without_media_fetch(
     monkeypatch,
 ) -> None:
-    monkeypatch.delenv("REELAI_SKIP_DOTENV", raising=False)
     transcript = {
         "source": "supadata",
         "native_mode": False,
@@ -313,40 +312,11 @@ def test_acoustic_gate_stores_deferred_but_emits_only_verified_valid_clip(
     engine_out = {"clips": clips, "transcript": transcript, "notes": ""}
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
     monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
-    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
-        "ready",
-        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
-            url="https://media.example/audio.m4a"
-        ),
-    )
-    monkeypatch.setattr(
-        pipeline_module.clip_engine_silence,
-        "prepare_audio_source",
-        mock.Mock(return_value=prepared),
-    )
-    monkeypatch.setattr(
-        pipeline_module.clip_engine_silence,
-        "verify_acoustic_boundaries",
-        mock.Mock(side_effect=[
-            pipeline_module.clip_engine_silence.SilenceVerificationResult(
-                "unavailable", 0.0, 10.0, {"reason": "start_silence_not_found"}
-            ),
-            pipeline_module.clip_engine_silence.SilenceVerificationResult(
-                "verified", 10.0, 190.1, {}
-            ),
-            pipeline_module.clip_engine_silence.SilenceVerificationResult(
-                "verified", 19.9, 30.2, {}
-            ),
-        ]),
-    )
     persisted_clips: list[dict] = []
 
     def persist(*, clip, **_kwargs):
         persisted_clips.append(clip)
-        return (
-            "verified-reel" if clip["search_context"]["surface_eligible"] else "deferred-reel",
-            mock.sentinel.metadata,
-        )
+        return (f"verified-reel-{len(persisted_clips)}", mock.sentinel.metadata)
 
     pipeline = _pipeline()
     monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
@@ -364,20 +334,24 @@ def test_acoustic_gate_stores_deferred_but_emits_only_verified_valid_clip(
         on_reel_created=emitted.append,
     )
 
-    assert reels == ["verified-reel"]
-    assert emitted == ["verified-reel"]
-    assert len(persisted_clips) == 3
-    assert persisted_clips[0]["search_context"]["boundary_status"] == "unavailable"
-    assert persisted_clips[0]["search_context"]["surface_eligible"] is False
-    assert persisted_clips[1]["search_context"]["surface_reason"] == (
-        "acoustic_boundary_duration_invalid"
-    )
-    assert persisted_clips[1]["start"] == 10.0
-    assert persisted_clips[1]["end"] == 20.0
-    assert persisted_clips[2]["start"] == 19.9
-    assert persisted_clips[2]["end"] == 30.2
-    assert context.counters()["stored_clips"] == 3
-    assert context.counters()["deferred_clips"] == 2
+    assert reels == ["verified-reel-1"]
+    assert emitted == ["verified-reel-1"]
+    assert len(persisted_clips) == 1
+    boundary = persisted_clips[0]["search_context"]
+    assert boundary["boundary_status"] == "verified"
+    assert boundary["surface_eligible"] is True
+    assert boundary["boundary_diagnostics"] == {
+        "method": "supadata_cue_timing",
+        "acoustic_verified": False,
+        "start_cue_id": "one",
+        "end_cue_id": "one",
+        "start_padding_ms": 0,
+        "end_padding_ms": 0,
+        "preceding_gap_ms": 0,
+        "following_gap_ms": 0,
+    }
+    assert context.counters()["stored_clips"] == 1
+    assert context.counters()["deferred_clips"] == 0
     assert context.counters()["persisted_clips"] == 1
 
 
@@ -573,9 +547,10 @@ def test_filter_orders_prerequisite_before_higher_score_dependent(monkeypatch) -
                 "prerequisite_ids": [],
                 "difficulty": 0.5,
             },
-            {
-                "start": 0.0,
-                "end": 9.0,
+                    {
+                        "start": 0.0,
+                        "end": 10.0,
+                        "cue_ids": ["python"],
                 "cue_ids": ["python"],
                 "informativeness": 0.95,
                 "topic_relevance": 0.95,
@@ -618,21 +593,24 @@ def test_joint_one_plus_one_initial_yield_uses_one_aggregate_pro_fallback(
             return video, [
                 {
                     "start": 0.0,
-                    "end": 9.0,
+                    "end": 10.0,
+                    "cue_ids": ["python"],
                     "score": 0.9,
                     "selection_candidate_id": "root",
                     "prerequisite_ids": [],
                 },
                 {
-                    "start": 20.0,
-                    "end": 30.0,
+                    "start": 10.0,
+                    "end": 20.0,
+                    "cue_ids": ["garden"],
                     "score": 0.9,
                     "selection_candidate_id": "dependent",
                     "prerequisite_ids": ["root"],
                 },
                 {
-                    "start": 40.0,
-                    "end": 50.0,
+                    "start": 0.0,
+                    "end": 20.0,
+                    "cue_ids": ["python", "garden"],
                     "score": 0.9,
                     "selection_candidate_id": "orphan",
                     "prerequisite_ids": ["missing"],
@@ -643,6 +621,7 @@ def test_joint_one_plus_one_initial_yield_uses_one_aggregate_pro_fallback(
             [{
                 "start": 0.0,
                 "end": 10.0,
+                "cue_ids": ["python"],
                 "score": 0.8,
                 "selection_candidate_id": "root",
                 "prerequisite_ids": [],
@@ -653,7 +632,7 @@ def test_joint_one_plus_one_initial_yield_uses_one_aggregate_pro_fallback(
     monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
     pro_fallback = mock.Mock(return_value={
         "transcript": _transcript(),
-        "clips": [{"start": 20.0, "end": 30.0}],
+        "clips": [{"start": 10.0, "end": 20.0, "cue_ids": ["garden"]}],
         "notes": "fallback",
     })
     monkeypatch.setattr(pipeline_module.clip_engine_run, "pro_boundary_fallback", pro_fallback)
@@ -676,8 +655,7 @@ def test_joint_one_plus_one_initial_yield_uses_one_aggregate_pro_fallback(
     )
 
     assert len(reels) == 3
-    assert any(str(reel).endswith(":20.0") for reel in reels)
-    assert not any(str(reel).endswith(":40.0") for reel in reels)
+    assert any(str(reel).endswith(":10.0") for reel in reels)
     pro_fallback.assert_called_once()
 
 
@@ -700,7 +678,7 @@ def test_bootstrap_skips_pro_fallback_and_optional_enrichment(monkeypatch) -> No
         "_clip_and_filter",
         lambda selected, *_args, **_kwargs: (
             selected,
-            [{"start": 0.0, "end": 10.0, "score": 0.8}],
+            [{"start": 0.0, "end": 10.0, "cue_ids": ["python"], "score": 0.8}],
             {"transcript": _transcript(), "clips": []},
         ),
     )
@@ -782,11 +760,16 @@ def test_aggregate_pro_fallback_targets_lowest_yield_initial_video(
 
     def clip_and_filter(video, *_args, engine_out_override=None, **_kwargs):
         if engine_out_override is not None:
-            return video, [{"start": 20.0, "end": 30.0, "score": 0.9}], engine_out_override
+            return video, [{
+                "start": 10.0,
+                "end": 20.0,
+                "cue_ids": ["garden"],
+                "score": 0.9,
+            }], engine_out_override
         clips = (
             [
-                {"start": 0.0, "end": 8.0, "score": 0.8},
-                {"start": 10.0, "end": 18.0, "score": 0.8},
+                {"start": 0.0, "end": 10.0, "cue_ids": ["python"], "score": 0.8},
+                {"start": 10.0, "end": 20.0, "cue_ids": ["garden"], "score": 0.8},
             ]
             if video["id"] == first["id"]
             else []
@@ -796,7 +779,7 @@ def test_aggregate_pro_fallback_targets_lowest_yield_initial_video(
     monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
     pro_fallback = mock.Mock(return_value={
         "transcript": _transcript(),
-        "clips": [{"start": 20.0, "end": 30.0}],
+        "clips": [{"start": 10.0, "end": 20.0, "cue_ids": ["garden"]}],
         "notes": "fallback",
     })
     monkeypatch.setattr(pipeline_module.clip_engine_run, "pro_boundary_fallback", pro_fallback)

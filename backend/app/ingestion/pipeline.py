@@ -75,7 +75,7 @@ from .persistence import (
     upsert_reel_row,
     upsert_video,
 )
-from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta, config as clip_engine_config, silence as clip_engine_silence  # noqa: F401
+from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta, config as clip_engine_config  # noqa: F401
 from ..clip_engine.cancellation import is_cancelled, raise_if_cancelled
 from ..clip_engine.provider_runtime import GenerationContext
 from ..clip_engine.errors import (
@@ -230,6 +230,64 @@ def _is_valid_timestamped_supadata_transcript(transcript: dict[str, Any]) -> boo
         previous_start = start
         previous_end = end
     return True
+
+
+def _supadata_boundary_diagnostics(
+    transcript: dict[str, Any],
+    clip: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Validate one complete clip against its immutable Supadata cue range."""
+    if not _is_valid_timestamped_supadata_transcript(transcript):
+        return None
+    cue_ids = [str(value or "").strip() for value in (clip.get("cue_ids") or [])]
+    if not cue_ids or any(not value for value in cue_ids):
+        return None
+    segments = transcript["segments"]
+    index_by_id = {
+        str(segment.get("cue_id") or "").strip(): index
+        for index, segment in enumerate(segments)
+    }
+    try:
+        indices = [index_by_id[cue_id] for cue_id in cue_ids]
+        start_sec = float(clip.get("start"))
+        end_sec = float(clip.get("end"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        indices != list(range(indices[0], indices[-1] + 1))
+        or not math.isfinite(start_sec)
+        or not math.isfinite(end_sec)
+        or start_sec < 0
+        or end_sec <= start_sec
+        or end_sec - start_sec > 180.0
+    ):
+        return None
+    first = segments[indices[0]]
+    last = segments[indices[-1]]
+    first_start = float(first["start"])
+    last_end = float(last["end"])
+    if start_sec > first_start + 1e-3 or end_sec + 1e-3 < last_end:
+        return None
+    previous_end = (
+        float(segments[indices[0] - 1]["end"])
+        if indices[0] > 0
+        else 0.0
+    )
+    next_start = (
+        float(segments[indices[-1] + 1]["start"])
+        if indices[-1] + 1 < len(segments)
+        else end_sec
+    )
+    return {
+        "method": "supadata_cue_timing",
+        "acoustic_verified": False,
+        "start_cue_id": cue_ids[0],
+        "end_cue_id": cue_ids[-1],
+        "start_padding_ms": round(max(0.0, first_start - start_sec) * 1000),
+        "end_padding_ms": round(max(0.0, end_sec - last_end) * 1000),
+        "preceding_gap_ms": round(max(0.0, first_start - previous_end) * 1000),
+        "following_gap_ms": round(max(0.0, next_start - last_end) * 1000),
+    }
 
 
 def _strict_topic_clips(
@@ -1350,40 +1408,18 @@ class IngestionPipeline:
                 if not prerequisites_ready:
                     search_context["surface_reason"] = "prerequisite_not_surfaceable"
 
-                if surface_eligible and bool(
-                    engine_out.get("_acoustic_verification_required")
-                ):
-                    verification = clip_engine_silence.verify_acoustic_boundaries(
-                        str(v.get("url") or v.get("id") or ""),
-                        float(clip.get("start") or 0.0),
-                        float(clip.get("end") or 0.0),
-                        prepared=engine_out.get("_audio_preparation"),
-                        timeout_sec=20.0,
-                        cancel_check=should_cancel,
+                if surface_eligible and generation_context is not None:
+                    boundary_diagnostics = _supadata_boundary_diagnostics(
+                        engine_out["transcript"], clip
                     )
-                    search_context["boundary_status"] = verification.status
-                    search_context["boundary_diagnostics"] = dict(
-                        verification.diagnostics
-                    )
-                    if verification.verified:
-                        adjusted_duration = verification.end_sec - verification.start_sec
-                        if 1.0 <= adjusted_duration <= 180.0:
-                            clip["start"] = verification.start_sec
-                            clip["end"] = verification.end_sec
-                        else:
-                            surface_eligible = False
-                            search_context["surface_reason"] = (
-                                "acoustic_boundary_duration_invalid"
-                            )
-                            if generation_context is not None:
-                                generation_context.increment_counter(
-                                    "boundary_unavailable"
-                                )
-                    else:
+                    if boundary_diagnostics is None:
                         surface_eligible = False
-                        search_context["surface_reason"] = "acoustic_boundary_unavailable"
-                        if generation_context is not None:
-                            generation_context.increment_counter("boundary_unavailable")
+                        search_context["boundary_status"] = "unavailable"
+                        search_context["surface_reason"] = "supadata_boundary_unavailable"
+                        generation_context.increment_counter("boundary_unavailable")
+                    else:
+                        search_context["boundary_status"] = "verified"
+                        search_context["boundary_diagnostics"] = boundary_diagnostics
                 else:
                     search_context.setdefault("boundary_status", "caption_aligned")
 
@@ -1808,47 +1844,17 @@ class IngestionPipeline:
         engine_out)`, scored_clips sorted by score DESCENDING. Empty `clips`
         yields no clips (video is skipped)."""
         engine_out = engine_out_override
-        acoustic_verification_required = bool(
-            generation_context is not None
-            and not os.environ.get("REELAI_SKIP_DOTENV")
-        )
         if engine_out is None:
-            audio_executor = None
-            audio_future = None
-            if acoustic_verification_required:
-                audio_executor = ThreadPoolExecutor(
-                    max_workers=1, thread_name_prefix="clip-audio-prepare"
-                )
-                audio_future = audio_executor.submit(
-                    clip_engine_silence.prepare_audio_source,
-                    str(v.get("url") or v.get("id") or ""),
-                    timeout_sec=10.0,
-                    cancel_check=should_cancel,
-                )
-            try:
-                engine_out = _run_clip(
-                    v["url"], topic=topic, language=language,
-                    should_cancel=should_cancel,
-                    generation_context=generation_context,
-                    deadline_monotonic=v.get("_deadline_monotonic"),
-                    candidate_rank=v.get("_segment_candidate_rank"),
-                    max_clips=v.get("_segment_max_candidates"),
-                    retrieval_profile=str(v.get("_retrieval_profile") or "deep"),
-                    knowledge_level=str(v.get("_knowledge_level") or ""),
-                )
-                if audio_future is not None:
-                    try:
-                        prepared_audio = audio_future.result(timeout=10.0)
-                    except Exception:
-                        prepared_audio = clip_engine_silence.AudioPreparationResult(
-                            "unavailable",
-                            diagnostics={"stage": "resolve", "reason": "prepare_failed"},
-                        )
-                    engine_out["_audio_preparation"] = prepared_audio
-            finally:
-                if audio_executor is not None:
-                    audio_executor.shutdown(wait=False, cancel_futures=True)
-        engine_out["_acoustic_verification_required"] = acoustic_verification_required
+            engine_out = _run_clip(
+                v["url"], topic=topic, language=language,
+                should_cancel=should_cancel,
+                generation_context=generation_context,
+                deadline_monotonic=v.get("_deadline_monotonic"),
+                candidate_rank=v.get("_segment_candidate_rank"),
+                max_clips=v.get("_segment_max_candidates"),
+                retrieval_profile=str(v.get("_retrieval_profile") or "deep"),
+                knowledge_level=str(v.get("_knowledge_level") or ""),
+            )
         transcript = engine_out["transcript"]
         query_plan = (
             v.get("_query_plan")

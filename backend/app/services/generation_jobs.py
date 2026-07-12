@@ -43,8 +43,8 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-# v4 prevents completed pre-acoustic jobs from being replayed as verified clips.
-REQUEST_SCHEMA_VERSION = "generation-request-v4-acoustic-boundaries"
+# v5 prevents completed acoustic-gated jobs from replaying into the Supadata-only path.
+REQUEST_SCHEMA_VERSION = "generation-request-v5-supadata-boundaries"
 
 
 class JobLeaseLostError(RuntimeError):

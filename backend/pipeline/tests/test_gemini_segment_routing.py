@@ -568,9 +568,9 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("medium", 4_096, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
+         ("medium", 8_192, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
         (G.PRO_BOUNDARY_PROFILE,
-         ("high", 4_096, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
+         ("high", 8_192, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -613,6 +613,7 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
     )
 
     assert captured["thinking_level"] == "low"
+    assert captured["max_output_tokens"] == 8_192
 
 
 def test_boundary_profile_repairs_bad_model_quote_from_cited_cue(monkeypatch):

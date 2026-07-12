@@ -543,7 +543,7 @@ def test_production_flash_is_compact_global_boundary_first():
     assert "20 to 90 seconds" in prompt
     assert "low or medium uncertainty" in prompt
     assert "omit only high-uncertainty" in prompt
-    assert G._BOUNDARY_OUTPUT_TOKENS == 4096
+    assert G._BOUNDARY_OUTPUT_TOKENS == 8192
     assert "globally" in prompt
     assert "do not favor the beginning" in prompt
     assert "at most 8" in prompt
