@@ -25,6 +25,8 @@ def _words() -> list[dict]:
 
 
 def _topic(**overrides) -> G._Topic:
+    start_line = int(overrides.get("start_line", 0))
+    line_word = "one" if start_line == 1 else "zero"
     data = {
         "candidate_id": (
             f"candidate-{overrides.get('title', 'Lesson')}-"
@@ -42,6 +44,9 @@ def _topic(**overrides) -> G._Topic:
         "topic_relevance": 0.9,
         "educational_importance": 0.9,
         "difficulty": 0.5,
+        "directly_teaches_topic": True,
+        "substantive": True,
+        "topic_evidence_quote": f"line {line_word} teaches {overrides.get('title', 'easy').lower()} lesson end",
         "self_contained": True,
         "is_standalone": True,
         "prerequisite_candidate_ids": [],

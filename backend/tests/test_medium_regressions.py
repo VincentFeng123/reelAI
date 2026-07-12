@@ -374,223 +374,57 @@ class MediumRegressionTests(unittest.TestCase):
         key_b = service._cache_key(shared_prefix + "second-suffix", "systems", 12)
         self.assertNotEqual(key_a, key_b)
 
-    def test_material_intelligence_seeds_topic_only_material_with_subtopics(self) -> None:
+    def test_material_intelligence_topic_only_seed_is_literal_and_skips_preexpansion(self) -> None:
         service = MaterialIntelligenceService()
-        service.client = None
-        plan = _validated_query_plan(
-            {
-                "canonical_topic": "Calculus",
-                "aliases": [],
-                "subtopics": ["limits", "derivatives", "chain rule"],
-                "related_terms": [],
-            }
-        )
-        with mock.patch(
-            "backend.app.services.material_intelligence.build_search_query_plan",
-            return_value=plan,
-        ) as planner:
-            concepts, objectives = service.extract_concepts_and_objectives(
-                None,
-                "Topic: calculus",
-                subject_tag="calculus",
-                max_concepts=6,
-            )
-        planner.assert_called_once_with(None, literal_query="calculus")
-        titles = {str(concept.get("title") or "").strip().lower() for concept in concepts}
-        self.assertIn("calculus", titles)
-        self.assertTrue({"limits", "derivatives", "chain rule"}.intersection(titles))
-        self.assertTrue(any("calculus" in objective.lower() for objective in objectives))
-
-    def test_material_intelligence_uses_ai_query_plan_for_unmapped_topic(self) -> None:
-        service = MaterialIntelligenceService()
-        service.client = None
-        plan = _validated_query_plan(
-            {
-                "canonical_topic": "Spanish language",
-                "aliases": ["Spanish language"],
-                "subtopics": ["grammar", "verb conjugation", "pronunciation", "common phrases"],
-                "related_terms": ["conversation practice", "listening comprehension"],
-            }
-        )
-        with mock.patch(
-            "backend.app.services.material_intelligence.build_search_query_plan",
-            return_value=plan,
-        ):
-            concepts, objectives = service.extract_concepts_and_objectives(
-                None,
-                "Topic: spanish",
-                subject_tag="spanish",
-                max_concepts=6,
-            )
-        titles = {str(concept.get("title") or "").strip().lower() for concept in concepts}
-        self.assertIn("spanish", titles)
-        self.assertTrue({"grammar", "verb conjugation", "pronunciation"}.intersection(titles))
-        root_concept = next(
-            concept for concept in concepts if str(concept.get("title") or "").strip().lower() == "spanish"
-        )
-        root_keywords = {str(keyword).strip().lower() for keyword in (root_concept.get("keywords") or [])}
-        self.assertIn("spanish language", root_keywords)
-        self.assertIn("grammar", root_keywords)
-        self.assertTrue(any("spanish" in objective.lower() for objective in objectives))
-
-    def test_material_intelligence_ai_failure_keeps_literal_topic_only(self) -> None:
-        service = MaterialIntelligenceService()
-        service.client = None
-        plan = mock.Mock()
-        plan.ai_status = "unavailable"
+        service.client = object()
         with (
             mock.patch(
-                "backend.app.services.material_intelligence.build_search_query_plan",
-                return_value=plan,
-            ),
+                "backend.app.services.search_query_plan.build_search_query_plan"
+            ) as planner,
             mock.patch.object(service, "_cached_or_generate") as material_llm,
         ):
             concepts, objectives = service.extract_concepts_and_objectives(
                 None,
-                "Topic: psychology",
-                subject_tag="psychology",
+                "Topic: carolingian minuscule paleography",
+                subject_tag="carolingian minuscule paleography",
                 max_concepts=6,
             )
+        planner.assert_not_called()
         material_llm.assert_not_called()
-        plan.as_topic_expansion.assert_not_called()
-        titles = {str(concept.get("title") or "").strip().lower() for concept in concepts}
-        self.assertEqual(titles, {"psychology"})
-        self.assertTrue(any("psychology" in objective.lower() for objective in objectives))
-
-    def test_material_intelligence_topic_uses_ai_terms_without_curated_injection(self) -> None:
-        service = MaterialIntelligenceService()
-        service.client = None
-        plan = _validated_query_plan(
-            {
-                "canonical_topic": "Machine learning",
-                "aliases": [],
-                "subtopics": ["reinforcement learning", "feature engineering"],
-                "related_terms": [],
-            }
+        self.assertEqual(len(concepts), 1)
+        self.assertEqual(concepts[0]["title"], "Carolingian Minuscule Paleography")
+        self.assertEqual(concepts[0]["keywords"], ["carolingian minuscule paleography"])
+        self.assertEqual(
+            concepts[0]["summary"],
+            "Core ideas, terminology, and intuition for Carolingian Minuscule Paleography.",
         )
-        with mock.patch(
-            "backend.app.services.material_intelligence.build_search_query_plan",
-            return_value=plan,
-        ):
-            concepts, _objectives = service.extract_concepts_and_objectives(
-                None,
-                "Topic: machine learning",
-                subject_tag="machine learning",
-                max_concepts=6,
-            )
-        titles = [str(concept.get("title") or "").strip().lower() for concept in concepts]
-        self.assertEqual(titles[0], "machine learning")
-        self.assertIn("reinforcement learning", titles)
-        self.assertIn("feature engineering", titles)
-        self.assertNotIn("supervised learning", titles)
-        self.assertNotIn("unsupervised learning", titles)
-
-    def test_material_intelligence_topic_seed_precedes_llm_for_topic_only_material(self) -> None:
-        service = MaterialIntelligenceService()
-        service.client = object()
-        plan = _validated_query_plan(
-            {
-                "canonical_topic": "Spanish language",
-                "aliases": ["Spanish language"],
-                "subtopics": ["grammar", "verb conjugation", "pronunciation"],
-                "related_terms": ["conversation practice"],
-            }
+        self.assertEqual(
+            objectives,
+            [
+                "Understand the core definitions and intuition behind Carolingian Minuscule Paleography.",
+                "Solve representative problems in Carolingian Minuscule Paleography.",
+            ],
         )
-        with (
-            mock.patch(
-                "backend.app.services.material_intelligence.build_search_query_plan",
-                return_value=plan,
-            ),
-            mock.patch.object(
-                service,
-                "_cached_or_generate",
-                return_value={
-                    "concepts": [
-                        {"title": f"Generic {index}", "keywords": ["generic"], "summary": "generic summary"}
-                        for index in range(8)
-                    ],
-                    "objectives": ["generic objective"],
-                },
-            ) as material_llm,
-        ):
-            concepts, objectives = service.extract_concepts_and_objectives(
-                None,
-                "Topic: spanish",
-                subject_tag="spanish",
-                max_concepts=4,
-            )
-        titles = [str(concept.get("title") or "").strip().lower() for concept in concepts]
-        self.assertEqual(titles[0], "spanish")
-        self.assertIn("grammar", titles)
-        self.assertNotEqual(objectives[0].lower(), "generic objective")
-        material_llm.assert_not_called()
 
-    def test_material_intelligence_opaque_topic_seed_does_not_promote_companion_terms_to_concepts(self) -> None:
+    def test_material_intelligence_topic_only_seed_is_deterministic_apart_from_identity(self) -> None:
         service = MaterialIntelligenceService()
-        service.client = None
-        plan = _validated_query_plan(
-            {
-                "canonical_topic": "Melittology",
-                "aliases": [],
-                "subtopics": ["Melittology field methods"],
-                "related_terms": ["bees"],
-            }
+        first, first_objectives = service.extract_concepts_and_objectives(
+            None,
+            "Topic: machine learning",
+            subject_tag="machine learning",
+            max_concepts=6,
         )
-        with mock.patch(
-            "backend.app.services.material_intelligence.build_search_query_plan",
-            return_value=plan,
-        ):
-            concepts, _objectives = service.extract_concepts_and_objectives(
-                None,
-                "Topic: melittology",
-                subject_tag="melittology",
-                max_concepts=4,
-            )
-        titles = {str(concept.get("title") or "").strip().lower() for concept in concepts}
-        self.assertIn("melittology", titles)
-        self.assertIn("melittology field methods", titles)
-        self.assertNotIn("bees", titles)
-
-    def test_material_intelligence_opaque_topic_only_material_skips_llm_garbage(self) -> None:
-        service = MaterialIntelligenceService()
-        service.client = object()
-        plan = _validated_query_plan(
-            {
-                "canonical_topic": "Apiology",
-                "aliases": [],
-                "subtopics": ["Apiology field methods"],
-                "related_terms": ["bees"],
-            }
+        second, second_objectives = service.extract_concepts_and_objectives(
+            None,
+            "Topic: machine learning",
+            subject_tag="machine learning",
+            max_concepts=6,
         )
-        with (
-            mock.patch(
-                "backend.app.services.material_intelligence.build_search_query_plan",
-                return_value=plan,
-            ),
-            mock.patch.object(
-                service,
-                "_cached_or_generate",
-                return_value={
-                    "concepts": [
-                        {"title": "Bees", "keywords": ["bees"], "summary": "General bees"},
-                        {"title": "Human-animal Interaction", "keywords": ["interaction"], "summary": "Off topic"},
-                    ],
-                    "objectives": ["generic objective"],
-                },
-            ) as cached_mock,
-        ):
-            concepts, objectives = service.extract_concepts_and_objectives(
-                None,
-                "Topic: apiology",
-                subject_tag="apiology",
-                max_concepts=4,
-            )
-        titles = {str(concept.get("title") or "").strip().lower() for concept in concepts}
-        cached_mock.assert_not_called()
-        self.assertIn("apiology", titles)
-        self.assertNotIn("bees", titles)
-        self.assertNotIn("human-animal interaction", titles)
-        self.assertTrue(any("apiology" in objective.lower() for objective in objectives))
+        self.assertEqual(
+            {key: value for key, value in first[0].items() if key != "id"},
+            {key: value for key, value in second[0].items() if key != "id"},
+        )
+        self.assertEqual(first_objectives, second_objectives)
 
     def test_topic_expansion_service_filters_language_topic_candidates(self) -> None:
         service = TopicExpansionService()

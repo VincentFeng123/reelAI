@@ -615,7 +615,7 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
     assert captured["thinking_level"] == "low"
 
 
-def test_pro_zero_output_preserves_the_actual_rejection_guard(monkeypatch):
+def test_boundary_profile_repairs_bad_model_quote_from_cited_cue(monkeypatch):
     proposal = G._BoundaryTopic(
         candidate_id="candidate-bad-quote",
         start_line=0,
@@ -630,6 +630,9 @@ def test_pro_zero_output_preserves_the_actual_rejection_guard(monkeypatch):
         topic_relevance=0.9,
         educational_importance=0.9,
         difficulty=0.5,
+        directly_teaches_topic=True,
+        substantive=True,
+        topic_evidence_quote="alpha lesson concept closes cleanly",
         self_contained=True,
         is_standalone=True,
         prerequisite_candidate_ids=[],
@@ -644,14 +647,14 @@ def test_pro_zero_output_preserves_the_actual_rejection_guard(monkeypatch):
 
     result = G.run_segment_profile(
         _transcript(),
-        {},
+        {"_segment_ignore_caption_case": True},
         G.PRO_BOUNDARY_PROFILE,
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert result.classification == "invalid"
-    assert result.classification_reasons == ["proposal_0:bad_start_quote"]
-    assert result.rejection_reasons == ["proposal_0:bad_start_quote"]
+    assert result.classification == "green"
+    assert result.accepted_count == 1
+    assert result.rejection_reasons == []
 
 
 def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatch):
@@ -679,6 +682,11 @@ def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatc
             topic_relevance=0.80 + index * 0.02,
             educational_importance=0.80 + index * 0.02,
             difficulty=0.5,
+            directly_teaches_topic=True,
+            substantive=True,
+            topic_evidence_quote=(
+                f"line {index} teaches concept {index} and finishes"
+            ),
             self_contained=True,
             is_standalone=True,
             prerequisite_candidate_ids=[],
@@ -951,6 +959,8 @@ def test_clip_grounding_text_matches_the_delivered_complete_cue_window():
         facet="lesson", reason="A complete alpha lesson.",
         informativeness=0.9, topic_relevance=0.9,
         educational_importance=0.9, difficulty=0.5,
+        directly_teaches_topic=True, substantive=True,
+        topic_evidence_quote="outside before alpha lesson closes cleanly",
         self_contained=True, is_standalone=True,
         prerequisite_candidate_ids=[], uncertainty="low", uncertainty_reasons=[],
         summary="The alpha lesson closes cleanly.",

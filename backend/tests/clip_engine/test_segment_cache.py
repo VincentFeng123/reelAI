@@ -13,8 +13,18 @@ def _transcript() -> dict:
     return {
         "artifact_key": "transcript:v1",
         "segments": [
-            {"cue_id": "c0", "start": 0.0, "end": 5.0, "text": "first lesson"},
-            {"cue_id": "c1", "start": 5.0, "end": 10.0, "text": "second lesson"},
+            {
+                "cue_id": "c0",
+                "start": 0.0,
+                "end": 5.0,
+                "text": "The first lesson explains how forces change an object's motion.",
+            },
+            {
+                "cue_id": "c1",
+                "start": 5.0,
+                "end": 10.0,
+                "text": "The second lesson applies those forces to circular motion.",
+            },
         ],
         "words": [],
         "duration": 10.0,
@@ -32,6 +42,9 @@ def _clip() -> dict:
         "informativeness": 0.9,
         "topic_relevance": 0.8,
         "educational_importance": 0.7,
+        "directly_teaches_topic": True,
+        "substantive": True,
+        "topic_evidence_quote": "The first lesson explains how forces change",
         "self_contained": True,
         "difficulty": 0.4,
         "summary": "",

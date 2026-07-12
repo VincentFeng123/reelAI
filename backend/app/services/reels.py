@@ -5385,7 +5385,21 @@ class ReelService:
             parsed = {**parsed, **nested}
         version = str(parsed.get("selection_contract_version") or "").strip()
         if not version or version.lower() in {"0", "legacy", "none"}:
-            return {}
+            # Acoustic eligibility is an operational serving guard, not a
+            # selector-version feature. Preserve it for legacy cached selector
+            # rows so an unavailable deferred clip can never leak into feed.
+            operational: dict[str, Any] = {}
+            if "surface_eligible" in parsed:
+                surface_eligible = parsed.get("surface_eligible")
+                if isinstance(surface_eligible, str):
+                    surface_eligible = surface_eligible.strip().lower() in {
+                        "1", "true", "yes", "on",
+                    }
+                operational["_selection_surface_eligible"] = bool(surface_eligible)
+            operational["_selection_boundary_status"] = str(
+                parsed.get("boundary_status") or ""
+            ).strip().lower()
+            return operational
 
         prerequisites = parsed.get("prerequisite_ids")
         if prerequisites is None:
@@ -5398,6 +5412,12 @@ class ReelService:
         standalone = parsed.get("is_standalone", parsed.get("standalone", False))
         if isinstance(standalone, str):
             standalone = standalone.strip().lower() in {"1", "true", "yes", "on"}
+
+        def selection_bool(key: str, default: bool) -> bool:
+            value = parsed.get(key, default)
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return bool(value)
 
         metadata: dict[str, Any] = {
             "_selection_contract_version": version,
@@ -5413,6 +5433,27 @@ class ReelService:
                 parsed.get("selection_candidate_id") or parsed.get("candidate_id") or ""
             ).strip(),
         }
+        if "surface_eligible" in parsed:
+            surface_eligible = parsed.get("surface_eligible")
+            if isinstance(surface_eligible, str):
+                surface_eligible = surface_eligible.strip().lower() in {
+                    "1", "true", "yes", "on",
+                }
+            metadata["_selection_surface_eligible"] = bool(surface_eligible)
+        metadata["_selection_boundary_status"] = str(
+            parsed.get("boundary_status") or ""
+        ).strip().lower()
+        metadata["_selection_directly_teaches_topic"] = selection_bool(
+            "directly_teaches_topic", True
+        )
+        metadata["_selection_substantive"] = selection_bool("substantive", True)
+        metadata["_selection_topic_evidence_quote"] = str(
+            parsed.get("topic_evidence_quote") or ""
+        ).strip()
+        metadata["_selection_uncertainty"] = str(
+            parsed.get("uncertainty") or "low"
+        ).strip().lower()
+        metadata["_selection_deferred_level"] = selection_bool("deferred_level", False)
         try:
             metadata["_selection_chain_position"] = float(
                 parsed.get("chain_position") or 0.0
@@ -5466,13 +5507,12 @@ class ReelService:
             content_score = self._selection_number(
                 item.get("_selection_content_score"), 0.0
             )
-            boundary_confidence = self._selection_number(
-                item.get("_selection_boundary_confidence"), 0.0
+            uncertainty_penalty = (
+                0.05 if item.get("_selection_uncertainty") == "medium" else 0.0
             )
-            item["score"] = (
-                0.65 * content_score
-                + 0.25 * level_fit
-                + 0.10 * boundary_confidence
+            item["score"] = max(
+                0.0,
+                0.85 * content_score + 0.15 * level_fit - uncertainty_penalty,
             )
             nodes[node_id] = item
             aliases[node_id] = node_id
@@ -5534,15 +5574,9 @@ class ReelService:
             def priority(node_id: str) -> tuple[float, float, str, str]:
                 row = nodes[node_id]
                 base = float(row.get("score") or 0.0)
-                same_video_penalty = (
-                    0.08
-                    if last_video
-                    and str(row.get("video_id") or "") == last_video
-                    else 0.0
-                )
                 return (
-                    base - same_video_penalty,
                     base,
+                    1.0 if not last_video or str(row.get("video_id") or "") != last_video else 0.0,
                     str(row.get("created_at") or ""),
                     node_id,
                 )
@@ -6843,6 +6877,15 @@ class ReelService:
                 selected_cue_ids = []
             selected_cue_ids = [str(cue_id) for cue_id in selected_cue_ids if str(cue_id).strip()]
             selection_metadata = self._selection_metadata(row.get("search_context_json"))
+            if selection_metadata.get("_selection_surface_eligible") is False:
+                continue
+            if selection_metadata.get("_selection_boundary_status") == "unavailable":
+                continue
+            if selection_metadata and (
+                not selection_metadata.get("_selection_directly_teaches_topic", True)
+                or not selection_metadata.get("_selection_substantive", True)
+            ):
+                continue
             video_title = str(row.get("video_title") or "").strip()
             video_description = self._clean_video_description(str(row.get("video_description") or ""))
             transcript_snippet = str(row.get("transcript_snippet") or "")
@@ -6928,18 +6971,21 @@ class ReelService:
                 min(1.0, level_target + concept_adjustments.get(str(row["concept_id"]), 0.0)),
             )
             learner_signal = learner_coverage.get(str(row["concept_id"]), {})
-            if selection_metadata:
+            if self._has_selection_contract(selection_metadata):
                 content_score = self._selection_number(
                     selection_metadata.get("_selection_content_score"), 0.0
                 )
-                boundary_confidence = self._selection_number(
-                    selection_metadata.get("_selection_boundary_confidence"), 0.0
-                )
                 current_level_fit = 1.0 - abs(_diff - concept_target)
-                score = (
-                    0.65 * content_score
-                    + 0.25 * current_level_fit
-                    + 0.10 * boundary_confidence
+                uncertainty_penalty = (
+                    0.05
+                    if selection_metadata.get("_selection_uncertainty") == "medium"
+                    else 0.0
+                )
+                score = max(
+                    0.0,
+                    0.85 * content_score
+                    + 0.15 * current_level_fit
+                    - uncertainty_penalty,
                 )
             else:
                 score = (

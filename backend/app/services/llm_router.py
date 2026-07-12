@@ -29,7 +29,7 @@ from ..clip_engine.errors import CancellationError
 logger = logging.getLogger(__name__)
 
 
-GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
+GEMINI_DEFAULT_MODEL = "gemini-3.5-flash"
 GROQ_DEFAULT_MODEL = "llama-3.3-70b-versatile"
 # llama3.1-8b is the default Cerebras free-tier model available to every
 # account (the other universally-available one is gpt-oss-120b). The

@@ -55,6 +55,11 @@ def _topic(start_line: int, end_line: int, **overrides) -> G._Topic:
         "topic_relevance": 0.9,
         "educational_importance": 0.9,
         "difficulty": 0.5,
+        "directly_teaches_topic": True,
+        "substantive": True,
+        "topic_evidence_quote": (
+            f"line {start_line} explains lesson {start_line} completely"
+        ),
         "self_contained": True,
         "is_standalone": True,
         "prerequisite_candidate_ids": [],
@@ -88,7 +93,8 @@ def _run(topics: list[G._Topic], segments: list[dict] | None = None,
     [
         "candidate_id", "start_line", "end_line", "start_quote", "end_quote", "title",
         "learning_objective", "facet", "reason", "informativeness", "topic_relevance",
-        "educational_importance", "difficulty", "self_contained", "is_standalone",
+        "educational_importance", "difficulty", "directly_teaches_topic", "substantive",
+        "topic_evidence_quote", "self_contained", "is_standalone",
         "prerequisite_candidate_ids", "uncertainty", "uncertainty_reasons", "summary",
         "takeaways", "match_reason", "assessment",
     ],
@@ -104,7 +110,7 @@ def test_every_single_pass_field_is_required(field):
     "field",
     [
         "candidate_id", "title", "learning_objective", "facet", "reason",
-        "start_quote", "end_quote",
+        "start_quote", "end_quote", "topic_evidence_quote",
     ],
 )
 def test_required_text_fields_reject_blank_values(field):
@@ -187,6 +193,7 @@ def test_complete_clips_through_one_eighty_seconds_survive(duration):
             0, 0,
             start_quote="line zero",
             end_quote="end zero",
+            topic_evidence_quote="line zero explains lesson zero completely",
             summary="Line zero explains lesson zero completely.",
             takeaways=["Line zero explains lesson zero.", "The lesson finishes end zero."],
             match_reason="Lesson zero is explained directly.",
@@ -202,6 +209,7 @@ def test_clip_over_one_eighty_seconds_is_rejected_without_hard_cut():
     proposal = _topic(
         0, 0,
         start_quote="line zero", end_quote="end zero",
+        topic_evidence_quote="line zero explains lesson zero completely",
         assessment={**_assessment(0), "evidence_quote": "lesson zero"},
     )
     assert _run([proposal], segments, {"segment_max_clip_s": 999}) == []
@@ -402,12 +410,26 @@ def test_prompt_layout_and_contract_follow_gemini3_guidance():
     for field in (
         "informativeness", "topic_relevance", "self_contained", "difficulty",
         "start_line", "end_line", "start_quote", "end_quote", "uncertainty",
+        "directly_teaches_topic", "substantive", "topic_evidence_quote",
     ):
         assert field in combined
     assert "prompt (at most 16 words)" in combined
     assert "options (at most 8 words each)" in combined
     assert "explanation (one sentence, at most 24 words)" in combined
     assert "chain-of-thought" in combined
+
+
+def test_boundary_prompt_includes_learner_level_and_rejects_course_framing():
+    _system, user = G._boundary_prompts(
+        "[0] 00:00 Biology explains cells.",
+        1,
+        topic="biology",
+        learner_level="advanced",
+    )
+    assert "current level is advanced" in user
+    assert "course logistics" in user
+    assert "institutional framing" in user
+    assert "merely names the subject" in user
 
 
 def _selection_task_tail(user: str) -> str:

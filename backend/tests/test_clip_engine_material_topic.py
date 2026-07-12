@@ -928,6 +928,177 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertEqual(calls[2:], ["video-2"])
         self.assertEqual(reels, ["video-2"] * 5)
 
+    def test_bootstrap_reserves_one_slot_per_initial_source(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video("source-a"), self._video("source-b")]
+        seen: list[str] = []
+
+        def clip_and_filter(video, *_args):
+            base = 0.9 if video["id"] == "source-b" else 0.8
+            return video, [
+                {"title": f"{video['id']}-best", "score": base},
+                {"title": f"{video['id']}-second", "score": base - 0.1},
+            ], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    f"{kwargs['v']['id']}:{kwargs['clip']['title']}",
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=2,
+                max_reels=2,
+                retrieval_profile="bootstrap",
+                on_reel_created=seen.append,
+            )
+
+        self.assertEqual(
+            reels,
+            ["source-a:source-a-best", "source-b:source-b-best"],
+        )
+        self.assertEqual(
+            seen,
+            ["source-b:source-b-best", "source-a:source-a-best"],
+        )
+
+    def test_bootstrap_third_source_backfills_missing_initial_source(self) -> None:
+        pipeline = self._pipeline()
+        videos = [
+            self._video("source-a"),
+            self._video("empty-source"),
+            self._video("source-c"),
+        ]
+        calls: list[str] = []
+
+        def clip_and_filter(video, *_args):
+            calls.append(video["id"])
+            if video["id"] == "empty-source":
+                return video, [], {"transcript": {}}
+            return video, [
+                {"title": f"{video['id']}-best", "score": 0.9},
+                {"title": f"{video['id']}-second", "score": 0.8},
+            ], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    f"{kwargs['v']['id']}:{kwargs['clip']['title']}",
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=3,
+                max_reels=2,
+                retrieval_profile="bootstrap",
+            )
+
+        self.assertEqual(set(calls), {"source-a", "empty-source", "source-c"})
+        self.assertEqual(
+            reels,
+            ["source-a:source-a-best", "source-c:source-c-best"],
+        )
+
+    def test_bootstrap_starts_three_together_but_third_cannot_displace_initial_pair(
+        self,
+    ) -> None:
+        pipeline = self._pipeline()
+        videos = [
+            self._video("source-a"),
+            self._video("source-b"),
+            self._video("source-c"),
+        ]
+        started: set[str] = set()
+        started_lock = threading.Lock()
+        all_started = threading.Event()
+
+        def clip_and_filter(video, *_args):
+            with started_lock:
+                started.add(video["id"])
+                if len(started) == 3:
+                    all_started.set()
+            self.assertTrue(
+                all_started.wait(1.0),
+                "all three bootstrap analyses must be dispatched concurrently",
+            )
+            score = {"source-a": 0.8, "source-b": 0.7, "source-c": 1.0}[
+                video["id"]
+            ]
+            return video, [
+                {"title": f"{video['id']}-best", "score": score},
+            ], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (
+                    f"{kwargs['v']['id']}:{kwargs['clip']['title']}",
+                    mock.sentinel.metadata,
+                ),
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=3,
+                max_reels=2,
+                retrieval_profile="bootstrap",
+            )
+
+        self.assertEqual(started, {"source-a", "source-b", "source-c"})
+        self.assertEqual(
+            reels,
+            ["source-a:source-a-best", "source-b:source-b-best"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,8 +2,9 @@
 # Railway deploy image for the FastAPI backend.
 #
 # The backend is a durable Railway process. Supadata supplies hosted timestamped
-# transcript cues (native when available, generated otherwise), so no audio
-# download, ffmpeg, or local Whisper runtime is installed.
+# transcript cues (native when available, generated otherwise). ffmpeg is used
+# only for bounded acoustic checks around selected clip edges; no local Whisper
+# runtime or full-media download is installed.
 #
 # The `# syntax=docker/dockerfile:1` header tells BuildKit to use the latest
 # stable Dockerfile frontend (features like heredoc, RUN --mount=, etc).
@@ -13,12 +14,14 @@ FROM python:3.12-slim
 
 # System deps:
 # - ca-certificates, curl: TLS + debugging
+# - ffmpeg: decode two bounded audio edge windows for silence verification
 # Slim image keeps build context small; `--no-install-recommends` avoids pulling
 # in X11 / doc packages we don't need.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && curl --version
 

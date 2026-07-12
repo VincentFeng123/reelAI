@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -204,6 +205,29 @@ def _valid_clips(
             return None
         uncertainty = str(raw.get("uncertainty") or "low").strip().lower()
         uncertainty_reasons = raw.get("uncertainty_reasons") or []
+        evidence_quote = " ".join(str(raw.get("topic_evidence_quote") or "").split())
+        evidence_words = re.findall(r"[\w+#'-]+", evidence_quote.casefold())
+        window_parts: list[str] = []
+        for segment in transcript.get("segments") or []:
+            if not isinstance(segment, Mapping):
+                continue
+            try:
+                segment_start = float(segment.get("start") or 0.0)
+                segment_end = float(segment.get("end") or segment_start)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if segment_end >= start and segment_start <= end:
+                window_parts.append(str(segment.get("text") or ""))
+        window_text = " ".join(window_parts)
+        window_words = re.findall(r"[\w+#'-]+", window_text.casefold())
+        evidence_width = len(evidence_words)
+        evidence_grounded = bool(
+            5 <= evidence_width <= 40
+            and any(
+                window_words[offset : offset + evidence_width] == evidence_words
+                for offset in range(len(window_words) - evidence_width + 1)
+            )
+        )
         if (
             not all(
                 math.isfinite(number)
@@ -225,6 +249,9 @@ def _valid_clips(
             or not 0 <= educational_importance <= 1
             or not 0 <= difficulty <= 1
             or raw.get("self_contained") is not True
+            or raw.get("directly_teaches_topic") is not True
+            or raw.get("substantive") is not True
+            or not evidence_grounded
             or raw.get("kind") != "educational"
             or uncertainty not in {"low", "medium"}
             or not isinstance(uncertainty_reasons, list)

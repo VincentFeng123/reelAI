@@ -12,6 +12,7 @@ import type {
   GenerationJobCancelResponse,
   GenerationJobStatusResponse,
   GenerationQueuedResponse,
+  GenerationTerminalStatus,
   IngestResult,
   IngestSearchRequest,
   IngestSearchResult,
@@ -1020,10 +1021,19 @@ export async function cancelGenerationJob(
 
 async function consumeGenerationJob(
   job: GenerationQueuedResponse,
-  options: { signal?: AbortSignal; onCandidate?: (reel: Reel) => void },
+  options: {
+    signal?: AbortSignal;
+    onCandidate?: (reel: Reel) => void;
+    onReconnect?: (consecutiveIdleWindows: number) => void;
+    onActivity?: () => void;
+    onTerminal?: (status: GenerationTerminalStatus) => void;
+    idleTimeoutMs?: number;
+  },
 ): Promise<ReelsGenerateResponse> {
   let afterSeq = 0;
   let finalResponse: ReelsGenerateResponse | null = null;
+  let consecutiveIdleWindows = 0;
+  const idleTimeoutMs = Math.max(10, options.idleTimeoutMs ?? 35_000);
   // Backend permits an eight-minute queue window plus a one-hour quality-first
   // execution window. Keep one minute of transport slack, but stay finite.
   const deadline = Date.now() + 69 * 60_000;
@@ -1063,6 +1073,8 @@ async function consumeGenerationJob(
         if (event.job_id !== job.job_id || !Number.isInteger(event.seq) || event.seq <= afterSeq) {
           return;
         }
+        consecutiveIdleWindows = 0;
+        options.onActivity?.();
         afterSeq = event.seq;
         if (event.type === "candidate") {
           options.onCandidate?.(event.payload.reel);
@@ -1077,7 +1089,21 @@ async function consumeGenerationJob(
       let readerDone = false;
       try {
         while (!terminalStatus) {
-          const { done, value } = await reader.read();
+          let idleTimer: ReturnType<typeof setTimeout> | null = null;
+          const idleTimeout = new Promise<never>((_, reject) => {
+            idleTimer = setTimeout(() => {
+              reject(new TransportError("Generation stream was idle; reconnecting to the durable job."));
+            }, idleTimeoutMs);
+          });
+          let chunk: ReadableStreamReadResult<Uint8Array>;
+          try {
+            chunk = await Promise.race([reader.read(), idleTimeout]);
+          } finally {
+            if (idleTimer) {
+              clearTimeout(idleTimer);
+            }
+          }
+          const { done, value } = chunk;
           if (done) {
             readerDone = true;
             break;
@@ -1111,9 +1137,14 @@ async function consumeGenerationJob(
       if (!isTransportError(error)) {
         throw error;
       }
+      if (error instanceof TransportError && /stream was idle/i.test(error.message)) {
+        consecutiveIdleWindows += 1;
+        options.onReconnect?.(consecutiveIdleWindows);
+      }
     }
 
     if (terminalStatus) {
+      options.onTerminal?.(terminalStatus as GenerationTerminalStatus);
       if (terminalStatus === "failed" || terminalStatus === "cancelled") {
         throwTerminalGenerationError(terminalError, terminalStatus);
       }
@@ -1139,9 +1170,11 @@ async function consumeGenerationJob(
       continue;
     }
     if (status.status === "failed" || status.status === "cancelled") {
+      options.onTerminal?.(status.status);
       throwTerminalGenerationError(status.error, status.status);
     }
     if (status.status === "completed" || status.status === "partial" || status.status === "exhausted") {
+      options.onTerminal?.(status.status);
       const response = finalResponse ?? terminalResponseFromStatus(status);
       if (response) {
         return response;
@@ -1158,15 +1191,32 @@ export async function generateReelsStream(
   params: GenerateReelsParams & {
     signal?: AbortSignal;
     onCandidate?: (reel: Reel) => void;
+    generationJobId?: string | null;
+    onReconnect?: (consecutiveIdleWindows: number) => void;
+    onActivity?: () => void;
+    onTerminal?: (status: GenerationTerminalStatus) => void;
+    idleTimeoutMs?: number;
   },
 ): Promise<ReelsGenerateResponse> {
-  const submission = await generateReels(params);
+  const resumeJobId = String(params.generationJobId || "").trim();
+  const submission: ReelsGenerateSubmission = resumeJobId
+    ? {
+        job_id: resumeJobId,
+        status: "running",
+        status_url: `/reels/generation-status/${encodeURIComponent(resumeJobId)}`,
+        stream_url: `/reels/generation-stream/${encodeURIComponent(resumeJobId)}`,
+      }
+    : await generateReels(params);
   if (!isQueuedGeneration(submission)) {
     return submission;
   }
   return consumeGenerationJob(submission, {
     signal: params.signal,
     onCandidate: params.onCandidate,
+    onReconnect: params.onReconnect,
+    onActivity: params.onActivity,
+    onTerminal: params.onTerminal,
+    idleTimeoutMs: params.idleTimeoutMs,
   });
 }
 

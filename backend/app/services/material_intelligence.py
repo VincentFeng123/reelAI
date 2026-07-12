@@ -10,7 +10,6 @@ from ..config import get_settings
 from ..db import dumps_json, fetch_one, now_iso, upsert
 from . import llm_router
 from .concepts import extract_concepts, extract_learning_objectives
-from .search_query_plan import build_search_query_plan
 from .text_utils import normalize_whitespace
 
 logger = logging.getLogger(__name__)
@@ -74,109 +73,27 @@ class MaterialIntelligenceService:
         if not self._is_topic_only_material(text=text, subject_tag=subject_tag):
             return [], []
 
-        expansion = self._ai_topic_expansion(conn, clean_subject)
-        canonical_topic = str(expansion.get("canonical_topic") or clean_subject).strip()
-        aliases = [str(item).strip() for item in (expansion.get("aliases") or []) if str(item).strip()]
-        subtopics = self._dedupe_topic_terms(
-            [str(item).strip() for item in (expansion.get("subtopics") or []) if str(item).strip()]
-        )
-        related_terms = [
-            str(item).strip()
-            for item in (expansion.get("related_terms") or [])
-            if str(item).strip()
-        ]
-        root_keywords = self._dedupe_topic_terms(
-            [
-                normalized_subject,
-                canonical_topic.lower(),
-                *[term.lower() for term in aliases],
-                *[term.lower() for term in subtopics],
-                *[term.lower() for term in related_terms],
-            ]
-        )
         title_subject = self._title_case_topic(clean_subject)
         concepts: list[dict[str, Any]] = [
             {
                 "id": str(uuid.uuid4()),
                 "title": title_subject,
-                "keywords": root_keywords[:8] or [normalized_subject],
-                "summary": self._topic_root_summary(
-                    subject=title_subject,
-                    canonical_topic=canonical_topic,
-                ),
+                "keywords": [normalized_subject],
+                "summary": self._topic_root_summary(subject=title_subject),
             }
         ]
-
-        if subtopics:
-            for term in subtopics[: max(0, max_concepts - 1)]:
-                related_keywords = self._dedupe_topic_terms(
-                    [
-                        term.lower(),
-                        normalized_subject,
-                        *root_keywords[:4],
-                    ]
-                )
-                concepts.append(
-                    {
-                        "id": str(uuid.uuid4()),
-                        "title": self._title_case_topic(term),
-                        "keywords": related_keywords[:8],
-                        "summary": f"Key subtopic within {title_subject}: {term}.",
-                    }
-                )
         objectives = [
             f"Understand the core definitions and intuition behind {title_subject}.",
             f"Solve representative problems in {title_subject}.",
         ]
-        objectives.extend(
-            f"Explain how {term} fits into {title_subject}."
-            for term in subtopics[:4]
-        )
         return concepts[:max_concepts], objectives[:6]
-
-    def _ai_topic_expansion(self, conn, literal_topic: str) -> dict[str, Any]:
-        literal = normalize_whitespace(literal_topic or "").strip()
-        fallback = {
-            "canonical_topic": literal,
-            "aliases": [],
-            "subtopics": [],
-            "related_terms": [],
-        }
-        if not literal:
-            return fallback
-        try:
-            plan = build_search_query_plan(conn, literal_query=literal)
-        except Exception as exc:
-            logger.warning(
-                "topic query plan unavailable during material creation error_type=%s",
-                type(exc).__name__,
-            )
-            return fallback
-        if plan.ai_status != "validated":
-            return fallback
-        return plan.as_topic_expansion()
 
     def _title_case_topic(self, value: str) -> str:
         parts = [segment for segment in normalize_whitespace(value).split(" ") if segment]
         return " ".join(part[:1].upper() + part[1:] for part in parts)
 
-    def _topic_root_summary(self, *, subject: str, canonical_topic: str) -> str:
-        clean_canonical = normalize_whitespace(canonical_topic or "").strip()
-        if clean_canonical and clean_canonical.lower() != subject.lower():
-            return f"Core ideas, terminology, and intuition for {subject} ({clean_canonical})."
+    def _topic_root_summary(self, *, subject: str) -> str:
         return f"Core ideas, terminology, and intuition for {subject}."
-
-    def _dedupe_topic_terms(self, values: list[str]) -> list[str]:
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for raw in values:
-            cleaned = normalize_whitespace(raw or "").strip()
-            key = cleaned.lower()
-            if not cleaned or key in seen:
-                continue
-            seen.add(key)
-            deduped.append(cleaned)
-        return deduped
 
     def _is_topic_only_material(self, *, text: str, subject_tag: str | None) -> bool:
         clean_subject = normalize_whitespace(subject_tag or "").strip().lower()

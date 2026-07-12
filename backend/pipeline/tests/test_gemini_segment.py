@@ -54,6 +54,11 @@ def _topic(title: str, start_line: int, end_line: int, **overrides) -> G._Topic:
         "topic_relevance": 0.9,
         "educational_importance": 0.9,
         "difficulty": 0.5,
+        "directly_teaches_topic": True,
+        "substantive": True,
+        "topic_evidence_quote": (
+            f"line {start_line} teaches concept {start_line} and finishes"
+        ),
         "self_contained": True,
         "is_standalone": True,
         "prerequisite_candidate_ids": [],
@@ -95,6 +100,58 @@ def test_maps_lines_to_chunk_times_after_required_alignment():
     assert clips[0]["chain_position"] == 0
     assert clips[0]["prerequisite_ids"] == []
     assert "cut_end" not in clips[0]
+
+
+def test_selector_rejects_non_teaching_non_substantive_and_ungrounded_evidence():
+    segs = _segs(4)
+    plan = G._Plan(topics=[
+        _topic("Not teaching", 0, 0, directly_teaches_topic=False),
+        _topic("Filler", 1, 1, substantive=False),
+        _topic(
+            "Invented evidence",
+            2,
+            2,
+            topic_evidence_quote="this exact teaching quote is not present",
+        ),
+        _topic("Useful", 3, 3),
+    ])
+
+    report = G._plan_to_report(
+        plan, segs, _words(segs), {"segment_fine_snap": False},
+    )
+
+    assert [clip["title"] for clip in report.clips] == ["Useful"]
+    assert report.rejected_reasons == [
+        "proposal_0:does_not_directly_teach_topic",
+        "proposal_1:not_substantive",
+        "proposal_2:ungrounded_topic_evidence_quote",
+    ]
+
+
+@pytest.mark.parametrize(
+    "quote,reason",
+    [
+        ("line 0 teaches concept", "proposal_0:invalid_topic_evidence_quote_length"),
+        (
+            "line 0 teaches concept 0 and finishes end 0 extra words beyond the source "
+            "one two three four five six seven eight nine ten eleven twelve thirteen "
+            "fourteen fifteen sixteen seventeen eighteen nineteen twenty twentyone "
+            "twentytwo twentythree twentythree twentyfour twentyfive twentysix "
+            "twentyseven twentyeight twentynine thirty thirtyone thirtytwo thirtythree",
+            "proposal_0:invalid_topic_evidence_quote_length",
+        ),
+    ],
+)
+def test_topic_evidence_quote_requires_five_to_forty_words(quote, reason):
+    segs = _segs(1)
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic("Evidence", 0, 0, topic_evidence_quote=quote)]),
+        segs,
+        _words(segs),
+        {"segment_fine_snap": False},
+    )
+    assert report.clips == []
+    assert report.rejected_reasons == [reason]
 
 
 def test_selector_metadata_preserves_explicit_prerequisite_chain():
@@ -277,6 +334,7 @@ def test_interpolated_words_never_tighten_physical_boundaries():
         "T", 0, 0,
         start_quote="topic starts",
         end_quote="ends now",
+        topic_evidence_quote="intro then the real topic starts here",
         summary="The real topic starts and ends now.",
         takeaways=["The topic starts here.", "The topic ends now."],
         match_reason="The topic starts in this explanation.",
@@ -308,6 +366,7 @@ def test_cue_boundaries_get_gap_clamped_three_hundred_ms_padding():
         "T", 1, 1,
         start_quote="topic starts",
         end_quote="ends now",
+        topic_evidence_quote="topic starts and ends now",
         summary="The topic starts and ends now.",
         takeaways=["The topic starts.", "The topic ends now."],
         match_reason="The topic is explained here.",
@@ -369,6 +428,7 @@ def test_chemistry_fast_path_closes_two_cues_of_missing_setup():
         2,
         start_quote="So the answer",
         end_quote="magnesium bromide",
+        topic_evidence_quote="So the answer is magnesium bromide",
     )
 
     [clip] = G._plan_to_clips(G._Plan(topics=[proposal]), segs, [], {})
@@ -390,6 +450,7 @@ def test_weak_conjunction_end_expands_to_the_completed_answer():
         0,
         start_quote="We combine",
         end_quote="magnesium and",
+        topic_evidence_quote="We combine magnesium and bromide",
     )
 
     [clip] = G._plan_to_clips(G._Plan(topics=[proposal]), segs, [], {})
@@ -480,6 +541,8 @@ def test_production_flash_is_compact_global_boundary_first():
     assert G.PRODUCTION_FLASH_PROFILE == G.FLASH_SPLIT_PROFILE
     assert "at most 150 seconds" in prompt
     assert "20 to 90 seconds" in prompt
+    assert "low or medium uncertainty" in prompt
+    assert "omit only high-uncertainty" in prompt
     assert G._BOUNDARY_OUTPUT_TOKENS == 4096
     assert "globally" in prompt
     assert "do not favor the beginning" in prompt

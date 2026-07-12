@@ -26,6 +26,15 @@ def _topic(start: int, end: int, *, title: str) -> G._BoundaryTopic:
         topic_relevance=0.9,
         educational_importance=0.9,
         difficulty=0.5,
+        directly_teaches_topic=True,
+        substantive=True,
+        topic_evidence_quote=(
+            "So we can now solve the equation"
+            if start == 3
+            else "So we can now balance the reaction"
+            if start == 9
+            else "Moles convert directly into mass in stoichiometry"
+        ),
         self_contained=True,
         is_standalone=True,
         prerequisite_candidate_ids=[],
@@ -237,7 +246,7 @@ def test_repaired_candidates_are_validated_independently(monkeypatch):
 
     assert result.classification == "green"
     assert {clip["title"] for clip in result.clips} == {
-        "equation", "stoichiometry",
+        "equation", "equilibrium", "stoichiometry",
     }
 
 

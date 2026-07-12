@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 import uuid
@@ -66,12 +68,14 @@ from .models import (
 )
 from .persistence import (
     load_existing_reel,
+    load_reel_by_selection_candidate,
     resolve_material_concept,
     store_ingest_metadata_blob,
+    update_reel_boundary_state,
     upsert_reel_row,
     upsert_video,
 )
-from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta, config as clip_engine_config  # noqa: F401
+from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta, config as clip_engine_config, silence as clip_engine_silence  # noqa: F401
 from ..clip_engine.cancellation import is_cancelled, raise_if_cancelled
 from ..clip_engine.provider_runtime import GenerationContext
 from ..clip_engine.errors import (
@@ -111,12 +115,15 @@ def _run_clip(
     candidate_rank: int | None = None,
     max_clips: int | None = None,
     retrieval_profile: str = "deep",
+    knowledge_level: str | None = None,
 ) -> dict[str, Any]:
     settings: dict[str, Any] = {
         "language": language,
         "generation_context": generation_context,
         "provider_cache": generation_context.cache_store if generation_context is not None else None,
     }
+    if knowledge_level:
+        settings["_knowledge_level"] = str(knowledge_level).strip().lower()
     if candidate_rank is not None:
         settings["_segment_candidate_rank"] = int(candidate_rank)
     if max_clips is not None:
@@ -282,6 +289,30 @@ def _topic_evidence(
     if semantic_score is not None and semantic_score >= 0.72 and text.strip():
         return [f"semantic:{semantic_score:.2f}"]
     return []
+
+
+def _grounded_topic_evidence_quote(text: str, quote: object) -> str:
+    """Return a substantive exact quote grounded inside one selected clip.
+
+    The selector supplies this semantic proof.  Keeping the check lexical and
+    local prevents a one-word topic mention (for example, "biology" in course
+    logistics) from becoming sufficient evidence on its own.
+    """
+    cleaned_quote = " ".join(str(quote or "").split()).strip()
+    quote_words = re.findall(r"[\w+#'-]+", cleaned_quote.casefold())
+    if not 5 <= len(quote_words) <= 40:
+        return ""
+    text_words = re.findall(r"[\w+#'-]+", str(text or "").casefold())
+    width = len(quote_words)
+    if not any(text_words[index : index + width] == quote_words for index in range(len(text_words) - width + 1)):
+        return ""
+    generic = {
+        "a", "an", "and", "are", "course", "class", "for", "in", "intro",
+        "introduction", "lecture", "of", "on", "the", "this", "to", "today",
+        "university", "welcome", "we", "will", "you", "your",
+    }
+    content_words = {word for word in quote_words if len(word) >= 3 and word not in generic}
+    return cleaned_quote if len(content_words) >= 2 else ""
 
 
 def _retrieval_search_context(
@@ -915,10 +946,10 @@ class IngestionPipeline:
         `dry_run`).
 
         Cost/latency guardrail: `max_videos` bounds the paid `run.clip` calls.
-        The first two videos run concurrently; later candidates start one at a
-        time only while the requested clip cap is unmet. Completed valid clips
-        persist and stream immediately, and the returned list is restored to
-        discover order.
+        Bootstrap analyzes up to three videos concurrently; deep retrieval starts
+        with two and backfills one at a time only while the requested clip cap is
+        unmet. Completed valid clips persist and stream immediately, and the
+        returned list is restored to discover order.
         """
         topic = " ".join(str(topic or "").split())
         if not topic:
@@ -1048,9 +1079,12 @@ class IngestionPipeline:
         inventory_cap = requested_count + 2 if max_reels is None else requested_count
         minimum_valid = inventory_cap
 
-        # Start with two videos. Additional candidates are backfilled one at a
-        # time only when the completed batch has not produced enough valid clips.
-        executor = ThreadPoolExecutor(max_workers=min(2, len(videos)))
+        concurrent_video_count = min(
+            3 if retrieval_profile == "bootstrap" else 2,
+            len(videos),
+            analysis_limit,
+        )
+        executor = ThreadPoolExecutor(max_workers=concurrent_video_count)
         enrichment_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="clip-enrichment")
             if generation_context is not None and retrieval_profile == "deep"
@@ -1286,6 +1320,8 @@ class IngestionPipeline:
                 "text": clip_text[:5000],
             })
 
+        surfaceable_candidate_ids_by_video: dict[str, set[str]] = {}
+
         def persist_result(
             result: tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
             *,
@@ -1293,8 +1329,66 @@ class IngestionPipeline:
         ) -> list[ReelOutWithAttribution]:
             v, kept, engine_out = result
             persisted: list[ReelOutWithAttribution] = []
-            for clip in kept if limit is None else kept[:max(0, limit)]:
+            surfaceable_candidate_ids = surfaceable_candidate_ids_by_video.setdefault(
+                str(v.get("id") or ""), set()
+            )
+            surface_limit = None if limit is None else max(0, int(limit))
+            for raw_clip in kept:
+                if surface_limit is not None and len(persisted) >= surface_limit:
+                    break
                 raise_if_cancelled(should_cancel)
+                clip = dict(raw_clip)
+                search_context = dict(clip.get("search_context") or {})
+                semantic_eligible = search_context.get("surface_eligible") is not False
+                prerequisite_ids = {
+                    str(value or "").strip()
+                    for value in (clip.get("prerequisite_ids") or [])
+                    if str(value or "").strip()
+                }
+                prerequisites_ready = prerequisite_ids.issubset(surfaceable_candidate_ids)
+                surface_eligible = semantic_eligible and prerequisites_ready
+                if not prerequisites_ready:
+                    search_context["surface_reason"] = "prerequisite_not_surfaceable"
+
+                if surface_eligible and bool(
+                    engine_out.get("_acoustic_verification_required")
+                ):
+                    verification = clip_engine_silence.verify_acoustic_boundaries(
+                        str(v.get("url") or v.get("id") or ""),
+                        float(clip.get("start") or 0.0),
+                        float(clip.get("end") or 0.0),
+                        prepared=engine_out.get("_audio_preparation"),
+                        timeout_sec=20.0,
+                        cancel_check=should_cancel,
+                    )
+                    search_context["boundary_status"] = verification.status
+                    search_context["boundary_diagnostics"] = dict(
+                        verification.diagnostics
+                    )
+                    if verification.verified:
+                        adjusted_duration = verification.end_sec - verification.start_sec
+                        if 1.0 <= adjusted_duration <= 180.0:
+                            clip["start"] = verification.start_sec
+                            clip["end"] = verification.end_sec
+                        else:
+                            surface_eligible = False
+                            search_context["surface_reason"] = (
+                                "acoustic_boundary_duration_invalid"
+                            )
+                            if generation_context is not None:
+                                generation_context.increment_counter(
+                                    "boundary_unavailable"
+                                )
+                    else:
+                        surface_eligible = False
+                        search_context["surface_reason"] = "acoustic_boundary_unavailable"
+                        if generation_context is not None:
+                            generation_context.increment_counter("boundary_unavailable")
+                else:
+                    search_context.setdefault("boundary_status", "caption_aligned")
+
+                search_context["surface_eligible"] = bool(surface_eligible)
+                clip["search_context"] = search_context
                 reel, _ = self._persist_engine_clip(
                     v=v,
                     clip=clip,
@@ -1305,7 +1399,16 @@ class IngestionPipeline:
                     generation_id=generation_id,
                     should_cancel=should_cancel,
                 )
+                if generation_context is not None:
+                    generation_context.increment_counter("stored_clips")
+                if not surface_eligible:
+                    if generation_context is not None:
+                        generation_context.increment_counter("deferred_clips")
+                    continue
                 persisted.append(reel)
+                candidate_id = str(clip.get("selection_candidate_id") or "").strip()
+                if candidate_id:
+                    surfaceable_candidate_ids.add(candidate_id)
                 if generation_context is not None:
                     generation_context.increment_counter("persisted_clips")
                 if on_reel_created is not None:
@@ -1330,6 +1433,63 @@ class IngestionPipeline:
                 configure_fallback(initial_count)
         valid_clip_count = 0
         persisted_count = 0
+        bootstrap_attempted_indices: set[int] = set()
+
+        def persist_bootstrap_sources() -> None:
+            """Persist at most one best clip per completed source before reuse.
+
+            Bootstrap waits for the two initial analyses, ranks their strongest
+            clips together, and reserves the second slot for the second source.
+            Later sources backfill empty/failed initial results.
+            """
+            nonlocal valid_clip_count, persisted_count
+            if retrieval_profile != "bootstrap" or len(initial_resolved) < initial_count:
+                return
+            # Rank the two initial sources together. Concurrent source three is
+            # considered only after those sources have had their first chance.
+            for source_indices in (
+                range(initial_count),
+                range(initial_count, min(len(videos), analysis_limit)),
+            ):
+                source_candidates: list[
+                    tuple[float, int, tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]]
+                ] = []
+                for source_index in source_indices:
+                    source_result = completed_results.get(source_index)
+                    if (
+                        source_result is None
+                        or source_index in bootstrap_attempted_indices
+                        or not source_result[1]
+                    ):
+                        continue
+                    source_candidates.append(
+                        (
+                            float(source_result[1][0].get("score") or 0.0),
+                            source_index,
+                            source_result,
+                        )
+                    )
+                for _score, source_index, source_result in sorted(
+                    source_candidates,
+                    key=lambda item: (item[0], -item[1]),
+                    reverse=True,
+                ):
+                    if persisted_count >= inventory_cap:
+                        break
+                    bootstrap_attempted_indices.add(source_index)
+                    one_clip_result = (
+                        source_result[0],
+                        source_result[1][:1],
+                        source_result[2],
+                    )
+                    persisted = persist_result(one_clip_result, limit=1)
+                    reels_by_video.setdefault(source_index, []).extend(persisted)
+                    persisted_count += len(persisted)
+                if persisted_count >= inventory_cap:
+                    break
+            # Backfill decisions must follow clips that can actually stream,
+            # rather than every low-value proposal returned by one source.
+            valid_clip_count = persisted_count
 
         def clips_temporally_overlap(a: dict[str, Any], b: dict[str, Any]) -> bool:
             start = max(float(a.get("start") or 0.0), float(b.get("start") or 0.0))
@@ -1468,10 +1628,10 @@ class IngestionPipeline:
 
         pending = {
             submit_video(index): (index, videos[index])
-            for index in range(initial_count)
+            for index in range(concurrent_video_count)
         }
         all_futures = list(pending)
-        next_index = initial_count
+        next_index = concurrent_video_count
         try:
             while pending:
                 raise_if_cancelled(should_cancel)
@@ -1484,6 +1644,10 @@ class IngestionPipeline:
                 if not done:
                     if time.monotonic() < deadline:
                         continue
+                    initial_resolved.update(
+                        index for index, _video in pending.values() if index < initial_count
+                    )
+                    persist_bootstrap_sources()
                     for _, v in pending.values():
                         log_event(
                             logger,
@@ -1524,21 +1688,30 @@ class IngestionPipeline:
                     if result is None:
                         continue
                     completed_results[index] = result
-                    valid_clip_count += len(result[1])
-                    if persisted_count < inventory_cap:
-                        persisted = persist_result(
-                            result,
-                            limit=inventory_cap - persisted_count,
-                        )
-                        reels_by_video[index] = persisted
-                        persisted_count += len(persisted)
+                    if retrieval_profile == "bootstrap":
+                        persist_bootstrap_sources()
+                    else:
+                        valid_clip_count += len(result[1])
+                        if persisted_count < inventory_cap:
+                            persisted = persist_result(
+                                result,
+                                limit=inventory_cap - persisted_count,
+                            )
+                            reels_by_video[index] = persisted
+                            persisted_count += len(persisted)
 
+                if retrieval_profile == "bootstrap":
+                    persist_bootstrap_sources()
                 maybe_run_aggregate_fallback()
 
                 if (
                     not pending
-                    and valid_clip_count < minimum_valid
-                    and valid_clip_count < inventory_cap
+                    and (
+                        persisted_count if retrieval_profile == "bootstrap" else valid_clip_count
+                    ) < minimum_valid
+                    and (
+                        persisted_count if retrieval_profile == "bootstrap" else valid_clip_count
+                    ) < inventory_cap
                     and next_index < min(len(videos), analysis_limit)
                 ):
                     future = submit_video(next_index)
@@ -1550,6 +1723,45 @@ class IngestionPipeline:
             for future in all_futures:
                 future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
+
+        if retrieval_profile == "bootstrap" and persisted_count < inventory_cap:
+            # Only after every available source has had its first chance may a
+            # later clip from an already used source fill the remaining slot.
+            # Keep walking that source when an otherwise-good earlier clip was
+            # acoustically unavailable; the inventory cap still limits emits.
+            extras: list[
+                tuple[
+                    float,
+                    int,
+                    int,
+                    tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]],
+                ]
+            ] = []
+            for source_index, source_result in completed_results.items():
+                if len(source_result[1]) <= 1:
+                    continue
+                for clip_index in range(1, len(source_result[1])):
+                    extras.append(
+                        (
+                            float(source_result[1][clip_index].get("score") or 0.0),
+                            source_index,
+                            clip_index,
+                            source_result,
+                        )
+                    )
+            for _score, source_index, clip_index, source_result in sorted(
+                extras, key=lambda item: (item[0], -item[1], -item[2]), reverse=True
+            ):
+                if persisted_count >= inventory_cap:
+                    break
+                extra_result = (
+                    source_result[0],
+                    source_result[1][clip_index : clip_index + 1],
+                    source_result[2],
+                )
+                persisted = persist_result(extra_result, limit=1)
+                reels_by_video.setdefault(source_index, []).extend(persisted)
+                persisted_count += len(persisted)
 
         if enrichment_executor is not None:
             while enrichment_buffer:
@@ -1596,16 +1808,47 @@ class IngestionPipeline:
         engine_out)`, scored_clips sorted by score DESCENDING. Empty `clips`
         yields no clips (video is skipped)."""
         engine_out = engine_out_override
+        acoustic_verification_required = bool(
+            generation_context is not None
+            and not os.environ.get("REELAI_SKIP_DOTENV")
+        )
         if engine_out is None:
-            engine_out = _run_clip(
-                v["url"], topic=topic, language=language,
-                should_cancel=should_cancel,
-                generation_context=generation_context,
-                deadline_monotonic=v.get("_deadline_monotonic"),
-                candidate_rank=v.get("_segment_candidate_rank"),
-                max_clips=v.get("_segment_max_candidates"),
-                retrieval_profile=str(v.get("_retrieval_profile") or "deep"),
-            )
+            audio_executor = None
+            audio_future = None
+            if acoustic_verification_required:
+                audio_executor = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="clip-audio-prepare"
+                )
+                audio_future = audio_executor.submit(
+                    clip_engine_silence.prepare_audio_source,
+                    str(v.get("url") or v.get("id") or ""),
+                    timeout_sec=10.0,
+                    cancel_check=should_cancel,
+                )
+            try:
+                engine_out = _run_clip(
+                    v["url"], topic=topic, language=language,
+                    should_cancel=should_cancel,
+                    generation_context=generation_context,
+                    deadline_monotonic=v.get("_deadline_monotonic"),
+                    candidate_rank=v.get("_segment_candidate_rank"),
+                    max_clips=v.get("_segment_max_candidates"),
+                    retrieval_profile=str(v.get("_retrieval_profile") or "deep"),
+                    knowledge_level=str(v.get("_knowledge_level") or ""),
+                )
+                if audio_future is not None:
+                    try:
+                        prepared_audio = audio_future.result(timeout=10.0)
+                    except Exception:
+                        prepared_audio = clip_engine_silence.AudioPreparationResult(
+                            "unavailable",
+                            diagnostics={"stage": "resolve", "reason": "prepare_failed"},
+                        )
+                    engine_out["_audio_preparation"] = prepared_audio
+            finally:
+                if audio_executor is not None:
+                    audio_executor.shutdown(wait=False, cancel_futures=True)
+        engine_out["_acoustic_verification_required"] = acoustic_verification_required
         transcript = engine_out["transcript"]
         query_plan = (
             v.get("_query_plan")
@@ -1672,17 +1915,43 @@ class IngestionPipeline:
                 clip, engine_out["transcript"], topic
             )
             informativeness = unit(clip.get("informativeness"), 0.5)
+            difficulty = unit(clip.get("difficulty"), 0.5)
             raw_topic_relevance = clip.get("topic_relevance")
             topic_relevance = (
                 lexical_relevance
                 if raw_topic_relevance is None
                 else unit(raw_topic_relevance, lexical_relevance)
             )
-            evidence = _topic_evidence(
-                transcript_texts[index],
-                topic_terms,
-                semantic_score=semantic_scores[index],
-            ) if topic_terms and trusted_transcript else []
+            selector_topic_contract = any(
+                key in clip
+                for key in (
+                    "directly_teaches_topic",
+                    "substantive",
+                    "topic_evidence_quote",
+                )
+            )
+            grounded_evidence_quote = ""
+            if selector_topic_contract:
+                grounded_evidence_quote = _grounded_topic_evidence_quote(
+                    transcript_texts[index], clip.get("topic_evidence_quote")
+                )
+                if (
+                    clip.get("directly_teaches_topic") is not True
+                    or clip.get("substantive") is not True
+                    or not grounded_evidence_quote
+                ):
+                    if generation_context is not None:
+                        generation_context.increment_counter("topic_rejections")
+                    continue
+                evidence = [grounded_evidence_quote]
+            else:
+                # Compatibility for legacy cached selector output. New selector
+                # responses always carry the grounded semantic contract above.
+                evidence = _topic_evidence(
+                    transcript_texts[index],
+                    topic_terms,
+                    semantic_score=semantic_scores[index],
+                ) if topic_terms and trusted_transcript else []
             if topic_terms and not evidence:
                 if generation_context is not None:
                     generation_context.increment_counter("topic_rejections")
@@ -1702,22 +1971,25 @@ class IngestionPipeline:
             search_context = {
                 **dict(v.get("_search_context") or {}),
                 "topic_evidence_terms": evidence[:8],
+                "directly_teaches_topic": bool(
+                    clip.get("directly_teaches_topic", bool(evidence))
+                ),
+                "substantive": bool(clip.get("substantive", bool(evidence))),
+                "topic_evidence_quote": grounded_evidence_quote,
+                "surface_eligible": True,
+                "deferred_level": abs(difficulty - level_target) > 0.35,
             }
             if has_selector_metadata:
                 importance = unit(clip.get("educational_importance"), 0.5)
                 boundary_confidence = unit(clip.get("boundary_confidence"), 0.5)
                 uncertainty = str(clip.get("uncertainty") or "low").strip().lower()
-                uncertainty_penalty = 0.08 if uncertainty == "medium" else 0.0
-                content_score = max(
-                    0.0,
-                    (
-                        0.45 * topic_relevance
-                        + 0.35 * importance
-                        + 0.20 * informativeness
-                    )
-                    - uncertainty_penalty,
+                uncertainty_penalty = 0.05 if uncertainty == "medium" else 0.0
+                content_score = (
+                    0.45 * topic_relevance
+                    + 0.35 * importance
+                    + 0.20 * informativeness
                 )
-                clip["score"] = content_score
+                clip["score"] = max(0.0, content_score - uncertainty_penalty)
                 prerequisite_ids = clip.get("prerequisite_ids")
                 source_namespace = str(v.get("id") or "unknown-video").strip()
 
@@ -1764,10 +2036,9 @@ class IngestionPipeline:
                     ],
                 )
             else:
-                difficulty = unit(clip.get("difficulty"), 0.5)
                 level_fit = 1.0 - abs(difficulty - level_target)
                 uncertainty_penalty = (
-                    0.08
+                    0.05
                     if str(clip.get("uncertainty") or "low").strip().lower()
                     == "medium"
                     else 0.0
@@ -1999,6 +2270,11 @@ class IngestionPipeline:
         )
 
         details = clip_details if isinstance(clip_details, dict) else {}
+        selection_context = (
+            dict(details.get("search_context") or {})
+            if isinstance(details.get("search_context"), dict)
+            else {}
+        )
         generated_takeaways = details.get("takeaways")
         takeaways: list[str] = []
         if isinstance(generated_takeaways, list):
@@ -2077,37 +2353,71 @@ class IngestionPipeline:
             upsert_video(conn, platform=adapter_result.platform, source_id=adapter_result.source_id, metadata=metadata)
 
             raise_if_cancelled(should_cancel)
-            reel_id = f"ingest-{uuid.uuid4().hex[:16]}"
-            inserted = upsert_reel_row(
+            selected_cue_ids = [
+                str(cue_id)
+                for cue_id in (details.get("cue_ids") or [])
+                if str(cue_id or "").strip()
+            ]
+            existing_candidate = load_reel_by_selection_candidate(
                 conn,
-                reel_id=reel_id,
                 material_id=effective_material_id,
                 concept_id=effective_concept_id,
                 video_id=video_id,
-                video_url=video_url,
-                t_start=clip_start,
-                t_end=clip_end,
-                transcript_snippet=snippet,
-                takeaways=takeaways,
-                base_score=float(chosen.score),
                 generation_id=generation_id,
-                difficulty=clip_difficulty,
-                ai_summary=ai_summary,
-                match_reason=match_reason,
-                informativeness=informativeness,
-                model_used=str(details.get("model_used") or ""),
-                quality_degraded=bool(details.get("quality_degraded", False)),
-                selected_cue_ids=[
-                    str(cue_id)
-                    for cue_id in (details.get("cue_ids") or [])
-                    if str(cue_id or "").strip()
-                ],
-                search_context=(
-                    dict(details.get("search_context") or {})
-                    if isinstance(details.get("search_context"), dict)
-                    else {}
+                selection_candidate_id=str(
+                    selection_context.get("selection_candidate_id") or ""
                 ),
             )
+            if existing_candidate:
+                reel_id = str(existing_candidate["id"])
+                existing_context = {}
+                try:
+                    existing_context = json.loads(
+                        str(existing_candidate.get("search_context_json") or "{}")
+                    )
+                except (TypeError, json.JSONDecodeError):
+                    pass
+                existing_surfaceable = (
+                    isinstance(existing_context, dict)
+                    and existing_context.get("surface_eligible") is True
+                )
+                incoming_surfaceable = selection_context.get("surface_eligible") is True
+                if incoming_surfaceable or not existing_surfaceable:
+                    update_reel_boundary_state(
+                        conn,
+                        reel_id=reel_id,
+                        video_url=video_url,
+                        t_start=clip_start,
+                        t_end=clip_end,
+                        transcript_snippet=snippet,
+                        selected_cue_ids=selected_cue_ids,
+                        search_context=selection_context,
+                    )
+                inserted = True
+            else:
+                reel_id = f"ingest-{uuid.uuid4().hex[:16]}"
+                inserted = upsert_reel_row(
+                    conn,
+                    reel_id=reel_id,
+                    material_id=effective_material_id,
+                    concept_id=effective_concept_id,
+                    video_id=video_id,
+                    video_url=video_url,
+                    t_start=clip_start,
+                    t_end=clip_end,
+                    transcript_snippet=snippet,
+                    takeaways=takeaways,
+                    base_score=float(chosen.score),
+                    generation_id=generation_id,
+                    difficulty=clip_difficulty,
+                    ai_summary=ai_summary,
+                    match_reason=match_reason,
+                    informativeness=informativeness,
+                    model_used=str(details.get("model_used") or ""),
+                    quality_degraded=bool(details.get("quality_degraded", False)),
+                    selected_cue_ids=selected_cue_ids,
+                    search_context=selection_context,
+                )
 
             if not inserted:
                 # Unique index collision — load the existing row and reuse it.
@@ -2161,11 +2471,6 @@ class IngestionPipeline:
             )
 
         attribution = format_attribution(metadata)
-        selection_context = (
-            dict(details.get("search_context") or {})
-            if isinstance(details.get("search_context"), dict)
-            else {}
-        )
         try:
             chain_position = float(selection_context.get("chain_position") or 0.0)
         except (TypeError, ValueError):

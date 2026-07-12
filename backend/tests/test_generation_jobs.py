@@ -100,6 +100,27 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
         conn.close()
 
 
+def test_request_key_version_invalidates_pre_acoustic_completed_inventory(monkeypatch) -> None:
+    params = {
+        "material_id": "material-1",
+        "concept_id": "concept-1",
+        "content_fingerprint": "fingerprint-1",
+        "knowledge_level": "beginner",
+        "generation_mode": "slow",
+        "creative_commons_only": False,
+        "source_duration": "medium",
+        "target_clip_duration_sec": 55,
+        "target_clip_duration_min_sec": 20,
+        "target_clip_duration_max_sec": 55,
+    }
+    verified_key = jobs.build_request_key(**params)
+    monkeypatch.setattr(
+        jobs, "REQUEST_SCHEMA_VERSION", "generation-request-v3-confidence-clipping"
+    )
+
+    assert jobs.build_request_key(**params) != verified_key
+
+
 def test_sqlite_init_migrates_legacy_job_and_metadata_tables(tmp_path, monkeypatch) -> None:
     path = tmp_path / "studyreels.db"
     legacy = sqlite3.connect(path)

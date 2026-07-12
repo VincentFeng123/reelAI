@@ -1114,3 +1114,140 @@ def test_next_session_backfill_observes_cancellation_before_any_write(conn) -> N
     assert conn.execute(
         "SELECT COUNT(*) FROM assessment_sessions WHERE status = 'pending'"
     ).fetchone()[0] == 0
+
+
+def _seed_promotion_outcome(
+    conn,
+    *,
+    index: int,
+    correct: int = 3,
+    adjustment: float = 0.08,
+) -> None:
+    concept_id = f"promotion-c{index}"
+    _seed_reel(
+        conn,
+        reel_id=f"promotion-r{index}",
+        concept_id=concept_id,
+        video_id=f"promotion-v{index}",
+        with_question=False,
+    )
+    session_id = f"promotion-session-{index}"
+    created_at = f"2026-07-10T00:0{index}:00+00:00"
+    _seed_completed_accuracy(
+        conn,
+        session_id=session_id,
+        correct_count=correct,
+        question_count=3,
+        completed_at=created_at,
+    )
+    conn.execute(
+        "INSERT INTO assessment_concept_outcomes "
+        "(learner_id, session_id, material_id, concept_id, question_count, "
+        "correct_count, accuracy, adjustment, created_at) "
+        "VALUES (?, ?, ?, ?, 3, ?, ?, ?, ?)",
+        (
+            LEARNER,
+            session_id,
+            MATERIAL,
+            concept_id,
+            correct,
+            correct / 3,
+            adjustment,
+            created_at,
+        ),
+    )
+
+
+def test_auto_promotion_requires_sustained_broad_mastery_and_never_demotes(conn) -> None:
+    service = AssessmentService()
+    service._ensure_learner_progress(conn, LEARNER, MATERIAL)
+    conn.execute(
+        "UPDATE learner_material_progress SET difficulty_reset_at = ? "
+        "WHERE learner_id = ? AND material_id = ?",
+        ("2026-07-09T00:00:00+00:00", LEARNER, MATERIAL),
+    )
+    for index in range(3):
+        _seed_promotion_outcome(conn, index=index)
+
+    promoted = service._maybe_auto_promote_level(
+        conn,
+        learner_id=LEARNER,
+        material_id=MATERIAL,
+        promoted_at="2026-07-11T00:00:00+00:00",
+    )
+    assert promoted == "intermediate"
+    progress = conn.execute(
+        "SELECT selected_level, global_adjustment FROM learner_material_progress "
+        "WHERE learner_id = ? AND material_id = ?",
+        (LEARNER, MATERIAL),
+    ).fetchone()
+    assert tuple(progress) == ("intermediate", 0.0)
+
+    conn.execute(
+        "UPDATE learner_material_progress SET selected_level = 'advanced' "
+        "WHERE learner_id = ? AND material_id = ?",
+        (LEARNER, MATERIAL),
+    )
+    assert service._maybe_auto_promote_level(
+        conn,
+        learner_id=LEARNER,
+        material_id=MATERIAL,
+        promoted_at="2026-07-12T00:00:00+00:00",
+    ) is None
+    assert conn.execute(
+        "SELECT selected_level FROM learner_material_progress "
+        "WHERE learner_id = ? AND material_id = ?",
+        (LEARNER, MATERIAL),
+    ).fetchone()[0] == "advanced"
+
+
+def test_auto_promotion_is_blocked_by_recent_negative_outcome(conn) -> None:
+    service = AssessmentService()
+    service._ensure_learner_progress(conn, LEARNER, MATERIAL)
+    conn.execute(
+        "UPDATE learner_material_progress SET difficulty_reset_at = ? "
+        "WHERE learner_id = ? AND material_id = ?",
+        ("2026-07-09T00:00:00+00:00", LEARNER, MATERIAL),
+    )
+    for index in range(3):
+        _seed_promotion_outcome(
+            conn,
+            index=index,
+            correct=2 if index == 2 else 3,
+            adjustment=-0.12 if index == 2 else 0.08,
+        )
+    assert service._maybe_auto_promote_level(
+        conn,
+        learner_id=LEARNER,
+        material_id=MATERIAL,
+        promoted_at="2026-07-11T00:00:00+00:00",
+    ) is None
+    assert conn.execute(
+        "SELECT selected_level FROM learner_material_progress "
+        "WHERE learner_id = ? AND material_id = ?",
+        (LEARNER, MATERIAL),
+    ).fetchone()[0] == "beginner"
+
+
+def test_auto_promotion_does_not_require_three_separate_sessions(conn) -> None:
+    service = AssessmentService()
+    service._ensure_learner_progress(conn, LEARNER, MATERIAL)
+    conn.execute(
+        "UPDATE learner_material_progress SET difficulty_reset_at = ? "
+        "WHERE learner_id = ? AND material_id = ?",
+        ("2026-07-09T00:00:00+00:00", LEARNER, MATERIAL),
+    )
+    for index in range(3):
+        _seed_promotion_outcome(conn, index=index)
+    conn.execute(
+        "UPDATE assessment_concept_outcomes SET session_id = ? "
+        "WHERE learner_id = ? AND material_id = ?",
+        ("promotion-session-0", LEARNER, MATERIAL),
+    )
+
+    assert service._maybe_auto_promote_level(
+        conn,
+        learner_id=LEARNER,
+        material_id=MATERIAL,
+        promoted_at="2026-07-11T00:00:00+00:00",
+    ) == "intermediate"

@@ -143,13 +143,35 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
         self.assertEqual([item["reel_id"] for item in ordered], ["safe", "unsafe"])
 
-    def test_same_video_penalty_is_soft_and_exactly_point_zero_eight(self) -> None:
+    def test_source_diversity_does_not_override_stronger_content(self) -> None:
         items = [
             self._selection_item(
                 "first", video_id="video-a", start=10, content_score=1.0,
             ),
             self._selection_item(
                 "same-video", video_id="video-a", start=40, content_score=0.92,
+            ),
+            self._selection_item(
+                "other-video", video_id="video-b", start=10, content_score=0.86,
+            ),
+        ]
+
+        ordered = self.service.adaptive_curriculum_order(
+            self.conn, self.MATERIAL, self.LEARNER, items,
+        )
+
+        self.assertEqual(
+            [item["reel_id"] for item in ordered],
+            ["first", "same-video", "other-video"],
+        )
+
+    def test_source_diversity_breaks_an_exact_priority_tie(self) -> None:
+        items = [
+            self._selection_item(
+                "first", video_id="video-a", start=10, content_score=1.0,
+            ),
+            self._selection_item(
+                "same-video", video_id="video-a", start=40, content_score=0.86,
             ),
             self._selection_item(
                 "other-video", video_id="video-b", start=10, content_score=0.86,
@@ -330,14 +352,36 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
         beginner = self._ranked()
         self.assertEqual([item["reel_id"] for item in beginner], ["easy", "hard"])
-        self.assertAlmostEqual(beginner[0]["score"], 0.86)
+        self.assertAlmostEqual(beginner[0]["score"], 0.83)
 
         self.service.set_learner_level(
             self.conn, self.MATERIAL, self.LEARNER, "advanced",
         )
         advanced = self._ranked()
         self.assertEqual([item["reel_id"] for item in advanced], ["hard", "easy"])
-        self.assertAlmostEqual(advanced[0]["score"], 0.86)
+        self.assertAlmostEqual(advanced[0]["score"], 0.83)
+
+    def test_ranked_feed_excludes_unversioned_acoustic_unavailable_row(self) -> None:
+        self.conn.execute(
+            "INSERT INTO reels "
+            "(id, generation_id, material_id, concept_id, video_id, video_url, "
+            "t_start, t_end, transcript_snippet, takeaways_json, base_score, difficulty, "
+            "informativeness, search_context_json, created_at) "
+            "VALUES ('deferred', 'selection-generation', ?, 'c1', 'video-a', "
+            "'https://youtube.test/video-a', 10, 30, "
+            "'Chemical bonding explains electron sharing.', '[]', 1, 0.2, 1, ?, "
+            "'2026-07-12T00:00:00+00:00')",
+            (
+                self.MATERIAL,
+                json.dumps({
+                    "selection_candidate_id": "video-a::legacy",
+                    "surface_eligible": False,
+                    "boundary_status": "unavailable",
+                }),
+            ),
+        )
+
+        self.assertEqual(self._ranked(), [])
 
 
 if __name__ == "__main__":

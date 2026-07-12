@@ -23,8 +23,6 @@ _BOOST_PATTERNS = [
     re.compile(r'\bintroduction\b|\bintro\s+to\b', re.I),
     re.compile(r'\bbasics\b', re.I),
     re.compile(r'\bfundamentals\b', re.I),
-    re.compile(r'\bprofessor\b', re.I),
-    re.compile(r'\buniversity\b', re.I),
     re.compile(r'\bdocumentary\b', re.I),
     re.compile(r'\bcrash\s+course\b', re.I),
     re.compile(r'\bkhan\s+academy\b', re.I),

@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from pydantic import BaseModel
 
 from backend.app import main
+from backend.app.config import Settings
 from backend.app.models import ChatRequest
 from backend.app.services import llm_router
 from backend.app.services.material_intelligence import MaterialIntelligenceService
@@ -16,6 +17,11 @@ from backend.app.services.material_intelligence import MaterialIntelligenceServi
 
 class StructuredPayload(BaseModel):
     value: str
+
+
+def test_text_llm_defaults_use_current_stable_flash() -> None:
+    assert llm_router.GEMINI_DEFAULT_MODEL == "gemini-3.5-flash"
+    assert Settings.model_fields["gemini_model"].default == "gemini-3.5-flash"
 
 
 def _clear_text_provider_env(monkeypatch) -> None:

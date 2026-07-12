@@ -298,6 +298,83 @@ def load_existing_reel(
     return row
 
 
+def load_reel_by_selection_candidate(
+    conn: Any,
+    *,
+    material_id: str,
+    concept_id: str,
+    video_id: str,
+    generation_id: str | None,
+    selection_candidate_id: str,
+) -> dict[str, Any] | None:
+    """Find a previously stored acoustic state for the same selector candidate.
+
+    Timestamps cannot identify the row because successful acoustic verification
+    intentionally adjusts them. Candidate identity is scoped to one generation,
+    concept, and source so promotion can update the existing reel safely.
+    """
+    candidate_id = str(selection_candidate_id or "").strip()
+    if not candidate_id:
+        return None
+    rows = fetch_all(
+        conn,
+        """
+        SELECT id, video_url, t_start, t_end, search_context_json
+          FROM reels
+         WHERE material_id = ?
+           AND concept_id = ?
+           AND video_id = ?
+           AND COALESCE(generation_id, '') = COALESCE(?, '')
+         ORDER BY created_at DESC
+        """,
+        (material_id, concept_id, video_id, generation_id),
+    )
+    for row in rows:
+        context = loads_json(str(row.get("search_context_json") or "{}"), {})
+        if (
+            isinstance(context, dict)
+            and str(context.get("selection_candidate_id") or "").strip() == candidate_id
+        ):
+            return row
+    return None
+
+
+def update_reel_boundary_state(
+    conn: Any,
+    *,
+    reel_id: str,
+    video_url: str,
+    t_start: float,
+    t_end: float,
+    transcript_snippet: str,
+    selected_cue_ids: list[str],
+    search_context: dict[str, Any],
+) -> None:
+    """Promote/defer a candidate in place without changing its public reel id."""
+    execute_modify(
+        conn,
+        """
+        UPDATE reels
+           SET video_url = ?,
+               t_start = ?,
+               t_end = ?,
+               transcript_snippet = ?,
+               selected_cue_ids_json = ?,
+               search_context_json = ?
+         WHERE id = ?
+        """,
+        (
+            video_url,
+            float(t_start),
+            float(t_end),
+            str(transcript_snippet or "")[:7000],
+            dumps_json(list(selected_cue_ids or [])),
+            dumps_json(dict(search_context or {})),
+            reel_id,
+        ),
+    )
+
+
 def upsert_reel_row(
     conn: Any,
     *,
@@ -688,6 +765,8 @@ __all__ = [
     "upsert_video",
     "upsert_reel_row",
     "load_existing_reel",
+    "load_reel_by_selection_candidate",
+    "update_reel_boundary_state",
     "load_reel_row_by_id",
     "store_ingest_metadata_blob",
     "load_ingest_metadata_blob",

@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -220,6 +221,87 @@ class PersistenceIntegrityTests(unittest.TestCase):
                     clip_window=(1.0, 2.0),
                     target_max=60,
                 )
+
+    def test_verified_retry_promotes_deferred_candidate_without_changing_reel_id(self) -> None:
+        with db_module.get_conn(transactional=True) as conn:
+            self._seed_identity(conn, "material-a", "concept-a")
+
+        pipeline = pipeline_module.IngestionPipeline(
+            youtube_service=None,
+            embedding_service=None,
+            serverless_mode=False,
+        )
+        adapter_result = YouTubeSourceRef(
+            source_id="video-a",
+            source_url="https://www.youtube.com/watch?v=video-a",
+            playback_url="https://www.youtube.com/embed/video-a",
+        )
+        metadata = IngestMetadata(
+            platform="yt",
+            source_id="video-a",
+            source_url=adapter_result.source_url,
+            playback_url=adapter_result.playback_url,
+            title="Video A",
+        )
+        candidate_id = "video-a::candidate-1"
+        deferred = pipeline._persist_ingest(
+            adapter_result=adapter_result,
+            metadata=metadata,
+            cues=[],
+            chosen=IngestSegment(t_start=10.0, t_end=20.0, text="snippet"),
+            snippet="rough snippet",
+            material_id="material-a",
+            concept_id="concept-a",
+            clip_window=(10.0, 20.0),
+            target_max=60,
+            generation_id="generation-a",
+            clip_details={
+                "cue_ids": ["cue-1"],
+                "search_context": {
+                    "selection_candidate_id": candidate_id,
+                    "surface_eligible": False,
+                    "boundary_status": "unavailable",
+                },
+            },
+        )
+        verified = pipeline._persist_ingest(
+            adapter_result=adapter_result,
+            metadata=metadata,
+            cues=[],
+            chosen=IngestSegment(t_start=9.9, t_end=20.2, text="snippet"),
+            snippet="verified snippet",
+            material_id="material-a",
+            concept_id="concept-a",
+            clip_window=(9.9, 20.2),
+            target_max=60,
+            generation_id="generation-a",
+            clip_details={
+                "cue_ids": ["cue-1"],
+                "search_context": {
+                    "selection_candidate_id": candidate_id,
+                    "surface_eligible": True,
+                    "boundary_status": "verified",
+                },
+            },
+        )
+
+        self.assertEqual(verified.reel_id, deferred.reel_id)
+        self.assertEqual((verified.t_start, verified.t_end), (9.9, 20.2))
+        with db_module.get_conn() as conn:
+            rows = db_module.fetch_all(
+                conn,
+                "SELECT id, video_url, t_start, t_end, transcript_snippet, "
+                "search_context_json FROM reels WHERE generation_id = ?",
+                ("generation-a",),
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["id"], deferred.reel_id)
+        self.assertEqual((rows[0]["t_start"], rows[0]["t_end"]), (9.9, 20.2))
+        self.assertIn("start=9&end=21", rows[0]["video_url"])
+        self.assertEqual(rows[0]["transcript_snippet"], "verified snippet")
+        context = json.loads(rows[0]["search_context_json"])
+        self.assertTrue(context["surface_eligible"])
+        self.assertEqual(context["boundary_status"], "verified")
 
 
 if __name__ == "__main__":

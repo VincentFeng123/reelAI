@@ -198,8 +198,13 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
                         "facet": "variables",
                             "informativeness": 0.95,
                             "topic_relevance": 0.99,
-                            "educational_importance": 0.97,
-                            "self_contained": True,
+                                "educational_importance": 0.97,
+                                "directly_teaches_topic": True,
+                                "substantive": True,
+                                "topic_evidence_quote": (
+                                    "Python variables store values such as numbers and strings"
+                                ),
+                                "self_contained": True,
                             "is_standalone": True,
                             "prerequisite_candidate_ids": [],
                         "difficulty": 0.1,

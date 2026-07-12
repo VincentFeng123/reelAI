@@ -410,6 +410,149 @@ test("transient stream and status failures reconnect to the durable job", TEST_O
   }
 });
 
+test("feed-owned durable jobs resume without a redundant generation POST", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  let generateCalls = 0;
+  let streamCalls = 0;
+
+  global.fetch = async (url) => {
+    if (String(url).includes("/reels/generate")) {
+      generateCalls += 1;
+      throw new Error("resume must not submit a new generation job");
+    }
+    if (!String(url).includes("/reels/generation-stream/job-from-feed")) {
+      throw new Error(`Unexpected request: ${url}`);
+    }
+    streamCalls += 1;
+    const events = [
+      {
+        job_id: "job-from-feed",
+        seq: 1,
+        timestamp: "2026-07-10T00:00:00Z",
+        type: "final",
+        payload: { reels: [], authoritative: true },
+      },
+      {
+        job_id: "job-from-feed",
+        seq: 2,
+        timestamp: "2026-07-10T00:00:01Z",
+        type: "terminal",
+        payload: { status: "completed" },
+      },
+    ];
+    return new Response(
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+      { status: 200, headers: { "Content-Type": "application/x-ndjson" } },
+    );
+  };
+
+  try {
+    const response = await generateReelsStream({
+      materialId: "material-stream-test",
+      generationJobId: "job-from-feed",
+    });
+    assert.deepEqual(response.reels, []);
+    assert.equal(generateCalls, 0);
+    assert.equal(streamCalls, 1);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test("idle streams reconnect to the same durable job without cancelling it", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const originalWindow = global.window;
+  let streamCalls = 0;
+  let statusCalls = 0;
+  let cancelCalls = 0;
+  let durableJobCancelCalls = 0;
+  const reconnectWindows = [];
+
+  global.window = {
+    setTimeout(callback, delay, ...args) {
+      return setTimeout(callback, delay === 400 || delay === 401 ? 1 : delay, ...args);
+    },
+    clearTimeout,
+  };
+  global.fetch = async (url) => {
+    if (String(url).includes("/generation-jobs/") && String(url).endsWith("/cancel")) {
+      durableJobCancelCalls += 1;
+      throw new Error("the idle watchdog must not cancel the durable job");
+    }
+    if (String(url).includes("/reels/generate")) {
+      throw new Error("resume must not submit a new generation job");
+    }
+    if (String(url).includes("/reels/generation-status/")) {
+      statusCalls += 1;
+      return new Response(JSON.stringify({
+        job_id: "job-idle-resume",
+        status: "running",
+        material_id: "material-stream-test",
+        request_key: "request-stream-test",
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (!String(url).includes("/reels/generation-stream/job-idle-resume")) {
+      throw new Error(`Unexpected request: ${url}`);
+    }
+    streamCalls += 1;
+    if (streamCalls === 1) {
+      return new Response(new ReadableStream({
+        cancel() {
+          cancelCalls += 1;
+        },
+      }), {
+        status: 200,
+        headers: { "Content-Type": "application/x-ndjson" },
+      });
+    }
+    const events = [
+      {
+        job_id: "job-idle-resume",
+        seq: 1,
+        timestamp: "2026-07-10T00:00:00Z",
+        type: "final",
+        payload: { reels: [], authoritative: true },
+      },
+      {
+        job_id: "job-idle-resume",
+        seq: 2,
+        timestamp: "2026-07-10T00:00:01Z",
+        type: "terminal",
+        payload: { status: "completed" },
+      },
+    ];
+    return new Response(
+      `${events.map((event) => JSON.stringify(event)).join("\n")}\n`,
+      { status: 200, headers: { "Content-Type": "application/x-ndjson" } },
+    );
+  };
+
+  try {
+    const response = await generateReelsStream({
+      materialId: "material-stream-test",
+      generationJobId: "job-idle-resume",
+      idleTimeoutMs: 20,
+      onReconnect: (windowCount) => reconnectWindows.push(windowCount),
+    });
+    assert.deepEqual(response.reels, []);
+    assert.equal(streamCalls, 2);
+    assert.equal(statusCalls, 1);
+    assert.equal(cancelCalls, 1);
+    assert.equal(durableJobCancelCalls, 0);
+    assert.deepEqual(reconnectWindows, [1]);
+  } finally {
+    global.fetch = originalFetch;
+    if (originalWindow === undefined) {
+      delete global.window;
+    } else {
+      global.window = originalWindow;
+    }
+  }
+});
+
 test("terminal stream events cancel and release an unfinished response body", TEST_OPTIONS, async () => {
   const originalFetch = global.fetch;
   const encoder = new TextEncoder();

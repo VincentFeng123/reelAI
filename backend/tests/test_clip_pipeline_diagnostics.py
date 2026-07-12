@@ -270,6 +270,218 @@ def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypat
     assert counters["persisted_clips"] == 1
 
 
+def test_acoustic_gate_stores_deferred_but_emits_only_verified_valid_clip(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("REELAI_SKIP_DOTENV", raising=False)
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:acoustic",
+        "duration": 30.0,
+        "segments": [
+            {"cue_id": "one", "start": 0.0, "end": 10.0, "text": "Python functions package reusable instructions for later calls."},
+            {"cue_id": "two", "start": 10.0, "end": 20.0, "text": "Python loops repeat a block while a condition remains true."},
+            {"cue_id": "three", "start": 20.0, "end": 30.0, "text": "Python dictionaries connect unique keys to stored values."},
+        ],
+    }
+    clips = []
+    for index, (cue_id, quote) in enumerate(
+        [
+            ("one", "Python functions package reusable instructions for later calls"),
+            ("two", "Python loops repeat a block while a condition remains true"),
+            ("three", "Python dictionaries connect unique keys to stored values"),
+        ]
+    ):
+        clips.append({
+            "start": float(index * 10),
+            "end": float((index + 1) * 10),
+            "cue_ids": [cue_id],
+            "informativeness": 0.9 - index * 0.1,
+            "topic_relevance": 0.9 - index * 0.1,
+            "educational_importance": 0.9 - index * 0.1,
+            "difficulty": 0.2,
+            "boundary_confidence": 0.9,
+            "is_standalone": True,
+            "selection_candidate_id": cue_id,
+            "prerequisite_ids": [],
+            "uncertainty": "low",
+            "directly_teaches_topic": True,
+            "substantive": True,
+            "topic_evidence_quote": quote,
+        })
+    engine_out = {"clips": clips, "transcript": transcript, "notes": ""}
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a"
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=prepared),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        mock.Mock(side_effect=[
+            pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                "unavailable", 0.0, 10.0, {"reason": "start_silence_not_found"}
+            ),
+            pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                "verified", 10.0, 190.1, {}
+            ),
+            pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                "verified", 19.9, 30.2, {}
+            ),
+        ]),
+    )
+    persisted_clips: list[dict] = []
+
+    def persist(*, clip, **_kwargs):
+        persisted_clips.append(clip)
+        return (
+            "verified-reel" if clip["search_context"]["surface_eligible"] else "deferred-reel",
+            mock.sentinel.metadata,
+        )
+
+    pipeline = _pipeline()
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    emitted: list[str] = []
+    context = GenerationContext("slow")
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        retrieval_profile="bootstrap",
+        max_videos=1,
+        max_reels=1,
+        on_reel_created=emitted.append,
+    )
+
+    assert reels == ["verified-reel"]
+    assert emitted == ["verified-reel"]
+    assert len(persisted_clips) == 3
+    assert persisted_clips[0]["search_context"]["boundary_status"] == "unavailable"
+    assert persisted_clips[0]["search_context"]["surface_eligible"] is False
+    assert persisted_clips[1]["search_context"]["surface_reason"] == (
+        "acoustic_boundary_duration_invalid"
+    )
+    assert persisted_clips[1]["start"] == 10.0
+    assert persisted_clips[1]["end"] == 20.0
+    assert persisted_clips[2]["start"] == 19.9
+    assert persisted_clips[2]["end"] == 30.2
+    assert context.counters()["stored_clips"] == 3
+    assert context.counters()["deferred_clips"] == 2
+    assert context.counters()["persisted_clips"] == 1
+
+
+def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        main,
+        "fetch_all",
+        lambda *_args, **_kwargs: [
+            {"search_context_json": '{"surface_eligible": false}'},
+            {"search_context_json": '{"surface_eligible": "false"}'},
+            {"search_context_json": '{"surface_eligible": true, "boundary_status": "unavailable"}'},
+            {"search_context_json": '{"surface_eligible": true, "boundary_status": "verified"}'},
+        ],
+    )
+
+    assert main._count_generation_reels(object(), "generation") == 1
+
+
+def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:biology",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "logistics",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "Welcome to biology at Stanford University and review the course grading policy today.",
+            },
+            {
+                "cue_id": "teaching",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "Cells convert nutrient energy into ATP through a sequence of enzyme controlled reactions.",
+            },
+        ],
+    }
+    engine_out = {
+        "clips": [
+            {
+                "start": 0.0,
+                "end": 10.0,
+                "cue_ids": ["logistics"],
+                "informativeness": 0.0,
+                "topic_relevance": 0.0,
+                "educational_importance": 0.0,
+                "difficulty": 0.1,
+                "boundary_confidence": 0.9,
+                "is_standalone": True,
+                "selection_candidate_id": "logistics",
+                "prerequisite_ids": [],
+                "uncertainty": "low",
+                "directly_teaches_topic": False,
+                "substantive": False,
+                "topic_evidence_quote": "Welcome to biology at Stanford University",
+            },
+            {
+                "start": 10.0,
+                "end": 20.0,
+                "cue_ids": ["teaching"],
+                "informativeness": 0.0,
+                "topic_relevance": 0.0,
+                "educational_importance": 0.0,
+                "difficulty": 0.8,
+                "boundary_confidence": 0.9,
+                "is_standalone": True,
+                "selection_candidate_id": "cell-energy",
+                "prerequisite_ids": [],
+                "uncertainty": "medium",
+                "directly_teaches_topic": True,
+                "substantive": True,
+                "topic_evidence_quote": (
+                    "Cells convert nutrient energy into ATP through a sequence of enzyme controlled reactions"
+                ),
+            },
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    video = {
+        **_video(),
+        "_topic_terms": ["biology"],
+        "_knowledge_level": "beginner",
+    }
+
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(
+        video, "biology", "en"
+    )
+
+    assert [clip["selection_candidate_id"] for clip in clips] == [
+        "dQw4w9WgXcQ::cell-energy"
+    ]
+    assert clips[0]["score"] == 0.0
+    assert clips[0]["search_context"]["topic_evidence_quote"].startswith("Cells convert")
+    assert clips[0]["search_context"]["deferred_level"] is True
+
+
 @pytest.mark.parametrize(
     ("knowledge_level", "expected_start"),
     [("beginner", 0.0), ("advanced", 10.0)],

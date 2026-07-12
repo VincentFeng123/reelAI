@@ -155,6 +155,7 @@ from .services.generation_jobs import (
     build_request_key as build_durable_request_key,
     cancellation_requested as generation_cancellation_requested,
     expire_stale_queued_job as expire_stale_generation_job,
+    find_active_job as find_active_generation_job,
     find_completed_job as find_completed_generation_job,
     get_job as get_generation_job,
     heartbeat_job as heartbeat_generation_job,
@@ -2556,8 +2557,39 @@ def _shape_reels_for_request_context(
 
 
 def _count_generation_reels(conn, generation_id: str) -> int:
-    row = fetch_one(conn, "SELECT COUNT(*) AS reel_count FROM reels WHERE generation_id = ?", (generation_id,))
-    return max(0, int((row or {}).get("reel_count") or 0))
+    try:
+        rows = fetch_all(
+            conn,
+            "SELECT search_context_json FROM reels WHERE generation_id = ?",
+            (generation_id,),
+        )
+    except Exception as exc:
+        if "search_context_json" not in str(exc).lower():
+            raise
+        legacy = fetch_one(
+            conn,
+            "SELECT COUNT(*) AS reel_count FROM reels WHERE generation_id = ?",
+            (generation_id,),
+        )
+        return max(0, int((legacy or {}).get("reel_count") or 0))
+    count = 0
+    for row in rows:
+        try:
+            context = json.loads(str(row.get("search_context_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            context = {}
+        if isinstance(context, dict):
+            surface_eligible = context.get("surface_eligible", True)
+            if isinstance(surface_eligible, str):
+                surface_eligible = surface_eligible.strip().lower() in {
+                    "1", "true", "yes", "on",
+                }
+            if not surface_eligible:
+                continue
+            if str(context.get("boundary_status") or "").strip().lower() == "unavailable":
+                continue
+        count += 1
+    return count
 
 
 def _fetch_generation_row(conn, generation_id: str | None) -> dict[str, Any] | None:
@@ -2755,6 +2787,79 @@ def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
 
     collect(generation_id)
     return ordered
+
+
+def _verified_cross_request_source_generation(
+    conn,
+    *,
+    material_id: str,
+    learner_id: str,
+    request_key: str,
+    concept_id: str | None,
+) -> str | None:
+    """Return the newest other-request inventory only when its whole chain is verified."""
+    candidate = fetch_one(
+        conn,
+        """
+        SELECT result_generation_id
+        FROM reel_generation_jobs
+        WHERE material_id = ?
+          AND learner_id = ?
+          AND request_key <> ?
+          AND ((? IS NULL AND concept_id IS NULL) OR concept_id = ?)
+          AND status IN ('completed', 'partial')
+          AND result_generation_id IS NOT NULL
+          AND TRIM(result_generation_id) <> ''
+        ORDER BY completed_at DESC, updated_at DESC, created_at DESC, id DESC
+        LIMIT 1
+        """,
+        (material_id, learner_id, request_key, concept_id, concept_id),
+    )
+    generation_id = str((candidate or {}).get("result_generation_id") or "").strip()
+    if not generation_id:
+        return None
+    generation_ids = _response_generation_ids(conn, generation_id)
+    if not generation_ids:
+        return None
+
+    placeholders = ", ".join("?" for _ in generation_ids)
+    generation_rows = fetch_all(
+        conn,
+        f"SELECT id, material_id FROM reel_generations WHERE id IN ({placeholders})",
+        tuple(generation_ids),
+    )
+    if (
+        {str(row.get("id") or "") for row in generation_rows} != set(generation_ids)
+        or any(str(row.get("material_id") or "") != material_id for row in generation_rows)
+    ):
+        return None
+
+    reel_rows = fetch_all(
+        conn,
+        f"SELECT search_context_json FROM reels WHERE generation_id IN ({placeholders})",
+        tuple(generation_ids),
+    )
+    verified_surfaceable_count = 0
+    for row in reel_rows:
+        try:
+            context = json.loads(str(row.get("search_context_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(context, dict):
+            return None
+        if "surface_eligible" not in context:
+            return None
+        surface_eligible = context.get("surface_eligible")
+        if isinstance(surface_eligible, str):
+            surface_eligible = surface_eligible.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        if not surface_eligible:
+            continue
+        if str(context.get("boundary_status") or "").strip().lower() != "verified":
+            return None
+        verified_surfaceable_count += 1
+    return generation_id if verified_surfaceable_count else None
 
 
 def _finalize_request_reel_order(
@@ -3317,13 +3422,27 @@ def _run_leased_generation_job(
                 _count_generation_reels(conn, source_id)
                 for source_id in source_generation_ids
             )
+            source_generation_row = _fetch_generation_row(
+                conn,
+                str(job_row.get("source_generation_id") or "").strip() or None,
+            )
+            if (
+                source_generation_row
+                and str(source_generation_row.get("request_key") or "")
+                != str(job_row.get("request_key") or "")
+            ):
+                source_reel_count = min(
+                    source_reel_count,
+                    max(0, requested_count - 2),
+                )
             emitted: set[tuple[str, str]] = set()
+            candidate_event_cap = 2 if mode == "fast" else requested_count
 
             def on_candidate(reel: dict[str, Any]) -> None:
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
                 identity = _reel_identity_key(reel)
-                if identity in emitted or len(emitted) >= 2:
+                if identity in emitted or len(emitted) >= candidate_event_cap:
                     return
                 emitted.add(identity)
                 append_generation_event(
@@ -4773,6 +4892,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
         )
         source_generation_id: str | None = None
         completed_job = find_completed_generation_job(conn, request_key)
+        active_job = find_active_generation_job(conn, request_key)
         if completed_job:
             cached_reels = _generation_job_reels(conn, completed_job)
             if len(cached_reels) >= requested_num_reels:
@@ -4783,6 +4903,14 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 }
             source_generation_id = (
                 str(completed_job.get("result_generation_id") or "").strip() or None
+            )
+        elif not active_job:
+            source_generation_id = _verified_cross_request_source_generation(
+                conn,
+                material_id=payload.material_id,
+                learner_id=learner_id,
+                request_key=request_key,
+                concept_id=payload.concept_id,
             )
         request_params = {
             "material_id": payload.material_id,
@@ -5533,19 +5661,25 @@ def feed(
             target_clip_duration_max_sec=safe_clip_max,
         )
         completed_job = find_completed_generation_job(conn, request_key)
-        active_job = fetch_one(
-            conn,
-            """
-            SELECT * FROM reel_generation_jobs
-            WHERE request_key = ? AND status IN ('queued', 'running')
-            ORDER BY created_at LIMIT 1
-            """,
-            (request_key,),
-        )
+        active_job = find_active_generation_job(conn, request_key)
+        cross_request_source = False
         generation_id = str((completed_job or {}).get("result_generation_id") or "") or None
         if generation_id is None:
             head = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
             generation_id = str((head or {}).get("id") or "") or None
+        if generation_id is None and active_job:
+            generation_id = (
+                str(active_job.get("source_generation_id") or "").strip() or None
+            )
+        if generation_id is None and not completed_job and not active_job:
+            generation_id = _verified_cross_request_source_generation(
+                conn,
+                material_id=material_id,
+                learner_id=learner_id,
+                request_key=request_key,
+                concept_id=None,
+            )
+            cross_request_source = generation_id is not None
         ranked = _ranked_request_reels(
             conn,
             material_id=material_id,
@@ -5565,6 +5699,7 @@ def feed(
         page_start = (page - 1) * limit
         page_end = page_start + limit
         sparse = len(ranked) < page_end
+        unseen_ready = max(0, len(ranked) - page_end)
         material_count = int(
             (
                 fetch_one(
@@ -5576,12 +5711,17 @@ def feed(
             ).get("reel_count")
             or 0
         )
-        if autofill and sparse and material_count < MAX_REELS_PER_MATERIAL:
+        if (
+            autofill
+            and (cross_request_source or sparse or unseen_ready <= 4)
+            and material_count < MAX_REELS_PER_MATERIAL
+        ):
             target_total = min(
                 MAX_REELS_PER_MATERIAL,
                 max(
-                    page_end + prefetch,
-                    material_count + max(limit, prefetch),
+                    12,
+                    page_end + 4,
+                    len(ranked) + max(limit, prefetch),
                 ),
             )
             active_job, _created = submit_generation_job(

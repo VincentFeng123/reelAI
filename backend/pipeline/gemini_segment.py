@@ -150,6 +150,9 @@ class _BoundaryTopic(_StrictModel):
     topic_relevance: float = Field(ge=0.0, le=1.0, strict=True)
     educational_importance: float = Field(ge=0.0, le=1.0, strict=True)
     difficulty: float = Field(ge=0.0, le=1.0, strict=True)
+    directly_teaches_topic: bool = Field(strict=True)
+    substantive: bool = Field(strict=True)
+    topic_evidence_quote: _NonBlank
     self_contained: bool = Field(strict=True)
     is_standalone: bool = Field(strict=True)
     prerequisite_candidate_ids: list[_NonBlank] = Field(max_length=8)
@@ -295,7 +298,21 @@ def _topic_rule(topic: str) -> str:
         return "No topic filter was supplied; return every substantive educational unit."
     return (
         f"The viewer is studying {topic!r}. Return only units that directly teach that "
-        "topic, and make each learning objective name the relevant idea."
+        "topic, and make each learning objective name the relevant idea. Set "
+        "directly_teaches_topic=true only when the selected transcript span itself teaches "
+        "the requested subject, not when it merely names the subject, course, institution, "
+        "or speaker."
+    )
+
+
+def _learner_rule(level: str) -> str:
+    normalized = " ".join(str(level or "").split()).casefold()
+    if normalized not in {"beginner", "intermediate", "advanced"}:
+        return ""
+    return (
+        f"The viewer's current level is {normalized}. Prefer explanations whose assumed prior "
+        "knowledge fits that level, while keeping topic relevance and educational substance "
+        "authoritative."
     )
 
 
@@ -303,7 +320,9 @@ def _selection_fields(*, enriched: bool) -> str:
     fields = (
         "candidate_id, start_line, end_line, start_quote, end_quote, title, "
         "learning_objective, facet, reason, informativeness, topic_relevance, "
-        "educational_importance, difficulty, self_contained, is_standalone, "
+        "educational_importance, difficulty, directly_teaches_topic, substantive, "
+        "topic_evidence_quote (an exact 5-40 word quote copied from within the selected "
+        "cue range that proves the clip teaches the topic), self_contained, is_standalone, "
         "prerequisite_candidate_ids, uncertainty, uncertainty_reasons"
     )
     if enriched:
@@ -316,14 +335,22 @@ def _selection_fields(*, enriched: bool) -> str:
     return fields
 
 
-def _prompts(lines: str, n: int, topic: str = "") -> tuple[str, str]:
+def _prompts(
+    lines: str,
+    n: int,
+    topic: str = "",
+    learner_level: str = "",
+) -> tuple[str, str]:
     """Gemini 3.5 single-pass prompt: policy/examples, context, task last."""
     system = (
         "You select self-contained educational clips from timestamped transcripts.\n\n"
         + _POLICY_AND_EXAMPLES
     )
+    learner_rule = _learner_rule(learner_level)
+    learner_line = f"{learner_rule}\n" if learner_rule else ""
     user = (
-        f"{_topic_rule(topic)}\nLine IDs must be between 0 and {n - 1}.\n\n"
+        f"{_topic_rule(topic)}\n{learner_line}"
+        f"Line IDs must be between 0 and {n - 1}.\n\n"
         f"Transcript ({n} lines, formatted `[index] MM:SS text`):\n{lines}\n\n"
         "Based on the preceding transcript, return the chronological educational units. "
         f"Every item must contain {_selection_fields(enriched=True)}. Return no item for "
@@ -338,13 +365,17 @@ def _boundary_prompts(
     topic: str = "",
     *,
     max_candidates: int = _PRODUCTION_MAX_CANDIDATES,
+    learner_level: str = "",
 ) -> tuple[str, str]:
     system = (
         "You select self-contained educational clip boundaries from timestamped transcripts.\n\n"
         + _POLICY_AND_EXAMPLES
     )
+    learner_rule = _learner_rule(learner_level)
+    learner_line = f"{learner_rule}\n" if learner_rule else ""
     user = (
-        f"{_topic_rule(topic)}\nLine IDs must be between 0 and {n - 1}.\n\n"
+        f"{_topic_rule(topic)}\n{learner_line}"
+        f"Line IDs must be between 0 and {n - 1}.\n\n"
         f"Transcript ({n} lines, formatted `[index] MM:SS text`):\n{lines}\n\n"
         "Choose the strongest educational moments globally from anywhere in the transcript. "
         "Do not favor the beginning and do not return every chronological section. Rank the "
@@ -355,7 +386,12 @@ def _boundary_prompts(
         "clip inside the hard 180-second envelope. If a section is longer, choose one smaller "
         "complete sub-explanation or omit it; never return the whole long section. "
         f"Return at most {max(1, min(_PRODUCTION_MAX_CANDIDATES, int(max_candidates)))} "
-        "moments, and only when boundaries and context are low-uncertainty. "
+        "moments when boundaries and context have low or medium uncertainty; omit only "
+        "high-uncertainty moments. "
+        "Set substantive=true only for a real explanation, worked example, definition, "
+        "mechanism, comparison, or conclusion that teaches something useful. Omit greetings, "
+        "course logistics, speaker credentials, institutional framing, sponsors, previews, "
+        "and transitions even when they mention the topic. "
         "Use a unique candidate_id for every moment. A non-standalone moment must list the "
         "candidate_id(s) that provide its required context; a standalone moment must list no "
         "prerequisites. "
@@ -1153,12 +1189,21 @@ def _plan_to_report(
             continue
         start_quote = str(proposal.start_quote or "").strip()
         end_quote = str(proposal.end_quote or "").strip()
-        if not _contains_quote(str(segments[a].get("text") or ""), start_quote):
-            report.rejected_reasons.append(f"{prefix}:bad_start_quote")
-            continue
-        if not _contains_quote(str(segments[b].get("text") or ""), end_quote):
-            report.rejected_reasons.append(f"{prefix}:bad_end_quote")
-            continue
+        start_text = str(segments[a].get("text") or "").strip()
+        end_text = str(segments[b].get("text") or "").strip()
+        quote_repaired = False
+        if not _contains_quote(start_text, start_quote):
+            if type(proposal) is _BoundaryTopic and start_text:
+                quote_repaired = True
+            else:
+                report.rejected_reasons.append(f"{prefix}:bad_start_quote")
+                continue
+        if not _contains_quote(end_text, end_quote):
+            if type(proposal) is _BoundaryTopic and end_text:
+                quote_repaired = True
+            else:
+                report.rejected_reasons.append(f"{prefix}:bad_end_quote")
+                continue
         info = _strict_score(proposal.informativeness)
         relevance = _strict_score(proposal.topic_relevance)
         raw_importance = getattr(proposal, "educational_importance", None)
@@ -1178,6 +1223,13 @@ def _plan_to_report(
         if proposal.self_contained is not True:
             report.rejected_reasons.append(f"{prefix}:not_self_contained")
             continue
+        if isinstance(proposal, _BoundaryTopic):
+            if proposal.directly_teaches_topic is not True:
+                report.rejected_reasons.append(f"{prefix}:does_not_directly_teach_topic")
+                continue
+            if proposal.substantive is not True:
+                report.rejected_reasons.append(f"{prefix}:not_substantive")
+                continue
         candidate_id = " ".join(
             str(
                 getattr(proposal, "candidate_id", "")
@@ -1260,6 +1312,17 @@ def _plan_to_report(
         if not clip_text:
             report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
             continue
+        topic_evidence_quote = " ".join(
+            str(getattr(proposal, "topic_evidence_quote", "") or "").split()
+        )
+        if isinstance(proposal, _BoundaryTopic):
+            evidence_word_count = len(_toks(topic_evidence_quote))
+            if evidence_word_count < 5 or evidence_word_count > 40:
+                report.rejected_reasons.append(f"{prefix}:invalid_topic_evidence_quote_length")
+                continue
+            if not _contains_quote(clip_text, topic_evidence_quote):
+                report.rejected_reasons.append(f"{prefix}:ungrounded_topic_evidence_quote")
+                continue
         cue_ids = [
             str(segments[line].get("cue_id") or f"cue-{line}")
             for line in range(a, b + 1)
@@ -1300,6 +1363,12 @@ def _plan_to_report(
             "_end_line": b,
             "_clip_id": clip_id,
             "_clip_text": clip_text,
+            "_quote_repaired": quote_repaired,
+            "directly_teaches_topic": bool(
+                getattr(proposal, "directly_teaches_topic", True)
+            ),
+            "substantive": bool(getattr(proposal, "substantive", True)),
+            "topic_evidence_quote": topic_evidence_quote,
             "summary": "",
             "takeaways": [],
             "match_reason": "",
@@ -1687,6 +1756,12 @@ def _run_selection_profile(
     segments = transcript.get("segments") or []
     words = transcript.get("words") or []
     rendered = _lines(segments)
+    learner_level = str(
+        settings.get("_knowledge_level")
+        or settings.get("knowledge_level")
+        or settings.get("learner_level")
+        or ""
+    )
 
     if profile == PRODUCTION_PRO_PROFILE:
         system, user = _legacy_prompts(rendered, len(segments), topic)
@@ -1695,13 +1770,17 @@ def _run_selection_profile(
         level, cap, timeout = "high", _SELECTION_OUTPUT_TOKENS, _PRO_TIMEOUT_S
         operation = "pro_authoritative"
     elif profile == CORRECTED_PRO_PROFILE:
-        system, user = _prompts(rendered, len(segments), topic)
+        system, user = _prompts(
+            rendered, len(segments), topic, learner_level=learner_level,
+        )
         schema = _Plan
         model = config.SEGMENT_PRO_MODEL
         level, cap, timeout = "high", _SELECTION_OUTPUT_TOKENS, _PRO_TIMEOUT_S
         operation = "pro_fallback"
     elif profile == FLASH_SINGLE_PROFILE:
-        system, user = _prompts(rendered, len(segments), topic)
+        system, user = _prompts(
+            rendered, len(segments), topic, learner_level=learner_level,
+        )
         schema = _Plan
         model = config.SEGMENT_FLASH_MODEL
         level, cap, timeout = "medium", _SELECTION_OUTPUT_TOKENS, _FLASH_SINGLE_TIMEOUT_S
@@ -1715,6 +1794,7 @@ def _run_selection_profile(
                 _PRODUCTION_MAX_CANDIDATES,
                 max(1, int(settings.get("max_clips") or _PRODUCTION_MAX_CANDIDATES)),
             ),
+            learner_level=learner_level,
         )
         schema = _BoundaryPlan
         model = config.SEGMENT_FLASH_MODEL
@@ -1729,6 +1809,7 @@ def _run_selection_profile(
                 _PRODUCTION_MAX_CANDIDATES,
                 max(1, int(settings.get("max_clips") or _PRODUCTION_MAX_CANDIDATES)),
             ),
+            learner_level=learner_level,
         )
         schema = _BoundaryPlan
         model = config.SEGMENT_PRO_MODEL

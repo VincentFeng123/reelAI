@@ -1165,6 +1165,71 @@ class AssessmentService:
             pk=["learner_id", "material_id"],
         )
 
+    @staticmethod
+    def _maybe_auto_promote_level(
+        conn: Any,
+        *,
+        learner_id: str,
+        material_id: str,
+        promoted_at: str,
+    ) -> str | None:
+        """Promote one named level after sustained, broad mastery evidence.
+
+        Manual level changes reset ``difficulty_reset_at``, which naturally
+        starts a fresh evidence window. Automatic demotion is intentionally not
+        supported.
+        """
+        progress = fetch_one(
+            conn,
+            "SELECT selected_level, difficulty_reset_at FROM learner_material_progress "
+            "WHERE learner_id = ? AND material_id = ?",
+            (learner_id, material_id),
+        ) or {}
+        selected_level = str(progress.get("selected_level") or "beginner").strip().lower()
+        next_level = {"beginner": "intermediate", "intermediate": "advanced"}.get(
+            selected_level
+        )
+        if next_level is None:
+            return None
+        reset_at = str(progress.get("difficulty_reset_at") or "")
+        outcomes = fetch_all(
+            conn,
+            """
+            SELECT session_id, concept_id, question_count, correct_count,
+                   adjustment, created_at
+            FROM assessment_concept_outcomes
+            WHERE learner_id = ? AND material_id = ? AND created_at > ?
+            ORDER BY created_at DESC, session_id DESC, concept_id ASC
+            """,
+            (learner_id, material_id, reset_at),
+        )
+        total_questions = sum(max(0, int(row.get("question_count") or 0)) for row in outcomes)
+        correct_questions = sum(max(0, int(row.get("correct_count") or 0)) for row in outcomes)
+        concept_ids = {
+            str(row.get("concept_id") or "").strip()
+            for row in outcomes
+            if str(row.get("concept_id") or "").strip()
+        }
+        if total_questions < 8 or len(concept_ids) < 3:
+            return None
+        if correct_questions / max(1, total_questions) < 0.85:
+            return None
+
+        if any(float(row.get("adjustment") or 0.0) < 0.0 for row in outcomes[:3]):
+            return None
+
+        execute_modify(
+            conn,
+            """
+            UPDATE learner_material_progress
+            SET selected_level = ?, global_adjustment = 0.0,
+                difficulty_reset_at = ?, updated_at = ?
+            WHERE learner_id = ? AND material_id = ?
+            """,
+            (next_level, promoted_at, promoted_at, learner_id, material_id),
+        )
+        return next_level
+
     def _finalize_session(self, conn: Any, session: dict[str, Any]) -> None:
         session_id = str(session["id"])
         self._ensure_learner_progress(
@@ -1237,6 +1302,12 @@ class AssessmentService:
                 },
                 pk=["session_id", "concept_id"],
             )
+        self._maybe_auto_promote_level(
+            conn,
+            learner_id=str(session["learner_id"]),
+            material_id=str(session["material_id"]),
+            promoted_at=timestamp,
+        )
         execute_modify(
             conn,
             """

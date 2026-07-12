@@ -47,6 +47,13 @@ def test_educational_ranking_and_bounds():
     ranked_heavy = merge_and_rank([{"query": "q", "videos": [heavy]}])
     assert ranked_heavy[0]["edu_score"] <= 3.0
 
+    institutional = merge_and_rank([{"query": "q", "videos": [{
+        "id": "institutional",
+        "title": "Professor Biology",
+        "channel": "Example University",
+    }]}])[0]
+    assert institutional["edu_score"] == 0.0
+
     # Invariant 3: penalised 2-match beats boosted 1-match (sort key unchanged)
     per_query_cross = [
         {"query": "q1", "videos": [

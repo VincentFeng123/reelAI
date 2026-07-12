@@ -85,6 +85,56 @@ def _insert_generation_reel(
     }
 
 
+def _set_reel_boundary_state(
+    conn: sqlite3.Connection,
+    *,
+    reel_id: str,
+    boundary_status: str,
+    surface_eligible: bool = True,
+) -> None:
+    conn.execute(
+        "UPDATE reels SET search_context_json = ? WHERE id = ?",
+        (
+            json.dumps({
+                "surface_eligible": surface_eligible,
+                "boundary_status": boundary_status,
+                "selection_contract_version": "confidence_v1",
+                "directly_teaches_topic": True,
+                "substantive": True,
+            }),
+            reel_id,
+        ),
+    )
+
+
+def _terminal_job_for_generation(
+    conn: sqlite3.Connection,
+    *,
+    request_key: str,
+    generation_id: str,
+    completed_at: str,
+    learner_id: str = "learner-1",
+    status: str = "completed",
+    concept_id: str | None = "c1",
+) -> dict:
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id=concept_id,
+        request_key=request_key,
+        content_fingerprint="prior-fingerprint",
+        learner_id=learner_id,
+        request_params={"generation_mode": "slow", "num_reels": 12},
+    )
+    conn.execute(
+        "UPDATE reel_generation_jobs SET status = ?, phase = 'terminal', "
+        "progress = 1.0, result_generation_id = ?, completed_at = ?, updated_at = ? "
+        "WHERE id = ?",
+        (status, generation_id, completed_at, completed_at, job["id"]),
+    )
+    return {**job, "status": status, "result_generation_id": generation_id}
+
+
 def test_generation_worker_pool_executes_two_jobs_concurrently_with_distinct_owners(
     monkeypatch,
 ) -> None:
@@ -454,6 +504,69 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
         conn.close()
 
 
+def test_cross_request_source_count_leaves_two_slots_for_fresh_bootstrap(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="prior-level-request",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="new-level-request",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "slow", "num_reels": 5},
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-cross-level",
+        now=now,
+    )
+    assert leased
+    generated_count = 0
+    calls: list[dict] = []
+
+    def count_generation_reels(_conn, generation_id: str) -> int:
+        return 10 if generation_id == source_generation_id else generated_count
+
+    def generate_stage(_worker_conn, **kwargs) -> None:
+        nonlocal generated_count
+        calls.append(kwargs)
+        generated_count += int(kwargs["max_new_reels"])
+
+    monkeypatch.setattr(main, "_count_generation_reels", count_generation_reels)
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_generation_job_reels",
+        lambda *_args, **_kwargs: [
+            {"reel_id": f"reel-{index}"} for index in range(5)
+        ],
+    )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        assert len(calls) == 1
+        assert calls[0]["retrieval_profile"] == "bootstrap"
+        assert calls[0]["max_new_reels"] == 2
+        assert generation_jobs.get_job(conn, job["id"])["status"] == "completed"
+    finally:
+        conn.close()
+
+
 def test_slow_generation_bootstraps_then_deepens_with_shared_caps(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
@@ -564,6 +677,7 @@ def test_slow_generation_bootstraps_then_deepens_with_shared_caps(monkeypatch) -
         assert [event["type"] for event in events] == [
             "candidate",
             "candidate",
+            "candidate",
             "final",
             "terminal",
         ]
@@ -571,7 +685,7 @@ def test_slow_generation_bootstraps_then_deepens_with_shared_caps(monkeypatch) -
             event["payload"]["reel"]["reel_id"]
             for event in events
             if event["type"] == "candidate"
-        ] == ["bootstrap-reel", "deep-reel-1"]
+        ] == ["bootstrap-reel", "deep-reel-1", "deep-reel-2"]
         final_reel_ids = [
             reel["reel_id"]
             for event in events
@@ -1055,6 +1169,180 @@ def test_feed_autofill_false_never_submits_and_true_submits_before_return(monkey
         assert queued["generation_job_id"]
         assert queued["generation_job_status"] == "queued"
         assert conn.execute("SELECT COUNT(*) FROM reel_generation_jobs").fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_feed_reuses_verified_prior_level_inventory_and_still_queues_bootstrap(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    completed_at = datetime.now(timezone.utc).isoformat()
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id=None,
+        request_key="prior-level-request",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="verified-prior-reel",
+        video_id="verified-prior-video",
+        created_at=completed_at,
+    )
+    _set_reel_boundary_state(
+        conn,
+        reel_id="verified-prior-reel",
+        boundary_status="verified",
+    )
+    _terminal_job_for_generation(
+        conn,
+        request_key="prior-level-request",
+        generation_id=source_generation_id,
+        completed_at=completed_at,
+        concept_id=None,
+    )
+    ranked_generation_ids: list[str | None] = []
+
+    def ranked(*_args, **kwargs):
+        ranked_generation_ids.append(kwargs.get("generation_id"))
+        return [
+            {"reel_id": f"verified-prior-reel-{index}"}
+            for index in range(12)
+        ]
+
+    monkeypatch.setattr(main, "_ranked_request_reels", ranked)
+    try:
+        response = main.feed(object(), material_id="m1", autofill=True)
+
+        assert response["generation_id"] == source_generation_id
+        assert len(response["reels"]) == 5
+        assert ranked_generation_ids == [source_generation_id]
+        queued = conn.execute(
+            "SELECT * FROM reel_generation_jobs WHERE status = 'queued' "
+            "ORDER BY created_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+        assert queued is not None
+        assert queued["request_key"] != "prior-level-request"
+        assert queued["source_generation_id"] == source_generation_id
+    finally:
+        conn.close()
+
+
+def test_cross_level_reservoir_rejects_unverified_or_implicit_surface_rows() -> None:
+    conn = _conn()
+    completed_at = datetime.now(timezone.utc).isoformat()
+    root_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id=None,
+        request_key="prior-root",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    child_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id=None,
+        request_key="prior-child",
+        generation_mode="slow",
+        retrieval_profile="unified",
+        source_generation_id=root_generation_id,
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=root_generation_id,
+        reel_id="verified-root-reel",
+        video_id="verified-root-video",
+        created_at=completed_at,
+    )
+    _set_reel_boundary_state(
+        conn,
+        reel_id="verified-root-reel",
+        boundary_status="verified",
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=child_generation_id,
+        reel_id="legacy-child-reel",
+        video_id="legacy-child-video",
+        created_at=completed_at,
+    )
+    _terminal_job_for_generation(
+        conn,
+        request_key="prior-child",
+        generation_id=child_generation_id,
+        completed_at=completed_at,
+        concept_id=None,
+        status="partial",
+    )
+    try:
+        assert main._verified_cross_request_source_generation(
+            conn,
+            material_id="m1",
+            learner_id="learner-1",
+            request_key="new-level-request",
+            concept_id=None,
+        ) is None
+
+        _set_reel_boundary_state(
+            conn,
+            reel_id="legacy-child-reel",
+            boundary_status="caption_aligned",
+        )
+        assert main._verified_cross_request_source_generation(
+            conn,
+            material_id="m1",
+            learner_id="learner-1",
+            request_key="new-level-request",
+            concept_id=None,
+        ) is None
+    finally:
+        conn.close()
+
+
+def test_generate_job_reuses_verified_prior_level_for_the_same_concept(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    completed_at = datetime.now(timezone.utc).isoformat()
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="prior-concept-level",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="verified-concept-reel",
+        video_id="verified-concept-video",
+        created_at=completed_at,
+    )
+    _set_reel_boundary_state(
+        conn,
+        reel_id="verified-concept-reel",
+        boundary_status="verified",
+    )
+    _terminal_job_for_generation(
+        conn,
+        request_key="prior-concept-level",
+        generation_id=source_generation_id,
+        completed_at=completed_at,
+    )
+    try:
+        response = asyncio.run(main.generate_reels(
+            object(),
+            ReelsGenerateRequest(material_id="m1", concept_id="c1", num_reels=5),
+        ))
+        queued = generation_jobs.get_job(conn, json.loads(response.body)["job_id"])
+        assert queued is not None
+        assert queued["source_generation_id"] == source_generation_id
     finally:
         conn.close()
 

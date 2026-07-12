@@ -47,7 +47,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
         "calclus", 3, level="beginner", should_cancel=lambda: False,
     )
 
-    assert expand.PRACTICE_FAST_EXPAND_MODEL == "gemini-3.5-flash"
+    assert expand.PRACTICE_FAST_EXPAND_MODEL == "gemini-3.1-flash-lite"
     assert expand.PRACTICE_FAST_EXPAND_TIMEOUT_MS == 8_000
     assert result == {
         "corrected": "Calculus",
@@ -55,7 +55,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
         "provider_used": "gemini",
     }
     assert seen == {
-        "topic": "calclus", "n": 3, "model": "gemini-3.5-flash",
+        "topic": "calclus", "n": 3, "model": "gemini-3.1-flash-lite",
         "level": "beginner", "cancelled": False,
     }
 
@@ -140,7 +140,7 @@ def test_practice_fast_expansion_never_falls_back_to_pro(monkeypatch):
 
     result = expand.expand_query_practice_fast("physics", 3)
 
-    assert calls == ["gemini-3.5-flash"]
+    assert calls == ["gemini-3.1-flash-lite"]
     assert result == {
         "corrected": "physics",
         "queries": ["physics", "physics explained", "physics lecture"],
@@ -159,7 +159,7 @@ def test_practice_fast_expansion_uses_deterministic_fallback_after_flash(monkeyp
 
     result = expand.expand_query_practice_fast("physics", 3)
 
-    assert calls == ["gemini-3.5-flash"]
+    assert calls == ["gemini-3.1-flash-lite"]
     assert result == {
         "corrected": "physics",
         "queries": ["physics", "physics explained", "physics lecture"],
