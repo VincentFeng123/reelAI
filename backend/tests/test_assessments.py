@@ -1060,7 +1060,8 @@ def test_default_backfill_forwards_the_cancellation_probe(monkeypatch) -> None:
     probe = lambda: False
     observed: dict[str, object] = {}
 
-    def fake_llm_json(*_args, **kwargs):
+    def fake_llm_json(*args, **kwargs):
+        observed["prompt"] = args[0]
         observed["probe"] = kwargs.get("should_cancel")
         return SimpleNamespace(model_dump=lambda: {"questions": []})
 
@@ -1073,6 +1074,9 @@ def test_default_backfill_forwards_the_cancellation_probe(monkeypatch) -> None:
     )
     assert result == {"questions": []}
     assert observed["probe"] is probe
+    assert "prompt at most 16 words" in str(observed["prompt"])
+    assert "each option at most 8 words" in str(observed["prompt"])
+    assert "explanation one sentence and at most 24 words" in str(observed["prompt"])
 
 
 def test_next_session_backfill_observes_cancellation_before_any_write(conn) -> None:

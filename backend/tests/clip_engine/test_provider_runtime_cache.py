@@ -89,6 +89,48 @@ def test_generation_context_records_billable_headers_and_model_usage() -> None:
     assert rows[1]["model_used"] == "gemini-primary"
 
 
+def test_generation_context_maps_live_gemini_telemetry_and_cache_hits() -> None:
+    context = GenerationContext("slow", generation_id="job-2")
+    context.record_gemini(
+        operation="expansion",
+        attempt=1,
+        model_used="gemini-3.5-flash",
+        quality_degraded=False,
+        usage={
+            "prompt_tokens": 10,
+            "candidate_tokens": 4,
+            "thought_tokens": 3,
+            "total_tokens": 17,
+            "latency_ms": 125.5,
+        },
+    )
+    context.increment_counter("segmentation_cache_hits")
+    context.record_cache_hit(provider="gemini", operation="segmentation")
+
+    provider_call, cache_hit = context.usage()
+    assert provider_call["operation"] == "expansion"
+    assert provider_call["input_tokens"] == 10
+    assert provider_call["output_tokens"] == 7
+    assert provider_call["total_tokens"] == 17
+    assert provider_call["metadata"]["candidate_tokens"] == 4
+    assert provider_call["metadata"]["thought_tokens"] == 3
+    assert provider_call["metadata"]["latency_ms"] == 125.5
+    assert cache_hit["billable_requests"] == 0
+    assert cache_hit["metadata"] == {"provider_call": False, "cache_hit": True}
+    assert context.counters()["segmentation_cache_hits"] == 1
+
+
+def test_generation_context_usage_persistence_is_fail_open() -> None:
+    def unavailable_sink(_record) -> None:
+        raise RuntimeError("database unavailable")
+
+    context = GenerationContext("slow", usage_sink=unavailable_sink)
+    context.record_cache_hit(provider="gemini", operation="segmentation")
+
+    assert len(context.usage()) == 1
+    assert context.usage()[0]["metadata"]["cache_hit"] is True
+
+
 def test_search_cache_key_normalizes_query_filters_and_language_but_not_page() -> None:
     filters = {"preferred_video_duration": "4-20m", "creative_commons_only": True}
     first = search_cache_key(

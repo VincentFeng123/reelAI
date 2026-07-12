@@ -312,6 +312,9 @@ def test_prompt_layout_and_contract_follow_gemini3_guidance():
         "start_line", "end_line", "start_quote", "end_quote", "uncertainty",
     ):
         assert field in combined
+    assert "prompt (at most 16 words)" in combined
+    assert "options (at most 8 words each)" in combined
+    assert "explanation (one sentence, at most 24 words)" in combined
     assert "chain-of-thought" in combined
 
 

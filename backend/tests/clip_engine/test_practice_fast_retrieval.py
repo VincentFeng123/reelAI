@@ -81,6 +81,62 @@ def test_practice_fast_expansion_uses_deterministic_fallback_after_both_models(m
     }
 
 
+def test_practice_fast_expansion_cache_hit_skips_gemini(monkeypatch):
+    context = GenerationContext("slow")
+    cached = {
+        "corrected": "Physics",
+        "queries": ["Physics", "mechanics", "waves"],
+        "provider_used": "gemini",
+    }
+    monkeypatch.setattr(expand, "_read_cached_expansion", lambda *_args: cached)
+    monkeypatch.setattr(
+        expand,
+        "_practice_fast_gemini_raw",
+        lambda *_args, **_kwargs: pytest.fail("Gemini must not run on a cache hit"),
+    )
+
+    result = expand.expand_query_practice_fast("physics", 3, context=context)
+
+    assert result == cached
+    assert context.counters()["expansion_cache_hits"] == 1
+    usage = context.usage()[0]
+    assert usage["operation"] == "expansion"
+    assert usage["billable_requests"] == 0
+    assert usage["metadata"]["cache_hit"] is True
+
+
+def test_practice_fast_expansion_stores_success_for_reuse(monkeypatch):
+    context = GenerationContext("slow")
+    stored: dict[str, dict] = {}
+    provider_calls = 0
+
+    monkeypatch.setattr(
+        expand,
+        "_read_cached_expansion",
+        lambda cache_key, _count: stored.get(cache_key),
+    )
+    monkeypatch.setattr(
+        expand,
+        "_write_cached_expansion",
+        lambda cache_key, result: stored.__setitem__(cache_key, result),
+    )
+
+    def fake_raw(*_args, context=None, **_kwargs):
+        nonlocal provider_calls
+        assert context is not None
+        provider_calls += 1
+        return '{"corrected":"Physics","queries":["Physics","mechanics","waves"]}'
+
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
+
+    first = expand.expand_query_practice_fast("physics", 3, context=context)
+    second = expand.expand_query_practice_fast("physics", 3, context=context)
+
+    assert first == second
+    assert provider_calls == 1
+    assert context.counters()["expansion_cache_hits"] == 1
+
+
 def test_practice_fast_expansion_does_not_swallow_cancellation(monkeypatch):
     cancelled = threading.Event()
     cancelled.set()

@@ -1479,7 +1479,7 @@ function HomePageContent() {
         : "community";
   const activeSettingsAvailabilityState = settingsAvailabilityModalSnapshot?.state ?? DEFAULT_SETTINGS_AVAILABILITY_STATE;
   const desktopSidebarWidthPx = desktopSidebarCollapsed ? 72 : 264;
-  const showLoadingScreen = useLoadingScreenGate(sidebarTabHydrated, { minimumVisibleMs: 2000 });
+  const showLoadingScreen = useLoadingScreenGate(sidebarTabHydrated, { minimumVisibleMs: 250 });
 
   if (showLoadingScreen) {
     return <FullscreenLoadingScreen />;

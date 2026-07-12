@@ -373,6 +373,17 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
 
     def create_one_reel(worker_conn, **kwargs) -> None:
         generation_calls.append(kwargs)
+        generation_context = kwargs["generation_context"]
+        generation_context.record_gemini(
+            attempt=1,
+            model_used="gemini-primary",
+            quality_degraded=False,
+            usage={"prompt_tokens": 10, "candidate_tokens": 2, "total_tokens": 12},
+        )
+        generation_context.record_cache_hit(
+            provider="gemini",
+            operation="segmentation",
+        )
         worker_conn.execute(
             "INSERT INTO videos (id, title, channel_title, duration_sec, created_at) "
             "VALUES ('source-chain-video', 'Source chain video', 'Test', 120, ?)",
@@ -398,6 +409,7 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
 
         completed_job = generation_jobs.get_job(conn, job["id"])
         assert completed_job and completed_job["status"] == "completed"
+        assert completed_job["model_used"] == "gemini-primary"
         result_generation_id = str(completed_job["result_generation_id"])
         result_generation = conn.execute(
             "SELECT source_generation_id FROM reel_generations WHERE id = ?",

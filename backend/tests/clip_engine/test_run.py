@@ -6,6 +6,13 @@ from backend.app.clip_engine.errors import (
     ProviderQuotaError,
     UnsupportedURLError,
 )
+from backend.app.clip_engine.provider_runtime import GenerationContext
+
+
+@pytest.fixture(autouse=True)
+def disable_persistent_segment_cache(monkeypatch):
+    monkeypatch.setattr(run.segment_cache, "load_segment_result", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(run.segment_cache, "store_segment_result", lambda *_args, **_kwargs: None)
 
 
 def test_rejects_non_youtube():
@@ -45,6 +52,82 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
 
 def test_live_runner_uses_the_canonical_practice_segmenter():
     assert run.gemini_segment.__name__ == "backend.pipeline.gemini_segment"
+
+
+def test_segment_cache_hit_skips_gemini_and_budget(monkeypatch):
+    transcript = {
+        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "words": [],
+        "duration": 5.0,
+    }
+    cached_clip = {
+        "start": 1.0,
+        "end": 4.0,
+        "title": "Bit",
+        "facet": "concept",
+        "reason": "Explains the concept",
+        "kind": "educational",
+        "informativeness": 0.9,
+        "topic_relevance": 0.9,
+        "self_contained": True,
+        "difficulty": 0.5,
+        "summary": "",
+        "takeaways": [],
+        "match_reason": "",
+        "assessment": None,
+        "sequence_index": 1,
+    }
+    context = GenerationContext("slow")
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        run.segment_cache,
+        "load_segment_result",
+        lambda *_args, **_kwargs: ([cached_clip], "cached"),
+    )
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "segment_clips",
+        lambda *_args, **_kwargs: pytest.fail("Gemini must not run on a cache hit"),
+    )
+
+    output = run.clip(
+        "https://youtu.be/dQw4w9WgXcQ",
+        "topic",
+        settings={"generation_context": context},
+    )
+
+    assert output["clips"][0]["title"] == "Bit"
+    assert context.budget.snapshot()["used"]["segmentation"] == 0
+    assert context.counters()["segmentation_cache_hits"] == 1
+    assert context.usage()[0]["metadata"]["cache_hit"] is True
+
+
+def test_shadow_routing_bypasses_segment_cache(monkeypatch):
+    transcript = {
+        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "words": [],
+        "duration": 5.0,
+    }
+    segment_calls = 0
+
+    def fake_segment(*_args, **_kwargs):
+        nonlocal segment_calls
+        segment_calls += 1
+        return ([{"start": 1.0, "end": 4.0, "title": "Bit"}], "shadow")
+
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(run.segment_cache, "cache_enabled", lambda: False)
+    monkeypatch.setattr(
+        run.segment_cache,
+        "load_segment_result",
+        lambda *_args, **_kwargs: pytest.fail("shadow mode must not read the cache"),
+    )
+    monkeypatch.setattr(run.gemini_segment, "segment_clips", fake_segment)
+
+    output = run.clip("https://youtu.be/dQw4w9WgXcQ", "topic")
+
+    assert output["notes"] == "shadow"
+    assert segment_calls == 1
 
 
 def test_transcript_provider_error_is_re_raised_unchanged(monkeypatch):

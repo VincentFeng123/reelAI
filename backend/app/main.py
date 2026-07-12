@@ -3400,7 +3400,12 @@ def _run_leased_generation_job(
 
             usage_records = context.usage()
             stage_counters = context.counters()
-            model_records = [row for row in usage_records if row.get("operation") == "segmentation"]
+            model_records = [
+                row
+                for row in usage_records
+                if row.get("operation") == "segmentation"
+                and bool((row.get("metadata") or {}).get("provider_call"))
+            ]
             model_used = str((model_records[-1] if model_records else {}).get("model_used") or "") or None
             quality_degraded = any(bool(row.get("quality_degraded")) for row in model_records)
             append_generation_event(

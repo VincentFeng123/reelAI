@@ -702,6 +702,8 @@ class AssessmentService:
             (
                 "Create one grounded four-option recall question for each supplied clip. "
                 "Every option must be distinct. The explanation must be supported by that clip's transcript. "
+                "Keep each prompt at most 16 words, each option at most 8 words, and each "
+                "explanation one sentence and at most 24 words. "
                 "Return JSON only as {\"questions\":[{\"reel_id\":...,\"prompt\":...,"
                 "\"options\":[... exactly four ...],\"correct_index\":0-3,\"explanation\":...}]}"
             ),

@@ -1,6 +1,7 @@
 """Shared provider budgets, retry parsing, and per-generation usage accounting."""
 from __future__ import annotations
 
+import logging
 import math
 import threading
 from dataclasses import asdict, dataclass, field
@@ -10,7 +11,10 @@ from typing import Any, Callable, Literal, Mapping
 
 from .errors import ProviderBudgetExceededError
 
-ProviderOperation = Literal["search", "transcript", "segmentation"]
+logger = logging.getLogger(__name__)
+
+BudgetedProviderOperation = Literal["search", "transcript", "segmentation"]
+ProviderOperation = Literal["search", "transcript", "segmentation", "expansion"]
 GenerationMode = Literal["fast", "slow"]
 GenerationCounter = Literal[
     "discovered_videos",
@@ -22,6 +26,8 @@ GenerationCounter = Literal[
     "topic_rejections",
     "persisted_clips",
     "provider_failures",
+    "segmentation_cache_hits",
+    "expansion_cache_hits",
 ]
 
 GENERATION_COUNTERS: tuple[GenerationCounter, ...] = (
@@ -34,6 +40,8 @@ GENERATION_COUNTERS: tuple[GenerationCounter, ...] = (
     "topic_rejections",
     "persisted_clips",
     "provider_failures",
+    "segmentation_cache_hits",
+    "expansion_cache_hits",
 )
 
 MAX_PROVIDER_RETRIES = 2
@@ -92,7 +100,7 @@ class ProviderUsageRecord:
 class GenerationBudget:
     """Atomic, job-wide provider ceilings plus acquisition-pass controls."""
 
-    _LIMITS: dict[GenerationMode, dict[ProviderOperation, int]] = {
+    _LIMITS: dict[GenerationMode, dict[BudgetedProviderOperation, int]] = {
         # Reservations count provider attempts, including retries.
         "fast": {"search": 3, "transcript": 3, "segmentation": 3},
         "slow": {"search": 12, "transcript": 10, "segmentation": 10},
@@ -106,7 +114,7 @@ class GenerationBudget:
         self.mode = mode
         self.limits = dict(self._LIMITS[mode])
         self.max_passes, self.max_no_growth_passes = self._PASS_LIMITS[mode]
-        self._used: dict[ProviderOperation, int] = {
+        self._used: dict[BudgetedProviderOperation, int] = {
             "search": 0,
             "transcript": 0,
             "segmentation": 0,
@@ -119,7 +127,7 @@ class GenerationBudget:
     def for_mode(cls, mode: str) -> "GenerationBudget":
         return cls("fast" if str(mode).strip().lower() == "fast" else "slow")
 
-    def reserve(self, operation: ProviderOperation, count: int = 1) -> int:
+    def reserve(self, operation: BudgetedProviderOperation, count: int = 1) -> int:
         count = max(1, int(count))
         with self._lock:
             next_value = self._used[operation] + count
@@ -151,7 +159,7 @@ class GenerationBudget:
                 self._no_growth_passes += 1
             return self._passes
 
-    def remaining(self, operation: ProviderOperation) -> int:
+    def remaining(self, operation: BudgetedProviderOperation) -> int:
         with self._lock:
             return max(0, self.limits[operation] - self._used[operation])
 
@@ -187,6 +195,12 @@ def _usage_value(usage: Any, *names: str) -> int:
     return 0
 
 
+def _usage_field(usage: Any, name: str) -> Any:
+    if isinstance(usage, Mapping):
+        return usage.get(name)
+    return getattr(usage, name, None)
+
+
 class GenerationContext:
     """Thread-safe budget and usage ledger shared by all calls in one generation."""
 
@@ -208,14 +222,17 @@ class GenerationContext:
         }
         self._lock = threading.Lock()
 
-    def reserve(self, operation: ProviderOperation) -> int:
+    def reserve(self, operation: BudgetedProviderOperation) -> int:
         return self.budget.reserve(operation)
 
     def record(self, record: ProviderUsageRecord) -> None:
         with self._lock:
             self._usage.append(record)
         if self.usage_sink is not None:
-            self.usage_sink(record)
+            try:
+                self.usage_sink(record)
+            except Exception as exc:
+                logger.warning("Provider usage persistence failed: %s", exc)
 
     def increment_counter(self, name: GenerationCounter, count: int = 1) -> int:
         """Atomically increment a generation-stage diagnostic counter."""
@@ -267,9 +284,30 @@ class GenerationContext:
             )
         )
 
+    def record_cache_hit(
+        self,
+        *,
+        provider: str,
+        operation: ProviderOperation,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Record reusable provider output without counting a provider request."""
+        record_metadata = dict(metadata or {})
+        record_metadata.update({"provider_call": False, "cache_hit": True})
+        self.record(
+            ProviderUsageRecord(
+                provider=provider,
+                operation=operation,
+                attempt=1,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                metadata=record_metadata,
+            )
+        )
+
     def record_gemini(
         self,
         *,
+        operation: ProviderOperation = "segmentation",
         attempt: int,
         model_used: str,
         quality_degraded: bool,
@@ -278,16 +316,49 @@ class GenerationContext:
         error_code: str = "",
     ) -> None:
         input_tokens = _usage_value(
-            usage, "prompt_token_count", "promptTokenCount", "input_tokens"
+            usage,
+            "prompt_tokens",
+            "prompt_token_count",
+            "promptTokenCount",
+            "input_tokens",
         )
-        output_tokens = _usage_value(
-            usage, "candidates_token_count", "candidatesTokenCount", "output_tokens"
+        candidate_tokens = _usage_value(
+            usage,
+            "candidate_tokens",
+            "candidates_token_count",
+            "candidatesTokenCount",
+        )
+        thought_tokens = _usage_value(
+            usage,
+            "thought_tokens",
+            "thoughts_token_count",
+            "thoughtsTokenCount",
+        )
+        output_tokens = (
+            candidate_tokens + thought_tokens
+            if candidate_tokens or thought_tokens
+            else _usage_value(usage, "output_tokens")
         )
         total_tokens = _usage_value(usage, "total_token_count", "totalTokenCount", "total_tokens")
+        record_metadata: dict[str, Any] = {
+            "provider_call": True,
+            "candidate_tokens": candidate_tokens,
+            "thought_tokens": thought_tokens,
+        }
+        for field_name in (
+            "latency_ms",
+            "retries",
+            "finish_reason",
+            "prompt_version",
+            "thinking_level",
+        ):
+            value = _usage_field(usage, field_name)
+            if value is not None:
+                record_metadata[field_name] = value
         self.record(
             ProviderUsageRecord(
                 provider="gemini",
-                operation="segmentation",
+                operation=operation,
                 attempt=max(1, int(attempt)),
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 status_code=status_code,
@@ -300,7 +371,7 @@ class GenerationContext:
                 model_used=model_used,
                 quality_degraded=quality_degraded,
                 error_code=error_code,
-                metadata={"provider_call": True},
+                metadata=record_metadata,
             )
         )
 

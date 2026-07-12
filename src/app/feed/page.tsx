@@ -70,15 +70,12 @@ const MAX_HISTORY_ITEMS = 120;
 const MAX_REELS_PER_FEED_SESSION = 300;
 const COMPACT_REELS_PER_FEED_SESSION = 48;
 const MINIMAL_REELS_PER_FEED_SESSION = 20;
-const RECOVERY_RETRY_BASE_MS = 1_200;
-const RECOVERY_RETRY_MAX_MS = 12_000;
-const RECOVERY_ACTIVE_REQUEST_DELAY_MS = 900;
 const RECOVERY_REQUEST_IDLE_TIMEOUT_MS = 18_000;
 const COMMUNITY_SET_FEED_HANDOFF_PREFIX = "studyreels-community-feed-handoff-";
 const DESCRIPTION_PREVIEW_CHAR_LIMIT = 180;
 const FEED_PLAYBACK_RATE_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 type FeedbackAction = "helpful" | "confusing" | "save";
-type FeedRecoveryPhase = "idle" | "fetching-page" | "generating" | "retry-scheduled" | "recovering";
+type FeedRecoveryPhase = "idle" | "fetching-page" | "generating";
 
 type FeedTuningSettings = {
   minRelevance: number;
@@ -763,14 +760,6 @@ function mergeReelMetadata(current: Reel, next: Reel): Reel {
   };
 }
 
-function computeRecoveryRetryDelay(attempt: number, activeRequestNeeded: boolean): number {
-  if (activeRequestNeeded && attempt <= 0) {
-    return RECOVERY_ACTIVE_REQUEST_DELAY_MS;
-  }
-  const scaled = RECOVERY_RETRY_BASE_MS * Math.max(1, 2 ** Math.max(0, attempt - 1));
-  return Math.min(RECOVERY_RETRY_MAX_MS, scaled);
-}
-
 function getCommunityPlatformLabel(value: string): string {
   const normalized = value.trim().toLowerCase();
   if (normalized === "youtube") {
@@ -999,7 +988,6 @@ function FeedPageInner() {
   const wheelReadyToRearmRef = useRef(false);
   const wheelGestureReleaseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const touchStartYRef = useRef<number | null>(null);
-  const zeroProgressAttemptCountRef = useRef(0);
   const bootstrapAttemptedRef = useRef(false);
   const desktopShellRef = useRef<HTMLDivElement | null>(null);
   const rightColumnRef = useRef<HTMLDivElement | null>(null);
@@ -1020,12 +1008,10 @@ function FeedPageInner() {
   const isRefreshingFeedRef = useRef(false);
   const pendingHistorySyncRef = useRef<StoredHistoryItem[] | null>(null);
   const historySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const recoveryRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recoveryRequestIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const visibleTransportErrorRef = useRef(false);
   const transportFailureStreakRef = useRef(0);
-  const isBackgroundRecoveryRunningRef = useRef(false);
   const activeRecoveryRequestRef = useRef<ActiveRecoveryRequest | null>(null);
   const chatAbortControllerRef = useRef<AbortController | null>(null);
   const assessmentProgressMaxRef = useRef<Map<string, number>>(new Map());
@@ -1071,13 +1057,6 @@ function FeedPageInner() {
     return current.key === scope.key && current.seq === scope.seq && !current.controller.signal.aborted;
   }, []);
 
-  const clearRecoveryRetryTimer = useCallback(() => {
-    if (recoveryRetryTimerRef.current) {
-      clearTimeout(recoveryRetryTimerRef.current);
-      recoveryRetryTimerRef.current = null;
-    }
-  }, []);
-
   const clearRecoveryRequestIdleTimer = useCallback(() => {
     if (recoveryRequestIdleTimerRef.current) {
       clearTimeout(recoveryRequestIdleTimerRef.current);
@@ -1087,7 +1066,6 @@ function FeedPageInner() {
 
   const renewActiveSearchScope = useCallback(() => {
     abortActiveSearchScope();
-    clearRecoveryRetryTimer();
     clearRecoveryRequestIdleTimer();
     activeRecoveryRequestRef.current = null;
     const previous = activeSearchScopeRef.current;
@@ -1097,20 +1075,19 @@ function FeedPageInner() {
       controller: new AbortController(),
     };
     resetActiveSearchRequestState();
-  }, [abortActiveSearchScope, clearRecoveryRequestIdleTimer, clearRecoveryRetryTimer, feedRouteKey, resetActiveSearchRequestState]);
+  }, [abortActiveSearchScope, clearRecoveryRequestIdleTimer, feedRouteKey, resetActiveSearchRequestState]);
 
   useEffect(() => {
     renewActiveSearchScope();
     return () => {
       abortActiveChat();
-      clearRecoveryRetryTimer();
       clearRecoveryRequestIdleTimer();
       const current = activeSearchScopeRef.current;
       if (current.key === feedRouteKey) {
         current.controller.abort();
       }
     };
-  }, [abortActiveChat, clearRecoveryRequestIdleTimer, clearRecoveryRetryTimer, feedRouteKey, renewActiveSearchScope]);
+  }, [abortActiveChat, clearRecoveryRequestIdleTimer, feedRouteKey, renewActiveSearchScope]);
 
   useEffect(() => {
     const abortPageRequests = () => {
@@ -1326,12 +1303,9 @@ function FeedPageInner() {
 
   const markRecoveryProgress = useCallback((addedCount: number) => {
     if (addedCount > 0) {
-      zeroProgressAttemptCountRef.current = 0;
       setFeedPagesExhausted(false);
       clearRecoveredTransportError();
-      return;
     }
-    zeroProgressAttemptCountRef.current += 1;
   }, [clearRecoveredTransportError]);
 
   const finishActiveRecoveryRequest = useCallback((scope: Pick<FeedSearchScope, "key" | "seq">) => {
@@ -2151,7 +2125,6 @@ function FeedPageInner() {
       setBootstrappingFirstReels(false);
       setGeneratingMore(false);
       setKnowledgeLevel(null);
-      zeroProgressAttemptCountRef.current = 0;
       bootstrapAttemptedRef.current = false;
       pendingAutoplayAdvanceRef.current = false;
       setRecoveryPhase("idle");
@@ -2215,7 +2188,6 @@ function FeedPageInner() {
     setFeedbackByReel({});
     setMobileDetailsOpen(false);
     setBootstrappingFirstReels(false);
-    zeroProgressAttemptCountRef.current = 0;
     bootstrapAttemptedRef.current = false;
     if (restoredSession) {
       const allowedMaterialIds = new Set(feedMaterialIds.map((id) => String(id || "").trim()).filter(Boolean));
@@ -2670,99 +2642,6 @@ function FeedPageInner() {
       })();
     }
   }, [canRequestMore, feedNeedsBootstrapTopUp, generationMode, hasMore, isIngestMaterial, loadPage, page, requestMore, runFastTopUp]);
-
-  const runBackgroundRecovery = useCallback(async () => {
-    if (
-      isBackgroundRecoveryRunningRef.current
-      || !materialId
-      || !settingsScopeReady
-      || getFeedMaterialIds().length === 0
-      || !canRequestMore
-      || isFetchingRef.current
-      || isGeneratingRef.current
-    ) {
-      return;
-    }
-    // Ingest materials are static: no recovery possible, no legacy API to call.
-    if (isIngestMaterial) {
-      return;
-    }
-    isBackgroundRecoveryRunningRef.current = true;
-    setRecoveryPhase("recovering");
-    try {
-      if (feedNeedsBootstrapTopUp()) {
-        const generated = await requestMore();
-        if (generationMode === "fast" && generated.length > 0) {
-          void runFastTopUp();
-        }
-        return;
-      }
-      if (hasMore) {
-        await loadPage(page + 1, { autofill: true });
-        return;
-      }
-      const generated = await requestMore();
-      if (generationMode === "fast" && generated.length > 0) {
-        void runFastTopUp();
-      }
-    } finally {
-      isBackgroundRecoveryRunningRef.current = false;
-    }
-  }, [
-    canRequestMore,
-    feedNeedsBootstrapTopUp,
-    generationMode,
-    getFeedMaterialIds,
-    hasMore,
-    isIngestMaterial,
-    loadPage,
-    materialId,
-    page,
-    requestMore,
-    runFastTopUp,
-    settingsScopeReady,
-  ]);
-
-  useEffect(() => {
-    clearRecoveryRetryTimer();
-    if (
-      !materialId
-      || !settingsScopeReady
-      || !sessionHydrated
-      || loading
-      || bootstrappingFirstReels
-      || !canRequestMore
-      || isBackgroundRecoveryRunningRef.current
-    ) {
-      return;
-    }
-    if (recoveryPhase === "fetching-page" || recoveryPhase === "generating" || recoveryPhase === "recovering") {
-      return;
-    }
-    const delayMs = computeRecoveryRetryDelay(zeroProgressAttemptCountRef.current, hasMore || !feedPagesExhausted);
-    if (recoveryPhase !== "retry-scheduled") {
-      setRecoveryPhase("retry-scheduled");
-    }
-    recoveryRetryTimerRef.current = setTimeout(() => {
-      recoveryRetryTimerRef.current = null;
-      void runBackgroundRecovery();
-    }, delayMs);
-    return () => {
-      clearRecoveryRetryTimer();
-    };
-  }, [
-    bootstrappingFirstReels,
-    canRequestMore,
-    clearRecoveryRetryTimer,
-    feedPagesExhausted,
-    hasMore,
-    loading,
-    materialId,
-    recoveryPhase,
-    runBackgroundRecovery,
-    sessionHydrated,
-    settingsScopeReady,
-  ]);
 
   const shouldBlockDownwardAtEnd = useCallback(
     (direction: 1 | -1): boolean => {
@@ -3394,21 +3273,16 @@ function FeedPageInner() {
   const [descriptionHydrating, setDescriptionHydrating] = useState(false);
   const atEndOfVisibleReels = reels.length > 0 && activeIndex >= reels.length - 1;
   const activeRecoveryRequest = recoveryPhase === "fetching-page" || recoveryPhase === "generating";
-  const passiveBackgroundSearch =
-    recoveryPhase === "retry-scheduled" || recoveryPhase === "recovering";
   const noMoreReelsAvailable =
     reels.length > 0 &&
     !hasMore &&
     !canRequestMore &&
     !activeRecoveryRequest &&
-    !passiveBackgroundSearch &&
     !loading;
   const activelyFindingMoreReels = atEndOfVisibleReels && !noMoreReelsAvailable && activeRecoveryRequest;
-  const passivelyFindingMoreReels =
-    atEndOfVisibleReels && !noMoreReelsAvailable && !activelyFindingMoreReels && canRequestMore && passiveBackgroundSearch;
   const shouldKeepFeedEntryLoading = loading || (reels.length === 0 && bootstrappingFirstReels);
   const showLoadingScreen = useLoadingScreenGate(initialFeedScreenReady, {
-    minimumVisibleMs: 1000,
+    minimumVisibleMs: 250,
   });
 
   useEffect(() => {
@@ -4066,19 +3940,21 @@ function FeedPageInner() {
             >
               {reels.map((reel, index) => (
                 <div key={reel.reel_id} className="h-[calc(100dvh-2rem)] shrink-0 grow-0 basis-full md:h-full lg:h-full">
-                  <ReelCard
-                    reel={reel}
-                    isActive={index === activeIndex && !assessmentPlaybackBlocked}
-                    mutedPreference={mutedPreference}
-                    onMutedPreferenceChange={setMutedPreference}
-                    autoplayEnabled={autoplayEnabled}
-                    onAutoplayEnabledChange={setAutoplayEnabled}
-                    playbackRate={playbackRate}
-                    onPlaybackRateChange={setPlaybackRate}
-                    onRequestNextReel={index === activeIndex ? requestAutoplayAdvance : undefined}
-                    onPlaybackProgress={index === activeIndex ? handleActivePlaybackProgress : undefined}
-                    onOpenContent={index === activeIndex ? openMobileDetails : undefined}
-                  />
+                  {Math.abs(index - activeIndex) <= 1 ? (
+                    <ReelCard
+                      reel={reel}
+                      isActive={index === activeIndex && !assessmentPlaybackBlocked}
+                      mutedPreference={mutedPreference}
+                      onMutedPreferenceChange={setMutedPreference}
+                      autoplayEnabled={autoplayEnabled}
+                      onAutoplayEnabledChange={setAutoplayEnabled}
+                      playbackRate={playbackRate}
+                      onPlaybackRateChange={setPlaybackRate}
+                      onRequestNextReel={index === activeIndex ? requestAutoplayAdvance : undefined}
+                      onPlaybackProgress={index === activeIndex ? handleActivePlaybackProgress : undefined}
+                      onOpenContent={index === activeIndex ? openMobileDetails : undefined}
+                    />
+                  ) : null}
                 </div>
               ))}
             </div>
@@ -4113,13 +3989,6 @@ function FeedPageInner() {
               <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-4">
                 <div className="rounded-full border border-white/20 bg-black/72 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/80 backdrop-blur-sm">
                   Finding more reels...
-                </div>
-              </div>
-            ) : null}
-            {reels.length > 0 && passivelyFindingMoreReels ? (
-              <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center px-4">
-                <div className="rounded-full border border-white/15 bg-black/56 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-white/70 backdrop-blur-sm">
-                  Searching for fresh reels in background...
                 </div>
               </div>
             ) : null}
