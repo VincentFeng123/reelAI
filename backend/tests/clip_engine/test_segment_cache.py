@@ -31,6 +31,7 @@ def _clip() -> dict:
         "kind": "educational",
         "informativeness": 0.9,
         "topic_relevance": 0.8,
+        "educational_importance": 0.7,
         "self_contained": True,
         "difficulty": 0.4,
         "summary": "",
@@ -72,6 +73,7 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         transcript,
         {"segment_enrich_clips": False},
     )
+    assert _key(transcript, {"_segment_routing_mode": "flash_only"}) != baseline
 
     monkeypatch.setattr(segment_cache.pipeline_config, "SEGMENT_FLASH_MODEL", "new-model")
     assert _key(transcript) != baseline
@@ -84,6 +86,35 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
         [_clip()], transcript=transcript, settings=settings
     ) == [_clip()]
 
+    low_scored = _clip()
+    low_scored.update({
+        "informativeness": 0.0,
+        "topic_relevance": 0.0,
+        "educational_importance": 0.0,
+        "difficulty": 0.0,
+    })
+    assert segment_cache._valid_clips(
+        [low_scored], transcript=transcript, settings=settings
+    ) == [low_scored]
+
+    medium_uncertainty = _clip()
+    medium_uncertainty.update({
+        "uncertainty": "medium",
+        "uncertainty_reasons": ["boundary_ambiguous"],
+    })
+    assert segment_cache._valid_clips(
+        [medium_uncertainty], transcript=transcript, settings=settings
+    ) == [medium_uncertainty]
+
+    high_uncertainty = _clip()
+    high_uncertainty.update({
+        "uncertainty": "high",
+        "uncertainty_reasons": ["incomplete_context"],
+    })
+    assert segment_cache._valid_clips(
+        [high_uncertainty], transcript=transcript, settings=settings
+    ) is None
+
     invalid = _clip()
     invalid["self_contained"] = False
     assert segment_cache._valid_clips(
@@ -92,6 +123,12 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
 
     invalid = _clip()
     invalid["end"] = 11.0
+    assert segment_cache._valid_clips(
+        [invalid], transcript=transcript, settings=settings
+    ) is None
+
+    invalid = _clip()
+    invalid["educational_importance"] = 1.01
     assert segment_cache._valid_clips(
         [invalid], transcript=transcript, settings=settings
     ) is None
@@ -140,10 +177,17 @@ def test_segment_cache_sqlite_round_trip_expiry_and_tombstone(monkeypatch) -> No
     transcript = _transcript()
     settings = {"segment_accept_partial_flash": True}
     cache_key = _key(transcript, settings)
+    low_scored = _clip()
+    low_scored.update({
+        "informativeness": 0.0,
+        "topic_relevance": 0.0,
+        "educational_importance": 0.0,
+        "difficulty": 0.0,
+    })
 
     segment_cache.store_segment_result(
         cache_key,
-        [_clip()],
+        [low_scored],
         "cached",
         video_id=VIDEO_ID,
         transcript=transcript,
@@ -154,7 +198,7 @@ def test_segment_cache_sqlite_round_trip_expiry_and_tombstone(monkeypatch) -> No
         video_id=VIDEO_ID,
         transcript=transcript,
         settings=settings,
-    ) == ([_clip()], "cached")
+    ) == ([low_scored], "cached")
 
     expired = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
     connection.execute(

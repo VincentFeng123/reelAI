@@ -1545,6 +1545,9 @@ class ReelService:
         generation_context: GenerationContext | None = None,
         max_generation_videos: int | None = None,
         acquisition_concept_offset: int = 0,
+        max_new_reels: int | None = None,
+        analyzed_video_ids: set[str] | None = None,
+        retrieved_video_ids: set[str] | None = None,
     ) -> list[dict[str, Any]]:
         def raise_if_cancelled() -> None:
             if should_cancel is None:
@@ -1564,6 +1567,13 @@ class ReelService:
                 raise GenerationCancelledError("Generation cancelled.") from exc
 
         raise_if_cancelled()
+        retrieval_profile = self._normalize_retrieval_profile(retrieval_profile)
+        new_reel_limit = (
+            None if max_new_reels is None else max(0, int(max_new_reels))
+        )
+        if new_reel_limit == 0:
+            return []
+        analyzed_ids = analyzed_video_ids if analyzed_video_ids is not None else set()
         chain_emitter = _ChainBufferingEmitter(on_reel_created) if on_reel_created is not None else None
         self._generation_state.min_relevance_threshold = max(
             0.0, min(1.0, float(min_relevance_threshold))
@@ -1809,6 +1819,8 @@ class ReelService:
 
         for idx, concept in enumerate(concepts):
             raise_if_cancelled()
+            if new_reel_limit is not None and len(generated) >= new_reel_limit:
+                break
             # Persistence is never truncated by the requested response page;
             # only the material-wide inventory ceiling and provider budgets bound it.
             remaining_reel_capacity = max(
@@ -1828,6 +1840,16 @@ class ReelService:
             )
             if video_budget <= 0:
                 break
+            ingest_reel_cap = min(
+                remaining_reel_capacity,
+                (
+                    new_reel_limit - len(generated)
+                    if new_reel_limit is not None
+                    else max(3, num_reels - len(generated)) + 2
+                ),
+            )
+            if ingest_reel_cap <= 0:
+                break
 
             def _stream(reel_obj, _concept=concept, _idx=idx):
                 if chain_emitter is not None:
@@ -1846,6 +1868,7 @@ class ReelService:
                     )
 
             try:
+                analyzed_before = len(analyzed_ids)
                 reels, resolved_ids = self.ingestion_pipeline.ingest_topic(
                     topic=topic,
                     material_id=material_id,
@@ -1858,10 +1881,7 @@ class ReelService:
                     language="en",
                     knowledge_level=material_knowledge_level,
                     max_videos=video_budget,
-                    max_reels=min(
-                        remaining_reel_capacity,
-                        max(3, num_reels - len(generated)) + 2,
-                    ),
+                    max_reels=ingest_reel_cap,
                     on_reel_created=(None if dry_run else _stream),
                     dry_run=dry_run,
                     should_cancel=should_cancel,
@@ -1873,6 +1893,9 @@ class ReelService:
                         if strict_topic_only and literal_subject_tag
                         else topic
                     ),
+                    retrieval_profile=retrieval_profile,
+                    analyzed_video_ids=analyzed_ids,
+                    retrieved_video_ids=retrieved_video_ids,
                 )
             except _ClipEngineCancellationError as exc:
                 raise GenerationCancelledError("Generation cancelled.") from exc
@@ -1905,7 +1928,14 @@ class ReelService:
                 )
                 continue
             accumulated_exclusions.extend(resolved_ids)
-            videos_processed += len(resolved_ids)
+            if retrieved_video_ids is not None:
+                retrieved_video_ids.update(
+                    str(video_id or "").strip().split(":", 1)[-1]
+                    for video_id in resolved_ids
+                    if str(video_id or "").strip()
+                )
+            analyzed_delta = max(0, len(analyzed_ids) - analyzed_before)
+            videos_processed += analyzed_delta or len(resolved_ids)
 
             if dry_run:
                 # Discover-only viability probe: one minimal preview per resolved
@@ -2256,6 +2286,8 @@ class ReelService:
         ]
         t_start = float(getattr(reel_obj, "t_start", 0.0) or 0.0)
         t_end = float(getattr(reel_obj, "t_end", 0.0) or 0.0)
+        raw_informativeness = getattr(reel_obj, "informativeness", None)
+        raw_difficulty = getattr(reel_obj, "difficulty", None)
         return {
             "reel_id": reel_obj.reel_id,
             "material_id": reel_obj.material_id,
@@ -2267,7 +2299,9 @@ class ReelService:
             "channel_name": getattr(reel_obj, "channel_name", "") or "",
             "ai_summary": getattr(reel_obj, "ai_summary", "") or "",
             "match_reason": getattr(reel_obj, "match_reason", "") or "",
-            "informativeness": float(getattr(reel_obj, "informativeness", 0.6) or 0.6),
+            "informativeness": float(
+                0.6 if raw_informativeness is None else raw_informativeness
+            ),
             "video_url": video_url,
             "t_start": t_start,
             "t_end": t_end,
@@ -2287,7 +2321,7 @@ class ReelService:
             "clip_duration_sec": float(
                 getattr(reel_obj, "clip_duration_sec", None) or max(0.0, t_end - t_start)
             ),
-            "difficulty": float(getattr(reel_obj, "difficulty", 0.5) or 0.5),
+            "difficulty": float(0.5 if raw_difficulty is None else raw_difficulty),
             "selection_contract_version": (
                 getattr(reel_obj, "selection_contract_version", None)
             ),
@@ -6886,7 +6920,7 @@ class ReelService:
                 informativeness = float(row.get("informativeness"))
             except (TypeError, ValueError):
                 informativeness = 0.6
-            informativeness = max(0.6, min(1.0, informativeness))
+            informativeness = max(0.0, min(1.0, informativeness))
             safe_page_hint = max(1, int(page_hint))
             _diff = self._difficulty(row)
             concept_target = max(

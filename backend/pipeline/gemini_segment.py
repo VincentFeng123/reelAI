@@ -74,7 +74,6 @@ _ENRICH_OUTPUT_TOKENS = 2_048
 _MIN_CLIP_S = 1.0
 _MAX_CLIP_S = 180.0
 _UNCERTAIN_DURATION_S = 150.0
-_MIN_SCORE = 0.60
 _GREEN_SCORE = 0.75
 _MAX_CLIPS = 40
 _PRODUCTION_MAX_CANDIDATES = 8
@@ -82,6 +81,10 @@ _DUPLICATE_OVERLAP = 0.8
 _CONTEXT_CUE_LIMIT = 2
 _CONTEXT_WINDOW_S = 30.0
 _BOUNDARY_PAD_S = 0.3
+_LONG_RANGE_REPAIR_MIN_S = 20.0
+_LONG_RANGE_REPAIR_TARGET_S = 75.0
+_LONG_RANGE_REPAIR_MAX_S = 150.0
+_LONG_RANGE_REPAIR_START_SCAN_S = 30.0
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
@@ -346,6 +349,11 @@ def _boundary_prompts(
         "Choose the strongest educational moments globally from anywhere in the transcript. "
         "Do not favor the beginning and do not return every chronological section. Rank the "
         "strongest, most educational, self-contained moments first; sequencing happens later. "
+        "For every moment, verify the displayed start/end timestamps before returning it: the "
+        "selected source span must be at most 150 seconds and should usually be 20 to 90 seconds. "
+        "The shorter limit leaves room for deterministic context repair while keeping the final "
+        "clip inside the hard 180-second envelope. If a section is longer, choose one smaller "
+        "complete sub-explanation or omit it; never return the whole long section. "
         f"Return at most {max(1, min(_PRODUCTION_MAX_CANDIDATES, int(max_candidates)))} "
         "moments, and only when boundaries and context are low-uncertainty. "
         "Use a unique candidate_id for every moment. A non-standalone moment must list the "
@@ -757,6 +765,75 @@ def _padded_cue_bounds(
     return start, end
 
 
+def _repair_oversized_cue_range(
+    segments: list[dict],
+    start_line: int,
+    end_line: int,
+    *,
+    ignore_caption_case: bool,
+    anchor_text: str = "",
+) -> tuple[int, int] | None:
+    """Choose a complete cue-level subunit without making another model call."""
+    anchor_tokens = _content_tokens(anchor_text)
+    original_start = float(segments[start_line].get("start", 0.0))
+    candidates: list[tuple[float, float, float, float, int, int]] = []
+    for candidate_start in range(start_line, end_line + 1):
+        candidate_start_time = float(
+            segments[candidate_start].get("start", original_start)
+        )
+        start_shift = candidate_start_time - original_start
+        if start_shift > _LONG_RANGE_REPAIR_START_SCAN_S:
+            break
+        if _cue_opens_mid_thought(
+            str(segments[candidate_start].get("text") or ""),
+            ignore_caption_case=ignore_caption_case,
+        ):
+            continue
+        opening_segments = segments[
+            candidate_start:min(end_line + 1, candidate_start + 3)
+        ]
+        anchor_overlap = sum(
+            (3 - offset)
+            * len(
+                anchor_tokens
+                & _content_tokens(str(segment.get("text") or ""))
+            )
+            for offset, segment in enumerate(opening_segments)
+        )
+        for candidate_end in range(candidate_start, end_line + 1):
+            start, end = _padded_cue_bounds(
+                segments, candidate_start, candidate_end
+            )
+            duration = end - start
+            if duration > _LONG_RANGE_REPAIR_MAX_S:
+                break
+            if duration < _LONG_RANGE_REPAIR_MIN_S:
+                continue
+            next_text = (
+                str(segments[candidate_end + 1].get("text") or "")
+                if candidate_end + 1 < len(segments)
+                else ""
+            )
+            if _cue_has_weak_end(
+                str(segments[candidate_end].get("text") or ""),
+                next_text,
+                ignore_caption_case=ignore_caption_case,
+            ):
+                continue
+            candidates.append((
+                -float(anchor_overlap),
+                start_shift,
+                abs(duration - _LONG_RANGE_REPAIR_TARGET_S),
+                -duration,
+                candidate_start,
+                candidate_end,
+            ))
+    if not candidates:
+        return None
+    best = min(candidates)
+    return best[4], best[5]
+
+
 def _cue_clip_text(segments: list[dict], start_line: int, end_line: int) -> str:
     return " ".join(
         str(segment.get("text") or "").strip()
@@ -923,9 +1000,12 @@ def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
     quality_order = sorted(
         clips,
         key=lambda clip: (
-            0.45 * float(clip["topic_relevance"])
-            + 0.35 * float(clip["educational_importance"])
-            + 0.20 * float(clip["informativeness"]),
+            (
+                0.45 * float(clip["topic_relevance"])
+                + 0.35 * float(clip["educational_importance"])
+                + 0.20 * float(clip["informativeness"])
+            )
+            - (0.08 if clip.get("uncertainty") == "medium" else 0.0),
             -(clip["end"] - clip["start"]),
         ),
         reverse=True,
@@ -1054,17 +1134,6 @@ def _plan_to_report(
         report.rejected_reasons.append("missing_segments")
         return report
 
-    info_setting = settings.get("segment_informativeness_min")
-    relevance_setting = settings.get("segment_topic_relevance_min")
-    info_floor = max(
-        _MIN_SCORE,
-        float(config.SEGMENT_INFORMATIVENESS_MIN if info_setting is None else info_setting),
-    )
-    relevance_floor = max(
-        _MIN_SCORE,
-        float(config.SEGMENT_TOPIC_RELEVANCE_MIN
-              if relevance_setting is None else relevance_setting),
-    )
     ignore_caption_case = bool(settings.get("_segment_ignore_caption_case", True))
     raw: list[dict] = []
     seen_candidate_ids: set[str] = set()
@@ -1106,9 +1175,6 @@ def _plan_to_report(
         if info is None or relevance is None or importance is None or difficulty is None:
             report.rejected_reasons.append(f"{prefix}:score_out_of_range")
             continue
-        if info < info_floor or relevance < relevance_floor:
-            report.rejected_reasons.append(f"{prefix}:quality_below_floor")
-            continue
         if proposal.self_contained is not True:
             report.rejected_reasons.append(f"{prefix}:not_self_contained")
             continue
@@ -1136,7 +1202,7 @@ def _plan_to_report(
         uncertainty = str(getattr(proposal, "uncertainty", "low") or "low")
         uncertainty_reasons = [str(getattr(reason, "value", reason))
                                for reason in (getattr(proposal, "uncertainty_reasons", None) or [])]
-        if uncertainty != "low":
+        if uncertainty == "high":
             report.rejected_reasons.append(f"{prefix}:{uncertainty}_uncertainty")
             continue
 
@@ -1165,6 +1231,27 @@ def _plan_to_report(
             continue
         start, end = round(start, 3), round(end, 3)
         duration = round(end - start, 3)
+        if duration > _MAX_CLIP_S:
+            repaired_range = _repair_oversized_cue_range(
+                segments,
+                a,
+                b,
+                ignore_caption_case=ignore_caption_case,
+                anchor_text=" ".join(
+                    str(value or "")
+                    for value in (
+                        proposal.title,
+                        getattr(proposal, "learning_objective", ""),
+                        proposal.facet,
+                        proposal.reason,
+                    )
+                ),
+            )
+            if repaired_range is not None:
+                a, b = repaired_range
+                start, end = _padded_cue_bounds(segments, a, b)
+                start, end = round(start, 3), round(end, 3)
+                duration = round(end - start, 3)
         if duration < _MIN_CLIP_S or duration > _MAX_CLIP_S:
             report.rejected_reasons.append(f"{prefix}:invalid_duration")
             continue
@@ -1207,8 +1294,8 @@ def _plan_to_report(
             "start_cue_id": cue_ids[0],
             "end_cue_id": cue_ids[-1],
             "selection_candidate_id": candidate_id,
-            "_uncertainty": uncertainty,
-            "_uncertainty_reasons": uncertainty_reasons,
+            "uncertainty": uncertainty,
+            "uncertainty_reasons": uncertainty_reasons,
             "_start_line": a,
             "_end_line": b,
             "_clip_id": clip_id,
@@ -1259,7 +1346,7 @@ def _plan_to_report(
 
     # Detect duplicates before removing them so classification cannot turn green by repair.
     report.medium_uncertainty = any(
-        clip.get("_uncertainty") == "medium" for clip in raw
+        clip.get("uncertainty") == "medium" for clip in raw
     )
     report.score_below_green = any(
         min(float(clip["informativeness"]), float(clip["topic_relevance"])) < _GREEN_SCORE
@@ -1329,6 +1416,7 @@ class SegmentResult:
     accepted_count: int = 0
     error: str | None = None
     flash_configuration_error: str | None = None
+    rejection_reasons: list[str] = field(default_factory=list)
 
 
 class _SchemaResponseError(RuntimeError):
@@ -1649,6 +1737,12 @@ def _run_selection_profile(
     else:
         raise ValueError(f"unknown segmentation profile: {profile}")
 
+    if profile == FLASH_SPLIT_PROFILE:
+        requested_level = str(
+            settings.get("_segment_thinking_level") or level
+        ).strip().lower()
+        if requested_level in {"minimal", "low", "medium", "high"}:
+            level = requested_level
     operation = str(settings.get("_segment_operation") or operation)
     parsed, call = _call_model(
         system,
@@ -1702,7 +1796,10 @@ def _run_selection_profile(
             report, segments, topic, enrichment_required=(profile == FLASH_SINGLE_PROFILE),
         )
     else:
-        classification = _Classification("green" if report.clips else "invalid", ())
+        classification = _Classification(
+            "green" if report.clips else "invalid",
+            () if report.clips else tuple(dict.fromkeys(report.rejected_reasons)),
+        )
     return report, classification, calls
 
 
@@ -1902,6 +1999,7 @@ def run_segment_profile(
             report.proposed_count,
             len(clips),
             flash_configuration_error=flash_configuration_error,
+            rejection_reasons=list(report.rejected_reasons),
         )
     except Exception as exc:  # callers decide whether an invalid profile should fall back
         call = _exception_telemetry(exc)
@@ -1914,6 +2012,7 @@ def run_segment_profile(
             [f"request_failure:{type(exc).__name__}"],
             calls=calls,
             error=f"{type(exc).__name__}: {exc}",
+            rejection_reasons=[f"request_failure:{type(exc).__name__}"],
         )
 
 
@@ -2005,6 +2104,7 @@ def pro_boundary_fallback_detailed(
         route=result.route,
         classification=result.classification,
         classification_reasons=result.classification_reasons,
+        rejection_reasons=result.rejection_reasons,
         fallback_reasons=reasons,
         proposed_count=result.proposed_count,
         accepted_count=accepted,
@@ -2035,10 +2135,11 @@ def segment_clips_detailed(
                              ["missing_segments"])
 
     configured_mode = str(routing_mode or config.SEGMENT_ROUTING_MODE).lower()
+    flash_only = configured_mode == "flash_only"
     mode = configured_mode
-    if mode not in {"pro_only", "shadow", "hybrid"}:
+    if mode not in {"pro_only", "shadow", "hybrid", "flash_only"}:
         mode = "pro_only"
-    disabled_reason = _flash_disable_reason()
+    disabled_reason = None if flash_only else _flash_disable_reason()
     if disabled_reason is not None and mode in {"shadow", "hybrid"}:
         mode = "pro_only"
     percent = float(config.SEGMENT_HYBRID_PERCENT)
@@ -2050,7 +2151,9 @@ def segment_clips_detailed(
     generation_hash_key = str(
         getattr(generation_context, "generation_id", "") or video_id
     )
-    selected = mode == "hybrid" and _hybrid_selected(generation_hash_key, percent)
+    selected = flash_only or (
+        mode == "hybrid" and _hybrid_selected(generation_hash_key, percent)
+    )
     route = "flash_first" if selected else "pro_authoritative"
     sink = settings.get("_segment_telemetry") if isinstance(settings, dict) else None
     cancelled = settings.get("_segment_cancelled") if isinstance(settings, dict) else None
@@ -2100,6 +2203,7 @@ def segment_clips_detailed(
                 video_id=video_id or None,
                 classification=shadow.classification,
                 reasons=shadow.classification_reasons,
+                rejection_reasons=shadow.rejection_reasons,
                 proposed_count=shadow.proposed_count,
                 accepted_count=shadow_accepted,
                 fallback_reasons=shadow.fallback_reasons,
@@ -2130,6 +2234,7 @@ def segment_clips_detailed(
         )
         _emit(sink, "flash_classified", video_id=video_id or None,
               classification=flash.classification, reasons=flash.classification_reasons,
+              rejection_reasons=flash.rejection_reasons,
               proposed_count=flash.proposed_count, accepted_count=flash.accepted_count)
         flash_error = flash.flash_configuration_error or flash.error
         if _flash_configuration_failure(flash_error):
@@ -2140,13 +2245,15 @@ def segment_clips_detailed(
             result = flash
             result.route = "hybrid_flash"
         else:
-            fallback_allowed = True
+            # Bootstrap's hard latency contract never dispatches Pro, even if a
+            # caller forgets to install the normal generation-level fallback gate.
+            fallback_allowed = not flash_only
             fallback_gate = (
                 settings.get("_segment_pro_fallback_gate")
                 if isinstance(settings, dict)
                 else None
             )
-            if callable(fallback_gate):
+            if fallback_allowed and callable(fallback_gate):
                 try:
                     fallback_allowed = bool(
                         fallback_gate(
@@ -2178,6 +2285,10 @@ def segment_clips_detailed(
                 result.route = "hybrid_pro_fallback"
                 result.fallback_reasons = fallback_reasons
                 result.calls = flash.calls + pro.calls
+                result.rejection_reasons = [
+                    *flash.rejection_reasons,
+                    *pro.rejection_reasons,
+                ]
             else:
                 _emit(
                     sink,
@@ -2213,6 +2324,7 @@ def segment_clips_detailed(
         route=result.route,
         classification=result.classification,
         classification_reasons=result.classification_reasons,
+        rejection_reasons=result.rejection_reasons,
         fallback_reasons=result.fallback_reasons,
         proposed_count=result.proposed_count,
         accepted_count=accepted,
@@ -2242,5 +2354,10 @@ def segment_clips(
         topic=topic,
         video_id=video_id,
         progress=progress,
+        routing_mode=(
+            str(settings.get("_segment_routing_mode") or "").strip() or None
+            if isinstance(settings, dict)
+            else None
+        ),
     )
     return result.clips, result.notes

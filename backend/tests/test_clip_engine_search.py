@@ -211,6 +211,7 @@ class ClipEngineSearchTests(unittest.TestCase):
             literal_topic="calc",
             use_query_planner=True,
             practice_fast=True,
+            retrieval_profile="deep",
             breadth=3,
         )
 

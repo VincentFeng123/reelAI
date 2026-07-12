@@ -397,15 +397,16 @@ def test_weak_conjunction_end_expands_to_the_completed_answer():
     assert clip["end"] == 12.3
 
 
-def test_global_quality_limit_keeps_late_point_nine_nine_over_early_point_six_one():
+def test_global_quality_limit_ranks_stronger_clip_over_valid_low_scored_clip():
     segs = _segs(5)
     plan = G._Plan(topics=[
         _topic(
-            "early .61",
+            "early .01",
             0,
             0,
-            informativeness=0.61,
-            topic_relevance=0.61,
+            informativeness=0.01,
+            topic_relevance=0.01,
+            educational_importance=0.01,
         ),
         _topic(
             "late .99",
@@ -421,7 +422,7 @@ def test_global_quality_limit_keeps_late_point_nine_nine_over_early_point_six_on
     assert [clip["title"] for clip in clips] == ["late .99"]
 
 
-def test_medium_candidate_is_rejected_without_poisoning_independent_low_candidate():
+def test_medium_uncertainty_is_accepted_but_high_uncertainty_is_rejected():
     segs = _segs(3)
     plan = G._Plan(topics=[
         _topic(
@@ -432,6 +433,13 @@ def test_medium_candidate_is_rejected_without_poisoning_independent_low_candidat
             uncertainty_reasons=["boundary_ambiguous"],
         ),
         _topic("clean", 2, 2),
+        _topic(
+            "incomplete",
+            1,
+            1,
+            uncertainty="high",
+            uncertainty_reasons=["incomplete_context"],
+        ),
     ])
 
     report = G._plan_to_report(plan, segs, [], {})
@@ -439,9 +447,30 @@ def test_medium_candidate_is_rejected_without_poisoning_independent_low_candidat
         report, segs, "", enrichment_required=False,
     )
 
-    assert [clip["title"] for clip in report.clips] == ["clean"]
-    assert "proposal_0:medium_uncertainty" in report.rejected_reasons
+    assert [clip["title"] for clip in report.clips] == ["ambiguous", "clean"]
+    assert report.clips[0]["uncertainty"] == "medium"
+    assert report.clips[0]["uncertainty_reasons"] == ["boundary_ambiguous"]
+    assert "proposal_0:medium_uncertainty" not in report.rejected_reasons
+    assert "proposal_2:high_uncertainty" in report.rejected_reasons
     assert classification == G._Classification("green", ())
+
+
+def test_medium_uncertainty_ranks_below_equally_scored_clean_clip():
+    segs = _segs(2)
+    plan = G._Plan(topics=[
+        _topic(
+            "ambiguous",
+            0,
+            0,
+            uncertainty="medium",
+            uncertainty_reasons=["boundary_ambiguous"],
+        ),
+        _topic("clean", 1, 1),
+    ])
+
+    clips = G._plan_to_clips(plan, segs, [], {"max_clips": 1})
+
+    assert [clip["title"] for clip in clips] == ["clean"]
 
 
 def test_production_flash_is_compact_global_boundary_first():
@@ -449,6 +478,8 @@ def test_production_flash_is_compact_global_boundary_first():
     prompt = f"{system}\n{user}".casefold()
 
     assert G.PRODUCTION_FLASH_PROFILE == G.FLASH_SPLIT_PROFILE
+    assert "at most 150 seconds" in prompt
+    assert "20 to 90 seconds" in prompt
     assert G._BOUNDARY_OUTPUT_TOKENS == 4096
     assert "globally" in prompt
     assert "do not favor the beginning" in prompt
@@ -497,6 +528,7 @@ def test_budget_is_reserved_once_before_dispatch_and_provider_retry_is_disabled(
 
 
 def test_invalid_partial_flash_is_never_shipped_even_when_legacy_setting_is_true(monkeypatch):
+    events = []
     partial = G.SegmentResult(
         clips=[{"title": "unsafe partial"}],
         notes="partial",
@@ -505,6 +537,7 @@ def test_invalid_partial_flash_is_never_shipped_even_when_legacy_setting_is_true
         classification_reasons=["proposal_1:unresolved_weak_end"],
         proposed_count=2,
         accepted_count=1,
+        rejection_reasons=["proposal_1:unresolved_weak_end"],
     )
     pro = G.SegmentResult(
         clips=[{"title": "safe pro"}],
@@ -513,6 +546,7 @@ def test_invalid_partial_flash_is_never_shipped_even_when_legacy_setting_is_true
         classification="green",
         proposed_count=1,
         accepted_count=1,
+        rejection_reasons=["proposal_0:bad_start_quote"],
     )
     monkeypatch.setattr(G.config, "SEGMENT_HYBRID_PERCENT", 100.0)
     monkeypatch.setattr(G, "_flash_disable_reason", lambda: None)
@@ -521,13 +555,22 @@ def test_invalid_partial_flash_is_never_shipped_even_when_legacy_setting_is_true
 
     result = G.segment_clips_detailed(
         {"segments": _segs(2)},
-        {"segment_accept_partial_flash": True},
+        {
+            "segment_accept_partial_flash": True,
+            "_segment_telemetry": events.append,
+        },
         video_id="dQw4w9WgXcQ",
         routing_mode="hybrid",
     )
 
     assert [clip["title"] for clip in result.clips] == ["safe pro"]
     assert result.route == "hybrid_pro_fallback"
+    assert result.rejection_reasons == [
+        "proposal_1:unresolved_weak_end",
+        "proposal_0:bad_start_quote",
+    ]
+    completed = next(event for event in events if event["event"] == "segment_completed")
+    assert completed["rejection_reasons"] == result.rejection_reasons
 
 
 def test_optional_enrichment_failure_keeps_valid_boundary_without_pro_retry(monkeypatch):

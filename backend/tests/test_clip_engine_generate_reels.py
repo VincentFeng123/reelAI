@@ -264,6 +264,50 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertTrue(str(first.get("ai_summary") or "").strip())
         self.assertTrue(str(first.get("match_reason") or "").strip())
 
+    def test_zero_quality_and_difficulty_scores_round_trip_without_inflation(self) -> None:
+        engine_out = _multi_clip_engine_out()
+        engine_out["clips"] = [{
+            **engine_out["clips"][0],
+            "informativeness": 0.0,
+            "topic_relevance": 0.0,
+            "educational_importance": 0.0,
+            "difficulty": 0.0,
+            "boundary_confidence": 0.9,
+            "is_standalone": True,
+            "prerequisite_ids": [],
+            "selection_candidate_id": "low-score",
+        }]
+        self._patched_engine(engine_out)
+
+        with db_module.get_conn() as conn:
+            generated = main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=CONCEPT_ID,
+                num_reels=1,
+                creative_commons_only=False,
+                generation_id="gen-low-score",
+            )
+        with db_module.get_conn() as conn:
+            stored = db_module.fetch_one(
+                conn,
+                "SELECT informativeness, difficulty FROM reels WHERE generation_id = ?",
+                ("gen-low-score",),
+            )
+            feed = main_module.reel_service.ranked_feed(
+                conn,
+                material_id=MATERIAL_ID,
+                generation_id="gen-low-score",
+            )
+
+        self.assertIsNotNone(stored)
+        self.assertEqual(float(stored["informativeness"]), 0.0)
+        self.assertEqual(float(stored["difficulty"]), 0.0)
+        self.assertEqual(generated[0]["informativeness"], 0.0)
+        self.assertEqual(generated[0]["difficulty"], 0.0)
+        self.assertEqual(feed[0]["informativeness"], 0.0)
+        self.assertEqual(feed[0]["difficulty"], 0.0)
+
     def test_one_pass_clips_never_call_legacy_summary_model(self) -> None:
         self._patched_engine(_multi_clip_engine_out())
         with mock.patch.object(
@@ -423,6 +467,35 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 )
 
         self.assertEqual(ingest_topic.call_args.kwargs["max_reels"], 22)
+
+    def test_two_stage_cap_and_profile_reach_ingestion(self) -> None:
+        analyzed: set[str] = set()
+        retrieved: set[str] = set()
+        with mock.patch.object(
+            main_module.ingestion_pipeline,
+            "ingest_topic",
+            return_value=([], [VIDEO_ID]),
+        ) as ingest_topic:
+            with db_module.get_conn() as conn:
+                main_module.reel_service.generate_reels(
+                    conn,
+                    material_id=MATERIAL_ID,
+                    concept_id=CONCEPT_ID,
+                    num_reels=20,
+                    creative_commons_only=False,
+                    generation_id="gen-bootstrap-cap",
+                    retrieval_profile="bootstrap",
+                    max_new_reels=2,
+                    analyzed_video_ids=analyzed,
+                    retrieved_video_ids=retrieved,
+                )
+
+        kwargs = ingest_topic.call_args.kwargs
+        self.assertEqual(kwargs["max_reels"], 2)
+        self.assertEqual(kwargs["retrieval_profile"], "bootstrap")
+        self.assertIs(kwargs["analyzed_video_ids"], analyzed)
+        self.assertIs(kwargs["retrieved_video_ids"], retrieved)
+        self.assertEqual(retrieved, {VIDEO_ID})
 
     def test_material_inventory_never_exceeds_300_reels(self) -> None:
         existing_video_id = "inventory-video"

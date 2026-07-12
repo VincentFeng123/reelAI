@@ -313,6 +313,7 @@ class GenerationContext:
             name: 0 for name in GENERATION_COUNTERS
         }
         self._fallback_reasons: list[str] = []
+        self._rejection_reason_counts: dict[str, int] = {}
         self._counted_pro_fallbacks: set[tuple[str, bool]] = set()
         self._lock = threading.Lock()
         self._pro_fallback_condition = threading.Condition(self._lock)
@@ -516,6 +517,25 @@ class GenerationContext:
             accepted = max(0, int(event.get("accepted_count") or 0))
             if proposed > accepted:
                 self.increment_counter("boundary_rejections", proposed - accepted)
+        if event_name in {"segment_completed", "segment_error"}:
+            raw_reasons = event.get("rejection_reasons")
+            reasons = (
+                [str(reason).strip() for reason in raw_reasons if str(reason).strip()]
+                if isinstance(raw_reasons, list)
+                else []
+            )
+            with self._lock:
+                for reason in reasons:
+                    prefix, separator, guard = reason.partition(":")
+                    normalized = (
+                        guard
+                        if separator
+                        and (prefix.startswith("proposal_") or prefix.startswith("candidate_"))
+                        else reason
+                    )
+                    self._rejection_reason_counts[normalized] = (
+                        self._rejection_reason_counts.get(normalized, 0) + 1
+                    )
 
     def record_http(
         self,
@@ -724,6 +744,7 @@ class GenerationContext:
         accepted = int(counters.get("persisted_clips") or 0)
         with self._lock:
             fallback_reasons = list(self._fallback_reasons)
+            rejection_reason_counts = dict(sorted(self._rejection_reason_counts.items()))
         cache_hits = sum(
             1 for row in records if bool((row.get("metadata") or {}).get("cache_hit"))
         )
@@ -765,6 +786,7 @@ class GenerationContext:
             ),
             "cache_hits": cache_hits,
             "fallback_reasons": fallback_reasons,
+            "rejection_reason_counts": rejection_reason_counts,
             "rejected_boundaries": int(counters.get("boundary_rejections") or 0),
         }
         return {

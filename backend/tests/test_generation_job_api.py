@@ -12,6 +12,7 @@ import pytest
 
 from backend.app import db
 from backend.app import main
+from backend.app.clip_engine.errors import ProviderQuotaError, ProviderTransientError
 from backend.app.models import ReelsGenerateRequest
 from backend.app.ingestion.models import IngestRequest
 from backend.app.services import generation_jobs
@@ -54,6 +55,34 @@ def _patch_request_context(monkeypatch, conn: sqlite3.Connection) -> None:
         "learner_progress",
         lambda *_args, **_kwargs: {"selected_level": "beginner", "global_adjustment": 0.0},
     )
+
+
+def _insert_generation_reel(
+    conn: sqlite3.Connection,
+    *,
+    generation_id: str,
+    reel_id: str,
+    video_id: str,
+    created_at: str,
+) -> dict:
+    conn.execute(
+        "INSERT INTO videos (id, title, channel_title, duration_sec, created_at) "
+        "VALUES (?, ?, 'Test', 120, ?)",
+        (video_id, video_id, created_at),
+    )
+    conn.execute(
+        "INSERT INTO reels "
+        "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+        "transcript_snippet, takeaways_json, base_score, generation_id, created_at) "
+        "VALUES (?, 'm1', 'c1', ?, '', 0, 30, '', '[]', 1, ?, ?)",
+        (reel_id, video_id, generation_id, created_at),
+    )
+    return {
+        "reel_id": reel_id,
+        "video_id": video_id,
+        "t_start": 0.0,
+        "t_end": 30.0,
+    }
 
 
 def test_generation_worker_pool_executes_two_jobs_concurrently_with_distinct_owners(
@@ -421,6 +450,356 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
             root_generation_id,
             source_generation_id,
         ]
+    finally:
+        conn.close()
+
+
+def test_slow_generation_bootstraps_then_deepens_with_shared_caps(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="two-stage-source",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="source-reel",
+        video_id="source-video",
+        created_at=now.isoformat(),
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="two-stage-slow",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={
+            "generation_mode": "slow",
+            "num_reels": 4,
+            "exclude_video_ids": ["manual-exclusion"],
+        },
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-two-stage",
+        now=now,
+    )
+    assert leased
+    calls: list[dict] = []
+    progress_updates: list[tuple[str, float]] = []
+    update_progress = main.update_generation_progress
+
+    def capture_progress(*args, **kwargs):
+        progress_updates.append((str(kwargs["phase"]), float(kwargs["progress"])))
+        return update_progress(*args, **kwargs)
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        calls.append(kwargs)
+        profile = kwargs["retrieval_profile"]
+        analyzed = kwargs["analyzed_video_ids"]
+        if profile == "bootstrap":
+            analyzed.update({"bootstrap-video", "bootstrap-empty-video"})
+            kwargs["retrieved_video_ids"].update(
+                {
+                    "bootstrap-video",
+                    "bootstrap-empty-video",
+                    "bootstrap-retrieved-only-video",
+                }
+            )
+            staged = [("bootstrap-reel", "bootstrap-video")]
+        else:
+            analyzed.update({"deep-video-1", "deep-video-2"})
+            staged = [
+                ("deep-reel-1", "deep-video-1"),
+                ("deep-reel-2", "deep-video-2"),
+            ]
+        for reel_id, video_id in staged[: kwargs["max_new_reels"]]:
+            reel = _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id=reel_id,
+                video_id=video_id,
+                created_at=now.isoformat(),
+            )
+            kwargs["on_reel_created"](reel)
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(main, "update_generation_progress", capture_progress)
+    monkeypatch.setattr(
+        main,
+        "_generation_job_reels",
+        lambda *_args, **_kwargs: [
+            {"reel_id": "deep-reel-2"},
+            {"reel_id": "source-reel"},
+            {"reel_id": "deep-reel-1"},
+            {"reel_id": "bootstrap-reel"},
+        ],
+    )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        assert [call["retrieval_profile"] for call in calls] == ["bootstrap", "deep"]
+        assert [call["max_new_reels"] for call in calls] == [2, 2]
+        assert calls[0]["max_generation_videos"] == 3
+        assert calls[1]["max_generation_videos"] == 3
+        assert set(calls[1]["exclude_video_ids"]) == {
+            "manual-exclusion",
+            "bootstrap-video",
+            "bootstrap-empty-video",
+            "bootstrap-retrieved-only-video",
+        }
+        assert ("retrieval", 0.45) in progress_updates
+        assert ("ranking", 0.85) in progress_updates
+        events = generation_jobs.replay_events(conn, job_id=job["id"])
+        assert [event["type"] for event in events] == [
+            "candidate",
+            "candidate",
+            "final",
+            "terminal",
+        ]
+        assert [
+            event["payload"]["reel"]["reel_id"]
+            for event in events
+            if event["type"] == "candidate"
+        ] == ["bootstrap-reel", "deep-reel-1"]
+        final_reel_ids = [
+            reel["reel_id"]
+            for event in events
+            if event["type"] == "final"
+            for reel in event["payload"]["reels"]
+        ]
+        assert final_reel_ids == [
+            "deep-reel-2",
+            "source-reel",
+            "deep-reel-1",
+            "bootstrap-reel",
+        ]
+        assert "bootstrap-reel" in final_reel_ids
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reels WHERE generation_id = ?",
+            (str((generation_jobs.get_job(conn, job["id"]) or {})["result_generation_id"]),),
+        ).fetchone()[0] == 3
+    finally:
+        conn.close()
+
+
+def test_fast_generation_stops_after_two_clip_bootstrap(monkeypatch) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="two-stage-fast",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 4},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-fast-stage",
+        now=now,
+    )
+    assert leased
+    calls: list[dict] = []
+
+    def generate_bootstrap(worker_conn, **kwargs) -> None:
+        calls.append(kwargs)
+        kwargs["analyzed_video_ids"].update({"fast-video-1", "fast-video-2"})
+        for index in range(kwargs["max_new_reels"]):
+            reel = _insert_generation_reel(
+                worker_conn,
+                generation_id=str(kwargs["generation_id"]),
+                reel_id=f"fast-reel-{index}",
+                video_id=f"fast-video-{index + 1}",
+                created_at=now.isoformat(),
+            )
+            kwargs["on_reel_created"](reel)
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_bootstrap)
+    monkeypatch.setattr(
+        main,
+        "_generation_job_reels",
+        lambda *_args, **_kwargs: [
+            {"reel_id": "fast-reel-0"},
+            {"reel_id": "fast-reel-1"},
+        ],
+    )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        assert len(calls) == 1
+        assert calls[0]["retrieval_profile"] == "bootstrap"
+        assert calls[0]["max_generation_videos"] == 3
+        assert calls[0]["max_new_reels"] == 2
+        events = generation_jobs.replay_events(conn, job_id=job["id"])
+        assert [event["type"] for event in events] == [
+            "candidate",
+            "candidate",
+            "final",
+            "terminal",
+        ]
+        final_event = next(event for event in events if event["type"] == "final")
+        terminal_event = next(event for event in events if event["type"] == "terminal")
+        assert len(final_event["payload"]["reels"]) == 2
+        assert terminal_event["payload"]["status"] == "partial"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_profiles", "expected_status"),
+    [
+        ("slow", ["bootstrap", "deep"], "completed"),
+        ("fast", ["bootstrap"], "exhausted"),
+    ],
+)
+def test_bootstrap_deadline_exhaustion_is_a_stage_result(
+    monkeypatch,
+    mode: str,
+    expected_profiles: list[str],
+    expected_status: str,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=f"bootstrap-deadline-{mode}",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": mode, "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner=f"worker-bootstrap-deadline-{mode}",
+        now=now,
+    )
+    assert leased
+    calls: list[dict] = []
+
+    def generate_stage(worker_conn, **kwargs) -> None:
+        profile = str(kwargs["retrieval_profile"])
+        calls.append(kwargs)
+        if profile == "bootstrap":
+            kwargs["analyzed_video_ids"].add("bootstrap-analyzed-timeout")
+            kwargs["retrieved_video_ids"].add("bootstrap-retrieved-timeout")
+            raise ProviderTransientError(
+                "Supadata search timed out.",
+                provider="supadata",
+                operation="search",
+                detail="generation deadline exceeded",
+            )
+        _insert_generation_reel(
+            worker_conn,
+            generation_id=str(kwargs["generation_id"]),
+            reel_id="deep-after-timeout",
+            video_id="deep-video-after-timeout",
+            created_at=now.isoformat(),
+        )
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    if mode == "slow":
+        monkeypatch.setattr(
+            main,
+            "_generation_job_reels",
+            lambda *_args, **_kwargs: [{"reel_id": "deep-after-timeout"}],
+        )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        completed_job = generation_jobs.get_job(conn, job["id"])
+        assert completed_job and completed_job["status"] == expected_status
+        assert [call["retrieval_profile"] for call in calls] == expected_profiles
+        if mode == "slow":
+            assert set(calls[1]["exclude_video_ids"]) == {
+                "bootstrap-retrieved-timeout"
+            }
+        terminal_error_code = conn.execute(
+            "SELECT terminal_error_code FROM reel_generation_jobs WHERE id = ?",
+            (job["id"],),
+        ).fetchone()[0]
+        assert terminal_error_code == (
+            "inventory_exhausted" if mode == "fast" else None
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "provider_error",
+    [
+        ProviderQuotaError(
+            "Supadata quota is exhausted.",
+            provider="supadata",
+            operation="search",
+        ),
+        ProviderTransientError(
+            "Could not reach Supadata search.",
+            provider="supadata",
+            operation="search",
+            detail="connection reset",
+        ),
+    ],
+)
+def test_bootstrap_non_deadline_provider_failures_remain_fatal(
+    monkeypatch,
+    provider_error,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=f"bootstrap-fatal-{provider_error.code}-{provider_error.detail}",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "slow", "num_reels": 1},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-bootstrap-fatal",
+        now=now,
+    )
+    assert leased
+    profiles: list[str] = []
+
+    def fail_stage(_worker_conn, **kwargs) -> None:
+        profiles.append(str(kwargs["retrieval_profile"]))
+        raise provider_error
+
+    monkeypatch.setattr(main.reel_service, "generate_reels", fail_stage)
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        failed_job = generation_jobs.get_job(conn, job["id"])
+        assert failed_job and failed_job["status"] == "failed"
+        assert profiles == ["bootstrap"]
+        assert conn.execute(
+            "SELECT terminal_error_code FROM reel_generation_jobs WHERE id = ?",
+            (job["id"],),
+        ).fetchone()[0] == provider_error.code
     finally:
         conn.close()
 

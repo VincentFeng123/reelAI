@@ -97,7 +97,10 @@ def segment_cache_key(
         "transcript_sha256": hashlib.sha256(
             _canonical_json(transcript_payload).encode("utf-8")
         ).hexdigest(),
-        "routing_mode": pipeline_config.SEGMENT_ROUTING_MODE,
+        "routing_mode": str(
+            settings.get("_segment_routing_mode")
+            or pipeline_config.SEGMENT_ROUTING_MODE
+        ).strip().lower(),
         "hybrid_percent": float(pipeline_config.SEGMENT_HYBRID_PERCENT),
         "flash_model": pipeline_config.SEGMENT_FLASH_MODEL,
         "pro_model": pipeline_config.SEGMENT_PRO_MODEL,
@@ -175,35 +178,56 @@ def _valid_clips(
     if bounds is None:
         return None
     transcript_start, transcript_end = bounds
-    info_floor = max(0.60, float(policy["informativeness_min"]))
-    relevance_floor = max(0.60, float(policy["topic_relevance_min"]))
     clips: list[dict[str, Any]] = []
     previous_start = -1.0
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, dict):
             return None
+        score_values = (
+            raw.get("informativeness"),
+            raw.get("topic_relevance"),
+            raw.get("educational_importance"),
+            raw.get("difficulty"),
+        )
+        if any(
+            isinstance(score, bool) or not isinstance(score, (int, float))
+            for score in score_values
+        ):
+            return None
         try:
             start = float(raw.get("start"))
             end = float(raw.get("end"))
-            informativeness = float(raw.get("informativeness"))
-            topic_relevance = float(raw.get("topic_relevance"))
-            difficulty = float(raw.get("difficulty"))
+            informativeness, topic_relevance, educational_importance, difficulty = (
+                float(score) for score in score_values
+            )
         except (TypeError, ValueError):
             return None
+        uncertainty = str(raw.get("uncertainty") or "low").strip().lower()
+        uncertainty_reasons = raw.get("uncertainty_reasons") or []
         if (
             not all(
                 math.isfinite(number)
-                for number in (start, end, informativeness, topic_relevance, difficulty)
+                for number in (
+                    start,
+                    end,
+                    informativeness,
+                    topic_relevance,
+                    educational_importance,
+                    difficulty,
+                )
             )
             or start < transcript_start - 0.001
             or end > transcript_end + 0.001
             or start < previous_start
             or not 1 <= end - start <= 180
-            or not info_floor <= informativeness <= 1
-            or not relevance_floor <= topic_relevance <= 1
+            or not 0 <= informativeness <= 1
+            or not 0 <= topic_relevance <= 1
+            or not 0 <= educational_importance <= 1
             or not 0 <= difficulty <= 1
             or raw.get("self_contained") is not True
             or raw.get("kind") != "educational"
+            or uncertainty not in {"low", "medium"}
+            or not isinstance(uncertainty_reasons, list)
             or any(not str(raw.get(field) or "").strip() for field in ("title", "facet", "reason"))
             or any(field not in raw for field in ("summary", "takeaways", "match_reason", "assessment"))
             or raw.get("sequence_index") != index

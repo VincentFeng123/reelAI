@@ -1,3 +1,5 @@
+import time
+
 import pytest
 
 from backend.app.clip_engine import supadata_search as ss
@@ -34,8 +36,8 @@ def _offline_client(monkeypatch):
         async def __aexit__(self, *args):
             return False
 
-        async def get(self, url, headers=None, params=None):
-            return ss.httpx.get(url, headers=headers, params=params, timeout=None)
+        async def get(self, url, headers=None, params=None, timeout=None):
+            return ss.httpx.get(url, headers=headers, params=params, timeout=timeout)
 
     async def no_sleep(*args, **kwargs):
         return None
@@ -76,6 +78,42 @@ def test_search_one_sends_truthful_filters_and_caches(monkeypatch):
     assert second["cache_hit"] is True
     assert second["billed"] == 0
     assert len(calls) == 1
+
+
+def test_search_deadline_expires_before_http_dispatch(monkeypatch):
+    monkeypatch.setattr(
+        ss.httpx,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("expired work must not reach HTTP"),
+    )
+
+    with pytest.raises(ProviderTransientError) as exc_info:
+        ss.search_one(
+            "Calculus",
+            cache_store=MemoryProviderCache(),
+            deadline_monotonic=time.monotonic() - 1.0,
+        )
+
+    assert exc_info.value.detail == "generation deadline exceeded"
+
+
+def test_search_request_timeout_is_clamped_to_remaining_deadline(monkeypatch):
+    timeouts: list[float] = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        del url, headers, params
+        timeouts.append(float(timeout))
+        return _Resp(200, {"results": []})
+
+    monkeypatch.setattr(ss.httpx, "get", fake_get)
+    ss.search_one(
+        "Calculus",
+        cache_store=MemoryProviderCache(),
+        deadline_monotonic=time.monotonic() + 0.5,
+    )
+
+    assert len(timeouts) == 1
+    assert 0.0 < timeouts[0] <= 0.5
 
 
 def test_search_one_never_turns_subtitles_into_a_requirement(monkeypatch):

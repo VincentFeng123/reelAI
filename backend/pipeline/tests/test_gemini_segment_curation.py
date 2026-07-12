@@ -123,8 +123,14 @@ def test_line_ids_are_strict_integers(field, value):
         G._Topic.model_validate(data)
 
 
-@pytest.mark.parametrize("field", ["informativeness", "topic_relevance", "difficulty"])
-@pytest.mark.parametrize("value", [-0.001, 1.001, 7, 85])
+@pytest.mark.parametrize(
+    "field",
+    ["informativeness", "topic_relevance", "educational_importance", "difficulty"],
+)
+@pytest.mark.parametrize(
+    "value",
+    [-0.001, 1.001, 7, 85, True, "0.5", float("nan"), float("inf")],
+)
 def test_scores_outside_zero_to_one_are_rejected_not_normalized(field, value):
     data = _topic(0, 1).model_dump()
     data[field] = value
@@ -140,29 +146,30 @@ def test_kind_is_not_model_supplied_and_is_deterministically_educational():
     assert _run([_topic(0, 1)])[0]["kind"] == "educational"
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"informativeness": 0.59},
-        {"topic_relevance": 0.59},
-        {"self_contained": False},
-    ],
-)
-def test_application_quality_gates_fail_closed(overrides):
-    assert _run([_topic(0, 1, **overrides)]) == []
+def test_self_contained_gate_still_fails_closed():
+    assert _run([_topic(0, 1, self_contained=False)]) == []
 
 
-def test_quality_thresholds_are_inclusive_and_carried():
-    clip = _run([_topic(0, 1, informativeness=0.6, topic_relevance=0.6)])[0]
-    assert clip["informativeness"] == pytest.approx(0.6)
-    assert clip["topic_relevance"] == pytest.approx(0.6)
+def test_zero_scores_are_valid_and_carried():
+    clip = _run([_topic(
+        0,
+        1,
+        informativeness=0.0,
+        topic_relevance=0.0,
+        educational_importance=0.0,
+        difficulty=0.0,
+    )])[0]
+    assert clip["informativeness"] == pytest.approx(0.0)
+    assert clip["topic_relevance"] == pytest.approx(0.0)
+    assert clip["educational_importance"] == pytest.approx(0.0)
+    assert clip["difficulty"] == pytest.approx(0.0)
     assert clip["self_contained"] is True
 
 
-def test_request_quality_floor_overrides_are_preserved():
-    proposal = _topic(0, 1, informativeness=0.7, topic_relevance=0.7)
-    assert _run([proposal], settings={"segment_informativeness_min": 0.8}) == []
-    assert _run([proposal], settings={"segment_topic_relevance_min": 0.8}) == []
+def test_request_quality_floor_overrides_do_not_reject_valid_scores():
+    proposal = _topic(0, 1, informativeness=0.1, topic_relevance=0.1)
+    assert _run([proposal], settings={"segment_informativeness_min": 0.8})
+    assert _run([proposal], settings={"segment_topic_relevance_min": 0.8})
 
 
 def test_short_complete_clip_survives_legacy_fifteen_second_setting():
@@ -200,6 +207,76 @@ def test_clip_over_one_eighty_seconds_is_rejected_without_hard_cut():
     assert _run([proposal], segments, {"segment_max_clip_s": 999}) == []
 
 
+def test_oversized_section_repairs_to_a_complete_cue_subunit():
+    segments = [
+        {
+            "start": float(index * 5),
+            "end": float((index + 1) * 5),
+            "text": f"line {index} explains lesson {index} completely end {index}.",
+        }
+        for index in range(48)
+    ]
+    proposal = _topic(
+        0,
+        47,
+        title="Long section",
+        start_quote="line 0",
+        end_quote="end 47",
+    )
+
+    clips = _run([proposal], segments)
+
+    assert len(clips) == 1
+    assert clips[0]["start"] == 0.0
+    assert clips[0]["end"] == 75.0
+    assert clips[0]["cue_ids"][-1] == "cue-14"
+
+
+def test_oversized_range_without_complete_subunit_is_not_hard_cut():
+    segments = [
+        {
+            "start": float(index * 10),
+            "end": float((index + 1) * 10),
+            "text": f"Photosynthesis step {index} continues and",
+        }
+        for index in range(20)
+    ]
+
+    repaired = G._repair_oversized_cue_range(
+        segments,
+        0,
+        19,
+        ignore_caption_case=True,
+    )
+
+    assert repaired is None
+
+
+def test_oversized_repair_prefers_title_grounded_opening_within_setup_window():
+    segments = [
+        {
+            "start": float(index * 5),
+            "end": float((index + 1) * 5),
+            "text": (
+                "Chloroplast structure begins this complete explanation."
+                if index == 3
+                else f"Background lesson point {index} finishes completely."
+            ),
+        }
+        for index in range(48)
+    ]
+
+    repaired = G._repair_oversized_cue_range(
+        segments,
+        0,
+        47,
+        ignore_caption_case=True,
+        anchor_text="Chloroplast structure and pigments",
+    )
+
+    assert repaired == (3, 17)
+
+
 def test_explicit_max_clips_is_respected_below_forty_ceiling():
     segments = _segs(4)
     clips = _run([_topic(i, i, title=f"T{i}") for i in range(4)], segments, {"max_clips": 2})
@@ -211,7 +288,9 @@ def test_explicit_max_clips_is_respected_below_forty_ceiling():
     [
         ({"informativeness": 0.7}, None),
         ({"uncertainty": "medium", "uncertainty_reasons": ["boundary_ambiguous"]},
-         "proposal_1:medium_uncertainty"),
+         None),
+        ({"uncertainty": "high", "uncertainty_reasons": ["incomplete_context"]},
+         "proposal_1:high_uncertainty"),
     ],
 )
 def test_lower_ranked_candidate_never_poison_independent_kept_clip(overrides, rejected_reason):

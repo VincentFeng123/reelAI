@@ -30,6 +30,38 @@ from .provider_cache import (
 from .provider_runtime import GenerationContext, MAX_PROVIDER_RETRIES, bounded_retry_after
 
 
+def _remaining_seconds(deadline_monotonic: float | None) -> float | None:
+    if deadline_monotonic is None:
+        return None
+    return max(0.0, float(deadline_monotonic) - time.monotonic())
+
+
+def _request_timeout(deadline_monotonic: float | None) -> float:
+    remaining = _remaining_seconds(deadline_monotonic)
+    if remaining is not None and remaining <= 0:
+        raise ProviderTransientError(
+            "Supadata search timed out.",
+            provider="supadata",
+            operation="search",
+            detail="generation deadline exceeded",
+        )
+    return max(0.001, min(30.0, remaining if remaining is not None else 30.0))
+
+
+async def _sleep_before_retry(
+    seconds: float,
+    *,
+    should_cancel: Callable[[], bool] | None,
+    deadline_monotonic: float | None,
+) -> None:
+    remaining = _remaining_seconds(deadline_monotonic)
+    await sleep_with_probe(
+        min(max(0.0, seconds), remaining) if remaining is not None else max(0.0, seconds),
+        should_cancel,
+    )
+    _request_timeout(deadline_monotonic)
+
+
 def _message(response: httpx.Response) -> str:
     try:
         body = response.json()
@@ -71,6 +103,7 @@ async def _search_one_async(
     page_token: str | None = None,
     context: GenerationContext | None = None,
     cache_store: ProviderCacheStore | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     store = cache_store or (context.cache_store if context is not None else None) or DEFAULT_PROVIDER_CACHE
     normalized_filters = {**normalize_filters(filters), "sort_by": "relevance"}
@@ -119,6 +152,7 @@ async def _search_one_async(
     async with httpx.AsyncClient(timeout=30.0) as client:
         for retry_index in range(MAX_PROVIDER_RETRIES + 1):
             raise_if_cancelled(should_cancel)
+            request_timeout = _request_timeout(deadline_monotonic)
             attempt = retry_index + 1
             if context is not None:
                 context.reserve("search")
@@ -127,6 +161,7 @@ async def _search_one_async(
                     config.SUPADATA_SEARCH_URL,
                     headers={"x-api-key": key, "Accept": "application/json"},
                     params=params,
+                    timeout=request_timeout,
                 )
             except httpx.RequestError as exc:
                 if context is not None:
@@ -136,9 +171,13 @@ async def _search_one_async(
                         attempt=attempt,
                         status_code=None,
                         error_code="provider_transient",
-                    )
+                )
                 if retry_index < MAX_PROVIDER_RETRIES:
-                    await sleep_with_probe(min(30.0, 1.2 * attempt), should_cancel)
+                    await _sleep_before_retry(
+                        min(30.0, 1.2 * attempt),
+                        should_cancel=should_cancel,
+                        deadline_monotonic=deadline_monotonic,
+                    )
                     continue
                 raise ProviderTransientError(
                     "Could not reach Supadata search.",
@@ -173,9 +212,10 @@ async def _search_one_async(
             if status == 429 or 500 <= status <= 599:
                 retry_after = bounded_retry_after(response.headers)
                 if retry_index < MAX_PROVIDER_RETRIES:
-                    await sleep_with_probe(
+                    await _sleep_before_retry(
                         retry_after if retry_after is not None else min(30.0, 1.2 * attempt),
-                        should_cancel,
+                        should_cancel=should_cancel,
+                        deadline_monotonic=deadline_monotonic,
                     )
                     continue
                 raise _failure(response, retry_after=retry_after)
@@ -238,6 +278,7 @@ def search_one(
     page_token: str | None = None,
     context: GenerationContext | None = None,
     cache_store: ProviderCacheStore | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     return run_cancellable(
         lambda: _search_one_async(
@@ -248,6 +289,7 @@ def search_one(
             page_token=page_token,
             context=context,
             cache_store=cache_store,
+            deadline_monotonic=deadline_monotonic,
         ),
         should_cancel,
     )
@@ -265,6 +307,7 @@ def search_all(
     context: GenerationContext | None = None,
     cache_store: ProviderCacheStore | None = None,
     parallel_prefix: int = 0,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     credits_used = 0
     per_query: list[dict] = []
@@ -289,6 +332,7 @@ def search_all(
                         language=language,
                         context=context,
                         cache_store=cache_store,
+                        deadline_monotonic=deadline_monotonic,
                     )
                 )
             for future in futures:
@@ -320,6 +364,7 @@ def search_all(
                 language=language,
                 context=context,
                 cache_store=cache_store,
+                deadline_monotonic=deadline_monotonic,
             )
         except ProviderBudgetExceededError:
             if not per_query:

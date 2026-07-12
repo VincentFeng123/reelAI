@@ -15,6 +15,14 @@ def test_and_then_continuation_is_weak():
 def test_however_continuation_is_weak():
     assert opens_mid_thought("However we do have a subscript next to O and it's a two.")
 
+
+def test_back_to_prior_context_is_weak():
+    assert opens_mid_thought("Back to the cycle!")
+
+
+def test_explicit_moving_along_transition_is_self_contained_framing():
+    assert not opens_mid_thought("Because now we're moving along to the Calvin Cycle!")
+
 def test_dangling_anaphor_is_weak():
     assert opens_mid_thought("This is why the reaction proceeds so quickly.")
     assert opens_mid_thought("That gives us the final concentration.")

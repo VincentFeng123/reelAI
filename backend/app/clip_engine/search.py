@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,31 @@ if TYPE_CHECKING:
     from ..services.search_query_plan import SearchQueryPlan
 
 logger = logging.getLogger(__name__)
+
+
+_DIFFICULTY_QUALIFIERS = {
+    "beginner": re.compile(
+        r"\b(?:beginners?|intro(?:duction|ductory)?|basics?|fundamentals?|novices?)\b",
+        re.IGNORECASE,
+    ),
+    "intermediate": re.compile(r"\b(?:intermediate|mid[ -]?level)\b", re.IGNORECASE),
+    "advanced": re.compile(
+        r"\b(?:advanced|experts?|graduate(?:[ -]?level)?|upper[ -]?level)\b",
+        re.IGNORECASE,
+    ),
+}
+
+
+def _difficulty_bootstrap_query(topic: str, level: str | None) -> str:
+    """Encode the learner's level once without changing the topic identity."""
+    literal = " ".join(str(topic or "").split())
+    normalized_level = str(level or "").strip().casefold()
+    qualifier = _DIFFICULTY_QUALIFIERS.get(normalized_level)
+    if not literal or qualifier is None or qualifier.search(literal):
+        return literal
+    if normalized_level == "beginner":
+        return f"{literal} for beginners"
+    return f"{normalized_level} {literal}"
 
 
 def _request_filters(filters: dict | None, *, prefer_hd: bool) -> dict:
@@ -148,7 +174,9 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
              literal_topic: str | None = None,
              use_query_planner: bool = True,
              query_plan: "SearchQueryPlan | None" = None,
-             practice_fast: bool = False) -> dict:
+             practice_fast: bool = False,
+             retrieval_profile: str = "deep",
+             deadline_monotonic: float | None = None) -> dict:
     if practice_fast:
         return discover_practice_fast(
             topic,
@@ -164,6 +192,8 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
             literal_topic=literal_topic,
             use_query_planner=use_query_planner,
             query_plan=query_plan,
+            retrieval_profile=retrieval_profile,
+            deadline_monotonic=deadline_monotonic,
         )
     topic = " ".join(str(topic or "").split())
     if not topic:
@@ -349,13 +379,15 @@ def discover_practice_fast(
     literal_topic: str | None = None,
     use_query_planner: bool = True,
     query_plan: "SearchQueryPlan | None" = None,
+    retrieval_profile: str = "deep",
+    deadline_monotonic: float | None = None,
 ) -> dict:
-    """Literal-first retrieval with conditional, Flash-only expansion.
+    """Difficulty-first bootstrap or literal-first conditional expansion.
 
     The signature intentionally matches ``discover`` so live wiring can switch paths
     without dropping cancellation, budgets, provider caching, filters, or exclusions.
-    Planner arguments remain a compatibility surface; the user's literal text is the
-    retrieval and downstream relevance identity.
+    Planner arguments remain a compatibility surface; the user's literal text always
+    remains the downstream relevance identity.
     """
     del use_query_planner
     topic = " ".join(str(topic or "").split())
@@ -379,7 +411,13 @@ def discover_practice_fast(
     tutorial_query = f"{literal_query} explained tutorial"
     initial_queries: list[str] = []
     seen_query_keys: set[str] = set()
-    for candidate in (literal_query, tutorial_query):
+    bootstrap = str(retrieval_profile or "deep").strip().casefold() == "bootstrap"
+    deterministic_queries = (
+        (_difficulty_bootstrap_query(literal_query, level),)
+        if bootstrap
+        else (literal_query, tutorial_query)
+    )
+    for candidate in deterministic_queries:
         key = " ".join(candidate.casefold().split())
         if key and key not in seen_query_keys:
             seen_query_keys.add(key)
@@ -387,14 +425,20 @@ def discover_practice_fast(
         if len(initial_queries) >= query_count:
             break
 
+    search_runtime: dict[str, object] = {
+        "should_cancel": should_cancel,
+        "language": language,
+        "context": context,
+        "cache_store": cache_store,
+    }
+    if deadline_monotonic is not None:
+        search_runtime["deadline_monotonic"] = float(deadline_monotonic)
+
     initial = supadata_search.search_all(
         initial_queries,
         filters,
-        should_cancel=should_cancel,
-        language=language,
-        context=context,
-        cache_store=cache_store,
         parallel_prefix=len(initial_queries),
+        **search_runtime,
     )
     raise_if_cancelled(should_cancel)
 
@@ -420,6 +464,45 @@ def discover_practice_fast(
         for video_id in (exclude_video_ids or [])
     }
     initial_ranked = rank.merge_and_rank(per_query, level=level)
+    eligible_initial = [
+        video for video in initial_ranked if video.get("id") not in excluded
+    ]
+    if bootstrap:
+        fallback_result = {"per_query": [], "credits_used": 0, "warning": None}
+        qualified_key = " ".join(initial_queries[0].casefold().split())
+        literal_key = " ".join(literal_query.casefold().split())
+        if not eligible_initial and qualified_key != literal_key:
+            fallback_result = supadata_search.search_all(
+                [literal_query],
+                filters,
+                **search_runtime,
+            )
+            raise_if_cancelled(should_cancel)
+            annotate(fallback_result["per_query"])
+            per_query.extend(fallback_result["per_query"])
+            initial_queries.append(literal_query)
+
+        ranked = rank.merge_and_rank(per_query, level=level)
+        top_n = max(0, int(limit))
+        videos = [
+            video for video in ranked if video.get("id") not in excluded
+        ][:top_n]
+        return {
+            "corrected": literal_query,
+            "queries": initial_queries,
+            # The deterministic qualifier is retrieval-only. Transcript
+            # segmentation and topic-evidence checks retain the raw topic.
+            "topic_terms": [literal_query],
+            "provider_used": "deterministic",
+            "videos": videos,
+            "credits_used": (
+                int(initial.get("credits_used") or 0)
+                + int(fallback_result.get("credits_used") or 0)
+            ),
+            "warning": fallback_result.get("warning") or initial.get("warning"),
+            "query_plan": query_plan,
+        }
+
     good_candidates = sum(
         1
         for video in initial_ranked
@@ -456,10 +539,7 @@ def discover_practice_fast(
             expansion_result = supadata_search.search_all(
                 expansion_queries,
                 filters,
-                should_cancel=should_cancel,
-                language=language,
-                context=context,
-                cache_store=cache_store,
+                **search_runtime,
             )
             annotate(expansion_result["per_query"], expanded=True)
             per_query.extend(expansion_result["per_query"])

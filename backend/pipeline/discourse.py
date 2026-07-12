@@ -49,6 +49,7 @@ _FRAMING_PATTERNS = (
     "we'll", "i want to", "i'm going to", "consider", "suppose", "imagine",
     "here's", "here is", "take ", "let me", "start with", "starting with",
     "look at", "move on to", "moving on", "turn to", "next up", "first,",
+    "moving along to",
     "to begin", "begin with", "picture ", "think about", "what about",
     "how about", "say we", "say you",
 )
@@ -100,6 +101,8 @@ def opens_mid_thought(text: str) -> bool:
 
     # 1) leading continuation marker without framing → mid-thought
     if w0 in CONTINUATION_MARKERS:
+        return True
+    if w0 == "back" and w1 == "to":
         return True
     # 2) dangling anaphor (pronoun immediately before a verb/aux) → unresolved reference
     if w0 in ANAPHORS and (w1 in _AUX_VERB or w1 == "s"):

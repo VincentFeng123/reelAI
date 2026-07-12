@@ -3323,7 +3323,7 @@ def _run_leased_generation_job(
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
                 identity = _reel_identity_key(reel)
-                if identity in emitted:
+                if identity in emitted or len(emitted) >= 2:
                     return
                 emitted.add(identity)
                 append_generation_event(
@@ -3334,41 +3334,24 @@ def _run_leased_generation_job(
                     lease_owner=lease_owner,
                 )
 
-            previous_count = source_reel_count + _count_generation_reels(
-                conn, generation_id
-            )
-            last_growth: int | None = None
-            for pass_index in range(context.budget.max_passes):
-                if previous_count >= requested_count:
-                    break
-                if pass_index > 0 and any(
-                    context.budget.remaining(operation) <= 0
-                    for operation in ("search", "transcript", "segmentation")
-                ):
-                    break
-                context.budget.reserve_pass(no_growth=last_growth == 0)
-                if should_cancel():
-                    raise GenerationCancelledError("Generation cancelled.")
-                if mode == "fast":
-                    pass_video_budget = 3
-                elif pass_index == 0:
-                    pass_video_budget = 5
-                else:
-                    pass_video_budget = max(
-                        1,
-                        min(
-                            3,
-                            context.budget.remaining("transcript"),
-                            context.budget.remaining("segmentation"),
-                        ),
-                    )
+            base_exclusions = list(params.get("exclude_video_ids") or [])
+
+            def run_retrieval_stage(
+                *,
+                retrieval_profile: Literal["bootstrap", "deep"],
+                video_budget: int,
+                new_reel_cap: int,
+                excluded_video_ids: list[str],
+                analyzed_video_ids: set[str],
+                retrieved_video_ids: set[str],
+            ) -> None:
                 reel_service.generate_reels(
                     conn,
                     material_id=material_id,
                     concept_id=concept_id,
                     num_reels=requested_count,
                     creative_commons_only=bool(params.get("creative_commons_only")),
-                    exclude_video_ids=list(params.get("exclude_video_ids") or []),
+                    exclude_video_ids=excluded_video_ids,
                     exclude_generation_ids=source_generation_ids,
                     fast_mode=mode == "fast",
                     preferred_video_duration=_normalize_preferred_video_duration(
@@ -3377,7 +3360,7 @@ def _run_leased_generation_job(
                     target_clip_duration_sec=int(params.get("target_clip_duration_sec") or 55),
                     target_clip_duration_min_sec=params.get("target_clip_duration_min_sec"),
                     target_clip_duration_max_sec=params.get("target_clip_duration_max_sec"),
-                    retrieval_profile="deep",
+                    retrieval_profile=retrieval_profile,
                     generation_id=generation_id,
                     min_relevance_threshold=float(params.get("min_relevance") or 0.0),
                     page_hint=1,
@@ -3386,9 +3369,48 @@ def _run_leased_generation_job(
                     knowledge_level_override=str(params.get("knowledge_level") or "beginner"),
                     learner_id=learner_id,
                     generation_context=context,
-                    max_generation_videos=pass_video_budget,
-                    acquisition_concept_offset=pass_index,
+                    max_generation_videos=video_budget,
+                    acquisition_concept_offset=0,
+                    max_new_reels=new_reel_cap,
+                    analyzed_video_ids=analyzed_video_ids,
+                    retrieved_video_ids=retrieved_video_ids,
                 )
+
+            current_count = source_reel_count + _count_generation_reels(
+                conn, generation_id
+            )
+            if current_count < requested_count:
+                context.budget.reserve_pass()
+                if should_cancel():
+                    raise GenerationCancelledError("Generation cancelled.")
+                bootstrap_analyzed_video_ids: set[str] = set()
+                bootstrap_retrieved_video_ids: set[str] = set()
+                try:
+                    run_retrieval_stage(
+                        retrieval_profile="bootstrap",
+                        video_budget=3,
+                        new_reel_cap=min(2, requested_count - current_count),
+                        excluded_video_ids=base_exclusions,
+                        analyzed_video_ids=bootstrap_analyzed_video_ids,
+                        retrieved_video_ids=bootstrap_retrieved_video_ids,
+                    )
+                except ClipEngineProviderError as exc:
+                    deadline_exhausted = (
+                        exc.code == "provider_transient"
+                        and exc.operation in {"search", "transcript"}
+                        and str(exc.detail or "").strip().casefold()
+                        == "generation deadline exceeded"
+                    )
+                    if not deadline_exhausted:
+                        raise
+                    # The provisional stage has a strict wall-clock ceiling.
+                    # Slow jobs may still recover through deep retrieval; Fast
+                    # jobs truthfully finish partial/exhausted.
+                    logger.info(
+                        "bootstrap deadline exhausted job_id=%s operation=%s",
+                        job_id,
+                        exc.operation,
+                    )
                 current_count = source_reel_count + _count_generation_reels(
                     conn, generation_id
                 )
@@ -3396,17 +3418,51 @@ def _run_leased_generation_job(
                     conn,
                     job_id=job_id,
                     lease_owner=lease_owner,
-                    phase="ranking",
-                    progress=min(0.85, 0.25 + 0.2 * (pass_index + 1)),
+                    phase="ranking" if mode == "fast" else "retrieval",
+                    progress=0.85 if mode == "fast" else 0.45,
                     usage=context.usage_payload(),
                 ):
                     raise JobLeaseLostError(
                         f"generation job lease is no longer active: {job_id}"
                     )
-                if current_count >= requested_count or mode == "fast":
-                    break
-                last_growth = max(0, current_count - previous_count)
-                previous_count = current_count
+
+                deep_video_budget = min(
+                    max(0, 5 - len(bootstrap_analyzed_video_ids)),
+                    context.budget.remaining("transcript"),
+                    context.budget.remaining("segmentation"),
+                )
+                if (
+                    mode == "slow"
+                    and current_count < requested_count
+                    and deep_video_budget > 0
+                    and context.budget.remaining("search") > 0
+                ):
+                    deep_exclusions = _normalize_excluded_video_ids(
+                        [*base_exclusions, *sorted(bootstrap_retrieved_video_ids)]
+                    )
+                    run_retrieval_stage(
+                        retrieval_profile="deep",
+                        video_budget=deep_video_budget,
+                        new_reel_cap=requested_count - current_count,
+                        excluded_video_ids=deep_exclusions,
+                        analyzed_video_ids=set(),
+                        retrieved_video_ids=set(),
+                    )
+                    current_count = source_reel_count + _count_generation_reels(
+                        conn, generation_id
+                    )
+                if mode == "slow":
+                    if not update_generation_progress(
+                        conn,
+                        job_id=job_id,
+                        lease_owner=lease_owner,
+                        phase="ranking",
+                        progress=0.85,
+                        usage=context.usage_payload(),
+                    ):
+                        raise JobLeaseLostError(
+                            f"generation job lease is no longer active: {job_id}"
+                        )
 
             cumulative_count = source_reel_count + _count_generation_reels(
                 conn, generation_id

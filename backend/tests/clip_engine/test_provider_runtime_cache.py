@@ -231,6 +231,14 @@ def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -
         },
     )
     context.record_segment_event({"event": "pro_fallback", "reason": "invalid_edges"})
+    context.record_segment_event({
+        "event": "segment_completed",
+        "rejection_reasons": [
+            "proposal_0:bad_start_quote",
+            "proposal_1:bad_start_quote",
+            "request_failure:RuntimeError",
+        ],
+    })
     context.increment_counter("persisted_clips", 2)
 
     payload = context.usage_payload()
@@ -240,6 +248,10 @@ def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -
     assert payload["summary"]["thought_tokens"] == 10
     assert payload["summary"]["accepted_clips"] == 2
     assert payload["summary"]["fallback_reasons"] == ["invalid_edges"]
+    assert payload["summary"]["rejection_reason_counts"] == {
+        "bad_start_quote": 2,
+        "request_failure:RuntimeError": 1,
+    }
     assert payload["by_stage"]["selection"]["calls"] == 1
     assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.25
 

@@ -95,6 +95,9 @@ logger: logging.Logger = get_ingest_logger(__name__)
 # Shared wall-clock budget for one topic's concurrent clip+filter batch. A
 # pathological set of videos must not multiply this deadline by video count.
 INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOUT_SEC", "180"))
+INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
+    os.environ.get("INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC", "45")
+)
 
 
 def _run_clip(
@@ -107,6 +110,7 @@ def _run_clip(
     deadline_monotonic: float | None = None,
     candidate_rank: int | None = None,
     max_clips: int | None = None,
+    retrieval_profile: str = "deep",
 ) -> dict[str, Any]:
     settings: dict[str, Any] = {
         "language": language,
@@ -119,6 +123,13 @@ def _run_clip(
         settings["max_clips"] = max(1, min(8, int(max_clips)))
     if deadline_monotonic is not None:
         settings["deadline_monotonic"] = float(deadline_monotonic)
+    if retrieval_profile == "bootstrap":
+        # Bootstrap is the low-latency Flash path. Fail closed instead of
+        # spending the shared job's one Pro fallback; localized Flash boundary
+        # repair still runs inside the selector.
+        settings["_segment_pro_fallback_gate"] = lambda **_kwargs: False
+        settings["_segment_routing_mode"] = "flash_only"
+        settings["_segment_thinking_level"] = "low"
     kwargs = {
         "topic": topic,
         "settings": settings,
@@ -142,6 +153,8 @@ def _discover(
     literal_topic: str | None = None,
     use_query_planner: bool = True,
     breadth: int | None = None,
+    retrieval_profile: str = "deep",
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "limit": limit,
@@ -156,7 +169,10 @@ def _discover(
         "literal_topic": literal_topic or topic,
         "use_query_planner": bool(use_query_planner),
         "practice_fast": True,
+        "retrieval_profile": retrieval_profile,
     }
+    if deadline_monotonic is not None:
+        kwargs["deadline_monotonic"] = float(deadline_monotonic)
     if breadth is not None:
         kwargs["breadth"] = max(1, int(breadth))
     if level is not None:
@@ -883,6 +899,9 @@ class IngestionPipeline:
         preferred_video_duration: str = "any",
         generation_context: GenerationContext | None = None,
         literal_topic: str | None = None,
+        retrieval_profile: str = "deep",
+        analyzed_video_ids: set[str] | None = None,
+        retrieved_video_ids: set[str] | None = None,
     ) -> tuple[list[ReelOutWithAttribution], list[str]]:
         """
         Route ONE study concept through the clip engine and persist EVERY
@@ -904,6 +923,9 @@ class IngestionPipeline:
         topic = " ".join(str(topic or "").split())
         if not topic:
             raise UnsupportedSourceError("A non-blank YouTube search topic is required.")
+        retrieval_profile = (
+            "bootstrap" if str(retrieval_profile).strip().lower() == "bootstrap" else "deep"
+        )
         raise_if_cancelled(should_cancel)
         provider_analysis_limit = int(max_videos)
         if generation_context is not None and not dry_run:
@@ -917,9 +939,18 @@ class IngestionPipeline:
         )
         if analysis_limit <= 0:
             return [], []
-        discovery_limit = min(
-            clip_engine_config.CLIP_SEARCH_MAX_VIDEOS,
-            max(analysis_limit, analysis_limit * 2),
+        discovery_limit = (
+            analysis_limit
+            if retrieval_profile == "bootstrap"
+            else min(
+                clip_engine_config.CLIP_SEARCH_MAX_VIDEOS,
+                max(analysis_limit, analysis_limit * 2),
+            )
+        )
+        bootstrap_deadline = (
+            time.monotonic() + max(0.0, INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC)
+            if retrieval_profile == "bootstrap"
+            else None
         )
 
         self._rate_limiter.acquire("yt")
@@ -944,6 +975,8 @@ class IngestionPipeline:
                 literal_topic=literal_topic or topic,
                 use_query_planner=False,
                 breadth=clip_engine_config.SEARCH_BREADTH,
+                retrieval_profile=retrieval_profile,
+                deadline_monotonic=bootstrap_deadline,
             )
         except _ClipProviderError:
             if generation_context is not None:
@@ -976,6 +1009,7 @@ class IngestionPipeline:
             )
         topic_terms = list(dict.fromkeys(topic_terms))
         for discovered_video in disc["videos"]:
+            discovered_video["_retrieval_profile"] = retrieval_profile
             discovered_video["_knowledge_level"] = knowledge_level
             discovered_video["_topic_terms"] = topic_terms
             discovered_video["_literal_topic"] = authoritative_topic
@@ -990,6 +1024,12 @@ class IngestionPipeline:
             if query_plan is not None:
                 discovered_video["_query_plan"] = query_plan
         resolved_video_ids = [v["id"] for v in disc["videos"][:analysis_limit]]
+        if retrieved_video_ids is not None:
+            retrieved_video_ids.update(
+                str(video_id or "").strip().split(":", 1)[-1]
+                for video_id in resolved_video_ids
+                if str(video_id or "").strip()
+            )
         if generation_context is not None:
             generation_context.increment_counter("discovered_videos", len(resolved_video_ids))
 
@@ -1013,7 +1053,7 @@ class IngestionPipeline:
         executor = ThreadPoolExecutor(max_workers=min(2, len(videos)))
         enrichment_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="clip-enrichment")
-            if generation_context is not None
+            if generation_context is not None and retrieval_profile == "deep"
             else None
         )
         enrichment_buffer: list[dict[str, Any]] = []
@@ -1023,12 +1063,22 @@ class IngestionPipeline:
         def fetch_should_cancel() -> bool:
             return batch_cancelled.is_set() or is_cancelled(should_cancel)
 
-        deadline = time.monotonic() + max(0.0, INGEST_TOPIC_VIDEO_TIMEOUT_SEC)
+        shared_timeout_sec = (
+            INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC
+            if retrieval_profile == "bootstrap"
+            else INGEST_TOPIC_VIDEO_TIMEOUT_SEC
+        )
+        deadline = bootstrap_deadline or (
+            time.monotonic() + max(0.0, INGEST_TOPIC_VIDEO_TIMEOUT_SEC)
+        )
         for index, video in enumerate(videos):
             video["_deadline_monotonic"] = deadline
             video["_segment_candidate_rank"] = index
 
         def submit_video(index: int):
+            analyzed_video_id = str(videos[index].get("id") or "").strip()
+            if analyzed_video_ids is not None and analyzed_video_id:
+                analyzed_video_ids.add(analyzed_video_id)
             videos[index]["_segment_max_candidates"] = min(
                 8,
                 max(1, inventory_cap - valid_clip_count + 2),
@@ -1053,7 +1103,7 @@ class IngestionPipeline:
                         "record_pro_fallback_cohort_result",
                         None,
                     )
-                    if callable(record_cohort):
+                    if retrieval_profile == "deep" and callable(record_cohort):
                         accepted_count = (
                             len(result[1])
                             if isinstance(result, tuple) and len(result) > 1
@@ -1086,7 +1136,7 @@ class IngestionPipeline:
                     query_plan_ai_status=(v.get("_search_context") or {}).get("query_plan_ai_status"),
                     error=(
                         "shared clip fetch deadline exceeded "
-                        f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
+                        f"({shared_timeout_sec:g}s)"
                     ),
                 )
             except _TranscriptUnavailableError as exc:
@@ -1148,7 +1198,7 @@ class IngestionPipeline:
                         "record_pro_fallback_cohort_result",
                         None,
                     )
-                    if callable(record_cohort):
+                    if retrieval_profile == "deep" and callable(record_cohort):
                         record_cohort(
                             candidate_rank=int(v.get("_segment_candidate_rank") or 0),
                             accepted_count=0,
@@ -1272,7 +1322,7 @@ class IngestionPipeline:
         aggregate_fallback_checked = False
         provider_errors: list[_ClipProviderError] = []
         initial_count = min(2, len(videos), analysis_limit)
-        if generation_context is not None:
+        if generation_context is not None and retrieval_profile == "deep":
             configure_fallback = getattr(
                 generation_context, "configure_pro_fallback_gate", None
             )
@@ -1295,6 +1345,8 @@ class IngestionPipeline:
 
         def maybe_run_aggregate_fallback() -> None:
             nonlocal aggregate_fallback_checked, valid_clip_count, persisted_count
+            if retrieval_profile != "deep":
+                return
             if aggregate_fallback_checked or len(initial_resolved) < initial_count:
                 return
             aggregate_fallback_checked = True
@@ -1446,7 +1498,7 @@ class IngestionPipeline:
                             query_plan_ai_status=(v.get("_search_context") or {}).get("query_plan_ai_status"),
                             error=(
                                 "shared clip fetch deadline exceeded "
-                                f"({INGEST_TOPIC_VIDEO_TIMEOUT_SEC:g}s)"
+                                f"({shared_timeout_sec:g}s)"
                             ),
                         )
                     if generation_context is not None:
@@ -1552,6 +1604,7 @@ class IngestionPipeline:
                 deadline_monotonic=v.get("_deadline_monotonic"),
                 candidate_rank=v.get("_segment_candidate_rank"),
                 max_clips=v.get("_segment_max_candidates"),
+                retrieval_profile=str(v.get("_retrieval_profile") or "deep"),
             )
         transcript = engine_out["transcript"]
         query_plan = (
@@ -1653,10 +1706,16 @@ class IngestionPipeline:
             if has_selector_metadata:
                 importance = unit(clip.get("educational_importance"), 0.5)
                 boundary_confidence = unit(clip.get("boundary_confidence"), 0.5)
-                content_score = (
-                    0.45 * topic_relevance
-                    + 0.35 * importance
-                    + 0.20 * informativeness
+                uncertainty = str(clip.get("uncertainty") or "low").strip().lower()
+                uncertainty_penalty = 0.08 if uncertainty == "medium" else 0.0
+                content_score = max(
+                    0.0,
+                    (
+                        0.45 * topic_relevance
+                        + 0.35 * importance
+                        + 0.20 * informativeness
+                    )
+                    - uncertainty_penalty,
                 )
                 clip["score"] = content_score
                 prerequisite_ids = clip.get("prerequisite_ids")
@@ -1697,15 +1756,31 @@ class IngestionPipeline:
                     chain_position=clip.get("chain_position"),
                     selection_candidate_id=selection_candidate_id,
                     prerequisite_ids=namespaced_prerequisites,
+                    uncertainty=uncertainty,
+                    uncertainty_reasons=[
+                        str(reason)
+                        for reason in (clip.get("uncertainty_reasons") or [])
+                        if str(reason).strip()
+                    ],
                 )
             else:
                 difficulty = unit(clip.get("difficulty"), 0.5)
                 level_fit = 1.0 - abs(difficulty - level_target)
-                clip["score"] = (
-                    0.55 * topic_relevance
-                    + 0.25 * informativeness
-                    + 0.15 * level_fit
-                    + 0.05 * lexical_relevance
+                uncertainty_penalty = (
+                    0.08
+                    if str(clip.get("uncertainty") or "low").strip().lower()
+                    == "medium"
+                    else 0.0
+                )
+                clip["score"] = max(
+                    0.0,
+                    (
+                        0.55 * topic_relevance
+                        + 0.25 * informativeness
+                        + 0.15 * level_fit
+                        + 0.05 * lexical_relevance
+                    )
+                    - uncertainty_penalty,
                 )
             clip["search_context"] = search_context
             kept.append(clip)
@@ -1973,7 +2048,7 @@ class IngestionPipeline:
             informativeness = float(details.get("informativeness"))
         except (TypeError, ValueError):
             informativeness = 0.6
-        informativeness = max(0.6, min(1.0, informativeness))
+        informativeness = max(0.0, min(1.0, informativeness))
         assessment = details.get("assessment")
         raise_if_cancelled(should_cancel)
 
@@ -2126,6 +2201,9 @@ class IngestionPipeline:
             total_concepts=None,
             video_duration_sec=int(metadata.duration_sec) if metadata.duration_sec else None,
             clip_duration_sec=float(clip_duration),
+            difficulty=(
+                0.5 if clip_difficulty is None else float(clip_difficulty)
+            ),
             model_used=str(details.get("model_used") or ""),
             quality_degraded=bool(details.get("quality_degraded", False)),
             selected_cue_ids=[

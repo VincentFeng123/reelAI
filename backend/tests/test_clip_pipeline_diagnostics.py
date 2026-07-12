@@ -144,6 +144,70 @@ def test_ingest_topic_records_stage_counts_and_propagates_shared_deadline(
     assert counters["gemini_empty_results"] == 2
 
 
+def test_bootstrap_uses_one_end_to_end_deadline_from_search_through_segmentation(
+    monkeypatch,
+) -> None:
+    captured_discovery: dict = {}
+    captured_settings: list[dict] = []
+
+    def discover(*_args, **kwargs):
+        captured_discovery.update(kwargs)
+        return _discovery()
+
+    def fake_clip(_url, *, topic, settings, should_cancel):
+        del topic, should_cancel
+        captured_settings.append(settings)
+        return {"clips": [], "transcript": _transcript(), "notes": ""}
+
+    monkeypatch.setattr(pipeline_module, "_discover", discover)
+    monkeypatch.setattr(pipeline_module.clip_engine_run, "clip", fake_clip)
+    started = time.monotonic()
+
+    _pipeline().ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext("slow"),
+        retrieval_profile="bootstrap",
+        max_videos=1,
+    )
+
+    discovery_deadline = float(captured_discovery["deadline_monotonic"])
+    assert discovery_deadline == captured_settings[0]["deadline_monotonic"]
+    assert started + 44.0 <= discovery_deadline <= started + 46.0
+    assert captured_discovery["retrieval_profile"] == "bootstrap"
+
+
+def test_bootstrap_records_discovered_sources_before_video_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
+    monkeypatch.setattr(
+        _pipeline().__class__,
+        "_clip_and_filter",
+        mock.Mock(
+            side_effect=ProviderTransientError(
+                "Supadata transcript retrieval timed out.",
+                provider="supadata",
+                operation="transcript",
+                detail="generation deadline exceeded",
+            )
+        ),
+    )
+    retrieved: set[str] = set()
+
+    with pytest.raises(ProviderTransientError):
+        _pipeline().ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            generation_context=GenerationContext("slow"),
+            retrieval_profile="bootstrap",
+            max_videos=1,
+            retrieved_video_ids=retrieved,
+        )
+
+    assert retrieved == {"dQw4w9WgXcQ"}
+
+
 def test_ingest_topic_uses_literal_identity_for_segmentation(monkeypatch) -> None:
     captured_topics: list[str] = []
     discovery = {
@@ -403,6 +467,92 @@ def test_joint_one_plus_one_initial_yield_uses_one_aggregate_pro_fallback(
     assert any(str(reel).endswith(":20.0") for reel in reels)
     assert not any(str(reel).endswith(":40.0") for reel in reels)
     pro_fallback.assert_called_once()
+
+
+def test_bootstrap_skips_pro_fallback_and_optional_enrichment(monkeypatch) -> None:
+    video = _video()
+    discovery_limits: list[int] = []
+
+    def discover(*_args, **kwargs):
+        discovery_limits.append(int(kwargs["limit"]))
+        return {**_discovery(), "videos": [video]}
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        discover,
+    )
+    pipeline = _pipeline()
+    monkeypatch.setattr(
+        pipeline,
+        "_clip_and_filter",
+        lambda selected, *_args, **_kwargs: (
+            selected,
+            [{"start": 0.0, "end": 10.0, "score": 0.8}],
+            {"transcript": _transcript(), "clips": []},
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(return_value=("bootstrap-reel", mock.sentinel.metadata)),
+    )
+    pro_fallback = mock.Mock()
+    enrichment = mock.Mock()
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_run,
+        "pro_boundary_fallback",
+        pro_fallback,
+    )
+    monkeypatch.setattr(
+        pipeline_module.live_gemini_segment,
+        "enrich_accepted_clips",
+        enrichment,
+    )
+    context = GenerationContext("slow")
+    analyzed: set[str] = set()
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        max_videos=3,
+        max_reels=2,
+        generation_context=context,
+        retrieval_profile="bootstrap",
+        analyzed_video_ids=analyzed,
+    )
+
+    assert reels == ["bootstrap-reel"]
+    assert discovery_limits == [3]
+    assert analyzed == {video["id"]}
+    pro_fallback.assert_not_called()
+    enrichment.assert_not_called()
+    assert context.claim_aggregate_pro_fallback(validated_count=0) is True
+
+
+def test_bootstrap_clip_call_closes_pro_fallback_gate(monkeypatch) -> None:
+    captured: dict = {}
+
+    def clip(_url, **kwargs):
+        captured.update(kwargs["settings"])
+        return {"clips": [], "transcript": {"segments": []}}
+
+    monkeypatch.setattr(pipeline_module.clip_engine_run, "clip", clip)
+
+    pipeline_module._run_clip(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        topic="Intro to Python",
+        language="en",
+        should_cancel=None,
+        retrieval_profile="bootstrap",
+    )
+
+    fallback_gate = captured.get("_segment_pro_fallback_gate")
+    assert callable(fallback_gate)
+    assert fallback_gate(accepted_count=0, video_id="dQw4w9WgXcQ") is False
+    assert captured["_segment_routing_mode"] == "flash_only"
+    assert captured["_segment_thinking_level"] == "low"
 
 
 def test_aggregate_pro_fallback_targets_lowest_yield_initial_video(

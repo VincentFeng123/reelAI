@@ -264,6 +264,116 @@ def test_practice_fast_rank_is_the_simple_practice_formula():
     assert "edu_score" not in ranked[0]
 
 
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [
+        ("beginner", "AP macroeconomics for beginners"),
+        ("intermediate", "intermediate AP macroeconomics"),
+        ("advanced", "advanced AP macroeconomics"),
+    ],
+)
+def test_bootstrap_query_encodes_difficulty(level, expected):
+    assert search._difficulty_bootstrap_query("AP macroeconomics", level) == expected
+
+
+@pytest.mark.parametrize(
+    ("topic", "level"),
+    [
+        ("AP macroeconomics for beginners", "beginner"),
+        ("Beginner AP macroeconomics", "beginner"),
+        ("intermediate AP macroeconomics", "intermediate"),
+        ("Advanced AP macroeconomics", "advanced"),
+    ],
+)
+def test_bootstrap_query_does_not_duplicate_equivalent_qualifier(topic, level):
+    assert search._difficulty_bootstrap_query(topic, level) == topic
+
+
+def test_bootstrap_searches_qualified_query_without_gemini_and_preserves_raw_topic(monkeypatch):
+    calls = []
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        calls.append(list(queries))
+        return {
+            "per_query": [
+                {
+                    "query": queries[0],
+                    "videos": [{"id": "matched", "title": "Physics basics"}],
+                }
+            ],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda *_args, **_kwargs: pytest.fail("bootstrap retrieval must not invoke Gemini"),
+    )
+
+    result = search.discover_practice_fast(
+        "quantum physics",
+        limit=2,
+        level="beginner",
+        retrieval_profile="bootstrap",
+    )
+
+    assert calls == [["quantum physics for beginners"]]
+    assert result["corrected"] == "quantum physics"
+    assert result["topic_terms"] == ["quantum physics"]
+    assert result["queries"] == ["quantum physics for beginners"]
+    assert [video["id"] for video in result["videos"]] == ["matched"]
+
+
+def test_bootstrap_retries_raw_topic_once_when_qualified_results_are_ineligible(monkeypatch):
+    calls = []
+    deadline = 1234.5
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        calls.append((list(queries), kwargs.get("deadline_monotonic")))
+        if len(calls) == 1:
+            return {
+                "per_query": [
+                    {"query": queries[0], "videos": [{"id": "excluded"}]}
+                ],
+                "credits_used": 1,
+                "warning": None,
+            }
+        return {
+            "per_query": [
+                {"query": queries[0], "videos": [{"id": "raw-match"}]}
+            ],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda *_args, **_kwargs: pytest.fail("raw fallback must precede and skip Gemini"),
+    )
+
+    result = search.discover(
+        "physics",
+        limit=2,
+        exclude_video_ids=["excluded"],
+        level="advanced",
+        practice_fast=True,
+        retrieval_profile="bootstrap",
+        deadline_monotonic=deadline,
+    )
+
+    assert calls == [
+        (["advanced physics"], deadline),
+        (["physics"], deadline),
+    ]
+    assert result["queries"] == ["advanced physics", "physics"]
+    assert result["credits_used"] == 2
+    assert [video["id"] for video in result["videos"]] == ["raw-match"]
+
+
 def test_discover_practice_fast_threads_runtime_args_and_applies_exclude_top_n(monkeypatch):
     context = GenerationContext("slow")
     cache = MemoryProviderCache()

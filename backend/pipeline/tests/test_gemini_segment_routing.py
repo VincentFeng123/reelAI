@@ -186,6 +186,41 @@ def test_green_hybrid_flash_never_calls_pro(monkeypatch):
     assert result.route == "hybrid_flash" and result.clips[0]["title"] == "flash"
 
 
+def test_flash_only_ignores_rollout_and_never_calls_pro(monkeypatch):
+    seen = []
+    monkeypatch.setattr(G.config, "SEGMENT_HYBRID_PERCENT", 0.0)
+    monkeypatch.setattr(G, "_flash_disabled_reason", "previous flash failure")
+
+    def fake_run(transcript, settings, profile, **kwargs):
+        seen.append(profile)
+        return _result(profile, "invalid", title="unsafe flash")
+
+    monkeypatch.setattr(G, "run_segment_profile", fake_run)
+    result = G.segment_clips_detailed(
+        _transcript(), {}, video_id="video", routing_mode="flash_only",
+    )
+
+    assert seen == [G.PRODUCTION_FLASH_PROFILE]
+    assert result.route == "hybrid_flash_deferred"
+    assert result.clips == []
+
+
+def test_public_adapter_forwards_internal_flash_only_route(monkeypatch):
+    captured = {}
+
+    def fake_detailed(transcript, settings, **kwargs):
+        captured.update(kwargs)
+        return _result(G.PRODUCTION_FLASH_PROFILE, "green", title="flash")
+
+    monkeypatch.setattr(G, "segment_clips_detailed", fake_detailed)
+    clips, _notes = G.segment_clips(
+        _transcript(), {"_segment_routing_mode": "flash_only"}, video_id="video",
+    )
+
+    assert captured["routing_mode"] == "flash_only"
+    assert clips[0]["title"] == "flash"
+
+
 def test_generation_gate_defers_non_green_flash_without_shipping_it(monkeypatch):
     seen = []
     gate_calls = []
@@ -558,6 +593,65 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         captured["thinking_level"], captured["max_output_tokens"],
         captured["timeout_s"], captured["operation"], captured["model"],
     ) == (level, cap, timeout, operation, expected_model)
+
+
+def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypatch):
+    captured = {}
+
+    def fake_call(system, user, schema, **kwargs):
+        captured.update(kwargs)
+        return schema(topics=[]), {}
+
+    monkeypatch.setattr(G, "_call_model", fake_call)
+    G._run_selection_profile(
+        G.FLASH_SPLIT_PROFILE,
+        _transcript(),
+        "",
+        {"_segment_thinking_level": "low"},
+        deadline=time.monotonic() + 10,
+        cancelled=None,
+    )
+
+    assert captured["thinking_level"] == "low"
+
+
+def test_pro_zero_output_preserves_the_actual_rejection_guard(monkeypatch):
+    proposal = G._BoundaryTopic(
+        candidate_id="candidate-bad-quote",
+        start_line=0,
+        end_line=0,
+        start_quote="missing quote",
+        end_quote="closes cleanly",
+        title="Alpha",
+        learning_objective="Understand alpha.",
+        facet="alpha",
+        reason="Complete lesson.",
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.5,
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+    monkeypatch.setattr(
+        G,
+        "_call_model",
+        lambda *args, **kwargs: (G._BoundaryPlan(topics=[proposal]), {}),
+    )
+
+    result = G.run_segment_profile(
+        _transcript(),
+        {},
+        G.PRO_BOUNDARY_PROFILE,
+        deadline_monotonic=time.monotonic() + 10,
+    )
+
+    assert result.classification == "invalid"
+    assert result.classification_reasons == ["proposal_0:bad_start_quote"]
+    assert result.rejection_reasons == ["proposal_0:bad_start_quote"]
 
 
 def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatch):

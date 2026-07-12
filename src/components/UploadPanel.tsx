@@ -572,7 +572,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         setLoading(false);
       }
     }
-  }, [active, file, inputMode, onMaterialCreated, reelUrl, router, text, topics]);
+  }, [active, file, inputMode, knowledgeLevel, onMaterialCreated, reelUrl, router, text, topics]);
 
   const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
