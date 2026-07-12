@@ -751,6 +751,28 @@ def test_bootstrap_clip_call_closes_pro_fallback_gate(monkeypatch) -> None:
     assert captured["_segment_target_max_sec"] == 55
 
 
+def test_deep_clip_call_uses_low_thinking_to_preserve_candidate_output(monkeypatch) -> None:
+    captured: dict = {}
+
+    def clip(_url, **kwargs):
+        captured.update(kwargs["settings"])
+        return {"clips": [], "transcript": {"segments": []}}
+
+    monkeypatch.setattr(pipeline_module.clip_engine_run, "clip", clip)
+
+    pipeline_module._run_clip(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        topic="Intro to Python",
+        language="en",
+        should_cancel=None,
+        retrieval_profile="deep",
+    )
+
+    assert captured["_segment_thinking_level"] == "low"
+    assert "_segment_routing_mode" not in captured
+    assert "_segment_pro_fallback_gate" not in captured
+
+
 def test_aggregate_pro_fallback_targets_lowest_yield_initial_video(
     monkeypatch,
 ) -> None:

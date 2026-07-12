@@ -45,7 +45,9 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"\b(?:welcome(?: back)? to|thanks? for watching|have a great day|"
     r"see you next time|like and subscribe|please subscribe|"
     r"subscribe to (?:this|the|my|our) channel|sponsored by|"
-    r"today'?s sponsor)\b",
+    r"today'?s sponsor|we (?:made|have) (?:a|an|another|whole) video "
+    r"(?:about|explaining|on)|check out (?:our|the) video|"
+    r"we (?:are|'re) reaching (?:a|the) crossroad now)\b",
     re.IGNORECASE,
 )
 _NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -405,6 +407,10 @@ def _boundary_prompts(
             f"be at most {requested_max:g} seconds; the minimum is a preference, not a "
             "rejection rule."
         )
+    candidate_limit = max(
+        1,
+        min(_PRODUCTION_MAX_CANDIDATES, int(max_candidates)),
+    )
     user = (
         f"{_topic_rule(topic)}\n{learner_line}"
         f"Line IDs must be between 0 and {n - 1}.\n\n"
@@ -417,9 +423,11 @@ def _boundary_prompts(
         "sub-explanation or omit it; never return the whole long section. If a useful "
         "section contains a greeting, channel plug, sponsor, or outro, select a complete "
         "teaching unit before or after that interruption rather than including it. "
-        f"Return at most {max(1, min(_PRODUCTION_MAX_CANDIDATES, int(max_candidates)))} "
-        "moments when boundaries and context have low or medium uncertainty; omit only "
-        "high-uncertainty moments. "
+        f"Return as many distinct strong moments as the transcript supports, up to "
+        f"{candidate_limit}. If {candidate_limit} valid complete teaching units exist, "
+        f"return {candidate_limit}. Never add filler or incomplete material just to hit "
+        "the limit. Accept moments when boundaries and context have low or medium "
+        "uncertainty; omit only high-uncertainty moments. "
         "Set substantive=true only for a real explanation, worked example, definition, "
         "mechanism, comparison, or conclusion that teaches something useful. Omit greetings, "
         "course logistics, speaker credentials, institutional framing, sponsors, previews, "

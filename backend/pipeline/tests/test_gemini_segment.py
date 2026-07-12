@@ -546,7 +546,9 @@ def test_production_flash_is_compact_global_boundary_first():
     assert G._BOUNDARY_OUTPUT_TOKENS == 8192
     assert "globally" in prompt
     assert "do not favor the beginning" in prompt
-    assert "at most 8" in prompt
+    assert "up to 8" in prompt
+    assert "if 8 valid complete teaching units exist, return 8" in prompt
+    assert "never add filler or incomplete material" in prompt
     assert "learning details and assessments are generated later" in prompt
 
 

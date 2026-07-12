@@ -449,6 +449,56 @@ def test_structural_filler_is_rejected_even_when_scores_are_high():
     assert report.rejected_reasons == ["proposal_0:contains_filler"]
 
 
+def test_video_plug_tail_is_rejected_even_after_substantive_teaching():
+    segments = [{
+        "start": 0.0,
+        "end": 20.0,
+        "text": (
+            "Complement proteins mark bacteria and help immune cells destroy them. "
+            "We made a whole video explaining them in detail. We are reaching a crossroad now."
+        ),
+    }]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Complement proteins mark bacteria",
+            end_quote="reaching a crossroad now",
+            topic_evidence_quote="Complement proteins mark bacteria and help immune cells destroy them",
+        )]),
+        segments,
+        [],
+        {},
+        topic="biology",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:contains_filler"]
+
+
+def test_video_recording_example_is_not_mistaken_for_a_channel_plug():
+    segments = [{
+        "start": 0.0,
+        "end": 15.0,
+        "text": "We made a video recording to observe mitosis and count each stage.",
+    }]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="We made a video recording",
+            end_quote="count each stage",
+            topic_evidence_quote="observe mitosis and count each stage",
+        )]),
+        segments,
+        [],
+        {},
+        topic="mitosis",
+    )
+
+    assert len(report.clips) == 1
+
+
 def test_explicit_max_clips_is_respected_below_forty_ceiling():
     segments = _segs(4)
     clips = _run([_topic(i, i, title=f"T{i}") for i in range(4)], segments, {"max_clips": 2})

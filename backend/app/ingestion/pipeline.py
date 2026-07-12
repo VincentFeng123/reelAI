@@ -146,6 +146,11 @@ def _run_clip(
         settings["_segment_pro_fallback_gate"] = lambda **_kwargs: False
         settings["_segment_routing_mode"] = "flash_only"
         settings["_segment_thinking_level"] = "low"
+    elif retrieval_profile == "deep":
+        # Whole-transcript deep selection still relies on the deterministic
+        # relevance, grounding, closure, and filler gates. Low thinking leaves
+        # output room for more valid clips and avoids candidate JSON truncation.
+        settings["_segment_thinking_level"] = "low"
     kwargs = {
         "topic": topic,
         "settings": settings,
