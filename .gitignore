@@ -44,3 +44,4 @@ audit_smoke*.md
 .superpowers/
 .claude/worktrees/
 data/uploads/
+.backup/
