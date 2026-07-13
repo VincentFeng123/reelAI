@@ -10,7 +10,11 @@
 # stable Dockerfile frontend (features like heredoc, RUN --mount=, etc).
 # It's also a strong signal to Railway's builder auto-detection that this
 # is a "real" Dockerfile and should not be bypassed for Railpack.
+FROM denoland/deno:bin-2.9.2 AS deno_runtime
+
 FROM python:3.12-slim
+
+COPY --from=deno_runtime /deno /usr/local/bin/deno
 
 # System deps:
 # - ca-certificates, curl: TLS + debugging
@@ -32,7 +36,10 @@ WORKDIR /app
 # copy just that file, install, then copy the rest of the source.
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r backend/requirements.txt
+    && pip install --no-cache-dir -r backend/requirements.txt \
+    && deno --version \
+    && python -m yt_dlp --version \
+    && ffmpeg -version >/dev/null
 
 # Application source — the main.py startup sweeps the ingestion package on
 # import, so we need the whole backend tree present before uvicorn boots.

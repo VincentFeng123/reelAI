@@ -31,7 +31,7 @@ boto3==1.37.1
 python-dateutil==2.9.0.post0
 psycopg[binary]==3.2.10
 resend==2.10.0
-yt-dlp==2026.3.17
+yt-dlp[default]==2026.3.17
 # Optional yt-dlp plugin that supplies PO Tokens via a bgutil HTTP provider.
 # Safe to install even when no provider is deployed — yt-dlp skips the plugin
 # if extractor_args don't point to a reachable URL. Activate by deploying

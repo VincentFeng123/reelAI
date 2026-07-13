@@ -1572,8 +1572,11 @@ class IngestionPipeline:
                                     else "acoustic_boundary_outside_selected_range"
                                 )
                             )
+                            failure_stage = str(
+                                acoustic_diagnostics.get("stage") or "verify"
+                            ).strip()
                             record_boundary_unavailable(
-                                str(search_context["surface_reason"])
+                                f"{failure_stage}:{search_context['surface_reason']}"
                             )
                         else:
                             clip["start"] = round(float(acoustic.start_sec), 3)

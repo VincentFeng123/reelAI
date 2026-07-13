@@ -12,6 +12,16 @@ import pytest
 from backend.app.clip_engine import silence
 
 
+def test_hosted_image_includes_yt_dlp_javascript_runtime() -> None:
+    project_root = Path(__file__).resolve().parents[3]
+    dockerfile = (project_root / "Dockerfile").read_text()
+    requirements = (project_root / "backend" / "requirements.txt").read_text()
+
+    assert "FROM denoland/deno:bin-2.9.2 AS deno_runtime" in dockerfile
+    assert "COPY --from=deno_runtime /deno /usr/local/bin/deno" in dockerfile
+    assert "yt-dlp[default]==2026.3.17" in requirements
+
+
 def _write_wav(path: Path, spans: list[tuple[float, float]], *, sample_rate: int = 16000) -> None:
     samples = array("h")
     for duration, amplitude in spans:

@@ -579,7 +579,11 @@ def test_acoustic_failure_is_stored_but_never_emitted(
     assert context.counters()["deferred_clips"] == 1
     assert context.counters()["persisted_clips"] == 0
     assert context.usage_payload()["summary"]["rejection_reason_counts"] == {
-        f"acoustic:{expected_reason}": 1,
+        (
+            "acoustic:"
+            f"{verification['diagnostics'].get('stage', 'verify')}:"
+            f"{expected_reason}"
+        ): 1,
     }
 
 
