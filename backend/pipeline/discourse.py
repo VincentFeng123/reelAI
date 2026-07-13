@@ -42,6 +42,12 @@ _DANGLING_QUESTION_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ANAPHORIC_QUESTION_RE = re.compile(
+    r"\b(?:is|are|was|were|does|do|did|can|could|would|should|will)\s+"
+    r"(?:it|this|that|these|those|they)\b[^?]*\?",
+    re.IGNORECASE,
+)
+
 # Bare anaphora that, as the first word before a verb/aux, lack an in-clip antecedent.
 ANAPHORS: frozenset[str] = frozenset({
     "this", "that", "these", "those", "it", "they", "them", "he", "she",
@@ -120,12 +126,14 @@ def opens_mid_thought(text: str) -> bool:
     if _DANGLING_QUESTION_REFERENCE_RE.search(stripped):
         return True
 
+    w0 = words[0].lower()
+    w1 = words[1].lower() if len(words) > 1 else ""
+    if w0 in CONTINUATION_MARKERS and _ANAPHORIC_QUESTION_RE.search(stripped):
+        return True
+
     framing = _is_framing_or_question(text, words)
     if framing:
         return False                       # self-contained framing/question wins outright
-
-    w0 = words[0].lower()
-    w1 = words[1].lower() if len(words) > 1 else ""
 
     # 1) leading continuation marker without framing → mid-thought
     if w0 in CONTINUATION_MARKERS:

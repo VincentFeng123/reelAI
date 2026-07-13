@@ -48,6 +48,9 @@ def test_dangling_anaphor_is_weak():
 def test_question_with_missing_antecedent_is_weak():
     assert opens_mid_thought("Ok. But like, how does the cell do that?")
     assert opens_mid_thought("How does that work?")
+    assert opens_mid_thought(
+        "And then you have to ask the question, is it renormalizable?"
+    )
 
 def test_context_dependent_np_is_weak():
     assert opens_mid_thought("The answer is fifteen newtons.")

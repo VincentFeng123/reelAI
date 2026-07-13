@@ -499,6 +499,45 @@ def test_video_recording_example_is_not_mistaken_for_a_channel_plug():
     assert len(report.clips) == 1
 
 
+def test_course_logistics_suffix_is_trimmed_after_complete_teaching():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 26.0,
+            "text": "Calculations show that this gauge theory is indeed renormalizable.",
+        },
+        {
+            "start": 26.0,
+            "end": 31.0,
+            "text": "I have no hope that we'll cover that in this course.",
+        },
+        {
+            "start": 31.0,
+            "end": 35.0,
+            "text": "Lots of hard combinatorics.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            2,
+            start_quote="Calculations show that",
+            end_quote="hard combinatorics",
+            topic_evidence_quote=(
+                "Calculations show that this gauge theory is indeed renormalizable"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic="renormalization",
+    )
+
+    assert len(report.clips) == 1
+    assert report.clips[0]["_end_line"] == 0
+    assert report.clips[0]["end"] == 26.0
+
+
 def test_explicit_max_clips_is_respected_below_forty_ceiling():
     segments = _segs(4)
     clips = _run([_topic(i, i, title=f"T{i}") for i in range(4)], segments, {"max_clips": 2})

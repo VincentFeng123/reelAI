@@ -47,7 +47,8 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"subscribe to (?:this|the|my|our) channel|sponsored by|"
     r"today'?s sponsor|we (?:made|have) (?:a|an|another|whole) video "
     r"(?:about|explaining|on)|check out (?:our|the) video|"
-    r"we (?:are|'re) reaching (?:a|the) crossroad now)\b",
+    r"we (?:are|'re) reaching (?:a|the) crossroad now|"
+    r"cover (?:that|this) in (?:this|the) course)\b",
     re.IGNORECASE,
 )
 _NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -822,11 +823,13 @@ def _cue_has_weak_end(
     # A bare auto-caption edge needs expansion only when the following cue has
     # an explicit dependency signal. The onset guard's lowercase/short-text
     # fallbacks are intentionally insufficient by themselves here.
-    from .discourse import ANAPHORS, CONTEXT_DEP_HEADS, CONTINUATION_MARKERS
+    from .discourse import ANAPHORS, CONTEXT_DEP_HEADS, CONTINUATION_MARKERS, _AUX_VERB
 
     words = next_words
     if not words:
         return False
+    if len(words) < 3 and words[0] in _AUX_VERB:
+        return True
     return bool(
         words[0] in CONTINUATION_MARKERS
         or words[0] in ANAPHORS
@@ -904,8 +907,13 @@ def _close_cue_context(
         if end_line + 1 < len(segments)
         else ""
     )
+    final_end_text = (
+        _cue_clip_text(segments, original_end, end_line)
+        if end_line > original_end
+        else str(segments[end_line].get("text") or "")
+    )
     if _cue_has_weak_end(
-        str(segments[end_line].get("text") or ""),
+        final_end_text,
         next_text,
         ignore_caption_case=ignore_caption_case,
     ):
@@ -1029,6 +1037,23 @@ def _cue_range_contains_structural_filler(
         _STRUCTURAL_FILLER_RE.search(str(segment.get("text") or ""))
         for segment in segments[start_line:end_line + 1]
     )
+
+
+def _trim_structural_filler_suffix(
+    segments: list[dict], start_line: int, end_line: int,
+) -> int | None:
+    """Keep a complete teaching prefix when only its trailing cues are filler."""
+    from .sentences import classify_terminator
+
+    for line in range(start_line, end_line + 1):
+        if not _STRUCTURAL_FILLER_RE.search(str(segments[line].get("text") or "")):
+            continue
+        previous_line = line - 1
+        if previous_line < start_line:
+            return None
+        previous_text = str(segments[previous_line].get("text") or "").strip()
+        return previous_line if classify_terminator(previous_text) else None
+    return end_line
 
 
 def _near_duplicate(a: dict, b: dict, threshold: float = _DUPLICATE_OVERLAP) -> bool:
@@ -1491,8 +1516,17 @@ def _plan_to_report(
             continue
 
         if _cue_range_contains_structural_filler(segments, a, b):
-            report.rejected_reasons.append(f"{prefix}:contains_filler")
-            continue
+            trimmed_end = _trim_structural_filler_suffix(segments, a, b)
+            if trimmed_end is None:
+                report.rejected_reasons.append(f"{prefix}:contains_filler")
+                continue
+            b = trimmed_end
+            start, end = _padded_cue_bounds(segments, a, b)
+            start, end = round(start, 3), round(end, 3)
+            duration = round(end - start, 3)
+            if duration < _MIN_CLIP_S or duration > requested_max:
+                report.rejected_reasons.append(f"{prefix}:invalid_duration")
+                continue
 
         clip_text = _cue_clip_text(segments, a, b)
         if not clip_text:

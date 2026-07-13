@@ -238,6 +238,30 @@ def test_production_end_extends_into_following_gerund_explanation() -> None:
     assert (start, end, error) == (0, 1, None)
 
 
+def test_production_end_extends_into_short_auxiliary_continuation() -> None:
+    segments = [
+        {
+            "start": 4865.84,
+            "end": 4870.4,
+            "text": "I'll certainly give you a hint as to how two",
+        },
+        {
+            "start": 4869.08,
+            "end": 4871.88,
+            "text": "will happen.",
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        0,
+        0,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 1, None)
+
+
 def test_dirty_edges_use_one_localized_low_thinking_flash_batch(monkeypatch):
     transcript = _transcript()
     selector = G._BoundaryPlan(topics=[
