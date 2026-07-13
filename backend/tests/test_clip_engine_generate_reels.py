@@ -275,6 +275,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             "boundary_confidence": 0.9,
             "directly_teaches_topic": True,
             "substantive": True,
+            "factually_grounded": True,
             "topic_evidence_quote": (
                 "Cellular respiration releases energy in the mitochondria"
             ),

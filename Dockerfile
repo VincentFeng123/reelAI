@@ -38,6 +38,7 @@ COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -r backend/requirements.txt \
     && deno --version \
+    && python -c "import yt_dlp.networking._curlcffi" \
     && python -m yt_dlp --version \
     && ffmpeg -version >/dev/null
 

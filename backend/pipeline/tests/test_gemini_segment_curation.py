@@ -57,6 +57,7 @@ def _topic(start_line: int, end_line: int, **overrides) -> G._Topic:
         "difficulty": 0.5,
         "directly_teaches_topic": True,
         "substantive": True,
+        "factually_grounded": True,
         "topic_evidence_quote": (
             f"line {start_line} explains lesson {start_line} completely"
         ),
@@ -94,7 +95,7 @@ def _run(topics: list[G._Topic], segments: list[dict] | None = None,
         "candidate_id", "start_line", "end_line", "start_quote", "end_quote", "title",
         "learning_objective", "facet", "reason", "informativeness", "topic_relevance",
         "educational_importance", "difficulty", "directly_teaches_topic", "substantive",
-        "topic_evidence_quote", "self_contained", "is_standalone",
+        "factually_grounded", "topic_evidence_quote", "self_contained", "is_standalone",
         "prerequisite_candidate_ids", "uncertainty", "uncertainty_reasons", "summary",
         "takeaways", "match_reason", "assessment",
     ],
@@ -330,6 +331,7 @@ def test_production_biology_range_repairs_around_channel_bump():
         difficulty=0.3,
         directly_teaches_topic=True,
         substantive=True,
+        factually_grounded=True,
         topic_evidence_quote="An enzyme called RNA polymerase will split the DNA and make a strand of RNA",
         self_contained=True,
         is_standalone=True,
@@ -394,6 +396,7 @@ def test_production_biology_fragment_expands_to_question_and_complete_list():
         difficulty=0.3,
         directly_teaches_topic=True,
         substantive=True,
+        factually_grounded=True,
         topic_evidence_quote="every living thing on earth is made of cells, of which there's two main categories",
         self_contained=True,
         is_standalone=True,
@@ -473,6 +476,7 @@ def test_production_ligature_clip_repairs_elliptical_instruction_to_r_context():
         difficulty=0.4,
         directly_teaches_topic=True,
         substantive=True,
+        factually_grounded=True,
         topic_evidence_quote=(
             "The second R is what you might see when it gets written off of a letter"
         ),
@@ -543,6 +547,7 @@ def test_oversized_repair_rewrites_objective_when_omitted_cues_owned_its_details
         difficulty=0.3,
         directly_teaches_topic=True,
         substantive=True,
+        factually_grounded=True,
         topic_evidence_quote=(
             "Living systems maintain chemical balance and evolve across generations"
         ),
@@ -609,6 +614,115 @@ def test_structural_filler_is_rejected_even_when_scores_are_high():
 
     assert report.clips == []
     assert report.rejected_reasons == ["proposal_0:contains_filler"]
+
+
+@pytest.mark.parametrize("topic", ["biology", "biology myths", "Gothic architecture"])
+def test_unrequested_fictional_biology_is_rejected_even_with_real_terminology(topic):
+    segments = [{
+        "cue_id": "oJLA8iNUV-0:722.37-773.27",
+        "start": 722.37,
+        "end": 773.27,
+        "text": (
+            "solidified in the Middle Ages of course the greatest threat to any dark entity "
+            "is the Cross of Christ but as we've seen the vampire condition is not Supernatural "
+            "is there any legitimacy to this bit of lore let me explain with a bit of context "
+            "our eyes contain arrays of specialized receptor cells some only activate when "
+            "they see light and Shadow in conjunction some activate only when they see "
+            "horizontal lines Horizons and so on in Vampires The receptors that respond to "
+            "horizontal lines are cross-wired with those that respond to Vertical ones when "
+            "both sets of receptors are fired simultaneously in a very specific way that is "
+            "when intersecting right angles occupy more than 30 degrees of visual Arc positive "
+            "feedback seems to generate a neuroelectrical overload in the visual cortex"
+        ),
+    }]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="solidified in the Middle Ages",
+            end_quote="overload in the visual cortex",
+            topic_evidence_quote=(
+                "our eyes contain arrays of specialized receptor cells some only activate"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic=topic,
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:fictional_framing"]
+
+
+def test_requested_fictional_topic_can_still_teach_its_named_subject():
+    segments = [{
+        "start": 0.0,
+        "end": 24.0,
+        "text": (
+            "Vampire folklore changed from contagious corpses into aristocratic figures. "
+            "This shift followed nineteenth century Gothic literature and theater."
+        ),
+    }]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Vampire folklore changed",
+            end_quote="literature and theater",
+            topic_evidence_quote=(
+                "Vampire folklore changed from contagious corpses into aristocratic figures"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic="history of vampire folklore",
+    )
+
+    assert len(report.clips) == 1
+
+
+def test_real_teaching_that_denies_a_supernatural_claim_is_not_rejected():
+    segments = [{
+        "start": 0.0,
+        "end": 22.0,
+        "text": (
+            "Quantum entanglement is not supernatural communication. "
+            "Measurements are correlated, but they cannot transmit information faster than light."
+        ),
+    }]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Quantum entanglement",
+            end_quote="faster than light",
+            topic_evidence_quote=(
+                "Measurements are correlated but they cannot transmit information faster than light"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic="quantum entanglement",
+    )
+
+    assert len(report.clips) == 1
+
+
+def test_selector_rejects_an_explicitly_ungrounded_teaching_claim():
+    segments = _segs(1)
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(0, 0, factually_grounded=False)]),
+        segments,
+        _words(segments),
+        {},
+        topic="lesson 0",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:not_factually_grounded"]
 
 
 def test_video_plug_tail_is_rejected_even_after_substantive_teaching():

@@ -44,6 +44,7 @@ def _clip() -> dict:
         "educational_importance": 0.7,
         "directly_teaches_topic": True,
         "substantive": True,
+        "factually_grounded": True,
         "topic_evidence_quote": "The first lesson explains how forces change",
         "self_contained": True,
         "difficulty": 0.4,
@@ -67,7 +68,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:v2:")
+    assert baseline.startswith("clip-segmentation:v3:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"

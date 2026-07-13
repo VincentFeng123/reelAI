@@ -10,7 +10,7 @@ requests==2.32.3
 # order, and ALPN sequence match Chrome instead of Python-urllib3's
 # bot-shaped fingerprint. Non-scraping call sites (Resend API, LLM
 # routers, topic_expansion) keep plain `requests`.
-curl_cffi>=0.15.0
+curl_cffi==0.15.0
 # YouTube serves Brotli-compressed pages when the request advertises
 # Accept-Encoding: br (which our stealth headers do, to look like a real
 # browser). requests/urllib3 auto-decodes br ONLY if the ``brotli`` (or
@@ -31,7 +31,7 @@ boto3==1.37.1
 python-dateutil==2.9.0.post0
 psycopg[binary]==3.2.10
 resend==2.10.0
-yt-dlp[default]==2026.3.17
+yt-dlp[default,curl-cffi]==2026.7.4
 # Optional yt-dlp plugin that supplies PO Tokens via a bgutil HTTP provider.
 # Safe to install even when no provider is deployed — yt-dlp skips the plugin
 # if extractor_args don't point to a reachable URL. Activate by deploying

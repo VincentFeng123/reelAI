@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,7 +33,7 @@ VerificationStatus = Literal["verified", "unavailable"]
 PreparationStatus = Literal["ready", "unavailable"]
 
 DEFAULT_TIMEOUT_SEC = 20.0
-DEFAULT_PREPARE_TIMEOUT_SEC = 10.0
+DEFAULT_PREPARE_TIMEOUT_SEC = 32.0
 EDGE_WINDOW_SEC = 6.0
 QUIET_THRESHOLD_DBFS = -38.0
 ADAPTIVE_QUIET_THRESHOLD_DBFS = -24.0
@@ -94,10 +95,17 @@ class _QuietInterval:
 
 
 class _Unavailable(RuntimeError):
-    def __init__(self, stage: str, reason: str) -> None:
+    def __init__(
+        self,
+        stage: str,
+        reason: str,
+        *,
+        attempt_reasons: Sequence[str] = (),
+    ) -> None:
         super().__init__(reason)
         self.stage = stage
         self.reason = reason
+        self.attempt_reasons = tuple(attempt_reasons)
 
 
 def _is_cancelled(cancel_check: CancelCheck | None) -> bool:
@@ -107,6 +115,32 @@ def _is_cancelled(cancel_check: CancelCheck | None) -> bool:
         return bool(cancel_check())
     except Exception:
         return True
+
+
+def _process_failure_reason(stage: str, stderr: bytes) -> str:
+    """Classify resolver failures without retaining sensitive command output."""
+    if stage != "resolve":
+        return "process_failed"
+    message = stderr.decode("utf-8", errors="ignore").casefold()
+    if "sign in to confirm" in message or "not a bot" in message:
+        return "youtube_bot_challenge"
+    if "proxy" in message and any(
+        marker in message
+        for marker in ("unable", "failed", "refused", "timed out", "tunnel", "407")
+    ):
+        return "proxy_failed"
+    if any(
+        marker in message
+        for marker in (
+            "requested format is not available",
+            "no video formats found",
+            "no formats found",
+        )
+    ):
+        return "format_unavailable"
+    if ("remote component" in message or "ejs" in message) and "fail" in message:
+        return "component_failed"
+    return "process_failed"
 
 
 def _canonical_watch_url(value: str) -> str | None:
@@ -140,6 +174,29 @@ def _remaining(deadline: float, stage: str) -> float:
     return value
 
 
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    """Kill yt-dlp and any Deno child without an unbounded pipe wait."""
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except (OSError, ValueError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+    try:
+        process.communicate(timeout=1.0)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        for stream in (process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+
+
 def _run_command(
     command: Sequence[str],
     *,
@@ -156,19 +213,18 @@ def _run_command(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            start_new_session=os.name == "posix",
         )
     except (OSError, ValueError):
         raise _Unavailable(stage, "process_start_failed") from None
 
     while True:
         if _is_cancelled(cancel_check):
-            process.kill()
-            process.communicate()
+            _terminate_process(process)
             raise _Unavailable(stage, "cancelled")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            process.kill()
-            process.communicate()
+            _terminate_process(process)
             raise _Unavailable(stage, "deadline_exceeded")
         wait_for = min(0.1, remaining)
         try:
@@ -177,21 +233,29 @@ def _run_command(
         except subprocess.TimeoutExpired:
             continue
         except Exception:
-            process.kill()
-            process.communicate()
+            _terminate_process(process)
             raise _Unavailable(stage, "process_failed") from None
 
     if process.returncode != 0:
-        raise _Unavailable(stage, "process_failed")
+        raise _Unavailable(stage, _process_failure_reason(stage, stderr))
     return stdout, stderr
 
 
-def _proxy_url() -> str:
+def _proxy_urls() -> list[str]:
     proxies = str(get_settings().proxy_urls or "")
-    return next((part.strip() for part in proxies.split(",") if part.strip()), "")
+    return list(dict.fromkeys(part.strip() for part in proxies.split(",") if part.strip()))
 
 
-def _yt_dlp_command(watch_url: str) -> list[str]:
+def _proxy_url() -> str:
+    return next(iter(_proxy_urls()), "")
+
+
+def _yt_dlp_command(
+    watch_url: str,
+    *,
+    proxy_url: str | None = None,
+    embedded_client: bool = False,
+) -> list[str]:
     settings = get_settings()
     command = [
         sys.executable,
@@ -208,8 +272,9 @@ def _yt_dlp_command(watch_url: str) -> list[str]:
         "1",
         "--fragment-retries",
         "1",
-        "--remote-components",
-        "ejs:github",
+        "--no-remote-components",
+        "--impersonate",
+        "chrome",
         "--format",
         "bestaudio/best",
     ]
@@ -220,13 +285,20 @@ def _yt_dlp_command(watch_url: str) -> list[str]:
         browser = str(os.environ.get("YT_COOKIES_FROM_BROWSER") or "").strip()
         if browser:
             command.extend(["--cookies-from-browser", browser])
-    proxy = _proxy_url()
+    proxy = _proxy_url() if proxy_url is None else proxy_url
     if proxy:
         command.extend(["--proxy", proxy])
     provider_url = str(settings.ytdlp_pot_provider_url or "").strip()
     if provider_url:
         command.extend(
             ["--extractor-args", f"youtubepot-bgutilhttp:base_url={provider_url}"]
+        )
+    if embedded_client:
+        command.extend(
+            [
+                "--extractor-args",
+                "youtube:player_client=web_embedded;player_skip=webpage",
+            ]
         )
     command.append(watch_url)
     return command
@@ -265,36 +337,94 @@ def _prepare_audio_source(
     watch_url = _canonical_watch_url(video_id_or_url)
     if watch_url is None:
         raise _Unavailable("resolve", "invalid_youtube_source")
-    stdout, _ = _run_command(
-        _yt_dlp_command(watch_url),
-        deadline=deadline,
-        cancel_check=cancel_check,
-        stage="resolve",
+    configured_routes = _proxy_urls()[:3]
+    routes = [*configured_routes, ""] if configured_routes else [""]
+    attempts = [
+        (route, embedded_client)
+        for embedded_client in (False, True)
+        for route in routes
+    ]
+    attempt_reasons: list[str] = []
+    for attempt_index, (proxy, embedded_client) in enumerate(attempts):
+        try:
+            remaining = _remaining(deadline, "resolve")
+            attempts_left = len(attempts) - attempt_index
+            attempt_deadline = time.monotonic() + (remaining / max(1, attempts_left))
+            stdout, _ = _run_command(
+                _yt_dlp_command(
+                    watch_url,
+                    proxy_url=proxy,
+                    embedded_client=embedded_client,
+                ),
+                deadline=attempt_deadline,
+                cancel_check=cancel_check,
+                stage="resolve",
+            )
+            try:
+                info = json.loads(stdout.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
+                raise _Unavailable("resolve", "invalid_ytdlp_response") from None
+            if not isinstance(info, Mapping):
+                raise _Unavailable("resolve", "invalid_ytdlp_response")
+            entry = _audio_entry(info)
+            media_url = str(entry.get("url") or "").strip()
+            if not media_url.startswith(("https://", "http://")):
+                raise _Unavailable("resolve", "audio_url_missing")
+            raw_headers = entry.get("http_headers") or info.get("http_headers") or {}
+            headers = {
+                str(key): str(value)
+                for key, value in (
+                    raw_headers.items() if isinstance(raw_headers, Mapping) else ()
+                )
+                if re.fullmatch(r"[A-Za-z0-9-]+", str(key))
+                and "\r" not in str(value)
+                and "\n" not in str(value)
+                and str(key).lower() not in {"host", "content-length", "range"}
+            }
+            return PreparedAudioSource(
+                url=media_url,
+                headers=headers,
+                proxy_url=proxy,
+                format_id=str(entry.get("format_id") or info.get("format_id") or ""),
+            )
+        except _Unavailable as exc:
+            if exc.reason in {"cancelled", "invalid_youtube_source"}:
+                raise
+            reason = exc.reason
+            if reason == "deadline_exceeded":
+                if deadline - time.monotonic() <= 0:
+                    reason = "deadline_exceeded"
+                else:
+                    reason = "attempt_timeout"
+            route = "proxy" if proxy else "direct"
+            client = "embedded" if embedded_client else "default"
+            attempt_reasons.append(f"{route}:{client}:{reason}")
+            if reason == "deadline_exceeded":
+                break
+
+    reason_priority = (
+        "youtube_bot_challenge",
+        "proxy_failed",
+        "format_unavailable",
+        "component_failed",
+        "deadline_exceeded",
+        "attempt_timeout",
+        "process_failed",
+        "audio_url_missing",
+        "invalid_ytdlp_response",
     )
-    try:
-        info = json.loads(stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-        raise _Unavailable("resolve", "invalid_ytdlp_response") from None
-    if not isinstance(info, Mapping):
-        raise _Unavailable("resolve", "invalid_ytdlp_response")
-    entry = _audio_entry(info)
-    media_url = str(entry.get("url") or "").strip()
-    if not media_url.startswith(("https://", "http://")):
-        raise _Unavailable("resolve", "audio_url_missing")
-    raw_headers = entry.get("http_headers") or info.get("http_headers") or {}
-    headers = {
-        str(key): str(value)
-        for key, value in (raw_headers.items() if isinstance(raw_headers, Mapping) else ())
-        if re.fullmatch(r"[A-Za-z0-9-]+", str(key))
-        and "\r" not in str(value)
-        and "\n" not in str(value)
-        and str(key).lower() not in {"host", "content-length", "range"}
-    }
-    return PreparedAudioSource(
-        url=media_url,
-        headers=headers,
-        proxy_url=_proxy_url(),
-        format_id=str(entry.get("format_id") or info.get("format_id") or ""),
+    final_reason = next(
+        (
+            reason
+            for reason in reason_priority
+            if any(item.endswith(f":{reason}") for item in attempt_reasons)
+        ),
+        "process_failed",
+    )
+    raise _Unavailable(
+        "resolve",
+        final_reason,
+        attempt_reasons=attempt_reasons,
     )
 
 
@@ -328,6 +458,7 @@ def prepare_audio_source(
             diagnostics={
                 "stage": exc.stage,
                 "reason": exc.reason,
+                "attempt_reasons": list(exc.attempt_reasons),
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
             },
         )
@@ -563,12 +694,20 @@ def verify_acoustic_boundaries(
             )
             preparation_diagnostics: Mapping[str, Any] = {}
         elif not prepared.ready or prepared.source is None:
+            prepared_extra = {
+                key: value
+                for key, value in prepared.diagnostics.items()
+                if key not in {"stage", "reason", "elapsed_ms"}
+            }
+            if "elapsed_ms" in prepared.diagnostics:
+                prepared_extra["prepare_elapsed_ms"] = prepared.diagnostics["elapsed_ms"]
             return _unavailable(
                 original_start,
                 original_end,
                 stage=str(prepared.diagnostics.get("stage") or "resolve"),
                 reason=str(prepared.diagnostics.get("reason") or "media_unavailable"),
                 started=started,
+                extra=prepared_extra,
             )
         else:
             source = prepared.source

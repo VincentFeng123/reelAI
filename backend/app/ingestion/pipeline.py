@@ -2113,6 +2113,7 @@ class IngestionPipeline:
                 for key in (
                     "directly_teaches_topic",
                     "substantive",
+                    "factually_grounded",
                     "topic_evidence_quote",
                 )
             )
@@ -2124,6 +2125,7 @@ class IngestionPipeline:
                 if (
                     clip.get("directly_teaches_topic") is not True
                     or clip.get("substantive") is not True
+                    or clip.get("factually_grounded") is not True
                     or not grounded_evidence_quote
                 ):
                     if generation_context is not None:
@@ -2161,6 +2163,7 @@ class IngestionPipeline:
                     clip.get("directly_teaches_topic", bool(evidence))
                 ),
                 "substantive": bool(clip.get("substantive", bool(evidence))),
+                "factually_grounded": bool(clip.get("factually_grounded")),
                 "topic_evidence_quote": grounded_evidence_quote,
                 "surface_eligible": True,
                 "deferred_level": abs(difficulty - level_target) > 0.35,

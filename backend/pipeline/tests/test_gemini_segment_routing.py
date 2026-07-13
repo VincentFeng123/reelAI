@@ -633,6 +633,7 @@ def test_boundary_profile_repairs_bad_model_quote_from_cited_cue(monkeypatch):
         difficulty=0.5,
         directly_teaches_topic=True,
         substantive=True,
+        factually_grounded=True,
         topic_evidence_quote="alpha lesson concept closes cleanly",
         self_contained=True,
         is_standalone=True,
@@ -685,6 +686,7 @@ def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatc
             difficulty=0.5,
             directly_teaches_topic=True,
             substantive=True,
+            factually_grounded=True,
             topic_evidence_quote=(
                 f"line {index} teaches concept {index} and finishes"
             ),
@@ -960,7 +962,7 @@ def test_clip_grounding_text_matches_the_delivered_complete_cue_window():
         facet="lesson", reason="A complete alpha lesson.",
         informativeness=0.9, topic_relevance=0.9,
         educational_importance=0.9, difficulty=0.5,
-        directly_teaches_topic=True, substantive=True,
+        directly_teaches_topic=True, substantive=True, factually_grounded=True,
         topic_evidence_quote="outside before alpha lesson closes cleanly",
         self_contained=True, is_standalone=True,
         prerequisite_candidate_ids=[], uncertainty="low", uncertainty_reasons=[],

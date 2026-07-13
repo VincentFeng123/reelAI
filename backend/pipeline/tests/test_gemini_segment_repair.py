@@ -28,6 +28,7 @@ def _topic(start: int, end: int, *, title: str) -> G._BoundaryTopic:
         difficulty=0.5,
         directly_teaches_topic=True,
         substantive=True,
+        factually_grounded=True,
         topic_evidence_quote=(
             "So we can now solve the equation"
             if start == 3

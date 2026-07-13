@@ -113,7 +113,7 @@ def test_request_key_version_invalidates_pre_acoustic_completed_inventory(monkey
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "generation-request-v6-energy-silence"
+    assert jobs.REQUEST_SCHEMA_VERSION == "generation-request-v7-browser-audio"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(
         jobs, "REQUEST_SCHEMA_VERSION", "generation-request-v5-supadata-boundaries"

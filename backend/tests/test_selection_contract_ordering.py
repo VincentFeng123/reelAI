@@ -287,6 +287,9 @@ class SelectionContractOrderingTests(unittest.TestCase):
     ) -> None:
         search_context = {
             "selection_contract_version": "confidence-gated-v1",
+            "directly_teaches_topic": True,
+            "substantive": True,
+            "factually_grounded": True,
             "topic_relevance": 0.80,
             "educational_importance": educational_importance,
             "informativeness": 0.80,

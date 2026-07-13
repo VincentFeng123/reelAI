@@ -17,7 +17,7 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_CACHE_VERSION = 2
+SEGMENT_CACHE_VERSION = 3
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
 
 
@@ -260,6 +260,7 @@ def _valid_clips(
             or raw.get("self_contained") is not True
             or raw.get("directly_teaches_topic") is not True
             or raw.get("substantive") is not True
+            or raw.get("factually_grounded") is not True
             or not evidence_grounded
             or raw.get("kind") != "educational"
             or uncertainty not in {"low", "medium"}

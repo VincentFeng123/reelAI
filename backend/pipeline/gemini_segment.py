@@ -51,6 +51,15 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"cover (?:that|this) in (?:this|the) course)\b",
     re.IGNORECASE,
 )
+_VAMPIRE_TOPIC_RE = re.compile(
+    r"\b(?:vampir\w*|dracula|nosferatu)\b",
+    re.IGNORECASE,
+)
+_VAMPIRE_PSEUDOSCIENCE_SIGNAL_RE = re.compile(
+    r"\b(?:supernatural|lore|condition|virus|cross[- ]?wired|receptors?|"
+    r"visual cortex|crucifix|dark entit\w*)\b",
+    re.IGNORECASE,
+)
 _NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 PRODUCTION_PRO_PROFILE = "production_pro_v0"
@@ -161,6 +170,7 @@ class _BoundaryTopic(_StrictModel):
     difficulty: float = Field(ge=0.0, le=1.0, strict=True)
     directly_teaches_topic: bool = Field(strict=True)
     substantive: bool = Field(strict=True)
+    factually_grounded: bool = Field(strict=True)
     topic_evidence_quote: _NonBlank
     self_contained: bool = Field(strict=True)
     is_standalone: bool = Field(strict=True)
@@ -316,6 +326,20 @@ def _topic_rule(topic: str) -> str:
         "identification, recognition, diagnosis, derivation, comparison, or application, "
         "the span must teach or perform that task for the named object; its history or "
         "definition alone is not a direct match."
+        " Exclude fictional, supernatural, pseudoscientific, or invented mechanisms unless "
+        "the viewer explicitly requested that fictional subject. Borrowing real academic "
+        "terminology does not make an invented claim educational evidence."
+    )
+
+
+def _contains_unrequested_vampire_pseudoscience(text: str, topic: str) -> bool:
+    requested = " ".join(str(topic or "").split())
+    if _VAMPIRE_TOPIC_RE.search(requested):
+        return False
+    candidate = re.sub(r"\bvampire bats?\b", "", str(text or ""), flags=re.IGNORECASE)
+    return bool(
+        re.search(r"\bvampir\w*\b", candidate, flags=re.IGNORECASE)
+        and _VAMPIRE_PSEUDOSCIENCE_SIGNAL_RE.search(candidate)
     )
 
 
@@ -335,6 +359,7 @@ def _selection_fields(*, enriched: bool) -> str:
         "candidate_id, start_line, end_line, start_quote, end_quote, title, "
         "learning_objective, facet, reason, informativeness, topic_relevance, "
         "educational_importance, difficulty, directly_teaches_topic, substantive, "
+        "factually_grounded, "
         "topic_evidence_quote (an exact 5-40 word quote copied from within the selected "
         "cue range that proves the clip teaches the topic), self_contained, is_standalone, "
         "prerequisite_candidate_ids, uncertainty, uncertainty_reasons"
@@ -437,7 +462,11 @@ def _boundary_prompts(
         "Set substantive=true only for a real explanation, worked example, definition, "
         "mechanism, comparison, or conclusion that teaches something useful. Omit greetings, "
         "course logistics, speaker credentials, institutional framing, sponsors, previews, "
-        "and transitions even when they mention the topic. "
+        "and transitions even when they mention the topic. Also omit fictional, supernatural, "
+        "pseudoscientific, and invented mechanisms unless the requested topic explicitly asks "
+        "for that fiction; real terminology inside fictional lore is not a valid lesson. "
+        "Set factually_grounded=false for those invented claims and true only when the teaching "
+        "claim is academically sound within the requested subject. "
         "Use a unique candidate_id for every moment. A non-standalone moment must list the "
         "candidate_id(s) that provide its required context; a standalone moment must list no "
         "prerequisites. "
@@ -1496,6 +1525,9 @@ def _plan_to_report(
             if proposal.substantive is not True:
                 report.rejected_reasons.append(f"{prefix}:not_substantive")
                 continue
+            if proposal.factually_grounded is not True:
+                report.rejected_reasons.append(f"{prefix}:not_factually_grounded")
+                continue
         candidate_id = " ".join(
             str(
                 getattr(proposal, "candidate_id", "")
@@ -1603,6 +1635,9 @@ def _plan_to_report(
         if not clip_text:
             report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
             continue
+        if _contains_unrequested_vampire_pseudoscience(clip_text, topic):
+            report.rejected_reasons.append(f"{prefix}:fictional_framing")
+            continue
         topic_evidence_quote = " ".join(
             str(getattr(proposal, "topic_evidence_quote", "") or "").split()
         )
@@ -1681,6 +1716,7 @@ def _plan_to_report(
                 getattr(proposal, "directly_teaches_topic", True)
             ),
             "substantive": bool(getattr(proposal, "substantive", True)),
+            "factually_grounded": bool(getattr(proposal, "factually_grounded", True)),
             "topic_evidence_quote": topic_evidence_quote,
             "summary": "",
             "takeaways": [],

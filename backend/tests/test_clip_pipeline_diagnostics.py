@@ -305,9 +305,10 @@ def test_topic_generation_requires_acoustic_boundaries_before_emit(
             "selection_candidate_id": cue_id,
             "prerequisite_ids": [],
             "uncertainty": "low",
-            "directly_teaches_topic": True,
-            "substantive": True,
-            "topic_evidence_quote": quote,
+                "directly_teaches_topic": True,
+                "substantive": True,
+                "factually_grounded": True,
+                "topic_evidence_quote": quote,
         })
     engine_out = {"clips": clips, "transcript": transcript, "notes": ""}
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
@@ -413,6 +414,7 @@ def test_level_mismatch_is_verified_and_stored_without_streaming(monkeypatch) ->
             "uncertainty": "low",
             "directly_teaches_topic": True,
             "substantive": True,
+            "factually_grounded": True,
             "topic_evidence_quote": (
                 "Python functions package reusable instructions"
             ),
@@ -529,6 +531,7 @@ def test_acoustic_failure_is_stored_but_never_emitted(
             "uncertainty": "low",
             "directly_teaches_topic": True,
             "substantive": True,
+            "factually_grounded": True,
             "topic_evidence_quote": quote,
         }],
         "transcript": transcript,
@@ -669,6 +672,7 @@ def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
                 "uncertainty": "low",
                 "directly_teaches_topic": False,
                 "substantive": False,
+                "factually_grounded": False,
                 "topic_evidence_quote": "Welcome to biology at Stanford University",
             },
             {
@@ -684,6 +688,26 @@ def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
                 "selection_candidate_id": "cell-energy",
                 "prerequisite_ids": [],
                 "uncertainty": "medium",
+                "directly_teaches_topic": True,
+                "substantive": True,
+                "factually_grounded": True,
+                "topic_evidence_quote": (
+                    "Cells convert nutrient energy into ATP through a sequence of enzyme controlled reactions"
+                ),
+            },
+            {
+                "start": 10.0,
+                "end": 20.0,
+                "cue_ids": ["teaching"],
+                "informativeness": 0.9,
+                "topic_relevance": 0.9,
+                "educational_importance": 0.9,
+                "difficulty": 0.2,
+                "boundary_confidence": 0.9,
+                "is_standalone": True,
+                "selection_candidate_id": "missing-grounding-contract",
+                "prerequisite_ids": [],
+                "uncertainty": "low",
                 "directly_teaches_topic": True,
                 "substantive": True,
                 "topic_evidence_quote": (
@@ -710,6 +734,7 @@ def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
     ]
     assert clips[0]["score"] == 0.0
     assert clips[0]["search_context"]["topic_evidence_quote"].startswith("Cells convert")
+    assert clips[0]["search_context"]["factually_grounded"] is True
     assert clips[0]["search_context"]["deferred_level"] is True
 
 
@@ -746,6 +771,7 @@ def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
         "prerequisite_ids": [],
         "uncertainty": "low",
         "substantive": True,
+        "factually_grounded": True,
     }
     engine_out = {
         "clips": [

@@ -5499,6 +5499,9 @@ class ReelService:
             "directly_teaches_topic", True
         )
         metadata["_selection_substantive"] = selection_bool("substantive", True)
+        metadata["_selection_factually_grounded"] = selection_bool(
+            "factually_grounded", False
+        )
         metadata["_selection_topic_evidence_quote"] = str(
             parsed.get("topic_evidence_quote") or ""
         ).strip()
@@ -6967,11 +6970,21 @@ class ReelService:
                     continue
             elif boundary_status == "unavailable":
                 continue
-            if selection_metadata and (
-                not selection_metadata.get("_selection_directly_teaches_topic", True)
-                or not selection_metadata.get("_selection_substantive", True)
-            ):
-                continue
+            if selection_metadata:
+                selection_version = str(
+                    selection_metadata.get("_selection_contract_version") or ""
+                ).strip()
+                if (
+                    not selection_metadata.get("_selection_directly_teaches_topic", True)
+                    or not selection_metadata.get("_selection_substantive", True)
+                    or (
+                        selection_version
+                        and not selection_metadata.get(
+                            "_selection_factually_grounded", False
+                        )
+                    )
+                ):
+                    continue
             video_title = str(row.get("video_title") or "").strip()
             video_description = self._clean_video_description(str(row.get("video_description") or ""))
             transcript_snippet = str(row.get("transcript_snippet") or "")

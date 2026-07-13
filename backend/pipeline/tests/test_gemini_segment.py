@@ -56,6 +56,7 @@ def _topic(title: str, start_line: int, end_line: int, **overrides) -> G._Topic:
         "difficulty": 0.5,
         "directly_teaches_topic": True,
         "substantive": True,
+        "factually_grounded": True,
         "topic_evidence_quote": (
             f"line {start_line} teaches concept {start_line} and finishes"
         ),

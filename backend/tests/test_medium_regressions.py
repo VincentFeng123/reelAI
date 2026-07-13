@@ -3713,6 +3713,51 @@ class MediumRegressionTests(unittest.TestCase):
 
         self.assertEqual([row["reel_id"] for row in filtered], ["a", "b", "c"])
 
+    def test_request_shaping_keeps_grounded_low_score_inventory_to_fill_the_page(self) -> None:
+        ranked = [
+            {
+                "reel_id": "strong",
+                "video_id": "strong-video",
+                "relevance_score": 0.9,
+                "_selection_ordered": True,
+            },
+            {
+                "reel_id": "grounded-low-score",
+                "video_id": "grounded-low-video",
+                "relevance_score": 0.0,
+                "_selection_ordered": True,
+            },
+        ]
+
+        shaped = main_module._shape_request_page_reels(
+            ranked,
+            page=1,
+            limit=2,
+            subject_tag="rare niche subject",
+            strict_topic_only=True,
+            min_relevance=0.3,
+            preferred_video_duration="any",
+            target_clip_duration_sec=38,
+            target_clip_duration_min_sec=None,
+            target_clip_duration_max_sec=None,
+        )
+
+        self.assertEqual(
+            [row["reel_id"] for row in shaped],
+            ["strong", "grounded-low-score"],
+        )
+
+    def test_versioned_selection_metadata_missing_factual_contract_fails_closed(self) -> None:
+        metadata = ReelService._selection_metadata(
+            {
+                "selection_contract_version": "selector-v1",
+                "directly_teaches_topic": True,
+                "substantive": True,
+            }
+        )
+
+        self.assertFalse(metadata["_selection_factually_grounded"])
+
     def test_bootstrap_topic_keywords_include_canonical_aliases(self) -> None:
         service = ReelService(embedding_service=mock.Mock(), youtube_service=mock.Mock())
         concept = {

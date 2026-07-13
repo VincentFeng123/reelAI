@@ -43,8 +43,8 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-# v6 separates measured-silence inventory from caption-only candidate history.
-REQUEST_SCHEMA_VERSION = "generation-request-v6-energy-silence"
+# v7 also invalidates jobs created with the resolver that lacked browser impersonation.
+REQUEST_SCHEMA_VERSION = "generation-request-v7-browser-audio"
 
 
 class JobLeaseLostError(RuntimeError):

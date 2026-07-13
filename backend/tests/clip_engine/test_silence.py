@@ -19,7 +19,9 @@ def test_hosted_image_includes_yt_dlp_javascript_runtime() -> None:
 
     assert "FROM denoland/deno:bin-2.9.2 AS deno_runtime" in dockerfile
     assert "COPY --from=deno_runtime /deno /usr/local/bin/deno" in dockerfile
-    assert "yt-dlp[default]==2026.3.17" in requirements
+    assert "yt-dlp[default,curl-cffi]==2026.7.4" in requirements
+    assert "curl_cffi==0.15.0" in requirements
+    assert "import yt_dlp.networking._curlcffi" in dockerfile
 
 
 def _write_wav(path: Path, spans: list[tuple[float, float]], *, sample_rate: int = 16000) -> None:
@@ -200,15 +202,19 @@ def test_cancelled_before_work_never_resolves_or_decodes() -> None:
 def test_command_timeout_kills_child_process() -> None:
     process = mock.Mock(returncode=None)
     process.communicate.return_value = (b"", b"")
-    with mock.patch.object(silence.subprocess, "Popen", return_value=process), mock.patch.object(
-        silence.time, "monotonic", side_effect=[0.0, 2.0]
-    ):
+    with mock.patch.object(
+        silence.subprocess, "Popen", return_value=process
+    ) as popen, mock.patch.object(
+        silence.os, "killpg"
+    ) as killpg, mock.patch.object(silence.time, "monotonic", side_effect=[0.0, 2.0]):
         with pytest.raises(silence._Unavailable, match="deadline_exceeded"):
             silence._run_command(
                 ["fake"], deadline=1.0, cancel_check=None, stage="decode"
             )
 
-    process.kill.assert_called_once_with()
+    assert popen.call_args.kwargs["start_new_session"] is True
+    killpg.assert_called_once_with(process.pid, silence.signal.SIGKILL)
+    process.communicate.assert_called_once_with(timeout=1.0)
 
 
 def test_ffmpeg_uses_bounded_seek_before_input(tmp_path: Path) -> None:
@@ -269,8 +275,199 @@ def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monke
     assert command[command.index("--extractor-args") + 1] == (
         "youtubepot-bgutilhttp:base_url=http://pot.internal:4416"
     )
+    assert command[command.index("--impersonate") + 1] == "chrome"
+    assert "--no-remote-components" in command
+    assert "--remote-components" not in command
     assert result.source is not None and result.source.format_id == "140"
     assert "media.example" not in repr(result)
+
+
+def test_prepare_rotates_to_the_next_configured_proxy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(
+            proxy_urls="http://broken.example:8080,http://healthy.example:8080",
+            ytdlp_pot_provider_url="",
+        ),
+    )
+    payload = b'{"url":"https://media.example/audio.m4a","format_id":"140"}'
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(list(command))
+        if len(commands) == 1:
+            raise silence._Unavailable("resolve", "proxy_failed")
+        return payload, b""
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ")
+
+    assert result.ready
+    assert commands[0][commands[0].index("--proxy") + 1] == "http://broken.example:8080"
+    assert commands[1][commands[1].index("--proxy") + 1] == "http://healthy.example:8080"
+    assert result.source is not None
+    assert result.source.proxy_url == "http://healthy.example:8080"
+
+
+def test_prepare_uses_direct_route_after_all_configured_proxies_fail(monkeypatch) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(
+            proxy_urls="http://one.example:8080,http://two.example:8080",
+            ytdlp_pot_provider_url="",
+        ),
+    )
+    payload = b'{"url":"https://media.example/audio.m4a","format_id":"251"}'
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(list(command))
+        if len(commands) <= 2:
+            raise silence._Unavailable("resolve", "proxy_failed")
+        return payload, b""
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ")
+
+    assert result.ready
+    assert "--proxy" in commands[0] and "--proxy" in commands[1]
+    assert "--proxy" not in commands[2]
+    assert result.source is not None and result.source.proxy_url == ""
+
+
+def test_prepare_retries_bot_challenge_with_embedded_player(monkeypatch) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
+    )
+    payload = b'{"url":"https://media.example/audio.m4a","format_id":"251"}'
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(list(command))
+        if len(commands) == 1:
+            raise silence._Unavailable("resolve", "youtube_bot_challenge")
+        return payload, b""
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ")
+
+    assert result.ready
+    assert "youtube:player_client=web_embedded;player_skip=webpage" not in commands[0]
+    assert "youtube:player_client=web_embedded;player_skip=webpage" in commands[1]
+
+
+def test_prepare_reserves_time_for_fallback_after_attempt_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
+    )
+    payload = b'{"url":"https://media.example/audio.m4a","format_id":"251"}'
+    deadlines: list[float] = []
+
+    def fake_run(_command, **kwargs):
+        deadlines.append(float(kwargs["deadline"]))
+        if len(deadlines) == 1:
+            raise silence._Unavailable("resolve", "deadline_exceeded")
+        return payload, b""
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ")
+
+    assert result.ready
+    assert len(deadlines) == 2
+    assert deadlines[0] < deadlines[1]
+
+
+def test_prepare_preserves_actionable_reasons_across_failed_attempts(monkeypatch) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
+    )
+    failures = iter(("youtube_bot_challenge", "process_failed"))
+
+    def fake_run(_command, **_kwargs):
+        raise silence._Unavailable("resolve", next(failures))
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ")
+
+    assert result.status == "unavailable"
+    assert result.diagnostics["reason"] == "youtube_bot_challenge"
+    assert result.diagnostics["attempt_reasons"] == [
+        "direct:default:youtube_bot_challenge",
+        "direct:embedded:process_failed",
+    ]
+
+
+def test_preparation_attempt_reasons_reach_boundary_diagnostics() -> None:
+    prepared = silence.AudioPreparationResult(
+        "unavailable",
+        diagnostics={
+            "stage": "resolve",
+            "reason": "youtube_bot_challenge",
+            "attempt_reasons": [
+                "proxy:default:proxy_failed",
+                "direct:embedded:youtube_bot_challenge",
+            ],
+            "elapsed_ms": 123,
+        },
+    )
+
+    result = silence.verify_acoustic_boundaries(
+        "dQw4w9WgXcQ", 10.0, 20.0, prepared=prepared
+    )
+
+    assert result.status == "unavailable"
+    assert result.diagnostics["attempt_reasons"] == prepared.diagnostics["attempt_reasons"]
+    assert result.diagnostics["prepare_elapsed_ms"] == 123
+
+
+def test_global_prepare_timeout_keeps_the_terminal_attempt_reason(monkeypatch) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
+    )
+
+    def fake_run(_command, **_kwargs):
+        silence.time.sleep(0.02)
+        raise silence._Unavailable("resolve", "deadline_exceeded")
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ", timeout_sec=0.01)
+
+    assert result.status == "unavailable"
+    assert result.diagnostics["reason"] == "deadline_exceeded"
+    assert result.diagnostics["attempt_reasons"] == [
+        "direct:default:deadline_exceeded"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("stderr", "reason"),
+    [
+        (b"Sign in to confirm you're not a bot", "youtube_bot_challenge"),
+        (b"Unable to connect to proxy", "proxy_failed"),
+        (b"Requested format is not available", "format_unavailable"),
+        (b"Remote component ejs failed", "component_failed"),
+    ],
+)
+def test_resolver_process_failures_are_safely_classified(stderr: bytes, reason: str) -> None:
+    process = mock.Mock(returncode=1)
+    process.communicate.return_value = (b"", stderr)
+    with mock.patch.object(silence.subprocess, "Popen", return_value=process):
+        with pytest.raises(silence._Unavailable) as exc:
+            silence._run_command(
+                ["fake"], deadline=9999999999.0, cancel_check=None, stage="resolve"
+            )
+
+    assert exc.value.reason == reason
 
 
 def test_invalid_source_fails_before_yt_dlp() -> None:
