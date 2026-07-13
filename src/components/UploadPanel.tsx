@@ -367,9 +367,6 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
         const result = await ingestUrl({
           sourceUrl: normalized,
-          targetClipDurationSec: activeSettings.targetClipDurationSec,
-          targetClipDurationMinSec: activeSettings.targetClipDurationMinSec,
-          targetClipDurationMaxSec: activeSettings.targetClipDurationMaxSec,
           signal: controller.signal,
         });
         if (controller.signal.aborted) {

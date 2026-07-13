@@ -348,6 +348,9 @@ assessment_service = AssessmentService()
 # reels per material in the worst case). 300 comfortably covers typical study
 # sessions (3-50 reels) while guarding against runaway pagination.
 MAX_REELS_PER_MATERIAL = 300
+GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
+GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
+SELECTION_CONTRACT_VERSION = "quality_silence_v2"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -1887,8 +1890,8 @@ def _filter_reels_by_video_preferences(
     target_clip_duration_max_sec: int | None = None,
 ) -> list[dict]:
     safe_duration_pref = _normalize_preferred_video_duration(preferred_video_duration)
-    ranked: list[tuple[int, float, int, dict[str, Any]]] = []
-    for original_index, reel in enumerate(reels):
+    filtered: list[dict[str, Any]] = []
+    for reel in reels:
         if safe_duration_pref != "any":
             bucket = _video_duration_bucket(reel.get("video_duration_sec"))
             if bucket != safe_duration_pref:
@@ -1905,26 +1908,10 @@ def _filter_reels_by_video_preferences(
         normalized = dict(reel)
         if clip_duration_value > 0:
             normalized["clip_duration_sec"] = round(clip_duration_value, 2)
-
-        duration_fit = "in_range"
-        distance = 0.0
-        if target_clip_duration_min_sec is not None and clip_duration_value < float(
-            target_clip_duration_min_sec
-        ):
-            duration_fit = "shorter"
-            distance = float(target_clip_duration_min_sec) - clip_duration_value
-        elif target_clip_duration_max_sec is not None and clip_duration_value > float(
-            target_clip_duration_max_sec
-        ):
-            duration_fit = "longer"
-            distance = clip_duration_value - float(target_clip_duration_max_sec)
-
-        normalized["duration_preference_met"] = duration_fit == "in_range"
-        normalized["duration_fit"] = duration_fit
-        ranked.append((0 if duration_fit == "in_range" else 1, distance, original_index, normalized))
-
-    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
-    return [item[3] for item in ranked]
+        normalized["duration_preference_met"] = True
+        normalized["duration_fit"] = "in_range"
+        filtered.append(normalized)
+    return filtered
 
 
 def _generation_content_fingerprint(
@@ -2451,7 +2438,6 @@ def _shape_reels_for_request_context(
         if strict_topic_only and subject_tag:
             text = _request_reel_text(reel)
             video_duration_sec = max(0, int(reel.get("video_duration_sec") or 0))
-            clip_duration_sec = max(0.0, float(reel.get("clip_duration_sec") or 0.0))
             relevance_score = float(reel.get("relevance_score") or 0.0)
             matched_terms = reel.get("matched_terms") or []
             if not isinstance(matched_terms, list):
@@ -2473,7 +2459,7 @@ def _shape_reels_for_request_context(
                 )
             )
             topical_short_support = (
-                ((0 < video_duration_sec <= 3 * 60) or (0 < clip_duration_sec <= 75.0))
+                (0 < video_duration_sec <= 3 * 60)
                 and (has_root_anchor or has_companion_anchor or has_page_one_companion_anchor)
                 and (
                     relevance_score >= (0.18 if page <= 1 else 0.14 if page <= 3 else 0.12)
@@ -2842,30 +2828,75 @@ def _verified_cross_request_source_generation(
     learner_id: str,
     request_key: str,
     concept_id: str | None,
+    content_fingerprint: str,
+    request_params: dict[str, Any],
 ) -> str | None:
-    """Return the newest other-request inventory only when its whole chain is verified."""
+    """Return compatible other-mode inventory only when its whole chain is verified."""
     concept_clause = "AND concept_id IS NULL"
-    candidate_params: tuple[Any, ...] = (material_id, learner_id, request_key)
+    candidate_params: tuple[Any, ...] = (
+        material_id,
+        learner_id,
+        request_key,
+        content_fingerprint,
+    )
     if concept_id is not None:
         concept_clause = "AND concept_id = ?"
         candidate_params = (*candidate_params, concept_id)
-    candidate = fetch_one(
+    candidates = fetch_all(
         conn,
         f"""
-        SELECT result_generation_id
+        SELECT result_generation_id, request_params_json
         FROM reel_generation_jobs
         WHERE material_id = ?
           AND learner_id = ?
           AND request_key <> ?
+          AND content_fingerprint = ?
           {concept_clause}
           AND status IN ('completed', 'partial')
           AND result_generation_id IS NOT NULL
           AND TRIM(result_generation_id) <> ''
         ORDER BY completed_at DESC, updated_at DESC, created_at DESC, id DESC
-        LIMIT 1
+        LIMIT 20
         """,
         candidate_params,
     )
+    expected_exclusions = sorted(
+        _normalize_excluded_video_ids(request_params.get("exclude_video_ids") or [])
+    )
+    expected_relevance = _normalize_min_relevance(
+        request_params.get("min_relevance")
+    )
+    candidate = None
+    for row in candidates:
+        try:
+            prior_params = json.loads(str(row.get("request_params_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(prior_params, dict):
+            continue
+        if (
+            bool(prior_params.get("creative_commons_only"))
+            != bool(request_params.get("creative_commons_only"))
+            or _normalize_preferred_video_duration(
+                str(prior_params.get("preferred_video_duration") or "any")
+            )
+            != _normalize_preferred_video_duration(
+                str(request_params.get("preferred_video_duration") or "any")
+            )
+            or str(prior_params.get("knowledge_level") or "").strip().lower()
+            != str(request_params.get("knowledge_level") or "").strip().lower()
+            or str(prior_params.get("language") or "en").strip().lower()
+            != str(request_params.get("language") or "en").strip().lower()
+            or sorted(_normalize_excluded_video_ids(
+                prior_params.get("exclude_video_ids") or []
+            ))
+            != expected_exclusions
+            or _normalize_min_relevance(prior_params.get("min_relevance"))
+            != expected_relevance
+        ):
+            continue
+        candidate = row
+        break
     generation_id = str((candidate or {}).get("result_generation_id") or "").strip()
     if not generation_id:
         return None
@@ -2887,7 +2918,7 @@ def _verified_cross_request_source_generation(
 
     reel_rows = fetch_all(
         conn,
-        f"SELECT search_context_json FROM reels WHERE generation_id IN ({placeholders})",
+        f"SELECT search_context_json, transcript_snippet FROM reels WHERE generation_id IN ({placeholders})",
         tuple(generation_ids),
     )
     verified_surfaceable_count = 0
@@ -2897,6 +2928,56 @@ def _verified_cross_request_source_generation(
         except (TypeError, json.JSONDecodeError):
             return None
         if not isinstance(context, dict):
+            return None
+        if (
+            str(context.get("selection_contract_version") or "").strip()
+            != SELECTION_CONTRACT_VERSION
+        ):
+            return None
+        try:
+            quality_scores = (
+                float(context.get("informativeness")),
+                float(context.get("topic_relevance")),
+                float(context.get("educational_importance")),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if any(
+            not math.isfinite(score) or score < 0.75
+            for score in quality_scores
+        ):
+            return None
+        if any(
+            context.get(field) is not True
+            for field in (
+                "directly_teaches_topic",
+                "substantive",
+                "factually_grounded",
+                "self_contained",
+                "is_standalone",
+            )
+        ):
+            return None
+        evidence_words = re.findall(
+            r"[\w+#'-]+",
+            str(context.get("topic_evidence_quote") or "").casefold(),
+        )
+        transcript_words = re.findall(
+            r"[\w+#'-]+",
+            str(row.get("transcript_snippet") or "").casefold(),
+        )
+        evidence_width = len(evidence_words)
+        if (
+            evidence_width < 5
+            or evidence_width > 40
+            or not any(
+                transcript_words[index : index + evidence_width]
+                == evidence_words
+                for index in range(
+                    max(0, len(transcript_words) - evidence_width + 1)
+                )
+            )
+        ):
             return None
         if "surface_eligible" not in context:
             return None
@@ -2933,7 +3014,10 @@ def _finalize_request_reel_order(
     cleaned: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
-        item.pop("_selection_ordered", None)
+        for internal_key in [
+            key for key in item if key.startswith("_selection_")
+        ]:
+            item.pop(internal_key, None)
         cleaned.append(item)
     if versioned_order:
         return cleaned
@@ -2995,8 +3079,11 @@ def _ranked_request_reels(
     )
     generation_ids = _response_generation_ids(conn, generation_id)
     if generation_ids:
-        ranked_batches = [
-            reel_service.ranked_feed(
+        ranked_batches: list[list[dict[str, Any]]] = []
+        for generation_rank, current_generation_id in enumerate(generation_ids):
+            if not current_generation_id:
+                continue
+            batch = reel_service.ranked_feed(
                 conn,
                 material_id,
                 fast_mode=fast_mode,
@@ -3007,9 +3094,9 @@ def _ranked_request_reels(
                 content_fingerprint=content_fingerprint,
                 require_verified_boundaries=True,
             )
-            for current_generation_id in generation_ids
-            if current_generation_id
-        ]
+            for reel in batch:
+                reel["_selection_generation_rank"] = generation_rank
+            ranked_batches.append(batch)
         ranked = _merge_request_reel_lists(*ranked_batches)
     else:
         ranked = reel_service.ranked_feed(
@@ -3022,6 +3109,22 @@ def _ranked_request_reels(
             exclusions_fingerprint=exclusions_fingerprint,
             content_fingerprint=content_fingerprint,
             require_verified_boundaries=True,
+        )
+    if ranked and all(
+        str(reel.get("selection_contract_version") or "").strip()
+        == SELECTION_CONTRACT_VERSION
+        for reel in ranked
+    ):
+        ranked.sort(
+            key=lambda reel: (
+                -float(reel.get("_selection_quality_floor") or 0.0),
+                -float(reel.get("_selection_quality_mean") or 0.0),
+                -float(reel.get("_selection_topic_relevance") or 0.0),
+                int(reel.get("_selection_generation_rank") or 0),
+                int(reel.get("_selection_source_rank") or 0),
+                float(reel.get("t_start") or 0.0),
+                str(reel.get("reel_id") or ""),
+            )
         )
     excluded_video_id_set = {
         _bare_video_id(video_id)
@@ -3226,91 +3329,55 @@ def _currently_surfaceable_generation_reel_ids(
     return valid_ids
 
 
-def _generation_job_reels(conn, job_row: dict[str, Any]) -> list[dict[str, Any]]:
+def _generation_job_reels(
+    conn,
+    job_row: dict[str, Any],
+    *,
+    requested_override: int | None = None,
+) -> list[dict[str, Any]]:
     generation_id = str(job_row.get("result_generation_id") or "").strip()
     if not generation_id:
         return []
     params = _job_request_params(job_row)
-    requested = max(1, min(MAX_REELS_PER_MATERIAL, int(params.get("num_reels") or 20)))
+    mode = "fast" if str(params.get("generation_mode") or "slow") == "fast" else "slow"
+    requested = max(
+        1,
+        min(
+            GENERATION_OUTPUT_CEILINGS[mode],
+            int(
+                requested_override
+                if requested_override is not None
+                else params.get("num_reels") or GENERATION_OUTPUT_CEILINGS[mode]
+            ),
+        ),
+    )
     ranked = _ranked_request_reels(
         conn,
         material_id=str(job_row.get("material_id") or ""),
-        fast_mode=str(params.get("generation_mode") or "slow") == "fast",
+        fast_mode=mode == "fast",
         generation_id=generation_id,
         min_relevance=_normalize_min_relevance(params.get("min_relevance")),
         preferred_video_duration=_normalize_preferred_video_duration(
             str(params.get("preferred_video_duration") or "any")
         ),
-        target_clip_duration_sec=int(params.get("target_clip_duration_sec") or 55),
-        target_clip_duration_min_sec=(
-            int(params["target_clip_duration_min_sec"])
-            if params.get("target_clip_duration_min_sec") is not None
-            else None
-        ),
-        target_clip_duration_max_sec=(
-            int(params["target_clip_duration_max_sec"])
-            if params.get("target_clip_duration_max_sec") is not None
-            else None
-        ),
+        target_clip_duration_sec=0,
+        target_clip_duration_min_sec=None,
+        target_clip_duration_max_sec=None,
         exclude_video_ids=list(params.get("exclude_video_ids") or []),
         page=1,
         limit=requested,
         learner_id=str(job_row.get("learner_id") or LEGACY_LEARNER_ID),
     )
-    # Candidate events are emitted only after a clip is persisted and passes
-    # the surfaceability guards. Request shaping may still remove one for page
-    # diversity; the authoritative inventory must never make a streamed clip
-    # disappear.
-    provisional: list[dict[str, Any]] = []
-    for event in replay_generation_events(
-        conn,
-        job_id=str(job_row.get("id") or ""),
-    ):
-        if str(event.get("type") or "") != "candidate":
-            continue
-        payload = event.get("payload") or {}
-        reel = payload.get("reel") if isinstance(payload, dict) else None
-        if isinstance(reel, dict):
-            provisional.append(dict(reel))
-    verified_provisional_ids = _verified_acoustic_reel_ids(
-        conn,
-        [str(reel.get("reel_id") or "") for reel in provisional],
-    )
-    currently_surfaceable_ids = _currently_surfaceable_generation_reel_ids(
-        conn,
-        job_row,
-    )
-    provisional = [
-        reel for reel in provisional
-        if (
-            str(reel.get("reel_id") or "") in verified_provisional_ids
-            and str(reel.get("reel_id") or "") in currently_surfaceable_ids
-        )
-    ]
-    merged = _merge_request_reel_lists(ranked, provisional)
-    if len(merged) <= requested:
-        return merged
-    selected = merged[:requested]
-    selected_identities = {_reel_identity_key(reel) for reel in selected}
-    required_provisional = [
-        reel for reel in provisional
-        if _reel_identity_key(reel) not in selected_identities
-    ]
-    provisional_identities = {
-        _reel_identity_key(reel) for reel in provisional
-    }
-    for reel in required_provisional:
-        replace_index = next(
-            (
-                index for index in range(len(selected) - 1, -1, -1)
-                if _reel_identity_key(selected[index]) not in provisional_identities
-            ),
-            None,
-        )
-        if replace_index is None:
-            break
-        selected[replace_index] = reel
-    return selected
+    return [
+        {
+            key: value
+            for key, value in reel.items()
+            if not key.startswith("_selection_")
+        }
+        for reel in ranked
+        if str(reel.get("selection_contract_version") or "").strip()
+        == SELECTION_CONTRACT_VERSION
+    ][:requested]
 
 
 def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, Any]:
@@ -3512,7 +3579,10 @@ def _run_leased_generation_job(
     mode: Literal["fast", "slow"] = "fast" if params.get("generation_mode") == "fast" else "slow"
     requested_count = max(
         1,
-        min(MAX_REELS_PER_MATERIAL, int(params.get("num_reels") or 20)),
+        min(
+            GENERATION_OUTPUT_CEILINGS[mode],
+            int(params.get("num_reels") or GENERATION_OUTPUT_CEILINGS[mode]),
+        ),
     )
     material_id = str(job_row.get("material_id") or "")
     concept_id = str(job_row.get("concept_id") or "") or None
@@ -3634,7 +3704,11 @@ def _run_leased_generation_job(
                     max(0, requested_count - 2),
                 )
             emitted: set[tuple[str, str]] = set()
-            candidate_event_cap = 2 if mode == "fast" else requested_count
+            # Candidate events are provisional and reconciled against the
+            # authoritative capped final. Emit every qualifying clip from the
+            # already-budgeted sources so a slower, stronger source is visible
+            # as soon as its acoustic checks pass.
+            candidate_event_cap = GENERATION_SOURCE_BUDGETS[mode] * 8
 
             def on_candidate(reel: dict[str, Any]) -> None:
                 if should_cancel():
@@ -3643,11 +3717,16 @@ def _run_leased_generation_job(
                 if identity in emitted or len(emitted) >= candidate_event_cap:
                     return
                 emitted.add(identity)
+                public_reel = {
+                    key: value
+                    for key, value in reel.items()
+                    if not key.startswith("_selection_")
+                }
                 append_generation_event(
                     conn,
                     job_id=job_id,
                     event_type="candidate",
-                    payload={"reel": reel, "provisional": True},
+                    payload={"reel": public_reel, "provisional": True},
                     lease_owner=lease_owner,
                 )
 
@@ -3655,7 +3734,7 @@ def _run_leased_generation_job(
 
             def run_retrieval_stage(
                 *,
-                retrieval_profile: Literal["bootstrap", "deep"],
+                retrieval_profile: Literal["deep"],
                 video_budget: int,
                 new_reel_cap: int,
                 excluded_video_ids: list[str],
@@ -3674,9 +3753,9 @@ def _run_leased_generation_job(
                     preferred_video_duration=_normalize_preferred_video_duration(
                         str(params.get("preferred_video_duration") or "any")
                     ),
-                    target_clip_duration_sec=int(params.get("target_clip_duration_sec") or 55),
-                    target_clip_duration_min_sec=params.get("target_clip_duration_min_sec"),
-                    target_clip_duration_max_sec=params.get("target_clip_duration_max_sec"),
+                    target_clip_duration_sec=0,
+                    target_clip_duration_min_sec=None,
+                    target_clip_duration_max_sec=None,
                     retrieval_profile=retrieval_profile,
                     generation_id=generation_id,
                     min_relevance_threshold=float(params.get("min_relevance") or 0.0),
@@ -3700,34 +3779,16 @@ def _run_leased_generation_job(
                 context.budget.reserve_pass()
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
-                bootstrap_analyzed_video_ids: set[str] = set()
-                bootstrap_retrieved_video_ids: set[str] = set()
-                try:
-                    run_retrieval_stage(
-                        retrieval_profile="bootstrap",
-                        video_budget=3,
-                        new_reel_cap=min(2, requested_count - current_count),
-                        excluded_video_ids=base_exclusions,
-                        analyzed_video_ids=bootstrap_analyzed_video_ids,
-                        retrieved_video_ids=bootstrap_retrieved_video_ids,
-                    )
-                except ClipEngineProviderError as exc:
-                    deadline_exhausted = (
-                        exc.code == "provider_transient"
-                        and exc.operation in {"search", "transcript"}
-                        and str(exc.detail or "").strip().casefold()
-                        == "generation deadline exceeded"
-                    )
-                    if not deadline_exhausted:
-                        raise
-                    # The provisional stage has a strict wall-clock ceiling.
-                    # Slow jobs may still recover through deep retrieval; Fast
-                    # jobs truthfully finish partial/exhausted.
-                    logger.info(
-                        "bootstrap deadline exhausted job_id=%s operation=%s",
-                        job_id,
-                        exc.operation,
-                    )
+                analyzed_video_ids: set[str] = set()
+                retrieved_video_ids: set[str] = set()
+                run_retrieval_stage(
+                    retrieval_profile="deep",
+                    video_budget=GENERATION_SOURCE_BUDGETS[mode],
+                    new_reel_cap=requested_count - current_count,
+                    excluded_video_ids=base_exclusions,
+                    analyzed_video_ids=analyzed_video_ids,
+                    retrieved_video_ids=retrieved_video_ids,
+                )
                 current_count = source_reel_count + _count_generation_reels(
                     conn, generation_id
                 )
@@ -3735,51 +3796,13 @@ def _run_leased_generation_job(
                     conn,
                     job_id=job_id,
                     lease_owner=lease_owner,
-                    phase="ranking" if mode == "fast" else "retrieval",
-                    progress=0.85 if mode == "fast" else 0.45,
+                    phase="ranking",
+                    progress=0.85,
                     usage=context.usage_payload(),
                 ):
                     raise JobLeaseLostError(
                         f"generation job lease is no longer active: {job_id}"
                     )
-
-                deep_video_budget = min(
-                    max(0, 8 - len(bootstrap_analyzed_video_ids)),
-                    context.budget.remaining("transcript"),
-                    context.budget.remaining("segmentation"),
-                )
-                if (
-                    mode == "slow"
-                    and current_count < requested_count
-                    and deep_video_budget > 0
-                    and context.budget.remaining("search") > 0
-                ):
-                    deep_exclusions = _normalize_excluded_video_ids(
-                        [*base_exclusions, *sorted(bootstrap_retrieved_video_ids)]
-                    )
-                    run_retrieval_stage(
-                        retrieval_profile="deep",
-                        video_budget=deep_video_budget,
-                        new_reel_cap=requested_count - current_count,
-                        excluded_video_ids=deep_exclusions,
-                        analyzed_video_ids=set(),
-                        retrieved_video_ids=set(),
-                    )
-                    current_count = source_reel_count + _count_generation_reels(
-                        conn, generation_id
-                    )
-                if mode == "slow":
-                    if not update_generation_progress(
-                        conn,
-                        job_id=job_id,
-                        lease_owner=lease_owner,
-                        phase="ranking",
-                        progress=0.85,
-                        usage=context.usage_payload(),
-                    ):
-                        raise JobLeaseLostError(
-                            f"generation job lease is no longer active: {job_id}"
-                        )
 
             cumulative_count = source_reel_count + _count_generation_reels(
                 conn, generation_id
@@ -5054,12 +5077,14 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
     _reject_multi_platform_search(payload.multi_platform_search)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
-    safe_target_clip_duration_sec, safe_target_clip_min_sec, safe_target_clip_max_sec = _resolve_target_clip_duration_bounds(
-        target_clip_duration_sec=payload.target_clip_duration_sec,
-        target_clip_duration_min_sec=payload.target_clip_duration_min_sec,
-        target_clip_duration_max_sec=payload.target_clip_duration_max_sec,
+    excluded_video_ids = _normalize_excluded_video_ids(payload.exclude_video_ids)
+    requested_num_reels = max(
+        1,
+        min(
+            GENERATION_OUTPUT_CEILINGS[payload.generation_mode],
+            int(payload.num_reels),
+        ),
     )
-    requested_num_reels = max(1, int(payload.num_reels))
     with get_conn(transactional=True) as conn:
         material = fetch_one(
             conn,
@@ -5084,24 +5109,38 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             generation_mode=payload.generation_mode,
             creative_commons_only=payload.creative_commons_only,
             source_duration=safe_video_duration_pref,
-            target_clip_duration_sec=safe_target_clip_duration_sec,
-            target_clip_duration_min_sec=safe_target_clip_min_sec,
-            target_clip_duration_max_sec=safe_target_clip_max_sec,
+            target_clip_duration_sec=0,
+            target_clip_duration_min_sec=None,
+            target_clip_duration_max_sec=None,
+            min_relevance=min_relevance,
+            exclude_video_ids=excluded_video_ids,
         )
+        request_params = {
+            "material_id": payload.material_id,
+            "concept_id": payload.concept_id,
+            "num_reels": requested_num_reels,
+            "exclude_video_ids": excluded_video_ids,
+            "creative_commons_only": payload.creative_commons_only,
+            "generation_mode": payload.generation_mode,
+            "min_relevance": min_relevance,
+            "preferred_video_duration": safe_video_duration_pref,
+            "knowledge_level": learner_knowledge_level,
+            "language": "en",
+        }
         source_generation_id: str | None = None
         completed_job = find_completed_generation_job(conn, request_key)
         active_job = find_active_generation_job(conn, request_key)
         if completed_job:
-            cached_reels = _generation_job_reels(conn, completed_job)
-            if len(cached_reels) >= requested_num_reels:
-                return {
-                    "reels": cached_reels[:requested_num_reels],
-                    "generation_id": str(completed_job.get("result_generation_id") or "") or None,
-                    "response_profile": "unified",
-                }
-            source_generation_id = (
-                str(completed_job.get("result_generation_id") or "").strip() or None
+            cached_reels = _generation_job_reels(
+                conn,
+                completed_job,
+                requested_override=requested_num_reels,
             )
+            return {
+                "reels": cached_reels,
+                "generation_id": str(completed_job.get("result_generation_id") or "") or None,
+                "response_profile": "unified",
+            }
         elif not active_job:
             source_generation_id = _verified_cross_request_source_generation(
                 conn,
@@ -5109,21 +5148,9 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 learner_id=learner_id,
                 request_key=request_key,
                 concept_id=payload.concept_id,
+                content_fingerprint=content_fingerprint,
+                request_params=request_params,
             )
-        request_params = {
-            "material_id": payload.material_id,
-            "concept_id": payload.concept_id,
-            "num_reels": requested_num_reels,
-            "exclude_video_ids": _normalize_excluded_video_ids(payload.exclude_video_ids),
-            "creative_commons_only": payload.creative_commons_only,
-            "generation_mode": payload.generation_mode,
-            "min_relevance": min_relevance,
-            "preferred_video_duration": safe_video_duration_pref,
-            "target_clip_duration_sec": safe_target_clip_duration_sec,
-            "target_clip_duration_min_sec": safe_target_clip_min_sec,
-            "target_clip_duration_max_sec": safe_target_clip_max_sec,
-            "knowledge_level": learner_knowledge_level,
-        }
         job_row, _created = submit_generation_job(
             conn,
             material_id=payload.material_id,
@@ -5807,7 +5834,7 @@ def feed(
     generation_mode: Literal["slow", "fast"] = "slow",
     min_relevance: float | None = None,
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any",
-    target_clip_duration_sec: int = DEFAULT_TARGET_CLIP_DURATION_SEC,
+    target_clip_duration_sec: int | None = None,
     target_clip_duration_min_sec: int | None = None,
     target_clip_duration_max_sec: int | None = None,
     exclude_video_ids: str = "",
@@ -5834,11 +5861,8 @@ def feed(
         prefetch = 30
 
     safe_duration = _normalize_preferred_video_duration(preferred_video_duration)
-    safe_clip_target, safe_clip_min, safe_clip_max = _resolve_target_clip_duration_bounds(
-        target_clip_duration_sec=target_clip_duration_sec,
-        target_clip_duration_min_sec=target_clip_duration_min_sec,
-        target_clip_duration_max_sec=target_clip_duration_max_sec,
-    )
+    # Deprecated clip-duration query fields are accepted for old URLs but inert.
+    safe_clip_target, safe_clip_min, safe_clip_max = (0, None, None)
     safe_relevance = _normalize_min_relevance(min_relevance)
     excluded_videos = _parse_excluded_video_ids_param(exclude_video_ids)
     excluded_reels = _parse_excluded_reel_ids_param(exclude_reel_ids)
@@ -5869,7 +5893,21 @@ def feed(
             target_clip_duration_sec=safe_clip_target,
             target_clip_duration_min_sec=safe_clip_min,
             target_clip_duration_max_sec=safe_clip_max,
+            min_relevance=safe_relevance,
+            exclude_video_ids=excluded_videos,
         )
+        request_params = {
+            "material_id": material_id,
+            "concept_id": None,
+            "num_reels": GENERATION_OUTPUT_CEILINGS[generation_mode],
+            "exclude_video_ids": excluded_videos,
+            "creative_commons_only": creative_commons_only,
+            "generation_mode": generation_mode,
+            "min_relevance": safe_relevance,
+            "preferred_video_duration": safe_duration,
+            "knowledge_level": knowledge_level,
+            "language": "en",
+        }
         completed_job = find_completed_generation_job(conn, request_key)
         active_job = find_active_generation_job(conn, request_key)
         cross_request_source = False
@@ -5888,9 +5926,17 @@ def feed(
                 learner_id=learner_id,
                 request_key=request_key,
                 concept_id=None,
+                content_fingerprint=content_fingerprint,
+                request_params=request_params,
             )
             cross_request_source = generation_id is not None
-        ranked = _ranked_request_reels(
+        ranked = [] if (
+            generation_id is None
+            or (
+                completed_job
+                and str(completed_job.get("status") or "") == "exhausted"
+            )
+        ) else _ranked_request_reels(
             conn,
             material_id=material_id,
             fast_mode=generation_mode == "fast",
@@ -5913,13 +5959,14 @@ def feed(
         material_ready_count = _count_material_ready_reels(conn, material_id)
         if (
             autofill
+            and completed_job is None
             and (cross_request_source or sparse or unseen_ready <= 4)
             and material_ready_count < MAX_REELS_PER_MATERIAL
         ):
             target_total = min(
-                MAX_REELS_PER_MATERIAL,
+                GENERATION_OUTPUT_CEILINGS[generation_mode],
                 max(
-                    12,
+                    1,
                     page_end + 4,
                     len(ranked) + max(limit, prefetch),
                 ),
@@ -5931,20 +5978,7 @@ def feed(
                 request_key=request_key,
                 content_fingerprint=content_fingerprint,
                 learner_id=learner_id,
-                request_params={
-                    "material_id": material_id,
-                    "concept_id": None,
-                    "num_reels": target_total,
-                    "exclude_video_ids": excluded_videos,
-                    "creative_commons_only": creative_commons_only,
-                    "generation_mode": generation_mode,
-                    "min_relevance": safe_relevance,
-                    "preferred_video_duration": safe_duration,
-                    "target_clip_duration_sec": safe_clip_target,
-                    "target_clip_duration_min_sec": safe_clip_min,
-                    "target_clip_duration_max_sec": safe_clip_max,
-                    "knowledge_level": knowledge_level,
-                },
+                request_params={**request_params, "num_reels": target_total},
                 source_generation_id=generation_id,
             )
         reels = ranked[page_start:page_end]

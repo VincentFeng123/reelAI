@@ -94,13 +94,71 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
         )
         assert base != changed_level
 
+        changed_duration = jobs.build_request_key(
+            material_id="material-1",
+            concept_id="concept-1",
+            content_fingerprint=fingerprint,
+            knowledge_level="beginner",
+            generation_mode="slow",
+            creative_commons_only=False,
+            source_duration="medium",
+            target_clip_duration_sec=999,
+            target_clip_duration_min_sec=-10,
+            target_clip_duration_max_sec=1,
+        )
+        assert changed_duration == base
+
+        changed_relevance = jobs.build_request_key(
+            material_id="material-1",
+            concept_id="concept-1",
+            content_fingerprint=fingerprint,
+            knowledge_level="beginner",
+            generation_mode="slow",
+            creative_commons_only=False,
+            source_duration="medium",
+            target_clip_duration_sec=55,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+            min_relevance=0.9,
+        )
+        assert changed_relevance != base
+
+        excluded_source = jobs.build_request_key(
+            material_id="material-1",
+            concept_id="concept-1",
+            content_fingerprint=fingerprint,
+            knowledge_level="beginner",
+            generation_mode="slow",
+            creative_commons_only=False,
+            source_duration="medium",
+            target_clip_duration_sec=55,
+            target_clip_duration_min_sec=20,
+            target_clip_duration_max_sec=55,
+            exclude_video_ids=["yt:video-b", "video-a"],
+        )
+        reordered_exclusions = jobs.build_request_key(
+            material_id="material-1",
+            concept_id="concept-1",
+            content_fingerprint=fingerprint,
+            knowledge_level="beginner",
+            generation_mode="slow",
+            creative_commons_only=False,
+            source_duration="medium",
+            target_clip_duration_sec=999,
+            target_clip_duration_min_sec=-10,
+            target_clip_duration_max_sec=1,
+            exclude_video_ids=["video-a", "video-b"],
+        )
+        assert excluded_source != base
+        assert reordered_exclusions == excluded_source
+
         conn.execute("UPDATE concepts SET summary = 'Changed content' WHERE id = 'concept-1'")
         assert jobs.material_content_fingerprint(conn, "material-1", "concept-1") != fingerprint
     finally:
         conn.close()
 
 
-def test_request_key_version_invalidates_pre_acoustic_completed_inventory(monkeypatch) -> None:
+def test_request_key_version_invalidates_pre_quality_silence_inventory(monkeypatch) -> None:
     params = {
         "material_id": "material-1",
         "concept_id": "concept-1",
@@ -113,7 +171,7 @@ def test_request_key_version_invalidates_pre_acoustic_completed_inventory(monkey
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "generation-request-v7-browser-audio"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v2"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(
         jobs, "REQUEST_SCHEMA_VERSION", "generation-request-v5-supadata-boundaries"

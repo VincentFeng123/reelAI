@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from backend.pipeline import gemini_segment
 
 
@@ -14,9 +16,9 @@ def _proposal(*, end_line: int = 0) -> gemini_segment._BoundaryTopic:
         learning_objective="Explain how chlorophyll powers photosynthesis",
         facet="photosynthesis",
         reason="The span directly explains the core mechanism.",
-        informativeness=0.2,
-        topic_relevance=0.2,
-        educational_importance=0.2,
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
         difficulty=0.2,
         directly_teaches_topic=True,
         substantive=True,
@@ -32,7 +34,7 @@ def _proposal(*, end_line: int = 0) -> gemini_segment._BoundaryTopic:
     )
 
 
-def test_complete_clip_may_exceed_preferred_duration_but_not_safety_ceiling() -> None:
+def test_duration_settings_do_not_change_a_complete_clip() -> None:
     complete = [{
         "cue_id": "cue-0",
         "start": 0.0,
@@ -53,16 +55,17 @@ def test_complete_clip_may_exceed_preferred_duration_but_not_safety_ceiling() ->
 
     assert [(clip["start"], clip["end"]) for clip in report.clips] == [(0.0, 80.0)]
 
-    too_long = [{**complete[0], "end": 181.0}]
-    rejected = gemini_segment._plan_to_report(
+    long_complete = [{**complete[0], "end": 420.0}]
+    long_report = gemini_segment._plan_to_report(
         gemini_segment._BoundaryPlan(topics=[_proposal()]),
-        too_long,
+        long_complete,
         [],
         {"_segment_target_max_sec": 55},
         topic="photosynthesis",
     )
-    assert rejected.clips == []
-    assert any("invalid_duration" in reason for reason in rejected.rejected_reasons)
+    assert [(clip["start"], clip["end"]) for clip in long_report.clips] == [
+        (0.0, 420.0)
+    ]
 
 
 def test_selector_prompt_prefers_foundations_and_allows_one_listed_component() -> None:
@@ -71,18 +74,17 @@ def test_selector_prompt_prefers_foundations_and_allows_one_listed_component() -
         1,
         "photosynthesis, cellular respiration, and DNA inheritance",
         learner_level="beginner",
-        target_sec=55,
-        target_min_sec=20,
-        target_max_sec=55,
     )
 
     assert "deeply teaches any one requested component" in user
     assert "field-wide foundations" in user
-    assert "duration preference" in user
-    assert "180-second safety ceiling" in user
+    assert "whole transcript" in (_system + user).lower()
+    assert "each at least 0.75" in (_system + user)
+    assert "unseen visual" in user
+    assert "180-second" not in (_system + user)
 
 
-def test_carolingian_bad_section_edges_trim_to_complete_half_r_lesson() -> None:
+def test_carolingian_visual_dependent_span_is_rejected() -> None:
     raw_cues = [
         (577, 2229.04, 2234.16, "tail. Um it really is just like the end of the M."),
         (578, 2249.16, 2254.36, "So we explicitly have two Rs here."),
@@ -134,8 +136,10 @@ def test_carolingian_bad_section_edges_trim_to_complete_half_r_lesson() -> None:
     ]
     proposal = _proposal(end_line=len(segments) - 1).model_copy(update={
         "candidate_id": "carolingian-half-r",
-        "start_quote": "tail",
-        "end_quote": "favorite T",
+        "start_line": 2,
+        "end_line": 14,
+        "start_quote": "We have the first R",
+        "end_quote": "actually called a half R",
         "title": "Identifying the Carolingian half R ligature",
         "learning_objective": "Recognize the half R ligature in Carolingian minuscule",
         "facet": "ligature identification",
@@ -158,14 +162,8 @@ def test_carolingian_bad_section_edges_trim_to_complete_half_r_lesson() -> None:
         topic="Carolingian minuscule ligature identification",
     )
 
-    assert report.rejected_reasons == []
-    [clip] = report.clips
-    assert clip["cue_ids"][0] == "nHMf37SMX-Q:cue:579"
-    assert clip["cue_ids"][-1] == "nHMf37SMX-Q:cue:591"
-    assert clip["_clip_text"].startswith("We have the first R")
-    assert clip["_clip_text"].endswith("actually called a half R.")
-    assert clip["informativeness"] == 0.2
-    assert clip["uncertainty"] == "medium"
+    assert report.clips == []
+    assert "proposal_0:requires_visual_context" in report.rejected_reasons
 
 
 def test_short_topic_sentence_with_anaphoric_explanation_remains_a_valid_start() -> None:
@@ -255,5 +253,156 @@ def test_genetic_drift_callback_end_extends_through_its_explanation() -> None:
     assert clip["cue_ids"][-1] == "XX7PdJIGiCw:cue:53"
     assert not clip["_clip_text"].endswith("Look back at our replicator battle.")
     assert clip["_clip_text"].endswith("how much is up to chance.")
-    assert clip["informativeness"] == 0.2
+    assert clip["informativeness"] == 0.9
     assert clip["uncertainty"] == "medium"
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["informativeness", "topic_relevance", "educational_importance"],
+)
+def test_each_quality_floor_is_independently_hard(field: str) -> None:
+    segments = [{
+        "start": 0.0,
+        "end": 12.0,
+        "text": (
+            "Cells use chlorophyll to capture light energy and power the chemical "
+            "reactions of photosynthesis."
+        ),
+    }]
+    rejected = _proposal().model_copy(update={field: 0.74})
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[rejected]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+    assert report.clips == []
+    assert report.rejected_reasons == [f"proposal_0:{field}_below_green"]
+
+    accepted = _proposal().model_copy(update={
+        "informativeness": 0.75,
+        "topic_relevance": 0.75,
+        "educational_importance": 0.75,
+    })
+    accepted_report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[accepted]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+    assert len(accepted_report.clips) == 1
+
+
+def test_context_expands_beyond_eight_cues_and_thirty_seconds() -> None:
+    texts = [
+        "A worked example begins with two values and",
+        "we substitute both values into the equation and",
+        "then simplify the first expression and",
+        "carry the coefficient to the other side and",
+        "combine the matching terms together and",
+        "divide both sides by the coefficient and",
+        "check the sign of the resulting value and",
+        "substitute the result into the original equation and",
+        "verify that both sides now agree and",
+        "state the meaning of the solution and",
+        "the calculation finishes with x equals two.",
+    ]
+    segments = [
+        {"start": index * 5.0, "end": (index + 1) * 5.0, "text": text}
+        for index, text in enumerate(texts)
+    ]
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "worked-example",
+        "start_quote": "A worked example begins",
+        "end_quote": "two values and",
+        "title": "Solving the equation",
+        "learning_objective": "Solve the equation through its verified result",
+        "facet": "worked example",
+        "reason": "The complete worked example reaches and checks its answer.",
+        "topic_evidence_quote": "A worked example begins with two values",
+    })
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="equation worked example",
+    )
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_end_line"] == 10
+    assert report.clips[0]["end"] == 55.0
+
+
+def test_rephrased_facet_is_deduped_but_distinct_facet_survives() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 10.0,
+            "text": "Chlorophyll captures light energy that powers photosynthesis reactions.",
+        },
+        {
+            "start": 20.0,
+            "end": 30.0,
+            "text": "Light absorbed by chlorophyll supplies energy for photosynthesis reactions.",
+        },
+        {
+            "start": 40.0,
+            "end": 50.0,
+            "text": "Carbon fixation converts carbon dioxide into sugars used by the cell.",
+        },
+    ]
+    first = _proposal().model_copy(update={
+        "candidate_id": "energy-first",
+        "start_quote": "Chlorophyll captures light energy",
+        "end_quote": "photosynthesis reactions",
+        "learning_objective": "Explain how chlorophyll captures light energy",
+        "facet": "energy capture",
+        "topic_evidence_quote": (
+            "Chlorophyll captures light energy that powers photosynthesis reactions"
+        ),
+        "informativeness": 0.80,
+        "topic_relevance": 0.85,
+        "educational_importance": 0.80,
+    })
+    rephrased = first.model_copy(update={
+        "candidate_id": "energy-better",
+        "start_line": 1,
+        "end_line": 1,
+        "start_quote": "Light absorbed by chlorophyll",
+        "end_quote": "photosynthesis reactions",
+        "learning_objective": "How chlorophyll captures light energy",
+        "topic_evidence_quote": (
+            "Light absorbed by chlorophyll supplies energy for photosynthesis reactions"
+        ),
+        "informativeness": 0.95,
+        "topic_relevance": 0.95,
+        "educational_importance": 0.95,
+    })
+    distinct = first.model_copy(update={
+        "candidate_id": "carbon-fixation",
+        "start_line": 2,
+        "end_line": 2,
+        "start_quote": "Carbon fixation converts",
+        "end_quote": "used by the cell",
+        "learning_objective": "Explain how carbon dioxide becomes sugar",
+        "facet": "carbon fixation",
+        "topic_evidence_quote": (
+            "Carbon fixation converts carbon dioxide into sugars used by the cell"
+        ),
+        "informativeness": 0.90,
+        "topic_relevance": 0.90,
+        "educational_importance": 0.90,
+    })
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[first, rephrased, distinct]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+    assert [
+        clip["selection_candidate_id"] for clip in report.clips
+    ] == ["energy-better", "carbon-fixation"]

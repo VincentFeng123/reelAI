@@ -5,7 +5,7 @@ This package provides a YouTube-only pipeline that:
   1. Canonicalizes YouTube video, playlist, and channel URLs.
   2. Retrieves search metadata and timestamped transcript cues through Supadata.
   3. Uses Gemini to propose clips grounded in exact transcript cue IDs.
-  4. Persists only clips inside the global 1-180 second safety envelope.
+  4. Persists only finite, ordered clips that stay inside the source timeline.
   5. Returns `ReelOut`-compatible payloads for the iOS and web clients.
 
 Design rules (non-negotiable):

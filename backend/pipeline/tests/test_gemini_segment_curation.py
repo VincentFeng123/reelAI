@@ -157,26 +157,26 @@ def test_self_contained_gate_still_fails_closed():
     assert _run([_topic(0, 1, self_contained=False)]) == []
 
 
-def test_zero_scores_are_valid_and_carried():
-    clip = _run([_topic(
+def test_scores_below_fixed_green_floor_are_rejected():
+    assert _run([_topic(
         0,
         1,
         informativeness=0.0,
         topic_relevance=0.0,
         educational_importance=0.0,
         difficulty=0.0,
-    )])[0]
-    assert clip["informativeness"] == pytest.approx(0.0)
-    assert clip["topic_relevance"] == pytest.approx(0.0)
-    assert clip["educational_importance"] == pytest.approx(0.0)
-    assert clip["difficulty"] == pytest.approx(0.0)
-    assert clip["self_contained"] is True
+    )]) == []
 
 
-def test_request_quality_floor_overrides_do_not_reject_valid_scores():
-    proposal = _topic(0, 1, informativeness=0.1, topic_relevance=0.1)
+def test_request_quality_floor_overrides_cannot_change_fixed_contract():
+    proposal = _topic(
+        0, 1, informativeness=0.75, topic_relevance=0.75,
+        educational_importance=0.75,
+    )
     assert _run([proposal], settings={"segment_informativeness_min": 0.8})
     assert _run([proposal], settings={"segment_topic_relevance_min": 0.8})
+    rejected = _topic(0, 1, informativeness=0.74)
+    assert _run([rejected], settings={"segment_informativeness_min": 0.1}) == []
 
 
 def test_short_complete_clip_survives_legacy_fifteen_second_setting():
@@ -185,8 +185,8 @@ def test_short_complete_clip_survives_legacy_fifteen_second_setting():
     assert [(clip["start"], clip["end"]) for clip in clips] == [(0.0, 5.0)]
 
 
-@pytest.mark.parametrize("duration", [90.0, 120.0, 180.0])
-def test_complete_clips_through_one_eighty_seconds_survive(duration):
+@pytest.mark.parametrize("duration", [90.0, 180.0, 420.0])
+def test_complete_clips_of_any_duration_survive(duration):
     segments = [{"start": 0.0, "end": duration,
                  "text": "line zero explains lesson zero completely end zero"}]
     clip = _run([
@@ -204,8 +204,8 @@ def test_complete_clips_through_one_eighty_seconds_survive(duration):
     assert clip["end"] == duration
 
 
-def test_clip_over_one_eighty_seconds_is_rejected_without_hard_cut():
-    segments = [{"start": 0.0, "end": 180.001,
+def test_clip_over_one_eighty_seconds_is_preserved_without_hard_cut():
+    segments = [{"start": 0.0, "end": 420.0,
                  "text": "line zero explains lesson zero completely end zero"}]
     proposal = _topic(
         0, 0,
@@ -213,10 +213,11 @@ def test_clip_over_one_eighty_seconds_is_rejected_without_hard_cut():
         topic_evidence_quote="line zero explains lesson zero completely",
         assessment={**_assessment(0), "evidence_quote": "lesson zero"},
     )
-    assert _run([proposal], segments, {"segment_max_clip_s": 999}) == []
+    [clip] = _run([proposal], segments, {"segment_max_clip_s": 15})
+    assert clip["end"] == 420.0
 
 
-def test_oversized_section_repairs_to_a_complete_cue_subunit():
+def test_long_complete_section_is_not_subselected_by_duration():
     segments = [
         {
             "start": float(index * 5),
@@ -237,11 +238,11 @@ def test_oversized_section_repairs_to_a_complete_cue_subunit():
 
     assert len(clips) == 1
     assert clips[0]["start"] == 0.0
-    assert clips[0]["end"] == 75.0
-    assert clips[0]["cue_ids"][-1] == "cue-14"
+    assert clips[0]["end"] == 240.0
+    assert clips[0]["cue_ids"][-1] == "cue-47"
 
 
-def test_oversized_range_without_complete_subunit_is_not_hard_cut():
+def test_long_incomplete_range_is_rejected_for_context_not_duration():
     segments = [
         {
             "start": float(index * 10),
@@ -251,42 +252,24 @@ def test_oversized_range_without_complete_subunit_is_not_hard_cut():
         for index in range(20)
     ]
 
-    repaired = G._repair_oversized_cue_range(
-        segments,
+    proposal = _topic(
         0,
         19,
-        ignore_caption_case=True,
+        start_quote="Photosynthesis step 0",
+        end_quote="continues and",
+        topic_evidence_quote="Photosynthesis step 0 continues and Photosynthesis step 1",
     )
-
-    assert repaired is None
-
-
-def test_oversized_repair_prefers_title_grounded_opening_within_setup_window():
-    segments = [
-        {
-            "start": float(index * 5),
-            "end": float((index + 1) * 5),
-            "text": (
-                "Chloroplast structure begins this complete explanation."
-                if index == 3
-                else f"Background lesson point {index} finishes completely."
-            ),
-        }
-        for index in range(48)
-    ]
-
-    repaired = G._repair_oversized_cue_range(
+    report = G._plan_to_report(
+        G._Plan(topics=[proposal]),
         segments,
-        0,
-        47,
-        ignore_caption_case=True,
-        anchor_text="Chloroplast structure and pigments",
+        [],
+        {"_segment_ignore_caption_case": True},
     )
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:unresolved_weak_end"]
 
-    assert repaired == (3, 17)
 
-
-def test_production_biology_range_repairs_around_channel_bump():
+def test_internal_channel_bump_rejects_the_whole_candidate():
     raw_cues = [
         (354.960, 359.240, "Cool! There's just one issue: Your DNA and its information is in the nucleus,"),
         (359.240, 362.680, "but proteins are made in organelles called the ribosomes. How do we get the"),
@@ -352,13 +335,8 @@ def test_production_biology_range_repairs_around_channel_bump():
         topic="biology",
     )
 
-    assert len(report.clips) == 1
-    clip = report.clips[0]
-    assert clip["end"] - clip["start"] <= 55
-    clip_text = G._cue_clip_text(segments, clip["_start_line"], clip["_end_line"])
-    assert clip_text.rstrip().endswith((".", "!", "?"))
-    assert "Welcome to Biology Pro Tips" not in clip_text
-    assert "have a great day" not in clip_text
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:contains_filler"]
 
 
 def test_production_biology_fragment_expands_to_question_and_complete_list():
@@ -428,7 +406,7 @@ def test_production_biology_fragment_expands_to_question_and_complete_list():
     assert clip_text.endswith("related to one another.")
 
 
-def test_production_ligature_clip_repairs_elliptical_instruction_to_r_context():
+def test_visual_ligature_instruction_is_rejected_without_frame_analysis():
     raw_cues = [
         (2252.24, 2255.96, "We have the first R,"),
         (2254.36, 2258.60, "which very much looks like the R we're"),
@@ -499,13 +477,8 @@ def test_production_ligature_clip_repairs_elliptical_instruction_to_r_context():
         topic="Carolingian minuscule ligature identification",
     )
 
-    assert len(report.clips) == 1
-    clip = report.clips[0]
-    assert clip["cue_ids"][0] == "nHMf37SMX-Q:cue:748"
-    assert G._cue_clip_text(segments, clip["_start_line"], clip["_end_line"]).startswith(
-        "We have the first R"
-    )
-    assert 55 < clip["end"] - clip["start"] <= 180
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
 
 
 def test_complete_clean_range_is_not_shortened_to_duration_preference():
@@ -784,18 +757,13 @@ def test_course_logistics_suffix_is_trimmed_after_complete_teaching():
             "end": 31.0,
             "text": "I have no hope that we'll cover that in this course.",
         },
-        {
-            "start": 31.0,
-            "end": 35.0,
-            "text": "Lots of hard combinatorics.",
-        },
     ]
     report = G._plan_to_report(
         G._Plan(topics=[_topic(
             0,
-            2,
+            1,
             start_quote="Calculations show that",
-            end_quote="hard combinatorics",
+            end_quote="cover that in this course",
             topic_evidence_quote=(
                 "Calculations show that this gauge theory is indeed renormalizable"
             ),
@@ -820,7 +788,7 @@ def test_explicit_max_clips_is_respected_below_forty_ceiling():
 @pytest.mark.parametrize(
     "overrides,rejected_reason",
     [
-        ({"informativeness": 0.7}, None),
+        ({"informativeness": 0.7}, "proposal_1:informativeness_below_green"),
         ({"uncertainty": "medium", "uncertainty_reasons": ["boundary_ambiguous"]},
          None),
         ({"uncertainty": "high", "uncertainty_reasons": ["incomplete_context"]},

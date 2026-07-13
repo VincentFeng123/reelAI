@@ -46,7 +46,7 @@ def test_clip_builds_embed_urls_and_forwards_topic(monkeypatch):
     assert out["clips"][0]["embed_url"] == "https://www.youtube.com/embed/dQw4w9WgXcQ?start=1&end=4&rel=0"
     assert seen["topic"] == "topic"
     assert seen["video_id"] == "dQw4w9WgXcQ"
-    assert seen["accept_partial_flash"] is False
+    assert seen["accept_partial_flash"] is True
     assert seen["transcript_url"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
 
@@ -131,6 +131,31 @@ def test_segment_cache_miss_reserves_generic_and_per_dispatch_budgets(monkeypatc
     budget = context.budget.snapshot()
     assert budget["used"]["segmentation"] == 1
     assert budget["gemini"]["flash_selector_calls"] == 1
+
+
+def test_empty_selector_result_is_cached(monkeypatch):
+    transcript = {
+        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "words": [],
+        "duration": 5.0,
+    }
+    stored: list[list[dict]] = []
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "segment_clips",
+        lambda *_args, **_kwargs: ([], "No qualifying clips."),
+    )
+    monkeypatch.setattr(
+        run.segment_cache,
+        "store_segment_result",
+        lambda _key, clips, *_args, **_kwargs: stored.append(clips),
+    )
+
+    output = run.clip("https://youtu.be/dQw4w9WgXcQ", "topic")
+
+    assert output["clips"] == []
+    assert stored == [[]]
 
 
 def test_boundary_repair_usage_is_recorded_in_repair_stage():

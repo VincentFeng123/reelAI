@@ -36,9 +36,11 @@ export function applySearchFeedSettingsToParams(
   params.set("min_relevance", String(Number(settings.minRelevanceThreshold.toFixed(2))));
   params.set("creative_commons_only", settings.creativeCommonsOnly ? "1" : "0");
   params.set("preferred_video_duration", settings.preferredVideoDuration);
-  params.set("target_clip_duration_sec", String(settings.targetClipDurationSec));
-  params.set("target_clip_duration_min_sec", String(settings.targetClipDurationMinSec));
-  params.set("target_clip_duration_max_sec", String(settings.targetClipDurationMaxSec));
+  // Old history URLs may still carry these deprecated preferences. Read them
+  // for compatibility, but never propagate them into a new feed URL.
+  params.delete("target_clip_duration_sec");
+  params.delete("target_clip_duration_min_sec");
+  params.delete("target_clip_duration_max_sec");
   params.set("start_muted", settings.startMuted ? "1" : "0");
   return params;
 }

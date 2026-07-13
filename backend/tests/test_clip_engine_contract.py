@@ -43,19 +43,34 @@ def _fake_engine_out(video_id: str = "dQw4w9WgXcQ") -> dict:
                 "end": 75.0,
                 "cut_end": 75.0,
                 "title": "The chorus",
-                "facet": "music",
-                "reason": "catchy hook",
+                "facet": "promise-and-response structure",
+                "reason": "Directly explains the promise-and-response structure.",
+                "learning_objective": "Identify the promise-and-response structure.",
+                "kind": "educational",
+                "informativeness": 0.9,
+                "topic_relevance": 0.9,
+                "educational_importance": 0.9,
+                "self_contained": True,
+                "is_standalone": True,
+                "directly_teaches_topic": True,
+                "substantive": True,
+                "factually_grounded": True,
+                "topic_evidence_quote": "Never gonna give you up Never gonna let you down",
+                "cue_ids": ["cue-0", "cue-1"],
                 "sequence_index": 0,
                 "embed_url": f"https://www.youtube.com/embed/{video_id}?start=30&end=75",
             }
         ],
         "transcript": {
             "segments": [
-                {"start": 30.0, "end": 55.0, "text": "Never gonna give you up."},
-                {"start": 55.0, "end": 75.0, "text": "Never gonna let you down."},
+                {"cue_id": "cue-0", "start": 30.0, "end": 55.0, "text": "Never gonna give you up."},
+                {"cue_id": "cue-1", "start": 55.0, "end": 75.0, "text": "Never gonna let you down."},
             ],
             "words": [],
             "duration": 300.0,
+            "source": "supadata",
+            "artifact_key": f"supadata:{video_id}",
+            "native_mode": True,
         },
         "notes": "test notes",
     }
@@ -83,6 +98,33 @@ class ClipEngineContractTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/test"
+            ),
+        )
+        self._prepare_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "prepare_audio_source",
+            return_value=prepared,
+        )
+        self._verify_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "verify_acoustic_boundaries",
+            side_effect=lambda _url, start, end, **_kwargs: (
+                pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                    "verified",
+                    start,
+                    end,
+                    {"threshold_dbfs": -38.0},
+                )
+            ),
+        )
+        self._prepare_patch.start()
+        self._verify_patch.start()
+        self.addCleanup(self._prepare_patch.stop)
+        self.addCleanup(self._verify_patch.stop)
         with db_module.get_conn(transactional=True) as conn:
             db_module.insert(
                 conn,

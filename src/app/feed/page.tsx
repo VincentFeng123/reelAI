@@ -53,9 +53,13 @@ import type {
 } from "@/lib/types";
 
 const PAGE_SIZE = 5;
-const READY_RESERVOIR_TARGET = 12;
+const FAST_READY_RESERVOIR_TARGET = 8;
+const SLOW_READY_RESERVOIR_TARGET = 12;
 const READY_RESERVOIR_REFILL_THRESHOLD = 4;
-const INITIAL_SLOW_PREFETCH = READY_RESERVOIR_TARGET;
+
+function readyReservoirTarget(mode: GenerationMode): number {
+  return mode === "fast" ? FAST_READY_RESERVOIR_TARGET : SLOW_READY_RESERVOIR_TARGET;
+}
 const REEL_SNAP_DURATION_MS = 300;
 const POST_SNAP_COOLDOWN_MS = 30;
 const WHEEL_GESTURE_RELEASE_MS = 220;
@@ -90,9 +94,6 @@ type FeedTuningSettings = {
   minRelevance: number;
   creativeCommonsOnly: boolean;
   preferredVideoDuration: PreferredVideoDuration;
-  targetClipDurationSec: number;
-  targetClipDurationMinSec: number;
-  targetClipDurationMaxSec: number;
 };
 
 type ReelFeedbackState = {
@@ -1380,9 +1381,6 @@ function FeedPageInner() {
       minRelevance: settings.minRelevanceThreshold,
       creativeCommonsOnly: settings.creativeCommonsOnly,
       preferredVideoDuration: settings.preferredVideoDuration,
-      targetClipDurationSec: settings.targetClipDurationSec,
-      targetClipDurationMinSec: settings.targetClipDurationMinSec,
-      targetClipDurationMaxSec: settings.targetClipDurationMaxSec,
     };
   }, [mergeFeedSettingsSnapshot]);
 
@@ -1943,6 +1941,7 @@ function FeedPageInner() {
 
       try {
         const tuning = getFeedTuningSettings();
+        const requestGenerationMode = options?.generationMode ?? generationMode;
         const requestLimit = adaptiveExcludeReelIdsRef.current.length > 0 ? 25 : PAGE_SIZE;
         const rows = await Promise.all(
           feedMaterialIds.map(async (id) => {
@@ -1953,14 +1952,11 @@ function FeedPageInner() {
                 limit: requestLimit,
                 excludeReelIds: adaptiveExcludeReelIdsRef.current,
                 autofill: options?.autofill ?? true,
-                prefetch: INITIAL_SLOW_PREFETCH,
-                generationMode: options?.generationMode ?? generationMode,
+                prefetch: readyReservoirTarget(requestGenerationMode),
+                generationMode: requestGenerationMode,
                 minRelevance: tuning.minRelevance,
                 creativeCommonsOnly: tuning.creativeCommonsOnly,
                 preferredVideoDuration: tuning.preferredVideoDuration,
-                targetClipDurationSec: tuning.targetClipDurationSec,
-                targetClipDurationMinSec: tuning.targetClipDurationMinSec,
-                targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
                 signal: searchScope.controller.signal,
               });
               return { materialId: id, data, error: null };
@@ -2132,7 +2128,7 @@ function FeedPageInner() {
     const searchScope = activeSearchScopeRef.current;
     const tuning = getFeedTuningSettings();
     const unseenReadyCount = Math.max(0, reelsRef.current.length - activeIndexRef.current - 1);
-    const requestedReadyCount = Math.max(1, READY_RESERVOIR_TARGET - unseenReadyCount);
+    const requestedReadyCount = Math.max(1, readyReservoirTarget(generationMode) - unseenReadyCount);
     const perTopicBatch = Math.max(1, Math.ceil(requestedReadyCount / feedMaterialIds.length));
     isGeneratingRef.current = true;
     setGeneratingMore(true);
@@ -2149,7 +2145,7 @@ function FeedPageInner() {
         feedMaterialIds.map(async (id) => {
           const streamedReels: Reel[] = [];
           const currentCount = countReelsForMaterial(id);
-          const targetTotal = currentCount + perTopicBatch;
+          const targetTotal = Math.min(readyReservoirTarget(generationMode), currentCount + perTopicBatch);
           const activeGenerationJob = generationJobByMaterialRef.current.get(id);
           try {
             const data = await generateReelsStream({
@@ -2160,9 +2156,6 @@ function FeedPageInner() {
               minRelevance: tuning.minRelevance,
               creativeCommonsOnly: tuning.creativeCommonsOnly,
               preferredVideoDuration: tuning.preferredVideoDuration,
-              targetClipDurationSec: tuning.targetClipDurationSec,
-              targetClipDurationMinSec: tuning.targetClipDurationMinSec,
-              targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
               signal: searchScope.controller.signal,
               idleTimeoutMs: GENERATION_STREAM_IDLE_TIMEOUT_MS,
               onActivity: () => {
@@ -2640,9 +2633,6 @@ function FeedPageInner() {
                 minRelevance: tuning.minRelevance,
                 creativeCommonsOnly: tuning.creativeCommonsOnly,
                 preferredVideoDuration: tuning.preferredVideoDuration,
-                targetClipDurationSec: tuning.targetClipDurationSec,
-                targetClipDurationMinSec: tuning.targetClipDurationMinSec,
-                targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
                 signal: searchScope.controller.signal,
               });
               if (!isSearchScopeActive(searchScope)) {
@@ -2759,7 +2749,7 @@ function FeedPageInner() {
     const unseenReadyCount = Math.max(0, reelsRef.current.length - activeIndexRef.current - 1);
     const perTopicBatch = Math.max(
       1,
-      Math.ceil(Math.max(1, READY_RESERVOIR_TARGET - unseenReadyCount) / feedMaterialIds.length),
+      Math.ceil(Math.max(1, readyReservoirTarget("fast") - unseenReadyCount) / feedMaterialIds.length),
     );
     isFastTopUpRef.current = true;
     try {
@@ -2767,7 +2757,7 @@ function FeedPageInner() {
         feedMaterialIds.map(async (id) => {
           const streamedReels: Reel[] = [];
           const currentCount = countReelsForMaterial(id);
-          const targetTotal = currentCount + perTopicBatch;
+          const targetTotal = Math.min(readyReservoirTarget("fast"), currentCount + perTopicBatch);
           const activeGenerationJob = generationJobByMaterialRef.current.get(id);
           try {
             const data = await generateReelsStream({
@@ -2778,9 +2768,6 @@ function FeedPageInner() {
               minRelevance: tuning.minRelevance,
               creativeCommonsOnly: tuning.creativeCommonsOnly,
               preferredVideoDuration: tuning.preferredVideoDuration,
-              targetClipDurationSec: tuning.targetClipDurationSec,
-              targetClipDurationMinSec: tuning.targetClipDurationMinSec,
-              targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
               signal: searchScope.controller.signal,
               idleTimeoutMs: GENERATION_STREAM_IDLE_TIMEOUT_MS,
               onTerminal: (status) => {
@@ -2863,6 +2850,7 @@ function FeedPageInner() {
         return;
       }
       const searchScope = activeSearchScopeRef.current;
+      const reservoirTarget = readyReservoirTarget(generationMode);
       setBootstrappingFirstReels(true);
       try {
         // A restored/current session can already contain rows from later
@@ -2875,7 +2863,7 @@ function FeedPageInner() {
         while (
           !persistedPagesExhausted
           && nextPersistedPage <= lastPersistedPage
-          && Math.max(0, reelsRef.current.length - activeIndexRef.current - 1) < READY_RESERVOIR_TARGET
+          && Math.max(0, reelsRef.current.length - activeIndexRef.current - 1) < reservoirTarget
         ) {
           const persisted = await loadPage(nextPersistedPage, {
             autofill: false,
@@ -2887,7 +2875,7 @@ function FeedPageInner() {
           persistedPagesExhausted = persisted.exhausted;
           nextPersistedPage += 1;
         }
-        if (Math.max(0, reelsRef.current.length - activeIndexRef.current - 1) >= READY_RESERVOIR_TARGET) {
+        if (Math.max(0, reelsRef.current.length - activeIndexRef.current - 1) >= reservoirTarget) {
           return;
         }
         const generated = await requestMore({ surfaceError: manual });
@@ -3772,9 +3760,6 @@ function FeedPageInner() {
               minRelevance: tuning.minRelevance,
               creativeCommonsOnly: tuning.creativeCommonsOnly,
               preferredVideoDuration: tuning.preferredVideoDuration,
-              targetClipDurationSec: tuning.targetClipDurationSec,
-              targetClipDurationMinSec: tuning.targetClipDurationMinSec,
-              targetClipDurationMaxSec: tuning.targetClipDurationMaxSec,
               signal: searchScope.controller.signal,
             }));
           }

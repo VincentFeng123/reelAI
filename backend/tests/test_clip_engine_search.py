@@ -67,17 +67,32 @@ _FAKE_ENGINE_OUT = {
             "title": "Intro to calc",
             "facet": "math",
             "reason": "explains calculus basics",
+            "learning_objective": "Explain rates of change and derivatives.",
+            "kind": "educational",
+            "informativeness": 0.9,
+            "topic_relevance": 0.9,
+            "educational_importance": 0.9,
+            "self_contained": True,
+            "is_standalone": True,
+            "directly_teaches_topic": True,
+            "substantive": True,
+            "factually_grounded": True,
+            "topic_evidence_quote": "Calculus is the study of change Derivatives measure instantaneous rate",
+            "cue_ids": ["cue-0", "cue-1"],
             "sequence_index": 0,
             "embed_url": f"https://www.youtube.com/embed/{_VIDEO_ID}?start=20&end=65",
         }
     ],
     "transcript": {
         "segments": [
-            {"start": 20.0, "end": 40.0, "text": "Calculus is the study of change."},
-            {"start": 40.0, "end": 65.0, "text": "Derivatives measure instantaneous rate."},
+            {"cue_id": "cue-0", "start": 20.0, "end": 40.0, "text": "Calculus is the study of change."},
+            {"cue_id": "cue-1", "start": 40.0, "end": 65.0, "text": "Derivatives measure instantaneous rate."},
         ],
         "words": [],
         "duration": 300.0,
+        "source": "supadata",
+        "artifact_key": f"supadata:{_VIDEO_ID}",
+        "native_mode": True,
     },
     "notes": "test fixture",
 }
@@ -106,6 +121,30 @@ class ClipEngineSearchTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/test"
+            ),
+        )
+        self._prepare_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "prepare_audio_source",
+            return_value=prepared,
+        )
+        self._verify_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "verify_acoustic_boundaries",
+            side_effect=lambda _url, start, end, **_kwargs: (
+                pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                    "verified", start, end, {"threshold_dbfs": -38.0}
+                )
+            ),
+        )
+        self._prepare_patch.start()
+        self._verify_patch.start()
+        self.addCleanup(self._prepare_patch.stop)
+        self.addCleanup(self._verify_patch.stop)
         with db_module.get_conn(transactional=True) as conn:
             db_module.insert(
                 conn,

@@ -55,7 +55,6 @@ def _report(**overrides) -> G._Conversion:
 
 @pytest.mark.parametrize("report,topic", [
     (_report(), "alpha lesson"),
-    (_report(clips=[_clip(informativeness=0.61)]), "alpha"),
     (_report(clips=[_clip(end=150.0)]), "alpha"),
     (_report(near_duplicate=True), "alpha"),
     (_report(), "beta"),
@@ -64,6 +63,18 @@ def _report(**overrides) -> G._Conversion:
 def test_flash_classification_keeps_any_independently_valid_candidate(report, topic):
     classified = G._classify_flash(report, _segments(), topic, enrichment_required=False)
     assert classified == G._Classification("green", ())
+
+
+def test_flash_classification_never_marks_below_green_output_green():
+    classified = G._classify_flash(
+        _report(score_below_green=True),
+        _segments(),
+        "alpha",
+        enrichment_required=False,
+    )
+    assert classified == G._Classification(
+        "invalid", ("quality_score_below_green",),
+    )
 
 
 def test_zero_valid_candidates_is_invalid_at_any_transcript_length():
@@ -568,7 +579,7 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("medium", 8_192, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
+         ("low", 8_192, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
         (G.PRO_BOUNDARY_PROFILE,
          ("high", 8_192, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
@@ -698,25 +709,33 @@ def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatc
         )
         for index in range(9)
     ]
+    with pytest.raises(ValueError):
+        G._BoundaryPlan(topics=topics)
+
+    captured = {}
     monkeypatch.setattr(
         G,
         "_call_model",
-        lambda *args, **kwargs: (G._BoundaryPlan(topics=topics), {}),
+        lambda system, user, *args, **kwargs: (
+            captured.update({"user": user}) or G._BoundaryPlan(topics=topics[:8]),
+            {},
+        ),
     )
 
     report, classification, _ = G._run_selection_profile(
         G.PRODUCTION_FLASH_PROFILE,
         {"segments": segments, "words": [], "source": "supadata"},
         "",
-        {"max_clips": 40},
+        {"max_clips": 1},
         deadline=time.monotonic() + 10,
         cancelled=None,
     )
 
     assert classification.status == "green"
     assert len(report.clips) == 8
-    assert "T0" not in {clip["title"] for clip in report.clips}
-    assert "T8" in {clip["title"] for clip in report.clips}
+    assert "up to 8" in captured["user"]
+    assert "T0" in {clip["title"] for clip in report.clips}
+    assert "T7" in {clip["title"] for clip in report.clips}
 
 
 def test_production_profile_preserves_optional_learning_detail_schema(monkeypatch):

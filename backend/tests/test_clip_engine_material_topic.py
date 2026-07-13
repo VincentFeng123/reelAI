@@ -70,6 +70,71 @@ CLIP_WINDOWS = {
 }
 
 
+def _quality_v2_engine_out(engine_out: dict) -> dict:
+    """Give mocked selector output the same provenance and hard gates as v2."""
+    transcript = engine_out["transcript"]
+    transcript.update(
+        source="supadata",
+        artifact_key=f"supadata:{engine_out['video_id']}",
+        native_mode=True,
+    )
+    segments = transcript["segments"]
+    for index, segment in enumerate(segments):
+        segment.setdefault("cue_id", f"cue-{index}")
+
+    for index, clip in enumerate(engine_out["clips"]):
+        start = float(clip["start"])
+        end = float(clip["end"])
+        selected = [
+            segment
+            for segment in segments
+            if float(segment["start"]) >= start - 1e-6
+            and float(segment["end"]) <= end + 1e-6
+        ]
+        if not selected:
+            selected = [
+                segment
+                for segment in segments
+                if float(segment["end"]) > start and float(segment["start"]) < end
+            ]
+            if selected:
+                clip["start"] = min(float(segment["start"]) for segment in selected)
+                clip["end"] = max(float(segment["end"]) for segment in selected)
+                clip["cut_end"] = clip["end"]
+        if not selected:
+            continue
+        words = " ".join(str(segment["text"]) for segment in selected).split()
+        if len(words) < 5:
+            selected[0]["text"] = (
+                f"{selected[0]['text']} with complete grounded explanatory context"
+            )
+            words = " ".join(str(segment["text"]) for segment in selected).split()
+        clip.update(
+            cue_ids=[str(segment["cue_id"]) for segment in selected],
+            kind="educational",
+            learning_objective=clip.get("learning_objective")
+            or f"Explain {clip.get('title') or 'this concept'}.",
+            facet=clip.get("facet") or f"facet-{index}",
+            reason=clip.get("reason") or "Provides a complete grounded explanation.",
+            informativeness=max(0.75, float(clip.get("informativeness", 0.9))),
+            topic_relevance=float(clip.get("topic_relevance", 0.9)),
+            educational_importance=float(
+                clip.get("educational_importance", 0.9)
+            ),
+            self_contained=True,
+            is_standalone=True,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            topic_evidence_quote=" ".join(words[:40]),
+            boundary_confidence=0.9,
+            prerequisite_ids=[],
+            selection_candidate_id=clip.get("selection_candidate_id")
+            or f"candidate-{index}",
+        )
+    return engine_out
+
+
 def _build_engine_out(video_id: str) -> dict:
     """Fresh engine_out each call (clip dicts are mutated by filter_by_query)."""
     windows = CLIP_WINDOWS[video_id]
@@ -92,12 +157,12 @@ def _build_engine_out(video_id: str) -> dict:
         segments.append(
             {"start": start, "end": end, "text": f"Here we explain photosynthesis part {i}."}
         )
-    return {
+    return _quality_v2_engine_out({
         "video_id": video_id,
         "clips": clips,
         "transcript": {"segments": segments, "words": [], "duration": 600.0},
         "notes": "",
-    }
+    })
 
 
 def _discover_side_effect(topic, limit, exclude_video_ids=None, **kw):
@@ -368,7 +433,7 @@ class IngestTopicTests(unittest.TestCase):
         search.discover.return_value = {
             "corrected": TOPIC, "videos": [vid], "credits_used": 0, "warning": None,
         }
-        run.clip.return_value = engine_out
+        run.clip.return_value = _quality_v2_engine_out(engine_out)
         return search, run
 
     def test_complete_clip_through_one_eighty_persists(self) -> None:
@@ -437,16 +502,16 @@ class IngestTopicTests(unittest.TestCase):
         )
         self.assertEqual(len(reels), 1)
         reel = reels[0]
-        clip_len = reel.t_end - reel.t_start  # 45.0
-        self.assertEqual(len(reel.captions), 2, "gamma cue is outside [30,75] and must be dropped")
+        clip_len = reel.t_end - reel.t_start  # 70.0; v2 includes both required cues.
+        self.assertEqual(len(reel.captions), 2, "gamma cue is outside [20,90] and must be dropped")
         for cue in reel.captions:
             self.assertGreaterEqual(cue.start, 0.0)
             self.assertLessEqual(cue.end, clip_len)
             self.assertLessEqual(cue.start, cue.end)
-        # alpha [20,50] -> [0,20]; beta [60,90] -> [30,45]
+        # The selector cannot begin/end inside required speech, so both cues are whole.
         self.assertEqual(reel.captions[0].start, 0.0)
-        self.assertEqual(reel.captions[0].end, 20.0)
-        self.assertEqual(reel.captions[1].start, 30.0)
+        self.assertEqual(reel.captions[0].end, 30.0)
+        self.assertEqual(reel.captions[1].start, 40.0)
         self.assertEqual(reel.captions[1].end, clip_len)
 
 
@@ -461,10 +526,10 @@ class PreserveEveryClipAndBlendTests(IngestTopicTests):
     def _blend_engine_out(*_a, **_kw) -> dict:
         # (title, start, end, informativeness, on_topic)
         specs = [
-            ("Segment 0", 30.0, 75.0, 0.5, True),     # rel 1.0 -> score 0.75
-            ("Segment 1", 120.0, 165.0, 1.0, True),   # rel 1.0 -> score 1.00 (best)
-            ("Segment 2", 200.0, 245.0, 1.0, False),  # rel 0.0 -> score 0.00 (capped out)
-            ("Segment 3", 300.0, 345.0, 0.6, True),   # rel 1.0 -> score 0.80
+            ("Segment 0", 30.0, 75.0, 0.80, True),
+            ("Segment 1", 120.0, 165.0, 1.00, True),
+            ("Segment 2", 200.0, 245.0, 1.00, False),
+            ("Segment 3", 300.0, 345.0, 0.90, True),
         ]
         clips, segments = [], []
         for i, (title, start, end, info, on_topic) in enumerate(specs):
@@ -477,18 +542,20 @@ class PreserveEveryClipAndBlendTests(IngestTopicTests):
                     "facet": "",
                     "reason": "",
                     "informativeness": info,
+                    "topic_relevance": 0.9 if on_topic else 0.74,
+                    "educational_importance": info,
                     "sequence_index": i,
                     "embed_url": f"https://www.youtube.com/embed/vidAAAAAAAA?start={int(start)}",
                 }
             )
             text = "here we explain photosynthesis" if on_topic else "unrelated words only"
             segments.append({"start": start, "end": end, "text": text})
-        return {
+        return _quality_v2_engine_out({
             "video_id": "vidAAAAAAAA",
             "clips": clips,
             "transcript": {"segments": segments, "words": [], "duration": 600.0},
             "notes": "",
-        }
+        })
 
     def _run(self, suffix: str):
         with _Patched() as (mock_search, mock_run):
@@ -510,9 +577,9 @@ class PreserveEveryClipAndBlendTests(IngestTopicTests):
             )
         return reels
 
-    def test_every_clip_persists_in_blended_score_order(self) -> None:
+    def test_only_hard_gate_clips_persist_in_quality_order(self) -> None:
         reels = self._run("all")
-        self.assertEqual([r.t_start for r in reels], [120.0, 300.0, 30.0, 200.0])
+        self.assertEqual([r.t_start for r in reels], [120.0, 300.0, 30.0])
 
 
 class EmbedUrlCeilTests(IngestTopicTests):
@@ -521,7 +588,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
 
     @staticmethod
     def _fractional_engine_out(*_a, **_kw) -> dict:
-        return {
+        return _quality_v2_engine_out({
             "video_id": "vidAAAAAAAA",
             "clips": [
                 {
@@ -542,7 +609,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
                 "duration": 600.0,
             },
             "notes": "",
-        }
+        })
 
     def test_video_url_floors_start_and_ceils_end(self) -> None:
         with _Patched() as (mock_search, mock_run):
@@ -577,7 +644,7 @@ class DifficultyPersistenceTests(IngestTopicTests):
 
     @staticmethod
     def _difficulty_engine_out(*_a, **_kw) -> dict:
-        return {
+        return _quality_v2_engine_out({
             "video_id": "vidAAAAAAAA",
             "clips": [{
                 "start": 30.0, "end": 75.0, "cut_end": 75.15,
@@ -590,7 +657,7 @@ class DifficultyPersistenceTests(IngestTopicTests):
                 {"start": 30.0, "end": 75.0, "text": "here we explain photosynthesis"}
             ], "words": [], "duration": 600.0},
             "notes": "",
-        }
+        })
 
     def test_difficulty_round_trips_to_db(self) -> None:
         with _Patched() as (mock_search, mock_run):
@@ -613,7 +680,7 @@ class DifficultyPersistenceTests(IngestTopicTests):
 
     @staticmethod
     def _no_difficulty_engine_out(*_a, **_kw) -> dict:
-        return {
+        return _quality_v2_engine_out({
             "video_id": "vidAAAAAAAA",
             "clips": [{
                 "start": 30.0, "end": 75.0, "cut_end": 75.15,
@@ -626,7 +693,7 @@ class DifficultyPersistenceTests(IngestTopicTests):
                 {"start": 30.0, "end": 75.0, "text": "here we explain photosynthesis"}
             ], "words": [], "duration": 600.0},
             "notes": "",
-        }
+        })
 
     def test_difficulty_absent_stays_null(self) -> None:
         with _Patched() as (mock_search, mock_run):
@@ -1094,7 +1161,7 @@ class IngestTopicProgressTests(unittest.TestCase):
             ["source-a:source-a-best", "source-c:source-c-best"],
         )
 
-    def test_bootstrap_starts_three_together_but_third_cannot_displace_initial_pair(
+    def test_bootstrap_starts_three_together_and_keeps_highest_quality_pair(
         self,
     ) -> None:
         pipeline = self._pipeline()
@@ -1156,7 +1223,7 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertEqual(started, {"source-a", "source-b", "source-c"})
         self.assertEqual(
             reels,
-            ["source-a:source-a-best", "source-b:source-b-best"],
+            ["source-a:source-a-best", "source-c:source-c-best"],
         )
 
 

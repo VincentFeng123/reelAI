@@ -55,9 +55,48 @@ def _discover_result(video_id: str = VIDEO_ID) -> dict:
     }
 
 
+def _quality_v2_engine_out(engine_out: dict) -> dict:
+    transcript = engine_out["transcript"]
+    transcript.update(
+        source="supadata",
+        artifact_key=f"supadata:{engine_out['video_id']}",
+        native_mode=True,
+    )
+    for index, segment in enumerate(transcript["segments"]):
+        segment["cue_id"] = f"cue-{index}"
+    for index, clip in enumerate(engine_out["clips"]):
+        selected = [
+            segment
+            for segment in transcript["segments"]
+            if float(segment["start"]) >= float(clip["start"]) - 1e-6
+            and float(segment["end"]) <= float(clip["end"]) + 1e-6
+        ]
+        words = " ".join(str(segment["text"]) for segment in selected).split()
+        clip.update(
+            cue_ids=[str(segment["cue_id"]) for segment in selected],
+            kind="educational",
+            learning_objective=f"Explain {clip['title']}.",
+            facet=clip.get("facet") or f"facet-{index}",
+            reason=clip.get("reason") or "Provides a complete grounded explanation.",
+            informativeness=0.9,
+            topic_relevance=0.9,
+            educational_importance=0.9,
+            self_contained=True,
+            is_standalone=True,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            topic_evidence_quote=" ".join(words[:40]),
+            boundary_confidence=0.9,
+            prerequisite_ids=[],
+            selection_candidate_id=f"candidate-{index}",
+        )
+    return engine_out
+
+
 def _two_clip_engine_out(video_id: str = VIDEO_ID) -> dict:
     """Two relevance-surviving clips from one video's transcript."""
-    return {
+    return _quality_v2_engine_out({
         "video_id": video_id,
         "clips": [
             {
@@ -98,7 +137,7 @@ def _two_clip_engine_out(video_id: str = VIDEO_ID) -> dict:
             "duration": 300.0,
         },
         "notes": "",
-    }
+    })
 
 
 class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
@@ -120,6 +159,30 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/test"
+            ),
+        )
+        self._prepare_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "prepare_audio_source",
+            return_value=prepared,
+        )
+        self._verify_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "verify_acoustic_boundaries",
+            side_effect=lambda _url, start, end, **_kwargs: (
+                pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                    "verified", start, end, {"threshold_dbfs": -38.0}
+                )
+            ),
+        )
+        self._prepare_patch.start()
+        self._verify_patch.start()
+        self.addCleanup(self._prepare_patch.stop)
+        self.addCleanup(self._verify_patch.stop)
 
         self._seed_material_and_concept()
 
@@ -211,8 +274,8 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
     # ------------------------------------------------------------------ #
     # T5-2: feedback shifts score
     # ------------------------------------------------------------------ #
-    def test_feedback_shifts_score_up_and_down(self) -> None:
-        """helpful feedback raises score; confusing feedback lowers it."""
+    def test_feedback_does_not_override_v2_quality_ranking(self) -> None:
+        """v2 ranks by selector quality even after feedback is recorded."""
         self._patched_engine(_two_clip_engine_out())
 
         with db_module.get_conn() as conn:
@@ -267,18 +330,21 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertIn(reel_a["reel_id"], after_by_id, "reel_a should still be in feed after feedback")
         self.assertIn(reel_b["reel_id"], after_by_id, "reel_b should still be in feed after feedback")
 
-        self.assertGreater(
-            after_by_id[reel_a["reel_id"]],
-            score_a_before,
-            "helpful+saved+rating=5 feedback must raise reel_a's score",
+        self.assertEqual(
+            [item["reel_id"] for item in feed_after],
+            [item["reel_id"] for item in feed_before],
         )
-        self.assertLess(
-            after_by_id[reel_b["reel_id"]],
-            score_b_before,
-            "confusing+rating=1 feedback must lower reel_b's score",
+        self.assertAlmostEqual(
+            after_by_id[reel_a["reel_id"]] - score_a_before,
+            after_by_id[reel_b["reel_id"]] - score_b_before,
         )
+        with db_module.get_conn() as conn:
+            feedback_count = db_module.fetch_one(
+                conn, "SELECT COUNT(*) AS count FROM reel_feedback"
+            )
+        self.assertEqual(int(feedback_count["count"]), 2)
 
-    def test_feedback_ranking_is_private_to_each_learner(self) -> None:
+    def test_v2_quality_ranking_is_not_mutated_by_private_feedback(self) -> None:
         self._patched_engine(_two_clip_engine_out())
         with db_module.get_conn() as conn:
             main_module.reel_service.generate_reels(
@@ -328,7 +394,7 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
 
         after_a_scores = {item["reel_id"]: item["score"] for item in after_a}
         after_b_scores = {item["reel_id"]: item["score"] for item in after_b}
-        self.assertLess(after_a_scores[target_reel_id], baseline_b_scores[target_reel_id])
+        self.assertEqual(after_a_scores, baseline_b_scores)
         self.assertEqual(after_b_scores, baseline_b_scores)
 
     # ------------------------------------------------------------------ #
@@ -459,11 +525,11 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_14(self) -> None:
+    def test_ranked_feed_cache_version_is_15(self) -> None:
         """Cache rows must include adaptation, semantic, and strict acoustic gates."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            14,
+            15,
             "Current feeds must not reuse stale pre-acoustic-gate rows.",
         )
 

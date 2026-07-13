@@ -357,7 +357,7 @@ def test_malformed_nonmonotonic_transcript_is_not_cached(monkeypatch) -> None:
     assert cache.transcript_rows == {}
 
 
-def test_network_retry_ceiling_is_two_retries(monkeypatch) -> None:
+def test_slow_network_retry_ceiling_is_two_retries(monkeypatch) -> None:
     calls = 0
 
     def responder(*args):
@@ -366,7 +366,7 @@ def test_network_retry_ceiling_is_two_retries(monkeypatch) -> None:
         raise supadata_client.httpx.ConnectError("offline")
 
     _install_client(monkeypatch, responder)
-    context = GenerationContext("fast", cache_store=MemoryProviderCache())
+    context = GenerationContext("slow", cache_store=MemoryProviderCache())
     with pytest.raises(ProviderTransientError):
         supadata_client.fetch_transcript_artifact(VIDEO_URL, context=context)
     assert calls == 3

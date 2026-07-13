@@ -36,17 +36,19 @@ def _clip() -> dict:
         "start": 1.0,
         "end": 4.0,
         "title": "First lesson",
+        "learning_objective": "Explain how forces change motion",
         "facet": "concept",
         "reason": "Explains the first lesson",
         "kind": "educational",
         "informativeness": 0.9,
         "topic_relevance": 0.8,
-        "educational_importance": 0.7,
+        "educational_importance": 0.8,
         "directly_teaches_topic": True,
         "substantive": True,
         "factually_grounded": True,
         "topic_evidence_quote": "The first lesson explains how forces change",
         "self_contained": True,
+        "is_standalone": True,
         "difficulty": 0.4,
         "summary": "",
         "takeaways": [],
@@ -68,7 +70,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:v3:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v2:v4:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -82,7 +84,7 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
     assert _key(changed_duration) != baseline
     assert _key(transcript, topic="Physics") != baseline
     assert _key(transcript, {"segment_accept_partial_flash": False}) == baseline
-    assert _key(transcript, {"max_clips": 0}) != _key(transcript, {})
+    assert _key(transcript, {"max_clips": 0}) == _key(transcript, {})
     duration_policy = {
         "_segment_target_sec": 38,
         "_segment_target_min_sec": 20,
@@ -94,12 +96,12 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         ("_segment_target_min_sec", 21),
         ("_segment_target_max_sec", 56),
     ):
-        assert _key(transcript, {**duration_policy, field: value}) != duration_key
-    assert _key(transcript, {"segment_enrich_clips": True}) != _key(
+        assert _key(transcript, {**duration_policy, field: value}) == duration_key
+    assert _key(transcript, {"segment_enrich_clips": True}) == _key(
         transcript,
         {"segment_enrich_clips": False},
     )
-    assert _key(transcript, {"_segment_routing_mode": "flash_only"}) != baseline
+    assert _key(transcript, {"_segment_routing_mode": "flash_only"}) == baseline
 
     monkeypatch.setattr(segment_cache.pipeline_config, "SEGMENT_FLASH_MODEL", "new-model")
     assert _key(transcript) != baseline
@@ -112,16 +114,18 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
         [_clip()], transcript=transcript, settings=settings
     ) == [_clip()]
 
-    low_scored = _clip()
-    low_scored.update({
-        "informativeness": 0.0,
-        "topic_relevance": 0.0,
-        "educational_importance": 0.0,
-        "difficulty": 0.0,
-    })
-    assert segment_cache._valid_clips(
-        [low_scored], transcript=transcript, settings=settings
-    ) == [low_scored]
+    for field in ("informativeness", "topic_relevance", "educational_importance"):
+        below_floor = _clip()
+        below_floor[field] = 0.74
+        assert segment_cache._valid_clips(
+            [below_floor], transcript=transcript, settings=settings
+        ) is None
+
+        at_floor = _clip()
+        at_floor[field] = 0.75
+        assert segment_cache._valid_clips(
+            [at_floor], transcript=transcript, settings=settings
+        ) == [at_floor]
 
     medium_uncertainty = _clip()
     medium_uncertainty.update({
@@ -192,6 +196,23 @@ def test_segment_cache_treats_requested_max_as_preference() -> None:
     ) == [clip]
 
 
+def test_segment_cache_accepts_complete_clips_longer_than_180_seconds() -> None:
+    transcript = _transcript()
+    transcript["segments"] = [{
+        "cue_id": "long-cue",
+        "start": 0.0,
+        "end": 240.0,
+        "text": "The first lesson explains how forces change an object's motion.",
+    }]
+    transcript["duration"] = 240.0
+    clip = _clip()
+    clip.update({"start": 0.0, "end": 240.0})
+
+    assert segment_cache._valid_clips(
+        [clip], transcript=transcript, settings={}
+    ) == [clip]
+
+
 def test_segment_cache_disables_shadow_and_unversioned_releases(monkeypatch) -> None:
     monkeypatch.setattr(segment_cache.pipeline_config, "SEGMENT_ROUTING_MODE", "shadow")
     assert segment_cache.cache_enabled() is False
@@ -227,17 +248,11 @@ def test_segment_cache_sqlite_round_trip_expiry_and_tombstone(monkeypatch) -> No
     transcript = _transcript()
     settings = {"segment_accept_partial_flash": True}
     cache_key = _key(transcript, settings)
-    low_scored = _clip()
-    low_scored.update({
-        "informativeness": 0.0,
-        "topic_relevance": 0.0,
-        "educational_importance": 0.0,
-        "difficulty": 0.0,
-    })
+    cached_clip = _clip()
 
     segment_cache.store_segment_result(
         cache_key,
-        [low_scored],
+        [cached_clip],
         "cached",
         video_id=VIDEO_ID,
         transcript=transcript,
@@ -248,7 +263,7 @@ def test_segment_cache_sqlite_round_trip_expiry_and_tombstone(monkeypatch) -> No
         video_id=VIDEO_ID,
         transcript=transcript,
         settings=settings,
-    ) == ([low_scored], "cached")
+    ) == ([cached_clip], "cached")
 
     expired = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
     connection.execute(
@@ -280,4 +295,49 @@ def test_segment_cache_sqlite_round_trip_expiry_and_tombstone(monkeypatch) -> No
         transcript=transcript,
         settings=settings,
     ) is None
+    connection.close()
+
+
+def test_segment_cache_round_trips_empty_qualifying_result(monkeypatch) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        "CREATE TABLE llm_cache (cache_key TEXT PRIMARY KEY, response_json TEXT NOT NULL, created_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE blocked_video_tombstones (video_id TEXT PRIMARY KEY)"
+    )
+
+    @contextmanager
+    def fake_get_conn(*, transactional: bool = False):
+        try:
+            yield connection
+        except Exception:
+            if transactional:
+                connection.rollback()
+            raise
+        else:
+            if transactional:
+                connection.commit()
+
+    monkeypatch.setattr(segment_cache, "get_conn", fake_get_conn)
+    transcript = _transcript()
+    settings = {"segment_accept_partial_flash": True}
+    cache_key = _key(transcript, settings)
+
+    segment_cache.store_segment_result(
+        cache_key,
+        [],
+        "No qualifying clips.",
+        video_id=VIDEO_ID,
+        transcript=transcript,
+        settings=settings,
+    )
+
+    assert segment_cache.load_segment_result(
+        cache_key,
+        video_id=VIDEO_ID,
+        transcript=transcript,
+        settings=settings,
+    ) == ([], "No qualifying clips.")
     connection.close()

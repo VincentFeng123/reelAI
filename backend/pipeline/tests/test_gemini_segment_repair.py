@@ -340,7 +340,7 @@ def test_production_gene_clip_includes_the_first_selection_criterion() -> None:
     assert (start, end, error) == (0, 2, None)
 
 
-def test_production_dialogue_reply_is_rejected_when_context_exceeds_repair_window() -> None:
+def test_production_dialogue_reply_recovers_context_beyond_old_window() -> None:
     segments = [
         {
             "start": 0.080,
@@ -365,10 +365,10 @@ def test_production_dialogue_reply_is_rejected_when_context_exceeds_repair_windo
         ignore_caption_case=True,
     )
 
-    assert (start, end, error) == (1, 1, "unresolved_weak_start")
+    assert (start, end, error) == (0, 1, None)
 
 
-def test_production_anaphoric_question_is_rejected_without_its_antecedent() -> None:
+def test_production_anaphoric_question_recovers_its_distant_antecedent() -> None:
     segments = [
         {
             "start": 137.0,
@@ -392,7 +392,7 @@ def test_production_anaphoric_question_is_rejected_without_its_antecedent() -> N
         ignore_caption_case=True,
     )
 
-    assert (start, end, error) == (1, 1, "unresolved_weak_start")
+    assert (start, end, error) == (0, 1, None)
 
 
 def test_plan_rejects_live_biology_cue_despite_later_framing_sentence() -> None:
@@ -728,28 +728,12 @@ def test_complete_cannot_explanation_is_not_mistaken_for_a_forward_setup() -> No
     assert (start, end, error) == (0, 0, None)
 
 
-def test_dirty_edges_use_one_localized_low_thinking_flash_batch(monkeypatch):
+def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
     transcript = _transcript()
     selector = G._BoundaryPlan(topics=[
         _topic(3, 4, title="equation"),
         _topic(9, 10, title="equilibrium"),
         _topic(13, 13, title="stoichiometry"),
-    ])
-    repair = G._BoundaryRepairPlan(items=[
-        G._BoundaryRepairItem(
-            candidate_id="candidate-3-4-equation",
-            start_line=0,
-            end_line=4,
-            start_quote="complete setup introduces",
-            end_quote="x equals two",
-        ),
-        G._BoundaryRepairItem(
-            candidate_id="candidate-9-10-equilibrium",
-            start_line=6,
-            end_line=10,
-            start_quote="complete setup introduces equilibrium",
-            end_quote="result is balanced",
-        ),
     ])
     calls = []
     events = []
@@ -757,10 +741,8 @@ def test_dirty_edges_use_one_localized_low_thinking_flash_batch(monkeypatch):
 
     def fake_call(system, user, schema, **kwargs):
         calls.append((system, user, schema, kwargs))
-        if schema is G._BoundaryPlan:
-            return selector, {"operation": kwargs["operation"]}
-        assert schema is G._BoundaryRepairPlan
-        return repair, {"operation": kwargs["operation"]}
+        assert schema is G._BoundaryPlan
+        return selector, {"operation": kwargs["operation"]}
 
     monkeypatch.setattr(G, "_call_model", fake_call)
     result = G.run_segment_profile(
@@ -774,20 +756,18 @@ def test_dirty_edges_use_one_localized_low_thinking_flash_batch(monkeypatch):
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert len(calls) == 2
-    _system, repair_user, schema, kwargs = calls[1]
-    assert schema is G._BoundaryRepairPlan
+    assert len(calls) == 1
+    _system, selector_user, schema, kwargs = calls[0]
+    assert schema is G._BoundaryPlan
     assert kwargs["model"] == G.config.SEGMENT_FLASH_MODEL
     assert kwargs["thinking_level"] == "low"
-    assert kwargs["max_output_tokens"] == 1_024
-    assert kwargs["operation"] == "flash_boundary_repair"
-    assert kwargs["prompt_version"] == G._BOUNDARY_REPAIR_PROMPT_VERSION
+    assert kwargs["max_output_tokens"] == 8_192
+    assert kwargs["operation"] == "flash_boundary_selector"
+    assert kwargs["prompt_version"] == G.FLASH_SPLIT_PROFILE
     assert kwargs["budget_reserve"] is reserve
     assert (
-        "candidate-3-4-equation" in repair_user
-        and "candidate-9-10-equilibrium" in repair_user
+        "GLOBAL DISTANT SENTINEL" in selector_user
     )
-    assert "GLOBAL DISTANT SENTINEL" not in repair_user
 
     assert result.classification == "green"
     assert result.accepted_count == 3
@@ -799,13 +779,11 @@ def test_dirty_edges_use_one_localized_low_thinking_flash_batch(monkeypatch):
     )["boundary_confidence"] == 1.0
     assert next(
         clip for clip in result.clips if clip["title"] == "equation"
-    )["boundary_confidence"] == 0.85
-    assert [event["event"] for event in events] == ["boundary_repair"]
-    assert events[0]["attempted_count"] == 2
-    assert events[0]["accepted_count"] == 2
+    )["boundary_confidence"] == 1.0
+    assert events == []
 
 
-def test_repair_failure_preserves_independently_valid_original(monkeypatch):
+def test_no_boundary_repair_is_attempted_after_selector_validation(monkeypatch):
     transcript = _transcript()
     selector = G._BoundaryPlan(topics=[
         _topic(3, 4, title="equation"),
@@ -829,40 +807,24 @@ def test_repair_failure_preserves_independently_valid_original(monkeypatch):
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert calls == 2
+    assert calls == 1
     assert result.classification == "green"
-    assert result.accepted_count == 1
-    assert [clip["title"] for clip in result.clips] == ["stoichiometry"]
+    assert result.accepted_count == 2
+    assert [clip["title"] for clip in result.clips] == [
+        "equation", "stoichiometry",
+    ]
 
 
-def test_repaired_candidates_are_validated_independently(monkeypatch):
+def test_candidates_are_validated_independently_without_model_repair(monkeypatch):
     transcript = _transcript()
     selector = G._BoundaryPlan(topics=[
         _topic(3, 4, title="equation"),
         _topic(9, 10, title="equilibrium"),
         _topic(13, 13, title="stoichiometry"),
     ])
-    repair = G._BoundaryRepairPlan(items=[
-        G._BoundaryRepairItem(
-            candidate_id="candidate-3-4-equation",
-            start_line=0,
-            end_line=4,
-            start_quote="complete setup introduces",
-            end_quote="x equals two",
-        ),
-        G._BoundaryRepairItem(
-            candidate_id="candidate-9-10-equilibrium",
-            start_line=6,
-            end_line=10,
-            start_quote="quote not present in selected cue",
-            end_quote="result is balanced",
-        ),
-    ])
-
     def fake_call(system, user, schema, **kwargs):
-        if schema is G._BoundaryPlan:
-            return selector, {"operation": kwargs["operation"]}
-        return repair, {"operation": kwargs["operation"]}
+        assert schema is G._BoundaryPlan
+        return selector, {"operation": kwargs["operation"]}
 
     monkeypatch.setattr(G, "_call_model", fake_call)
     result = G.run_segment_profile(

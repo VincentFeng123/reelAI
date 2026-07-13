@@ -344,7 +344,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 require_verified_boundaries=require_verified_boundaries,
             )
 
-    def test_ranked_feed_uses_level_neutral_content_and_current_level(self) -> None:
+    def test_ranked_feed_v2_order_is_quality_only_and_level_neutral(self) -> None:
         self._insert_versioned_reel(
             reel_id="easy", video_id="video-a", start=10,
             difficulty=0.15, base_score=0.01,
@@ -356,14 +356,14 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
         beginner = self._ranked()
         self.assertEqual([item["reel_id"] for item in beginner], ["easy", "hard"])
-        self.assertAlmostEqual(beginner[0]["score"], 0.83)
+        self.assertAlmostEqual(beginner[0]["score"], 0.80)
 
         self.service.set_learner_level(
             self.conn, self.MATERIAL, self.LEARNER, "advanced",
         )
         advanced = self._ranked()
-        self.assertEqual([item["reel_id"] for item in advanced], ["hard", "easy"])
-        self.assertAlmostEqual(advanced[0]["score"], 0.83)
+        self.assertEqual([item["reel_id"] for item in advanced], ["easy", "hard"])
+        self.assertAlmostEqual(advanced[0]["score"], 0.80)
 
     def test_ranked_feed_excludes_unversioned_acoustic_unavailable_row(self) -> None:
         self.conn.execute(

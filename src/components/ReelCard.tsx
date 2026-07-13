@@ -38,6 +38,7 @@ const PLAYER_REVEAL_DELAY_MS = 0;
 const RESUME_MASK_MS = 480;
 const AUTOPLAY_RETRY_DELAY_MS = 320;
 const AUTOPLAY_MAX_RETRIES = 5;
+const CLIP_END_POLL_INTERVAL_MS = 20;
 const PLAYBACK_SPEED_OPTIONS = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2] as const;
 
 function detectTouchLikeDevice(): boolean {
@@ -181,8 +182,8 @@ export function ReelCard({
   const clipStartRaw = Number(reel.t_start);
   const clipEndRaw = Number(reel.t_end);
   const clipStart = Number.isFinite(clipStartRaw) && clipStartRaw >= 0 ? clipStartRaw : 0;
-  const clipEnd = Number.isFinite(clipEndRaw) && clipEndRaw >= clipStart + 1 ? clipEndRaw : clipStart + 1;
-  const clipDuration = Math.max(1, clipEnd - clipStart);
+  const clipEnd = Number.isFinite(clipEndRaw) && clipEndRaw > clipStart ? clipEndRaw : clipStart;
+  const clipDuration = Math.max(0, clipEnd - clipStart);
   const progressPercent = clipDuration > 0 ? clamp((currentSec / clipDuration) * 100, 0, 100) : 0;
   const reelProgressStyle = { width: `${progressPercent}%` } as CSSProperties;
   const reelProgressDotStyle = { left: `${progressPercent}%` } as CSSProperties;
@@ -328,31 +329,37 @@ export function ReelCard({
       if (!player) {
         return;
       }
-      const now = clamp(player.getCurrentTime(), clipStart, clipEnd);
+      const playerTime = player.getCurrentTime();
+      if (!Number.isFinite(playerTime)) {
+        return;
+      }
+      const now = clamp(playerTime, clipStart, clipEnd);
       const fraction = clipDuration > 0 ? clamp((now - clipStart) / clipDuration, 0, 1) : 0;
       if (fraction >= 0.8 && !didReportCompletionThresholdRef.current) {
         didReportCompletionThresholdRef.current = true;
         onPlaybackProgress?.(fraction, false);
       }
-      if (now >= clipEnd) {
+      // The iframe's integer `end` parameter is only a safety net. Enforce the
+      // authoritative floating-point boundary ourselves, including at 2x.
+      if (playerTime >= clipEnd) {
         onPlaybackProgress?.(1, true);
-        if (autoplayEnabledRef.current && isActive && onRequestNextReel && !didHandleClipEndRef.current) {
+        if (!didHandleClipEndRef.current) {
           didHandleClipEndRef.current = true;
+          manualPauseRequestedRef.current = true;
+          player.pauseVideo();
           setIsPlaying(false);
           setIsResumeMaskVisible(false);
           setCurrentSec(clipDuration);
           stopProgressTimer();
-          onRequestNextReel();
-          return;
+          if (autoplayEnabledRef.current && isActive && onRequestNextReel) {
+            onRequestNextReel();
+          }
         }
-        player.seekTo(clipStart, true);
-        if (isActive) {
-          player.playVideo();
-        }
+        return;
       }
       const rel = clamp(now - clipStart, 0, clipDuration);
       setCurrentSec(rel);
-    }, 160);
+    }, CLIP_END_POLL_INTERVAL_MS);
   }, [clipDuration, clipEnd, clipStart, isActive, onPlaybackProgress, onRequestNextReel, stopProgressTimer]);
 
   useEffect(() => {
@@ -615,23 +622,19 @@ export function ReelCard({
               } else if (state === playerState.ENDED) {
                 clearAutoplayRetryTimer();
                 onPlaybackProgress?.(1, true);
-                if (autoplayEnabledRef.current && isActive && onRequestNextReel) {
+                if (!didHandleClipEndRef.current) {
                   didHandleClipEndRef.current = true;
+                  manualPauseRequestedRef.current = true;
+                  event.target.pauseVideo();
                   setIsPlaying(false);
                   setIsResumeMaskVisible(false);
-                  setCurrentSec(0);
+                  setCurrentSec(clipDuration);
                   stopProgressTimer();
-                  onRequestNextReel();
-                  return;
+                  if (autoplayEnabledRef.current && isActive && onRequestNextReel) {
+                    onRequestNextReel();
+                  }
                 }
-                manualPauseRequestedRef.current = false;
-                event.target.seekTo(clipStart, true);
-                event.target.playVideo();
-                setIsPlaying(true);
-                setIsSurfaceVisible(true);
-                setCurrentSec(0);
-                scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
-                startProgressTimer();
+                return;
               } else if ((state === playerState.UNSTARTED || state === playerState.CUED) && isActive) {
                 // Retry autoplay for devices that initially report cued/unstarted.
                 manualPauseRequestedRef.current = false;
@@ -746,6 +749,11 @@ export function ReelCard({
       syncProgress();
       return;
     }
+    if (clipDuration > 0 && currentSec >= clipDuration - 0.05) {
+      didHandleClipEndRef.current = false;
+      setCurrentSec(0);
+      player.seekTo(clipStart, true);
+    }
     manualPauseRequestedRef.current = false;
     showResumeMask(RESUME_MASK_MS);
     scheduleSurfaceReveal(PLAYER_REVEAL_DELAY_MS);
@@ -755,6 +763,9 @@ export function ReelCard({
     startProgressTimer();
   }, [
     clearAutoplayRetryTimer,
+    clipDuration,
+    clipStart,
+    currentSec,
     isPlaying,
     isReady,
     isYouTubeVideo,

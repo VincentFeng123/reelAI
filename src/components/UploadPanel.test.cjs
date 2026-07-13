@@ -57,4 +57,9 @@ test("topic submission starts at the hidden beginner level", () => {
   assert.ok(!source.includes('aria-label="How well do you know this topic?"'));
   assert.ok(!source.includes('role="radiogroup"'));
   assert.doesNotMatch(source, /setKnowledgeLevel/);
+  assert.doesNotMatch(
+    callbackText,
+    /targetClipDuration/,
+    "URL ingestion must not send deprecated clip-duration preferences",
+  );
 });

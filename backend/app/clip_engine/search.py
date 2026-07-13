@@ -672,6 +672,11 @@ def discover_practice_fast(
         if video.get("id") not in excluded
         and float(video.get("retrieval_score") or 0.0) >= 0.60
     )
+    required_sources = (
+        2
+        if context is not None and context.budget.mode == "fast"
+        else 3
+    )
 
     expansion: dict[str, object] = {
         "corrected": literal_query,
@@ -681,7 +686,7 @@ def discover_practice_fast(
     remaining_queries = max(0, query_count - len(initial_queries))
     expansion_queries: list[str] = []
     expansion_result = {"per_query": [], "credits_used": 0, "warning": None}
-    if good_candidates < 4 and remaining_queries > 0:
+    if good_candidates < required_sources and remaining_queries > 0:
         expansion = expand.expand_query_practice_fast(
             literal_query,
             min(8, remaining_queries + 2),

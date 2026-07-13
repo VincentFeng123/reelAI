@@ -52,7 +52,7 @@ def test_verified_edges_preserve_required_quiet_cushions(tmp_path: Path) -> None
     start_wav = tmp_path / "source-start.wav"
     end_wav = tmp_path / "source-end.wav"
     _write_wav(start_wav, [(2.7, 12000), (0.40, 0), (2.90, 12000)])
-    _write_wav(end_wav, [(2.7, 12000), (0.30, 0), (3.00, 12000)])
+    _write_wav(end_wav, [(2.7, 12000), (0.40, 0), (2.90, 12000)])
 
     def fake_decode(_source, *, window_start_sec, output_path, **_kwargs):
         source = start_wav if window_start_sec < 8 else end_wav
@@ -65,12 +65,233 @@ def test_verified_edges_preserve_required_quiet_cushions(tmp_path: Path) -> None
 
     assert result.verified
     assert result.start_sec == 10.0
-    assert result.end_sec == 20.2
+    assert result.end_sec == 20.3
     assert result.diagnostics["start_quiet"] == [9.7, 10.1]
-    assert result.diagnostics["end_quiet"] == [20.0, 20.3]
+    assert result.diagnostics["end_quiet"] == [20.0, 20.4]
     assert result.diagnostics["threshold_dbfs"] == -38.0
     assert result.diagnostics["start_cushion_ms"] == 100
     assert result.diagnostics["end_cushion_ms"] == 200
+
+
+def test_progressive_search_finds_silence_beyond_the_old_edge_window(
+    tmp_path: Path,
+) -> None:
+    decoded: list[tuple[str, float, float, int]] = []
+
+    def fake_decode(
+        source,
+        *,
+        window_start_sec,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        decoded.append(
+            (
+                output_path.name,
+                window_start_sec,
+                window_duration_sec,
+                id(source),
+            )
+        )
+        spans = [(window_duration_sec, 12000)]
+        if output_path.name == "start-1.wav":
+            spans = [(0.5, 12000), (0.3, 0), (window_duration_sec - 0.8, 12000)]
+        elif output_path.name == "end-1.wav":
+            spans = [(3.0, 12000), (0.3, 0), (window_duration_sec - 3.3, 12000)]
+        _write_wav(output_path, spans)
+
+    prepared = _prepared()
+    with mock.patch.object(silence, "_prepare_audio_source") as resolve, mock.patch.object(
+        silence, "_decode_window", side_effect=fake_decode
+    ):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            20.0,
+            40.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=60.0,
+            prepared=prepared,
+        )
+
+    assert result.verified
+    assert result.start_sec == 11.7
+    assert result.end_sec == 46.2
+    assert result.start_sec <= 20.0
+    assert result.end_sec >= 40.0
+    assert result.diagnostics["start_quiet"] == [11.5, 11.8]
+    assert result.diagnostics["end_quiet"] == [46.0, 46.3]
+    assert result.diagnostics["start_windows"] == [[17.0, 23.0], [11.0, 17.0]]
+    assert result.diagnostics["end_windows"] == [[37.0, 43.0], [43.0, 49.0]]
+    assert result.diagnostics["start_windows"][0][0] == result.diagnostics[
+        "start_windows"
+    ][1][1]
+    assert result.diagnostics["end_windows"][0][1] == result.diagnostics[
+        "end_windows"
+    ][1][0]
+    assert len({source_id for *_rest, source_id in decoded}) == 1
+    resolve.assert_not_called()
+
+
+def test_non_overlapping_windows_preserve_silence_transitions_at_chunk_edges(
+    tmp_path: Path,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        spans = [(window_duration_sec, 12000)]
+        if output_path.name == "start-1.wav":
+            spans = [(window_duration_sec - 0.3, 12000), (0.3, 0)]
+        elif output_path.name == "end-1.wav":
+            spans = [(0.3, 0), (window_duration_sec - 0.3, 12000)]
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            20.0,
+            40.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=60.0,
+            prepared=_prepared(),
+        )
+
+    assert result.verified
+    assert result.start_sec == 16.9
+    assert result.end_sec == 43.2
+    assert result.diagnostics["start_quiet"] == [16.7, 17.0]
+    assert result.diagnostics["end_quiet"] == [43.0, 43.3]
+
+
+def test_progressive_search_fails_closed_when_limits_contain_no_silence(
+    tmp_path: Path,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        _write_wav(output_path, [(window_duration_sec, 12000)])
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            20.0,
+            40.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=60.0,
+            prepared=_prepared(),
+        )
+
+    assert result.status == "unavailable"
+    assert (result.start_sec, result.end_sec) == (20.0, 40.0)
+    assert result.diagnostics["reason"] == "start_silence_not_found"
+    assert result.diagnostics["start_windows"] == [
+        [17.0, 23.0],
+        [11.0, 17.0],
+        [5.0, 11.0],
+        [0.0, 5.0],
+    ]
+
+
+def test_source_edges_are_accepted_only_when_the_audio_at_each_edge_is_quiet(
+    tmp_path: Path,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        if output_path.name == "start-0.wav":
+            spans = [(0.3, 0), (window_duration_sec - 0.3, 12000)]
+        else:
+            spans = [(window_duration_sec - 0.3, 12000), (0.3, 0)]
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            2.0,
+            8.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=10.0,
+            prepared=_prepared(),
+        )
+
+    assert result.verified
+    assert result.start_sec == 0.2
+    assert result.end_sec == 9.9
+    assert result.diagnostics["start_quiet"] == [0.0, 0.3]
+    assert result.diagnostics["end_quiet"] == [9.7, 10.0]
+
+
+def test_exact_source_end_is_accepted_when_audio_reaches_edge_in_quiet(
+    tmp_path: Path,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        if output_path.name == "start-0.wav":
+            spans = [(0.3, 0), (window_duration_sec - 0.3, 12000)]
+        else:
+            spans = [(window_duration_sec - 0.3, 12000), (0.3, 0)]
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            2.0,
+            10.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=10.0,
+            prepared=_prepared(),
+        )
+
+    assert result.verified
+    assert result.end_sec == 10.0
+    assert result.diagnostics["end_quiet"] == [9.7, 10.0]
+
+
+def test_source_end_with_continuous_sound_is_not_assumed_to_be_silence(
+    tmp_path: Path,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        if output_path.name == "start-0.wav":
+            spans = [(0.3, 0), (window_duration_sec - 0.3, 12000)]
+        else:
+            spans = [(window_duration_sec, 12000)]
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            2.0,
+            10.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=10.0,
+            prepared=_prepared(),
+        )
+
+    assert result.status == "unavailable"
+    assert result.diagnostics["reason"] == "end_silence_not_found"
 
 
 def test_final_cue_can_extend_into_measured_end_silence(tmp_path: Path) -> None:

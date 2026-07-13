@@ -1,9 +1,9 @@
 """Guarded Gemini educational clip segmentation.
 
-Production starts with a guarded Flash-first canary. Hybrid mode admits only
-deterministic ``green`` Gemini 3.5 Flash results and lets the generation-wide
-confidence gate decide whether an uncertain request may use the single Pro
-fallback. Shadow and Pro-only modes remain available as explicit overrides.
+Production uses one low-thinking Flash call over the whole timestamped transcript,
+then applies deterministic quality, context, grounding, filler, and deduplication
+guards. Legacy routing and enrichment helpers remain available only for isolated
+evaluation compatibility; the public production adapter never dispatches them.
 
 The public contract stays ``segment_clips(...) -> (clips, notes)``.  Model names,
 routing decisions, and call telemetry are logged internally and never added to a
@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -42,15 +43,26 @@ log = logging.getLogger("clipper.segment")
 
 _WORD_RE = re.compile(r"[a-z0-9']+", re.IGNORECASE)
 _STRUCTURAL_FILLER_RE = re.compile(
-    r"\b(?:welcome(?: back)? to|thanks? for watching|have a great day|"
+    r"\b(?:welcome(?: back)?(?: to)?|thanks? for watching|have a great day|"
     r"see you next time|like and subscribe|please subscribe|"
     r"subscribe to (?:this|the|my|our) channel|sponsored by|"
     r"today'?s sponsor|we (?:made|have) (?:a|an|another|whole) video "
     r"(?:about|explaining|on)|check out (?:our|the) video|"
+    r"my name is|in this (?:video|lesson|course) we(?:['’]ll| will)|"
+    r"before we (?:begin|get started)|let(?:['’]?s| us) move on|"
+    r"next we(?:['’]ll| will)|to (?:recap|summarize)|in summary|"
     r"we (?:are|'re) reaching (?:a|the) crossroad now|"
     r"we(?:['’]ve| have) already (?:done|covered|finished)\b.{0,80}"
-    r"we(?:['’]re| are) going to\b|"
+    r"|we(?:['’]re| are) going to\b|"
     r"cover (?:that|this) in (?:this|the) course)\b",
+    re.IGNORECASE,
+)
+_VISUAL_DEPENDENCY_RE = re.compile(
+    r"\b(?:as you can see|as shown (?:here|on (?:the )?screen)|"
+    r"on (?:the )?screen|this (?:diagram|figure|chart|graph|image|slide|drawing)|"
+    r"the (?:diagram|figure|chart|graph|image|slide) (?:shows|illustrates)|"
+    r"look (?:here|at this|at the)|over here|watch (?:this|what happens)|"
+    r"I(?:['’]m| am)? (?:drawing|writing)|I(?:['’]ll| will) (?:draw|write))\b",
     re.IGNORECASE,
 )
 _DANGLING_TAIL_PREFIX_RE = re.compile(
@@ -140,20 +152,12 @@ _SELECTION_OUTPUT_TOKENS = 24_576
 _BOUNDARY_OUTPUT_TOKENS = 8_192
 _BOUNDARY_REPAIR_OUTPUT_TOKENS = 1_024
 _ENRICH_OUTPUT_TOKENS = 2_048
-_MIN_CLIP_S = 1.0
-_MAX_CLIP_S = 180.0
-_UNCERTAIN_DURATION_S = 150.0
 _GREEN_SCORE = 0.75
 _MAX_CLIPS = 40
 _PRODUCTION_MAX_CANDIDATES = 8
 _DUPLICATE_OVERLAP = 0.8
-_CONTEXT_CUE_LIMIT = 8
-_CONTEXT_WINDOW_S = 30.0
 _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
-_LONG_RANGE_REPAIR_MIN_S = 20.0
-_LONG_RANGE_REPAIR_TARGET_S = 75.0
-_LONG_RANGE_REPAIR_MAX_S = 150.0
 _REPAIR_NEIGHBOR_CUES = 2
 _BOUNDARY_REPAIR_PROMPT_VERSION = "boundary_repair_v1"
 _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
@@ -255,7 +259,7 @@ class _Plan(_StrictModel):
 
 
 class _BoundaryPlan(_StrictModel):
-    topics: list[_BoundaryTopic] = Field(max_length=_MAX_CLIPS)
+    topics: list[_BoundaryTopic] = Field(max_length=_PRODUCTION_MAX_CANDIDATES)
 
 
 class _BoundaryRepairItem(_StrictModel):
@@ -337,14 +341,22 @@ class _ProductionPlan(BaseModel):
 # Prompt construction
 
 _POLICY_AND_EXAMPLES = """Policy:
-- Return only complete, substantive teaching units. Omit greetings, sponsors,
-  administration, promos, outros, tangents, and partial explanations.
-- Prefer fewer clips to forcing an incomplete idea.
-- Contextual overlap is allowed only when both clips remain independently complete.
+- First understand the whole transcript and the viewer's exact request. Return only
+  directly relevant, complete, substantive teaching units that make sense to a cold
+  viewer hearing the clip without seeing the original video.
+- Include every necessary setup or prerequisite through the explanation's natural
+  conclusion. For a worked example, include the question or setup, reasoning, and answer.
+- Omit greetings, credentials, sponsors, administration, promos, transitions, previews,
+  recaps, outros, jokes, tangents, repeated restatements, and partial explanations.
+- Omit teaching that depends on a diagram, screen, gesture, drawing, or other missing
+  visual context. Mark self_contained and is_standalone false for such material.
+- Prefer fewer clips to filler or an incomplete idea. Do not shorten a complete idea to
+  fit a target length; clip duration is never a selection criterion.
+- Keep distinct informational facets from the same source. Do not return two clips that
+  teach the same learning objective in different words.
+- Return a candidate only when informativeness, topic_relevance, and
+  educational_importance are each at least 0.75.
 - Copy exact transcript line IDs and exact opening/closing quotes.
-- A complete clip may be 1 to 180 seconds; prefer focused 20 to 90 second units.
-- Include the setup or question needed to understand the teaching and the conclusion,
-  answer, or worked result that completes it.
 - Do not provide chain-of-thought or hidden reasoning.
 
 Examples:
@@ -469,9 +481,6 @@ def _boundary_prompts(
     *,
     max_candidates: int = _PRODUCTION_MAX_CANDIDATES,
     learner_level: str = "",
-    target_sec: float | None = None,
-    target_min_sec: float | None = None,
-    target_max_sec: float | None = None,
 ) -> tuple[str, str]:
     system = (
         "You select self-contained educational clip boundaries from timestamped transcripts.\n\n"
@@ -479,29 +488,6 @@ def _boundary_prompts(
     )
     learner_rule = _learner_rule(learner_level)
     learner_line = f"{learner_rule}\n" if learner_rule else ""
-    if target_max_sec is None:
-        duration_rule = (
-            "the selected source span must be at most 150 seconds and should usually "
-            "be 20 to 90 seconds. The shorter limit leaves room for deterministic "
-            "context repair while keeping the final clip inside the hard 180-second "
-            "envelope."
-        )
-    else:
-        requested_max = max(_MIN_CLIP_S, min(_MAX_CLIP_S, float(target_max_sec)))
-        requested_min = max(
-            _MIN_CLIP_S,
-            min(requested_max, float(target_min_sec or _MIN_CLIP_S)),
-        )
-        requested_target = max(
-            requested_min,
-            min(requested_max, float(target_sec or requested_max)),
-        )
-        duration_rule = (
-            f"the requested {requested_min:g} to {requested_max:g} second range and "
-            f"{requested_target:g}-second target are a duration preference. A complete "
-            "focused unit may exceed that preference when its setup or conclusion requires "
-            "it, but it must stay within the 180-second safety ceiling."
-        )
     candidate_limit = max(
         1,
         min(_PRODUCTION_MAX_CANDIDATES, int(max_candidates)),
@@ -513,9 +499,9 @@ def _boundary_prompts(
         "Choose the strongest educational moments globally from anywhere in the transcript. "
         "Do not favor the beginning and do not return every chronological section. Rank the "
         "strongest, most educational, self-contained moments first; sequencing happens later. "
-        "For every moment, verify the displayed start/end timestamps before returning it: "
-        f"{duration_rule} If a section is longer, choose one smaller complete "
-        "sub-explanation or omit it; never return the whole long section. If a useful "
+        "For every moment, verify the displayed start/end timestamps before returning it. "
+        "Select the minimum complete span containing all necessary setup, reasoning, and the "
+        "natural conclusion, regardless of its duration. If a useful "
         "section contains a greeting, channel plug, sponsor, or outro, select a complete "
         "teaching unit before or after that interruption rather than including it. "
         f"Return as many distinct strong moments as the transcript supports, up to "
@@ -531,15 +517,17 @@ def _boundary_prompts(
         "for that fiction; real terminology inside fictional lore is not a valid lesson. "
         "Set factually_grounded=false for those invented claims and true only when the teaching "
         "claim is academically sound within the requested subject. "
+        "A candidate is self-contained only when its spoken content is understandable without "
+        "a diagram, screen, gesture, drawing, slide, or other unseen visual. Omit candidates "
+        "that rely on those visuals. "
         "Score educational_importance by centrality to what this learner most needs from the "
-        "requested topic. For broad beginner topics, field-wide foundations, core organizing "
+        "requested topic. Omit any candidate when informativeness, topic_relevance, or "
+        "educational_importance is below 0.75. For broad beginner topics, field-wide foundations, core organizing "
         "principles, and canonical mechanisms outrank niche case studies, jokes, novelty, or "
         "institutional prestige. For an exact niche topic, centrality to that exact requested "
-        "task remains authoritative. Use low scores to rank weaker valid teaching later, not "
-        "as a reason to omit a directly relevant substantive clip. "
-        "Use a unique candidate_id for every moment. A non-standalone moment must list the "
-        "candidate_id(s) that provide its required context; a standalone moment must list no "
-        "prerequisites. "
+        "task remains authoritative. "
+        "Use a unique candidate_id for every moment. Every returned moment must be standalone "
+        "and list no prerequisite candidate IDs; include required setup inside its own span. "
         f"Every item must contain {_selection_fields(enriched=False)}. Learning details and "
         "assessments are generated later, so do not include them."
     )
@@ -629,9 +617,8 @@ def _legacy_prompts(lines: str, n: int, topic: str = "") -> tuple[str, str]:
         "options, correct_index, explanation, and an exact evidence_quote from the clip. "
         "Rules: (1) a clip must START at the beginning of the idea and END at its end — "
         "never mid-thought; (2) contextual overlap is allowed when two complete ideas share "
-        "setup; (3) go in chronological order; (4) prefer complete clips of 20-90 seconds. "
-        "Split longer sections into complete subtopics. A complete clip may be up to 180 "
-        "seconds, but never force or truncate a longer section; (5) line indices range from 0 to "
+        "setup; (3) go in chronological order; (4) select the minimum complete span and never "
+        "truncate required context or a conclusion; (5) line indices range from 0 to "
         f"{n - 1} — never exceed {n - 1}."
     )
     user = (
@@ -1023,10 +1010,26 @@ def _close_cue_context(
     end_line: int,
     *,
     ignore_caption_case: bool,
-    cue_limit: int = _CONTEXT_CUE_LIMIT,
+    cue_limit: int | None = None,
 ) -> tuple[int, int, str | None]:
-    """Expand dirty edges by at most eight cues and thirty seconds per side."""
-    cue_limit = max(0, min(_CONTEXT_CUE_LIMIT, int(cue_limit)))
+    """Expand dirty edges until discourse closes or a real section edge is reached."""
+    expansion_limit = (
+        len(segments) if cue_limit is None else max(0, int(cue_limit))
+    )
+
+    def crosses_section_reset(left: int, right: int) -> bool:
+        return (
+            float(segments[right].get("start", 0.0))
+            - float(segments[left].get("end", 0.0))
+            >= _SECTION_RESET_GAP_S
+        )
+
+    if any(
+        crosses_section_reset(line, line + 1)
+        for line in range(start_line, end_line)
+    ):
+        return start_line, end_line, "crosses_section_reset"
+
     following_text = (
         str(segments[end_line + 1].get("text") or "")
         if end_line + 1 < len(segments)
@@ -1053,7 +1056,6 @@ def _close_cue_context(
             str(segments[end_line].get("text") or "").strip()
         )
     )
-    initial_start = start_line
     from .sentences import classify_terminator
 
     force_start_question_setup = bool(
@@ -1068,28 +1070,17 @@ def _close_cue_context(
     if _DANGLING_TAIL_PREFIX_RE.search(
         str(segments[start_line].get("text") or "").strip()
     ):
-        saw_section_pause = False
-        for candidate in range(start_line + 1, min(end_line, start_line + cue_limit) + 1):
-            previous_end = float(segments[candidate - 1].get("end", 0.0))
-            candidate_start = float(segments[candidate].get("start", previous_end))
-            saw_section_pause = saw_section_pause or (
-                candidate_start - previous_end >= _SECTION_RESET_GAP_S
-            )
-            elapsed = candidate_start - float(
-                segments[initial_start].get("start", 0.0)
-            )
-            if elapsed > _CONTEXT_WINDOW_S:
-                break
-            if saw_section_pause and not _cue_opens_mid_thought_at(
+        for candidate in range(start_line + 1, end_line + 1):
+            if crosses_section_reset(candidate - 1, candidate) and not _cue_opens_mid_thought_at(
                 segments,
                 candidate,
                 ignore_caption_case=ignore_caption_case,
             ):
                 start_line = candidate
                 break
-    original_start = start_line
     original_end = end_line
-    for _ in range(cue_limit):
+    start_expansions = 0
+    while start_expansions < expansion_limit:
         if force_start_question_setup and _cue_begins_standalone_question(
             str(segments[start_line].get("text") or "")
         ):
@@ -1104,13 +1095,10 @@ def _close_cue_context(
         candidate = start_line - 1
         if candidate < 0:
             break
-        movement = (
-            float(segments[original_start].get("start", 0.0))
-            - float(segments[candidate].get("start", 0.0))
-        )
-        if movement > _CONTEXT_WINDOW_S + 1e-9:
+        if crosses_section_reset(candidate, start_line):
             break
         start_line = candidate
+        start_expansions += 1
     if force_start_question_setup or _cue_opens_mid_thought_at(
         segments,
         start_line,
@@ -1121,21 +1109,18 @@ def _close_cue_context(
     consumed_end_cues = 0
     if forward_solution_needed and not suffix_was_trimmed:
         candidate = end_line + 1
-        if candidate >= len(segments) or cue_limit <= 0:
+        if candidate >= len(segments) or expansion_limit <= 0:
             return start_line, end_line, "unresolved_weak_end"
-        movement = (
-            float(segments[candidate].get("end", 0.0))
-            - float(segments[original_end].get("end", 0.0))
-        )
-        if movement > _CONTEXT_WINDOW_S + 1e-9:
+        if crosses_section_reset(end_line, candidate):
             return start_line, end_line, "unresolved_weak_end"
         end_line = candidate
         consumed_end_cues = 1
 
     end_cue_limit = (
-        0 if suffix_was_trimmed else max(0, cue_limit - consumed_end_cues)
+        0 if suffix_was_trimmed else max(0, expansion_limit - consumed_end_cues)
     )
-    for _ in range(end_cue_limit):
+    end_expansions = 0
+    while end_expansions < end_cue_limit:
         current_end_text = str(segments[end_line].get("text") or "")
         if force_end_clause_completion and classify_terminator(current_end_text):
             force_end_clause_completion = False
@@ -1153,13 +1138,10 @@ def _close_cue_context(
         candidate = end_line + 1
         if candidate >= len(segments):
             break
-        movement = (
-            float(segments[candidate].get("end", 0.0))
-            - float(segments[original_end].get("end", 0.0))
-        )
-        if movement > _CONTEXT_WINDOW_S + 1e-9:
+        if crosses_section_reset(end_line, candidate):
             break
         end_line = candidate
+        end_expansions += 1
     next_text = "" if suffix_was_trimmed else (
         str(segments[end_line + 1].get("text") or "")
         if end_line + 1 < len(segments)
@@ -1200,92 +1182,6 @@ def _padded_cue_bounds(
     return start, end
 
 
-def _repair_oversized_cue_range(
-    segments: list[dict],
-    start_line: int,
-    end_line: int,
-    *,
-    ignore_caption_case: bool,
-    anchor_text: str = "",
-    required_quote: str = "",
-    minimum_duration: float = _LONG_RANGE_REPAIR_MIN_S,
-    target_duration: float = _LONG_RANGE_REPAIR_TARGET_S,
-    maximum_duration: float = _LONG_RANGE_REPAIR_MAX_S,
-) -> tuple[int, int] | None:
-    """Choose a complete cue-level subunit without making another model call."""
-    anchor_tokens = _content_tokens(anchor_text)
-    candidates: list[tuple[float, float, float, float, float, int, int]] = []
-    for candidate_start in range(start_line, end_line + 1):
-        candidate_start_time = float(
-            segments[candidate_start].get("start", 0.0)
-        )
-        start_shift = candidate_start_time - float(
-            segments[start_line].get("start", 0.0)
-        )
-        if _cue_opens_mid_thought_at(
-            segments,
-            candidate_start,
-            ignore_caption_case=ignore_caption_case,
-        ):
-            continue
-        opening_segments = segments[
-            candidate_start:min(end_line + 1, candidate_start + 3)
-        ]
-        anchor_overlap = sum(
-            (3 - offset)
-            * len(
-                anchor_tokens
-                & _content_tokens(str(segment.get("text") or ""))
-            )
-            for offset, segment in enumerate(opening_segments)
-        )
-        for candidate_end in range(candidate_start, end_line + 1):
-            if _cue_range_contains_structural_filler(
-                segments, candidate_start, candidate_end
-            ):
-                break
-            start, end = _padded_cue_bounds(
-                segments, candidate_start, candidate_end
-            )
-            duration = end - start
-            if duration > maximum_duration:
-                break
-            if duration < minimum_duration:
-                continue
-            next_text = (
-                str(segments[candidate_end + 1].get("text") or "")
-                if candidate_end + 1 < len(segments)
-                else ""
-            )
-            if _cue_has_weak_end(
-                str(segments[candidate_end].get("text") or ""),
-                next_text,
-                ignore_caption_case=ignore_caption_case,
-            ):
-                continue
-            if required_quote and not _contains_quote(
-                _cue_clip_text(segments, candidate_start, candidate_end),
-                required_quote,
-            ):
-                continue
-            candidates.append((
-                0.0 if re.search(
-                    r"[.!?][\"')\]]*$",
-                    str(segments[candidate_end].get("text") or "").strip(),
-                ) else 1.0,
-                -float(anchor_overlap),
-                start_shift,
-                abs(duration - target_duration),
-                -duration,
-                candidate_start,
-                candidate_end,
-            ))
-    if not candidates:
-        return None
-    best = min(candidates)
-    return best[5], best[6]
-
-
 def _cue_clip_text(segments: list[dict], start_line: int, end_line: int) -> str:
     return " ".join(
         str(segment.get("text") or "").strip()
@@ -1294,30 +1190,49 @@ def _cue_clip_text(segments: list[dict], start_line: int, end_line: int) -> str:
     ).strip()
 
 
-def _cue_range_contains_structural_filler(
+def _trim_structural_filler_edges(
+    segments: list[dict], start_line: int, end_line: int,
+    *,
+    ignore_caption_case: bool,
+) -> tuple[int, int] | None:
+    """Trim contiguous edge filler; reject filler embedded inside teaching."""
+    from .sentences import classify_terminator
+
+    filler_lines = {
+        line
+        for line in range(start_line, end_line + 1)
+        if _STRUCTURAL_FILLER_RE.search(str(segments[line].get("text") or ""))
+    }
+    if not filler_lines:
+        return start_line, end_line
+
+    trimmed_start = start_line
+    while trimmed_start <= end_line and trimmed_start in filler_lines:
+        trimmed_start += 1
+    trimmed_end = end_line
+    while trimmed_end >= trimmed_start and trimmed_end in filler_lines:
+        trimmed_end -= 1
+    if trimmed_start > trimmed_end:
+        return None
+    if any(trimmed_start <= line <= trimmed_end for line in filler_lines):
+        return None
+    if _cue_opens_mid_thought_at(
+        segments, trimmed_start, ignore_caption_case=ignore_caption_case,
+    ):
+        return None
+    trailing_text = str(segments[trimmed_end].get("text") or "").strip()
+    if not classify_terminator(trailing_text):
+        return None
+    return trimmed_start, trimmed_end
+
+
+def _cue_range_requires_visual_context(
     segments: list[dict], start_line: int, end_line: int,
 ) -> bool:
     return any(
-        _STRUCTURAL_FILLER_RE.search(str(segment.get("text") or ""))
+        _VISUAL_DEPENDENCY_RE.search(str(segment.get("text") or ""))
         for segment in segments[start_line:end_line + 1]
     )
-
-
-def _trim_structural_filler_suffix(
-    segments: list[dict], start_line: int, end_line: int,
-) -> int | None:
-    """Keep a complete teaching prefix when only its trailing cues are filler."""
-    from .sentences import classify_terminator
-
-    for line in range(start_line, end_line + 1):
-        if not _STRUCTURAL_FILLER_RE.search(str(segments[line].get("text") or "")):
-            continue
-        previous_line = line - 1
-        if previous_line < start_line:
-            return None
-        previous_text = str(segments[previous_line].get("text") or "").strip()
-        return previous_line if classify_terminator(previous_text) else None
-    return end_line
 
 
 def _near_duplicate(a: dict, b: dict, threshold: float = _DUPLICATE_OVERLAP) -> bool:
@@ -1327,6 +1242,32 @@ def _near_duplicate(a: dict, b: dict, threshold: float = _DUPLICATE_OVERLAP) -> 
     shorter = min(float(a["end"]) - float(a["start"]),
                   float(b["end"]) - float(b["start"]))
     return shorter > 0 and overlap / shorter >= threshold
+
+
+def _semantic_restatement(
+    a: dict,
+    b: dict,
+    threshold: float = _DUPLICATE_OVERLAP,
+) -> bool:
+    """Match reworded copies by their normalized objective and facet."""
+    generic = {
+        "complete", "concept", "example", "explain", "idea", "learn",
+        "lesson", "point", "teach", "understand", "work",
+    }
+    a_tokens = _content_tokens(
+        f"{a.get('learning_objective', '')} {a.get('facet', '')}"
+    ) - generic
+    b_tokens = _content_tokens(
+        f"{b.get('learning_objective', '')} {b.get('facet', '')}"
+    ) - generic
+    smaller = min(len(a_tokens), len(b_tokens))
+    if smaller == 0:
+        return False
+    return len(a_tokens & b_tokens) / smaller >= threshold
+
+
+def _duplicates(a: dict, b: dict) -> bool:
+    return _near_duplicate(a, b) or _semantic_restatement(a, b)
 
 
 def _content_tokens(text: str) -> set[str]:
@@ -1534,45 +1475,30 @@ def _configured_clip_limit(settings: dict) -> int:
     return max(0, min(_MAX_CLIPS, limit))
 
 
-def _requested_duration_policy(settings: dict) -> tuple[float, float, float]:
-    """Return the requested advisory min, target, and preferred maximum."""
-    raw_max = settings.get("_segment_target_max_sec")
-    maximum = (
-        _MAX_CLIP_S
-        if raw_max is None
-        else max(_MIN_CLIP_S, min(_MAX_CLIP_S, float(raw_max)))
-    )
-    raw_min = settings.get("_segment_target_min_sec")
-    minimum = max(
-        _MIN_CLIP_S,
-        min(maximum, float(_LONG_RANGE_REPAIR_MIN_S if raw_min is None else raw_min)),
-    )
-    raw_target = settings.get("_segment_target_sec")
-    target = max(
-        minimum,
-        min(maximum, float(_LONG_RANGE_REPAIR_TARGET_S if raw_target is None else raw_target)),
-    )
-    return minimum, target, maximum
-
-
 def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
     """Dedupe and limit while candidates remain quality-ranked."""
     quality_order = sorted(
         clips,
         key=lambda clip: (
-            (
-                0.45 * float(clip["topic_relevance"])
-                + 0.35 * float(clip["educational_importance"])
-                + 0.20 * float(clip["informativeness"])
-            )
-            - (0.08 if clip.get("uncertainty") == "medium" else 0.0),
-            -(clip["end"] - clip["start"]),
+            -min(
+                float(clip["informativeness"]),
+                float(clip["topic_relevance"]),
+                float(clip["educational_importance"]),
+            ),
+            -(
+                float(clip["informativeness"])
+                + float(clip["topic_relevance"])
+                + float(clip["educational_importance"])
+            ) / 3.0,
+            -float(clip["topic_relevance"]),
+            float(clip["start"]),
+            float(clip["end"]),
+            str(clip.get("selection_candidate_id") or ""),
         ),
-        reverse=True,
     )
     kept: list[dict] = []
     for candidate in quality_order:
-        if not any(_near_duplicate(candidate, prior) for prior in kept):
+        if not any(_duplicates(candidate, prior) for prior in kept):
             kept.append(candidate)
     limit = _configured_clip_limit(settings)
     by_candidate_id = {
@@ -1686,7 +1612,7 @@ def _plan_to_report(
     *,
     topic: str = "",
     require_enrichment: bool = False,
-    context_cue_limit: int = _CONTEXT_CUE_LIMIT,
+    context_cue_limit: int | None = None,
 ) -> _Conversion:
     report = _Conversion(proposed_count=len(plan.topics))
     n = len(segments)
@@ -1695,9 +1621,6 @@ def _plan_to_report(
         return report
 
     ignore_caption_case = bool(settings.get("_segment_ignore_caption_case", True))
-    requested_min, requested_target, requested_max = _requested_duration_policy(
-        settings
-    )
     raw: list[dict] = []
     seen_candidate_ids: set[str] = set()
 
@@ -1751,6 +1674,18 @@ def _plan_to_report(
         if info is None or relevance is None or importance is None or difficulty is None:
             report.rejected_reasons.append(f"{prefix}:score_out_of_range")
             continue
+        score_gate = next((
+            field_name
+            for field_name, value in (
+                ("informativeness", info),
+                ("topic_relevance", relevance),
+                ("educational_importance", importance),
+            )
+            if value < _GREEN_SCORE
+        ), None)
+        if score_gate is not None:
+            report.rejected_reasons.append(f"{prefix}:{score_gate}_below_green")
+            continue
         if proposal.self_contained is not True:
             report.rejected_reasons.append(f"{prefix}:not_self_contained")
             continue
@@ -1782,8 +1717,8 @@ def _plan_to_report(
         is_standalone = bool(
             getattr(proposal, "is_standalone", proposal.self_contained)
         )
-        if (is_standalone and prerequisites) or (not is_standalone and not prerequisites):
-            report.rejected_reasons.append(f"{prefix}:inconsistent_prerequisites")
+        if not is_standalone or prerequisites:
+            report.rejected_reasons.append(f"{prefix}:not_standalone")
             continue
         uncertainty = str(getattr(proposal, "uncertainty", "low") or "low")
         uncertainty_reasons = [str(getattr(reason, "value", reason))
@@ -1801,79 +1736,24 @@ def _plan_to_report(
         )
         if closure_error:
             report.rejected_reasons.append(f"{prefix}:{closure_error}")
-            if isinstance(proposal, _BoundaryTopic):
-                report.repair_candidates.append(_BoundaryRepairCandidate(
-                    candidate_id=candidate_id,
-                    prefix=prefix,
-                    proposal=proposal,
-                    start_line=a,
-                    end_line=b,
-                    reason=closure_error,
-                ))
             continue
+
+        filler_trim = _trim_structural_filler_edges(
+            segments,
+            a,
+            b,
+            ignore_caption_case=ignore_caption_case,
+        )
+        if filler_trim is None:
+            report.rejected_reasons.append(f"{prefix}:contains_filler")
+            continue
+        a, b = filler_trim
         context_was_trimmed = b < selected_end_before_context
         start, end = _padded_cue_bounds(segments, a, b)
-        if end <= start:
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
             report.rejected_reasons.append(f"{prefix}:reversed_cue_boundary")
             continue
         start, end = round(start, 3), round(end, 3)
-        duration = round(end - start, 3)
-        range_before_size_repair = (a, b)
-        text_before_size_repair = _cue_clip_text(segments, a, b)
-        range_was_size_repaired = False
-        contains_structural_filler = _cue_range_contains_structural_filler(
-            segments, a, b
-        )
-        if duration > _MAX_CLIP_S or contains_structural_filler:
-            repaired_range = _repair_oversized_cue_range(
-                segments,
-                a,
-                b,
-                ignore_caption_case=ignore_caption_case,
-                anchor_text=" ".join(
-                    str(value or "")
-                    for value in (
-                        proposal.title,
-                        getattr(proposal, "learning_objective", ""),
-                        proposal.facet,
-                        proposal.reason,
-                        getattr(proposal, "topic_evidence_quote", ""),
-                        topic,
-                    )
-                ),
-                required_quote=str(
-                    getattr(proposal, "topic_evidence_quote", "") or ""
-                ),
-                minimum_duration=requested_min,
-                target_duration=requested_target,
-                maximum_duration=(
-                    requested_max
-                    if contains_structural_filler
-                    else min(_LONG_RANGE_REPAIR_MAX_S, _MAX_CLIP_S)
-                ),
-            )
-            if repaired_range is not None:
-                a, b = repaired_range
-                range_was_size_repaired = (a, b) != range_before_size_repair
-                start, end = _padded_cue_bounds(segments, a, b)
-                start, end = round(start, 3), round(end, 3)
-                duration = round(end - start, 3)
-        if duration < _MIN_CLIP_S or duration > _MAX_CLIP_S:
-            report.rejected_reasons.append(f"{prefix}:invalid_duration")
-            continue
-
-        if _cue_range_contains_structural_filler(segments, a, b):
-            trimmed_end = _trim_structural_filler_suffix(segments, a, b)
-            if trimmed_end is None:
-                report.rejected_reasons.append(f"{prefix}:contains_filler")
-                continue
-            b = trimmed_end
-            start, end = _padded_cue_bounds(segments, a, b)
-            start, end = round(start, 3), round(end, 3)
-            duration = round(end - start, 3)
-            if duration < _MIN_CLIP_S or duration > _MAX_CLIP_S:
-                report.rejected_reasons.append(f"{prefix}:invalid_duration")
-                continue
 
         clip_text = _cue_clip_text(segments, a, b)
         if not clip_text:
@@ -1890,6 +1770,9 @@ def _plan_to_report(
             continue
         if _contains_unrequested_vampire_pseudoscience(clip_text, topic):
             report.rejected_reasons.append(f"{prefix}:fictional_framing")
+            continue
+        if _cue_range_requires_visual_context(segments, a, b):
+            report.rejected_reasons.append(f"{prefix}:requires_visual_context")
             continue
         topic_evidence_quote = " ".join(
             str(getattr(proposal, "topic_evidence_quote", "") or "").split()
@@ -1917,11 +1800,8 @@ def _plan_to_report(
         clip_title = str(proposal.title or "").strip()
         clip_facet = str(proposal.facet or "").strip()
         clip_reason = str(proposal.reason or "").strip()
-        if range_was_size_repaired or context_was_trimmed:
-            repair_source_text = " ".join(dict.fromkeys(filter(None, (
-                context_repair_source_text if context_was_trimmed else "",
-                text_before_size_repair if range_was_size_repaired else "",
-            ))))
+        if context_was_trimmed:
+            repair_source_text = context_repair_source_text
             require_grounding = context_was_trimmed
             learning_objective = _objective_after_range_repair(
                 learning_objective,
@@ -2043,15 +1923,15 @@ def _plan_to_report(
         clip.get("uncertainty") == "medium" for clip in raw
     )
     report.score_below_green = any(
-        min(float(clip["informativeness"]), float(clip["topic_relevance"])) < _GREEN_SCORE
-        for clip in raw
-    )
-    report.long_clip = any(
-        float(clip["end"]) - float(clip["start"]) >= _UNCERTAIN_DURATION_S
+        min(
+            float(clip["informativeness"]),
+            float(clip["topic_relevance"]),
+            float(clip["educational_importance"]),
+        ) < _GREEN_SCORE
         for clip in raw
     )
     for i, candidate in enumerate(raw):
-        if any(_near_duplicate(candidate, other) for other in raw[i + 1:]):
+        if any(_duplicates(candidate, other) for other in raw[i + 1:]):
             report.near_duplicate = True
             break
 
@@ -2089,6 +1969,8 @@ def _classify_flash(report: _Conversion, segments: list[dict], topic: str,
                     *, enrichment_required: bool) -> _Classification:
     del segments, topic, enrichment_required
     if report.accepted_count:
+        if report.score_below_green:
+            return _Classification("invalid", ("quality_score_below_green",))
         return _Classification("green", ())
     reasons = list(report.rejected_reasons) or ["zero_valid_candidates"]
     return _Classification("invalid", tuple(dict.fromkeys(reasons)))
@@ -2387,11 +2269,6 @@ def _run_selection_profile(
         or settings.get("learner_level")
         or ""
     )
-    requested_min, requested_target, requested_max = _requested_duration_policy(
-        settings
-    )
-    has_requested_duration = settings.get("_segment_target_max_sec") is not None
-
     if profile == PRODUCTION_PRO_PROFILE:
         system, user = _legacy_prompts(rendered, len(segments), topic)
         schema: type[BaseModel] = _LegacyPlan
@@ -2419,32 +2296,20 @@ def _run_selection_profile(
             rendered,
             len(segments),
             topic,
-            max_candidates=min(
-                _PRODUCTION_MAX_CANDIDATES,
-                max(1, int(settings.get("max_clips") or _PRODUCTION_MAX_CANDIDATES)),
-            ),
+            max_candidates=_PRODUCTION_MAX_CANDIDATES,
             learner_level=learner_level,
-            target_sec=requested_target if has_requested_duration else None,
-            target_min_sec=requested_min if has_requested_duration else None,
-            target_max_sec=requested_max if has_requested_duration else None,
         )
         schema = _BoundaryPlan
         model = config.SEGMENT_FLASH_MODEL
-        level, cap, timeout = "medium", _BOUNDARY_OUTPUT_TOKENS, _FLASH_BOUNDARY_TIMEOUT_S
+        level, cap, timeout = "low", _BOUNDARY_OUTPUT_TOKENS, _FLASH_BOUNDARY_TIMEOUT_S
         operation = "flash_boundary_selector"
     elif profile == PRO_BOUNDARY_PROFILE:
         system, user = _boundary_prompts(
             rendered,
             len(segments),
             topic,
-            max_candidates=min(
-                _PRODUCTION_MAX_CANDIDATES,
-                max(1, int(settings.get("max_clips") or _PRODUCTION_MAX_CANDIDATES)),
-            ),
+            max_candidates=_PRODUCTION_MAX_CANDIDATES,
             learner_level=learner_level,
-            target_sec=requested_target if has_requested_duration else None,
-            target_min_sec=requested_min if has_requested_duration else None,
-            target_max_sec=requested_max if has_requested_duration else None,
         )
         schema = _BoundaryPlan
         model = config.SEGMENT_PRO_MODEL
@@ -2457,7 +2322,7 @@ def _run_selection_profile(
         requested_level = str(
             settings.get("_segment_thinking_level") or level
         ).strip().lower()
-        if requested_level in {"minimal", "low", "medium", "high"}:
+        if requested_level in {"minimal", "low"}:
             level = requested_level
     operation = str(settings.get("_segment_operation") or operation)
     parsed, call = _call_model(
@@ -2481,11 +2346,9 @@ def _run_selection_profile(
         str(transcript.get("source") or "").casefold() == "supadata",
     )
     if profile in {PRODUCTION_FLASH_PROFILE, PRO_BOUNDARY_PROFILE}:
-        configured_limit = conversion_settings.get("max_clips")
-        conversion_settings["max_clips"] = min(
-            _PRODUCTION_MAX_CANDIDATES,
-            int(config.SEGMENT_MAX_CLIPS if configured_limit is None else configured_limit),
-        )
+        # Cache the complete selector result. Request ceilings are applied only
+        # after cache lookup by the ingestion layer.
+        conversion_settings["max_clips"] = _PRODUCTION_MAX_CANDIDATES
     report = _plan_to_report(
         parsed,
         segments,
@@ -2495,16 +2358,6 @@ def _run_selection_profile(
         require_enrichment=require_enrichment,
     )
     calls = [call]
-    if profile == FLASH_SPLIT_PROFILE and report.repair_candidates:
-        calls.extend(_repair_failed_boundaries(
-            report,
-            segments,
-            words,
-            topic,
-            conversion_settings,
-            deadline=deadline,
-            cancelled=cancelled,
-        ))
     if profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}:
         _drop_unmet_prerequisite_clips(report)
     if profile.startswith("flash_"):
@@ -2691,17 +2544,6 @@ def run_segment_profile(
         )
         fallback_reasons: list[str] = []
         flash_configuration_error: str | None = None
-        if (profile == FLASH_SPLIT_PROFILE and classification.status == "green"
-                and report.clips and bool(settings.get("segment_enrich_clips"))):
-            (report.clips, enrichment_calls, fallback_reasons,
-             flash_configuration_error) = _enrich_split(
-                 report.clips,
-                 topic,
-                 settings,
-                 deadline=deadline,
-                 cancelled=cancelled,
-             )
-            calls.extend(enrichment_calls)
         clips = _public_clips(report.clips)
         notes = f"{len(clips)} topic clip(s) from {len(segments)} transcript segments."
         return SegmentResult(
@@ -2850,7 +2692,9 @@ def segment_clips_detailed(
         return SegmentResult([], "No transcript segments to segment.", "none", "invalid",
                              ["missing_segments"])
 
-    configured_mode = str(routing_mode or config.SEGMENT_ROUTING_MODE).lower()
+    # Production defaults to the single Flash selector. Explicit alternate modes
+    # remain available only to legacy evaluation callers.
+    configured_mode = str(routing_mode or "flash_only").lower()
     flash_only = configured_mode == "flash_only"
     mode = configured_mode
     if mode not in {"pro_only", "shadow", "hybrid", "flash_only"}:
@@ -3070,10 +2914,6 @@ def segment_clips(
         topic=topic,
         video_id=video_id,
         progress=progress,
-        routing_mode=(
-            str(settings.get("_segment_routing_mode") or "").strip() or None
-            if isinstance(settings, dict)
-            else None
-        ),
+        routing_mode="flash_only",
     )
     return result.clips, result.notes
