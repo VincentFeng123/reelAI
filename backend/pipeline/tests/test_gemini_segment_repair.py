@@ -211,6 +211,33 @@ def test_production_anaphoric_question_is_rejected_without_its_antecedent() -> N
     assert (start, end, error) == (1, 1, "unresolved_weak_start")
 
 
+def test_production_end_extends_into_following_gerund_explanation() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 44.0,
+            "text": (
+                "The production possibilities frontier is the same thing. "
+                "It's a model"
+            ),
+        },
+        {
+            "start": 44.0,
+            "end": 50.0,
+            "text": "showing the tradeoffs between producing two different goods.",
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        0,
+        0,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 1, None)
+
+
 def test_dirty_edges_use_one_localized_low_thinking_flash_batch(monkeypatch):
     transcript = _transcript()
     selector = G._BoundaryPlan(topics=[

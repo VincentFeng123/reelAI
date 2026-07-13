@@ -21,6 +21,7 @@ def test_dialogue_reply_and_mid_list_ordinal_are_weak():
     assert opens_mid_thought("Yes, that's correct.")
     assert opens_mid_thought("Exactly, that's the point.")
     assert opens_mid_thought("Second, it needs to exhibit traits that affect survival.")
+    assert opens_mid_thought("All right. To solve this, first define comparative advantage.")
 
 
 def test_ordinal_and_reply_words_are_valid_when_they_are_subjects():
@@ -29,6 +30,7 @@ def test_ordinal_and_reply_words_are_valid_when_they_are_subjects():
     assert is_onset("Right triangles satisfy the Pythagorean theorem.")
     assert is_onset("Exactly one solution exists for this equation.")
     assert is_onset("Yes votes determine the result of the referendum.")
+    assert is_onset("All right triangles satisfy the Pythagorean theorem.")
 
 
 def test_back_to_prior_context_is_weak():

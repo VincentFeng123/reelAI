@@ -798,6 +798,12 @@ def _cue_has_weak_end(
         return False
     next_words = _toks(next_text)
     if (
+        next_words
+        and len(next_words[0]) > 5
+        and next_words[0].endswith("ing")
+    ):
+        return True
+    if (
         len(raw_words) >= 2
         and raw_words[-1].endswith("ing")
         and len(raw_words[-1]) > 5
