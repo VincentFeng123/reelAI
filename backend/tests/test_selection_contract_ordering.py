@@ -1,4 +1,4 @@
-"""Importance-first ordering for versioned clipping selections."""
+"""Difficulty-first ordering for versioned clipping selections."""
 from __future__ import annotations
 
 import json
@@ -84,13 +84,15 @@ class SelectionContractOrderingTests(unittest.TestCase):
             "_selection_prerequisite_ids": list(prerequisite_ids or []),
         }
 
-    def test_later_more_important_independent_clip_beats_video_intro(self) -> None:
+    def test_easier_independent_clip_precedes_higher_quality_advanced_clip(self) -> None:
         items = [
             self._selection_item(
                 "early-low", video_id="video-a", start=10, content_score=0.61,
+                difficulty=0.10,
             ),
             self._selection_item(
                 "late-high", video_id="video-a", start=240, content_score=0.99,
+                difficulty=0.80,
             ),
         ]
 
@@ -98,7 +100,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             self.conn, self.MATERIAL, self.LEARNER, items,
         )
 
-        self.assertEqual([item["reel_id"] for item in ordered], ["late-high", "early-low"])
+        self.assertEqual([item["reel_id"] for item in ordered], ["early-low", "late-high"])
 
     def test_explicit_chain_and_prerequisite_edges_remain_ordered(self) -> None:
         items = [
@@ -344,7 +346,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 require_verified_boundaries=require_verified_boundaries,
             )
 
-    def test_ranked_feed_v2_order_is_quality_only_and_level_neutral(self) -> None:
+    def test_ranked_feed_order_is_difficulty_first_and_stable(self) -> None:
         self._insert_versioned_reel(
             reel_id="easy", video_id="video-a", start=10,
             difficulty=0.15, base_score=0.01,
@@ -364,6 +366,106 @@ class SelectionContractOrderingTests(unittest.TestCase):
         advanced = self._ranked()
         self.assertEqual([item["reel_id"] for item in advanced], ["easy", "hard"])
         self.assertAlmostEqual(advanced[0]["score"], 0.80)
+
+    def test_v3_reservoir_filters_against_the_current_learner_level(self) -> None:
+        for reel_id, video_id, difficulty in (
+            ("easy-v3", "video-a", 0.10),
+            ("hard-v3", "video-b", 0.85),
+        ):
+            self._insert_versioned_reel(
+                reel_id=reel_id,
+                video_id=video_id,
+                start=10,
+                difficulty=difficulty,
+                base_score=0.8,
+            )
+            row = self.conn.execute(
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                (reel_id,),
+            ).fetchone()
+            context = json.loads(row[0])
+            context.update({
+                "selection_contract_version": "quality_silence_v3",
+                "self_contained": True,
+                "topic_evidence_quote": (
+                    "Chemical bonding explains how atoms share or transfer electrons"
+                ),
+                "surface_eligible": True,
+                "deferred_level": False,
+            })
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (json.dumps(context), reel_id),
+            )
+
+        self.assertEqual(
+            [item["reel_id"] for item in self._ranked()],
+            ["easy-v3"],
+        )
+        self.service.set_learner_level(
+            self.conn, self.MATERIAL, self.LEARNER, "advanced",
+        )
+        self.assertEqual(
+            [item["reel_id"] for item in self._ranked()],
+            ["hard-v3"],
+        )
+
+    def test_v3_deferred_boundary_clips_release_only_in_their_exact_bin(self) -> None:
+        cases = (
+            ("bin-33", "video-a", 10, 0.33),
+            ("bin-34", "video-b", 20, 0.34),
+            ("bin-66", "video-c", 30, 0.66),
+            ("bin-67", "video-a", 40, 0.67),
+        )
+        for reel_id, video_id, start, difficulty in cases:
+            self._insert_versioned_reel(
+                reel_id=reel_id,
+                video_id=video_id,
+                start=start,
+                difficulty=difficulty,
+                base_score=0.8,
+            )
+            row = self.conn.execute(
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                (reel_id,),
+            ).fetchone()
+            context = json.loads(row[0])
+            context.update({
+                "selection_contract_version": "quality_silence_v3",
+                "self_contained": True,
+                "topic_evidence_quote": (
+                    "Chemical bonding explains how atoms share or transfer electrons"
+                ),
+                "surface_eligible": False,
+                "surface_reason": "level_mismatch",
+                "deferred_level": True,
+                "boundary_status": "verified",
+                "boundary_diagnostics": {
+                    "acoustic_verified": True,
+                    "acoustic": {"threshold_dbfs": -38.0},
+                },
+            })
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (json.dumps(context), reel_id),
+            )
+
+        expected_by_level = {
+            "beginner": ["bin-33"],
+            "intermediate": ["bin-34", "bin-66"],
+            "advanced": ["bin-67"],
+        }
+        for level, expected in expected_by_level.items():
+            self.service.set_learner_level(
+                self.conn, self.MATERIAL, self.LEARNER, level,
+            )
+            self.assertEqual(
+                [
+                    item["reel_id"]
+                    for item in self._ranked(require_verified_boundaries=True)
+                ],
+                expected,
+            )
 
     def test_ranked_feed_excludes_unversioned_acoustic_unavailable_row(self) -> None:
         self.conn.execute(

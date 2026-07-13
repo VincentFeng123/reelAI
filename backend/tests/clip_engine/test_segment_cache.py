@@ -70,7 +70,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v2:v4:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v3:v5:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -102,6 +102,9 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         {"segment_enrich_clips": False},
     )
     assert _key(transcript, {"_segment_routing_mode": "flash_only"}) == baseline
+    assert _key(transcript, {"_knowledge_level": "beginner"}) == _key(
+        transcript, {"_knowledge_level": "advanced"},
+    )
 
     monkeypatch.setattr(segment_cache.pipeline_config, "SEGMENT_FLASH_MODEL", "new-model")
     assert _key(transcript) != baseline
@@ -114,18 +117,29 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
         [_clip()], transcript=transcript, settings=settings
     ) == [_clip()]
 
-    for field in ("informativeness", "topic_relevance", "educational_importance"):
+    for field in ("informativeness", "educational_importance"):
         below_floor = _clip()
-        below_floor[field] = 0.74
+        below_floor[field] = 0.0
         assert segment_cache._valid_clips(
             [below_floor], transcript=transcript, settings=settings
-        ) is None
+        ) == [below_floor]
 
         at_floor = _clip()
         at_floor[field] = 0.75
         assert segment_cache._valid_clips(
             [at_floor], transcript=transcript, settings=settings
         ) == [at_floor]
+
+    below_relevance = _clip()
+    below_relevance["topic_relevance"] = 0.74
+    assert segment_cache._valid_clips(
+        [below_relevance], transcript=transcript, settings=settings
+    ) is None
+    at_relevance = _clip()
+    at_relevance["topic_relevance"] = 0.75
+    assert segment_cache._valid_clips(
+        [at_relevance], transcript=transcript, settings=settings
+    ) == [at_relevance]
 
     medium_uncertainty = _clip()
     medium_uncertainty.update({
@@ -194,6 +208,64 @@ def test_segment_cache_treats_requested_max_as_preference() -> None:
         transcript=transcript,
         settings={"_segment_target_max_sec": 60},
     ) == [clip]
+
+
+def test_segment_cache_preserves_difficulty_order_not_chronology() -> None:
+    transcript = _transcript()
+    easy_later = _clip()
+    easy_later.update({
+        "start": 6.0,
+        "end": 9.0,
+        "difficulty": 0.2,
+        "topic_evidence_quote": "The second lesson applies those forces to circular",
+        "sequence_index": 1,
+    })
+    hard_earlier = _clip()
+    hard_earlier.update({"difficulty": 0.8, "sequence_index": 2})
+
+    assert segment_cache._valid_clips(
+        [easy_later, hard_earlier], transcript=transcript, settings={}
+    ) == [easy_later, hard_earlier]
+    assert segment_cache._valid_clips(
+        [hard_earlier, easy_later], transcript=transcript, settings={}
+    ) is None
+
+
+def test_segment_cache_accepts_more_than_sixteen_distinct_candidates() -> None:
+    transcript = {
+        "artifact_key": "transcript:exhaustive",
+        "segments": [
+            {
+                "cue_id": f"c{index}",
+                "start": index * 5.0,
+                "end": (index + 1) * 5.0,
+                "text": f"Lesson {index} explains forces and motion clearly for students.",
+            }
+            for index in range(20)
+        ],
+        "words": [],
+        "duration": 100.0,
+    }
+    clips = []
+    for index in range(20):
+        clip = _clip()
+        clip.update({
+            "start": index * 5.0 + 0.5,
+            "end": index * 5.0 + 4.5,
+            "title": f"Lesson {index}",
+            "learning_objective": f"Explain lesson {index}",
+            "facet": f"lesson-{index}",
+            "reason": f"Lesson {index} directly teaches motion",
+            "topic_evidence_quote": (
+                f"Lesson {index} explains forces and motion clearly"
+            ),
+            "sequence_index": index + 1,
+        })
+        clips.append(clip)
+
+    assert segment_cache._valid_clips(
+        clips, transcript=transcript, settings={}
+    ) == clips
 
 
 def test_segment_cache_accepts_complete_clips_longer_than_180_seconds() -> None:

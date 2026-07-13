@@ -32,6 +32,7 @@ from backend.app.clip_engine.provider_runtime import GenerationContext  # noqa: 
 import backend.app.main as main_module  # noqa: E402
 from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
 from backend.app.ingestion.models import ReelOutWithAttribution  # noqa: E402
+from backend.pipeline import gemini_segment as segment_module  # noqa: E402
 
 
 # --------------------------------------------------------------------- #
@@ -83,6 +84,7 @@ def _quality_v2_engine_out(engine_out: dict) -> dict:
         segment.setdefault("cue_id", f"cue-{index}")
 
     for index, clip in enumerate(engine_out["clips"]):
+        clip.setdefault("difficulty", 0.15)
         start = float(clip["start"])
         end = float(clip["end"])
         selected = [
@@ -337,13 +339,14 @@ class IngestTopicTests(unittest.TestCase):
                 on_reel_created=seen.append,
             )
 
-        # Exactly 2 persisted even though 3 clips are available
+        # The active inventory and callbacks honor the cap, while the remaining
+        # valid later-source clip is stored for future difficulty progression.
         self.assertEqual(len(reels), 2)
         self.assertEqual(len(seen), 2)
         self.assertEqual([r.t_start for r in reels], [30.0, 120.0])
         self.assertTrue(all("vidAAAAAAAA" in r.video_url for r in reels))
         rows = self._reels_for_generation("gen-3")
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 3)
 
     # ---- 4. on_reel_created fires once per reel, in order ---- #
 
@@ -516,11 +519,7 @@ class IngestTopicTests(unittest.TestCase):
 
 
 class PreserveEveryClipAndBlendTests(IngestTopicTests):
-    """Every accepted engine clip persists; blend affects ordering only.
-
-    Fixture order deliberately differs from blended-score order so a revert of
-    the blend (back to pure token-overlap relevance) fails the ordering assert.
-    """
+    """Every accepted engine clip persists in stable relevance order."""
 
     @staticmethod
     def _blend_engine_out(*_a, **_kw) -> dict:
@@ -577,9 +576,9 @@ class PreserveEveryClipAndBlendTests(IngestTopicTests):
             )
         return reels
 
-    def test_only_hard_gate_clips_persist_in_quality_order(self) -> None:
+    def test_only_hard_gate_clips_persist_in_relevance_order(self) -> None:
         reels = self._run("all")
-        self.assertEqual([r.t_start for r in reels], [120.0, 300.0, 30.0])
+        self.assertEqual([r.t_start for r in reels], [30.0, 120.0, 300.0])
 
 
 class EmbedUrlCeilTests(IngestTopicTests):
@@ -638,6 +637,195 @@ class EmbedUrlCeilTests(IngestTopicTests):
         self.assertEqual(float(row["t_start"]), 30.613)
         self.assertEqual(float(row["t_end"]), 74.457)
 
+    def test_complete_clip_over_180_seconds_survives_v3_persistence_and_level_feed(
+        self,
+    ) -> None:
+        transcript_text = (
+            "Photosynthesis converts light energy into chemical energy, and this "
+            "explanation concludes by connecting the light reactions to carbon fixation."
+        )
+        transcript = {
+            "segments": [
+                {
+                    "cue_id": "long-cue",
+                    "start": 12.345,
+                    "end": 432.789,
+                    "text": transcript_text,
+                }
+            ],
+            "words": [],
+            "duration": 432.789,
+            "source": "supadata",
+            "artifact_key": "supadata:vidAAAAAAAA",
+            "native_mode": True,
+        }
+        proposal = segment_module._BoundaryTopic(
+            candidate_id="long-complete",
+            start_line=0,
+            end_line=0,
+            start_quote="Photosynthesis converts light energy",
+            end_quote="light reactions to carbon fixation",
+            title="Photosynthesis from light to carbon",
+            learning_objective=(
+                "Explain how photosynthesis connects light capture to carbon fixation."
+            ),
+            facet="energy conversion and carbon fixation",
+            reason="Directly explains the core process and reaches its conclusion.",
+            informativeness=0.92,
+            topic_relevance=0.97,
+            educational_importance=0.94,
+            difficulty=0.20,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            topic_evidence_quote=(
+                "Photosynthesis converts light energy into chemical energy"
+            ),
+            self_contained=True,
+            is_standalone=True,
+            prerequisite_candidate_ids=[],
+            uncertainty="low",
+            uncertainty_reasons=[],
+        )
+        clips = segment_module._plan_to_clips(
+            segment_module._BoundaryPlan(topics=[proposal]),
+            transcript["segments"],
+            [],
+            {"max_clips": 16},
+        )
+        self.assertEqual(len(clips), 1)
+        self.assertGreater(clips[0]["end"] - clips[0]["start"], 180.0)
+        engine_out = {
+            "video_id": "vidAAAAAAAA",
+            "clips": clips,
+            "transcript": transcript,
+            "notes": "",
+        }
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                url="https://media.example/audio.m4a",
+                format_id="140",
+                duration_sec=600.0,
+            ),
+        )
+        verified = pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "verified",
+            start_sec=12.001,
+            end_sec=433.012,
+            diagnostics={"threshold_dbfs": -38.0},
+        )
+
+        with (
+            _Patched() as (mock_search, mock_run),
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "prepare_audio_source",
+                return_value=prepared,
+            ),
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "verify_acoustic_boundaries",
+                return_value=verified,
+            ),
+        ):
+            mock_search.discover.side_effect = (
+                lambda topic, limit, exclude_video_ids=None, **kw: {
+                    "corrected": topic,
+                    "videos": [VID_A],
+                    "credits_used": 0,
+                    "warning": None,
+                }
+            )
+            mock_run.clip.return_value = engine_out
+            mock_run.clip.side_effect = None
+            reels, _ = main_module.ingestion_pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="mat-ceil",
+                concept_id="con-ceil",
+                generation_id="gen-long-v3",
+                knowledge_level="beginner",
+                max_videos=1,
+                max_reels=1,
+                retrieval_profile="deep",
+                generation_context=GenerationContext(
+                    "fast",
+                    generation_id="gen-long-v3",
+                    require_acoustic_boundaries=True,
+                ),
+            )
+
+        self.assertEqual(len(reels), 1)
+        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v3")
+        self.assertEqual(reels[0].t_start, 12.001)
+        self.assertEqual(reels[0].t_end, 433.012)
+        self.assertGreater(reels[0].t_end - reels[0].t_start, 180.0)
+
+        with db_module.get_conn(transactional=True) as conn:
+            row = db_module.fetch_one(
+                conn,
+                "SELECT t_start, t_end FROM reels WHERE generation_id = ?",
+                ("gen-long-v3",),
+            )
+            self.assertEqual(float(row["t_start"]), 12.001)
+            self.assertEqual(float(row["t_end"]), 433.012)
+            main_module.reel_service.set_learner_level(
+                conn, "mat-ceil", "owner:long-v3", "advanced"
+            )
+
+        relevance = {
+            "score": 0.97,
+            "concept_overlap": 1.0,
+            "context_overlap": 1.0,
+            "matched_terms": ["photosynthesis"],
+            "off_topic_penalty": 0.0,
+            "reason": "matched topic",
+        }
+        with (
+            mock.patch.object(
+                main_module.reel_service,
+                "_score_text_relevance",
+                return_value=relevance,
+            ),
+            mock.patch.object(
+                main_module.reel_service, "_build_caption_cues", return_value=[]
+            ),
+        ):
+            with db_module.get_conn() as conn:
+                advanced_feed = main_module.reel_service.ranked_feed(
+                    conn,
+                    material_id="mat-ceil",
+                    generation_id="gen-long-v3",
+                    learner_id="owner:long-v3",
+                    require_verified_boundaries=True,
+                )
+            self.assertEqual(advanced_feed, [])
+
+            with db_module.get_conn(transactional=True) as conn:
+                main_module.reel_service.set_learner_level(
+                    conn, "mat-ceil", "owner:long-v3", "beginner"
+                )
+            with db_module.get_conn() as conn:
+                beginner_feed = main_module.reel_service.ranked_feed(
+                    conn,
+                    material_id="mat-ceil",
+                    generation_id="gen-long-v3",
+                    learner_id="owner:long-v3",
+                    require_verified_boundaries=True,
+                )
+
+        self.assertEqual(len(beginner_feed), 1)
+        self.assertEqual(
+            beginner_feed[0]["selection_contract_version"], "quality_silence_v3"
+        )
+        self.assertIsInstance(beginner_feed[0]["t_start"], float)
+        self.assertIsInstance(beginner_feed[0]["t_end"], float)
+        self.assertEqual(beginner_feed[0]["t_start"], 12.001)
+        self.assertEqual(beginner_feed[0]["t_end"], 433.012)
+        self.assertGreater(
+            beginner_feed[0]["t_end"] - beginner_feed[0]["t_start"], 180.0
+        )
+
 
 class DifficultyPersistenceTests(IngestTopicTests):
     """Engine difficulty lands in reels.difficulty; absent -> NULL."""
@@ -685,7 +873,7 @@ class DifficultyPersistenceTests(IngestTopicTests):
             "clips": [{
                 "start": 30.0, "end": 75.0, "cut_end": 75.15,
                 "title": "Unscored", "facet": "", "reason": "",
-                "informativeness": 0.9,
+                "informativeness": 0.9, "difficulty": None,
                 "sequence_index": 0,
                 "embed_url": "https://www.youtube.com/embed/vidAAAAAAAA?start=30&end=75&rel=0",
             }],

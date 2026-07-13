@@ -49,7 +49,10 @@ from .segmenter import (
 from .search_query_plan import build_search_query_plan
 from .topic_expansion import TopicExpansionService
 from .structural_classifier import classify_passage
-from .knowledge_level import effective_level_target
+from .knowledge_level import (
+    difficulty_matches_knowledge_level,
+    effective_level_target,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1194,8 +1197,8 @@ class ReelService:
     # v13: full caption text and the current transcript-semantic surfaceability
     # gates must be recomputed instead of replaying pre-gate cached rows.
     # v14: discard rows accepted only by the retired -24 dBFS adaptive verifier.
-    RANKED_FEED_CACHE_VERSION = 15
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v2"
+    RANKED_FEED_CACHE_VERSION = 16
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v3"
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -1818,17 +1821,6 @@ class ReelService:
                     row.get("reel_count") or 0
                 )
         generated: list[dict[str, Any]] = []
-        material_reel_count = int(
-            (
-                fetch_one(
-                    conn,
-                    "SELECT COUNT(*) AS reel_count FROM reels WHERE material_id = ?",
-                    (material_id,),
-                )
-                or {}
-            ).get("reel_count")
-            or 0
-        )
         accumulated_exclusions: list[str] = list(exclude_video_ids or [])
         # Finding #3: exclude videos we've already clipped for this generation and
         # videos from the excluded prior generations (exclude_generation_ids) so
@@ -1873,9 +1865,20 @@ class ReelService:
                 break
             # Persistence is never truncated by the requested response page;
             # only the material-wide inventory ceiling and provider budgets bound it.
+            material_reel_count = int(
+                (
+                    fetch_one(
+                        conn,
+                        "SELECT COUNT(*) AS reel_count FROM reels WHERE material_id = ?",
+                        (material_id,),
+                    )
+                    or {}
+                ).get("reel_count")
+                or 0
+            )
             remaining_reel_capacity = max(
                 0,
-                MATERIAL_REEL_INVENTORY_LIMIT - material_reel_count - len(generated),
+                MATERIAL_REEL_INVENTORY_LIMIT - material_reel_count,
             )
             if remaining_reel_capacity <= 0:
                 break
@@ -1896,7 +1899,7 @@ class ReelService:
                 break
             ingest_reel_cap = min(
                 remaining_reel_capacity,
-                video_budget * 8
+                remaining_reel_capacity
                 if generation_context is not None
                 else (
                     new_reel_limit - len(generated)
@@ -1938,6 +1941,7 @@ class ReelService:
                     knowledge_level=material_knowledge_level,
                     max_videos=video_budget,
                     max_reels=ingest_reel_cap,
+                    max_persisted_reels=remaining_reel_capacity,
                     on_reel_created=(None if dry_run else _stream),
                     dry_run=dry_run,
                     should_cancel=should_cancel,
@@ -2423,32 +2427,22 @@ class ReelService:
             return []
         if all(
             str(reel.get("selection_contract_version") or "").strip()
-            == "quality_silence_v2"
+            == "quality_silence_v3"
             for reel in generated
         ):
             ordered = sorted(
                 enumerate(generated),
                 key=lambda pair: (
-                    float(
-                        pair[1].get("_selection_quality_floor")
-                        if pair[1].get("_selection_quality_floor") is not None
-                        else pair[1].get("score") or 0.0
-                    ),
-                    float(
-                        pair[1].get("_selection_quality_mean")
-                        if pair[1].get("_selection_quality_mean") is not None
-                        else pair[1].get("score") or 0.0
-                    ),
-                    float(
+                    self._difficulty(pair[1]),
+                    -float(
                         pair[1].get("_selection_topic_relevance")
                         if pair[1].get("_selection_topic_relevance") is not None
                         else pair[1].get("relevance_score") or 0.0
                     ),
-                    -int(pair[1].get("_selection_source_rank") or 0),
-                    -float(pair[1].get("t_start") or 0.0),
-                    -pair[0],
+                    int(pair[1].get("_selection_source_rank") or 0),
+                    float(pair[1].get("t_start") or 0.0),
+                    pair[0],
                 ),
-                reverse=True,
             )
             return [
                 {
@@ -5618,10 +5612,12 @@ class ReelService:
             parsed.get("surface_reason") or ""
         ).strip().lower()
         metadata["_selection_directly_teaches_topic"] = selection_bool(
-            "directly_teaches_topic", version != "quality_silence_v2"
+            "directly_teaches_topic",
+            version not in {"quality_silence_v2", "quality_silence_v3"},
         )
         metadata["_selection_substantive"] = selection_bool(
-            "substantive", version != "quality_silence_v2"
+            "substantive",
+            version not in {"quality_silence_v2", "quality_silence_v3"},
         )
         metadata["_selection_factually_grounded"] = selection_bool(
             "factually_grounded", False
@@ -5745,18 +5741,15 @@ class ReelService:
                 if not eligible:
                     return []
 
-            def priority(node_id: str) -> tuple[float, float, float, int, float, int]:
+            def priority(
+                node_id: str,
+            ) -> tuple[float, float, int, float, int]:
                 row = nodes[node_id]
                 compatibility_score = self._selection_number(
                     row.get("_selection_content_score"), 0.0
                 )
                 return (
-                    self._selection_number(
-                        row.get("_selection_quality_floor"), compatibility_score
-                    ),
-                    self._selection_number(
-                        row.get("_selection_quality_mean"), compatibility_score
-                    ),
+                    -self._difficulty(row),
                     self._selection_number(
                         row.get("_selection_topic_relevance"), compatibility_score
                     ),
@@ -7076,14 +7069,25 @@ class ReelService:
                 selected_cue_ids = []
             selected_cue_ids = [str(cue_id) for cue_id in selected_cue_ids if str(cue_id).strip()]
             selection_metadata = self._selection_metadata(row.get("search_context_json"))
+            selection_version = str(
+                selection_metadata.get("_selection_contract_version") or ""
+            ).strip()
             surface_eligible = selection_metadata.get(
                 "_selection_surface_eligible", True
             )
             surface_reason = str(
                 selection_metadata.get("_selection_surface_reason") or ""
             )
-            difficulty_matches_level = (
+            legacy_difficulty_matches_level = (
                 abs(self._difficulty(row) - level_target) <= 0.35
+            )
+            difficulty_matches_level = (
+                difficulty_matches_knowledge_level(
+                    self._difficulty(row),
+                    str(progress.get("selected_level") or "beginner"),
+                )
+                if selection_version == "quality_silence_v3"
+                else legacy_difficulty_matches_level
             )
             deferred_level_ready = bool(
                 surface_reason == "level_mismatch" and difficulty_matches_level
@@ -7101,6 +7105,11 @@ class ReelService:
                 and not difficulty_matches_level
             ):
                 continue
+            if (
+                selection_version == "quality_silence_v3"
+                and not difficulty_matches_level
+            ):
+                continue
             boundary_status = selection_metadata.get(
                 "_selection_boundary_status"
             )
@@ -7113,21 +7122,27 @@ class ReelService:
             elif boundary_status == "unavailable":
                 continue
             if selection_metadata:
-                selection_version = str(
-                    selection_metadata.get("_selection_contract_version") or ""
-                ).strip()
-                if selection_version == "quality_silence_v2" and (
-                    min(
-                        self._selection_number(
-                            selection_metadata.get("_selection_informativeness"), 0.0
-                        ),
-                        self._selection_number(
+                if selection_version in {
+                    "quality_silence_v2",
+                    "quality_silence_v3",
+                } and (
+                    (
+                        min(
+                            self._selection_number(
+                                selection_metadata.get("_selection_informativeness"), 0.0
+                            ),
+                            self._selection_number(
+                                selection_metadata.get("_selection_topic_relevance"), 0.0
+                            ),
+                            self._selection_number(
+                                selection_metadata.get("_selection_educational_importance"), 0.0
+                            ),
+                        ) < 0.75
+                        if selection_version == "quality_silence_v2"
+                        else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
-                        ),
-                        self._selection_number(
-                            selection_metadata.get("_selection_educational_importance"), 0.0
-                        ),
-                    ) < 0.75
+                        ) < 0.75
+                    )
                     or not selection_metadata.get("_selection_self_contained")
                     or not selection_metadata.get("_selection_is_standalone")
                     or not selection_metadata.get("_selection_topic_evidence_quote")

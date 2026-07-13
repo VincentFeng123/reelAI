@@ -59,6 +59,7 @@ class PreparedAudioSource:
     headers: Mapping[str, str] = field(default_factory=dict, repr=False)
     proxy_url: str = field(default="", repr=False)
     format_id: str = ""
+    duration_sec: float | None = None
 
 
 @dataclass(frozen=True)
@@ -417,6 +418,15 @@ def _prepare_audio_source(
             media_url = str(entry.get("url") or "").strip()
             if not media_url.startswith(("https://", "http://")):
                 raise _Unavailable("resolve", "audio_url_missing")
+            raw_duration = info.get("duration") or entry.get("duration")
+            try:
+                duration_sec = float(raw_duration)
+            except (TypeError, ValueError, OverflowError):
+                duration_sec = None
+            if duration_sec is not None and (
+                not math.isfinite(duration_sec) or duration_sec <= 0.0
+            ):
+                duration_sec = None
             raw_headers = entry.get("http_headers") or info.get("http_headers") or {}
             headers = {
                 str(key): str(value)
@@ -433,6 +443,7 @@ def _prepare_audio_source(
                 headers=headers,
                 proxy_url=proxy,
                 format_id=str(entry.get("format_id") or info.get("format_id") or ""),
+                duration_sec=duration_sec,
             )
         except _Unavailable as exc:
             if exc.reason in {"cancelled", "invalid_youtube_source"}:
@@ -940,6 +951,14 @@ def verify_acoustic_boundaries(
             source = prepared.source
             preparation_diagnostics = prepared.diagnostics
 
+        source_duration = source.duration_sec
+        if (
+            source_duration is not None
+            and math.isfinite(source_duration)
+            and source_duration >= original_end
+        ):
+            search_end_limit = min(search_end_limit, source_duration)
+
         with tempfile.TemporaryDirectory(prefix="reelai_silence_") as temp_dir:
             edge_temp_dir = Path(temp_dir)
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="silence-edge") as pool:
@@ -1099,6 +1118,8 @@ def verify_acoustic_boundaries(
         "end_shift_sec": round(adjusted_end - original_end, 3),
         "elapsed_ms": round((time.monotonic() - started) * 1000),
     }
+    if source.duration_sec is not None:
+        diagnostics["source_duration_sec"] = round(source.duration_sec, 3)
     if preparation_diagnostics:
         diagnostics["prepare_elapsed_ms"] = preparation_diagnostics.get("elapsed_ms")
     return SilenceVerificationResult(

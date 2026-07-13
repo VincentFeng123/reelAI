@@ -113,7 +113,7 @@ def test_extreme_valid_difficulty_never_gates():
             "evidence_quote": "hard lesson",
         },
     )
-    assert {clip["title"] for clip in _run([easy, hard])} == {"Easy", "Hard"}
+    assert [clip["title"] for clip in _run([hard, easy])] == ["Easy", "Hard"]
 
 
 def test_prompt_requires_difficulty():

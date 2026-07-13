@@ -65,6 +65,7 @@ def _quality_v2_engine_out(engine_out: dict) -> dict:
     for index, segment in enumerate(transcript["segments"]):
         segment["cue_id"] = f"cue-{index}"
     for index, clip in enumerate(engine_out["clips"]):
+        clip.setdefault("difficulty", 0.15)
         selected = [
             segment
             for segment in transcript["segments"]
@@ -525,12 +526,12 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_15(self) -> None:
-        """Cache rows must include adaptation, semantic, and strict acoustic gates."""
+    def test_ranked_feed_cache_version_is_16(self) -> None:
+        """Cache rows must include v3 difficulty, semantic, and acoustic gates."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            15,
-            "Current feeds must not reuse stale pre-acoustic-gate rows.",
+            16,
+            "Current feeds must not reuse stale pre-v3 difficulty rows.",
         )
 
 

@@ -569,6 +569,46 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
     assert telemetry["model"] == G.config.SEGMENT_FLASH_MODEL
 
 
+def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
+    provider_telemetry = GC.GeminiCallTelemetry(
+        model=G.config.SEGMENT_FLASH_MODEL,
+        operation="flash_boundary_selector",
+        prompt_version=G.FLASH_SPLIT_PROFILE,
+        thinking_level="low",
+        latency_ms=321.0,
+        retries=1,
+        finish_reason=None,
+        prompt_tokens=None,
+        candidate_tokens=None,
+        thought_tokens=None,
+        total_tokens=None,
+    )
+    monkeypatch.setattr(
+        GC,
+        "generate_json_v3",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            GC.GeminiTransportError("status 503", provider_telemetry)
+        ),
+    )
+
+    result = G.run_segment_profile(
+        _transcript(),
+        {},
+        G.FLASH_SPLIT_PROFILE,
+        topic="calculus",
+    )
+
+    assert result.classification_reasons == [
+        "request_failure:GeminiTransportError"
+    ]
+    assert result.rejection_reasons == [
+        "request_failure:GeminiTransportError"
+    ]
+    assert result.calls[0]["retries"] == 1
+    assert result.calls[0]["latency_ms"] == 321.0
+    assert result.calls[0]["error_type"] == "GeminiTransportError"
+
+
 @pytest.mark.parametrize(
     "profile,expected",
     [
@@ -670,7 +710,7 @@ def test_boundary_profile_repairs_bad_model_quote_from_cited_cue(monkeypatch):
     assert result.rejection_reasons == []
 
 
-def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatch):
+def test_production_boundary_selector_keeps_every_candidate_beyond_sixteen(monkeypatch):
     segments = [
         {
             "cue_id": f"c{index}",
@@ -678,7 +718,7 @@ def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatc
             "end": (index + 1) * 10.0,
             "text": f"line {index} teaches concept {index} and finishes end {index}",
         }
-        for index in range(9)
+        for index in range(17)
     ]
     topics = [
         G._BoundaryTopic(
@@ -691,9 +731,9 @@ def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatc
             learning_objective=f"Understand concept {index}.",
             facet="concept",
             reason="Complete educational moment.",
-            informativeness=0.80 + index * 0.02,
-            topic_relevance=0.80 + index * 0.02,
-            educational_importance=0.80 + index * 0.02,
+            informativeness=0.80 + index * 0.004,
+            topic_relevance=0.80 + index * 0.004,
+            educational_importance=0.80 + index * 0.004,
             difficulty=0.5,
             directly_teaches_topic=True,
             substantive=True,
@@ -707,17 +747,16 @@ def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatc
             uncertainty="low",
             uncertainty_reasons=[],
         )
-        for index in range(9)
+        for index in range(17)
     ]
-    with pytest.raises(ValueError):
-        G._BoundaryPlan(topics=topics)
+    assert len(G._BoundaryPlan(topics=topics).topics) == 17
 
     captured = {}
     monkeypatch.setattr(
         G,
         "_call_model",
         lambda system, user, *args, **kwargs: (
-            captured.update({"user": user}) or G._BoundaryPlan(topics=topics[:8]),
+            captured.update({"user": user}) or G._BoundaryPlan(topics=topics),
             {},
         ),
     )
@@ -732,10 +771,75 @@ def test_production_boundary_selector_caps_global_candidates_at_eight(monkeypatc
     )
 
     assert classification.status == "green"
-    assert len(report.clips) == 8
-    assert "up to 8" in captured["user"]
+    assert len(report.clips) == 17
+    assert "return every distinct qualifying moment" in captured["user"].casefold()
+    assert "up to 16" not in captured["user"].casefold()
     assert "T0" in {clip["title"] for clip in report.clips}
-    assert "T7" in {clip["title"] for clip in report.clips}
+    assert "T16" in {clip["title"] for clip in report.clips}
+
+
+def test_production_order_uses_relevance_not_information_or_importance(monkeypatch):
+    segments = [
+        {
+            "cue_id": f"c{index}",
+            "start": index * 10.0,
+            "end": (index + 1) * 10.0,
+            "text": f"line {index} teaches concept {index} and finishes end {index}",
+        }
+        for index in range(2)
+    ]
+    topics = [
+        G._BoundaryTopic(
+            candidate_id=f"candidate-{index}",
+            start_line=index,
+            end_line=index,
+            start_quote=f"line {index}",
+            end_quote=f"end {index}",
+            title=title,
+            learning_objective=f"Understand concept {index}.",
+            facet=f"facet {index}",
+            reason="Complete educational moment.",
+            informativeness=informativeness,
+            topic_relevance=relevance,
+            educational_importance=importance,
+            difficulty=0.5,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            topic_evidence_quote=(
+                f"line {index} teaches concept {index} and finishes"
+            ),
+            self_contained=True,
+            is_standalone=True,
+            prerequisite_candidate_ids=[],
+            uncertainty="low",
+            uncertainty_reasons=[],
+        )
+        for index, title, informativeness, relevance, importance in (
+            (0, "Most relevant", 0.05, 0.99, 0.05),
+            (1, "Less relevant", 1.0, 0.80, 1.0),
+        )
+    ]
+    monkeypatch.setattr(
+        G,
+        "_call_model",
+        lambda *_args, **_kwargs: (G._BoundaryPlan(topics=topics), {}),
+    )
+
+    report, classification, _ = G._run_selection_profile(
+        G.PRODUCTION_FLASH_PROFILE,
+        {"segments": segments, "words": [], "source": "supadata"},
+        "concept",
+        {"max_clips": 1},
+        deadline=time.monotonic() + 10,
+        cancelled=None,
+    )
+
+    assert classification.status == "green"
+    assert [clip["title"] for clip in report.clips] == [
+        "Most relevant",
+        "Less relevant",
+    ]
 
 
 def test_production_profile_preserves_optional_learning_detail_schema(monkeypatch):

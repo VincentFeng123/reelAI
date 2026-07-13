@@ -17,9 +17,9 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_CACHE_VERSION = 4
+SEGMENT_CACHE_VERSION = 5
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v2"
+SELECTION_CONTRACT_VERSION = "quality_silence_v3"
 
 
 def _canonical_json(value: Any) -> str:
@@ -34,9 +34,6 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             if fine_snap is None
             else bool(fine_snap)
         ),
-        "knowledge_level": " ".join(
-            str(settings.get("_knowledge_level") or "").split()
-        ).lower(),
         "language": " ".join(str(settings.get("language") or "en").split()).lower(),
     }
 
@@ -150,17 +147,14 @@ def _valid_clips(
     transcript: Mapping[str, Any],
     settings: Mapping[str, Any],
 ) -> list[dict[str, Any]] | None:
-    if (
-        not isinstance(value, list)
-        or len(value) > 8
-    ):
+    if not isinstance(value, list):
         return None
     bounds = _transcript_bounds(transcript)
     if bounds is None:
         return None
     transcript_start, transcript_end = bounds
     clips: list[dict[str, Any]] = []
-    previous_start = -1.0
+    previous_order: tuple[float, float, float, str] | None = None
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, dict):
             return None
@@ -208,6 +202,13 @@ def _valid_clips(
                 for offset in range(len(window_words) - evidence_width + 1)
             )
         )
+        order_key = (
+            difficulty,
+            -topic_relevance,
+            start,
+            end,
+            str(raw.get("selection_candidate_id") or ""),
+        )
         if (
             not all(
                 math.isfinite(number)
@@ -222,14 +223,12 @@ def _valid_clips(
             )
             or start < transcript_start - 0.001
             or end > transcript_end + 0.001
-            or start < previous_start
+            or (previous_order is not None and order_key < previous_order)
             or end <= start
             or not 0 <= informativeness <= 1
             or not 0 <= topic_relevance <= 1
             or not 0 <= educational_importance <= 1
-            or informativeness < 0.75
             or topic_relevance < 0.75
-            or educational_importance < 0.75
             or not 0 <= difficulty <= 1
             or raw.get("self_contained") is not True
             or raw.get("is_standalone") is not True
@@ -257,7 +256,7 @@ def _valid_clips(
         ):
             return None
         clips.append(dict(raw))
-        previous_start = start
+        previous_order = order_key
     return clips
 
 

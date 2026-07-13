@@ -11,6 +11,7 @@ if str(ROOT) not in sys.path:
 from backend.app.services.knowledge_level import (  # noqa: E402
     KNOWLEDGE_LEVELS,
     LEVEL_VALUES,
+    difficulty_matches_knowledge_level,
     effective_level_target,
     normalize_knowledge_level,
 )
@@ -47,6 +48,21 @@ class TargetTests(unittest.TestCase):
 
     def test_none_inputs(self) -> None:
         self.assertAlmostEqual(effective_level_target(None, None), 0.15)
+
+    def test_difficulty_bins_are_exact_and_non_overlapping(self) -> None:
+        for difficulty, expected_level in (
+            (0.33, "beginner"),
+            (0.34, "intermediate"),
+            (0.66, "intermediate"),
+            (0.67, "advanced"),
+        ):
+            with self.subTest(difficulty=difficulty):
+                matching = [
+                    level
+                    for level in KNOWLEDGE_LEVELS
+                    if difficulty_matches_knowledge_level(difficulty, level)
+                ]
+                self.assertEqual(matching, [expected_level])
 
 
 if __name__ == "__main__":

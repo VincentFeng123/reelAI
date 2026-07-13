@@ -134,6 +134,7 @@ type FeedSessionSnapshot = {
   autoplayEnabled: boolean;
   playbackRate: number;
   activeIndex: number;
+  watchedFrontierIndex?: number;
   activeReelId?: string;
   updatedAt: number;
 };
@@ -461,6 +462,10 @@ function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapsh
       const page = Math.max(1, Math.floor(Number(row.page) || 1));
       const total = Math.max(reels.length, Math.floor(Number(row.total) || reels.length));
       const activeIndex = Math.max(0, Math.floor(Number(row.activeIndex) || 0));
+      const watchedFrontierIndex = Math.max(
+        activeIndex,
+        Math.floor(Number(row.watchedFrontierIndex) || activeIndex),
+      );
       const feedbackByReel: Record<string, ReelFeedbackState> = {};
       if (row.feedbackByReel && typeof row.feedbackByReel === "object" && !Array.isArray(row.feedbackByReel)) {
         for (const [reelId, rawFeedback] of Object.entries(row.feedbackByReel as Record<string, unknown>)) {
@@ -494,6 +499,7 @@ function parseFeedSessions(raw: string | null): Record<string, FeedSessionSnapsh
         autoplayEnabled: row.autoplayEnabled === true || row.autoplayEnabled === "1" || row.autoplayEnabled === "true",
         playbackRate: normalizeFeedPlaybackRate(row.playbackRate),
         activeIndex,
+        watchedFrontierIndex,
         activeReelId: typeof row.activeReelId === "string" && row.activeReelId.trim() ? row.activeReelId.trim() : undefined,
         updatedAt: Number(row.updatedAt) || 0,
       };
@@ -621,9 +627,17 @@ function formatCaptionTimestamp(seconds: number): string {
   return `${minutes}:${String(secs).padStart(2, "0")}`;
 }
 
-function selectStoredSessionWindow(reels: Reel[], activeIndex: number, maxReels: number): { reels: Reel[]; activeIndex: number } {
+function selectStoredSessionWindow(
+  reels: Reel[],
+  activeIndex: number,
+  maxReels: number,
+): { reels: Reel[]; activeIndex: number; startIndex: number } {
   if (reels.length <= maxReels) {
-    return { reels, activeIndex: clamp(activeIndex, 0, Math.max(0, reels.length - 1)) };
+    return {
+      reels,
+      activeIndex: clamp(activeIndex, 0, Math.max(0, reels.length - 1)),
+      startIndex: 0,
+    };
   }
   const clampedActiveIndex = clamp(activeIndex, 0, reels.length - 1);
   const leadingCount = Math.floor(maxReels / 2);
@@ -632,6 +646,7 @@ function selectStoredSessionWindow(reels: Reel[], activeIndex: number, maxReels:
   return {
     reels: nextReels,
     activeIndex: clamp(clampedActiveIndex - start, 0, Math.max(0, nextReels.length - 1)),
+    startIndex: start,
   };
 }
 
@@ -659,7 +674,7 @@ function compactStoredReel(reel: Reel, mode: "compact" | "minimal"): Reel {
 }
 
 function compactFeedSessionSnapshot(snapshot: FeedSessionSnapshot, mode: "compact" | "minimal"): FeedSessionSnapshot {
-  const { reels, activeIndex } = selectStoredSessionWindow(
+  const { reels, activeIndex, startIndex } = selectStoredSessionWindow(
     snapshot.reels,
     snapshot.activeIndex,
     mode === "minimal" ? MINIMAL_REELS_PER_FEED_SESSION : COMPACT_REELS_PER_FEED_SESSION,
@@ -670,11 +685,19 @@ function compactFeedSessionSnapshot(snapshot: FeedSessionSnapshot, mode: "compac
     Object.entries(snapshot.feedbackByReel).filter(([reelId]) => storedReelIds.has(reelId)),
   );
   const nextActiveIndex = compactedReels.length > 0 ? clamp(activeIndex, 0, compactedReels.length - 1) : 0;
+  const nextWatchedFrontierIndex = compactedReels.length > 0
+    ? clamp(
+        Math.max(snapshot.activeIndex, snapshot.watchedFrontierIndex ?? snapshot.activeIndex) - startIndex,
+        nextActiveIndex,
+        compactedReels.length - 1,
+      )
+    : 0;
   return {
     ...snapshot,
     reels: compactedReels,
     feedbackByReel,
     activeIndex: nextActiveIndex,
+    watchedFrontierIndex: nextWatchedFrontierIndex,
     activeReelId: compactedReels[nextActiveIndex]?.reel_id,
   };
 }
@@ -1032,6 +1055,7 @@ function FeedPageInner() {
   const isFetchingRef = useRef(false);
   const isGeneratingRef = useRef(false);
   const activeIndexRef = useRef(0);
+  const watchedFrontierIndexRef = useRef(0);
   const reelsRef = useRef<Reel[]>([]);
   const pendingAutoplayAdvanceRef = useRef(false);
   const stepLockUntilRef = useRef(0);
@@ -1264,26 +1288,23 @@ function FeedPageInner() {
     setReels(nextReels);
   }, []);
 
-  const interleaveReelBatches = useCallback((batches: Reel[][]): Reel[] => {
-    if (batches.length <= 1) {
-      return batches[0] ? [...batches[0]] : [];
-    }
-    const queues = batches.map((batch) => [...batch]);
-    const merged: Reel[] = [];
-    let added = true;
-    while (added) {
-      added = false;
-      for (const queue of queues) {
-        const next = queue.shift();
-        if (!next) {
-          continue;
-        }
-        merged.push(next);
-        added = true;
-      }
-    }
-    return merged;
+  const orderReelsByDifficulty = useCallback((rows: Reel[]): Reel[] => {
+    return rows
+      .map((reel, index) => ({
+        reel,
+        index,
+        difficulty: typeof reel.difficulty === "number" && Number.isFinite(reel.difficulty)
+          ? Math.min(1, Math.max(0, reel.difficulty))
+          : 0.5,
+      }))
+      .sort((left, right) => left.difficulty - right.difficulty || left.index - right.index)
+      .map(({ reel }) => reel);
   }, []);
+
+  const mergeReelBatchesByDifficulty = useCallback(
+    (batches: Reel[][]): Reel[] => orderReelsByDifficulty(batches.flatMap((batch) => batch)),
+    [orderReelsByDifficulty],
+  );
 
   const getFeedMaterialIds = useCallback((): string[] => {
     const ids = materialIdsForFeedRef.current
@@ -1848,7 +1869,10 @@ function FeedPageInner() {
       options: { preserveUnmatchedUnseen: boolean },
     ): SessionMergeResult => {
       const currentRows = reelsRef.current;
-      const lockedPrefixLength = Math.min(currentRows.length, activeIndexRef.current + 1);
+      const lockedPrefixLength = Math.min(
+        currentRows.length,
+        Math.max(activeIndexRef.current, watchedFrontierIndexRef.current) + 1,
+      );
       const authoritativeById = new Map(
         finalInventory
           .map((reel) => [String(reel.reel_id || "").trim(), reel] as const)
@@ -1907,7 +1931,8 @@ function FeedPageInner() {
             && !provisionalClipKeys.has(reelClipKey(reel));
         }));
       }
-      const reordered = dedupeByIdentity([...lockedPrefix, ...authoritativeTail]);
+      const orderedTail = orderReelsByDifficulty(authoritativeTail);
+      const reordered = dedupeByIdentity([...lockedPrefix, ...orderedTail]);
       const previousIdentity = new Set(currentRows.map((reel) => `${String(reel.reel_id || "").trim()}|${reelClipKey(reel)}`));
       const addedReels = reordered.filter(
         (reel) => !previousIdentity.has(`${String(reel.reel_id || "").trim()}|${reelClipKey(reel)}`),
@@ -1922,7 +1947,7 @@ function FeedPageInner() {
       setTotal((prevTotal) => Math.max(prevTotal, reordered.length));
       return merged;
     },
-    [dedupeByIdentity, reelClipKey, updateSessionReels],
+    [dedupeByIdentity, orderReelsByDifficulty, reelClipKey, updateSessionReels],
   );
 
   const loadPage = useCallback(
@@ -2011,7 +2036,7 @@ function FeedPageInner() {
           rememberFeedGenerationJob(row.materialId, row.data!);
         }
 
-        const fetchedReels = dedupeByIdentity(interleaveReelBatches(successful.map((row) => row.data!.reels)));
+        const fetchedReels = dedupeByIdentity(mergeReelBatchesByDifficulty(successful.map((row) => row.data!.reels)));
         const fetchedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data!.total) || 0), 0);
         const merged = targetPage === 1
           ? options?.preserveSession
@@ -2091,7 +2116,7 @@ function FeedPageInner() {
       generationMode,
       getFeedMaterialIds,
       getFeedTuningSettings,
-      interleaveReelBatches,
+      mergeReelBatchesByDifficulty,
       isSearchScopeActive,
       markRecoveryProgress,
       materialId,
@@ -2224,7 +2249,7 @@ function FeedPageInner() {
         return [];
       }
       const generated = dedupeByIdentity(
-        interleaveReelBatches(generatedRows.map((row) => row.streamedReels ?? [])),
+        mergeReelBatchesByDifficulty(generatedRows.map((row) => row.streamedReels ?? [])),
       );
       if (generated.length === 0) {
         markRecoveryProgress(0);
@@ -2286,7 +2311,7 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    interleaveReelBatches,
+    mergeReelBatchesByDifficulty,
     isIngestMaterial,
     isGenerationCoolingDown,
     isSearchScopeActive,
@@ -2305,6 +2330,7 @@ function FeedPageInner() {
     mutedRestoredFromSnapshotRef.current = false;
     autoplayRestoredFromSnapshotRef.current = false;
     if (!materialId) {
+      watchedFrontierIndexRef.current = 0;
       materialIdsForFeedRef.current = [];
       knowledgeLevelByMaterialRef.current.clear();
       adaptiveExcludeReelIdsRef.current = [];
@@ -2424,6 +2450,7 @@ function FeedPageInner() {
     setFeedPagesExhausted(false);
     setActiveIndex(0);
     activeIndexRef.current = 0;
+    watchedFrontierIndexRef.current = 0;
     setFeedbackByReel({});
     setMobileDetailsOpen(false);
     setBootstrappingFirstReels(false);
@@ -2447,6 +2474,13 @@ function FeedPageInner() {
       updateSessionReels(restoredReels);
       setActiveIndex(restoredIndex);
       activeIndexRef.current = restoredIndex;
+      watchedFrontierIndexRef.current = restoredReels.length > 0
+        ? clamp(
+            Math.max(restoredIndex, restoredSession.watchedFrontierIndex ?? restoredIndex),
+            restoredIndex,
+            restoredReels.length - 1,
+          )
+        : 0;
       setFeedbackByReel(restoredSession.feedbackByReel);
       adaptiveExcludeReelIdsRef.current = restoredSession.adaptiveExcludeReelIds;
       setPage(restoredSession.page);
@@ -2678,7 +2712,7 @@ function FeedPageInner() {
         setRecoveryPhase("idle");
         return;
       }
-      const refreshedReels = dedupeByIdentity(interleaveReelBatches(successful.map((row) => row.data.reels)));
+      const refreshedReels = dedupeByIdentity(mergeReelBatchesByDifficulty(successful.map((row) => row.data.reels)));
       const refreshedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data.total) || 0), 0);
       const currentReels = reelsRef.current;
       const currentReelId = currentReels[activeIndexRef.current]?.reel_id;
@@ -2722,7 +2756,7 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    interleaveReelBatches,
+    mergeReelBatchesByDifficulty,
     isSearchScopeActive,
     markRecoveryProgress,
     mergeSessionReels,
@@ -2802,7 +2836,7 @@ function FeedPageInner() {
         return;
       }
       const generated = dedupeByIdentity(
-        interleaveReelBatches(generatedRows.map((row) => row?.streamedReels ?? [])),
+        mergeReelBatchesByDifficulty(generatedRows.map((row) => row?.streamedReels ?? [])),
       );
       if (generated.length > 0) {
         markRecoveryProgress(generated.length);
@@ -2826,7 +2860,7 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    interleaveReelBatches,
+    mergeReelBatchesByDifficulty,
     isGenerationCoolingDown,
     isSearchScopeActive,
     markRecoveryProgress,
@@ -3022,6 +3056,7 @@ function FeedPageInner() {
 
   useEffect(() => {
     activeIndexRef.current = activeIndex;
+    watchedFrontierIndexRef.current = Math.max(watchedFrontierIndexRef.current, activeIndex);
   }, [activeIndex]);
 
   useEffect(() => {
@@ -3134,6 +3169,13 @@ function FeedPageInner() {
       autoplayEnabled,
       playbackRate,
       activeIndex: index,
+      watchedFrontierIndex: dedupedReels.length > 0
+        ? clamp(
+            Math.max(index, watchedFrontierIndexRef.current),
+            index,
+            dedupedReels.length - 1,
+          )
+        : 0,
       activeReelId,
       updatedAt: Date.now(),
     });
@@ -3731,7 +3773,13 @@ function FeedPageInner() {
     const searchScope = activeSearchScopeRef.current;
 
     const currentIndex = clamp(activeIndexRef.current, 0, currentReels.length - 1);
-    const watchedPrefix = currentReels.slice(0, currentIndex + 1);
+    const preservedThroughIndex = clamp(
+      Math.max(currentIndex, watchedFrontierIndexRef.current),
+      currentIndex,
+      currentReels.length - 1,
+    );
+    const currentActiveReelId = currentReels[currentIndex]?.reel_id;
+    const watchedPrefix = currentReels.slice(0, preservedThroughIndex + 1);
     const excludeReelIds = watchedPrefix.map((reel) => String(reel.reel_id || "").trim()).filter(Boolean);
     const tailCapacity = Math.max(0, MAX_REELS_PER_FEED_SESSION - watchedPrefix.length);
     if (tailCapacity === 0) {
@@ -3796,13 +3844,17 @@ function FeedPageInner() {
       renewActiveSearchScope();
     }
 
-    const rankedTail = dedupeByIdentity(interleaveReelBatches(
+    const rankedTail = dedupeByIdentity(mergeReelBatchesByDifficulty(
       successful.map((pages) => dedupeByIdentity(pages.flatMap((response) => response.reels))),
     ));
     const nextReels = dedupeByIdentity(rankedTail, watchedPrefix).slice(0, MAX_REELS_PER_FEED_SESSION);
     adaptiveExcludeReelIdsRef.current = excludeReelIds.slice(-200);
     updateSessionReels(nextReels);
-    setActiveIndex(watchedPrefix.length - 1);
+    const nextActiveIndex = currentActiveReelId
+      ? nextReels.findIndex((reel) => reel.reel_id === currentActiveReelId)
+      : -1;
+    activeIndexRef.current = nextActiveIndex >= 0 ? nextActiveIndex : currentIndex;
+    setActiveIndex(activeIndexRef.current);
     setTotal(Math.max(
       nextReels.length,
       watchedPrefix.length + successful.reduce((sum, pages) => {
@@ -3823,7 +3875,7 @@ function FeedPageInner() {
     generationMode,
     getFeedMaterialIds,
     getFeedTuningSettings,
-    interleaveReelBatches,
+    mergeReelBatchesByDifficulty,
     isSearchScopeActive,
     renewActiveSearchScope,
     settingsScopeReady,

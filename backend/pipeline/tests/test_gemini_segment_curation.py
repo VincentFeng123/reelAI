@@ -157,15 +157,17 @@ def test_self_contained_gate_still_fails_closed():
     assert _run([_topic(0, 1, self_contained=False)]) == []
 
 
-def test_scores_below_fixed_green_floor_are_rejected():
-    assert _run([_topic(
+def test_relevance_is_the_only_numeric_green_gate():
+    relevant = _topic(
         0,
         1,
         informativeness=0.0,
-        topic_relevance=0.0,
+        topic_relevance=0.75,
         educational_importance=0.0,
         difficulty=0.0,
-    )]) == []
+    )
+    assert _run([relevant])
+    assert _run([_topic(0, 1, topic_relevance=0.74)]) == []
 
 
 def test_request_quality_floor_overrides_cannot_change_fixed_contract():
@@ -175,8 +177,11 @@ def test_request_quality_floor_overrides_cannot_change_fixed_contract():
     )
     assert _run([proposal], settings={"segment_informativeness_min": 0.8})
     assert _run([proposal], settings={"segment_topic_relevance_min": 0.8})
-    rejected = _topic(0, 1, informativeness=0.74)
-    assert _run([rejected], settings={"segment_informativeness_min": 0.1}) == []
+    assert _run([
+        _topic(0, 1, informativeness=0.1, educational_importance=0.1)
+    ], settings={"segment_informativeness_min": 0.8})
+    rejected = _topic(0, 1, topic_relevance=0.74)
+    assert _run([rejected], settings={"segment_topic_relevance_min": 0.1}) == []
 
 
 def test_short_complete_clip_survives_legacy_fifteen_second_setting():
@@ -788,7 +793,7 @@ def test_explicit_max_clips_is_respected_below_forty_ceiling():
 @pytest.mark.parametrize(
     "overrides,rejected_reason",
     [
-        ({"informativeness": 0.7}, "proposal_1:informativeness_below_green"),
+        ({"topic_relevance": 0.7}, "proposal_1:topic_relevance_below_green"),
         ({"uncertainty": "medium", "uncertainty_reasons": ["boundary_ambiguous"]},
          None),
         ({"uncertainty": "high", "uncertainty_reasons": ["incomplete_context"]},
@@ -913,14 +918,16 @@ def test_prompt_layout_and_contract_follow_gemini3_guidance():
     assert "chain-of-thought" in combined
 
 
-def test_boundary_prompt_includes_learner_level_and_rejects_course_framing():
+def test_boundary_prompt_selects_all_difficulties_and_rejects_course_framing():
     _system, user = G._boundary_prompts(
         "[0] 00:00 Biology explains cells.",
         1,
         topic="biology",
         learner_level="advanced",
     )
-    assert "current level is advanced" in user
+    assert "current level is advanced" not in user
+    assert "0.00-0.33 means beginner" in user
+    assert "return units across that entire scale" in user.lower()
     assert "course logistics" in user
     assert "institutional framing" in user
     assert "merely names the subject" in user

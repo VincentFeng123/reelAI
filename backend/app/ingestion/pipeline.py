@@ -30,7 +30,13 @@ import re
 import threading
 import time
 import uuid
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    as_completed,
+    wait,
+)
 from pathlib import Path
 from typing import Any, Callable
 
@@ -98,7 +104,10 @@ from ..services.search_query_plan import (
     SearchQueryPlan,
     topic_signature_evidence,
 )
-from ..services.knowledge_level import effective_level_target
+from ..services.knowledge_level import (
+    difficulty_matches_knowledge_level,
+    effective_level_target,
+)
 
 logger: logging.Logger = get_ingest_logger(__name__)
 
@@ -137,7 +146,7 @@ def _run_clip(
     if candidate_rank is not None:
         settings["_segment_candidate_rank"] = int(candidate_rank)
     if max_clips is not None:
-        settings["max_clips"] = max(1, min(8, int(max_clips)))
+        settings["max_clips"] = max(1, int(max_clips))
     if deadline_monotonic is not None:
         settings["deadline_monotonic"] = float(deadline_monotonic)
     settings["_segment_pro_fallback_gate"] = lambda **_kwargs: False
@@ -298,6 +307,8 @@ def _supadata_boundary_diagnostics(
 def _semantic_section_search_limits(
     transcript: dict[str, Any],
     raw_clip: dict[str, Any],
+    *,
+    source_end_sec: float | None = None,
 ) -> tuple[float, float]:
     """Bound silence search to the candidate's enclosing transcript section."""
     segments = [
@@ -312,8 +323,15 @@ def _semantic_section_search_limits(
         ],
         default=0.0,
     )
+    source_end = transcript_end
+    try:
+        candidate_source_end = float(source_end_sec)
+    except (TypeError, ValueError, OverflowError):
+        candidate_source_end = 0.0
+    if math.isfinite(candidate_source_end) and candidate_source_end >= transcript_end:
+        source_end = candidate_source_end
     if not segments:
-        return 0.0, transcript_end
+        return 0.0, source_end
 
     selected_ids = {
         str(cue_id)
@@ -337,7 +355,7 @@ def _semantic_section_search_limits(
             )
         ]
     if not selected_indices:
-        return 0.0, transcript_end
+        return 0.0, source_end
 
     first_index = min(selected_indices)
     last_index = max(selected_indices)
@@ -349,14 +367,54 @@ def _semantic_section_search_limits(
             start_limit = max(0.0, previous_end)
             break
 
-    end_limit = transcript_end
+    end_limit = source_end
     for index in range(last_index, len(segments) - 1):
         current_end = float(segments[index].get("end") or 0.0)
         next_start = float(segments[index + 1].get("start") or current_end)
         if next_start - current_end >= SEMANTIC_SECTION_RESET_GAP_SEC:
-            end_limit = min(transcript_end, next_start)
+            end_limit = min(source_end, next_start)
             break
     return start_limit, end_limit
+
+
+def _prepared_media_end_sec(
+    prepared: object,
+    *,
+    transcript_end_sec: float,
+) -> float:
+    """Use resolved media duration only when it safely encloses the transcript."""
+    source = getattr(prepared, "source", None)
+    try:
+        duration = float(getattr(source, "duration_sec", None))
+    except (TypeError, ValueError, OverflowError):
+        return transcript_end_sec
+    if not math.isfinite(duration) or duration < transcript_end_sec:
+        return transcript_end_sec
+    return duration
+
+
+def _direct_adapter_duration_sec(
+    transcript: dict[str, Any],
+    verified_clips: list[dict[str, Any]],
+) -> float:
+    """Return the verified media duration, falling back to transcript timing."""
+    candidates: list[float] = []
+    raw_values = [
+        transcript.get("duration"),
+        *[
+            clip.get("_verified_media_duration_sec")
+            for clip in verified_clips
+            if isinstance(clip, dict)
+        ],
+    ]
+    for value in raw_values:
+        try:
+            duration = float(value)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(duration) and duration > 0.0:
+            candidates.append(duration)
+    return max(candidates, default=0.0)
 
 
 def _verified_direct_adapter_clips(
@@ -366,7 +424,7 @@ def _verified_direct_adapter_clips(
     should_cancel: Callable[[], bool] | None,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Return quality-ranked v2 candidates with two verified silence cuts."""
+    """Return difficulty-ranked v3 candidates with two verified silence cuts."""
     transcript = dict(engine_out.get("transcript") or {})
     segments = list(transcript.get("segments") or [])
     transcript_end = max(
@@ -403,7 +461,8 @@ def _verified_direct_adapter_clips(
                 float(raw_clip.get("end") or 0.0),
             )
         if (
-            any(not math.isfinite(score) or score < 0.75 for score in quality_scores)
+            any(not math.isfinite(score) for score in quality_scores)
+            or quality_scores[1] < 0.75
             or raw_clip.get("kind") != "educational"
             or raw_clip.get("directly_teaches_topic") is not True
             or raw_clip.get("substantive") is not True
@@ -427,8 +486,7 @@ def _verified_direct_adapter_clips(
 
     candidates.sort(
         key=lambda candidate: (
-            -min(candidate["_quality_scores"]),
-            -(sum(candidate["_quality_scores"]) / 3.0),
+            float(candidate.get("difficulty") or 0.0),
             -float(candidate["_quality_scores"][1]),
             float(candidate.get("start") or 0.0),
             float(candidate.get("end") or 0.0),
@@ -440,6 +498,10 @@ def _verified_direct_adapter_clips(
         source_url,
         cancel_check=should_cancel,
     )
+    media_end = _prepared_media_end_sec(
+        prepared,
+        transcript_end_sec=transcript_end,
+    )
 
     def verify(raw_clip: dict[str, Any]):
         diagnostics = _supadata_boundary_diagnostics(transcript, raw_clip)
@@ -448,7 +510,9 @@ def _verified_direct_adapter_clips(
         start_sec = float(raw_clip.get("start") or 0.0)
         end_sec = float(raw_clip.get("end") or 0.0)
         search_start_limit, search_end_limit = _semantic_section_search_limits(
-            transcript, raw_clip
+            transcript,
+            raw_clip,
+            source_end_sec=media_end,
         )
         acoustic = clip_engine_silence.verify_acoustic_boundaries(
             source_url,
@@ -489,26 +553,27 @@ def _verified_direct_adapter_clips(
             and acoustic.end_sec > acoustic.start_sec
             and acoustic.start_sec <= required_first_speech + 0.05
             and acoustic.end_sec + 0.05 >= required_last_speech
-            and acoustic.end_sec <= transcript_end + 1e-3
+            and acoustic.end_sec <= media_end + 1e-3
         ):
             continue
         clip = dict(raw_clip)
         clip.pop("_quality_scores", None)
         clip["start"] = round(float(acoustic.start_sec), 3)
         clip["end"] = round(float(acoustic.end_sec), 3)
+        # Persistence must validate an acoustically extended tail against the
+        # prepared media, not a caption track that may end slightly earlier.
+        clip["_verified_media_duration_sec"] = media_end
         informativeness, topic_relevance, educational_importance = raw_clip[
             "_quality_scores"
         ]
-        quality_floor = min(
-            informativeness, topic_relevance, educational_importance
-        )
+        quality_floor = topic_relevance
         quality_mean = (
             informativeness + topic_relevance + educational_importance
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v2",
-            content_score=quality_floor,
+            selection_contract_version="quality_silence_v3",
+            content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
             informativeness=informativeness,
@@ -814,38 +879,64 @@ class IngestionPipeline:
         except _ClipError as exc:
             raise SegmentationError(str(exc)) from exc
 
-        best = _verified_direct_adapter_clip(
+        verified = _verified_direct_adapter_clips(
             source_url=source_url,
             engine_out=engine_out,
             should_cancel=should_cancel,
+            limit=None,
         )
-        if best is None:
+        if not verified:
             raise SegmentationError(
                 "no quality clip with verified silence boundaries could be produced"
             )
 
         raise_if_cancelled(should_cancel)
-        meta = {"duration_sec": engine_out["transcript"].get("duration")}
+        meta = {
+            "duration_sec": _direct_adapter_duration_sec(
+                engine_out["transcript"], verified
+            )
+        }
 
         adapter_result = clip_engine_bridge.synth_adapter_result(video_id, source_url)
         metadata = clip_engine_bridge.to_metadata(video_id, meta, source_url)
         cues = clip_engine_bridge.to_cues(engine_out["transcript"])
-        chosen = clip_engine_bridge.to_segment(best, engine_out["transcript"])
-        snippet = clip_engine_bridge.window_text(engine_out["transcript"], chosen.t_start, chosen.t_end)[:7000]
+        chosen = clip_engine_bridge.to_segment(verified[0], engine_out["transcript"])
+        persisted: ReelOutWithAttribution | None = None
+        for index, clip in enumerate(verified):
+            raise_if_cancelled(should_cancel)
+            segment = (
+                chosen
+                if index == 0
+                else clip_engine_bridge.to_segment(clip, engine_out["transcript"])
+            )
+            snippet = clip_engine_bridge.window_text(
+                engine_out["transcript"], segment.t_start, segment.t_end
+            )[:7000]
+            stored = self._persist_ingest(
+                adapter_result=adapter_result,
+                metadata=metadata,
+                cues=cues,
+                chosen=segment,
+                snippet=snippet,
+                material_id=material_id,
+                concept_id=concept_id,
+                clip_window=(segment.t_start, segment.t_end),
+                target_max=0,
+                clip_title=str(clip.get("title") or "").strip(),
+                clip_difficulty=(
+                    None
+                    if clip.get("difficulty") is None
+                    else float(clip["difficulty"])
+                ),
+                clip_details=clip,
+                should_cancel=should_cancel,
+            )
+            if persisted is None:
+                persisted = stored
 
-        persisted = self._persist_ingest(
-            adapter_result=adapter_result,
-            metadata=metadata,
-            cues=cues,
-            chosen=chosen,
-            snippet=snippet,
-            material_id=material_id,
-            concept_id=concept_id,
-            clip_window=(chosen.t_start, chosen.t_end),
-            target_max=0,
-            clip_details=best,
-            should_cancel=should_cancel,
-        )
+        # The legacy URL response exposes one reel, while the shared feed can
+        # immediately load every additional verified unit persisted above.
+        assert persisted is not None
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
         log_event(
@@ -943,13 +1034,13 @@ class IngestionPipeline:
             source_url=source_url,
             engine_out=engine_out,
             should_cancel=should_cancel,
-            limit=8,
+            limit=None,
         )
 
-        meta: dict[str, Any] = {}
-        duration = float(
-            meta.get("duration_sec") or engine_out["transcript"].get("duration") or 0.0
+        duration = _direct_adapter_duration_sec(
+            engine_out["transcript"], kept
         )
+        meta: dict[str, Any] = {"duration_sec": duration}
 
         is_short = bool(duration and duration < 60.0 and not kept)
 
@@ -976,6 +1067,12 @@ class IngestionPipeline:
                     concept_id=concept_id,
                     clip_window=(chosen.t_start, chosen.t_end),
                     target_max=0,
+                    clip_title=str(clip.get("title") or "").strip(),
+                    clip_difficulty=(
+                        None
+                        if clip.get("difficulty") is None
+                        else float(clip["difficulty"])
+                    ),
                     clip_details=clip,
                     should_cancel=should_cancel,
                 )
@@ -1292,6 +1389,7 @@ class IngestionPipeline:
         knowledge_level: str | None = None,
         max_videos: int = 3,
         max_reels: int | None = None,
+        max_persisted_reels: int | None = None,
         on_reel_created: Callable[[ReelOutWithAttribution], None] | None = None,
         dry_run: bool = False,
         should_cancel: Callable[[], bool] | None = None,
@@ -1447,6 +1545,12 @@ class IngestionPipeline:
             return [], resolved_video_ids
         inventory_cap = requested_count + 2 if max_reels is None else requested_count
         minimum_valid = inventory_cap
+        persistence_cap = (
+            None
+            if max_persisted_reels is None
+            else max(0, int(max_persisted_reels))
+        )
+        stored_count = 0
 
         concurrent_video_count = min(3, len(videos), analysis_limit)
         executor = ThreadPoolExecutor(max_workers=concurrent_video_count)
@@ -1491,7 +1595,7 @@ class IngestionPipeline:
             analyzed_video_id = str(videos[index].get("id") or "").strip()
             if analyzed_video_ids is not None and analyzed_video_id:
                 analyzed_video_ids.add(analyzed_video_id)
-            videos[index]["_segment_max_candidates"] = 8
+            videos[index].pop("_segment_max_candidates", None)
             if (
                 audio_executor is not None
                 and analyzed_video_id
@@ -1681,15 +1785,28 @@ class IngestionPipeline:
             *,
             limit: int | None = None,
         ) -> list[ReelOutWithAttribution]:
+            nonlocal stored_count
             v, kept, engine_out = result
-            persisted: list[ReelOutWithAttribution] = []
+            persisted_by_index: dict[int, ReelOutWithAttribution] = {}
+            callback_indices: set[int] = set()
+            if persistence_cap is not None and stored_count >= persistence_cap:
+                return []
             surfaceable_candidate_ids = surfaceable_candidate_ids_by_video.setdefault(
                 str(v.get("id") or ""), set()
             )
             surface_limit = None if limit is None else max(0, int(limit))
             candidate_clips = list(kept)
-            if surface_limit is not None:
-                candidate_clips = candidate_clips[:surface_limit]
+            storage_is_limited = bool(
+                persistence_cap is not None
+                and stored_count + len(candidate_clips) > persistence_cap
+            )
+            completion_order_safe = all(
+                not any(
+                    str(value or "").strip()
+                    for value in (clip.get("prerequisite_ids") or [])
+                )
+                for clip in candidate_clips
+            )
 
             transcript_segments = list(engine_out["transcript"].get("segments") or [])
             transcript_end = max(
@@ -1705,6 +1822,10 @@ class IngestionPipeline:
             prepared_audio = (
                 prepared_audio_for(v) if require_acoustic_boundaries else None
             )
+            media_end = _prepared_media_end_sec(
+                prepared_audio,
+                transcript_end_sec=transcript_end,
+            )
 
             def verify_boundary(raw_clip: dict[str, Any]):
                 caption = _supadata_boundary_diagnostics(
@@ -1715,7 +1836,9 @@ class IngestionPipeline:
                 original_start = float(raw_clip.get("start") or 0.0)
                 original_end = float(raw_clip.get("end") or 0.0)
                 search_start_limit, search_end_limit = _semantic_section_search_limits(
-                    engine_out["transcript"], raw_clip
+                    engine_out["transcript"],
+                    raw_clip,
+                    source_end_sec=media_end,
                 )
                 remaining = acoustic_phase_deadline_for(v) - time.monotonic()
                 if remaining <= 0:
@@ -1736,10 +1859,10 @@ class IngestionPipeline:
                     cancel_check=should_cancel,
                 )
 
-            def ordered_boundary_results():
+            def boundary_results():
                 if generation_context is None or not candidate_clips:
-                    for clip in candidate_clips:
-                        yield (
+                    for index, clip in enumerate(candidate_clips):
+                        yield index, (
                             _supadata_boundary_diagnostics(
                                 engine_out["transcript"], clip
                             ),
@@ -1750,23 +1873,26 @@ class IngestionPipeline:
                     max_workers=min(3, len(candidate_clips)),
                     thread_name_prefix="clip-boundary-verify",
                 )
-                futures = [
-                    boundary_executor.submit(verify_boundary, clip)
-                    for clip in candidate_clips
-                ]
+                futures = {
+                    boundary_executor.submit(verify_boundary, clip): index
+                    for index, clip in enumerate(candidate_clips)
+                }
                 try:
-                    # All checks overlap, but results are consumed in stable
-                    # candidate order. The first passing clip can therefore
-                    # persist and stream before later checks finish.
-                    for future in futures:
-                        yield future.result()
+                    ordered_futures = (
+                        as_completed(futures)
+                        if completion_order_safe and not storage_is_limited
+                        else iter(futures)
+                    )
+                    for future in ordered_futures:
+                        yield futures[future], future.result()
                 finally:
                     boundary_executor.shutdown(wait=False, cancel_futures=True)
 
-            for raw_clip, (caption_diagnostics, acoustic) in zip(
-                candidate_clips, ordered_boundary_results(), strict=True
-            ):
+            for candidate_index, (caption_diagnostics, acoustic) in boundary_results():
                 raise_if_cancelled(should_cancel)
+                if persistence_cap is not None and stored_count >= persistence_cap:
+                    break
+                raw_clip = candidate_clips[candidate_index]
                 clip = dict(raw_clip)
                 search_context = dict(clip.get("search_context") or {})
                 semantic_eligible = search_context.get("surface_eligible") is not False
@@ -1807,7 +1933,7 @@ class IngestionPipeline:
                             and acoustic.end_sec > acoustic.start_sec
                             and acoustic.start_sec <= first_start + 0.05
                             and acoustic.end_sec + 0.05 >= last_end
-                            and acoustic.end_sec <= transcript_end + 1e-3
+                            and acoustic.end_sec <= media_end + 1e-3
                         )
                         boundary_diagnostics = {
                             "method": "energy_silence",
@@ -1855,21 +1981,41 @@ class IngestionPipeline:
                     generation_id=generation_id,
                     should_cancel=should_cancel,
                 )
+                stored_count += 1
                 if generation_context is not None:
                     generation_context.increment_counter("stored_clips")
                 if not surface_eligible:
                     if generation_context is not None:
                         generation_context.increment_counter("deferred_clips")
                     continue
-                persisted.append(reel)
                 candidate_id = str(clip.get("selection_candidate_id") or "").strip()
                 if candidate_id:
                     surfaceable_candidate_ids.add(candidate_id)
-                if generation_context is not None:
-                    generation_context.increment_counter("persisted_clips")
-                if on_reel_created is not None:
+                persisted_by_index[candidate_index] = reel
+                definitely_selected = (
+                    surface_limit is None
+                    or candidate_index < surface_limit
+                    or (
+                        not completion_order_safe
+                        and len(persisted_by_index) <= surface_limit
+                    )
+                )
+                if on_reel_created is not None and definitely_selected:
                     on_reel_created(reel)
-            return persisted
+                    callback_indices.add(candidate_index)
+
+            selected_indices = sorted(persisted_by_index)
+            if surface_limit is not None:
+                selected_indices = selected_indices[:surface_limit]
+            if on_reel_created is not None:
+                for candidate_index in selected_indices:
+                    if candidate_index not in callback_indices:
+                        on_reel_created(persisted_by_index[candidate_index])
+            if generation_context is not None:
+                generation_context.increment_counter(
+                    "persisted_clips", len(selected_indices)
+                )
+            return [persisted_by_index[index] for index in selected_indices]
 
         reels_by_video: dict[int, list[ReelOutWithAttribution]] = {}
         completed_results: dict[
@@ -1999,13 +2145,12 @@ class IngestionPipeline:
                     if retrieval_profile == "bootstrap":
                         persist_bootstrap_sources()
                     else:
-                        if persisted_count < inventory_cap:
-                            persisted = persist_result(
-                                result,
-                                limit=inventory_cap - persisted_count,
-                            )
-                            reels_by_video[index] = persisted
-                            persisted_count += len(persisted)
+                        persisted = persist_result(
+                            result,
+                            limit=max(0, inventory_cap - persisted_count),
+                        )
+                        reels_by_video[index] = persisted
+                        persisted_count += len(persisted)
 
                 if retrieval_profile == "bootstrap":
                     persist_bootstrap_sources()
@@ -2185,9 +2330,7 @@ class IngestionPipeline:
                 clip.get("educational_importance"), 0.0
             )
             if (
-                informativeness < 0.75
-                or topic_relevance < 0.75
-                or educational_importance < 0.75
+                topic_relevance < 0.75
                 or clip.get("self_contained") is not True
                 or clip.get("is_standalone") is not True
             ):
@@ -2253,21 +2396,20 @@ class IngestionPipeline:
                 "self_contained": bool(clip.get("self_contained")),
                 "topic_evidence_quote": grounded_evidence_quote,
                 "surface_eligible": True,
-                "deferred_level": abs(difficulty - level_target) > 0.35,
+                "deferred_level": not difficulty_matches_knowledge_level(
+                    difficulty,
+                    str(v.get("_knowledge_level") or ""),
+                ),
             }
             if has_selector_metadata:
                 importance = educational_importance
                 boundary_confidence = unit(clip.get("boundary_confidence"), 0.5)
                 uncertainty = str(clip.get("uncertainty") or "low").strip().lower()
-                quality_floor = min(
-                    topic_relevance,
-                    importance,
-                    informativeness,
-                )
+                quality_floor = topic_relevance
                 quality_mean = (
                     topic_relevance + importance + informativeness
                 ) / 3.0
-                content_score = quality_floor
+                content_score = topic_relevance
                 clip["score"] = content_score
                 prerequisite_ids = clip.get("prerequisite_ids")
                 source_namespace = str(v.get("id") or "unknown-video").strip()
@@ -2297,7 +2439,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v2",
+                    selection_contract_version="quality_silence_v3",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,
@@ -2387,16 +2529,14 @@ class IngestionPipeline:
             chosen_id = max(
                 eligible_nodes,
                 key=lambda node_id: (
-                    float(
-                        nodes[node_id]
-                        .get("search_context", {})
-                        .get("quality_floor", 0.0)
+                    int(
+                        not bool(
+                            nodes[node_id]
+                            .get("search_context", {})
+                            .get("deferred_level")
+                        )
                     ),
-                    float(
-                        nodes[node_id]
-                        .get("search_context", {})
-                        .get("quality_mean", 0.0)
-                    ),
+                    -unit(nodes[node_id].get("difficulty"), 0.5),
                     float(
                         nodes[node_id]
                         .get("search_context", {})

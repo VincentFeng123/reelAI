@@ -68,7 +68,7 @@ def test_duration_settings_do_not_change_a_complete_clip() -> None:
     ]
 
 
-def test_selector_prompt_prefers_foundations_and_allows_one_listed_component() -> None:
+def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None:
     _system, user = gemini_segment._boundary_prompts(
         "[0] 00:00 Cells use chlorophyll to capture light energy.",
         1,
@@ -77,9 +77,10 @@ def test_selector_prompt_prefers_foundations_and_allows_one_listed_component() -
     )
 
     assert "deeply teaches any one requested component" in user
-    assert "field-wide foundations" in user
+    assert "every distinct educational unit" in user
     assert "whole transcript" in (_system + user).lower()
-    assert "each at least 0.75" in (_system + user)
+    assert "topic_relevance is at least 0.75" in (_system + user)
+    assert "return units across that entire scale" in user.lower()
     assert "unseen visual" in user
     assert "180-second" not in (_system + user)
 
@@ -257,11 +258,7 @@ def test_genetic_drift_callback_end_extends_through_its_explanation() -> None:
     assert clip["uncertainty"] == "medium"
 
 
-@pytest.mark.parametrize(
-    "field",
-    ["informativeness", "topic_relevance", "educational_importance"],
-)
-def test_each_quality_floor_is_independently_hard(field: str) -> None:
+def test_only_topic_relevance_is_a_numeric_hard_gate() -> None:
     segments = [{
         "start": 0.0,
         "end": 12.0,
@@ -270,7 +267,7 @@ def test_each_quality_floor_is_independently_hard(field: str) -> None:
             "reactions of photosynthesis."
         ),
     }]
-    rejected = _proposal().model_copy(update={field: 0.74})
+    rejected = _proposal().model_copy(update={"topic_relevance": 0.74})
     report = gemini_segment._plan_to_report(
         gemini_segment._BoundaryPlan(topics=[rejected]),
         segments,
@@ -279,7 +276,21 @@ def test_each_quality_floor_is_independently_hard(field: str) -> None:
         topic="photosynthesis",
     )
     assert report.clips == []
-    assert report.rejected_reasons == [f"proposal_0:{field}_below_green"]
+    assert report.rejected_reasons == ["proposal_0:topic_relevance_below_green"]
+
+    related = _proposal().model_copy(update={
+        "informativeness": 0.74,
+        "topic_relevance": 0.75,
+        "educational_importance": 0.74,
+    })
+    related_report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[related]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+    assert len(related_report.clips) == 1
 
     accepted = _proposal().model_copy(update={
         "informativeness": 0.75,
