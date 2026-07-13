@@ -120,6 +120,189 @@ def test_lowercase_fragment_uses_previous_unfinished_cue_as_evidence() -> None:
     ) is False
 
 
+def test_live_biology_comparative_question_recovers_its_missing_setup() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 5.0,
+            "text": "How did simple prokaryotic cells become",
+        },
+        {
+            "start": 5.0,
+            "end": 12.0,
+            "text": (
+                "more complicated? This is the theory of endosymbiosis."
+            ),
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        1,
+        1,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 1, None)
+
+
+def test_exact_live_biology_question_tail_never_surfaces_without_full_setup() -> None:
+    texts = [
+        "interesting theory that I just wanted to",
+        "teach you because it is so",
+        "fascinating, which is our ability or our",
+        "effort to try to understand where did",
+        "the eukaryotes come from? What was",
+        "responsible for such a significant",
+        "departure in these cells? Why do some",
+        "cells have such a basic appearance and",
+        "function and another cell type is much",
+        "more complicated? This is the theory of endosymbiosis.",
+    ]
+    segments = [
+        {"start": index * 2.5, "end": (index + 1) * 2.5, "text": text}
+        for index, text in enumerate(texts)
+    ]
+
+    _start, _end, error = G._close_cue_context(
+        segments,
+        9,
+        9,
+        ignore_caption_case=True,
+    )
+
+    assert error == "unresolved_weak_start"
+
+
+def test_live_biology_terminal_contraction_expands_to_complete_clause() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 8.0,
+            "text": "The eukaryotic cell is the type of cell which makes up you.",
+        },
+        {
+            "start": 8.0,
+            "end": 13.0,
+            "text": "All right. Now, let's back up for just a moment. I'd",
+        },
+        {
+            "start": 13.0,
+            "end": 20.0,
+            "text": "like to distinguish prokaryotic cells from eukaryotic cells.",
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        0,
+        1,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 2, None)
+
+
+def test_live_biology_terminal_contraction_finishes_the_following_explanation() -> None:
+    texts = [
+        "The eukaryotic cell is the type of cell which makes up you.",
+        "All right. Now, let's back up for just a moment. I'd",
+        "mentioned the archaea. And the archaea are",
+        "the most unknown and certainly worldwide",
+        "the smallest in abundance. But the archaea basically are",
+        "these small little cells, single cell",
+        "organisms that only live in environments",
+        "where nothing else can live. In other",
+        "words, even bacteria couldn't live here.",
+    ]
+    segments = [
+        {"start": index * 3.0, "end": (index + 1) * 3.0, "text": text}
+        for index, text in enumerate(texts)
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        0,
+        1,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 8, None)
+
+
+def test_comparative_question_without_dependency_evidence_remains_eligible() -> None:
+    segments = [{
+        "start": 0.0,
+        "end": 7.0,
+        "text": "more complicated? This is the theory of endosymbiosis.",
+    }]
+
+    assert G._close_cue_context(
+        segments,
+        0,
+        0,
+        ignore_caption_case=True,
+    ) == (0, 0, None)
+
+
+def test_complete_questions_and_contractions_remain_clean() -> None:
+    clean_questions = [
+        "what is endosymbiosis? It explains organelle origins.",
+        "how do mitochondria retain DNA? Endosymbiosis explains why.",
+        "is endosymbiosis supported by evidence? Yes, several lines support it.",
+        "can prokaryotes live independently? Many species can.",
+    ]
+    for text in clean_questions:
+        assert G._cue_opens_mid_thought_at(
+            [{"text": text}], 0, ignore_caption_case=True
+        ) is False
+
+    assert G._cue_has_weak_end(
+        "I'd like to distinguish prokaryotic cells from eukaryotic cells.",
+        "",
+        ignore_caption_case=True,
+    ) is False
+    assert G._cue_has_weak_end(
+        "The explanation is complete. I'd.",
+        "",
+        ignore_caption_case=True,
+    ) is True
+    for text in (
+        "Can cells regulate ion balance? They can.",
+        "Was the hypothesis correct? It was.",
+        "Would I use this method again? I would.",
+        "The final answer is yes, we can.",
+    ):
+        assert G._cue_has_weak_end(
+            text,
+            "",
+            ignore_caption_case=True,
+        ) is False
+
+
+def test_subject_question_after_unpunctuated_cues_is_not_over_rejected() -> None:
+    segments = [
+        {
+            "start": index * 3.0,
+            "end": (index + 1) * 3.0,
+            "text": "the preceding teaching explanation continues without punctuation",
+        }
+        for index in range(9)
+    ]
+    segments.append({
+        "start": 27.0,
+        "end": 33.0,
+        "text": "cells use ATP for energy? Yes, they do.",
+    })
+
+    assert G._close_cue_context(
+        segments,
+        9,
+        9,
+        ignore_caption_case=True,
+    ) == (9, 9, None)
+
+
 def test_production_gene_clip_includes_the_first_selection_criterion() -> None:
     segments = [
         {

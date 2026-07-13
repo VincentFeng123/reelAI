@@ -58,6 +58,10 @@ _DANGLING_TAIL_PREFIX_RE = re.compile(
     r"(?:(?:[Uu]m+|[Uu]h+|[Ww]ell)[, ]+)?"
     r"(?:[Ii]t|[Tt]his|[Tt]hat|[Tt]hey|[Tt]hese|[Tt]hose|[Hh]e|[Ss]he)\b"
 )
+_OPENING_COMPARATIVE_FRAGMENT_RE = re.compile(
+    r"^\s*(?:much\s+)?(?:more|less)\s+[a-z][a-z'-]*\?(?:\s+|$)",
+    re.IGNORECASE,
+)
 _TERMINAL_CALLBACK_RE = re.compile(
     r"(?:^|[.!?]\s+)(?:look|think|go|turn|refer) back (?:at|to)\b[^.!?]*[.!?]?\s*$",
     re.IGNORECASE,
@@ -65,6 +69,11 @@ _TERMINAL_CALLBACK_RE = re.compile(
 _TERMINAL_DANGLING_TRANSITION_RE = re.compile(
     r"(?:^|[.!?]\s+)(?:all\s+right\s*[,;:]?\s*)?"
     r"let(?:['’]?s|\s+us)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_INCOMPLETE_SUBJECT_RE = re.compile(
+    r"\b(?:i|we|you|he|she|it|they|this|that)['’](?:d|ll|m|re|s|ve)"
+    r"[.!?]?\s*$",
     re.IGNORECASE,
 )
 _TRAILING_FORWARD_SETUP_RE = re.compile(
@@ -93,6 +102,14 @@ _VAMPIRE_PSEUDOSCIENCE_SIGNAL_RE = re.compile(
     r"visual cortex|crucifix|dark entit\w*)\b",
     re.IGNORECASE,
 )
+_STANDALONE_QUESTION_HEADS = frozenset({
+    "what", "how", "why", "where", "when", "which", "who", "whose", "whom",
+    "is", "are", "can", "could", "would", "should", "does", "do", "did",
+    "will", "was", "were", "has", "have", "had",
+})
+_QUESTION_PREFIXES = frozenset({
+    "and", "but", "so", "now", "well", "okay", "ok", "alright",
+})
 _NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 PRODUCTION_PRO_PROFILE = "production_pro_v0"
@@ -854,6 +871,21 @@ def _cue_opens_mid_thought_at(
     )
 
 
+def _cue_begins_standalone_question(text: str) -> bool:
+    words = _toks(text)
+    return bool(
+        words
+        and (
+            words[0] in _STANDALONE_QUESTION_HEADS
+            or (
+                len(words) > 1
+                and words[0] in _QUESTION_PREFIXES
+                and words[1] in _STANDALONE_QUESTION_HEADS
+            )
+        )
+    )
+
+
 def _cue_has_weak_end(
     text: str,
     next_text: str,
@@ -868,6 +900,7 @@ def _cue_has_weak_end(
     if (
         _TERMINAL_CALLBACK_RE.search(raw_text)
         or _TERMINAL_DANGLING_TRANSITION_RE.search(raw_text)
+        or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
     ):
         return True
     if re.search(r"[,;:\-—][\"')\]]*$", raw_text):
@@ -1015,7 +1048,23 @@ def _close_cue_context(
         return start_line, end_line, "unresolved_weak_end"
     suffix_was_trimmed = trimmed_end < end_line
     end_line = trimmed_end
+    force_end_clause_completion = bool(
+        _TERMINAL_INCOMPLETE_SUBJECT_RE.search(
+            str(segments[end_line].get("text") or "").strip()
+        )
+    )
     initial_start = start_line
+    from .sentences import classify_terminator
+
+    force_start_question_setup = bool(
+        start_line > 0
+        and _OPENING_COMPARATIVE_FRAGMENT_RE.search(
+            str(segments[start_line].get("text") or "").strip()
+        )
+        and not classify_terminator(
+            str(segments[start_line - 1].get("text") or "").strip()
+        )
+    )
     if _DANGLING_TAIL_PREFIX_RE.search(
         str(segments[start_line].get("text") or "").strip()
     ):
@@ -1041,7 +1090,12 @@ def _close_cue_context(
     original_start = start_line
     original_end = end_line
     for _ in range(cue_limit):
-        if not _cue_opens_mid_thought_at(
+        if force_start_question_setup and _cue_begins_standalone_question(
+            str(segments[start_line].get("text") or "")
+        ):
+            force_start_question_setup = False
+            break
+        if not force_start_question_setup and not _cue_opens_mid_thought_at(
             segments,
             start_line,
             ignore_caption_case=ignore_caption_case,
@@ -1057,7 +1111,7 @@ def _close_cue_context(
         if movement > _CONTEXT_WINDOW_S + 1e-9:
             break
         start_line = candidate
-    if _cue_opens_mid_thought_at(
+    if force_start_question_setup or _cue_opens_mid_thought_at(
         segments,
         start_line,
         ignore_caption_case=ignore_caption_case,
@@ -1082,13 +1136,16 @@ def _close_cue_context(
         0 if suffix_was_trimmed else max(0, cue_limit - consumed_end_cues)
     )
     for _ in range(end_cue_limit):
+        current_end_text = str(segments[end_line].get("text") or "")
+        if force_end_clause_completion and classify_terminator(current_end_text):
+            force_end_clause_completion = False
         next_text = (
             str(segments[end_line + 1].get("text") or "")
             if end_line + 1 < len(segments)
             else ""
         )
-        if not _cue_has_weak_end(
-            str(segments[end_line].get("text") or ""),
+        if not force_end_clause_completion and not _cue_has_weak_end(
+            current_end_text,
             next_text,
             ignore_caption_case=ignore_caption_case,
         ):
@@ -1117,7 +1174,7 @@ def _close_cue_context(
         final_end_text,
         next_text,
         ignore_caption_case=ignore_caption_case,
-    ):
+    ) or force_end_clause_completion:
         return start_line, end_line, "unresolved_weak_end"
     return start_line, end_line, None
 
