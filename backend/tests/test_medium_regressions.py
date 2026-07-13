@@ -374,6 +374,54 @@ class MediumRegressionTests(unittest.TestCase):
         key_b = service._cache_key(shared_prefix + "second-suffix", "systems", 12)
         self.assertNotEqual(key_a, key_b)
 
+    def test_material_intelligence_uses_only_one_concept_llm_call(self) -> None:
+        service = MaterialIntelligenceService()
+        service.llm_available = True
+        payload = {
+            "concepts": [{
+                "title": "Photosynthesis",
+                "keywords": ["chlorophyll", "calvin cycle"],
+                "summary": "Plants convert light into chemical energy.",
+            }],
+            "objectives": [],
+        }
+        with (
+            mock.patch(
+                "backend.app.services.concepts._extract_concepts_via_llm"
+            ) as duplicate_llm,
+            mock.patch.object(service, "_cached_or_generate", return_value=payload),
+        ):
+            concepts, _objectives = service.extract_concepts_and_objectives(
+                None,
+                "Photosynthesis uses chlorophyll while cellular respiration produces ATP.",
+                max_concepts=6,
+            )
+
+        duplicate_llm.assert_not_called()
+        self.assertEqual(concepts[0]["title"], "Photosynthesis")
+
+    def test_material_intelligence_prompt_rejects_vague_umbrella_concepts(self) -> None:
+        service = MaterialIntelligenceService()
+        captured: dict[str, str] = {}
+
+        def fake_completion(**kwargs):
+            captured["user"] = str(kwargs["user"])
+            return '{"concepts": [], "objectives": []}'
+
+        service.llm_available = True
+        with mock.patch(
+            "backend.app.services.llm_router.chat_completion",
+            side_effect=fake_completion,
+        ):
+            service._generate_payload(
+                "Photosynthesis and cellular respiration exchange energy through ATP.",
+                None,
+                6,
+            )
+
+        self.assertIn("Do not use broad umbrella titles", captured["user"])
+        self.assertIn("Photosynthesis", captured["user"])
+
     def test_material_intelligence_topic_only_seed_is_literal_and_skips_preexpansion(self) -> None:
         service = MaterialIntelligenceService()
         service.client = object()

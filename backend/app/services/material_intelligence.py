@@ -37,7 +37,14 @@ class MaterialIntelligenceService:
                 max_concepts=max_concepts,
             )
 
-        heuristic_concepts = extract_concepts(text, max_concepts=max_concepts)
+        # This service performs the authoritative material-level LLM call below.
+        # Keep the fallback baseline deterministic instead of paying for a second,
+        # sequential concept-extraction request first.
+        heuristic_concepts = extract_concepts(
+            text,
+            max_concepts=max_concepts,
+            use_llm=not self.llm_available,
+        )
         heuristic_objectives = extract_learning_objectives(text, limit=6)
         base_concepts = heuristic_concepts
         base_objectives = heuristic_objectives
@@ -260,7 +267,9 @@ class MaterialIntelligenceService:
             f"Max concepts: {max_concepts}\n"
             "Requirements:\n"
             "- concepts: array of objects {title, keywords, summary}\n"
-            "- Each concept title should be concise and distinct.\n"
+            "- Each concept title should be concise, distinct, and specific to the mechanisms named in the material.\n"
+            "- Do not use broad umbrella titles such as Energy or Biology when the source names a more precise process such as Photosynthesis, Cellular Respiration, or DNA Replication.\n"
+            "- Order concepts by direct support and importance in the supplied material.\n"
             "- keywords should be 3 to 8 specific terms/phrases.\n"
             "- summary should be 1-2 sentences and <= 240 characters.\n"
             "- objectives: array of concise learning outcomes.\n"
