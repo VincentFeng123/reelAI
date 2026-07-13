@@ -456,6 +456,79 @@ def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
     assert clips[0]["search_context"]["deferred_level"] is True
 
 
+def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:carolingian-ligatures",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "history",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "Carolingian minuscule developed in medieval scriptoria under Charlemagne's reforms.",
+            },
+            {
+                "cue_id": "recognition",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "Recognize a Caroline minuscule ligature by the joined letter strokes between adjacent letter forms.",
+            },
+        ],
+    }
+    clip_defaults = {
+        "informativeness": 0.5,
+        "topic_relevance": 0.5,
+        "educational_importance": 0.5,
+        "difficulty": 0.4,
+        "boundary_confidence": 0.9,
+        "is_standalone": True,
+        "prerequisite_ids": [],
+        "uncertainty": "low",
+        "substantive": True,
+    }
+    engine_out = {
+        "clips": [
+            {
+                **clip_defaults,
+                "start": 0.0,
+                "end": 10.0,
+                "cue_ids": ["history"],
+                "selection_candidate_id": "history",
+                "directly_teaches_topic": False,
+                "topic_evidence_quote": (
+                    "Carolingian minuscule developed in medieval scriptoria under Charlemagne's reforms"
+                ),
+            },
+            {
+                **clip_defaults,
+                "start": 10.0,
+                "end": 20.0,
+                "cue_ids": ["recognition"],
+                "selection_candidate_id": "recognition",
+                "directly_teaches_topic": True,
+                "topic_evidence_quote": (
+                    "Recognize a Caroline minuscule ligature by the joined letter strokes"
+                ),
+            },
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    topic = "Carolingian minuscule ligature identification"
+    video = {**_video(), "_topic_terms": [topic], "_knowledge_level": "beginner"}
+
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(video, topic, "en")
+
+    assert [clip["selection_candidate_id"] for clip in clips] == [
+        "dQw4w9WgXcQ::recognition"
+    ]
+
+
 @pytest.mark.parametrize(
     ("knowledge_level", "expected_start"),
     [("beginner", 0.0), ("advanced", 10.0)],

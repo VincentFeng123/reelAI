@@ -312,7 +312,10 @@ def _topic_rule(topic: str) -> str:
         "the requested subject, not when it merely names the subject, course, institution, "
         "or speaker. When the topic names multiple linked ideas, the span must explain the "
         "requested relationship or application between those ideas; teaching only one "
-        "component or a nearby prerequisite is not a direct match."
+        "component or a nearby prerequisite is not a direct match. When the topic requests "
+        "identification, recognition, diagnosis, derivation, comparison, or application, "
+        "the span must teach or perform that task for the named object; its history or "
+        "definition alone is not a direct match."
     )
 
 

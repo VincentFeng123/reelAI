@@ -15,6 +15,7 @@ const MAX_MATERIAL_SEEDS = 120;
 const MAX_MATERIAL_GROUPS = 80;
 const MAX_SEED_TEXT_CHARS = 16000;
 const INGEST_SENTINEL_MATERIAL_ID = "ingest-scratch";
+const DEFAULT_KNOWLEDGE_LEVEL = "beginner" as const;
 // Must stay in sync with FEED_SESSION_STORAGE_KEY in src/app/feed/page.tsx — both
 // read/write the same localStorage key. Priming the session snapshot here lets the
 // feed page hydrate with ingested reels on mount instead of submitting a durable
@@ -279,7 +280,6 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
   const touchStartYRef = useRef<number | null>(null);
   const formRef = useRef<HTMLFormElement | null>(null);
   const [topics, setTopics] = useState<string[]>([""]);
-  const [knowledgeLevel, setKnowledgeLevel] = useState<"beginner" | "intermediate" | "advanced">("beginner");
   const [text, setText] = useState("");
   const [file, setFile] = useState<File | undefined>();
   const [reelUrl, setReelUrl] = useState("");
@@ -447,7 +447,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         // must not orphan successfully-created materials for the others —
         // Promise.all rejects the whole batch and would do exactly that.
         const settled = await Promise.allSettled(
-          topicList.map((topic) => uploadMaterial({ subjectTag: topic, knowledgeLevel, signal: controller.signal })),
+          topicList.map((topic) => uploadMaterial({ subjectTag: topic, knowledgeLevel: DEFAULT_KNOWLEDGE_LEVEL, signal: controller.signal })),
         );
         if (controller.signal.aborted) {
           return;
@@ -478,7 +478,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
           text: textValue || undefined,
           file: fileValue,
           subjectTag: topicValue || undefined,
-          knowledgeLevel: inputMode === "topic" ? knowledgeLevel : undefined,
+          knowledgeLevel: inputMode === "topic" ? DEFAULT_KNOWLEDGE_LEVEL : undefined,
           signal: controller.signal,
         });
         if (controller.signal.aborted) {
@@ -572,7 +572,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         setLoading(false);
       }
     }
-  }, [active, file, inputMode, knowledgeLevel, onMaterialCreated, reelUrl, router, text, topics]);
+  }, [active, file, inputMode, onMaterialCreated, reelUrl, router, text, topics]);
 
   const onFileDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
@@ -832,27 +832,6 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
           </>
         ) : null}
       </div>
-
-      {inputMode === "topic" ? (
-        <div className="relative z-20 mt-3 flex gap-2" role="radiogroup" aria-label="How well do you know this topic?">
-          {(["beginner", "intermediate", "advanced"] as const).map((level) => (
-            <button
-              key={level}
-              type="button"
-              role="radio"
-              aria-checked={knowledgeLevel === level}
-              onClick={() => setKnowledgeLevel(level)}
-              className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition-colors duration-200 ${
-                knowledgeLevel === level
-                  ? "bg-white text-black"
-                  : "border border-white/15 bg-white/[0.08] text-white/70 hover:text-white"
-              }`}
-            >
-              {level.charAt(0).toUpperCase() + level.slice(1)}
-            </button>
-          ))}
-        </div>
-      ) : null}
 
       <div className="relative z-20 mt-6 shrink-0 flex flex-col gap-2 md:mt-6">
         <p className="min-h-5 text-sm text-white/80">{error ?? ""}</p>

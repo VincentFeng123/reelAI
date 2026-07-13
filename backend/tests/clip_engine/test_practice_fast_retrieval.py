@@ -289,6 +289,22 @@ def test_bootstrap_query_does_not_duplicate_equivalent_qualifier(topic, level):
     assert search._difficulty_bootstrap_query(topic, level) == topic
 
 
+@pytest.mark.parametrize(
+    ("topic", "expected"),
+    [
+        (
+            "Carolingian minuscule ligature identification",
+            "Carolingian minuscule ligature",
+        ),
+        ("identification of Carolingian minuscule ligatures", None),
+        ("ligature identification", None),
+        ("renormalization group in quantum chromodynamics", None),
+    ],
+)
+def test_niche_bootstrap_backoff_removes_only_trailing_search_intent(topic, expected):
+    assert search._niche_bootstrap_backoff_query(topic) == expected
+
+
 def test_bootstrap_searches_qualified_query_without_gemini_and_preserves_raw_topic(monkeypatch):
     calls = []
 
@@ -324,6 +340,124 @@ def test_bootstrap_searches_qualified_query_without_gemini_and_preserves_raw_top
     assert result["topic_terms"] == ["quantum physics"]
     assert result["queries"] == ["quantum physics for beginners"]
     assert [video["id"] for video in result["videos"]] == ["matched"]
+
+
+def test_bootstrap_searches_bounded_niche_backoff_without_changing_topic_identity(monkeypatch):
+    calls = []
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        calls.append(list(queries))
+        if len(calls) == 1:
+            return {
+                "per_query": [
+                    {
+                        "query": queries[0],
+                        "videos": [
+                            {"id": "popular-adjacent", "title": "Cursive handwriting", "view_count": 9_000_000},
+                        ],
+                    }
+                ],
+                "credits_used": 1,
+                "warning": None,
+            }
+        return {
+            "per_query": [
+                {
+                    "query": queries[0],
+                    "videos": [
+                        {"id": "direct-1", "title": "Carolingian minuscule ligatures"},
+                        {"id": "direct-2", "title": "Reading Carolingian minuscule script"},
+                    ],
+                },
+            ],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda *_args, **_kwargs: pytest.fail("bootstrap retrieval must not invoke Gemini"),
+    )
+
+    result = search.discover_practice_fast(
+        "Carolingian minuscule ligature identification",
+        limit=3,
+        level="beginner",
+        retrieval_profile="bootstrap",
+    )
+
+    assert calls == [
+        ["Carolingian minuscule ligature identification for beginners"],
+        ["Carolingian minuscule ligature for beginners"],
+    ]
+    assert result["corrected"] == "Carolingian minuscule ligature identification"
+    assert result["topic_terms"] == ["Carolingian minuscule ligature identification"]
+    assert result["queries"] == [calls[0][0], calls[1][0]]
+    assert result["credits_used"] == 2
+    assert [video["id"] for video in result["videos"]] == [
+        "direct-1",
+        "direct-2",
+        "popular-adjacent",
+    ]
+
+
+def test_bootstrap_strong_exact_pool_skips_niche_backoff(monkeypatch):
+    calls = []
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        calls.append(list(queries))
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{"id": "direct", "title": "Identifying Carolingian minuscule ligatures"}],
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        "Carolingian minuscule ligature identification",
+        limit=3,
+        level="beginner",
+        retrieval_profile="bootstrap",
+    )
+
+    assert calls == [["Carolingian minuscule ligature identification for beginners"]]
+    assert [video["id"] for video in result["videos"]] == ["direct"]
+
+
+def test_bootstrap_reserves_raw_fallback_before_niche_recovery(monkeypatch):
+    calls = []
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        calls.append(list(queries))
+        videos = [] if len(calls) < 3 else [{"id": "too-late"}]
+        return {
+            "per_query": [{"query": queries[0], "videos": videos}],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+
+    result = search.discover_practice_fast(
+        "Carolingian minuscule ligature identification",
+        limit=3,
+        breadth=2,
+        level="beginner",
+        retrieval_profile="bootstrap",
+    )
+
+    assert calls == [
+        ["Carolingian minuscule ligature identification for beginners"],
+        ["Carolingian minuscule ligature identification"],
+    ]
+    assert result["videos"] == []
+    assert result["credits_used"] == 2
 
 
 def test_bootstrap_retries_raw_topic_once_when_qualified_results_are_ineligible(monkeypatch):

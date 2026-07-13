@@ -685,6 +685,16 @@ def test_boundary_prompt_includes_learner_level_and_rejects_course_framing():
     assert "merely names the subject" in user
 
 
+def test_boundary_prompt_requires_the_requested_identification_task():
+    _system, user = G._boundary_prompts(
+        "[0] 00:00 Joined letter strokes reveal the ligature form.",
+        1,
+        topic="Carolingian minuscule ligature identification",
+    )
+    assert "identification, recognition, diagnosis" in user
+    assert "history or definition alone is not a direct match" in user
+
+
 def _selection_task_tail(user: str) -> str:
     return user[user.index("Based on the preceding transcript"):]
 

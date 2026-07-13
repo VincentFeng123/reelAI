@@ -31,6 +31,10 @@ _DIFFICULTY_QUALIFIERS = {
     ),
 }
 
+_NICHE_SEARCH_INTENT_SUFFIX = re.compile(r"(?:^|\s)identification\s*$", re.IGNORECASE)
+_SEARCH_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_SEARCH_STOPWORDS = {"a", "an", "and", "for", "in", "of", "on", "the", "to", "with"}
+
 
 def _difficulty_bootstrap_query(topic: str, level: str | None) -> str:
     """Encode the learner's level once without changing the topic identity."""
@@ -42,6 +46,42 @@ def _difficulty_bootstrap_query(topic: str, level: str | None) -> str:
     if normalized_level == "beginner":
         return f"{literal} for beginners"
     return f"{normalized_level} {literal}"
+
+
+def _niche_bootstrap_backoff_query(topic: str) -> str | None:
+    """Drop only trailing task words when at least two topic terms remain."""
+    literal = " ".join(str(topic or "").split())
+    if len(literal.split()) < 3:
+        return None
+    shortened = literal
+    shortened = _NICHE_SEARCH_INTENT_SUFFIX.sub("", shortened).strip(" ,:;-")
+    if shortened == literal or len(_search_coverage_tokens(shortened)) < 2:
+        return None
+    return shortened
+
+
+def _search_coverage_tokens(text: object) -> set[str]:
+    tokens: set[str] = set()
+    for raw in _SEARCH_TOKEN_RE.findall(str(text or "").casefold()):
+        if raw in _SEARCH_STOPWORDS:
+            continue
+        token = raw[:-1] if len(raw) > 4 and raw.endswith("s") and not raw.endswith("ss") else raw
+        tokens.add(token)
+    return tokens
+
+
+def _bootstrap_pool_has_subject_coverage(result_sets: list[dict], subject: str) -> bool:
+    subject_tokens = _search_coverage_tokens(subject)
+    if len(subject_tokens) < 2:
+        return True
+    for result_set in result_sets:
+        for video in result_set.get("videos") or []:
+            metadata_tokens = _search_coverage_tokens(
+                f"{video.get('title') or ''} {video.get('description') or ''}"
+            )
+            if len(subject_tokens & metadata_tokens) >= 2:
+                return True
+    return False
 
 
 def _request_filters(filters: dict | None, *, prefer_hd: bool) -> dict:
@@ -467,11 +507,43 @@ def discover_practice_fast(
     eligible_initial = [
         video for video in initial_ranked if video.get("id") not in excluded
     ]
+    niche_result = {"per_query": [], "credits_used": 0, "warning": None}
+    niche_provider_order: list[str] = []
+    niche_backoff = _niche_bootstrap_backoff_query(literal_query) if bootstrap else None
+    if (
+        niche_backoff
+        and eligible_initial
+        and len(initial_queries) < query_count
+        and not _bootstrap_pool_has_subject_coverage(per_query, niche_backoff)
+    ):
+        recovery_query = _difficulty_bootstrap_query(niche_backoff, level)
+        recovery_key = " ".join(recovery_query.casefold().split())
+        if recovery_key and recovery_key not in seen_query_keys:
+            seen_query_keys.add(recovery_key)
+            niche_result = supadata_search.search_all(
+                [recovery_query],
+                filters,
+                **search_runtime,
+            )
+            raise_if_cancelled(should_cancel)
+            annotate(niche_result["per_query"])
+            per_query.extend(niche_result["per_query"])
+            initial_queries.append(recovery_query)
+            for result_set in niche_result["per_query"]:
+                for video in result_set.get("videos") or []:
+                    raw_video_id = video.get("id") or video.get("videoId") or video.get("url")
+                    video_id = normalize_youtube_video_id(raw_video_id) or str(raw_video_id or "").strip()
+                    if video_id and video_id not in niche_provider_order:
+                        niche_provider_order.append(video_id)
     if bootstrap:
         fallback_result = {"per_query": [], "credits_used": 0, "warning": None}
         qualified_key = " ".join(initial_queries[0].casefold().split())
         literal_key = " ".join(literal_query.casefold().split())
-        if not eligible_initial and qualified_key != literal_key:
+        if (
+            not eligible_initial
+            and qualified_key != literal_key
+            and len(initial_queries) < query_count
+        ):
             fallback_result = supadata_search.search_all(
                 [literal_query],
                 filters,
@@ -483,6 +555,18 @@ def discover_practice_fast(
             initial_queries.append(literal_query)
 
         ranked = rank.merge_and_rank(per_query, level=level)
+        if niche_provider_order:
+            ranked_by_id = {str(video.get("id") or ""): video for video in ranked}
+            preferred = [
+                ranked_by_id[video_id]
+                for video_id in niche_provider_order
+                if video_id in ranked_by_id
+            ]
+            preferred_ids = {str(video.get("id") or "") for video in preferred}
+            ranked = [
+                *preferred,
+                *[video for video in ranked if str(video.get("id") or "") not in preferred_ids],
+            ]
         top_n = max(0, int(limit))
         videos = [
             video for video in ranked if video.get("id") not in excluded
@@ -497,9 +581,14 @@ def discover_practice_fast(
             "videos": videos,
             "credits_used": (
                 int(initial.get("credits_used") or 0)
+                + int(niche_result.get("credits_used") or 0)
                 + int(fallback_result.get("credits_used") or 0)
             ),
-            "warning": fallback_result.get("warning") or initial.get("warning"),
+            "warning": (
+                fallback_result.get("warning")
+                or niche_result.get("warning")
+                or initial.get("warning")
+            ),
             "query_plan": query_plan,
         }
 

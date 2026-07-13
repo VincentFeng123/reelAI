@@ -14,42 +14,11 @@ const sourceFile = ts.createSourceFile(
   ts.ScriptKind.TSX,
 );
 
-test("level changes invalidate active generation before loading the new feed", () => {
-  let cycleLevelCallback;
-
-  function visit(node) {
-    if (
-      ts.isVariableDeclaration(node)
-      && ts.isIdentifier(node.name)
-      && node.name.text === "cycleLevel"
-      && node.initializer
-      && ts.isCallExpression(node.initializer)
-      && node.initializer.expression.getText(sourceFile) === "useCallback"
-    ) {
-      cycleLevelCallback = node.initializer;
-      return;
-    }
-    ts.forEachChild(node, visit);
-  }
-
-  visit(sourceFile);
-  assert.ok(cycleLevelCallback, "cycleLevel must remain discoverable");
-  const callbackText = cycleLevelCallback.arguments[0].getText(sourceFile);
-  const updateIndex = callbackText.indexOf("await updateMaterialLevel(");
-  const renewIndex = callbackText.indexOf("renewActiveSearchScope();");
-  const labelIndex = callbackText.indexOf("setKnowledgeLevel(");
-  const loadIndex = callbackText.indexOf("await loadPage(1");
-  assert.ok(updateIndex >= 0, "cycleLevel must persist the new level");
-  assert.ok(renewIndex > updateIndex, "the search scope must renew after the level update succeeds");
-  assert.ok(labelIndex > renewIndex, "old generation work must be invalidated before the level label changes");
-  assert.ok(loadIndex > labelIndex, "the new-level feed must load after the label changes");
-
-  const dependencies = cycleLevelCallback.arguments[1];
-  assert.ok(dependencies && ts.isArrayLiteralExpression(dependencies));
-  assert.ok(
-    dependencies.elements.some((element) => element.getText(sourceFile) === "renewActiveSearchScope"),
-    "cycleLevel must track the scope renewal callback",
-  );
+test("learner level remains internal and has no manual feed control", () => {
+  assert.match(source, /const \[knowledgeLevel, setKnowledgeLevel\] = useState/);
+  assert.doesNotMatch(source, /const cycleLevel =/);
+  assert.doesNotMatch(source, /updateMaterialLevel/);
+  assert.doesNotMatch(source, /Change knowledge level/);
 });
 
 test("generation finals cannot reconcile after their search scope is invalidated", () => {
@@ -127,7 +96,7 @@ test("progress copy reports stages instead of a fabricated requested total", () 
   assert.doesNotMatch(source, /reels ready`/);
 });
 
-test("automatic promotion invalidates old-level generation before changing the label", () => {
+test("automatic promotion invalidates old-level generation before changing the inventory", () => {
   const rerankStart = source.indexOf("const rerankUnseenTail = useCallback(async () => {");
   const rerankEnd = source.indexOf("const reportActiveReelProgress", rerankStart);
   assert.ok(rerankStart >= 0 && rerankEnd > rerankStart);
@@ -139,5 +108,7 @@ test("automatic promotion invalidates old-level generation before changing the l
   assert.ok(promotionGuard >= 0, "server-selected promotions must be detected");
   assert.ok(clearIndex > promotionGuard, "old durable-job tracking must be cleared");
   assert.ok(renewIndex > clearIndex, "the old search scope must be invalidated");
-  assert.ok(labelIndex > renewIndex, "the promoted label must only appear after stale generation is aborted");
+  assert.ok(labelIndex > renewIndex, "the promoted inventory level must only change after stale generation is aborted");
+  assert.doesNotMatch(source, /Change knowledge level/);
+  assert.doesNotMatch(source, /auto-adjusting/);
 });
