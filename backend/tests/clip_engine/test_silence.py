@@ -68,6 +68,7 @@ def test_verified_edges_preserve_required_quiet_cushions(tmp_path: Path) -> None
     assert result.end_sec == 20.2
     assert result.diagnostics["start_quiet"] == [9.7, 10.1]
     assert result.diagnostics["end_quiet"] == [20.0, 20.3]
+    assert result.diagnostics["threshold_dbfs"] == -38.0
     assert result.diagnostics["start_cushion_ms"] == 100
     assert result.diagnostics["end_cushion_ms"] == 200
 
@@ -92,7 +93,7 @@ def test_final_cue_can_extend_into_measured_end_silence(tmp_path: Path) -> None:
     assert result.diagnostics["end_shift_sec"] == 0.2
 
 
-def test_background_noise_uses_bounded_adaptive_quiet_threshold(tmp_path: Path) -> None:
+def test_background_noise_above_required_threshold_is_unavailable(tmp_path: Path) -> None:
     start_wav = tmp_path / "noisy-start.wav"
     end_wav = tmp_path / "noisy-end.wav"
     _write_wav(start_wav, [(2.7, 12000), (0.40, 1000), (2.90, 12000)])
@@ -106,10 +107,8 @@ def test_background_noise_uses_bounded_adaptive_quiet_threshold(tmp_path: Path) 
             "dQw4w9WgXcQ", 10.0, 20.0, prepared=_prepared()
         )
 
-    assert result.verified
-    assert result.diagnostics["adaptive_quiet"] is True
-    assert result.diagnostics["start_threshold_dbfs"] == -24.0
-    assert result.diagnostics["end_threshold_dbfs"] == -24.0
+    assert result.status == "unavailable"
+    assert result.diagnostics["reason"] == "start_silence_not_found"
 
 
 def test_missing_start_silence_is_unavailable_and_keeps_original_range(tmp_path: Path) -> None:

@@ -98,6 +98,8 @@ _INTERROGATIVE_FORMS = frozenset({
     "is", "are", "can", "could", "would", "should", "does", "do", "did", "will",
 })
 
+_FRAMING_WINDOW_WORDS = 20
+
 
 def _words(text: str) -> list[str]:
     return _WORD_RE.findall(text or "")
@@ -106,9 +108,18 @@ def _words(text: str) -> list[str]:
 def _is_framing_or_question(text: str, words: list[str]) -> bool:
     """A leading marker is fine when the sentence stands on its own as new framing/a question."""
     low = (text or "").lower()
-    if "?" in low:
+    opening_match = re.match(r"^([^.!?]*)([.!?]?)", low, re.DOTALL)
+    opening_text = opening_match.group(1) if opening_match else low
+    opening_terminator = opening_match.group(2) if opening_match else ""
+    opening_words = list(_WORD_RE.finditer(opening_text))
+    if (
+        opening_terminator == "?"
+        and len(opening_words) <= _FRAMING_WINDOW_WORDS
+    ):
         return True
-    if any(pat in low for pat in _FRAMING_PATTERNS):
+    if len(opening_words) > _FRAMING_WINDOW_WORDS:
+        opening_text = opening_text[:opening_words[_FRAMING_WINDOW_WORDS - 1].end()]
+    if any(pat in opening_text for pat in _FRAMING_PATTERNS):
         return True
     # A question that lost its '?' in ASR: starts with a pure interrogative word.
     if words and words[0].lower() in _INTERROGATIVE_WORDS:

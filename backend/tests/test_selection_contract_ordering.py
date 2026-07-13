@@ -389,12 +389,36 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
     def test_production_feed_requires_measured_acoustic_verification(self) -> None:
         states = [
-            ("missing", "", None),
-            ("caption", "caption_aligned", False),
-            ("legacy-verified", "verified", False),
-            ("acoustic-verified", "verified", True),
+            ("missing", "", {"acoustic_verified": None}),
+            ("caption", "caption_aligned", {"acoustic_verified": False}),
+            ("unverified", "verified", {"acoustic_verified": False}),
+            ("legacy-verified", "verified", {"acoustic_verified": True}),
+            (
+                "adaptive-verified",
+                "verified",
+                {
+                    "acoustic_verified": True,
+                    "acoustic": {
+                        "adaptive_quiet": True,
+                        "start_threshold_dbfs": -24.0,
+                        "end_threshold_dbfs": -38.0,
+                    },
+                },
+            ),
+            (
+                "strict-verified",
+                "verified",
+                {
+                    "acoustic_verified": True,
+                    "acoustic": {
+                        "threshold_dbfs": -38.0,
+                        "start_threshold_dbfs": -38.0,
+                        "end_threshold_dbfs": -38.0,
+                    },
+                },
+            ),
         ]
-        for index, (reel_id, boundary_status, acoustic_verified) in enumerate(states):
+        for index, (reel_id, boundary_status, boundary_diagnostics) in enumerate(states):
             self._insert_versioned_reel(
                 reel_id=reel_id,
                 video_id="video-a",
@@ -410,9 +434,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             context.update({
                 "surface_eligible": True,
                 "boundary_status": boundary_status,
-                "boundary_diagnostics": {
-                    "acoustic_verified": acoustic_verified,
-                },
+                "boundary_diagnostics": boundary_diagnostics,
             })
             self.conn.execute(
                 "UPDATE reels SET search_context_json = ? WHERE id = ?",
@@ -422,8 +444,8 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ranked = self._ranked(require_verified_boundaries=True)
 
         self.assertEqual(
-            [item["reel_id"] for item in ranked],
-            ["acoustic-verified"],
+            {item["reel_id"] for item in ranked},
+            {"strict-verified"},
         )
 
     def test_level_mismatched_verified_clip_waits_in_storage_until_ready(self) -> None:
@@ -443,7 +465,10 @@ class SelectionContractOrderingTests(unittest.TestCase):
             "surface_reason": "level_mismatch",
             "deferred_level": True,
             "boundary_status": "verified",
-            "boundary_diagnostics": {"acoustic_verified": True},
+            "boundary_diagnostics": {
+                "acoustic_verified": True,
+                "acoustic": {"threshold_dbfs": -38.0},
+            },
         })
         self.conn.execute(
             "UPDATE reels SET search_context_json = ? WHERE id = 'advanced-reservoir'",
@@ -513,7 +538,10 @@ class SelectionContractOrderingTests(unittest.TestCase):
             context.update({
                 **updates,
                 "boundary_status": "verified",
-                "boundary_diagnostics": {"acoustic_verified": True},
+                "boundary_diagnostics": {
+                    "acoustic_verified": True,
+                    "acoustic": {"threshold_dbfs": -38.0},
+                },
             })
             self.conn.execute(
                 "UPDATE reels SET search_context_json = ? WHERE id = ?",

@@ -459,12 +459,12 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_13(self) -> None:
-        """Cache rows must include adaptation, full captions, and semantic gates."""
+    def test_ranked_feed_cache_version_is_14(self) -> None:
+        """Cache rows must include adaptation, semantic, and strict acoustic gates."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            13,
-            "Current feeds must not reuse stale pre-caption or pre-semantic-gate rows.",
+            14,
+            "Current feeds must not reuse stale pre-acoustic-gate rows.",
         )
 
 

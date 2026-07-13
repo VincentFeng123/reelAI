@@ -1188,6 +1188,11 @@ class IngestionPipeline:
         audio_preparation_futures: dict[str, Any] = {}
         prepared_audio_results: dict[str, Any] = {}
         acoustic_phase_deadlines: dict[str, float] = {}
+        acoustic_phase_timeout_sec = (
+            clip_engine_silence.DEFAULT_TIMEOUT_SEC
+            if retrieval_profile == "bootstrap"
+            else clip_engine_silence.DEEP_PHASE_TIMEOUT_SEC
+        )
         enrichment_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="clip-enrichment")
             if generation_context is not None and retrieval_profile == "deep"
@@ -1358,7 +1363,7 @@ class IngestionPipeline:
             source_key = str(v.get("id") or "")
             return acoustic_phase_deadlines.setdefault(
                 source_key,
-                time.monotonic() + clip_engine_silence.DEFAULT_TIMEOUT_SEC,
+                time.monotonic() + acoustic_phase_timeout_sec,
             )
 
         def prepared_audio_for(v: dict[str, Any]):

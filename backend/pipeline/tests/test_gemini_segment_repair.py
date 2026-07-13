@@ -212,6 +212,80 @@ def test_production_anaphoric_question_is_rejected_without_its_antecedent() -> N
     assert (start, end, error) == (1, 1, "unresolved_weak_start")
 
 
+def test_plan_rejects_live_biology_cue_despite_later_framing_sentence() -> None:
+    segments = [
+        {
+            "cue_id": "tZE_fQFK8EY:cue:12",
+            "start": 350.0,
+            "end": 360.0,
+            "text": "The previous section closes before a long pause.",
+        },
+        {
+            "cue_id": "tZE_fQFK8EY:cue:13",
+            "start": 392.934,
+            "end": 423.0,
+            "text": (
+                "And at the same time, some of these traits can be found in "
+                "non-living things, too. Viruses complicate the definition of "
+                "life. Let's head to the Thought Bubble."
+            ),
+        },
+    ]
+    proposal = _topic(1, 1, title="biology").model_copy(update={
+        "start_quote": "And at the same time",
+        "end_quote": "Let's head to the Thought Bubble",
+        "topic_evidence_quote": "Viruses complicate the definition of life",
+    })
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="biology",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:unresolved_weak_start"]
+
+
+def test_plan_rejects_long_unpunctuated_biology_cue_with_late_framing() -> None:
+    segments = [
+        {
+            "cue_id": "tZE_fQFK8EY:cue:12",
+            "start": 350.0,
+            "end": 360.0,
+            "text": "The previous section closes before a long pause.",
+        },
+        {
+            "cue_id": "tZE_fQFK8EY:cue:13",
+            "start": 392.934,
+            "end": 423.0,
+            "text": (
+                "And at the same time some of these traits can be found in non "
+                "living things too which makes the definition complicated before "
+                "we eventually lets head to the thought bubble"
+            ),
+        },
+    ]
+    proposal = _topic(1, 1, title="biology").model_copy(update={
+        "start_quote": "And at the same time",
+        "end_quote": "head to the thought bubble",
+        "topic_evidence_quote": "these traits can be found in non living things",
+    })
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="biology",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:unresolved_weak_start"]
+
+
 def test_production_end_extends_into_following_gerund_explanation() -> None:
     segments = [
         {
@@ -261,6 +335,214 @@ def test_production_end_extends_into_short_auxiliary_continuation() -> None:
     )
 
     assert (start, end, error) == (0, 1, None)
+
+
+def test_production_terminal_dangling_transition_is_trimmed_or_rejected() -> None:
+    segments = [
+        {
+            "start": 309.45,
+            "end": 393.0,
+            "text": (
+                "After deletion all leaves must remain at the same level and the "
+                "tree must satisfy all the B+ tree properties."
+            ),
+        },
+        {
+            "start": 393.0,
+            "end": 399.89,
+            "text": "All right, let's",
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        0,
+        1,
+        ignore_caption_case=True,
+    )
+    assert (start, end, error) == (0, 0, None)
+
+    start, end, error = G._close_cue_context(
+        segments,
+        1,
+        1,
+        ignore_caption_case=True,
+    )
+    assert (start, end, error) == (1, 1, "unresolved_weak_end")
+
+    inside_last_cue = [{
+        "start": 309.45,
+        "end": 399.89,
+        "text": (
+            "After deletion all leaves must remain at the same level and the "
+            "tree must satisfy all the B+ tree properties. All right, let's"
+        ),
+    }]
+    start, end, error = G._close_cue_context(
+        inside_last_cue,
+        0,
+        0,
+        ignore_caption_case=True,
+    )
+    assert (start, end, error) == (0, 0, "unresolved_weak_end")
+
+
+def test_production_trailing_forward_setup_is_trimmed_to_complete_teaching() -> None:
+    segments = [
+        {
+            "start": 495.33,
+            "end": 540.0,
+            "text": (
+                "A B-tree deletion can redistribute a key from a neighboring sibling."
+            ),
+        },
+        {
+            "start": 540.0,
+            "end": 568.0,
+            "text": (
+                "So this works, as long as we have a sibling we can take from."
+            ),
+        },
+        {
+            "start": 568.0,
+            "end": 583.0,
+            "text": (
+                "But what happens if both of our sibling nodes are already at minimum?"
+            ),
+        },
+        {
+            "start": 583.0,
+            "end": 594.32,
+            "text": "Now we can't take from a sibling.",
+        },
+        {
+            "start": 594.32,
+            "end": 606.0,
+            "text": "Instead, we merge the node with a sibling and pull down a key.",
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        0,
+        3,
+        ignore_caption_case=True,
+    )
+    assert (start, end, error) == (0, 1, None)
+
+    start, end, error = G._close_cue_context(
+        segments,
+        2,
+        3,
+        ignore_caption_case=True,
+    )
+    assert (start, end, error) == (2, 4, None)
+
+
+def test_unpunctuated_prefix_expands_into_following_solution() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 8.0,
+            "text": "A pivot row with zero cannot be used as the divisor",
+        },
+        {
+            "start": 8.0,
+            "end": 14.0,
+            "text": "But what happens if the pivot is zero?",
+        },
+        {
+            "start": 14.0,
+            "end": 19.0,
+            "text": "Now we can't divide by that pivot.",
+        },
+        {
+            "start": 19.0,
+            "end": 27.0,
+            "text": "Instead, swap rows and continue Gaussian elimination.",
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        0,
+        2,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 3, None)
+
+
+def test_plan_regrounds_metadata_after_trimming_a_forward_setup() -> None:
+    segments = [
+        {
+            "cue_id": "K1a2Bk8NrYQ:cue:110",
+            "start": 540.0,
+            "end": 568.0,
+            "text": "A B-tree can borrow a key from its sibling to restore balance.",
+        },
+        {
+            "cue_id": "K1a2Bk8NrYQ:cue:111",
+            "start": 568.0,
+            "end": 594.32,
+            "text": (
+                "But what happens if both siblings are already at minimum? "
+                "Now we can't take from a sibling."
+            ),
+        },
+        {
+            "cue_id": "K1a2Bk8NrYQ:cue:113",
+            "start": 594.32,
+            "end": 606.0,
+            "text": "Instead, merge the node with a sibling and pull down a key.",
+        },
+    ]
+    proposal = _topic(0, 1, title="When borrowing fails, merge nodes").model_copy(update={
+        "start_quote": "A B-tree can borrow a key",
+        "end_quote": "can't take from a sibling",
+        "learning_objective": "Explain how a merge resolves an underfull node.",
+        "facet": "merge operation",
+        "reason": "Shows why the underfull node must merge with a sibling.",
+        "topic_evidence_quote": (
+            "A B-tree can borrow a key from its sibling"
+        ),
+    })
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="B-tree deletion rebalancing",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["_clip_text"] == segments[0]["text"]
+    assert clip["cue_ids"] == ["K1a2Bk8NrYQ:cue:110"]
+    assert clip["_quote_repaired"] is True
+    for field in ("title", "learning_objective", "facet", "reason"):
+        assert "merge" not in clip[field].lower()
+        assert G._text_has_grounding(clip[field], clip["_clip_text"])
+
+
+def test_complete_cannot_explanation_is_not_mistaken_for_a_forward_setup() -> None:
+    segments = [{
+        "start": 0.0,
+        "end": 8.0,
+        "text": (
+            "What happens if the denominator is zero? We can't divide by zero."
+        ),
+    }]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        0,
+        0,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 0, None)
 
 
 def test_dirty_edges_use_one_localized_low_thinking_flash_batch(monkeypatch):

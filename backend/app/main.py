@@ -135,6 +135,7 @@ from .clip_engine.provider_runtime import GenerationContext, ProviderUsageRecord
 from .clip_engine.clipper.supadata_client import fetch_transcript_artifact
 from .clip_engine.supadata_search import search_one as supadata_search_one
 from .clip_engine.metadata import canonicalize_youtube_url
+from .clip_engine.silence import persisted_boundary_is_verified
 from .ingestion.models import (
     IngestFeedRequest,
     IngestFeedResult,
@@ -2557,14 +2558,7 @@ def _shape_reels_for_request_context(
 
 
 def _search_context_has_verified_acoustic_boundary(context: Any) -> bool:
-    if not isinstance(context, dict):
-        return False
-    diagnostics = context.get("boundary_diagnostics")
-    return bool(
-        str(context.get("boundary_status") or "").strip().lower() == "verified"
-        and isinstance(diagnostics, dict)
-        and diagnostics.get("acoustic_verified") is True
-    )
+    return persisted_boundary_is_verified(context)
 
 
 def _count_generation_reels(conn, generation_id: str) -> int:
@@ -2584,16 +2578,17 @@ def _count_generation_reels(conn, generation_id: str) -> int:
             context = json.loads(str(row.get("search_context_json") or "{}"))
         except (TypeError, json.JSONDecodeError):
             context = {}
-        if isinstance(context, dict):
-            surface_eligible = context.get("surface_eligible", True)
-            if isinstance(surface_eligible, str):
-                surface_eligible = surface_eligible.strip().lower() in {
-                    "1", "true", "yes", "on",
-                }
-            if not surface_eligible:
-                continue
-            if not _search_context_has_verified_acoustic_boundary(context):
-                continue
+        if not isinstance(context, dict):
+            continue
+        surface_eligible = context.get("surface_eligible", True)
+        if isinstance(surface_eligible, str):
+            surface_eligible = surface_eligible.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        if not surface_eligible:
+            continue
+        if not _search_context_has_verified_acoustic_boundary(context):
+            continue
         count += 1
     return count
 

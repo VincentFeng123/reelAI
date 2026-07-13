@@ -39,6 +39,7 @@ from ..clip_engine.metadata import extract_video_id as _extract_embed_video_id
 from ..clip_engine.metadata import normalize_youtube_video_id
 from ..clip_engine.provider_cache import validate_transcript_payload
 from ..clip_engine.provider_runtime import GenerationContext
+from ..clip_engine.silence import persisted_boundary_is_verified
 from .segmenter import (
     SegmentMatch,
     TranscriptChunk,
@@ -1198,7 +1199,8 @@ class ReelService:
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
     # v13: full caption text and the current transcript-semantic surfaceability
     # gates must be recomputed instead of replaying pre-gate cached rows.
-    RANKED_FEED_CACHE_VERSION = 13
+    # v14: discard rows accepted only by the retired -24 dBFS adaptive verifier.
+    RANKED_FEED_CACHE_VERSION = 14
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -5507,10 +5509,8 @@ class ReelService:
             operational["_selection_boundary_status"] = str(
                 parsed.get("boundary_status") or ""
             ).strip().lower()
-            boundary_diagnostics = parsed.get("boundary_diagnostics")
-            operational["_selection_acoustic_verified"] = bool(
-                isinstance(boundary_diagnostics, dict)
-                and boundary_diagnostics.get("acoustic_verified") is True
+            operational["_selection_acoustic_verified"] = (
+                persisted_boundary_is_verified(parsed)
             )
             operational["_selection_surface_reason"] = str(
                 parsed.get("surface_reason") or ""
@@ -5559,10 +5559,8 @@ class ReelService:
         metadata["_selection_boundary_status"] = str(
             parsed.get("boundary_status") or ""
         ).strip().lower()
-        boundary_diagnostics = parsed.get("boundary_diagnostics")
-        metadata["_selection_acoustic_verified"] = bool(
-            isinstance(boundary_diagnostics, dict)
-            and boundary_diagnostics.get("acoustic_verified") is True
+        metadata["_selection_acoustic_verified"] = persisted_boundary_is_verified(
+            parsed
         )
         metadata["_selection_surface_reason"] = str(
             parsed.get("surface_reason") or ""

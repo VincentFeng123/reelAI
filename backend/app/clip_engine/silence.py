@@ -33,10 +33,10 @@ VerificationStatus = Literal["verified", "unavailable"]
 PreparationStatus = Literal["ready", "unavailable"]
 
 DEFAULT_TIMEOUT_SEC = 20.0
+DEEP_PHASE_TIMEOUT_SEC = 45.0
 DEFAULT_PREPARE_TIMEOUT_SEC = 32.0
 EDGE_WINDOW_SEC = 6.0
 QUIET_THRESHOLD_DBFS = -38.0
-ADAPTIVE_QUIET_THRESHOLD_DBFS = -24.0
 MIN_QUIET_MS = 120
 START_CUSHION_MS = 100
 END_CUSHION_MS = 200
@@ -106,6 +106,51 @@ class _Unavailable(RuntimeError):
         self.stage = stage
         self.reason = reason
         self.attempt_reasons = tuple(attempt_reasons)
+
+
+def persisted_boundary_is_verified(context: object) -> bool:
+    """Accept only rows with explicit strict energy-threshold evidence.
+
+    Measured energy verification has always persisted its threshold. Missing
+    or malformed threshold evidence therefore fails closed rather than letting
+    a forged/partial legacy row bypass the acoustic gate.
+    """
+    if not isinstance(context, Mapping):
+        return False
+    diagnostics = context.get("boundary_diagnostics")
+    if (
+        str(context.get("boundary_status") or "").strip().lower() != "verified"
+        or not isinstance(diagnostics, Mapping)
+        or diagnostics.get("acoustic_verified") is not True
+    ):
+        return False
+
+    acoustic = diagnostics.get("acoustic")
+    if not isinstance(acoustic, Mapping):
+        return False
+    detail_sets = [acoustic]
+    saw_threshold = False
+    for details in detail_sets:
+        adaptive = details.get("adaptive_quiet")
+        if adaptive is True or (
+            isinstance(adaptive, str)
+            and adaptive.strip().lower() in {"1", "true", "yes", "on"}
+        ):
+            return False
+        for key in ("threshold_dbfs", "start_threshold_dbfs", "end_threshold_dbfs"):
+            if key not in details:
+                continue
+            saw_threshold = True
+            value = details.get(key)
+            if isinstance(value, bool):
+                return False
+            try:
+                threshold = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return False
+            if not math.isfinite(threshold) or threshold > QUIET_THRESHOLD_DBFS:
+                return False
+    return saw_threshold
 
 
 def _is_cancelled(cancel_check: CancelCheck | None) -> bool:
@@ -752,30 +797,6 @@ def verify_acoustic_boundaries(
             )
             start_quiet = _pick_start_interval(start_intervals, original_start)
             end_quiet = _pick_end_interval(end_intervals, original_end)
-            start_threshold_dbfs = QUIET_THRESHOLD_DBFS
-            end_threshold_dbfs = QUIET_THRESHOLD_DBFS
-            if start_quiet is None:
-                start_quiet = _pick_start_interval(
-                    _quiet_intervals(
-                        edge_paths["start"],
-                        absolute_start_sec=start_window,
-                        threshold_dbfs=ADAPTIVE_QUIET_THRESHOLD_DBFS,
-                        min_quiet_ms=MIN_QUIET_MS,
-                    ),
-                    original_start,
-                )
-                start_threshold_dbfs = ADAPTIVE_QUIET_THRESHOLD_DBFS
-            if end_quiet is None:
-                end_quiet = _pick_end_interval(
-                    _quiet_intervals(
-                        edge_paths["end"],
-                        absolute_start_sec=end_window,
-                        threshold_dbfs=ADAPTIVE_QUIET_THRESHOLD_DBFS,
-                        min_quiet_ms=MIN_QUIET_MS,
-                    ),
-                    original_end,
-                )
-                end_threshold_dbfs = ADAPTIVE_QUIET_THRESHOLD_DBFS
             if start_quiet is None:
                 return _unavailable(
                     original_start,
@@ -829,13 +850,6 @@ def verify_acoustic_boundaries(
     diagnostics = {
         "format_id": source.format_id,
         "threshold_dbfs": QUIET_THRESHOLD_DBFS,
-        "adaptive_threshold_dbfs": ADAPTIVE_QUIET_THRESHOLD_DBFS,
-        "start_threshold_dbfs": start_threshold_dbfs,
-        "end_threshold_dbfs": end_threshold_dbfs,
-        "adaptive_quiet": bool(
-            start_threshold_dbfs != QUIET_THRESHOLD_DBFS
-            or end_threshold_dbfs != QUIET_THRESHOLD_DBFS
-        ),
         "min_quiet_ms": MIN_QUIET_MS,
         "start_cushion_ms": START_CUSHION_MS,
         "end_cushion_ms": END_CUSHION_MS,
@@ -858,6 +872,7 @@ __all__ = [
     "AudioPreparationResult",
     "PreparedAudioSource",
     "SilenceVerificationResult",
+    "persisted_boundary_is_verified",
     "prepare_audio_source",
     "verify_acoustic_boundaries",
 ]

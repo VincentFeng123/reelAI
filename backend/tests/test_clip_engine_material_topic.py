@@ -795,16 +795,23 @@ class IngestTopicProgressTests(unittest.TestCase):
         fast = self._video("fast-video")
         slow_started = threading.Event()
         fast_finished = threading.Event()
+        allow_slow_return = threading.Event()
         seen: list[str] = []
 
         def clip_and_filter(video, *_args):
             if video["id"] == "slow-video":
                 slow_started.set()
                 self.assertTrue(fast_finished.wait(1.0))
+                self.assertTrue(allow_slow_return.wait(1.0))
             else:
                 self.assertTrue(slow_started.wait(1.0))
                 fast_finished.set()
             return video, [{"title": video["id"]}], {"transcript": {}}
+
+        def record_seen(reel_id: str) -> None:
+            seen.append(reel_id)
+            if reel_id == "fast-video":
+                allow_slow_return.set()
 
         with (
             mock.patch.object(
@@ -830,7 +837,7 @@ class IngestTopicProgressTests(unittest.TestCase):
                 concept_id="concept",
                 max_videos=2,
                 max_reels=1,
-                on_reel_created=seen.append,
+                on_reel_created=record_seen,
             )
 
         self.assertEqual(reels, ["fast-video"])

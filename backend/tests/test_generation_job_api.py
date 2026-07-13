@@ -86,6 +86,7 @@ def _insert_generation_reel(
                 "boundary_diagnostics": {
                     "method": "energy_silence",
                     "acoustic_verified": True,
+                    "acoustic": {"threshold_dbfs": -38.0},
                 },
             }),
             created_at,
@@ -107,6 +108,11 @@ def _set_reel_boundary_state(
     surface_eligible: bool = True,
     acoustic_verified: bool | None = None,
 ) -> None:
+    verified = (
+        boundary_status == "verified"
+        if acoustic_verified is None
+        else acoustic_verified
+    )
     conn.execute(
         "UPDATE reels SET search_context_json = ? WHERE id = ?",
         (
@@ -115,11 +121,8 @@ def _set_reel_boundary_state(
                 "boundary_status": boundary_status,
                 "boundary_diagnostics": {
                     "method": "energy_silence",
-                    "acoustic_verified": (
-                        boundary_status == "verified"
-                        if acoustic_verified is None
-                        else acoustic_verified
-                    ),
+                    "acoustic_verified": verified,
+                    "acoustic": ({"threshold_dbfs": -38.0} if verified else {}),
                 },
                 "selection_contract_version": "confidence_v1",
                 "directly_teaches_topic": True,
@@ -502,10 +505,13 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
             (
                 str(kwargs["generation_id"]),
                 json.dumps({
-                    "surface_eligible": True,
-                    "boundary_status": "verified",
-                    "boundary_diagnostics": {"acoustic_verified": True},
-                }),
+                        "surface_eligible": True,
+                        "boundary_status": "verified",
+                        "boundary_diagnostics": {
+                            "acoustic_verified": True,
+                            "acoustic": {"threshold_dbfs": -38.0},
+                        },
+                    }),
                 now.isoformat(),
             ),
         )
@@ -1240,6 +1246,32 @@ def test_authoritative_job_inventory_retains_every_streamed_candidate(monkeypatc
         reel_id="streamed-reel",
         boundary_status="verified",
         acoustic_verified=True,
+    )
+    adaptive_context = json.loads(conn.execute(
+        "SELECT search_context_json FROM reels WHERE id = 'streamed-reel'"
+    ).fetchone()[0])
+    adaptive_context["boundary_diagnostics"]["acoustic"] = {
+        "adaptive_quiet": True,
+        "threshold_dbfs": -38.0,
+        "start_threshold_dbfs": -24.0,
+        "end_threshold_dbfs": -38.0,
+    }
+    conn.execute(
+        "UPDATE reels SET search_context_json = ? WHERE id = 'streamed-reel'",
+        (json.dumps(adaptive_context),),
+    )
+    adaptive_reels = main._generation_job_reels(conn, job_row)
+    assert [reel["reel_id"] for reel in adaptive_reels] == ["ranked-reel"]
+
+    adaptive_context["boundary_diagnostics"]["acoustic"] = {
+        "adaptive_quiet": False,
+        "threshold_dbfs": -38.0,
+        "start_threshold_dbfs": -38.0,
+        "end_threshold_dbfs": -38.0,
+    }
+    conn.execute(
+        "UPDATE reels SET search_context_json = ? WHERE id = 'streamed-reel'",
+        (json.dumps(adaptive_context),),
     )
     reels = main._generation_job_reels(conn, job_row)
 

@@ -270,8 +270,17 @@ def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypat
     assert counters["persisted_clips"] == 1
 
 
+@pytest.mark.parametrize(
+    ("retrieval_profile", "expected_phase_timeout"),
+    [
+        ("bootstrap", 20.0),
+        ("deep", 45.0),
+    ],
+)
 def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phase(
     monkeypatch,
+    retrieval_profile,
+    expected_phase_timeout,
 ) -> None:
     transcript = {
         "source": "supadata",
@@ -318,6 +327,7 @@ def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phas
         return engine_out
 
     monkeypatch.setattr(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(pipeline_module, "INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC", 0.05)
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
     monkeypatch.setattr(pipeline_module, "_run_clip", run_clip)
     original_caption_diagnostics = pipeline_module._supadata_boundary_diagnostics
@@ -396,6 +406,7 @@ def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phas
         max_videos=1,
         max_reels=3,
         on_reel_created=emitted.append,
+        retrieval_profile=retrieval_profile,
     )
 
     assert reels == ["verified-reel-1", "verified-reel-2", "verified-reel-3"]
@@ -424,7 +435,13 @@ def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phas
         },
     }
     assert verification_windows[0][0] > selection_deadline[0]
-    assert 0.0 < verification_windows[1][1] < verification_windows[0][1] <= 20.0
+    assert (
+        0.0
+        < verification_windows[1][1]
+        < verification_windows[0][1]
+        <= expected_phase_timeout
+    )
+    assert verification_windows[0][1] > expected_phase_timeout - 1.0
     phase_deadlines = [started + timeout for started, timeout in verification_windows]
     assert phase_deadlines == pytest.approx([phase_deadlines[0]] * 3, abs=0.01)
     prepare_audio.assert_called_once()
@@ -646,9 +663,15 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
             {"search_context_json": '{"surface_eligible": true, "boundary_status": "caption_aligned"}'},
             {"search_context_json": '{"surface_eligible": true, "boundary_status": "verified", "boundary_diagnostics": {"acoustic_verified": false}}'},
             {"search_context_json": '{"surface_eligible": true, "boundary_status": "verified", "boundary_diagnostics": {"acoustic_verified": true}}'},
+            {"search_context_json": '{"surface_eligible": true, "boundary_status": "verified", "boundary_diagnostics": {"acoustic_verified": true, "acoustic": {"adaptive_quiet": true, "start_threshold_dbfs": -24, "end_threshold_dbfs": -38}}}'},
+            {"search_context_json": '{"surface_eligible": true, "boundary_status": "verified", "boundary_diagnostics": {"acoustic_verified": true, "acoustic": {"threshold_dbfs": -38, "start_threshold_dbfs": -38, "end_threshold_dbfs": -38}}}'},
+            {"search_context_json": '{"surface_eligible": true, "boundary_status": "verified", "boundary_diagnostics": {"acoustic_verified": true, "acoustic": {"start_threshold_dbfs": -37.9}}}'},
+            {"search_context_json": '[]'},
         ],
     )
 
+    # Count only current strict diagnostics; missing, adaptive, noisier, and
+    # non-object metadata must never stop verified deep backfill.
     assert main._count_generation_reels(object(), "generation") == 1
 
 
@@ -665,10 +688,11 @@ def test_failed_and_level_deferred_storage_does_not_consume_ready_material_cap(
     ]
     deferred.append({
         "search_context_json": (
-            '{"surface_eligible": true, "boundary_status": "verified", '
-            '"boundary_diagnostics": {"acoustic_verified": true}}'
-        ),
-    })
+                '{"surface_eligible": true, "boundary_status": "verified", '
+                '"boundary_diagnostics": {"acoustic_verified": true, '
+                '"acoustic": {"threshold_dbfs": -38}}}'
+            ),
+        })
     monkeypatch.setattr(main, "fetch_all", lambda *_args, **_kwargs: deferred)
 
     assert main._count_material_ready_reels(object(), "material") == 1

@@ -3357,11 +3357,11 @@ class MediumRegressionTests(unittest.TestCase):
             self.assertEqual(len(caption_calls), 4)
         conn.close()
 
-    def test_ranked_feed_cache_version_rejects_pre_semantic_gate_rows(self) -> None:
+    def test_ranked_feed_cache_version_rejects_pre_current_gate_rows(self) -> None:
         conn = self._build_ranked_feed_test_conn()
         service = ReelService(embedding_service=None, youtube_service=None)
         current_version = service.RANKED_FEED_CACHE_VERSION
-        self.assertGreater(current_version, 12)
+        self.assertGreater(current_version, 13)
 
         stale_relevance = {
             "score": 0.9,
@@ -3371,7 +3371,7 @@ class MediumRegressionTests(unittest.TestCase):
             "off_topic_penalty": 0.0,
             "reason": "legacy cache entry",
         }
-        service.RANKED_FEED_CACHE_VERSION = 12
+        service.RANKED_FEED_CACHE_VERSION = 13
         with mock.patch.object(
             service,
             "_score_text_relevance",

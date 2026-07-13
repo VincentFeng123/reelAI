@@ -40,6 +40,36 @@ def test_back_to_prior_context_is_weak():
 def test_explicit_moving_along_transition_is_self_contained_framing():
     assert not opens_mid_thought("Because now we're moving along to the Calvin Cycle!")
 
+
+def test_later_framing_sentence_does_not_rescue_a_mid_thought_opening():
+    assert opens_mid_thought(
+        "And at the same time, some of these traits can be found in non-living "
+        "things, too. Viruses complicate the definition of life. Let's head "
+        "to the Thought Bubble."
+    )
+
+
+def test_late_framing_does_not_rescue_a_long_unpunctuated_cue():
+    assert opens_mid_thought(
+        "And at the same time some of these traits can be found in non living "
+        "things too which makes the definition complicated before we eventually "
+        "lets head to the thought bubble"
+    )
+    assert is_onset("And let's define the traits shared by living organisms.")
+    assert is_onset(
+        "And to understand how cells release usable energy from glucose in the "
+        "presence of oxygen lets examine cellular respiration step by step"
+    )
+
+
+def test_late_question_mark_does_not_rescue_a_long_continuation_cue():
+    assert opens_mid_thought(
+        "And at the same time these traits occur in many non living systems "
+        "which makes the boundary difficult and requires several more examples "
+        "before scientists can ask whether viruses count as life?"
+    )
+    assert is_onset("So what is life?")
+
 def test_dangling_anaphor_is_weak():
     assert opens_mid_thought("This is why the reaction proceeds so quickly.")
     assert opens_mid_thought("That gives us the final concentration.")

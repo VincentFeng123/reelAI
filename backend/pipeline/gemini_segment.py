@@ -62,6 +62,28 @@ _TERMINAL_CALLBACK_RE = re.compile(
     r"(?:^|[.!?]\s+)(?:look|think|go|turn|refer) back (?:at|to)\b[^.!?]*[.!?]?\s*$",
     re.IGNORECASE,
 )
+_TERMINAL_DANGLING_TRANSITION_RE = re.compile(
+    r"(?:^|[.!?]\s+)(?:all\s+right\s*[,;:]?\s*)?"
+    r"let(?:['’]?s|\s+us)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_TRAILING_FORWARD_SETUP_RE = re.compile(
+    r"(?:^|[.!?]\s+)(?:but\s+)?what happens if\b.*?\?\s*"
+    r"(?:now\s*[,]?\s*)?we\s+can(?:not|['’]t)\b[^.!?]*[.!?]?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_FORWARD_SOLUTION_CONTINUATION_RE = re.compile(
+    r"^\s*(?:so\s+)?instead\b",
+    re.IGNORECASE,
+)
+_TERMINAL_STRANDED_PREPOSITION_RE = re.compile(
+    r"\b(?:a|an|the|this|that|these|those|our|your|their)\s+"
+    r"(?:[a-z][a-z'-]*\s+){1,4}(?:(?:that|which|who|whom)\s+)?"
+    r"(?:i|we|you|they)\s+(?:can|could|will|would|should|may|might)\s+"
+    r"(?:[a-z][a-z'-]*\s+){1,4}(?:from|with|to|for|about|on|at|by)"
+    r"[.!?][\"')\]]*$",
+    re.IGNORECASE,
+)
 _VAMPIRE_TOPIC_RE = re.compile(
     r"\b(?:vampir\w*|dracula|nosferatu)\b",
     re.IGNORECASE,
@@ -670,6 +692,15 @@ def _contains_quote(text: str, quote: str) -> bool:
                for i in range(len(haystack) - len(needle) + 1))
 
 
+def _exact_boundary_quote(text: str, *, want: str) -> str:
+    """Return an exact short quote from the retained transcript edge."""
+    matches = list(_WORD_RE.finditer(text or ""))
+    if not matches:
+        return ""
+    chosen = matches[:6] if want == "start" else matches[-6:]
+    return (text or "")[chosen[0].start():chosen[-1].end()]
+
+
 def _repair_topic_evidence_quote(text: str, quote: str) -> str | None:
     """Recover a nearly copied evidence quote as an exact transcript span."""
     quote_tokens = _toks(quote)
@@ -834,12 +865,17 @@ def _cue_has_weak_end(
     from .sentences import Sentence, classify_terminator
 
     raw_text = str(text or "").strip()
-    if _TERMINAL_CALLBACK_RE.search(raw_text):
+    if (
+        _TERMINAL_CALLBACK_RE.search(raw_text)
+        or _TERMINAL_DANGLING_TRANSITION_RE.search(raw_text)
+    ):
         return True
     if re.search(r"[,;:\-—][\"')\]]*$", raw_text):
         return True
     guarded = _guard_text(raw_text, ignore_caption_case=ignore_caption_case)
     terminator = classify_terminator(guarded)
+    if terminator and _TERMINAL_STRANDED_PREPOSITION_RE.search(guarded):
+        return False
     sentence = Sentence(
         idx=0,
         text=guarded,
@@ -913,6 +949,41 @@ def _cue_boundary_confidence(text: str, *, ignore_caption_case: bool) -> float:
     return 1.0 if classify_terminator(guarded) else 0.90
 
 
+def _trim_trailing_incomplete_suffix(
+    segments: list[dict], start_line: int, end_line: int,
+) -> int | None:
+    """Trim a cue-aligned teaser/transition suffix, or reject if no clean prefix exists."""
+    from .sentences import classify_terminator
+
+    following_text = (
+        str(segments[end_line + 1].get("text") or "")
+        if end_line + 1 < len(segments)
+        else ""
+    )
+    solution_continues = bool(
+        _FORWARD_SOLUTION_CONTINUATION_RE.search(following_text)
+    )
+    for line in range(end_line, start_line - 1, -1):
+        suffix = _cue_clip_text(segments, line, end_line)
+        dangling_transition = bool(
+            _TERMINAL_DANGLING_TRANSITION_RE.search(suffix)
+        )
+        forward_setup = bool(
+            solution_continues
+            and _TRAILING_FORWARD_SETUP_RE.search(suffix)
+        )
+        if not (dangling_transition or forward_setup):
+            continue
+        previous_line = line - 1
+        if previous_line < start_line:
+            return end_line if forward_setup else None
+        previous_text = str(segments[previous_line].get("text") or "").strip()
+        if classify_terminator(previous_text):
+            return previous_line
+        return end_line if forward_setup else None
+    return end_line
+
+
 def _close_cue_context(
     segments: list[dict],
     start_line: int,
@@ -923,6 +994,27 @@ def _close_cue_context(
 ) -> tuple[int, int, str | None]:
     """Expand dirty edges by at most eight cues and thirty seconds per side."""
     cue_limit = max(0, min(_CONTEXT_CUE_LIMIT, int(cue_limit)))
+    following_text = (
+        str(segments[end_line + 1].get("text") or "")
+        if end_line + 1 < len(segments)
+        else ""
+    )
+    forward_solution_needed = bool(
+        _FORWARD_SOLUTION_CONTINUATION_RE.search(following_text)
+        and any(
+            _TRAILING_FORWARD_SETUP_RE.search(
+                _cue_clip_text(segments, line, end_line)
+            )
+            for line in range(start_line, end_line + 1)
+        )
+    )
+    trimmed_end = _trim_trailing_incomplete_suffix(
+        segments, start_line, end_line
+    )
+    if trimmed_end is None:
+        return start_line, end_line, "unresolved_weak_end"
+    suffix_was_trimmed = trimmed_end < end_line
+    end_line = trimmed_end
     initial_start = start_line
     if _DANGLING_TAIL_PREFIX_RE.search(
         str(segments[start_line].get("text") or "").strip()
@@ -972,7 +1064,24 @@ def _close_cue_context(
     ):
         return start_line, end_line, "unresolved_weak_start"
 
-    for _ in range(cue_limit):
+    consumed_end_cues = 0
+    if forward_solution_needed and not suffix_was_trimmed:
+        candidate = end_line + 1
+        if candidate >= len(segments) or cue_limit <= 0:
+            return start_line, end_line, "unresolved_weak_end"
+        movement = (
+            float(segments[candidate].get("end", 0.0))
+            - float(segments[original_end].get("end", 0.0))
+        )
+        if movement > _CONTEXT_WINDOW_S + 1e-9:
+            return start_line, end_line, "unresolved_weak_end"
+        end_line = candidate
+        consumed_end_cues = 1
+
+    end_cue_limit = (
+        0 if suffix_was_trimmed else max(0, cue_limit - consumed_end_cues)
+    )
+    for _ in range(end_cue_limit):
         next_text = (
             str(segments[end_line + 1].get("text") or "")
             if end_line + 1 < len(segments)
@@ -994,7 +1103,7 @@ def _close_cue_context(
         if movement > _CONTEXT_WINDOW_S + 1e-9:
             break
         end_line = candidate
-    next_text = (
+    next_text = "" if suffix_was_trimmed else (
         str(segments[end_line + 1].get("text") or "")
         if end_line + 1 < len(segments)
         else ""
@@ -1223,12 +1332,16 @@ def _objective_after_range_repair(
     original_text: str,
     retained_text: str,
     evidence_quote: str,
+    require_grounding: bool = False,
 ) -> str:
     """Remove claims whose only transcript support was cut by range repair."""
-    if not _range_repair_lost_support(
+    lost_support = _range_repair_lost_support(
         objective,
         original_text=original_text,
         retained_text=retained_text,
+    )
+    if not lost_support and not (
+        require_grounding and not _text_has_grounding(objective, retained_text)
     ):
         return objective
     grounded = " ".join(str(evidence_quote or "").split()).rstrip(" .!?;:")
@@ -1243,12 +1356,16 @@ def _title_after_range_repair(
     original_text: str,
     retained_text: str,
     evidence_quote: str,
+    require_grounding: bool = False,
 ) -> str:
     """Keep repaired clip labels within the teaching claim that remains."""
-    if not _range_repair_lost_support(
+    lost_support = _range_repair_lost_support(
         title,
         original_text=original_text,
         retained_text=retained_text,
+    )
+    if not lost_support and not (
+        require_grounding and not _text_has_grounding(title, retained_text)
     ):
         return title
     grounded_words = " ".join(str(evidence_quote or "").split()).split()
@@ -1540,6 +1657,10 @@ def _plan_to_report(
                 or not isinstance(b, int) or a < 0 or b < 0 or a >= n or b >= n or a > b):
             report.rejected_reasons.append(f"{prefix}:bad_index")
             continue
+        selected_end_before_context = b
+        context_repair_source_text = _cue_clip_text(
+            segments, a, min(n - 1, b + 1)
+        )
         start_quote = str(proposal.start_quote or "").strip()
         end_quote = str(proposal.end_quote or "").strip()
         start_text = str(segments[a].get("text") or "").strip()
@@ -1633,6 +1754,7 @@ def _plan_to_report(
                     reason=closure_error,
                 ))
             continue
+        context_was_trimmed = b < selected_end_before_context
         start, end = _padded_cue_bounds(segments, a, b)
         if end <= start:
             report.rejected_reasons.append(f"{prefix}:reversed_cue_boundary")
@@ -1700,6 +1822,15 @@ def _plan_to_report(
         if not clip_text:
             report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
             continue
+        if not _contains_quote(clip_text, start_quote):
+            start_quote = _exact_boundary_quote(clip_text, want="start")
+            quote_repaired = True
+        if not _contains_quote(clip_text, end_quote):
+            end_quote = _exact_boundary_quote(clip_text, want="end")
+            quote_repaired = True
+        if not start_quote or not end_quote:
+            report.rejected_reasons.append(f"{prefix}:ungrounded_boundary_quote")
+            continue
         if _contains_unrequested_vampire_pseudoscience(clip_text, topic):
             report.rejected_reasons.append(f"{prefix}:fictional_framing")
             continue
@@ -1727,18 +1858,41 @@ def _plan_to_report(
             or proposal.title
         ).strip()
         clip_title = str(proposal.title or "").strip()
-        if range_was_size_repaired:
+        clip_facet = str(proposal.facet or "").strip()
+        clip_reason = str(proposal.reason or "").strip()
+        if range_was_size_repaired or context_was_trimmed:
+            repair_source_text = " ".join(dict.fromkeys(filter(None, (
+                context_repair_source_text if context_was_trimmed else "",
+                text_before_size_repair if range_was_size_repaired else "",
+            ))))
+            require_grounding = context_was_trimmed
             learning_objective = _objective_after_range_repair(
                 learning_objective,
-                original_text=text_before_size_repair,
+                original_text=repair_source_text,
                 retained_text=clip_text,
                 evidence_quote=topic_evidence_quote,
+                require_grounding=require_grounding,
             )
             clip_title = _title_after_range_repair(
                 clip_title,
-                original_text=text_before_size_repair,
+                original_text=repair_source_text,
                 retained_text=clip_text,
                 evidence_quote=topic_evidence_quote,
+                require_grounding=require_grounding,
+            )
+            clip_facet = _title_after_range_repair(
+                clip_facet,
+                original_text=repair_source_text,
+                retained_text=clip_text,
+                evidence_quote=topic_evidence_quote,
+                require_grounding=require_grounding,
+            )
+            clip_reason = _objective_after_range_repair(
+                clip_reason,
+                original_text=repair_source_text,
+                retained_text=clip_text,
+                evidence_quote=topic_evidence_quote,
+                require_grounding=require_grounding,
             )
         cue_ids = [
             str(segments[line].get("cue_id") or f"cue-{line}")
@@ -1750,8 +1904,8 @@ def _plan_to_report(
             "end": end,
             "title": clip_title,
             "learning_objective": learning_objective,
-            "facet": str(proposal.facet or "").strip(),
-            "reason": str(proposal.reason or "").strip(),
+            "facet": clip_facet,
+            "reason": clip_reason,
             "kind": "educational",
             "informativeness": info,
             "topic_relevance": relevance,
