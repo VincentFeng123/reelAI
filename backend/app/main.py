@@ -350,7 +350,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v2"
+SELECTION_CONTRACT_VERSION = "quality_silence_v3"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -2821,6 +2821,161 @@ def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
     return ordered
 
 
+def _verified_reusable_generation_chain(
+    conn,
+    *,
+    generation_id: str,
+    material_id: str,
+) -> bool:
+    """Return whether a generation chain contains validated reusable v3 inventory."""
+    generation_ids = _response_generation_ids(conn, generation_id)
+    if not generation_ids:
+        return False
+
+    placeholders = ", ".join("?" for _ in generation_ids)
+    generation_rows = fetch_all(
+        conn,
+        f"SELECT id, material_id FROM reel_generations WHERE id IN ({placeholders})",
+        tuple(generation_ids),
+    )
+    if (
+        {str(row.get("id") or "") for row in generation_rows} != set(generation_ids)
+        or any(str(row.get("material_id") or "") != material_id for row in generation_rows)
+    ):
+        return False
+
+    reel_rows = fetch_all(
+        conn,
+        f"SELECT search_context_json, transcript_snippet FROM reels WHERE generation_id IN ({placeholders})",
+        tuple(generation_ids),
+    )
+    verified_reusable_count = 0
+    for row in reel_rows:
+        try:
+            context = json.loads(str(row.get("search_context_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            return False
+        if not isinstance(context, dict):
+            return False
+        if (
+            str(context.get("selection_contract_version") or "").strip()
+            != SELECTION_CONTRACT_VERSION
+        ):
+            return False
+        try:
+            quality_scores = (
+                float(context.get("informativeness")),
+                float(context.get("topic_relevance")),
+                float(context.get("educational_importance")),
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if (
+            any(not math.isfinite(score) for score in quality_scores)
+            or quality_scores[1] < 0.75
+        ):
+            return False
+        if any(
+            context.get(field) is not True
+            for field in (
+                "directly_teaches_topic",
+                "substantive",
+                "factually_grounded",
+                "self_contained",
+                "is_standalone",
+            )
+        ):
+            return False
+        evidence_words = re.findall(
+            r"[\w+#'-]+",
+            str(context.get("topic_evidence_quote") or "").casefold(),
+        )
+        transcript_words = re.findall(
+            r"[\w+#'-]+",
+            str(row.get("transcript_snippet") or "").casefold(),
+        )
+        evidence_width = len(evidence_words)
+        if (
+            evidence_width < 5
+            or evidence_width > 40
+            or not any(
+                transcript_words[index : index + evidence_width]
+                == evidence_words
+                for index in range(
+                    max(0, len(transcript_words) - evidence_width + 1)
+                )
+            )
+        ):
+            return False
+        if "surface_eligible" not in context:
+            return False
+        surface_eligible = context.get("surface_eligible")
+        if isinstance(surface_eligible, str):
+            surface_eligible = surface_eligible.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        surface_reason = str(context.get("surface_reason") or "").strip().lower()
+        deferred_for_level = (
+            not surface_eligible
+            and surface_reason == "level_mismatch"
+        )
+        if not surface_eligible and not deferred_for_level:
+            continue
+        if not _search_context_has_verified_acoustic_boundary(context):
+            return False
+        verified_reusable_count += 1
+    return verified_reusable_count > 0
+
+
+def _generation_chain_meets_source_budget(
+    conn,
+    *,
+    generation_id: str,
+    generation_mode: Literal["slow", "fast"],
+) -> bool:
+    generation_ids = _response_generation_ids(conn, generation_id)
+    if not generation_ids:
+        return False
+
+    placeholders = ", ".join("?" for _ in generation_ids)
+    rows = fetch_all(
+        conn,
+        f"SELECT video_id, search_context_json FROM reels "
+        f"WHERE generation_id IN ({placeholders})",
+        tuple(generation_ids),
+    )
+    source_video_ids: set[str] = set()
+    for row in rows:
+        video_id = str(row.get("video_id") or "").strip()
+        if not video_id:
+            continue
+        try:
+            context = json.loads(str(row.get("search_context_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(context, dict):
+            continue
+        surface_eligible = context.get("surface_eligible")
+        if isinstance(surface_eligible, str):
+            surface_eligible = surface_eligible.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        if (
+            not surface_eligible
+            and str(context.get("surface_reason") or "").strip().lower()
+            != "level_mismatch"
+        ):
+            continue
+        if (
+            str(context.get("selection_contract_version") or "").strip()
+            != SELECTION_CONTRACT_VERSION
+            or not _search_context_has_verified_acoustic_boundary(context)
+        ):
+            continue
+        source_video_ids.add(video_id)
+    return len(source_video_ids) >= GENERATION_SOURCE_BUDGETS[generation_mode]
+
+
 def _verified_cross_request_source_generation(
     conn,
     *,
@@ -2866,7 +3021,6 @@ def _verified_cross_request_source_generation(
     expected_relevance = _normalize_min_relevance(
         request_params.get("min_relevance")
     )
-    candidate = None
     for row in candidates:
         try:
             prior_params = json.loads(str(row.get("request_params_json") or "{}"))
@@ -2883,8 +3037,6 @@ def _verified_cross_request_source_generation(
             != _normalize_preferred_video_duration(
                 str(request_params.get("preferred_video_duration") or "any")
             )
-            or str(prior_params.get("knowledge_level") or "").strip().lower()
-            != str(request_params.get("knowledge_level") or "").strip().lower()
             or str(prior_params.get("language") or "en").strip().lower()
             != str(request_params.get("language") or "en").strip().lower()
             or sorted(_normalize_excluded_video_ids(
@@ -2895,108 +3047,16 @@ def _verified_cross_request_source_generation(
             != expected_relevance
         ):
             continue
-        candidate = row
-        break
-    generation_id = str((candidate or {}).get("result_generation_id") or "").strip()
-    if not generation_id:
-        return None
-    generation_ids = _response_generation_ids(conn, generation_id)
-    if not generation_ids:
-        return None
-
-    placeholders = ", ".join("?" for _ in generation_ids)
-    generation_rows = fetch_all(
-        conn,
-        f"SELECT id, material_id FROM reel_generations WHERE id IN ({placeholders})",
-        tuple(generation_ids),
-    )
-    if (
-        {str(row.get("id") or "") for row in generation_rows} != set(generation_ids)
-        or any(str(row.get("material_id") or "") != material_id for row in generation_rows)
-    ):
-        return None
-
-    reel_rows = fetch_all(
-        conn,
-        f"SELECT search_context_json, transcript_snippet FROM reels WHERE generation_id IN ({placeholders})",
-        tuple(generation_ids),
-    )
-    verified_surfaceable_count = 0
-    for row in reel_rows:
-        try:
-            context = json.loads(str(row.get("search_context_json") or "{}"))
-        except (TypeError, json.JSONDecodeError):
-            return None
-        if not isinstance(context, dict):
-            return None
-        if (
-            str(context.get("selection_contract_version") or "").strip()
-            != SELECTION_CONTRACT_VERSION
-        ):
-            return None
-        try:
-            quality_scores = (
-                float(context.get("informativeness")),
-                float(context.get("topic_relevance")),
-                float(context.get("educational_importance")),
-            )
-        except (TypeError, ValueError, OverflowError):
-            return None
-        if any(
-            not math.isfinite(score) or score < 0.75
-            for score in quality_scores
-        ):
-            return None
-        if any(
-            context.get(field) is not True
-            for field in (
-                "directly_teaches_topic",
-                "substantive",
-                "factually_grounded",
-                "self_contained",
-                "is_standalone",
-            )
-        ):
-            return None
-        evidence_words = re.findall(
-            r"[\w+#'-]+",
-            str(context.get("topic_evidence_quote") or "").casefold(),
-        )
-        transcript_words = re.findall(
-            r"[\w+#'-]+",
-            str(row.get("transcript_snippet") or "").casefold(),
-        )
-        evidence_width = len(evidence_words)
-        if (
-            evidence_width < 5
-            or evidence_width > 40
-            or not any(
-                transcript_words[index : index + evidence_width]
-                == evidence_words
-                for index in range(
-                    max(0, len(transcript_words) - evidence_width + 1)
-                )
-            )
-        ):
-            return None
-        if "surface_eligible" not in context:
-            return None
-        surface_eligible = context.get("surface_eligible")
-        if isinstance(surface_eligible, str):
-            surface_eligible = surface_eligible.strip().lower() in {
-                "1", "true", "yes", "on",
-            }
-        surface_reason = str(context.get("surface_reason") or "").strip().lower()
-        deferred_for_level = (
-            not surface_eligible
-            and surface_reason == "level_mismatch"
-        )
-        if not surface_eligible and not deferred_for_level:
+        generation_id = str(row.get("result_generation_id") or "").strip()
+        if not generation_id:
             continue
-        if not _search_context_has_verified_acoustic_boundary(context):
-            return None
-        verified_surfaceable_count += 1
-    return generation_id if verified_surfaceable_count else None
+        if _verified_reusable_generation_chain(
+            conn,
+            generation_id=generation_id,
+            material_id=material_id,
+        ):
+            return generation_id
+    return None
 
 
 def _finalize_request_reel_order(
@@ -3117,8 +3177,11 @@ def _ranked_request_reels(
     ):
         ranked.sort(
             key=lambda reel: (
-                -float(reel.get("_selection_quality_floor") or 0.0),
-                -float(reel.get("_selection_quality_mean") or 0.0),
+                float(
+                    0.5
+                    if reel.get("difficulty") is None
+                    else reel.get("difficulty")
+                ),
                 -float(reel.get("_selection_topic_relevance") or 0.0),
                 int(reel.get("_selection_generation_rank") or 0),
                 int(reel.get("_selection_source_rank") or 0),
@@ -3378,6 +3441,30 @@ def _generation_job_reels(
         if str(reel.get("selection_contract_version") or "").strip()
         == SELECTION_CONTRACT_VERSION
     ][:requested]
+
+
+def _reused_generation_reels(
+    conn,
+    *,
+    generation_id: str,
+    material_id: str,
+    concept_id: str | None,
+    learner_id: str,
+    request_params: dict[str, Any],
+    requested: int,
+) -> list[dict[str, Any]]:
+    """Read a compatible v3 reservoir under the current learner-level rules."""
+    return _generation_job_reels(
+        conn,
+        {
+            "result_generation_id": generation_id,
+            "material_id": material_id,
+            "concept_id": concept_id,
+            "learner_id": learner_id,
+            "request_params_json": json.dumps(request_params),
+        },
+        requested_override=requested,
+    )
 
 
 def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, Any]:
@@ -3705,16 +3792,14 @@ def _run_leased_generation_job(
                 )
             emitted: set[tuple[str, str]] = set()
             # Candidate events are provisional and reconciled against the
-            # authoritative capped final. Emit every qualifying clip from the
-            # already-budgeted sources so a slower, stronger source is visible
-            # as soon as its acoustic checks pass.
-            candidate_event_cap = GENERATION_SOURCE_BUDGETS[mode] * 8
+            # authoritative capped final. Every persisted candidate streams as
+            # soon as it passes verification.
 
             def on_candidate(reel: dict[str, Any]) -> None:
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
                 identity = _reel_identity_key(reel)
-                if identity in emitted or len(emitted) >= candidate_event_cap:
+                if identity in emitted:
                     return
                 emitted.add(identity)
                 public_reel = {
@@ -3807,7 +3892,12 @@ def _run_leased_generation_job(
             cumulative_count = source_reel_count + _count_generation_reels(
                 conn, generation_id
             )
-            if cumulative_count:
+            has_verified_reservoir = _verified_reusable_generation_chain(
+                conn,
+                generation_id=generation_id,
+                material_id=material_id,
+            )
+            if cumulative_count or has_verified_reservoir:
                 _activate_generation(
                     conn,
                     material_id=material_id,
@@ -3826,6 +3916,7 @@ def _run_leased_generation_job(
                     error_text="inventory_exhausted",
                 )
                 final_reels = []
+            has_terminal_result = bool(final_reels) or has_verified_reservoir
 
             usage_records = context.usage()
             stage_counters = context.counters()
@@ -3844,7 +3935,7 @@ def _run_leased_generation_job(
                 event_type="final",
                 payload={
                     "reels": final_reels,
-                    "generation_id": generation_id if final_reels else None,
+                    "generation_id": generation_id if has_terminal_result else None,
                     "authoritative": True,
                 },
                 lease_owner=lease_owner,
@@ -3853,14 +3944,14 @@ def _run_leased_generation_job(
                 "completed"
                 if len(final_reels) >= requested_count
                 else "partial"
-                if final_reels
+                if has_terminal_result
                 else "exhausted"
             )
             transition_generation_terminal(
                 conn,
                 job_id=job_id,
                 status=terminal_status,
-                result_generation_id=generation_id if final_reels else None,
+                result_generation_id=generation_id if has_terminal_result else None,
                 lease_owner=lease_owner,
                 model_used=model_used,
                 quality_degraded=quality_degraded,
@@ -5151,6 +5242,26 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                 content_fingerprint=content_fingerprint,
                 request_params=request_params,
             )
+            if source_generation_id and _generation_chain_meets_source_budget(
+                conn,
+                generation_id=source_generation_id,
+                generation_mode=payload.generation_mode,
+            ):
+                reused_reels = _reused_generation_reels(
+                    conn,
+                    generation_id=source_generation_id,
+                    material_id=payload.material_id,
+                    concept_id=payload.concept_id,
+                    learner_id=learner_id,
+                    request_params=request_params,
+                    requested=requested_num_reels,
+                )
+                if reused_reels:
+                    return {
+                        "reels": reused_reels,
+                        "generation_id": source_generation_id,
+                        "response_profile": "unified",
+                    }
         job_row, _created = submit_generation_job(
             conn,
             material_id=payload.material_id,
@@ -5911,6 +6022,7 @@ def feed(
         completed_job = find_completed_generation_job(conn, request_key)
         active_job = find_active_generation_job(conn, request_key)
         cross_request_source = False
+        cross_request_source_covers_mode = False
         generation_id = str((completed_job or {}).get("result_generation_id") or "") or None
         if generation_id is None:
             head = _fetch_active_generation_row(conn, material_id=material_id, request_key=request_key)
@@ -5930,6 +6042,14 @@ def feed(
                 request_params=request_params,
             )
             cross_request_source = generation_id is not None
+            if generation_id is not None:
+                cross_request_source_covers_mode = (
+                    _generation_chain_meets_source_budget(
+                        conn,
+                        generation_id=generation_id,
+                        generation_mode=generation_mode,
+                    )
+                )
         ranked = [] if (
             generation_id is None
             or (
@@ -5960,7 +6080,13 @@ def feed(
         if (
             autofill
             and completed_job is None
-            and (cross_request_source or sparse or unseen_ready <= 4)
+            and (
+                (
+                    cross_request_source
+                    and (not cross_request_source_covers_mode or not ranked)
+                )
+                or (not cross_request_source and (sparse or unseen_ready <= 4))
+            )
             and material_ready_count < MAX_REELS_PER_MATERIAL
         ):
             target_total = min(

@@ -122,10 +122,14 @@ test("restored reconciliation removes cached unseen rows and stream settlement d
   ];
   const reelsRef = { current: currentRows };
   const activeIndexRef = { current: 1 };
+  const watchedFrontierIndexRef = { current: 1 };
+  const orderReelsByDifficulty = compileUseCallback("orderReelsByDifficulty", {});
   let renderedRows = currentRows;
   const callback = compileUseCallback("reconcileGeneratedReels", {
     reelsRef,
     activeIndexRef,
+    watchedFrontierIndexRef,
+    orderReelsByDifficulty,
     reelClipKey: (reel) => reel.video_url,
     mergeReelMetadata: (current, next) => ({ ...current, ...next }),
     dedupeByIdentity: (rows) => {
@@ -163,6 +167,85 @@ test("restored reconciliation removes cached unseen rows and stream settlement d
     renderedRows.map((row) => row.reel_id),
     ["watched", "current", "new-unseen", "prior-unseen"],
   );
+});
+
+test("generation settlement freezes the watched frontier and orders only the unseen tail by difficulty", () => {
+  const currentRows = [
+    { reel_id: "watched", video_url: "watched", difficulty: 0.9 },
+    { reel_id: "backtracked-current", video_url: "backtracked-current", difficulty: 0.8 },
+    { reel_id: "watched-frontier", video_url: "watched-frontier", difficulty: 0.7 },
+    { reel_id: "rejected-provisional", video_url: "rejected-provisional", difficulty: 0.2 },
+  ];
+  const reelsRef = { current: currentRows };
+  const activeIndexRef = { current: 1 };
+  const watchedFrontierIndexRef = { current: 2 };
+  const orderReelsByDifficulty = compileUseCallback("orderReelsByDifficulty", {});
+  let renderedRows = currentRows;
+  const callback = compileUseCallback("reconcileGeneratedReels", {
+    reelsRef,
+    activeIndexRef,
+    watchedFrontierIndexRef,
+    orderReelsByDifficulty,
+    reelClipKey: (reel) => reel.video_url,
+    mergeReelMetadata: (current, next) => ({ ...current, ...next }),
+    dedupeByIdentity: (rows) => {
+      const seen = new Set();
+      return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
+    },
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedRows = rows;
+    },
+    setTotal: () => {},
+  });
+
+  callback(
+    [{ reel_id: "rejected-provisional", video_url: "rejected-provisional", difficulty: 0.2 }],
+    [
+      { reel_id: "watched-frontier", video_url: "watched-frontier", difficulty: 0.7, video_title: "Updated" },
+      { reel_id: "hard", video_url: "hard", difficulty: 3 },
+      { reel_id: "tie-first", video_url: "tie-first" },
+      { reel_id: "easy", video_url: "easy", difficulty: -2 },
+      { reel_id: "tie-second", video_url: "tie-second", difficulty: 0.5 },
+    ],
+    { preserveUnmatchedUnseen: true },
+  );
+
+  assert.deepEqual(renderedRows.map((row) => row.reel_id), [
+    "watched",
+    "backtracked-current",
+    "watched-frontier",
+    "easy",
+    "tie-first",
+    "tie-second",
+    "hard",
+  ]);
+  assert.equal(renderedRows[2].video_title, "Updated");
+});
+
+test("grouped material batches use stable difficulty order instead of round robin", () => {
+  const orderReelsByDifficulty = compileUseCallback("orderReelsByDifficulty", {});
+  const mergeReelBatchesByDifficulty = compileUseCallback("mergeReelBatchesByDifficulty", {
+    orderReelsByDifficulty,
+  });
+
+  const merged = mergeReelBatchesByDifficulty([
+    [
+      { reel_id: "hard", difficulty: 0.9 },
+      { reel_id: "tie-first" },
+    ],
+    [
+      { reel_id: "easy", difficulty: 0.1 },
+      { reel_id: "tie-second", difficulty: Number.POSITIVE_INFINITY },
+    ],
+  ]);
+
+  assert.deepEqual(merged.map((row) => row.reel_id), [
+    "easy",
+    "tie-first",
+    "tie-second",
+    "hard",
+  ]);
 });
 
 test("a restored feed reconciles durable inventory with its restored mode and a stale-scope guard", () => {
@@ -249,10 +332,12 @@ test("pagination remains available while background generation is active", () =>
 });
 
 test("authoritative finals lock the watched prefix and reorder only the unseen tail", () => {
-  assert.match(source, /const lockedPrefixLength = Math\.min\(currentRows\.length, activeIndexRef\.current \+ 1\)/);
+  assert.match(source, /Math\.max\(activeIndexRef\.current, watchedFrontierIndexRef\.current\) \+ 1/);
   assert.match(source, /const lockedPrefix = currentRows\.slice\(0, lockedPrefixLength\)/);
   assert.match(source, /const stableUnseenRows = currentRows\.slice\(lockedPrefixLength\)/);
-  assert.match(source, /const reordered = dedupeByIdentity\(\[\.\.\.lockedPrefix, \.\.\.authoritativeTail\]\)/);
+  assert.match(source, /const orderedTail = orderReelsByDifficulty\(authoritativeTail\)/);
+  assert.match(source, /const reordered = dedupeByIdentity\(\[\.\.\.lockedPrefix, \.\.\.orderedTail\]\)/);
+  assert.match(source, /watchedFrontierIndex: dedupedReels\.length > 0/);
 });
 
 test("same-source clips remain distinct when their authoritative float ranges differ", () => {

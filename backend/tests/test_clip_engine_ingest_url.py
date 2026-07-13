@@ -261,6 +261,7 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
                     "informativeness": 0.92,
                     "topic_relevance": 0.92,
                     "educational_importance": 0.92,
+                    "difficulty": 0.2,
                     "self_contained": True,
                     "is_standalone": True,
                     "directly_teaches_topic": True,
@@ -283,6 +284,7 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
                     "informativeness": 0.9,
                     "topic_relevance": 0.9,
                     "educational_importance": 0.9,
+                    "difficulty": 0.8,
                     "self_contained": True,
                     "is_standalone": True,
                     "directly_teaches_topic": True,
@@ -328,6 +330,17 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
 
         self.assertAlmostEqual(result.reel.t_start, 0.0)
         self.assertAlmostEqual(result.reel.t_end, 20.0)
+        with db_module.get_conn() as conn:
+            rows = db_module.fetch_all(
+                conn,
+                "SELECT t_start, difficulty FROM reels WHERE video_id = ? ORDER BY t_start",
+                ("yt:dQw4w9WgXcQ",),
+            )
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [(float(row["t_start"]), float(row["difficulty"])) for row in rows],
+            [(0.0, 0.2), (30.0, 0.8)],
+        )
 
     # --------------------------------------------------------------------- #
     # Idempotency: calling ingest_url twice with the same URL + material_id

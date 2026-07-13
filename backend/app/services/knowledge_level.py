@@ -6,6 +6,8 @@ everything here is pure — no DB, no LLM.
 """
 from __future__ import annotations
 
+import math
+
 KNOWLEDGE_LEVELS: tuple[str, ...] = ("beginner", "intermediate", "advanced")
 
 # Positions on the same 0..1 scale the engine's per-clip `difficulty` uses.
@@ -35,3 +37,23 @@ def effective_level_target(level: str | None, adjustment: float | None) -> float
     adj = 0.0 if adjustment is None else float(adjustment)
     adj = max(-ADJUSTMENT_BOUND, min(ADJUSTMENT_BOUND, adj))
     return max(0.0, min(1.0, base + adj))
+
+
+def difficulty_matches_knowledge_level(
+    difficulty: float,
+    level: str | None,
+) -> bool:
+    """Match selector difficulty bins without overlap at level boundaries."""
+    try:
+        score = float(difficulty)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(score) or score < 0.0 or score > 1.0:
+        return False
+
+    normalized = normalize_knowledge_level(level)
+    if normalized == "beginner":
+        return score < 0.34
+    if normalized == "intermediate":
+        return score < 0.67 and score >= 0.34
+    return score >= 0.67

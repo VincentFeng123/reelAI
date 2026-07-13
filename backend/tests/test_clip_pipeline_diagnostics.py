@@ -95,7 +95,7 @@ def _quality_clip(
     score: float = 0.9,
     **overrides,
 ) -> dict:
-    """A complete quality_silence_v2 selector result grounded to one cue."""
+    """A complete quality_silence_v3 selector result grounded to one cue."""
     clip = {
         "start": start,
         "end": end,
@@ -281,7 +281,7 @@ def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypat
     assert counters["persisted_clips"] == 1
 
 
-def test_topic_generation_prepares_audio_once_overlaps_three_acoustic_checks_and_streams_in_order(
+def test_topic_generation_streams_independent_acoustic_passes_immediately_but_returns_stable_order(
     monkeypatch,
 ) -> None:
     transcript = {
@@ -355,7 +355,7 @@ def test_topic_generation_prepares_audio_once_overlaps_three_acoustic_checks_and
             if len(verification_started) == 3:
                 all_started.set()
         assert all_started.wait(timeout=1.0)
-        time.sleep(0.02 if start_sec == 0.0 else 0.15)
+        time.sleep({0.0: 0.15, 10.0: 0.02, 20.0: 0.10}[start_sec])
         with verification_lock:
             verification_finished[start_sec] = time.monotonic()
         return mock.Mock(
@@ -401,9 +401,13 @@ def test_topic_generation_prepares_audio_once_overlaps_three_acoustic_checks_and
     )
 
     assert reels == ["verified-reel-one", "verified-reel-two", "verified-reel-three"]
-    assert emitted == ["verified-reel-one", "verified-reel-two", "verified-reel-three"]
+    assert emitted == ["verified-reel-two", "verified-reel-three", "verified-reel-one"]
     assert len(persisted_clips) == 3
-    boundary = persisted_clips[0]["search_context"]
+    persisted_by_candidate = {
+        str(clip["selection_candidate_id"]).split("::")[-1]: clip
+        for clip in persisted_clips
+    }
+    boundary = persisted_by_candidate["one"]["search_context"]
     assert boundary["boundary_status"] == "verified"
     assert boundary["surface_eligible"] is True
     assert boundary["boundary_diagnostics"] == {
@@ -426,7 +430,8 @@ def test_topic_generation_prepares_audio_once_overlaps_three_acoustic_checks_and
         },
     }
     assert max(verification_started.values()) < min(verification_finished.values())
-    assert emitted_at[0] < verification_finished[10.0]
+    assert emitted_at[0] >= verification_finished[10.0]
+    assert emitted_at[0] < verification_finished[0.0]
     assert emitted_at[0] < verification_finished[20.0]
     prepare_audio.assert_called_once()
     assert verify_audio_mock.call_count == 3
@@ -441,6 +446,104 @@ def test_topic_generation_prepares_audio_once_overlaps_three_acoustic_checks_and
     assert context.counters()["stored_clips"] == 3
     assert context.counters()["deferred_clips"] == 0
     assert context.counters()["persisted_clips"] == 3
+
+
+def test_final_caption_clip_searches_to_true_media_end_and_keeps_verified_quiet_pad(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:media-tail",
+        "duration": 10.0,
+        "segments": [
+            {
+                "cue_id": "tail",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "Python functions package reusable instructions for later calls.",
+            },
+        ],
+    }
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                cue_id="tail",
+                start=0.0,
+                end=10.0,
+                quote="Python functions package reusable instructions for later calls.",
+            )
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            format_id="140",
+            duration_sec=12.0,
+        ),
+    )
+    verify = mock.Mock(
+        return_value=mock.Mock(
+            verified=True,
+            start_sec=0.0,
+            end_sec=10.2,
+            diagnostics={
+                "threshold_dbfs": -38.0,
+                "start_quiet": [0.0, 0.2],
+                "end_quiet": [10.0, 10.3],
+            },
+        )
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=prepared),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify,
+    )
+    persisted: list[dict] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        persisted.append(clip)
+        return ("verified-tail", mock.sentinel.metadata)
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    context = GenerationContext("slow", require_acoustic_boundaries=True)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == ["verified-tail"]
+    assert persisted[0]["end"] == 10.2
+    assert verify.call_args.kwargs["search_end_limit_sec"] == 12.0
+    assert persisted[0]["search_context"]["boundary_status"] == "verified"
+    assert persisted[0]["search_context"]["boundary_diagnostics"]["acoustic"][
+        "threshold_dbfs"
+    ] == -38.0
 
 
 @pytest.mark.parametrize(
@@ -733,15 +836,15 @@ def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
 @pytest.mark.parametrize(
     ("quality_axis", "value", "accepted"),
     [
-        ("informativeness", 0.74, False),
+        ("informativeness", 0.00, True),
         ("informativeness", 0.75, True),
         ("topic_relevance", 0.74, False),
         ("topic_relevance", 0.75, True),
-        ("educational_importance", 0.74, False),
+        ("educational_importance", 0.00, True),
         ("educational_importance", 0.75, True),
     ],
 )
-def test_each_quality_axis_has_an_independent_hard_point_seven_five_gate(
+def test_only_topic_relevance_has_a_hard_point_seven_five_gate(
     monkeypatch,
     quality_axis: str,
     value: float,
@@ -765,9 +868,18 @@ def test_each_quality_axis_has_an_independent_hard_point_seven_five_gate(
     assert bool(clips) is accepted
 
 
-@pytest.mark.parametrize("knowledge_level", ["beginner", "advanced"])
-def test_quality_ranking_is_learner_level_neutral(
-    monkeypatch, knowledge_level: str
+@pytest.mark.parametrize(
+    ("knowledge_level", "expected_starts", "expected_deferred"),
+    [
+        ("beginner", [0.0, 10.0], [False, True]),
+        ("advanced", [10.0, 0.0], [False, True]),
+    ],
+)
+def test_candidate_plan_prioritizes_level_eligible_then_difficulty(
+    monkeypatch,
+    knowledge_level: str,
+    expected_starts: list[float],
+    expected_deferred: list[bool],
 ) -> None:
     engine_out = {
         "clips": [
@@ -789,8 +901,45 @@ def test_quality_ranking_is_learner_level_neutral(
 
     _, clips, _ = _pipeline()._clip_and_filter(video, "Intro to Python", "en")
 
-    assert [clip["start"] for clip in clips] == [10.0, 0.0]
-    assert [clip["score"] for clip in clips] == [0.9, 0.8]
+    assert [clip["start"] for clip in clips] == expected_starts
+    assert [
+        bool(clip["search_context"]["deferred_level"])
+        for clip in clips
+    ] == expected_deferred
+
+
+@pytest.mark.parametrize(
+    ("difficulty", "matching_level"),
+    [
+        (0.33, "beginner"),
+        (0.34, "intermediate"),
+        (0.66, "intermediate"),
+        (0.67, "advanced"),
+    ],
+)
+def test_v3_ingestion_uses_exact_non_overlapping_difficulty_bins(
+    monkeypatch,
+    difficulty: float,
+    matching_level: str,
+) -> None:
+    engine_out = {
+        "clips": [_quality_clip(difficulty=difficulty)],
+        "transcript": _transcript(),
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+    pipeline = _pipeline()
+
+    for level in ("beginner", "intermediate", "advanced"):
+        video = {**_video(), "_knowledge_level": level}
+        _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
+        assert bool(clips[0]["search_context"]["deferred_level"]) is (
+            level != matching_level
+        )
 
 
 def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None:
@@ -817,7 +966,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v2"
+        assert context["selection_contract_version"] == "quality_silence_v3"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
@@ -825,7 +974,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         assert context["selection_candidate_id"] == "dQw4w9WgXcQ::python-functions-2"
         assert context["prerequisite_ids"] == []
 
-    assert scores == pytest.approx([0.8, 0.8])
+    assert scores == pytest.approx([0.85, 0.85])
 
 
 def test_filter_rejects_non_standalone_dependent_instead_of_repairing_it(

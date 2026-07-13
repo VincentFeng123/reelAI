@@ -56,6 +56,7 @@ def _fake_engine_out_two_clips(video_id: str = "dQw4w9WgXcQ") -> dict:
                 "title": "Chain rule differentiation",
                 "facet": "calculus",
                 "reason": "Explains the chain rule with examples",
+                "difficulty": 0.25,
                 "sequence_index": 0,
                 "embed_url": (
                     f"https://www.youtube.com/embed/{video_id}?start=30&end=90"
@@ -68,6 +69,7 @@ def _fake_engine_out_two_clips(video_id: str = "dQw4w9WgXcQ") -> dict:
                 "title": "Cooking pasta at home",
                 "facet": "food",
                 "reason": "How to cook spaghetti",
+                "difficulty": 0.75,
                 "sequence_index": 1,
                 "embed_url": (
                     f"https://www.youtube.com/embed/{video_id}?start=120&end=180"
@@ -178,6 +180,7 @@ class ClipEngineTopicCutTests(unittest.TestCase):
             )
 
         mock_verify.assert_called_once()
+        self.assertIsNone(mock_verify.call_args.kwargs["limit"])
 
         # The exact-topic selector returns only the chain-rule teaching unit.
         self.assertFalse(result.is_short)
@@ -258,6 +261,15 @@ class ClipEngineTopicCutTests(unittest.TestCase):
                 )
                 self.assertIsNotNone(row, f"reel {reel.reel_id} missing from DB")
                 self.assertEqual(row["video_id"], "yt:dQw4w9WgXcQ")
+            difficulty_rows = db_module.fetch_all(
+                conn,
+                "SELECT t_start, difficulty FROM reels WHERE video_id = ? ORDER BY t_start",
+                ("yt:dQw4w9WgXcQ",),
+            )
+        self.assertEqual(
+            [float(row["difficulty"]) for row in difficulty_rows],
+            [0.25, 0.75],
+        )
 
     # --------------------------------------------------------------------- #
     # Non-YouTube URL → UnsupportedSourceError

@@ -236,7 +236,7 @@ def test_nonstandalone_candidate_cannot_displace_standalone_candidate():
     assert [clip["selection_candidate_id"] for clip in clips] == ["setup"]
 
 
-def test_clip_limit_uses_importance_before_chronology():
+def test_clip_limit_uses_relevance_then_stable_chronology():
     segs = _segs(3)
     early = _topic(
         "Early",
@@ -258,7 +258,7 @@ def test_clip_limit_uses_importance_before_chronology():
     )
 
     clips = _convert(G._Plan(topics=[early, later]), segs, max_clips=1)
-    assert [clip["selection_candidate_id"] for clip in clips] == ["later"]
+    assert [clip["selection_candidate_id"] for clip in clips] == ["early"]
 
 
 def test_post_acceptance_enrichment_is_grounded_batched_and_quiz_free(monkeypatch):
@@ -322,9 +322,22 @@ def test_span_covering_eighty_percent_of_shorter_is_deduplicated():
     assert [clip["title"] for clip in clips] == ["A"]
 
 
-def test_identical_single_token_facets_are_semantic_restatements():
+def test_one_shared_topic_token_does_not_collapse_distinct_facets():
     first = {"learning_objective": "Photosynthesis", "facet": ""}
     second = {"learning_objective": "Photosynthesis", "facet": ""}
+
+    assert not G._semantic_restatement(first, second)
+
+
+def test_two_token_reworded_objectives_are_semantic_restatements():
+    first = {
+        "learning_objective": "Explain photosynthesis light reactions",
+        "facet": "energy capture",
+    }
+    second = {
+        "learning_objective": "Understand photosynthesis light reactions",
+        "facet": "energy capture",
+    }
 
     assert G._semantic_restatement(first, second)
 
@@ -572,21 +585,23 @@ def test_equal_quality_ranking_is_stable_and_not_duration_or_uncertainty_shaped(
     assert [clip["title"] for clip in clips] == ["ambiguous"]
 
 
-def test_production_flash_is_compact_global_boundary_first():
+def test_production_flash_is_compact_exhaustive_boundary_first():
     system, user = G._boundary_prompts("[0] 00:00 lesson", 1, "chemistry")
     prompt = f"{system}\n{user}".casefold()
 
     assert G.PRODUCTION_FLASH_PROFILE == G.FLASH_SPLIT_PROFILE
     assert "duration is never a selection criterion" in prompt
-    assert "each at least 0.75" in prompt
+    assert "topic_relevance is at least 0.75" in prompt
     assert "low or medium uncertainty" in prompt
     assert "omit only high-uncertainty" in prompt
     assert G._BOUNDARY_OUTPUT_TOKENS == 8192
-    assert "globally" in prompt
-    assert "do not favor the beginning" in prompt
-    assert "up to 8" in prompt
-    assert "if 8 valid complete teaching units exist, return 8" in prompt
+    assert "scan the whole transcript from first to last" in prompt
+    assert "every distinct" in prompt
+    assert "return every distinct qualifying moment" in prompt
+    assert "arbitrary count" in prompt
+    assert "up to 16" not in prompt
     assert "never add filler or incomplete material" in prompt
+    assert "difficulty is metadata, not an eligibility filter" in prompt
     assert "learning details and assessments are generated later" in prompt
 
 
@@ -614,7 +629,7 @@ def test_compound_topic_requires_the_relationship_between_named_ideas():
     assert "nearby prerequisite is not a direct match" in user
 
 
-def test_budget_is_reserved_once_before_dispatch_and_provider_retry_is_disabled(monkeypatch):
+def test_budget_is_reserved_once_and_selector_dispatch_has_no_retry(monkeypatch):
     order = []
     payload = {}
 
@@ -652,6 +667,41 @@ def test_budget_is_reserved_once_before_dispatch_and_provider_retry_is_disabled(
         "prompt_text": "system\n\nuser",
         "estimated_input_tokens": 3,
     }
+
+
+def test_boundary_repair_without_explicit_clip_limit_does_not_compare_none(
+    monkeypatch,
+):
+    segments = _segs(1)
+    proposal = _topic("Repair", 0, 0)
+    report = G._Conversion(repair_candidates=[
+        G._BoundaryRepairCandidate(
+            candidate_id="candidate-0-0",
+            prefix="proposal_0",
+            proposal=proposal,
+            start_line=0,
+            end_line=0,
+            reason="bad_boundary",
+        )
+    ])
+    monkeypatch.setattr(
+        G,
+        "_call_model",
+        lambda *_args, **_kwargs: (G._BoundaryRepairPlan(items=[]), {}),
+    )
+
+    calls = G._repair_failed_boundaries(
+        report,
+        segments,
+        _words(segments),
+        "concept",
+        {},
+        deadline=10_000.0,
+        cancelled=None,
+    )
+
+    assert calls == [{}]
+    assert "proposal_0:repair_omitted" in report.rejected_reasons
 
 
 def test_invalid_partial_flash_is_never_shipped_even_when_legacy_setting_is_true(monkeypatch):

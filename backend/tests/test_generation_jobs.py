@@ -171,7 +171,7 @@ def test_request_key_version_invalidates_pre_quality_silence_inventory(monkeypat
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v2"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v3"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(
         jobs, "REQUEST_SCHEMA_VERSION", "generation-request-v5-supadata-boundaries"

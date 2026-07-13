@@ -124,6 +124,7 @@ def _quality_v2_engine_out(engine_out: dict) -> dict:
         clip.setdefault("informativeness", 0.9)
         clip.setdefault("topic_relevance", 0.9)
         clip.setdefault("educational_importance", 0.9)
+        clip.setdefault("difficulty", 0.15)
     return engine_out
 
 
@@ -507,6 +508,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                     "title": title,
                     "facet": "ATP",
                     "reason": "ATP explanation",
+                    "difficulty": 0.85,
                     "sequence_index": 0,
                     "embed_url": "",
                 }],
@@ -776,44 +778,47 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v2"
+            reel.get("selection_contract_version") == "quality_silence_v3"
             for reel in feed
         ))
 
-    def test_quality_silence_v2_response_applies_global_quality_order(self) -> None:
+    def test_quality_silence_v3_response_orders_difficulty_before_quality(self) -> None:
         generated = [
             {
                 "reel_id": "a-late",
                 "video_id": "source-a",
                 "t_start": 90.75,
+                "difficulty": 0.8,
                 "score": 0.88,
                 "_selection_quality_floor": 0.88,
                 "_selection_quality_mean": 0.94,
                 "_selection_topic_relevance": 0.96,
                 "_selection_source_rank": 0,
-                "selection_contract_version": "quality_silence_v2",
+                "selection_contract_version": "quality_silence_v3",
             },
             {
                 "reel_id": "b",
                 "video_id": "source-b",
                 "t_start": 20.5,
+                "difficulty": 0.1,
                 "score": 0.84,
                 "_selection_quality_floor": 0.84,
                 "_selection_quality_mean": 0.97,
                 "_selection_topic_relevance": 0.99,
                 "_selection_source_rank": 1,
-                "selection_contract_version": "quality_silence_v2",
+                "selection_contract_version": "quality_silence_v3",
             },
             {
                 "reel_id": "a-early",
                 "video_id": "source-a",
                 "t_start": 10.25,
+                "difficulty": 0.5,
                 "score": 0.91,
                 "_selection_quality_floor": 0.91,
                 "_selection_quality_mean": 0.92,
                 "_selection_topic_relevance": 0.93,
                 "_selection_source_rank": 0,
-                "selection_contract_version": "quality_silence_v2",
+                "selection_contract_version": "quality_silence_v3",
             },
         ]
 
@@ -825,7 +830,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
 
         self.assertEqual(
             [reel["reel_id"] for reel in result],
-            ["a-early", "a-late", "b"],
+            ["b", "a-early", "a-late"],
         )
         self.assertTrue(all(
             not any(key.startswith("_selection_") for key in reel)
@@ -1181,7 +1186,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 15)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 16)
 
 
 if __name__ == "__main__":

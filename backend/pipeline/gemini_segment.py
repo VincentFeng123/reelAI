@@ -52,8 +52,7 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"before we (?:begin|get started)|let(?:['’]?s| us) move on|"
     r"next we(?:['’]ll| will)|to (?:recap|summarize)|in summary|"
     r"we (?:are|'re) reaching (?:a|the) crossroad now|"
-    r"we(?:['’]ve| have) already (?:done|covered|finished)\b.{0,80}"
-    r"|we(?:['’]re| are) going to\b|"
+    r"we(?:['’]ve| have) already (?:done|covered|finished)\b.{0,80}|"
     r"cover (?:that|this) in (?:this|the) course)\b",
     re.IGNORECASE,
 )
@@ -152,9 +151,8 @@ _SELECTION_OUTPUT_TOKENS = 24_576
 _BOUNDARY_OUTPUT_TOKENS = 8_192
 _BOUNDARY_REPAIR_OUTPUT_TOKENS = 1_024
 _ENRICH_OUTPUT_TOKENS = 2_048
-_GREEN_SCORE = 0.75
 _MAX_CLIPS = 40
-_PRODUCTION_MAX_CANDIDATES = 8
+_GREEN_SCORE = 0.75
 _DUPLICATE_OVERLAP = 0.8
 _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
@@ -259,7 +257,7 @@ class _Plan(_StrictModel):
 
 
 class _BoundaryPlan(_StrictModel):
-    topics: list[_BoundaryTopic] = Field(max_length=_PRODUCTION_MAX_CANDIDATES)
+    topics: list[_BoundaryTopic]
 
 
 class _BoundaryRepairItem(_StrictModel):
@@ -271,7 +269,7 @@ class _BoundaryRepairItem(_StrictModel):
 
 
 class _BoundaryRepairPlan(_StrictModel):
-    items: list[_BoundaryRepairItem] = Field(max_length=_PRODUCTION_MAX_CANDIDATES)
+    items: list[_BoundaryRepairItem] = Field(max_length=_MAX_CLIPS)
 
 
 class _EnrichmentItem(_StrictModel):
@@ -350,12 +348,14 @@ _POLICY_AND_EXAMPLES = """Policy:
   recaps, outros, jokes, tangents, repeated restatements, and partial explanations.
 - Omit teaching that depends on a diagram, screen, gesture, drawing, or other missing
   visual context. Mark self_contained and is_standalone false for such material.
-- Prefer fewer clips to filler or an incomplete idea. Do not shorten a complete idea to
-  fit a target length; clip duration is never a selection criterion.
+- Exhaustively enumerate every distinct directly relevant teaching unit. Prefer an empty
+  slot to filler or an incomplete idea. Do not shorten a complete idea to fit a target
+  length; clip duration is never a selection criterion.
 - Keep distinct informational facets from the same source. Do not return two clips that
   teach the same learning objective in different words.
-- Return a candidate only when informativeness, topic_relevance, and
-  educational_importance are each at least 0.75.
+- Return a candidate when topic_relevance is at least 0.75 and the spoken unit satisfies
+  every substantive, grounding, context, and filler rule. Informativeness and educational
+  importance describe the unit but never exclude an otherwise valid relevant unit.
 - Copy exact transcript line IDs and exact opening/closing quotes.
 - Do not provide chain-of-thought or hidden reasoning.
 
@@ -424,9 +424,9 @@ def _learner_rule(level: str) -> str:
     if normalized not in {"beginner", "intermediate", "advanced"}:
         return ""
     return (
-        f"The viewer's current level is {normalized}. Prefer explanations whose assumed prior "
-        "knowledge fits that level, while keeping topic relevance and educational substance "
-        "authoritative."
+        f"The viewer's current level is {normalized}. Still return qualifying units at every "
+        "difficulty. Difficulty is metadata, not an eligibility filter; the application "
+        "organizes accepted units later."
     )
 
 
@@ -479,35 +479,31 @@ def _boundary_prompts(
     n: int,
     topic: str = "",
     *,
-    max_candidates: int = _PRODUCTION_MAX_CANDIDATES,
     learner_level: str = "",
 ) -> tuple[str, str]:
     system = (
         "You select self-contained educational clip boundaries from timestamped transcripts.\n\n"
         + _POLICY_AND_EXAMPLES
     )
-    learner_rule = _learner_rule(learner_level)
-    learner_line = f"{learner_rule}\n" if learner_rule else ""
-    candidate_limit = max(
-        1,
-        min(_PRODUCTION_MAX_CANDIDATES, int(max_candidates)),
-    )
+    del learner_level
     user = (
-        f"{_topic_rule(topic)}\n{learner_line}"
+        f"{_topic_rule(topic)}\n"
         f"Line IDs must be between 0 and {n - 1}.\n\n"
         f"Transcript ({n} lines, formatted `[index] MM:SS text`):\n{lines}\n\n"
-        "Choose the strongest educational moments globally from anywhere in the transcript. "
-        "Do not favor the beginning and do not return every chronological section. Rank the "
-        "strongest, most educational, self-contained moments first; sequencing happens later. "
+        "Scan the whole transcript from first to last and return every distinct educational "
+        "unit that directly teaches the exact requested topic. Do not stop after finding one "
+        "good unit, and do not omit a valid niche fact, example, mechanism, comparison, or "
+        "conclusion merely because another unit is more central. Sequencing happens later. "
         "For every moment, verify the displayed start/end timestamps before returning it. "
         "Select the minimum complete span containing all necessary setup, reasoning, and the "
         "natural conclusion, regardless of its duration. If a useful "
         "section contains a greeting, channel plug, sponsor, or outro, select a complete "
         "teaching unit before or after that interruption rather than including it. "
-        f"Return as many distinct strong moments as the transcript supports, up to "
-        f"{candidate_limit}. If {candidate_limit} valid complete teaching units exist, "
-        f"return {candidate_limit}. Never add filler or incomplete material just to hit "
-        "the limit. Accept moments when boundaries and context have low or medium "
+        "Return every distinct qualifying moment the transcript supports. Never add filler "
+        "or incomplete material. Finish scanning the entire transcript before returning; "
+        "do not stop after an arbitrary count or return only the earliest units. Accept "
+        "moments when boundaries "
+        "and context have low or medium "
         "uncertainty; omit only high-uncertainty moments. "
         "Set substantive=true only for a real explanation, worked example, definition, "
         "mechanism, comparison, or conclusion that teaches something useful. Omit greetings, "
@@ -520,12 +516,13 @@ def _boundary_prompts(
         "A candidate is self-contained only when its spoken content is understandable without "
         "a diagram, screen, gesture, drawing, slide, or other unseen visual. Omit candidates "
         "that rely on those visuals. "
-        "Score educational_importance by centrality to what this learner most needs from the "
-        "requested topic. Omit any candidate when informativeness, topic_relevance, or "
-        "educational_importance is below 0.75. For broad beginner topics, field-wide foundations, core organizing "
-        "principles, and canonical mechanisms outrank niche case studies, jokes, novelty, or "
-        "institutional prestige. For an exact niche topic, centrality to that exact requested "
-        "task remains authoritative. "
+        "Score educational_importance by centrality to the exact requested topic, but do not "
+        "use it or informativeness as an exclusion threshold. Omit a candidate only when "
+        "topic_relevance is below 0.75 or a substantive, grounding, context, visual, filler, "
+        "or standalone rule fails. Difficulty is metadata, not an eligibility filter. Score "
+        "difficulty only by assumed prior knowledge: 0.00-0.33 means beginner/no background, "
+        "0.34-0.66 means intermediate/foundational knowledge, and 0.67-1.00 means advanced or "
+        "specialist knowledge. Return units across that entire scale. "
         "Use a unique candidate_id for every moment. Every returned moment must be standalone "
         "and list no prerequisite candidate IDs; include required setup inside its own span. "
         f"Every item must contain {_selection_fields(enriched=False)}. Learning details and "
@@ -1261,9 +1258,10 @@ def _semantic_restatement(
         f"{b.get('learning_objective', '')} {b.get('facet', '')}"
     ) - generic
     smaller = min(len(a_tokens), len(b_tokens))
-    if smaller == 0:
+    if smaller < 2:
         return False
-    return len(a_tokens & b_tokens) / smaller >= threshold
+    shared = len(a_tokens & b_tokens)
+    return shared >= 2 and shared / smaller >= threshold
 
 
 def _duplicates(a: dict, b: dict) -> bool:
@@ -1469,27 +1467,16 @@ def _learning_details(topic_obj: object, clip_text: str, topic: str) -> tuple[di
     return details, errors
 
 
-def _configured_clip_limit(settings: dict) -> int:
+def _configured_clip_limit(settings: dict) -> int | None:
     configured = settings.get("max_clips")
-    limit = config.SEGMENT_MAX_CLIPS if configured is None else int(configured)
-    return max(0, min(_MAX_CLIPS, limit))
+    return None if configured is None else max(0, int(configured))
 
 
 def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
-    """Dedupe and limit while candidates remain quality-ranked."""
-    quality_order = sorted(
+    """Dedupe by relevance and retain every qualifying production candidate."""
+    relevance_order = sorted(
         clips,
         key=lambda clip: (
-            -min(
-                float(clip["informativeness"]),
-                float(clip["topic_relevance"]),
-                float(clip["educational_importance"]),
-            ),
-            -(
-                float(clip["informativeness"])
-                + float(clip["topic_relevance"])
-                + float(clip["educational_importance"])
-            ) / 3.0,
             -float(clip["topic_relevance"]),
             float(clip["start"]),
             float(clip["end"]),
@@ -1497,7 +1484,7 @@ def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
         ),
     )
     kept: list[dict] = []
-    for candidate in quality_order:
+    for candidate in relevance_order:
         if not any(_duplicates(candidate, prior) for prior in kept):
             kept.append(candidate)
     limit = _configured_clip_limit(settings)
@@ -1547,16 +1534,24 @@ def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
             for item in bundle
             if str(item.get("selection_candidate_id") or "") not in selected_ids
         ]
-        if len(selected) + len(additions) > limit:
+        if limit is not None and len(selected) + len(additions) > limit:
             continue
         for item in additions:
             selected.append(item)
             item_id = str(item.get("selection_candidate_id") or "")
             if item_id:
                 selected_ids.add(item_id)
-        if len(selected) >= limit:
+        if limit is not None and len(selected) >= limit:
             break
-    selected.sort(key=lambda clip: (clip["start"], clip["end"]))
+    selected.sort(
+        key=lambda clip: (
+            float(clip.get("difficulty") or 0.0),
+            -float(clip.get("topic_relevance") or 0.0),
+            float(clip["start"]),
+            float(clip["end"]),
+            str(clip.get("selection_candidate_id") or ""),
+        )
+    )
     for index, clip in enumerate(selected):
         clip["sequence_index"] = index + 1
     return selected
@@ -1674,17 +1669,8 @@ def _plan_to_report(
         if info is None or relevance is None or importance is None or difficulty is None:
             report.rejected_reasons.append(f"{prefix}:score_out_of_range")
             continue
-        score_gate = next((
-            field_name
-            for field_name, value in (
-                ("informativeness", info),
-                ("topic_relevance", relevance),
-                ("educational_importance", importance),
-            )
-            if value < _GREEN_SCORE
-        ), None)
-        if score_gate is not None:
-            report.rejected_reasons.append(f"{prefix}:{score_gate}_below_green")
+        if relevance < _GREEN_SCORE:
+            report.rejected_reasons.append(f"{prefix}:topic_relevance_below_green")
             continue
         if proposal.self_contained is not True:
             report.rejected_reasons.append(f"{prefix}:not_self_contained")
@@ -1923,12 +1909,7 @@ def _plan_to_report(
         clip.get("uncertainty") == "medium" for clip in raw
     )
     report.score_below_green = any(
-        min(
-            float(clip["informativeness"]),
-            float(clip["topic_relevance"]),
-            float(clip["educational_importance"]),
-        ) < _GREEN_SCORE
-        for clip in raw
+        float(clip["topic_relevance"]) < _GREEN_SCORE for clip in raw
     )
     for i, candidate in enumerate(raw):
         if any(_duplicates(candidate, other) for other in raw[i + 1:]):
@@ -2066,6 +2047,7 @@ def _call_model(
     except Exception as exc:
         if _cancel_requested(cancelled):
             raise
+        provider_telemetry = _telemetry_dict(getattr(exc, "telemetry", None))
         raise _ModelCallError(
             f"{type(exc).__name__}: {exc}",
             {
@@ -2073,7 +2055,7 @@ def _call_model(
                 "operation": operation,
                 "prompt_version": prompt_version,
                 "thinking_level": thinking_level,
-                "retries": 0,
+                **provider_telemetry,
                 "error_type": type(exc).__name__,
                 "dispatched": True,
                 **reservation,
@@ -2145,8 +2127,15 @@ def _repair_failed_boundaries(
     cancelled: CancelledCb,
 ) -> list[dict]:
     """Run one localized Flash batch and merge only independently valid repairs."""
-    candidates = report.repair_candidates[:_PRODUCTION_MAX_CANDIDATES]
-    if not candidates or report.accepted_count >= _configured_clip_limit(settings):
+    candidates = report.repair_candidates[:_MAX_CLIPS]
+    configured_limit = _configured_clip_limit(settings)
+    if (
+        not candidates
+        or (
+            configured_limit is not None
+            and report.accepted_count >= configured_limit
+        )
+    ):
         return []
 
     system, user, allowed = _boundary_repair_prompts(candidates, segments, topic)
@@ -2296,7 +2285,6 @@ def _run_selection_profile(
             rendered,
             len(segments),
             topic,
-            max_candidates=_PRODUCTION_MAX_CANDIDATES,
             learner_level=learner_level,
         )
         schema = _BoundaryPlan
@@ -2308,7 +2296,6 @@ def _run_selection_profile(
             rendered,
             len(segments),
             topic,
-            max_candidates=_PRODUCTION_MAX_CANDIDATES,
             learner_level=learner_level,
         )
         schema = _BoundaryPlan
@@ -2346,9 +2333,9 @@ def _run_selection_profile(
         str(transcript.get("source") or "").casefold() == "supadata",
     )
     if profile in {PRODUCTION_FLASH_PROFILE, PRO_BOUNDARY_PROFILE}:
-        # Cache the complete selector result. Request ceilings are applied only
-        # after cache lookup by the ingestion layer.
-        conversion_settings["max_clips"] = _PRODUCTION_MAX_CANDIDATES
+        # Cache and persist the complete selector result. Public request ceilings
+        # apply only when a feed inventory is surfaced, never during selection.
+        conversion_settings.pop("max_clips", None)
     report = _plan_to_report(
         parsed,
         segments,
@@ -2562,15 +2549,17 @@ def run_segment_profile(
     except Exception as exc:  # callers decide whether an invalid profile should fall back
         call = _exception_telemetry(exc)
         calls = [call] if call else []
+        error_type = str(call.get("error_type") or type(exc).__name__)
+        failure_reason = f"request_failure:{error_type}"
         return SegmentResult(
             [],
             "Segmentation model call failed.",
             profile,
             "invalid",
-            [f"request_failure:{type(exc).__name__}"],
+            [failure_reason],
             calls=calls,
             error=f"{type(exc).__name__}: {exc}",
-            rejection_reasons=[f"request_failure:{type(exc).__name__}"],
+            rejection_reasons=[failure_reason],
         )
 
 

@@ -233,6 +233,56 @@ def test_source_edges_are_accepted_only_when_the_audio_at_each_edge_is_quiet(
     assert result.diagnostics["end_quiet"] == [9.7, 10.0]
 
 
+def test_true_media_duration_allows_post_caption_end_silence(
+    tmp_path: Path,
+) -> None:
+    decoded_end_limits: list[float] = []
+
+    def fake_decode(
+        _source,
+        *,
+        window_start_sec,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        if output_path.name == "start-0.wav":
+            spans = [(0.3, 0), (window_duration_sec - 0.3, 12000)]
+        else:
+            decoded_end_limits.append(window_start_sec + window_duration_sec)
+            leading_sound = 10.0 - window_start_sec
+            spans = [
+                (leading_sound, 12000),
+                (0.3, 0),
+                (window_duration_sec - leading_sound - 0.3, 12000),
+            ]
+        _write_wav(output_path, spans)
+
+    prepared = silence.AudioPreparationResult(
+        "ready",
+        source=silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            format_id="140",
+            duration_sec=12.0,
+        ),
+    )
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            2.0,
+            10.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=20.0,
+            prepared=prepared,
+        )
+
+    assert result.verified
+    assert result.end_sec == 10.2
+    assert decoded_end_limits == [12.0]
+    assert result.diagnostics["search_end_limit_sec"] == 12.0
+    assert result.diagnostics["source_duration_sec"] == 12.0
+
+
 def test_exact_source_end_is_accepted_when_audio_reaches_edge_in_quiet(
     tmp_path: Path,
 ) -> None:
@@ -483,7 +533,7 @@ def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monke
     )
     payload = (
         b'{"url":"https://media.example/audio.m4a","format_id":"140",'
-        b'"http_headers":{"User-Agent":"agent"}}'
+        b'"duration":123.456,"http_headers":{"User-Agent":"agent"}}'
     )
     with mock.patch.object(silence, "_run_command", return_value=(payload, b"")) as run:
         result = silence.prepare_audio_source("dQw4w9WgXcQ")
@@ -499,6 +549,7 @@ def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monke
     assert "--no-remote-components" in command
     assert "--remote-components" not in command
     assert result.source is not None and result.source.format_id == "140"
+    assert result.source.duration_sec == 123.456
     assert "media.example" not in repr(result)
 
 
