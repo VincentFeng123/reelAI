@@ -154,6 +154,38 @@ def test_topic_evidence_quote_requires_five_to_forty_words(quote, reason):
     assert report.rejected_reasons == [reason]
 
 
+def test_near_exact_topic_evidence_is_repaired_to_transcript_words():
+    segments = [{
+        "start": 0.0,
+        "end": 12.0,
+        "text": "Mitochondria transform chemical energy from nutrients into ATP for cells.",
+    }]
+    proposal = _topic(
+        "Mitochondria",
+        0,
+        0,
+        start_quote="Mitochondria transform",
+        end_quote="ATP for cells",
+        topic_evidence_quote=(
+            "Mitochondria transform chemical energy in nutrients into ATP for cells"
+        ),
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="mitochondria",
+    )
+
+    assert len(report.clips) == 1
+    assert report.clips[0]["topic_evidence_quote"] == (
+        "Mitochondria transform chemical energy from nutrients into ATP for cells"
+    )
+    assert report.clips[0]["_quote_repaired"] is True
+
+
 def test_selector_metadata_preserves_explicit_prerequisite_chain():
     segs = _segs(3)
     setup = _topic(

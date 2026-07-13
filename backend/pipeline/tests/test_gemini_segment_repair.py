@@ -184,6 +184,33 @@ def test_production_dialogue_reply_is_rejected_when_context_exceeds_repair_windo
     assert (start, end, error) == (1, 1, "unresolved_weak_start")
 
 
+def test_production_anaphoric_question_is_rejected_without_its_antecedent() -> None:
+    segments = [
+        {
+            "start": 137.0,
+            "end": 184.0,
+            "text": "Homeostasis keeps a cell's internal environment stable.",
+        },
+        {
+            "start": 184.0,
+            "end": 218.0,
+            "text": (
+                "Ok. But like, how does the cell do that? The secret lies in "
+                "the cell membrane, which controls what goes in and out."
+            ),
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        1,
+        1,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (1, 1, "unresolved_weak_start")
+
+
 def test_dirty_edges_use_one_localized_low_thinking_flash_batch(monkeypatch):
     transcript = _transcript()
     selector = G._BoundaryPlan(topics=[

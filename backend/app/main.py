@@ -3142,7 +3142,7 @@ def _generation_job_reels(conn, job_row: dict[str, Any]) -> list[dict[str, Any]]
         return []
     params = _job_request_params(job_row)
     requested = max(1, min(MAX_REELS_PER_MATERIAL, int(params.get("num_reels") or 20)))
-    return _ranked_request_reels(
+    ranked = _ranked_request_reels(
         conn,
         material_id=str(job_row.get("material_id") or ""),
         fast_mode=str(params.get("generation_mode") or "slow") == "fast",
@@ -3166,7 +3166,23 @@ def _generation_job_reels(conn, job_row: dict[str, Any]) -> list[dict[str, Any]]
         page=1,
         limit=requested,
         learner_id=str(job_row.get("learner_id") or LEGACY_LEARNER_ID),
-    )[:requested]
+    )
+    # Candidate events are emitted only after a clip is persisted and passes
+    # the surfaceability guards. Request shaping may still remove one for page
+    # diversity; the authoritative inventory must never make a streamed clip
+    # disappear.
+    provisional: list[dict[str, Any]] = []
+    for event in replay_generation_events(
+        conn,
+        job_id=str(job_row.get("id") or ""),
+    ):
+        if str(event.get("type") or "") != "candidate":
+            continue
+        payload = event.get("payload") or {}
+        reel = payload.get("reel") if isinstance(payload, dict) else None
+        if isinstance(reel, dict):
+            provisional.append(dict(reel))
+    return _merge_request_reel_lists(ranked, provisional)[:requested]
 
 
 def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, Any]:

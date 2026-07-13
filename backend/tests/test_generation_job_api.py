@@ -1117,6 +1117,61 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         conn.close()
 
 
+def test_authoritative_job_inventory_retains_every_streamed_candidate(monkeypatch) -> None:
+    conn = _conn()
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="candidate-retention",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "slow", "num_reels": 4},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="candidate-retention-worker",
+        now=now,
+    )
+    assert leased
+    generation_jobs.append_event(
+        conn,
+        job_id=job["id"],
+        event_type="candidate",
+        payload={
+            "reel": {
+                "reel_id": "streamed-reel",
+                "video_id": "streamed-video",
+                "t_start": 10.0,
+                "t_end": 40.0,
+            },
+            "provisional": True,
+        },
+        lease_owner="candidate-retention-worker",
+        now=now,
+    )
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [{"reel_id": "ranked-reel"}],
+    )
+    job_row = {
+        **leased,
+        "result_generation_id": "generation-1",
+    }
+
+    reels = main._generation_job_reels(conn, job_row)
+
+    assert [reel["reel_id"] for reel in reels] == [
+        "ranked-reel",
+        "streamed-reel",
+    ]
+    conn.close()
+
+
 def test_preflight_uses_one_metadata_search_and_no_generation(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)

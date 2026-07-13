@@ -604,6 +604,40 @@ def _contains_quote(text: str, quote: str) -> bool:
                for i in range(len(haystack) - len(needle) + 1))
 
 
+def _repair_topic_evidence_quote(text: str, quote: str) -> str | None:
+    """Recover a nearly copied evidence quote as an exact transcript span."""
+    quote_tokens = _toks(quote)
+    matches = list(_WORD_RE.finditer(text or ""))
+    if not 5 <= len(quote_tokens) <= 40 or len(matches) < 5:
+        return None
+    try:
+        from rapidfuzz import fuzz
+
+        score_fn = lambda a, b: float(fuzz.ratio(a, b))
+    except Exception:  # pragma: no cover - rapidfuzz is a required dependency
+        from difflib import SequenceMatcher
+
+        score_fn = lambda a, b: 100.0 * SequenceMatcher(None, a, b).ratio()
+
+    target = " ".join(quote_tokens)
+    best: tuple[float, int, int] | None = None
+    for window_size in range(
+        max(5, len(quote_tokens) - 2),
+        min(40, len(quote_tokens) + 2, len(matches)) + 1,
+    ):
+        for start in range(len(matches) - window_size + 1):
+            end = start + window_size
+            candidate = " ".join(
+                match.group(0).lower() for match in matches[start:end]
+            )
+            score = score_fn(target, candidate)
+            if best is None or score > best[0]:
+                best = (score, start, end)
+    if best is None or best[0] < 90.0:
+        return None
+    return (text or "")[matches[best[1]].start():matches[best[2] - 1].end()]
+
+
 def _locate_quote_match(
     words: list[dict], quote: str, lo_t: float, hi_t: float, want: str,
 ) -> tuple[float, float] | None:
@@ -1467,8 +1501,15 @@ def _plan_to_report(
                 report.rejected_reasons.append(f"{prefix}:invalid_topic_evidence_quote_length")
                 continue
             if not _contains_quote(clip_text, topic_evidence_quote):
-                report.rejected_reasons.append(f"{prefix}:ungrounded_topic_evidence_quote")
-                continue
+                repaired_evidence_quote = _repair_topic_evidence_quote(
+                    clip_text,
+                    topic_evidence_quote,
+                )
+                if repaired_evidence_quote is None:
+                    report.rejected_reasons.append(f"{prefix}:ungrounded_topic_evidence_quote")
+                    continue
+                topic_evidence_quote = repaired_evidence_quote
+                quote_repaired = True
         cue_ids = [
             str(segments[line].get("cue_id") or f"cue-{line}")
             for line in range(a, b + 1)

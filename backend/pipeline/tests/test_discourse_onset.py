@@ -42,6 +42,11 @@ def test_dangling_anaphor_is_weak():
     assert opens_mid_thought("This is why the reaction proceeds so quickly.")
     assert opens_mid_thought("That gives us the final concentration.")
 
+
+def test_question_with_missing_antecedent_is_weak():
+    assert opens_mid_thought("Ok. But like, how does the cell do that?")
+    assert opens_mid_thought("How does that work?")
+
 def test_context_dependent_np_is_weak():
     assert opens_mid_thought("The answer is fifteen newtons.")
     assert opens_mid_thought("The previous equation tells us the velocity.")

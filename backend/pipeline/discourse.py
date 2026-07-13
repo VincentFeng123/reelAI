@@ -29,6 +29,14 @@ _MID_LIST_OR_REPLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_DANGLING_QUESTION_REFERENCE_RE = re.compile(
+    r"(?:\b(?:this|that|these|those|it|they|them)\s*\?|"
+    r"\b(?:how|why|when|where|what)\s+"
+    r"(?:does|do|did|is|are|was|were|can|could|would|should|will)\s+"
+    r"(?:this|that|these|those|it|they|them)\b)",
+    re.IGNORECASE,
+)
+
 # Bare anaphora that, as the first word before a verb/aux, lack an in-clip antecedent.
 ANAPHORS: frozenset[str] = frozenset({
     "this", "that", "these", "those", "it", "they", "them", "he", "she",
@@ -100,6 +108,11 @@ def opens_mid_thought(text: str) -> bool:
         return True
 
     if _MID_LIST_OR_REPLY_RE.match(stripped):
+        return True
+
+    # A question is not self-contained merely because it has punctuation.
+    # "How does the cell do that?" still requires the missing prior action.
+    if _DANGLING_QUESTION_REFERENCE_RE.search(stripped):
         return True
 
     framing = _is_framing_or_question(text, words)
