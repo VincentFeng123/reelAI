@@ -1844,7 +1844,11 @@ function FeedPageInner() {
   );
 
   const reconcileGeneratedReels = useCallback(
-    (_provisional: Reel[], finalInventory: Reel[]): SessionMergeResult => {
+    (
+      _provisional: Reel[],
+      finalInventory: Reel[],
+      options: { preserveUnmatchedUnseen: boolean },
+    ): SessionMergeResult => {
       const currentRows = reelsRef.current;
       const lockedPrefixLength = Math.min(currentRows.length, activeIndexRef.current + 1);
       const authoritativeById = new Map(
@@ -1864,9 +1868,13 @@ function FeedPageInner() {
         consumedAuthoritative.add(authoritative);
         return mergeReelMetadata(reel, authoritative);
       });
-      // Keep unmatched provisional clips at the end of the unseen tail so a
-      // clip already shown to the learner never disappears from the session.
       const stableUnseenRows = currentRows.slice(lockedPrefixLength);
+      const provisionalReelIds = new Set(
+        _provisional
+          .map((reel) => String(reel.reel_id || "").trim())
+          .filter(Boolean),
+      );
+      const provisionalClipKeys = new Set(_provisional.map((reel) => reelClipKey(reel)));
       const authoritativeUnseen = finalInventory.filter((reel) => !consumedAuthoritative.has(reel));
       const stableUnseenById = new Map(
         stableUnseenRows
@@ -1885,7 +1893,22 @@ function FeedPageInner() {
         consumedStableUnseen.add(stable);
         return mergeReelMetadata(stable, reel);
       });
-      authoritativeTail.push(...stableUnseenRows.filter((reel) => !consumedStableUnseen.has(reel)));
+      // Retain pre-existing unseen inventory during stream settlement. A
+      // provisional candidate that is absent from the authoritative final was
+      // intentionally removed; current-contract candidates already appear in
+      // that final inventory and are merged above.
+      // Restored snapshots are only a cache, so their unmatched unseen rows
+      // must be removed when page one supplies the authoritative inventory.
+      if (options.preserveUnmatchedUnseen) {
+        authoritativeTail.push(...stableUnseenRows.filter((reel) => {
+          if (consumedStableUnseen.has(reel)) {
+            return false;
+          }
+          const reelId = String(reel.reel_id || "").trim();
+          return !(reelId && provisionalReelIds.has(reelId))
+            && !provisionalClipKeys.has(reelClipKey(reel));
+        }));
+      }
       const reordered = dedupeByIdentity([...lockedPrefix, ...authoritativeTail]);
       const previousIdentity = new Set(currentRows.map((reel) => `${String(reel.reel_id || "").trim()}|${reelClipKey(reel)}`));
       const addedReels = reordered.filter(
@@ -1905,7 +1928,10 @@ function FeedPageInner() {
   );
 
   const loadPage = useCallback(
-    async (targetPage: number, options?: { autofill?: boolean }): Promise<{ addedCount: number; exhausted: boolean }> => {
+    async (
+      targetPage: number,
+      options?: { autofill?: boolean; preserveSession?: boolean; generationMode?: GenerationMode },
+    ): Promise<{ addedCount: number; exhausted: boolean }> => {
       const feedMaterialIds = getFeedMaterialIds();
       if (!settingsScopeReady || feedMaterialIds.length === 0 || isFetchingRef.current) {
         return { addedCount: 0, exhausted: feedPagesExhausted };
@@ -1928,7 +1954,7 @@ function FeedPageInner() {
                 excludeReelIds: adaptiveExcludeReelIdsRef.current,
                 autofill: options?.autofill ?? true,
                 prefetch: INITIAL_SLOW_PREFETCH,
-                generationMode,
+                generationMode: options?.generationMode ?? generationMode,
                 minRelevance: tuning.minRelevance,
                 creativeCommonsOnly: tuning.creativeCommonsOnly,
                 preferredVideoDuration: tuning.preferredVideoDuration,
@@ -1992,7 +2018,9 @@ function FeedPageInner() {
         const fetchedReels = dedupeByIdentity(interleaveReelBatches(successful.map((row) => row.data!.reels)));
         const fetchedTotal = successful.reduce((sum, row) => sum + Math.max(0, Number(row.data!.total) || 0), 0);
         const merged = targetPage === 1
-          ? mergeSessionReels(fetchedReels)
+          ? options?.preserveSession
+            ? reconcileGeneratedReels([], fetchedReels, { preserveUnmatchedUnseen: false })
+            : mergeSessionReels(fetchedReels)
           : mergeSessionReels(fetchedReels, reelsRef.current);
         const exhausted = successful.every((row) => {
           const rowTotal = Math.max(0, Number(row.data!.total) || 0);
@@ -2021,10 +2049,10 @@ function FeedPageInner() {
           updateSessionReels(merged.reels);
         }
         markRecoveryProgress(merged.addedCount);
-        if (targetPage > 1 && merged.addedCount === 0) {
+        if (targetPage > 1 && merged.addedCount === 0 && exhausted) {
           markPagedFeedExhausted();
         } else {
-          setFeedPagesExhausted(exhausted && merged.addedCount === 0);
+          setFeedPagesExhausted(exhausted);
         }
         clearRecoveredTransportError();
 
@@ -2076,6 +2104,7 @@ function FeedPageInner() {
       noteFeedFailure,
       noteFeedTransportFailure,
       recoverMissingMaterial,
+      reconcileGeneratedReels,
       rememberFeedGenerationJob,
       settingsScopeReady,
       updateSessionReels,
@@ -2166,7 +2195,7 @@ function FeedPageInner() {
             if (!isSearchScopeActive(searchScope)) {
               return { materialId: id, data: null, streamedReels, error: null };
             }
-            reconcileGeneratedReels(streamedReels, data.reels);
+            reconcileGeneratedReels(streamedReels, data.reels, { preserveUnmatchedUnseen: true });
             armActiveRecoveryRequest(searchScope, "generating");
             return { materialId: id, data, streamedReels: dedupeByIdentity(data.reels), error: null };
           } catch (e) {
@@ -2401,10 +2430,13 @@ function FeedPageInner() {
     setCanRequestMore(true);
     setFeedPagesExhausted(false);
     setActiveIndex(0);
+    activeIndexRef.current = 0;
     setFeedbackByReel({});
     setMobileDetailsOpen(false);
     setBootstrappingFirstReels(false);
     bootstrapAttemptedRef.current = false;
+    let restoredGenerationMode: GenerationMode =
+      generationModeParam === "fast" || generationModeParam === "slow" ? generationModeParam : "slow";
     if (restoredSession) {
       const allowedMaterialIds = new Set(feedMaterialIds.map((id) => String(id || "").trim()).filter(Boolean));
       const singleFeedMaterialId = feedMaterialIds.length === 1 ? feedMaterialIds[0] : "";
@@ -2418,8 +2450,10 @@ function FeedPageInner() {
       const restoredReelId = restoredReels[restoredIndex]?.reel_id;
       const modeFromQuery =
         generationModeParam === "fast" || generationModeParam === "slow" ? generationModeParam : null;
-      const restoredGenerationMode = modeFromQuery ?? restoredSession.generationMode;
+      restoredGenerationMode = modeFromQuery ?? restoredSession.generationMode;
       updateSessionReels(restoredReels);
+      setActiveIndex(restoredIndex);
+      activeIndexRef.current = restoredIndex;
       setFeedbackByReel(restoredSession.feedbackByReel);
       adaptiveExcludeReelIdsRef.current = restoredSession.adaptiveExcludeReelIds;
       setPage(restoredSession.page);
@@ -2457,10 +2491,29 @@ function FeedPageInner() {
       }
       return;
     }
-    if (!restoredSession || restoredSession.reels.length === 0) {
+    const hasRestoredReels = Boolean(restoredSession?.reels.length);
+    if (hasRestoredReels) {
+      // A local snapshot makes playback instant, but it is not authoritative:
+      // the durable job may have streamed or finalized more clips while this
+      // page was away. Reconcile page one before deciding whether to generate.
+      setBootstrappingFirstReels(true);
+      const restoredSearchScope = activeSearchScopeRef.current;
+      void loadPage(1, {
+        autofill: true,
+        preserveSession: true,
+        generationMode: restoredGenerationMode,
+      }).finally(() => {
+        if (
+          hydratedMaterialIdRef.current === materialId
+          && isSearchScopeActive(restoredSearchScope)
+        ) {
+          setBootstrappingFirstReels(false);
+        }
+      });
+    } else {
       void loadPage(1, { autofill: true });
     }
-  }, [communityHandoffIdParam, communityPreviewReel, generationModeParam, loadPage, materialId, mergeSessionReels, settingsScopeReady, setVisibleFeedError, updateSessionReels]);
+  }, [communityHandoffIdParam, communityPreviewReel, generationModeParam, isSearchScopeActive, loadPage, materialId, mergeSessionReels, settingsScopeReady, setVisibleFeedError, updateSessionReels]);
 
   useEffect(() => {
     if (!materialId || sessionHydrated || loading) {
@@ -2748,7 +2801,7 @@ function FeedPageInner() {
             if (!isSearchScopeActive(searchScope)) {
               return null;
             }
-            reconcileGeneratedReels(streamedReels, data.reels);
+            reconcileGeneratedReels(streamedReels, data.reels, { preserveUnmatchedUnseen: true });
             return { materialId: id, data, streamedReels: dedupeByIdentity(data.reels) };
           } catch (e) {
             if (!isRequestInterruptedError(e)) {
@@ -2812,6 +2865,31 @@ function FeedPageInner() {
       const searchScope = activeSearchScopeRef.current;
       setBootstrappingFirstReels(true);
       try {
+        // A restored/current session can already contain rows from later
+        // durable pages. Walk every still-available persisted page before
+        // asking the backend to generate a larger inventory; a duplicate-only
+        // page still advances us toward the next authoritative page.
+        let nextPersistedPage = page + 1;
+        let persistedPagesExhausted = !hasMore;
+        const lastPersistedPage = Math.max(page, Math.ceil(total / PAGE_SIZE));
+        while (
+          !persistedPagesExhausted
+          && nextPersistedPage <= lastPersistedPage
+          && Math.max(0, reelsRef.current.length - activeIndexRef.current - 1) < READY_RESERVOIR_TARGET
+        ) {
+          const persisted = await loadPage(nextPersistedPage, {
+            autofill: false,
+            generationMode,
+          });
+          if (!isSearchScopeActive(searchScope)) {
+            return;
+          }
+          persistedPagesExhausted = persisted.exhausted;
+          nextPersistedPage += 1;
+        }
+        if (Math.max(0, reelsRef.current.length - activeIndexRef.current - 1) >= READY_RESERVOIR_TARGET) {
+          return;
+        }
         const generated = await requestMore({ surfaceError: manual });
         if (isSearchScopeActive(searchScope) && generationMode === "fast" && generated.length > 0) {
           void runFastTopUp();
@@ -2822,7 +2900,7 @@ function FeedPageInner() {
         }
       }
     },
-    [canRequestMore, generationMode, isIngestMaterial, isSearchScopeActive, materialId, requestMore, runFastTopUp],
+    [canRequestMore, generationMode, hasMore, isIngestMaterial, isSearchScopeActive, loadPage, materialId, page, requestMore, runFastTopUp, total],
   );
 
   useEffect(() => {

@@ -3357,6 +3357,57 @@ class MediumRegressionTests(unittest.TestCase):
             self.assertEqual(len(caption_calls), 4)
         conn.close()
 
+    def test_ranked_feed_cache_version_rejects_pre_semantic_gate_rows(self) -> None:
+        conn = self._build_ranked_feed_test_conn()
+        service = ReelService(embedding_service=None, youtube_service=None)
+        current_version = service.RANKED_FEED_CACHE_VERSION
+        self.assertGreater(current_version, 12)
+
+        stale_relevance = {
+            "score": 0.9,
+            "concept_overlap": 0.8,
+            "context_overlap": 0.8,
+            "matched_terms": ["cell signaling"],
+            "off_topic_penalty": 0.0,
+            "reason": "legacy cache entry",
+        }
+        service.RANKED_FEED_CACHE_VERSION = 12
+        with mock.patch.object(
+            service,
+            "_score_text_relevance",
+            return_value=stale_relevance,
+        ), mock.patch.object(
+            service,
+            "_build_caption_cues",
+            return_value=[{"start": 0.0, "end": 5.0, "text": "x" * 220}],
+        ):
+            stale = service.ranked_feed(conn, "material-ranked", fast_mode=True)
+        self.assertEqual(len(stale[0]["captions"][0]["text"]), 220)
+
+        service.RANKED_FEED_CACHE_VERSION = current_version
+        current_relevance = {
+            "score": 0.0,
+            "concept_overlap": 0.0,
+            "context_overlap": 0.0,
+            "matched_terms": [],
+            "off_topic_penalty": 0.5,
+            "reason": "current semantic gate rejects the row",
+        }
+        with mock.patch.object(
+            service,
+            "_score_text_relevance",
+            return_value=current_relevance,
+        ) as score_relevance:
+            refreshed = service.ranked_feed(conn, "material-ranked", fast_mode=True)
+
+        self.assertEqual(refreshed, [])
+        score_relevance.assert_called_once()
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM ranked_feed_cache").fetchone()[0],
+            2,
+        )
+        conn.close()
+
     def test_ranked_feed_never_calls_legacy_youtube_details(self) -> None:
         conn = self._build_ranked_feed_test_conn()
         youtube_service = mock.Mock()

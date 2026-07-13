@@ -289,6 +289,120 @@ def test_bootstrap_query_does_not_duplicate_equivalent_qualifier(topic, level):
     assert search._difficulty_bootstrap_query(topic, level) == topic
 
 
+def test_long_topic_components_preserve_searchable_literal_subtopics():
+    topic = (
+        "How DNA replication proofreading, RNA transcription, ribosomal translation, "
+        "membrane transport, ATP production, and feedback regulation work together to "
+        "maintain cellular homeostasis and pass genetic information across cell divisions"
+    )
+
+    assert search._long_topic_component_queries(topic) == [
+        "DNA replication proofreading",
+        "RNA transcription",
+        "ribosomal translation",
+        "membrane transport",
+        "ATP production",
+        "feedback regulation",
+    ]
+
+
+def test_long_topic_bootstrap_falls_back_to_component_without_changing_identity(monkeypatch):
+    topic = (
+        "How DNA replication proofreading, RNA transcription, ribosomal translation, "
+        "membrane transport, ATP production, and feedback regulation work together to "
+        "maintain cellular homeostasis and pass genetic information across cell divisions"
+    )
+    calls = []
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        calls.append(list(queries))
+        videos = (
+            [{"id": "dna-lesson", "title": "DNA replication proofreading explained"}]
+            if queries == ["DNA replication proofreading for beginners"]
+            else []
+        )
+        return {
+            "per_query": [{"query": query, "videos": videos if index == 0 else []}
+                          for index, query in enumerate(queries)],
+            "credits_used": len(queries),
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.expand,
+        "expand_query_practice_fast",
+        lambda *_args, **_kwargs: pytest.fail("bootstrap retrieval must not invoke Gemini"),
+    )
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=3,
+        breadth=3,
+        level="beginner",
+        retrieval_profile="bootstrap",
+    )
+
+    assert calls == [
+        [f"{topic} for beginners"],
+        [topic],
+        ["DNA replication proofreading for beginners"],
+    ]
+    assert result["corrected"] == topic
+    assert result["topic_terms"] == [topic]
+    assert result["queries"] == [calls[0][0], calls[1][0], calls[2][0]]
+    assert [video["id"] for video in result["videos"]] == ["dna-lesson"]
+
+
+def test_long_topic_deep_preserves_literal_tutorial_and_expansion_capacity(monkeypatch):
+    topic = (
+        "How DNA replication proofreading, RNA transcription, ribosomal translation, "
+        "membrane transport, ATP production, and feedback regulation work together to "
+        "maintain cellular homeostasis and pass genetic information across cell divisions"
+    )
+    components = search._long_topic_component_queries(topic)
+    search_calls: list[list[str]] = []
+    expansion_calls: list[tuple[str, int]] = []
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        search_calls.append(list(queries))
+        return {
+            "per_query": [{"query": query, "videos": []} for query in queries],
+            "credits_used": len(queries),
+            "warning": None,
+        }
+
+    def fake_expand(expansion_topic, n, **_kwargs):
+        expansion_calls.append((expansion_topic, n))
+        return {
+            "corrected": expansion_topic,
+            "queries": [
+                expansion_topic,
+                f"{expansion_topic} explained tutorial",
+                "cell biology information flow and homeostasis",
+            ],
+            "provider_used": "gemini",
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=3,
+        breadth=8,
+        level="advanced",
+        retrieval_profile="deep",
+    )
+
+    deterministic = [topic, f"{topic} explained tutorial", *components[:5]]
+    expanded = "cell biology information flow and homeostasis"
+    assert search_calls == [deterministic, [expanded]]
+    assert expansion_calls == [(topic, 3)]
+    assert result["queries"] == [*deterministic, expanded]
+    assert result["credits_used"] == 8
+
+
 @pytest.mark.parametrize(
     ("topic", "expected"),
     [

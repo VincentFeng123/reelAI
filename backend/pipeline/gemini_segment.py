@@ -48,7 +48,18 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"today'?s sponsor|we (?:made|have) (?:a|an|another|whole) video "
     r"(?:about|explaining|on)|check out (?:our|the) video|"
     r"we (?:are|'re) reaching (?:a|the) crossroad now|"
+    r"we(?:['’]ve| have) already (?:done|covered|finished)\b.{0,80}"
+    r"we(?:['’]re| are) going to\b|"
     r"cover (?:that|this) in (?:this|the) course)\b",
+    re.IGNORECASE,
+)
+_DANGLING_TAIL_PREFIX_RE = re.compile(
+    r"^\s*tail[.!?]\s+"
+    r"(?:(?:[Uu]m+|[Uu]h+|[Ww]ell)[, ]+)?"
+    r"(?:[Ii]t|[Tt]his|[Tt]hat|[Tt]hey|[Tt]hese|[Tt]hose|[Hh]e|[Ss]he)\b"
+)
+_TERMINAL_CALLBACK_RE = re.compile(
+    r"(?:^|[.!?]\s+)(?:look|think|go|turn|refer) back (?:at|to)\b[^.!?]*[.!?]?\s*$",
     re.IGNORECASE,
 )
 _VAMPIRE_TOPIC_RE = re.compile(
@@ -99,6 +110,7 @@ _PRODUCTION_MAX_CANDIDATES = 8
 _DUPLICATE_OVERLAP = 0.8
 _CONTEXT_CUE_LIMIT = 8
 _CONTEXT_WINDOW_S = 30.0
+_SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _LONG_RANGE_REPAIR_MIN_S = 20.0
 _LONG_RANGE_REPAIR_TARGET_S = 75.0
@@ -769,6 +781,8 @@ def _cue_opens_mid_thought_at(
 ) -> bool:
     """Use the preceding cue to recover reliable lowercase-fragment evidence."""
     text = str(segments[index].get("text") or "").strip()
+    if _DANGLING_TAIL_PREFIX_RE.search(text):
+        return True
     if _cue_opens_mid_thought(
         text, ignore_caption_case=ignore_caption_case
     ):
@@ -820,6 +834,8 @@ def _cue_has_weak_end(
     from .sentences import Sentence, classify_terminator
 
     raw_text = str(text or "").strip()
+    if _TERMINAL_CALLBACK_RE.search(raw_text):
+        return True
     if re.search(r"[,;:\-—][\"')\]]*$", raw_text):
         return True
     guarded = _guard_text(raw_text, ignore_caption_case=ignore_caption_case)
@@ -907,6 +923,29 @@ def _close_cue_context(
 ) -> tuple[int, int, str | None]:
     """Expand dirty edges by at most eight cues and thirty seconds per side."""
     cue_limit = max(0, min(_CONTEXT_CUE_LIMIT, int(cue_limit)))
+    initial_start = start_line
+    if _DANGLING_TAIL_PREFIX_RE.search(
+        str(segments[start_line].get("text") or "").strip()
+    ):
+        saw_section_pause = False
+        for candidate in range(start_line + 1, min(end_line, start_line + cue_limit) + 1):
+            previous_end = float(segments[candidate - 1].get("end", 0.0))
+            candidate_start = float(segments[candidate].get("start", previous_end))
+            saw_section_pause = saw_section_pause or (
+                candidate_start - previous_end >= _SECTION_RESET_GAP_S
+            )
+            elapsed = candidate_start - float(
+                segments[initial_start].get("start", 0.0)
+            )
+            if elapsed > _CONTEXT_WINDOW_S:
+                break
+            if saw_section_pause and not _cue_opens_mid_thought_at(
+                segments,
+                candidate,
+                ignore_caption_case=ignore_caption_case,
+            ):
+                start_line = candidate
+                break
     original_start = start_line
     original_end = end_line
     for _ in range(cue_limit):

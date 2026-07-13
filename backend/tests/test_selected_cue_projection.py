@@ -74,3 +74,29 @@ def test_caption_projection_uses_selected_ids_and_explicit_end() -> None:
     ]
     assert captions[0]["start"] == 0.0
     assert captions[0]["end"] == 10.05
+
+
+def test_caption_projection_never_truncates_selected_transcript_text() -> None:
+    service = ReelService(embedding_service=None, youtube_service=None)
+    selected_text = " ".join(
+        [
+            "Cells organize molecules into membranes and organelles while preserving the complete teaching claim."
+        ]
+        * 4
+    )
+    captions = service._build_caption_cues(
+        transcript=[
+            {
+                "cue_id": "selected",
+                "start": 0.0,
+                "end": 30.0,
+                "text": selected_text,
+            }
+        ],
+        clip_start=0.0,
+        clip_end=30.0,
+        selected_cue_ids=["selected"],
+    )
+
+    assert len(selected_text) > 220
+    assert captions == [{"start": 0.0, "end": 30.0, "text": selected_text}]

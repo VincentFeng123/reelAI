@@ -34,6 +34,14 @@ _DIFFICULTY_QUALIFIERS = {
 _NICHE_SEARCH_INTENT_SUFFIX = re.compile(r"(?:^|\s)identification\s*$", re.IGNORECASE)
 _SEARCH_TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 _SEARCH_STOPWORDS = {"a", "an", "and", "for", "in", "of", "on", "the", "to", "with"}
+_LONG_TOPIC_LEAD = re.compile(
+    r"^(?:how|why|explain|describe|understand|learn)\s+",
+    re.IGNORECASE,
+)
+_LONG_TOPIC_RELATION = re.compile(
+    r"\b(?:work together|interact|combine|to maintain|to preserve|to pass|across)\b",
+    re.IGNORECASE,
+)
 
 
 def _difficulty_bootstrap_query(topic: str, level: str | None) -> str:
@@ -58,6 +66,37 @@ def _niche_bootstrap_backoff_query(topic: str) -> str | None:
     if shortened == literal or len(_search_coverage_tokens(shortened)) < 2:
         return None
     return shortened
+
+
+def _long_topic_component_queries(topic: str, *, limit: int = 6) -> list[str]:
+    """Extract bounded literal subtopics when a sentence is too broad for search.
+
+    The complete user text remains the transcript-selection identity. These
+    deterministic components only give Supadata searchable surfaces when the
+    literal is a long list or paragraph.
+    """
+    literal = " ".join(str(topic or "").split())
+    if len(_SEARCH_TOKEN_RE.findall(literal)) <= 12 and len(literal) <= 120:
+        return []
+    stripped = _LONG_TOPIC_LEAD.sub("", literal).strip(" ,:;-?.")
+    parts = re.split(r"\s*[,;]\s*|\s+\b(?:and|or)\b\s+", stripped, flags=re.IGNORECASE)
+    components: list[str] = []
+    seen: set[str] = set()
+    for raw_part in parts:
+        part = re.sub(r"^(?:and|or)\s+", "", raw_part.strip(), flags=re.IGNORECASE)
+        part = _LONG_TOPIC_RELATION.split(part, maxsplit=1)[0]
+        words = part.strip(" ,:;-?.").split()
+        if len(words) > 8:
+            words = words[:8]
+        candidate = " ".join(words).strip()
+        key = " ".join(candidate.casefold().split())
+        if len(_search_coverage_tokens(candidate)) < 2 or key in seen:
+            continue
+        seen.add(key)
+        components.append(candidate)
+        if len(components) >= max(1, int(limit)):
+            break
+    return components
 
 
 def _search_coverage_tokens(text: object) -> set[str]:
@@ -449,14 +488,22 @@ def discover_practice_fast(
     raise_if_cancelled(should_cancel)
     literal_query = " ".join(str(literal_topic or topic).split()) or topic
     tutorial_query = f"{literal_query} explained tutorial"
+    component_queries = _long_topic_component_queries(literal_query)
     initial_queries: list[str] = []
     seen_query_keys: set[str] = set()
     bootstrap = str(retrieval_profile or "deep").strip().casefold() == "bootstrap"
-    deterministic_queries = (
-        (_difficulty_bootstrap_query(literal_query, level),)
-        if bootstrap
-        else (literal_query, tutorial_query)
-    )
+    if bootstrap:
+        deterministic_queries = (_difficulty_bootstrap_query(literal_query, level),)
+    else:
+        # Keep the established literal/tutorial surface and leave at least one
+        # provider-search slot for conditional Gemini expansion. Components
+        # are only a bounded recovery surface for unusually long topics.
+        component_limit = max(0, query_count - 3)
+        deterministic_queries = (
+            literal_query,
+            tutorial_query,
+            *component_queries[:component_limit],
+        )
     for candidate in deterministic_queries:
         key = " ".join(candidate.casefold().split())
         if key and key not in seen_query_keys:
@@ -539,6 +586,7 @@ def discover_practice_fast(
                         niche_provider_order.append(video_id)
     if bootstrap:
         fallback_result = {"per_query": [], "credits_used": 0, "warning": None}
+        component_result = {"per_query": [], "credits_used": 0, "warning": None}
         qualified_key = " ".join(initial_queries[0].casefold().split())
         literal_key = " ".join(literal_query.casefold().split())
         if (
@@ -555,6 +603,28 @@ def discover_practice_fast(
             annotate(fallback_result["per_query"])
             per_query.extend(fallback_result["per_query"])
             initial_queries.append(literal_query)
+
+        remaining_component_queries: list[str] = []
+        for component in component_queries:
+            if len(initial_queries) + len(remaining_component_queries) >= query_count:
+                break
+            query = _difficulty_bootstrap_query(component, level)
+            key = " ".join(query.casefold().split())
+            if not key or key in seen_query_keys:
+                continue
+            seen_query_keys.add(key)
+            remaining_component_queries.append(query)
+        if remaining_component_queries:
+            component_result = supadata_search.search_all(
+                remaining_component_queries,
+                filters,
+                parallel_prefix=len(remaining_component_queries),
+                **search_runtime,
+            )
+            raise_if_cancelled(should_cancel)
+            annotate(component_result["per_query"])
+            per_query.extend(component_result["per_query"])
+            initial_queries.extend(remaining_component_queries)
 
         ranked = rank.merge_and_rank(per_query, level=level)
         if niche_provider_order:
@@ -585,9 +655,11 @@ def discover_practice_fast(
                 int(initial.get("credits_used") or 0)
                 + int(niche_result.get("credits_used") or 0)
                 + int(fallback_result.get("credits_used") or 0)
+                + int(component_result.get("credits_used") or 0)
             ),
             "warning": (
-                fallback_result.get("warning")
+                component_result.get("warning")
+                or fallback_result.get("warning")
                 or niche_result.get("warning")
                 or initial.get("warning")
             ),

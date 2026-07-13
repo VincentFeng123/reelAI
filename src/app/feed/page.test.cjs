@@ -14,6 +14,41 @@ const sourceFile = ts.createSourceFile(
   ts.ScriptKind.TSX,
 );
 
+function findVariableInitializer(name) {
+  let initializer = null;
+  function visit(node) {
+    if (
+      ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.name.text === name
+    ) {
+      initializer = node.initializer;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  assert.ok(initializer, `expected ${name} declaration`);
+  return initializer;
+}
+
+function compileUseCallback(name, bindings) {
+  const initializer = findVariableInitializer(name);
+  assert.ok(ts.isCallExpression(initializer), `${name} must remain a useCallback call`);
+  const callback = initializer.arguments[0];
+  assert.ok(
+    callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)),
+    `${name} must have a callable first argument`,
+  );
+  const compiled = ts.transpile(
+    `const callback = ${callback.getText(sourceFile)};`,
+    { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  );
+  const names = Object.keys(bindings);
+  const factory = new Function(...names, `${compiled}\nreturn callback;`);
+  return factory(...names.map((key) => bindings[key]));
+}
+
 test("learner level remains internal and has no manual feed control", () => {
   assert.match(source, /const \[knowledgeLevel, setKnowledgeLevel\] = useState/);
   assert.doesNotMatch(source, /const cycleLevel =/);
@@ -38,6 +73,12 @@ test("generation finals cannot reconcile after their search scope is invalidated
   visit(sourceFile);
   assert.equal(finalReconciliations.length, 2, "both generation paths must remain covered");
   for (const reconciliation of finalReconciliations) {
+    const reconciliationCall = reconciliation.expression;
+    assert.equal(
+      reconciliationCall.arguments[2]?.getText(sourceFile),
+      "{ preserveUnmatchedUnseen: true }",
+      "stream settlement must explicitly retain unmatched provisional rows",
+    );
     const block = reconciliation.parent;
     assert.ok(ts.isBlock(block), "final reconciliation must remain in a guarded block");
     const reconciliationIndex = block.statements.indexOf(reconciliation);
@@ -63,6 +104,129 @@ test("feed generation keeps a twelve-clip unseen reservoir and resumes durable j
   assert.match(source, /generationJobId: activeGenerationJob\?\.jobId/);
   assert.match(source, /idleTimeoutMs: GENERATION_STREAM_IDLE_TIMEOUT_MS/);
   assert.match(source, /consecutiveIdleWindows >= 2/);
+});
+
+test("restored reconciliation removes cached unseen rows and stream settlement drops rejected provisionals", () => {
+  const currentRows = [
+    { reel_id: "watched", video_url: "watched", video_title: "Watched" },
+    { reel_id: "current", video_url: "current", video_title: "Cached current" },
+    { reel_id: "prior-unseen", video_url: "prior-unseen", video_title: "Prior unseen" },
+    { reel_id: "rejected-provisional", video_url: "rejected-provisional", video_title: "Rejected provisional" },
+  ];
+  const reelsRef = { current: currentRows };
+  const activeIndexRef = { current: 1 };
+  let renderedRows = currentRows;
+  const callback = compileUseCallback("reconcileGeneratedReels", {
+    reelsRef,
+    activeIndexRef,
+    reelClipKey: (reel) => reel.video_url,
+    mergeReelMetadata: (current, next) => ({ ...current, ...next }),
+    dedupeByIdentity: (rows) => {
+      const seen = new Set();
+      return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
+    },
+    updateSessionReels: (rows) => {
+      reelsRef.current = rows;
+      renderedRows = rows;
+    },
+    setTotal: () => {},
+  });
+
+  callback(
+    [],
+    [
+      { reel_id: "current", video_url: "current", video_title: "Authoritative current" },
+      { reel_id: "new-unseen", video_url: "new-unseen", video_title: "New unseen" },
+    ],
+    { preserveUnmatchedUnseen: false },
+  );
+  assert.deepEqual(renderedRows.map((row) => row.reel_id), ["watched", "current", "new-unseen"]);
+  assert.equal(renderedRows[1].video_title, "Authoritative current");
+
+  reelsRef.current = currentRows;
+  callback(
+    [{ reel_id: "rejected-provisional", video_url: "rejected-provisional" }],
+    [
+      { reel_id: "current", video_url: "current", video_title: "Authoritative current" },
+      { reel_id: "new-unseen", video_url: "new-unseen", video_title: "New unseen" },
+    ],
+    { preserveUnmatchedUnseen: true },
+  );
+  assert.deepEqual(
+    renderedRows.map((row) => row.reel_id),
+    ["watched", "current", "new-unseen", "prior-unseen"],
+  );
+});
+
+test("a restored feed reconciles durable inventory with its restored mode and a stale-scope guard", () => {
+  const loadPageStart = source.indexOf("const loadPage = useCallback(");
+  const loadPageEnd = source.indexOf("const requestMore = useCallback(", loadPageStart);
+  assert.ok(loadPageStart >= 0 && loadPageEnd > loadPageStart);
+  const loadPageText = source.slice(loadPageStart, loadPageEnd);
+  assert.match(loadPageText, /generationMode: options\?\.generationMode \?\? generationMode/);
+  assert.match(
+    loadPageText,
+    /reconcileGeneratedReels\(\[\], fetchedReels, \{ preserveUnmatchedUnseen: false \}\)/,
+  );
+
+  const hydrationStart = source.indexOf("let restoredSession: FeedSessionSnapshot | null = null;");
+  const hydrationEnd = source.indexOf("useEffect(() => {", hydrationStart);
+  assert.ok(hydrationStart >= 0 && hydrationEnd > hydrationStart);
+  const hydrationText = source.slice(hydrationStart, hydrationEnd);
+  assert.match(hydrationText, /setBootstrappingFirstReels\(true\);/);
+  assert.match(hydrationText, /generationMode: restoredGenerationMode/);
+  assert.match(hydrationText, /hydratedMaterialIdRef\.current === materialId/);
+  assert.match(hydrationText, /isSearchScopeActive\(restoredSearchScope\)/);
+});
+
+test("bootstrap consumes duplicate persisted pages before considering generation", async () => {
+  const reelsRef = { current: Array.from({ length: 10 }, (_, index) => ({ reel_id: `r${index}` })) };
+  const pageLoads = [];
+  let generationRequests = 0;
+  const searchScope = { key: "material", seq: 1 };
+  const callback = compileUseCallback("bootstrapFirstReels", {
+    materialId: "material",
+    isGeneratingRef: { current: false },
+    canRequestMore: true,
+    isIngestMaterial: false,
+    setBootstrappingFirstReels: () => {},
+    setCanRequestMore: () => {},
+    setFeedPagesExhausted: () => {},
+    activeSearchScopeRef: { current: searchScope },
+    page: 1,
+    hasMore: true,
+    total: 12,
+    PAGE_SIZE: 5,
+    reelsRef,
+    activeIndexRef: { current: 0 },
+    READY_RESERVOIR_TARGET: 12,
+    generationMode: "slow",
+    loadPage: async (targetPage, options) => {
+      pageLoads.push({ targetPage, options });
+      if (targetPage === 2) {
+        return { addedCount: 0, exhausted: false };
+      }
+      reelsRef.current = [
+        ...reelsRef.current,
+        { reel_id: "r10" },
+        { reel_id: "r11" },
+        { reel_id: "r12" },
+      ];
+      return { addedCount: 3, exhausted: true };
+    },
+    isSearchScopeActive: (scope) => scope === searchScope,
+    requestMore: async () => {
+      generationRequests += 1;
+      return [];
+    },
+    runFastTopUp: () => {},
+  });
+
+  await callback();
+
+  assert.deepEqual(pageLoads.map((row) => row.targetPage), [2, 3]);
+  assert.ok(pageLoads.every((row) => row.options.autofill === false));
+  assert.equal(generationRequests, 0, "persisted inventory filled the reservoir");
 });
 
 test("pagination remains available while background generation is active", () => {

@@ -1187,6 +1187,7 @@ class IngestionPipeline:
         )
         audio_preparation_futures: dict[str, Any] = {}
         prepared_audio_results: dict[str, Any] = {}
+        acoustic_phase_deadlines: dict[str, float] = {}
         enrichment_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="clip-enrichment")
             if generation_context is not None and retrieval_profile == "deep"
@@ -1353,12 +1354,20 @@ class IngestionPipeline:
                         )
             return None
 
+        def acoustic_phase_deadline_for(v: dict[str, Any]) -> float:
+            source_key = str(v.get("id") or "")
+            return acoustic_phase_deadlines.setdefault(
+                source_key,
+                time.monotonic() + clip_engine_silence.DEFAULT_TIMEOUT_SEC,
+            )
+
         def prepared_audio_for(v: dict[str, Any]):
             video_id = str(v.get("id") or "").strip()
             if not require_acoustic_boundaries:
                 return None
             if video_id in prepared_audio_results:
                 return prepared_audio_results[video_id]
+            phase_deadline = acoustic_phase_deadline_for(v)
             future = audio_preparation_futures.get(video_id)
             if future is None:
                 result = clip_engine_silence.AudioPreparationResult(
@@ -1367,7 +1376,15 @@ class IngestionPipeline:
                 )
             else:
                 try:
-                    result = future.result(timeout=max(0.1, deadline - time.monotonic()))
+                    remaining = phase_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise FutureTimeoutError
+                    result = future.result(timeout=remaining)
+                except FutureTimeoutError:
+                    result = clip_engine_silence.AudioPreparationResult(
+                        "unavailable",
+                        diagnostics={"stage": "resolve", "reason": "deadline_exceeded"},
+                    )
                 except Exception:
                     result = clip_engine_silence.AudioPreparationResult(
                         "unavailable",
@@ -1507,7 +1524,10 @@ class IngestionPipeline:
                     elif require_acoustic_boundaries:
                         original_start = float(clip.get("start") or 0.0)
                         original_end = float(clip.get("end") or 0.0)
-                        acoustic_timeout = deadline - time.monotonic()
+                        acoustic_phase_deadline = acoustic_phase_deadline_for(v)
+                        prepared_audio = prepared_audio_for(v)
+                        now = time.monotonic()
+                        acoustic_timeout = acoustic_phase_deadline - now
                         if acoustic_timeout <= 0:
                             acoustic = clip_engine_silence.SilenceVerificationResult(
                                 "unavailable",
@@ -1520,11 +1540,8 @@ class IngestionPipeline:
                                 str(v.get("url") or v.get("id") or ""),
                                 original_start,
                                 original_end,
-                                prepared=prepared_audio_for(v),
-                                timeout_sec=min(
-                                    clip_engine_silence.DEFAULT_TIMEOUT_SEC,
-                                    acoustic_timeout,
-                                ),
+                                prepared=prepared_audio,
+                                timeout_sec=acoustic_timeout,
                                 cancel_check=should_cancel,
                             )
                         acoustic_diagnostics = dict(acoustic.diagnostics or {})

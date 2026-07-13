@@ -270,7 +270,7 @@ def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypat
     assert counters["persisted_clips"] == 1
 
 
-def test_topic_generation_requires_acoustic_boundaries_before_emit(
+def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phase(
     monkeypatch,
 ) -> None:
     transcript = {
@@ -311,8 +311,30 @@ def test_topic_generation_requires_acoustic_boundaries_before_emit(
                 "topic_evidence_quote": quote,
         })
     engine_out = {"clips": clips, "transcript": transcript, "notes": ""}
+    selection_deadline: list[float] = []
+
+    def run_clip(*_args, deadline_monotonic, **_kwargs):
+        selection_deadline.append(float(deadline_monotonic))
+        return engine_out
+
+    monkeypatch.setattr(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.05)
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
-    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    monkeypatch.setattr(pipeline_module, "_run_clip", run_clip)
+    original_caption_diagnostics = pipeline_module._supadata_boundary_diagnostics
+    caption_calls = 0
+
+    def caption_after_selection_deadline(*args, **kwargs):
+        nonlocal caption_calls
+        caption_calls += 1
+        if caption_calls == 1:
+            time.sleep(max(0.0, selection_deadline[0] - time.monotonic()) + 0.02)
+        return original_caption_diagnostics(*args, **kwargs)
+
+    monkeypatch.setattr(
+        pipeline_module,
+        "_supadata_boundary_diagnostics",
+        caption_after_selection_deadline,
+    )
     persisted_clips: list[dict] = []
 
     def persist(*, clip, **_kwargs):
@@ -322,17 +344,37 @@ def test_topic_generation_requires_acoustic_boundaries_before_emit(
     pipeline = _pipeline()
     monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
     prepared = mock.sentinel.prepared_audio
-    prepare_audio = mock.Mock(return_value=prepared)
-    verify_audio = mock.Mock(return_value=mock.Mock(
-        verified=True,
-        start_sec=0.0,
-        end_sec=10.0,
-        diagnostics={
-            "threshold_dbfs": -38.0,
-            "start_quiet": [0.0, 0.2],
-            "end_quiet": [9.8, 10.1],
-        },
-    ))
+
+    def delayed_prepare(*_args, **_kwargs):
+        time.sleep(0.25)
+        return prepared
+
+    prepare_audio = mock.Mock(side_effect=delayed_prepare)
+    verification_windows: list[tuple[float, float]] = []
+
+    def verify_audio(
+        _source,
+        start_sec,
+        end_sec,
+        *,
+        timeout_sec,
+        **_kwargs,
+    ):
+        verification_windows.append((time.monotonic(), timeout_sec))
+        if len(verification_windows) == 1:
+            time.sleep(0.05)
+        return mock.Mock(
+            verified=True,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            diagnostics={
+                "threshold_dbfs": -38.0,
+                "start_quiet": [start_sec, start_sec + 0.2],
+                "end_quiet": [end_sec - 0.2, end_sec + 0.1],
+            },
+        )
+
+    verify_audio_mock = mock.Mock(side_effect=verify_audio)
     monkeypatch.setattr(
         pipeline_module.clip_engine_silence,
         "prepare_audio_source",
@@ -341,7 +383,7 @@ def test_topic_generation_requires_acoustic_boundaries_before_emit(
     monkeypatch.setattr(
         pipeline_module.clip_engine_silence,
         "verify_acoustic_boundaries",
-        verify_audio,
+        verify_audio_mock,
     )
     emitted: list[str] = []
     context = GenerationContext("slow", require_acoustic_boundaries=True)
@@ -351,15 +393,14 @@ def test_topic_generation_requires_acoustic_boundaries_before_emit(
         material_id="material",
         concept_id="concept",
         generation_context=context,
-        retrieval_profile="bootstrap",
         max_videos=1,
-        max_reels=1,
+        max_reels=3,
         on_reel_created=emitted.append,
     )
 
-    assert reels == ["verified-reel-1"]
-    assert emitted == ["verified-reel-1"]
-    assert len(persisted_clips) == 1
+    assert reels == ["verified-reel-1", "verified-reel-2", "verified-reel-3"]
+    assert emitted == ["verified-reel-1", "verified-reel-2", "verified-reel-3"]
+    assert len(persisted_clips) == 3
     boundary = persisted_clips[0]["search_context"]
     assert boundary["boundary_status"] == "verified"
     assert boundary["surface_eligible"] is True
@@ -382,18 +423,19 @@ def test_topic_generation_requires_acoustic_boundaries_before_emit(
             "end_quiet": [9.8, 10.1],
         },
     }
+    assert verification_windows[0][0] > selection_deadline[0]
+    assert 0.0 < verification_windows[1][1] < verification_windows[0][1] <= 20.0
+    phase_deadlines = [started + timeout for started, timeout in verification_windows]
+    assert phase_deadlines == pytest.approx([phase_deadlines[0]] * 3, abs=0.01)
     prepare_audio.assert_called_once()
-    verify_audio.assert_called_once_with(
-        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        0.0,
-        10.0,
-        prepared=prepared,
-        timeout_sec=mock.ANY,
-        cancel_check=mock.ANY,
+    assert verify_audio_mock.call_count == 3
+    assert all(
+        call.kwargs["prepared"] is prepared
+        for call in verify_audio_mock.call_args_list
     )
-    assert context.counters()["stored_clips"] == 1
+    assert context.counters()["stored_clips"] == 3
     assert context.counters()["deferred_clips"] == 0
-    assert context.counters()["persisted_clips"] == 1
+    assert context.counters()["persisted_clips"] == 3
 
 
 def test_level_mismatch_is_verified_and_stored_without_streaming(monkeypatch) -> None:

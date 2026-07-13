@@ -124,6 +124,7 @@ def _set_reel_boundary_state(
                 "selection_contract_version": "confidence_v1",
                 "directly_teaches_topic": True,
                 "substantive": True,
+                "factually_grounded": True,
             }),
             reel_id,
         ),
@@ -1221,6 +1222,11 @@ def test_authoritative_job_inventory_retains_every_streamed_candidate(monkeypatc
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{"reel_id": "ranked-reel"}],
     )
+    monkeypatch.setattr(
+        main,
+        "_currently_surfaceable_generation_reel_ids",
+        lambda *_args, **_kwargs: {"streamed-reel"},
+    )
     job_row = {
         **leased,
         "result_generation_id": "generation-1",
@@ -1258,6 +1264,98 @@ def test_authoritative_job_inventory_retains_every_streamed_candidate(monkeypatc
     capped = main._generation_job_reels(conn, job_row)
     assert len(capped) == 4
     assert "streamed-reel" in {reel["reel_id"] for reel in capped}
+    conn.close()
+
+
+def test_completed_job_status_and_replay_drop_currently_invalid_candidate(monkeypatch) -> None:
+    conn = _conn()
+    now = datetime.now(timezone.utc)
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="completed-semantic-revalidation",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 2},
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="semantic-revalidation-worker",
+        now=now,
+    )
+    assert leased
+    valid = _insert_generation_reel(
+        conn,
+        generation_id="semantic-generation",
+        reel_id="current-valid",
+        video_id="current-valid-video",
+        created_at=now.isoformat(),
+    )
+    stale = _insert_generation_reel(
+        conn,
+        generation_id="semantic-generation",
+        reel_id="historical-invalid",
+        video_id="historical-invalid-video",
+        created_at=(now + timedelta(seconds=1)).isoformat(),
+    )
+    for reel in (stale, valid):
+        generation_jobs.append_event(
+            conn,
+            job_id=job["id"],
+            lease_owner="semantic-revalidation-worker",
+            event_type="candidate",
+            payload={"reel": reel, "provisional": True},
+            now=now,
+        )
+    generation_jobs.append_event(
+        conn,
+        job_id=job["id"],
+        lease_owner="semantic-revalidation-worker",
+        event_type="final",
+        payload={"reels": [stale, valid], "authoritative": True},
+        now=now,
+    )
+    terminal = generation_jobs.transition_terminal(
+        conn,
+        job_id=job["id"],
+        lease_owner="semantic-revalidation-worker",
+        status="completed",
+        result_generation_id="semantic-generation",
+        now=now,
+    )
+    assert terminal
+
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [valid],
+    )
+    monkeypatch.setattr(
+        main,
+        "_currently_surfaceable_generation_reel_ids",
+        lambda *_args, **_kwargs: {"current-valid"},
+    )
+
+    status = main._generation_job_status_payload(conn, terminal)
+    replay = main._sanitize_generation_replay_events(
+        conn,
+        terminal,
+        generation_jobs.replay_events(conn, job_id=job["id"]),
+    )
+
+    assert [reel["reel_id"] for reel in status["reels"]] == ["current-valid"]
+    assert [
+        event["payload"]["reel"]["reel_id"]
+        for event in replay
+        if event["type"] == "candidate"
+    ] == ["current-valid"]
+    final = next(event for event in replay if event["type"] == "final")
+    assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
+        "current-valid"
+    ]
     conn.close()
 
 

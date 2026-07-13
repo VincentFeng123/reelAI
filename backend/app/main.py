@@ -3195,6 +3195,42 @@ def _job_request_params(job_row: dict[str, Any]) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _currently_surfaceable_generation_reel_ids(
+    conn,
+    job_row: dict[str, Any],
+) -> set[str]:
+    """Revalidate persisted inventory with the current ranked-feed guards."""
+    generation_id = str(job_row.get("result_generation_id") or "").strip()
+    material_id = str(job_row.get("material_id") or "").strip()
+    if not generation_id or not material_id:
+        return set()
+    params = _job_request_params(job_row)
+    fast_mode = str(params.get("generation_mode") or "slow") == "fast"
+    learner_id = str(job_row.get("learner_id") or LEGACY_LEARNER_ID)
+    content_fingerprint = _generation_content_fingerprint(
+        conn,
+        material_id=material_id,
+        concept_id=(str(job_row.get("concept_id") or "").strip() or None),
+    )
+    valid_ids: set[str] = set()
+    for current_generation_id in _response_generation_ids(conn, generation_id):
+        current = reel_service.ranked_feed(
+            conn,
+            material_id,
+            fast_mode=fast_mode,
+            generation_id=current_generation_id,
+            learner_id=learner_id,
+            content_fingerprint=content_fingerprint,
+            require_verified_boundaries=True,
+        )
+        valid_ids.update(
+            str(reel.get("reel_id") or "").strip()
+            for reel in current
+            if str(reel.get("reel_id") or "").strip()
+        )
+    return valid_ids
+
+
 def _generation_job_reels(conn, job_row: dict[str, Any]) -> list[dict[str, Any]]:
     generation_id = str(job_row.get("result_generation_id") or "").strip()
     if not generation_id:
@@ -3245,9 +3281,16 @@ def _generation_job_reels(conn, job_row: dict[str, Any]) -> list[dict[str, Any]]
         conn,
         [str(reel.get("reel_id") or "") for reel in provisional],
     )
+    currently_surfaceable_ids = _currently_surfaceable_generation_reel_ids(
+        conn,
+        job_row,
+    )
     provisional = [
         reel for reel in provisional
-        if str(reel.get("reel_id") or "") in verified_provisional_ids
+        if (
+            str(reel.get("reel_id") or "") in verified_provisional_ids
+            and str(reel.get("reel_id") or "") in currently_surfaceable_ids
+        )
     ]
     merged = _merge_request_reel_lists(ranked, provisional)
     if len(merged) <= requested:
@@ -3329,6 +3372,19 @@ def _sanitize_generation_replay_events(
     verified_candidate_ids = _verified_acoustic_reel_ids(conn, candidate_reel_ids)
     sanitized: list[dict[str, Any]] = []
     authoritative_reels: list[dict[str, Any]] | None = None
+    authoritative_reel_ids: set[str] | None = None
+    terminal_inventory = bool(
+        job_row
+        and str(job_row.get("status") or "") in GENERATION_TERMINAL_STATUSES
+        and str(job_row.get("result_generation_id") or "").strip()
+    )
+    if terminal_inventory and job_row is not None:
+        authoritative_reels = _generation_job_reels(conn, job_row)
+        authoritative_reel_ids = {
+            str(reel.get("reel_id") or "").strip()
+            for reel in authoritative_reels
+            if str(reel.get("reel_id") or "").strip()
+        }
     for raw_event in events:
         event = dict(raw_event)
         event_type = str(event.get("type") or "")
@@ -3336,7 +3392,10 @@ def _sanitize_generation_replay_events(
         if event_type == "candidate":
             reel = payload.get("reel")
             reel_id = str((reel or {}).get("reel_id") or "") if isinstance(reel, dict) else ""
-            if reel_id not in verified_candidate_ids:
+            if reel_id not in verified_candidate_ids or (
+                authoritative_reel_ids is not None
+                and reel_id not in authoritative_reel_ids
+            ):
                 continue
         elif event_type == "final" and job_row is not None:
             if authoritative_reels is None:

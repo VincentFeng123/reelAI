@@ -1196,7 +1196,9 @@ class ReelService:
     # Bump whenever the cached row shape changes so stale entries are invalidated.
     # v4: video_id retained on response rows (was stripped in v3).
     # v5: reel rows now originate from _persist_ingest path (T4 clip-engine swap).
-    RANKED_FEED_CACHE_VERSION = 12
+    # v13: full caption text and the current transcript-semantic surfaceability
+    # gates must be recomputed instead of replaying pre-gate cached rows.
+    RANKED_FEED_CACHE_VERSION = 13
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -1682,6 +1684,27 @@ class ReelService:
             if not concepts:
                 return []
             root_topic_terms = [subject_tag]
+        material_parent_concepts = concepts
+        if not subject_tag and concept_id:
+            material_parent_concepts = fetch_all(
+                conn,
+                """
+                SELECT id, material_id, title, keywords_json, summary, embedding_json, created_at
+                FROM concepts
+                WHERE material_id = ?
+                ORDER BY created_at ASC
+                """,
+                (material_id,),
+            )
+        material_parent_topic = subject_tag
+        if not material_parent_topic:
+            material_parent_topic = " ".join(
+                self._build_material_context_terms(
+                    concepts=material_parent_concepts,
+                    subject_tag=None,
+                    max_terms=3,
+                )
+            ) or None
         concepts = self._order_concepts(conn, material_id, concepts, learner_id)
         if generation_context is not None and concepts:
             # One concept/query family per durable acquisition pass keeps the
@@ -1867,7 +1890,11 @@ class ReelService:
                 break
             if videos_processed >= generation_video_limit:
                 break
-            topic = self._concept_topic_query(concept)
+            leaf_topic = self._concept_topic_query(concept)
+            topic = self._concept_topic_query(
+                concept,
+                parent_topic=material_parent_topic,
+            )
             if not topic:
                 continue
             video_budget = min(
@@ -1925,9 +1952,13 @@ class ReelService:
                     preferred_video_duration=safe_video_duration_pref,
                     generation_context=generation_context,
                     literal_topic=(
-                        literal_subject_tag
-                        if strict_topic_only and literal_subject_tag
-                        else topic
+                        topic
+                        if topic != leaf_topic
+                        else (
+                            literal_subject_tag
+                            if strict_topic_only and literal_subject_tag
+                            else topic
+                        )
                     ),
                     retrieval_profile=retrieval_profile,
                     analyzed_video_ids=analyzed_ids,
@@ -2531,20 +2562,61 @@ class ReelService:
         tokens = re.findall(r"[a-z0-9\+#]+", cleaned)
         return " ".join(tokens)
 
-    def _concept_topic_query(self, concept_row: dict) -> str:
+    def _concept_topic_query(
+        self,
+        concept_row: dict,
+        *,
+        parent_topic: str | None = None,
+    ) -> str:
         """Return a search-engine topic string for a concept row: its clean title.
 
         Topic-material concepts and search terms come from the shared cached AI
-        query plan; document concepts retain their source-grounded titles.
+        query plan; document concepts retain their source-grounded titles. Short
+        leaf names keep the parent material topic because title-cased acronyms such
+        as ``Atp`` are otherwise ambiguous outside their source material.
         """
         title = self._clean_query_text(str(concept_row.get("title") or ""))
+        topic = title
         search_terms = concept_row.get("_search_terms")
         if isinstance(search_terms, list):
             for raw_term in search_terms:
                 term = self._clean_query_text(str(raw_term or ""))
                 if term:
-                    return term
-        return title
+                    topic = term
+                    break
+        parent = self._clean_query_text(str(parent_topic or ""))
+        if not topic or not parent:
+            return topic
+        topic_tokens = self._normalize_query_key(topic).split()
+        parent_tokens = self._normalize_query_key(parent).split()
+        if not topic_tokens or not parent_tokens or set(parent_tokens).issubset(topic_tokens):
+            return topic
+        if self._is_short_leaf_topic(topic):
+            return f"{topic} in {parent}"
+        return topic
+
+    @staticmethod
+    def _is_short_leaf_topic(value: str) -> bool:
+        tokens = re.findall(r"[A-Za-z0-9+#]+", str(value or ""))
+        if len(tokens) != 1:
+            return False
+        compact = re.sub(r"[^A-Za-z0-9]", "", tokens[0])
+        if not compact or len(compact) > 5:
+            return False
+        letters = [character for character in compact if character.isalpha()]
+        if len(letters) < 2:
+            return False
+        # Preserve explicit acronym casing (ATP, DNA, H2O, mRNA). Concept titles
+        # are title-cased before persistence, so also recognize compact three-
+        # letter forms such as ``Atp`` without treating ordinary short words such
+        # as Cell, Atom, Force, Logic, or Rome as ambiguous acronyms.
+        if sum(character.isupper() for character in letters) >= 2:
+            return True
+        return (
+            len(letters) <= 3
+            and compact[0].isupper()
+            and all(character.islower() for character in letters[1:])
+        )
 
     def _deep_query_expansion_limit(self, *, fast_mode: bool, request_need: int) -> int:
         safe_need = max(1, int(request_need))
@@ -6637,7 +6709,7 @@ class ReelService:
             payload = {
                 "start": round(float(cue_start), 2),
                 "end": round(float(min(clip_len, max(cue_end, cue_start + 0.16))), 2),
-                "text": text[:220],
+                "text": text,
             }
 
             if cues and payload["text"] == cues[-1]["text"] and payload["start"] - cues[-1]["end"] <= 0.2:
@@ -7046,6 +7118,16 @@ class ReelService:
                 require_context=bool(context_terms),
                 fast_mode=fast_mode,
             )
+            if (
+                not strict_topic_only
+                and context_terms
+                and self._is_short_leaf_topic(concept_title)
+                and not relevance["passes"]
+            ):
+                # Short leaf concepts such as ATP are valid inside their material,
+                # but ambiguous in isolation. Cached rows must still demonstrate
+                # the parent material context before they can surface.
+                continue
             if not strict_topic_only and not relevance["passes"] and (
                 float(relevance.get("off_topic_penalty") or 0.0) >= 0.24
                 or float(relevance.get("score") or -1.0) < 0.02

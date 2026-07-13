@@ -11,6 +11,7 @@ MULTIPLE clips per video survive, on_reel_created fires once per reel, the
 num_reels cap holds, and the returned dicts carry the _create_reel key shape.
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -35,6 +36,26 @@ from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
 VIDEO_ID = "vidABCDE123"
 MATERIAL_ID = "mat-t4-gen"
 CONCEPT_ID = "concept-t4-gen"
+
+SAP_ADVANCED_ATP_VIDEO_ID = "kRm4CviZPsc"
+SAP_ADVANCED_ATP_TITLE = (
+    "SAP S/4HANA aATP (Advanced ATP) – Part 1 | End-to-End Demo | SD aATP Tutorial"
+)
+SAP_ADVANCED_ATP_TRANSCRIPT = (
+    "in the SAP S/4HANA training system that provides this ATP advanced ATP "
+    "functionality. It is a part of S4H always on function business functions. "
+    "Okay. So, now we know that this advanced ATP is uh activated for this test "
+    "system. Here we will go, and we will check the config. So, going to this SPRO, "
+    "you will see that uh uh first we will check if this check uh group is uh been "
+    "activated for this advanced ATP checking. So, we'll go to this sales and "
+    "distribution node, and there you will go to this uh basic function, and here "
+    "you can select this node where you will find this advanced check and transfer "
+    "of requirements. So, in this uh node, you will find another node. The subnode "
+    "is for availability check. So, in this column AV, you will find this "
+    "availability check. Look at this entry. So, this is a individual request "
+    "change check. And in this column, you can see the last column in this table, "
+    "you will see the last column as advanced ATP, which is activated."
+)
 
 
 def _discover_result(video_id: str = VIDEO_ID) -> dict:
@@ -354,6 +375,236 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 knowledge_level_override="advanced",
             )
         self.assertEqual(search.discover.call_args.kwargs.get("level"), "advanced")
+
+    def test_acronym_leaf_search_keeps_parent_topic_and_avoids_sap_atp(self) -> None:
+        """Production regression: ``advanced ATP`` retrieved SAP S/4HANA for a
+        cellular-respiration material. The leaf remains valid, but both search and
+        transcript selection must receive its parent material context.
+        """
+        biological_video_id = "bioATP12345"
+        biological_title = "ATP production during cellular respiration"
+        biological_transcript = (
+            "During cellular respiration, the mitochondrial electron transport "
+            "chain builds a proton gradient that drives ATP synthase to make ATP."
+        )
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute(
+                "UPDATE materials SET subject_tag = 'cellular respiration' WHERE id = ?",
+                (MATERIAL_ID,),
+            )
+            conn.execute(
+                "UPDATE concepts SET title = 'Atp', keywords_json = '[\"atp\"]' WHERE id = ?",
+                (CONCEPT_ID,),
+            )
+
+        search_patch = mock.patch.object(pipeline_module, "clip_engine_search")
+        run_patch = mock.patch.object(pipeline_module, "clip_engine_run")
+        search = search_patch.start()
+        run = run_patch.start()
+        self.addCleanup(search_patch.stop)
+        self.addCleanup(run_patch.stop)
+
+        def discovery(query: str, **_kwargs) -> dict:
+            qualified = "cellular respiration" in query.casefold()
+            video_id = biological_video_id if qualified else SAP_ADVANCED_ATP_VIDEO_ID
+            title = biological_title if qualified else SAP_ADVANCED_ATP_TITLE
+            return {
+                "corrected": query,
+                "videos": [{
+                    "id": video_id,
+                    "url": f"https://www.youtube.com/watch?v={video_id}",
+                    "title": title,
+                    "channel": "Biology" if qualified else "SAP Training",
+                    "duration": 300,
+                    "thumbnail": "",
+                    "view_count": 1000,
+                    "upload_date": None,
+                }],
+                "credits_used": 1,
+                "warning": None,
+            }
+
+        def clip(source_url: str, **_kwargs) -> dict:
+            is_biological = biological_video_id in source_url
+            video_id = biological_video_id if is_biological else SAP_ADVANCED_ATP_VIDEO_ID
+            title = biological_title if is_biological else SAP_ADVANCED_ATP_TITLE
+            transcript = biological_transcript if is_biological else SAP_ADVANCED_ATP_TRANSCRIPT
+            return {
+                "video_id": video_id,
+                "clips": [{
+                    "start": 0.0,
+                    "end": 60.0,
+                    "cut_end": 60.0,
+                    "title": title,
+                    "facet": "ATP",
+                    "reason": "ATP explanation",
+                    "sequence_index": 0,
+                    "embed_url": "",
+                }],
+                "transcript": {
+                    "segments": [{"start": 0.0, "end": 60.0, "text": transcript}],
+                    "words": [],
+                    "duration": 300.0,
+                },
+                "notes": "",
+            }
+
+        search.discover.side_effect = discovery
+        run.clip.side_effect = clip
+        with db_module.get_conn() as conn:
+            generated = main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=CONCEPT_ID,
+                num_reels=1,
+                creative_commons_only=False,
+                generation_id="gen-atp-parent-context",
+                knowledge_level_override="advanced",
+            )
+
+        self.assertEqual(search.discover.call_args.args[0], "Atp in cellular respiration")
+        self.assertEqual(run.clip.call_args.kwargs.get("topic"), "Atp in cellular respiration")
+        self.assertTrue(generated)
+        self.assertEqual(generated[0]["video_id"], biological_video_id)
+        self.assertNotIn("SAP S/4HANA", generated[0]["video_title"])
+
+    def test_acronym_leaf_without_subject_tag_uses_sibling_material_context(self) -> None:
+        """Text/file materials may have no subject tag. Their sibling concepts
+        still provide enough source context to disambiguate a short leaf query.
+        """
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute(
+                "UPDATE materials SET subject_tag = NULL, source_type = 'text' WHERE id = ?",
+                (MATERIAL_ID,),
+            )
+            conn.execute(
+                "UPDATE concepts SET title = 'Atp', keywords_json = '[\"atp\"]' WHERE id = ?",
+                (CONCEPT_ID,),
+            )
+            conn.execute(
+                "INSERT INTO concepts "
+                "(id, material_id, title, keywords_json, summary, embedding_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                (
+                    "concept-cellular-respiration",
+                    MATERIAL_ID,
+                    "Cellular Respiration",
+                    '["cellular respiration"]',
+                    "Cellular respiration takes place in mitochondria.",
+                    "2026-07-06T00:02:00+00:00",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO concepts "
+                "(id, material_id, title, keywords_json, summary, embedding_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, NULL, ?)",
+                (
+                    "concept-mitochondria",
+                    MATERIAL_ID,
+                    "Mitochondria",
+                    '["mitochondria"]',
+                    "Mitochondria carry out cellular respiration.",
+                    "2026-07-06T00:03:00+00:00",
+                ),
+            )
+
+        search, run = self._patched_engine(_multi_clip_engine_out())
+        with db_module.get_conn() as conn:
+            main_module.reel_service.generate_reels(
+                conn,
+                material_id=MATERIAL_ID,
+                concept_id=CONCEPT_ID,
+                num_reels=1,
+                creative_commons_only=False,
+                generation_id="gen-atp-sibling-context",
+                knowledge_level_override="advanced",
+            )
+
+        self.assertEqual(
+            search.discover.call_args.args[0],
+            "Atp in cellular respiration mitochondria",
+        )
+        self.assertEqual(
+            run.clip.call_args.kwargs.get("topic"),
+            "Atp in cellular respiration mitochondria",
+        )
+
+    def test_ranked_feed_hides_cached_sap_atp_but_keeps_biochemical_atp(self) -> None:
+        """Old completed inventories are replayed without regeneration, so the
+        serving gate must reject the exact production SAP false positive while
+        retaining biological ATP teaching for the same short leaf concept.
+        """
+        biological_video_id = "bioATP12345"
+        biological_transcript = (
+            "During cellular respiration, the mitochondrial electron transport "
+            "chain builds a proton gradient that drives ATP synthase to make ATP."
+        )
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute(
+                "UPDATE materials SET subject_tag = 'cellular respiration' WHERE id = ?",
+                (MATERIAL_ID,),
+            )
+            conn.execute(
+                "UPDATE concepts SET title = 'Atp', keywords_json = '[\"atp\"]' WHERE id = ?",
+                (CONCEPT_ID,),
+            )
+            for video_id, title, channel, transcript in (
+                (
+                    f"yt:{SAP_ADVANCED_ATP_VIDEO_ID}",
+                    SAP_ADVANCED_ATP_TITLE,
+                    "SAP Training",
+                    SAP_ADVANCED_ATP_TRANSCRIPT,
+                ),
+                (
+                    f"yt:{biological_video_id}",
+                    "ATP production during cellular respiration",
+                    "Biology",
+                    biological_transcript,
+                ),
+            ):
+                conn.execute(
+                    "INSERT INTO videos "
+                    "(id, title, channel_title, description, duration_sec, created_at) "
+                    "VALUES (?, ?, ?, '', 300, '2026-07-13T00:00:00+00:00')",
+                    (video_id, title, channel),
+                )
+                conn.execute(
+                    "INSERT INTO reels "
+                    "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
+                    "transcript_snippet, takeaways_json, base_score, difficulty, generation_id, "
+                    "search_context_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, 0, 60, ?, '[]', 1.0, 0.7, ?, ?, "
+                    "'2026-07-13T00:01:00+00:00')",
+                    (
+                        f"reel-{video_id}",
+                        MATERIAL_ID,
+                        CONCEPT_ID,
+                        video_id,
+                        f"https://www.youtube.com/embed/{video_id.removeprefix('yt:')}",
+                        transcript,
+                        "gen-cached-atp",
+                        json.dumps({
+                            "surface_eligible": True,
+                            "boundary_status": "verified",
+                            "boundary_diagnostics": {
+                                "method": "energy_silence",
+                                "acoustic_verified": True,
+                            },
+                        }),
+                    ),
+                )
+
+        with db_module.get_conn() as conn:
+            feed = main_module.reel_service.ranked_feed(
+                conn,
+                material_id=MATERIAL_ID,
+                generation_id="gen-cached-atp",
+                fast_mode=True,
+            )
+
+        served_ids = {row["video_id"] for row in feed}
+        self.assertIn(f"yt:{biological_video_id}", served_ids)
+        self.assertNotIn(f"yt:{SAP_ADVANCED_ATP_VIDEO_ID}", served_ids)
 
     def test_concept_priority_uses_only_current_learner_feedback(self) -> None:
         other_concept_id = "concept-t4-other"
@@ -804,7 +1055,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 12)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 13)
 
 
 if __name__ == "__main__":

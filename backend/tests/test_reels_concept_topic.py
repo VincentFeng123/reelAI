@@ -50,6 +50,44 @@ class ConceptTopicQueryTests(unittest.TestCase):
         result = svc._concept_topic_query(_row("ATP", ["cell biology", "synthesis"]))
         self.assertEqual(result, "ATP")
 
+    def test_short_leaf_title_keeps_parent_material_context(self) -> None:
+        svc = _svc()
+        result = svc._concept_topic_query(
+            _row("Atp", ["atp"]),
+            parent_topic="cellular respiration",
+        )
+        self.assertEqual(result, "Atp in cellular respiration")
+
+    def test_explicit_acronym_title_keeps_parent_material_context(self) -> None:
+        svc = _svc()
+        self.assertEqual(
+            svc._concept_topic_query(
+                _row("ATP", ["atp"]),
+                parent_topic="cellular respiration",
+            ),
+            "ATP in cellular respiration",
+        )
+
+    def test_ordinary_short_words_do_not_gain_parent_context(self) -> None:
+        svc = _svc()
+        for title in ("Force", "Cell", "Atom", "Logic", "Rome"):
+            with self.subTest(title=title):
+                self.assertEqual(
+                    svc._concept_topic_query(
+                        _row(title, [title.lower()]),
+                        parent_topic="introductory material",
+                    ),
+                    title,
+                )
+
+    def test_parent_context_is_not_duplicated(self) -> None:
+        svc = _svc()
+        result = svc._concept_topic_query(
+            _row("ATP in cellular respiration", ["atp"]),
+            parent_topic="cellular respiration",
+        )
+        self.assertEqual(result, "ATP in cellular respiration")
+
     # ------------------------------------------------------------------
     # Test 2: multi-token title → clean title only
     # ------------------------------------------------------------------
