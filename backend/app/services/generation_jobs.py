@@ -43,8 +43,8 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-# v5 prevents completed acoustic-gated jobs from replaying into the Supadata-only path.
-REQUEST_SCHEMA_VERSION = "generation-request-v5-supadata-boundaries"
+# v6 separates measured-silence inventory from caption-only candidate history.
+REQUEST_SCHEMA_VERSION = "generation-request-v6-energy-silence"
 
 
 class JobLeaseLostError(RuntimeError):

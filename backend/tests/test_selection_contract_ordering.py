@@ -328,7 +328,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             "reason": "matched topic",
         }
 
-    def _ranked(self) -> list[dict]:
+    def _ranked(self, *, require_verified_boundaries: bool = False) -> list[dict]:
         with mock.patch.object(
             self.service, "_score_text_relevance", side_effect=self._relevance,
         ), mock.patch.object(self.service, "_build_caption_cues", return_value=[]):
@@ -338,6 +338,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 generation_id="selection-generation",
                 fast_mode=True,
                 learner_id=self.LEARNER,
+                require_verified_boundaries=require_verified_boundaries,
             )
 
     def test_ranked_feed_uses_level_neutral_content_and_current_level(self) -> None:
@@ -382,6 +383,158 @@ class SelectionContractOrderingTests(unittest.TestCase):
         )
 
         self.assertEqual(self._ranked(), [])
+
+    def test_production_feed_requires_measured_acoustic_verification(self) -> None:
+        states = [
+            ("missing", "", None),
+            ("caption", "caption_aligned", False),
+            ("legacy-verified", "verified", False),
+            ("acoustic-verified", "verified", True),
+        ]
+        for index, (reel_id, boundary_status, acoustic_verified) in enumerate(states):
+            self._insert_versioned_reel(
+                reel_id=reel_id,
+                video_id="video-a",
+                start=10 + index * 25,
+                difficulty=0.15,
+                base_score=0.8,
+            )
+            row = self.conn.execute(
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                (reel_id,),
+            ).fetchone()
+            context = json.loads(row[0])
+            context.update({
+                "surface_eligible": True,
+                "boundary_status": boundary_status,
+                "boundary_diagnostics": {
+                    "acoustic_verified": acoustic_verified,
+                },
+            })
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (json.dumps(context), reel_id),
+            )
+
+        ranked = self._ranked(require_verified_boundaries=True)
+
+        self.assertEqual(
+            [item["reel_id"] for item in ranked],
+            ["acoustic-verified"],
+        )
+
+    def test_level_mismatched_verified_clip_waits_in_storage_until_ready(self) -> None:
+        self._insert_versioned_reel(
+            reel_id="advanced-reservoir",
+            video_id="video-a",
+            start=10,
+            difficulty=0.85,
+            base_score=0.9,
+        )
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'advanced-reservoir'"
+        ).fetchone()
+        context = json.loads(row[0])
+        context.update({
+            "surface_eligible": False,
+            "surface_reason": "level_mismatch",
+            "deferred_level": True,
+            "boundary_status": "verified",
+            "boundary_diagnostics": {"acoustic_verified": True},
+        })
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'advanced-reservoir'",
+            (json.dumps(context),),
+        )
+
+        self.assertEqual(
+            self._ranked(require_verified_boundaries=True),
+            [],
+        )
+
+        self.service.set_learner_level(
+            self.conn, self.MATERIAL, self.LEARNER, "advanced",
+        )
+        self.assertEqual(
+            [
+                item["reel_id"]
+                for item in self._ranked(require_verified_boundaries=True)
+            ],
+            ["advanced-reservoir"],
+        )
+
+    def test_dependent_waits_until_its_deferred_prerequisite_is_ready(self) -> None:
+        self._insert_versioned_reel(
+            reel_id="deferred-parent",
+            video_id="video-a",
+            start=10,
+            difficulty=0.10,
+            base_score=0.8,
+        )
+        self._insert_versioned_reel(
+            reel_id="advanced-dependent",
+            video_id="video-a",
+            start=40,
+            difficulty=0.85,
+            base_score=0.9,
+        )
+        for reel_id, updates in (
+            (
+                "deferred-parent",
+                {
+                    "selection_candidate_id": "video-a::parent",
+                    "prerequisite_ids": [],
+                    "is_standalone": True,
+                    "surface_eligible": False,
+                    "surface_reason": "level_mismatch",
+                    "deferred_level": True,
+                },
+            ),
+            (
+                "advanced-dependent",
+                {
+                    "selection_candidate_id": "video-a::dependent",
+                    "prerequisite_ids": ["video-a::parent"],
+                    "is_standalone": False,
+                    "surface_eligible": False,
+                    "surface_reason": "prerequisite_not_surfaceable",
+                    "deferred_level": False,
+                },
+            ),
+        ):
+            row = self.conn.execute(
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                (reel_id,),
+            ).fetchone()
+            context = json.loads(row[0])
+            context.update({
+                **updates,
+                "boundary_status": "verified",
+                "boundary_diagnostics": {"acoustic_verified": True},
+            })
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (json.dumps(context), reel_id),
+            )
+
+        self.service.set_learner_level(
+            self.conn, self.MATERIAL, self.LEARNER, "advanced",
+        )
+        self.assertEqual(
+            self._ranked(require_verified_boundaries=True),
+            [],
+        )
+
+        self.conn.execute(
+            "UPDATE reels SET difficulty = 0.85 WHERE id = 'deferred-parent'"
+        )
+        self.assertEqual(
+            [
+                item["reel_id"]
+                for item in self._ranked(require_verified_boundaries=True)
+            ],
+            ["deferred-parent", "advanced-dependent"],
+        )
 
 
 if __name__ == "__main__":

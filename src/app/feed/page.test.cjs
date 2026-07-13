@@ -96,19 +96,32 @@ test("progress copy reports stages instead of a fabricated requested total", () 
   assert.doesNotMatch(source, /reels ready`/);
 });
 
-test("automatic promotion invalidates old-level generation before changing the inventory", () => {
+test("initial feed loads retain a level baseline for every grouped material", () => {
+  const loadPageStart = source.indexOf("const loadPage = useCallback(");
+  const loadPageEnd = source.indexOf("const requestMore = useCallback(", loadPageStart);
+  assert.ok(loadPageStart >= 0 && loadPageEnd > loadPageStart);
+  const callbackText = source.slice(loadPageStart, loadPageEnd);
+  assert.match(callbackText, /for \(const row of successful\)/);
+  assert.match(callbackText, /knowledgeLevelByMaterialRef\.current\.set\(row\.materialId, rowLevel\)/);
+  assert.match(callbackText, /knowledgeLevelByMaterialRef\.current\.get\(feedMaterialIds\[0\]\)/);
+});
+
+test("restored and grouped level changes invalidate old generation before changing inventory", () => {
   const rerankStart = source.indexOf("const rerankUnseenTail = useCallback(async () => {");
   const rerankEnd = source.indexOf("const reportActiveReelProgress", rerankStart);
   assert.ok(rerankStart >= 0 && rerankEnd > rerankStart);
   const callbackText = source.slice(rerankStart, rerankEnd);
-  const promotionGuard = callbackText.indexOf("knowledgeLevel && nextLevel !== knowledgeLevel");
-  const clearIndex = callbackText.indexOf("clearGenerationTracking();", promotionGuard);
-  const renewIndex = callbackText.indexOf("renewActiveSearchScope();", promotionGuard);
-  const labelIndex = callbackText.indexOf("setKnowledgeLevel(nextLevel);", promotionGuard);
-  assert.ok(promotionGuard >= 0, "server-selected promotions must be detected");
-  assert.ok(clearIndex > promotionGuard, "old durable-job tracking must be cleared");
+  const groupedLevelIndex = callbackText.indexOf("nextLevelsByMaterial.set(feedMaterialIds[index], nextLevel)");
+  const restoredSessionGuard = callbackText.indexOf("previousLevel === undefined || previousLevel !== nextLevel");
+  const clearIndex = callbackText.indexOf("clearGenerationTracking();", restoredSessionGuard);
+  const renewIndex = callbackText.indexOf("renewActiveSearchScope();", restoredSessionGuard);
+  const inventoryIndex = callbackText.indexOf("updateSessionReels(nextReels);", renewIndex);
+  assert.ok(groupedLevelIndex >= 0, "every grouped material must be checked independently");
+  assert.ok(restoredSessionGuard > groupedLevelIndex, "an absent restored-session baseline must count as stale");
+  assert.ok(clearIndex > restoredSessionGuard, "old durable-job tracking must be cleared");
   assert.ok(renewIndex > clearIndex, "the old search scope must be invalidated");
-  assert.ok(labelIndex > renewIndex, "the promoted inventory level must only change after stale generation is aborted");
+  assert.ok(inventoryIndex > renewIndex, "the new inventory must only be applied after stale generation is aborted");
+  assert.doesNotMatch(callbackText, /knowledgeLevel && nextLevel !== knowledgeLevel/);
   assert.doesNotMatch(source, /Change knowledge level/);
   assert.doesNotMatch(source, /auto-adjusting/);
 });

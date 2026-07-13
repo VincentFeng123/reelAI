@@ -175,6 +175,25 @@ def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> No
     assert budget["pro_fallback_calls"] == 1
     assert budget["pro_fallback_call_limit"] == 1
 
+    slow_flash = GenerationContext("slow", generation_id="job-slow-flash-budget")
+    for _ in range(8):
+        slow_flash.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            prompt_text="short transcript",
+            max_output_tokens=8192,
+        )
+    with pytest.raises(ProviderBudgetExceededError):
+        slow_flash.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            prompt_text="ninth transcript",
+            max_output_tokens=8192,
+        )
+    slow_budget = slow_flash.budget.snapshot()["gemini"]
+    assert slow_budget["flash_selector_calls"] == 8
+    assert slow_budget["cost_limit_usd"] == pytest.approx(0.9)
+
 
 def test_pro_fallback_gate_waits_for_joint_initial_flash_yield() -> None:
     context = GenerationContext("slow", generation_id="job-fallback-gate")

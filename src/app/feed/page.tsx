@@ -1056,6 +1056,7 @@ function FeedPageInner() {
   const autoplayRestoredFromSnapshotRef = useRef(false);
   const hydratedMaterialIdRef = useRef<string | null>(null);
   const materialIdsForFeedRef = useRef<string[]>([]);
+  const knowledgeLevelByMaterialRef = useRef<Map<string, string>>(new Map());
   const settingsLoadSequenceRef = useRef(0);
   const adaptiveExcludeReelIdsRef = useRef<string[]>([]);
   const isRefreshingFeedRef = useRef(false);
@@ -2001,7 +2002,13 @@ function FeedPageInner() {
         setPage(targetPage);
         if (targetPage === 1) {
           setTotal(Math.max(fetchedTotal, merged.reels.length));
-          const firstLevel = successful[0]?.data?.knowledge_level;
+          for (const row of successful) {
+            const rowLevel = String(row.data?.knowledge_level || "").trim();
+            if (rowLevel) {
+              knowledgeLevelByMaterialRef.current.set(row.materialId, rowLevel);
+            }
+          }
+          const firstLevel = knowledgeLevelByMaterialRef.current.get(feedMaterialIds[0]);
           if (firstLevel && typeof firstLevel === "string") {
             setKnowledgeLevel(firstLevel);
           } else {
@@ -2277,6 +2284,7 @@ function FeedPageInner() {
     autoplayRestoredFromSnapshotRef.current = false;
     if (!materialId) {
       materialIdsForFeedRef.current = [];
+      knowledgeLevelByMaterialRef.current.clear();
       adaptiveExcludeReelIdsRef.current = [];
       hydratedMaterialIdRef.current = null;
       setSessionHydrated(false);
@@ -2346,6 +2354,7 @@ function FeedPageInner() {
       return;
     }
     hydratedMaterialIdRef.current = materialId;
+    knowledgeLevelByMaterialRef.current.clear();
     adaptiveExcludeReelIdsRef.current = [];
     setSessionHydrated(false);
     setKnowledgeLevel(null);
@@ -3701,6 +3710,28 @@ function FeedPageInner() {
       return;
     }
     const successful = responses as Array<Array<Awaited<ReturnType<typeof fetchFeed>>>>;
+    const nextLevelsByMaterial = new Map<string, string>();
+    for (let index = 0; index < successful.length; index += 1) {
+      const nextLevel = String(successful[index]?.[0]?.knowledge_level || "").trim();
+      if (nextLevel) {
+        nextLevelsByMaterial.set(feedMaterialIds[index], nextLevel);
+      }
+    }
+    const levelChanged = Array.from(nextLevelsByMaterial).some(([id, nextLevel]) => {
+      const previousLevel = knowledgeLevelByMaterialRef.current.get(id);
+      return previousLevel === undefined || previousLevel !== nextLevel;
+    });
+    for (const [id, nextLevel] of nextLevelsByMaterial) {
+      knowledgeLevelByMaterialRef.current.set(id, nextLevel);
+    }
+    if (levelChanged) {
+      // A restored session has no trustworthy level baseline, and any member of
+      // a grouped feed can advance independently. Stop every old-level stream
+      // before applying the newly ranked inventory.
+      clearGenerationTracking();
+      setAssessmentPreparingFeed(false);
+      renewActiveSearchScope();
+    }
 
     const rankedTail = dedupeByIdentity(interleaveReelBatches(
       successful.map((pages) => dedupeByIdentity(pages.flatMap((response) => response.reels))),
@@ -3719,16 +3750,9 @@ function FeedPageInner() {
     setPage(pagesToFetch);
     setCanRequestMore(true);
     setFeedPagesExhausted(false);
-    const nextLevel = successful[0]?.[0]?.knowledge_level;
-    if (nextLevel) {
-      if (knowledgeLevel && nextLevel !== knowledgeLevel) {
-        // Assessment completion can promote the learner on the backend. Abort
-        // any old-level stream before exposing the new label/inventory.
-        clearGenerationTracking();
-        setAssessmentPreparingFeed(false);
-        renewActiveSearchScope();
-      }
-      setKnowledgeLevel(nextLevel);
+    const primaryLevel = nextLevelsByMaterial.get(feedMaterialIds[0]);
+    if (primaryLevel) {
+      setKnowledgeLevel(primaryLevel);
     }
   }, [
     clearGenerationTracking,
@@ -3738,7 +3762,6 @@ function FeedPageInner() {
     getFeedTuningSettings,
     interleaveReelBatches,
     isSearchScopeActive,
-    knowledgeLevel,
     renewActiveSearchScope,
     settingsScopeReady,
     updateSessionReels,

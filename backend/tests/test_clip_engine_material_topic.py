@@ -28,6 +28,7 @@ os.environ.setdefault("REELAI_INGEST_SKIP_IMPORT_SWEEP", "1")
 
 from backend.app import db as db_module  # noqa: E402
 from backend.app.config import get_settings  # noqa: E402
+from backend.app.clip_engine.provider_runtime import GenerationContext  # noqa: E402
 import backend.app.main as main_module  # noqa: E402
 from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
 from backend.app.ingestion.models import ReelOutWithAttribution  # noqa: E402
@@ -927,6 +928,58 @@ class IngestTopicProgressTests(unittest.TestCase):
         self.assertEqual(set(calls[:2]), {"video-0", "video-1"})
         self.assertEqual(calls[2:], ["video-2"])
         self.assertEqual(reels, ["video-2"] * 5)
+
+    def test_deep_backfill_counts_only_surfaceable_persisted_clips(self) -> None:
+        pipeline = self._pipeline()
+        videos = [self._video(f"video-{index}") for index in range(3)]
+        calls: list[str] = []
+
+        def clip_and_filter(video, *_args):
+            calls.append(video["id"])
+            return video, [{
+                "title": video["id"],
+                "selection_candidate_id": video["id"],
+                "search_context": {
+                    "surface_eligible": video["id"] == "video-2",
+                },
+            }], {"transcript": {}}
+
+        with (
+            mock.patch.object(
+                pipeline_module,
+                "_discover",
+                return_value={
+                    "corrected": TOPIC,
+                    "videos": videos,
+                    "credits_used": 0,
+                    "warning": None,
+                },
+            ),
+            mock.patch.object(pipeline, "_clip_and_filter", side_effect=clip_and_filter),
+            mock.patch.object(
+                pipeline,
+                "_persist_engine_clip",
+                side_effect=lambda **kwargs: (kwargs["v"]["id"], mock.sentinel.metadata),
+            ),
+            mock.patch.object(
+                pipeline_module,
+                "_supadata_boundary_diagnostics",
+                return_value={"method": "test"},
+            ),
+        ):
+            reels, _ = pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="material",
+                concept_id="concept",
+                max_videos=3,
+                max_reels=1,
+                retrieval_profile="deep",
+                generation_context=GenerationContext("slow"),
+            )
+
+        self.assertEqual(set(calls[:2]), {"video-0", "video-1"})
+        self.assertEqual(calls[2:], ["video-2"])
+        self.assertEqual(reels, ["video-2"])
 
     def test_bootstrap_reserves_one_slot_per_initial_source(self) -> None:
         pipeline = self._pipeline()

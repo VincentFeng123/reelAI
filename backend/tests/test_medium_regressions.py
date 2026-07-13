@@ -12,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import backend.app.main as main_module
+import backend.app.services.material_intelligence as material_intelligence_module
 from backend.app.main import _resolve_target_clip_duration_bounds
 from backend.app.db import SCHEMA, _ensure_reels_generation_index_sqlite, _migrate_reels_unique_clip_index_sqlite
 from backend.app.services.material_intelligence import MaterialIntelligenceService
@@ -374,6 +375,50 @@ class MediumRegressionTests(unittest.TestCase):
         key_b = service._cache_key(shared_prefix + "second-suffix", "systems", 12)
         self.assertNotEqual(key_a, key_b)
 
+    def test_material_intelligence_cache_key_tracks_prompt_version(self) -> None:
+        service = MaterialIntelligenceService()
+        with mock.patch.object(
+            material_intelligence_module,
+            "MATERIAL_INTELLIGENCE_PROMPT_VERSION",
+            "legacy-prompt",
+        ):
+            legacy_key = service._cache_key("Photosynthesis makes ATP.", None, 12)
+        current_key = service._cache_key("Photosynthesis makes ATP.", None, 12)
+        self.assertNotEqual(legacy_key, current_key)
+
+    def test_material_intelligence_prompt_upgrade_ignores_legacy_cached_plan(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(SCHEMA)
+        service = MaterialIntelligenceService()
+        text = "Photosynthesis uses chlorophyll to make ATP and sugars from light."
+        with mock.patch.object(
+            material_intelligence_module,
+            "MATERIAL_INTELLIGENCE_PROMPT_VERSION",
+            "legacy-prompt",
+        ):
+            legacy_key = service._cache_key(text, None, 12)
+        conn.execute(
+            "INSERT INTO llm_cache (cache_key, response_json, created_at) VALUES (?, ?, ?)",
+            (
+                legacy_key,
+                '{"concepts":[{"title":"Energy"}]}',
+                "2026-07-12T00:00:00+00:00",
+            ),
+        )
+        fresh = {"concepts": [{"title": "Photosynthesis"}], "objectives": []}
+        try:
+            with mock.patch.object(
+                service,
+                "_generate_payload",
+                return_value=fresh,
+            ) as generate:
+                result = service._cached_or_generate(conn, text, None, 12)
+            self.assertEqual(result, fresh)
+            generate.assert_called_once()
+        finally:
+            conn.close()
+
     def test_material_intelligence_uses_only_one_concept_llm_call(self) -> None:
         service = MaterialIntelligenceService()
         service.llm_available = True
@@ -421,6 +466,35 @@ class MediumRegressionTests(unittest.TestCase):
 
         self.assertIn("Do not use broad umbrella titles", captured["user"])
         self.assertIn("Photosynthesis", captured["user"])
+
+    def test_material_intelligence_prioritizes_specific_process_over_energy(self) -> None:
+        service = MaterialIntelligenceService()
+        service.llm_available = True
+        payload = {
+            "concepts": [
+                {
+                    "title": "Energy",
+                    "keywords": ["energy", "atp"],
+                    "summary": "Energy changes form in living systems.",
+                },
+                {
+                    "title": "Photosynthesis",
+                    "keywords": ["chlorophyll", "calvin cycle"],
+                    "summary": "Photosynthesis converts light into chemical energy.",
+                },
+            ],
+            "objectives": [],
+        }
+        with mock.patch.object(service, "_cached_or_generate", return_value=payload):
+            concepts, _objectives = service.extract_concepts_and_objectives(
+                None,
+                "Photosynthesis uses chlorophyll to make ATP and sugars from light.",
+                max_concepts=6,
+            )
+        titles = [concept["title"] for concept in concepts]
+        self.assertEqual(titles[0], "Photosynthesis")
+        if "Energy" in titles:
+            self.assertLess(titles.index("Photosynthesis"), titles.index("Energy"))
 
     def test_material_intelligence_topic_only_seed_is_literal_and_skips_preexpansion(self) -> None:
         service = MaterialIntelligenceService()
@@ -3210,6 +3284,31 @@ class MediumRegressionTests(unittest.TestCase):
 
             conn.execute(
                 """
+                UPDATE reels
+                SET t_start = ?, t_end = ?, search_context_json = ?
+                WHERE id = ?
+                """,
+                (
+                    10.25,
+                    40.25,
+                    json.dumps({
+                        "surface_eligible": True,
+                        "boundary_status": "verified",
+                        "boundary_diagnostics": {"acoustic_verified": True},
+                    }),
+                    "reel-ranked",
+                ),
+            )
+            promoted = service.ranked_feed(
+                conn,
+                "material-ranked",
+                fast_mode=True,
+            )
+            self.assertEqual(promoted[0]["t_start"], 10.25)
+            self.assertEqual(len(relevance_calls), 2)
+
+            conn.execute(
+                """
                 INSERT INTO reel_feedback (
                     id, reel_id, helpful, confusing, rating, saved, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -3217,7 +3316,7 @@ class MediumRegressionTests(unittest.TestCase):
                 ("feedback-1", "reel-ranked", 1, 0, 5, 1, "2026-03-13T00:05:00+00:00"),
             )
             third = service.ranked_feed(conn, "material-ranked", fast_mode=True)
-            self.assertEqual(len(relevance_calls), 2)
+            self.assertEqual(len(relevance_calls), 3)
             self.assertGreater(third[0]["score"], first[0]["score"])
 
             updated_artifact_key = transcript_artifact_key(
@@ -3254,8 +3353,8 @@ class MediumRegressionTests(unittest.TestCase):
                 ),
             )
             service.ranked_feed(conn, "material-ranked", fast_mode=True)
-            self.assertEqual(len(relevance_calls), 3)
-            self.assertEqual(len(caption_calls), 3)
+            self.assertEqual(len(relevance_calls), 4)
+            self.assertEqual(len(caption_calls), 4)
         conn.close()
 
     def test_ranked_feed_never_calls_legacy_youtube_details(self) -> None:

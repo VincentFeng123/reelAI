@@ -34,6 +34,16 @@ _ALL_RIGHT_REPLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ELLIPTICAL_SPATIAL_INSTRUCTION_RE = re.compile(
+    r"^(?:little|slightly|just)\s+(?:above|below|behind|inside|outside|over|under)\b",
+    re.IGNORECASE,
+)
+
+_UNRESOLVED_ACTION_REFERENCE_RE = re.compile(
+    r"^(?:i|we|you)\s+can\s+(?:just\s+)?do\s+(?:that|this|it)\b",
+    re.IGNORECASE,
+)
+
 _DANGLING_QUESTION_REFERENCE_RE = re.compile(
     r"(?:\b(?:this|that|these|those|it|they|them)\s*\?|"
     r"\b(?:how|why|when|where|what)\s+"
@@ -118,7 +128,12 @@ def opens_mid_thought(text: str) -> bool:
     if stripped and stripped[0].islower():
         return True
 
-    if _MID_LIST_OR_REPLY_RE.match(stripped) or _ALL_RIGHT_REPLY_RE.match(stripped):
+    if (
+        _MID_LIST_OR_REPLY_RE.match(stripped)
+        or _ALL_RIGHT_REPLY_RE.match(stripped)
+        or _ELLIPTICAL_SPATIAL_INSTRUCTION_RE.match(stripped)
+        or _UNRESOLVED_ACTION_REFERENCE_RE.match(stripped)
+    ):
         return True
 
     # A question is not self-contained merely because it has punctuation.

@@ -39,8 +39,8 @@ def _prepared() -> silence.AudioPreparationResult:
 def test_verified_edges_preserve_required_quiet_cushions(tmp_path: Path) -> None:
     start_wav = tmp_path / "source-start.wav"
     end_wav = tmp_path / "source-end.wav"
-    _write_wav(start_wav, [(2.8, 12000), (0.25, 0), (2.95, 12000)])
-    _write_wav(end_wav, [(3.0, 12000), (0.30, 0), (2.70, 12000)])
+    _write_wav(start_wav, [(2.7, 12000), (0.40, 0), (2.90, 12000)])
+    _write_wav(end_wav, [(2.7, 12000), (0.30, 0), (3.00, 12000)])
 
     def fake_decode(_source, *, window_start_sec, output_path, **_kwargs):
         source = start_wav if window_start_sec < 8 else end_wav
@@ -48,16 +48,36 @@ def test_verified_edges_preserve_required_quiet_cushions(tmp_path: Path) -> None
 
     with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
         result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ", 10.0, 20.3, prepared=_prepared()
+        )
+
+    assert result.verified
+    assert result.start_sec == 10.0
+    assert result.end_sec == 20.2
+    assert result.diagnostics["start_quiet"] == [9.7, 10.1]
+    assert result.diagnostics["end_quiet"] == [20.0, 20.3]
+    assert result.diagnostics["start_cushion_ms"] == 100
+    assert result.diagnostics["end_cushion_ms"] == 200
+
+
+def test_final_cue_can_extend_into_measured_end_silence(tmp_path: Path) -> None:
+    start_wav = tmp_path / "start.wav"
+    end_wav = tmp_path / "end.wav"
+    _write_wav(start_wav, [(2.7, 12000), (0.40, 0), (2.90, 12000)])
+    _write_wav(end_wav, [(3.0, 12000), (0.30, 0), (2.70, 12000)])
+
+    def fake_decode(_source, *, window_start_sec, output_path, **_kwargs):
+        shutil.copyfile(start_wav if window_start_sec < 8 else end_wav, output_path)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
             "dQw4w9WgXcQ", 10.0, 20.0, prepared=_prepared()
         )
 
     assert result.verified
-    assert result.start_sec == 9.95
+    assert result.start_sec == 10.0
     assert result.end_sec == 20.2
-    assert result.diagnostics["start_quiet"] == [9.8, 10.05]
-    assert result.diagnostics["end_quiet"] == [20.0, 20.3]
-    assert result.diagnostics["start_cushion_ms"] == 100
-    assert result.diagnostics["end_cushion_ms"] == 200
+    assert result.diagnostics["end_shift_sec"] == 0.2
 
 
 def test_missing_start_silence_is_unavailable_and_keeps_original_range(tmp_path: Path) -> None:

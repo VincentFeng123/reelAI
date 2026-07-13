@@ -1314,6 +1314,7 @@ class ReelService:
         page_hint: int = 1,
         exclusions_fingerprint: str = "",
         content_fingerprint: str = "",
+        require_verified_boundaries: bool = False,
     ) -> str:
         # Include subject_tag + strict_topic_only in the key because ranked_feed's
         # relevance gates (`_passes_relevance_gate`, strict topic filter, hard-
@@ -1333,6 +1334,7 @@ class ReelService:
             "page_hint": max(1, int(page_hint)),
             "exclusions_fingerprint": str(exclusions_fingerprint),
             "content_fingerprint": str(content_fingerprint),
+            "require_verified_boundaries": bool(require_verified_boundaries),
             "version": self.RANKED_FEED_CACHE_VERSION,
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
@@ -1377,6 +1379,35 @@ class ReelService:
             """,
             (*reel_params, learner_id),
         ) or {}
+        reel_state_rows = fetch_all(
+            conn,
+            f"""
+            SELECT
+                r.id,
+                r.t_start,
+                r.t_end,
+                r.transcript_snippet,
+                r.informativeness,
+                r.base_score,
+                r.difficulty,
+                r.selected_cue_ids_json,
+                r.search_context_json
+            FROM reels r
+            WHERE {reel_where}
+              AND (r.t_end - r.t_start) >= 1
+              AND (r.t_end - r.t_start) <= {_SERVING_MAX_CLIP_SEC}
+            ORDER BY r.id ASC
+            """,
+            reel_params,
+        )
+        reel_state_fingerprint = hashlib.sha256(
+            json.dumps(
+                [dict(row) for row in reel_state_rows],
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
         transcript_stats = fetch_one(
             conn,
             relevant_reels_cte
@@ -1416,6 +1447,7 @@ class ReelService:
             "subject_tag": subject_tag or "",
             "reel_count": int(reel_stats.get("reel_count") or 0),
             "reel_updated_at": str(reel_stats.get("reel_updated_at") or ""),
+            "reel_state_fingerprint": reel_state_fingerprint,
             "video_updated_at": str(reel_stats.get("video_updated_at") or ""),
             "feedback_count": int(reel_stats.get("feedback_count") or 0),
             "feedback_updated_at": str(reel_stats.get("feedback_updated_at") or ""),
@@ -1443,6 +1475,7 @@ class ReelService:
         page_hint: int = 1,
         exclusions_fingerprint: str = "",
         content_fingerprint: str = "",
+        require_verified_boundaries: bool = False,
     ) -> list[dict[str, Any]] | None:
         cache_key = self._ranked_feed_cache_key(
             material_id=material_id,
@@ -1456,6 +1489,7 @@ class ReelService:
             page_hint=page_hint,
             exclusions_fingerprint=exclusions_fingerprint,
             content_fingerprint=content_fingerprint,
+            require_verified_boundaries=require_verified_boundaries,
         )
         cached = fetch_one(
             conn,
@@ -1489,6 +1523,7 @@ class ReelService:
         page_hint: int = 1,
         exclusions_fingerprint: str = "",
         content_fingerprint: str = "",
+        require_verified_boundaries: bool = False,
     ) -> None:
         timestamp = now_iso()
         upsert(
@@ -1507,6 +1542,7 @@ class ReelService:
                     page_hint=page_hint,
                     exclusions_fingerprint=exclusions_fingerprint,
                     content_fingerprint=content_fingerprint,
+                    require_verified_boundaries=require_verified_boundaries,
                 ),
                 "material_id": material_id,
                 "generation_id": generation_id or "",
@@ -5399,6 +5435,14 @@ class ReelService:
             operational["_selection_boundary_status"] = str(
                 parsed.get("boundary_status") or ""
             ).strip().lower()
+            boundary_diagnostics = parsed.get("boundary_diagnostics")
+            operational["_selection_acoustic_verified"] = bool(
+                isinstance(boundary_diagnostics, dict)
+                and boundary_diagnostics.get("acoustic_verified") is True
+            )
+            operational["_selection_surface_reason"] = str(
+                parsed.get("surface_reason") or ""
+            ).strip().lower()
             return operational
 
         prerequisites = parsed.get("prerequisite_ids")
@@ -5442,6 +5486,14 @@ class ReelService:
             metadata["_selection_surface_eligible"] = bool(surface_eligible)
         metadata["_selection_boundary_status"] = str(
             parsed.get("boundary_status") or ""
+        ).strip().lower()
+        boundary_diagnostics = parsed.get("boundary_diagnostics")
+        metadata["_selection_acoustic_verified"] = bool(
+            isinstance(boundary_diagnostics, dict)
+            and boundary_diagnostics.get("acoustic_verified") is True
+        )
+        metadata["_selection_surface_reason"] = str(
+            parsed.get("surface_reason") or ""
         ).strip().lower()
         metadata["_selection_directly_teaches_topic"] = selection_bool(
             "directly_teaches_topic", True
@@ -6686,6 +6738,7 @@ class ReelService:
         learner_id: str = LEGACY_LEARNER_ID,
         exclusions_fingerprint: str = "",
         content_fingerprint: str = "",
+        require_verified_boundaries: bool = False,
     ) -> list[dict[str, Any]]:
         material = fetch_one(conn, "SELECT subject_tag, source_type FROM materials WHERE id = ?", (material_id,))
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
@@ -6726,6 +6779,7 @@ class ReelService:
             page_hint=page_hint,
             exclusions_fingerprint=exclusions_fingerprint,
             content_fingerprint=content_fingerprint,
+            require_verified_boundaries=require_verified_boundaries,
         )
         if cached is not None:
             return cached
@@ -6877,9 +6931,41 @@ class ReelService:
                 selected_cue_ids = []
             selected_cue_ids = [str(cue_id) for cue_id in selected_cue_ids if str(cue_id).strip()]
             selection_metadata = self._selection_metadata(row.get("search_context_json"))
-            if selection_metadata.get("_selection_surface_eligible") is False:
+            surface_eligible = selection_metadata.get(
+                "_selection_surface_eligible", True
+            )
+            surface_reason = str(
+                selection_metadata.get("_selection_surface_reason") or ""
+            )
+            difficulty_matches_level = (
+                abs(self._difficulty(row) - level_target) <= 0.35
+            )
+            deferred_level_ready = bool(
+                surface_reason == "level_mismatch" and difficulty_matches_level
+            )
+            prerequisite_may_become_ready = (
+                surface_reason == "prerequisite_not_surfaceable"
+                and difficulty_matches_level
+            )
+            if surface_eligible is False and not (
+                deferred_level_ready or prerequisite_may_become_ready
+            ):
                 continue
-            if selection_metadata.get("_selection_boundary_status") == "unavailable":
+            if (
+                selection_metadata.get("_selection_deferred_level")
+                and not difficulty_matches_level
+            ):
+                continue
+            boundary_status = selection_metadata.get(
+                "_selection_boundary_status"
+            )
+            if require_verified_boundaries:
+                if (
+                    boundary_status != "verified"
+                    or selection_metadata.get("_selection_acoustic_verified") is not True
+                ):
+                    continue
+            elif boundary_status == "unavailable":
                 continue
             if selection_metadata and (
                 not selection_metadata.get("_selection_directly_teaches_topic", True)
@@ -7139,5 +7225,6 @@ class ReelService:
             page_hint=page_hint,
             exclusions_fingerprint=exclusions_fingerprint,
             content_fingerprint=content_fingerprint,
+            require_verified_boundaries=require_verified_boundaries,
         )
         return response_rows

@@ -124,11 +124,11 @@ class GenerationBudget:
     }
     _GEMINI_COST_LIMIT_USD: dict[GenerationMode, float] = {
         "fast": 0.25,
-        "slow": 0.60,
+        "slow": 0.90,
     }
     _FLASH_SELECTOR_LIMIT: dict[GenerationMode, int] = {
         "fast": 3,
-        "slow": 5,
+        "slow": 8,
     }
     _PRO_FALLBACK_CALL_LIMIT = 1
 
@@ -309,11 +309,13 @@ class GenerationContext:
         generation_id: str = "",
         usage_sink: Callable[[ProviderUsageRecord], None] | None = None,
         cache_store: Any = None,
+        require_acoustic_boundaries: bool = False,
     ) -> None:
         self.generation_id = generation_id
         self.budget = GenerationBudget.for_mode(mode)
         self.usage_sink = usage_sink
         self.cache_store = cache_store
+        self.require_acoustic_boundaries = bool(require_acoustic_boundaries)
         self._usage: list[ProviderUsageRecord] = []
         self._counters: dict[GenerationCounter, int] = {
             name: 0 for name in GENERATION_COUNTERS

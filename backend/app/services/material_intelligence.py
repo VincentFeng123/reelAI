@@ -14,6 +14,18 @@ from .text_utils import normalize_whitespace
 
 logger = logging.getLogger(__name__)
 
+MATERIAL_INTELLIGENCE_PROMPT_VERSION = "specific-processes-v2"
+_UMBRELLA_CONCEPT_TITLES = {
+    "biology",
+    "chemistry",
+    "energy",
+    "history",
+    "math",
+    "mathematics",
+    "physics",
+    "science",
+}
+
 
 class MaterialIntelligenceService:
     def __init__(self) -> None:
@@ -60,7 +72,24 @@ class MaterialIntelligenceService:
         if priority_focus and not prefer_topic_seed:
             llm_concepts = [priority_focus, *llm_concepts]
 
-        merged_concepts = self._merge_concepts(llm_concepts, base_concepts, max_concepts=max_concepts)
+        concept_pool = [*llm_concepts, *base_concepts]
+        specific_concepts = [
+            concept
+            for concept in concept_pool
+            if str(concept.get("title") or "").strip().casefold()
+            not in _UMBRELLA_CONCEPT_TITLES
+        ]
+        umbrella_concepts = [
+            concept
+            for concept in concept_pool
+            if str(concept.get("title") or "").strip().casefold()
+            in _UMBRELLA_CONCEPT_TITLES
+        ]
+        merged_concepts = self._merge_concepts(
+            specific_concepts,
+            umbrella_concepts,
+            max_concepts=max_concepts,
+        )
         merged_objectives = self._merge_objectives(llm_objectives, base_objectives, limit=6)
         return merged_concepts, merged_objectives
 
@@ -422,5 +451,8 @@ class MaterialIntelligenceService:
         normalized_text = normalize_whitespace(text)
         normalized_subject = normalize_whitespace(subject_tag or "").strip()
         text_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
-        payload = f"{self.model}|{max_concepts}|{normalized_subject}|{text_hash}"
+        payload = (
+            f"{MATERIAL_INTELLIGENCE_PROMPT_VERSION}|{self.model}|{max_concepts}|"
+            f"{normalized_subject}|{text_hash}"
+        )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()

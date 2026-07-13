@@ -425,6 +425,168 @@ def test_production_biology_fragment_expands_to_question_and_complete_list():
     assert clip_text.endswith("related to one another.")
 
 
+def test_production_ligature_clip_repairs_elliptical_instruction_to_r_context():
+    raw_cues = [
+        (2252.24, 2255.96, "We have the first R,"),
+        (2254.36, 2258.60, "which very much looks like the R we're"),
+        (2255.96, 2258.60, "used to."),
+        (2261.32, 2264.56, "And remember to start just a little"),
+        (2262.44, 2267.32, "below the line and then pull your pen up"),
+        (2264.56, 2267.32, "and pull it through."),
+        (2269.08, 2272.52, "Little below the line,"),
+        (2270.76, 2274.48, "pull it through."),
+        (2272.52, 2275.76, "The second R"),
+        (2274.48, 2277.68, "is what you might see when it gets"),
+        (2275.76, 2279.96, "written off of a letter. It's kind of a"),
+        (2277.68, 2283.72, "ligature R."),
+        (2279.96, 2286.96, "So if I get put an O over here,"),
+        (2283.72, 2286.96, "then I want to draw an R,"),
+        (2288.36, 2291.36, "I can just do that."),
+        (2296.96, 2301.72, "And so this is the R and this is"),
+        (2298.72, 2303.84, "actually called a half R."),
+        (2301.72, 2306.56, "And a lot of different scripts use the"),
+        (2303.84, 2308.56, "half R."),
+        (2306.56, 2310.68, "Um I have seen this in formal documents."),
+        (2308.56, 2313.20, "I've seen it in formal documents. So,"),
+        (2310.68, 2315.16, "it's not that this is considered an"),
+        (2313.20, 2318.08, "informal way of writing"),
+        (2315.16, 2320.48, "um everywhere all the time. It's okay to"),
+        (2318.08, 2320.48, "do."),
+    ]
+    segments = [
+        {"cue_id": f"nHMf37SMX-Q:cue:{index + 748}", "start": start, "end": end, "text": text}
+        for index, (start, end, text) in enumerate(raw_cues)
+    ]
+    proposal = G._BoundaryTopic(
+        candidate_id="carolingian-half-r",
+        start_line=6,
+        end_line=23,
+        start_quote="Little below the line",
+        end_quote="okay to",
+        title="Identifying and writing the Carolingian half R ligature",
+        learning_objective="Recognize and write the half R ligature in Carolingian minuscule.",
+        facet="ligature identification",
+        reason="Explains the alternate R form and demonstrates how it joins another letter.",
+        informativeness=0.8,
+        topic_relevance=0.9,
+        educational_importance=0.8,
+        difficulty=0.4,
+        directly_teaches_topic=True,
+        substantive=True,
+        topic_evidence_quote=(
+            "The second R is what you might see when it gets written off of a letter"
+        ),
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {
+            "_segment_target_sec": 55,
+            "_segment_target_min_sec": 20,
+            "_segment_target_max_sec": 55,
+        },
+        topic="Carolingian minuscule ligature identification",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["cue_ids"][0] == "nHMf37SMX-Q:cue:748"
+    assert G._cue_clip_text(segments, clip["_start_line"], clip["_end_line"]).startswith(
+        "We have the first R"
+    )
+    assert clip["end"] - clip["start"] <= 55
+
+
+def test_oversized_repair_rewrites_objective_when_omitted_cues_owned_its_details():
+    segments = [
+        {
+            "cue_id": "life-definition",
+            "start": 0.0,
+            "end": 30.0,
+            "text": "Living systems maintain chemical balance and evolve across generations.",
+        },
+        {
+            "cue_id": "regulation",
+            "start": 30.0,
+            "end": 60.0,
+            "text": "Regulation keeps internal conditions stable and organisms respond to environmental change.",
+        },
+        {
+            "cue_id": "reproduction",
+            "start": 60.0,
+            "end": 90.0,
+            "text": "Reproduction passes genetic information to offspring.",
+        },
+    ]
+    proposal = G._BoundaryTopic(
+        candidate_id="life-characteristics",
+        start_line=0,
+        end_line=2,
+        start_quote="Living systems maintain chemical balance",
+        end_quote="genetic information to offspring",
+        title="Regulation, response, and reproduction define life",
+        learning_objective=(
+            "Identify regulation, environmental response, and reproduction as characteristics of life."
+        ),
+        facet="definition of life",
+        reason="Explains how scientists distinguish living systems.",
+        informativeness=0.8,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.3,
+        directly_teaches_topic=True,
+        substantive=True,
+        topic_evidence_quote=(
+            "Living systems maintain chemical balance and evolve across generations"
+        ),
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {
+            "_segment_target_sec": 30,
+            "_segment_target_min_sec": 20,
+            "_segment_target_max_sec": 40,
+        },
+        topic="biology",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["cue_ids"] == ["life-definition"]
+    assert clip["learning_objective"].startswith(
+        "Understand this transcript-grounded point:"
+    )
+    assert "regulation" not in clip["learning_objective"].casefold()
+    assert "regulation" not in clip["title"].casefold()
+
+
+def test_range_repair_keeps_paraphrased_objective_without_lost_support():
+    objective = "Explain how living systems preserve balance over time."
+    assert G._objective_after_range_repair(
+        objective,
+        original_text=(
+            "Living systems preserve balance over time. Regulation is one example."
+        ),
+        retained_text="Living systems preserve balance over time.",
+        evidence_quote="Living systems preserve balance over time",
+    ) == objective
+
+
 def test_structural_filler_is_rejected_even_when_scores_are_high():
     segments = [{
         "start": 0.0,

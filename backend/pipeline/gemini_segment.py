@@ -88,7 +88,7 @@ _GREEN_SCORE = 0.75
 _MAX_CLIPS = 40
 _PRODUCTION_MAX_CANDIDATES = 8
 _DUPLICATE_OVERLAP = 0.8
-_CONTEXT_CUE_LIMIT = 2
+_CONTEXT_CUE_LIMIT = 8
 _CONTEXT_WINDOW_S = 30.0
 _BOUNDARY_PAD_S = 0.3
 _LONG_RANGE_REPAIR_MIN_S = 20.0
@@ -857,7 +857,7 @@ def _close_cue_context(
     ignore_caption_case: bool,
     cue_limit: int = _CONTEXT_CUE_LIMIT,
 ) -> tuple[int, int, str | None]:
-    """Expand dirty edges by at most two cues and thirty seconds per side."""
+    """Expand dirty edges by at most eight cues and thirty seconds per side."""
     cue_limit = max(0, min(_CONTEXT_CUE_LIMIT, int(cue_limit)))
     original_start = start_line
     original_end = end_line
@@ -954,6 +954,7 @@ def _repair_oversized_cue_range(
     *,
     ignore_caption_case: bool,
     anchor_text: str = "",
+    required_quote: str = "",
     minimum_duration: float = _LONG_RANGE_REPAIR_MIN_S,
     target_duration: float = _LONG_RANGE_REPAIR_TARGET_S,
     maximum_duration: float = _LONG_RANGE_REPAIR_MAX_S,
@@ -1007,6 +1008,11 @@ def _repair_oversized_cue_range(
                 str(segments[candidate_end].get("text") or ""),
                 next_text,
                 ignore_caption_case=ignore_caption_case,
+            ):
+                continue
+            if required_quote and not _contains_quote(
+                _cue_clip_text(segments, candidate_start, candidate_end),
+                required_quote,
             ):
                 continue
             candidates.append((
@@ -1110,6 +1116,59 @@ def _text_has_grounding(text: str, transcript_text: str) -> bool:
         return False
     shared = source & generated
     return len(shared) >= min(2, len(generated))
+
+
+def _range_repair_lost_support(
+    text: str,
+    *,
+    original_text: str,
+    retained_text: str,
+) -> bool:
+    generated_tokens = _content_tokens(text)
+    original_support = generated_tokens & _content_tokens(original_text)
+    retained_support = generated_tokens & _content_tokens(retained_text)
+    return bool(original_support - retained_support)
+
+
+def _objective_after_range_repair(
+    objective: str,
+    *,
+    original_text: str,
+    retained_text: str,
+    evidence_quote: str,
+) -> str:
+    """Remove claims whose only transcript support was cut by range repair."""
+    if not _range_repair_lost_support(
+        objective,
+        original_text=original_text,
+        retained_text=retained_text,
+    ):
+        return objective
+    grounded = " ".join(str(evidence_quote or "").split()).rstrip(" .!?;:")
+    if not grounded:
+        return objective
+    return f"Understand this transcript-grounded point: {grounded}."
+
+
+def _title_after_range_repair(
+    title: str,
+    *,
+    original_text: str,
+    retained_text: str,
+    evidence_quote: str,
+) -> str:
+    """Keep repaired clip labels within the teaching claim that remains."""
+    if not _range_repair_lost_support(
+        title,
+        original_text=original_text,
+        retained_text=retained_text,
+    ):
+        return title
+    grounded_words = " ".join(str(evidence_quote or "").split()).split()
+    if not grounded_words:
+        return title
+    grounded = " ".join(grounded_words[:10]).rstrip(" .!?;:")
+    return grounded[:80]
 
 
 def _validated_assessment(value: object, *, grounding_text: str) -> dict | None:
@@ -1490,6 +1549,9 @@ def _plan_to_report(
             continue
         start, end = round(start, 3), round(end, 3)
         duration = round(end - start, 3)
+        range_before_size_repair = (a, b)
+        text_before_size_repair = _cue_clip_text(segments, a, b)
+        range_was_size_repaired = False
         if duration > requested_max:
             repaired_range = _repair_oversized_cue_range(
                 segments,
@@ -1507,12 +1569,16 @@ def _plan_to_report(
                         topic,
                     )
                 ),
+                required_quote=str(
+                    getattr(proposal, "topic_evidence_quote", "") or ""
+                ),
                 minimum_duration=requested_min,
                 target_duration=requested_target,
                 maximum_duration=requested_max,
             )
             if repaired_range is not None:
                 a, b = repaired_range
+                range_was_size_repaired = (a, b) != range_before_size_repair
                 start, end = _padded_cue_bounds(segments, a, b)
                 start, end = round(start, 3), round(end, 3)
                 duration = round(end - start, 3)
@@ -1555,6 +1621,25 @@ def _plan_to_report(
                     continue
                 topic_evidence_quote = repaired_evidence_quote
                 quote_repaired = True
+        learning_objective = str(
+            getattr(proposal, "learning_objective", "")
+            or proposal.reason
+            or proposal.title
+        ).strip()
+        clip_title = str(proposal.title or "").strip()
+        if range_was_size_repaired:
+            learning_objective = _objective_after_range_repair(
+                learning_objective,
+                original_text=text_before_size_repair,
+                retained_text=clip_text,
+                evidence_quote=topic_evidence_quote,
+            )
+            clip_title = _title_after_range_repair(
+                clip_title,
+                original_text=text_before_size_repair,
+                retained_text=clip_text,
+                evidence_quote=topic_evidence_quote,
+            )
         cue_ids = [
             str(segments[line].get("cue_id") or f"cue-{line}")
             for line in range(a, b + 1)
@@ -1563,12 +1648,8 @@ def _plan_to_report(
         clip = {
             "start": start,
             "end": end,
-            "title": str(proposal.title or "").strip(),
-            "learning_objective": str(
-                getattr(proposal, "learning_objective", "")
-                or proposal.reason
-                or proposal.title
-            ).strip(),
+            "title": clip_title,
+            "learning_objective": learning_objective,
             "facet": str(proposal.facet or "").strip(),
             "reason": str(proposal.reason or "").strip(),
             "kind": "educational",

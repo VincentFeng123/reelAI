@@ -59,6 +59,15 @@ def test_context_dependent_np_is_weak():
 def test_mid_clause_fragment_is_weak():
     assert opens_mid_thought("writing oxygen we're going to write a two")  # lowercase mid-clause
 
+
+def test_elliptical_instruction_and_action_reference_are_weak():
+    assert opens_mid_thought("Little below the line, pull it through.")
+    assert opens_mid_thought("I can just do that.")
+
+
+def test_complete_little_below_statement_is_an_onset():
+    assert is_onset("A little below the boiling point, water remains liquid.")
+
 # Real GOOD openers — MUST be treated as onsets (the critical false-positives).
 def test_so_lets_start_is_onset():
     assert is_onset("So let's start with KI. How can we name this compound?")

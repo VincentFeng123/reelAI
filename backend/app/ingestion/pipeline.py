@@ -75,7 +75,14 @@ from .persistence import (
     upsert_reel_row,
     upsert_video,
 )
-from ..clip_engine import run as clip_engine_run, search as clip_engine_search, bridge as clip_engine_bridge, metadata as clip_engine_meta, config as clip_engine_config  # noqa: F401
+from ..clip_engine import (  # noqa: F401
+    bridge as clip_engine_bridge,
+    config as clip_engine_config,
+    metadata as clip_engine_meta,
+    run as clip_engine_run,
+    search as clip_engine_search,
+    silence as clip_engine_silence,
+)
 from ..clip_engine.cancellation import is_cancelled, raise_if_cancelled
 from ..clip_engine.provider_runtime import GenerationContext
 from ..clip_engine.errors import (
@@ -1166,6 +1173,20 @@ class IngestionPipeline:
             analysis_limit,
         )
         executor = ThreadPoolExecutor(max_workers=concurrent_video_count)
+        require_acoustic_boundaries = bool(
+            generation_context is not None
+            and generation_context.require_acoustic_boundaries
+        )
+        audio_executor = (
+            ThreadPoolExecutor(
+                max_workers=concurrent_video_count,
+                thread_name_prefix="clip-audio-prepare",
+            )
+            if require_acoustic_boundaries
+            else None
+        )
+        audio_preparation_futures: dict[str, Any] = {}
+        prepared_audio_results: dict[str, Any] = {}
         enrichment_executor = (
             ThreadPoolExecutor(max_workers=1, thread_name_prefix="clip-enrichment")
             if generation_context is not None and retrieval_profile == "deep"
@@ -1196,8 +1217,18 @@ class IngestionPipeline:
                 analyzed_video_ids.add(analyzed_video_id)
             videos[index]["_segment_max_candidates"] = min(
                 8,
-                max(1, inventory_cap - valid_clip_count + 2),
+                max(1, inventory_cap - persisted_count + 2),
             )
+            if (
+                audio_executor is not None
+                and analyzed_video_id
+                and analyzed_video_id not in audio_preparation_futures
+            ):
+                audio_preparation_futures[analyzed_video_id] = audio_executor.submit(
+                    clip_engine_silence.prepare_audio_source,
+                    str(videos[index].get("url") or analyzed_video_id),
+                    cancel_check=fetch_should_cancel,
+                )
             return executor.submit(
                 self._clip_and_filter,
                 videos[index],
@@ -1254,6 +1285,7 @@ class IngestionPipeline:
                         f"({shared_timeout_sec:g}s)"
                     ),
                 )
+
             except _TranscriptUnavailableError as exc:
                 if generation_context is not None:
                     generation_context.increment_counter("transcript_failures")
@@ -1320,6 +1352,29 @@ class IngestionPipeline:
                             fallback_eligible=False,
                         )
             return None
+
+        def prepared_audio_for(v: dict[str, Any]):
+            video_id = str(v.get("id") or "").strip()
+            if not require_acoustic_boundaries:
+                return None
+            if video_id in prepared_audio_results:
+                return prepared_audio_results[video_id]
+            future = audio_preparation_futures.get(video_id)
+            if future is None:
+                result = clip_engine_silence.AudioPreparationResult(
+                    "unavailable",
+                    diagnostics={"stage": "resolve", "reason": "audio_not_prepared"},
+                )
+            else:
+                try:
+                    result = future.result(timeout=max(0.1, deadline - time.monotonic()))
+                except Exception:
+                    result = clip_engine_silence.AudioPreparationResult(
+                        "unavailable",
+                        diagnostics={"stage": "resolve", "reason": "audio_prepare_failed"},
+                    )
+            prepared_audio_results[video_id] = result
+            return result
 
         def enrich_persisted_batch(batch: list[dict[str, Any]]) -> None:
             if generation_context is None or not batch:
@@ -1431,20 +1486,97 @@ class IngestionPipeline:
                 if not prerequisites_ready:
                     search_context["surface_reason"] = "prerequisite_not_surfaceable"
 
-                if surface_eligible and generation_context is not None:
-                    boundary_diagnostics = _supadata_boundary_diagnostics(
+                if semantic_eligible and generation_context is not None:
+                    caption_diagnostics = _supadata_boundary_diagnostics(
                         engine_out["transcript"], clip
                     )
-                    if boundary_diagnostics is None:
+                    if caption_diagnostics is None:
                         surface_eligible = False
                         search_context["boundary_status"] = "unavailable"
                         search_context["surface_reason"] = "supadata_boundary_unavailable"
                         generation_context.increment_counter("boundary_unavailable")
-                    else:
-                        search_context["boundary_status"] = "verified"
+                    elif require_acoustic_boundaries:
+                        original_start = float(clip.get("start") or 0.0)
+                        original_end = float(clip.get("end") or 0.0)
+                        acoustic_timeout = deadline - time.monotonic()
+                        if acoustic_timeout <= 0:
+                            acoustic = clip_engine_silence.SilenceVerificationResult(
+                                "unavailable",
+                                original_start,
+                                original_end,
+                                {"stage": "verify", "reason": "deadline_exceeded"},
+                            )
+                        else:
+                            acoustic = clip_engine_silence.verify_acoustic_boundaries(
+                                str(v.get("url") or v.get("id") or ""),
+                                original_start,
+                                original_end,
+                                prepared=prepared_audio_for(v),
+                                timeout_sec=min(
+                                    clip_engine_silence.DEFAULT_TIMEOUT_SEC,
+                                    acoustic_timeout,
+                                ),
+                                cancel_check=should_cancel,
+                            )
+                        acoustic_diagnostics = dict(acoustic.diagnostics or {})
+                        first_start = (
+                            original_start
+                            + float(caption_diagnostics["start_padding_ms"]) / 1000.0
+                        )
+                        last_end = (
+                            original_end
+                            - float(caption_diagnostics["end_padding_ms"]) / 1000.0
+                        )
+                        adjusted_duration = acoustic.end_sec - acoustic.start_sec
+                        acoustic_range_is_safe = bool(
+                            acoustic.verified
+                            and acoustic.start_sec + 1e-3
+                            >= max(
+                                0.0,
+                                original_start
+                                - clip_engine_silence.START_CUSHION_MS / 1000.0,
+                            )
+                            and acoustic.end_sec
+                            <= original_end
+                            + clip_engine_silence.END_CUSHION_MS / 1000.0
+                            + 1e-3
+                            and acoustic.start_sec <= first_start + 0.05
+                            and acoustic.end_sec + 0.05 >= last_end
+                            and 1.0 <= adjusted_duration <= 180.0
+                        )
+                        boundary_diagnostics = {
+                            "method": "energy_silence",
+                            "acoustic_verified": acoustic_range_is_safe,
+                            "caption": caption_diagnostics,
+                            "acoustic": acoustic_diagnostics,
+                        }
                         search_context["boundary_diagnostics"] = boundary_diagnostics
+                        if not acoustic_range_is_safe:
+                            surface_eligible = False
+                            search_context["boundary_status"] = "unavailable"
+                            search_context["surface_reason"] = str(
+                                acoustic_diagnostics.get("reason")
+                                or (
+                                    "acoustic_adjusted_duration_invalid"
+                                    if acoustic.verified
+                                    and not 1.0 <= adjusted_duration <= 180.0
+                                    else "acoustic_boundary_outside_selected_range"
+                                )
+                            )
+                            generation_context.increment_counter("boundary_unavailable")
+                        else:
+                            clip["start"] = round(float(acoustic.start_sec), 3)
+                            clip["end"] = round(float(acoustic.end_sec), 3)
+                            search_context["boundary_status"] = "verified"
+                    else:
+                        search_context["boundary_status"] = "caption_aligned"
+                        search_context["boundary_diagnostics"] = caption_diagnostics
                 else:
                     search_context.setdefault("boundary_status", "caption_aligned")
+
+                if surface_eligible and bool(search_context.get("deferred_level")):
+                    surface_eligible = False
+                    search_context["surface_reason"] = "level_mismatch"
 
                 search_context["surface_eligible"] = bool(surface_eligible)
                 clip["search_context"] = search_context
@@ -1569,12 +1701,11 @@ class IngestionPipeline:
             if aggregate_fallback_checked or len(initial_resolved) < initial_count:
                 return
             aggregate_fallback_checked = True
-            initial_validated = sum(
-                len(completed_results[index][1])
+            initial_surfaceable = sum(
+                len(reels_by_video.get(index, []))
                 for index in range(initial_count)
-                if index in completed_results
             )
-            if generation_context is None or initial_validated >= 3:
+            if generation_context is None or initial_surfaceable >= 3:
                 return
             viable_candidates = [
                 index
@@ -1598,7 +1729,7 @@ class IngestionPipeline:
                 None,
             )
             if not callable(claim_fallback) or not claim_fallback(
-                validated_count=initial_validated
+                validated_count=initial_surfaceable
             ):
                 return
             v, existing_clips, engine_out = completed_results[candidate_index]
@@ -1619,7 +1750,7 @@ class IngestionPipeline:
                         ),
                         "max_clips": min(
                             8,
-                            max(1, inventory_cap - initial_validated + 2),
+                            max(1, inventory_cap - initial_surfaceable + 2),
                         ),
                     },
                     should_cancel=should_cancel,
@@ -1772,12 +1903,8 @@ class IngestionPipeline:
 
                 if (
                     not pending
-                    and (
-                        persisted_count if retrieval_profile == "bootstrap" else valid_clip_count
-                    ) < minimum_valid
-                    and (
-                        persisted_count if retrieval_profile == "bootstrap" else valid_clip_count
-                    ) < inventory_cap
+                    and persisted_count < minimum_valid
+                    and persisted_count < inventory_cap
                     and next_index < min(len(videos), analysis_limit)
                 ):
                     future = submit_video(next_index)
@@ -1789,6 +1916,8 @@ class IngestionPipeline:
             for future in all_futures:
                 future.cancel()
             executor.shutdown(wait=False, cancel_futures=True)
+            if audio_executor is not None:
+                audio_executor.shutdown(wait=False, cancel_futures=True)
 
         if retrieval_profile == "bootstrap" and persisted_count < inventory_cap:
             # Only after every available source has had its first chance may a

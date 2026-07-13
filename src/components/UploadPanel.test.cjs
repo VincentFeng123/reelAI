@@ -33,10 +33,21 @@ test("topic submission starts at the hidden beginner level", () => {
 
   visit(sourceFile);
   assert.ok(submitCallback, "UploadPanel onSubmit must remain discoverable");
+  const callbackText = submitCallback.arguments[0].getText(sourceFile);
   assert.match(
-    submitCallback.arguments[0].getText(sourceFile),
-    /DEFAULT_KNOWLEDGE_LEVEL/,
-    "topic upload must preserve an internal starting level",
+    source,
+    /const DEFAULT_KNOWLEDGE_LEVEL = "beginner" as const;/,
+    "the hidden initial level must stay beginner",
+  );
+  assert.match(
+    callbackText,
+    /topicList\.map\([\s\S]*knowledgeLevel: DEFAULT_KNOWLEDGE_LEVEL/,
+    "multi-topic upload must preserve the hidden starting level",
+  );
+  assert.match(
+    callbackText,
+    /knowledgeLevel: inputMode === "topic" \? DEFAULT_KNOWLEDGE_LEVEL : undefined/,
+    "single-topic upload must preserve the hidden starting level",
   );
   const dependencies = submitCallback.arguments[1];
   assert.ok(

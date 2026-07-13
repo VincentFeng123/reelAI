@@ -73,9 +73,23 @@ def _insert_generation_reel(
     conn.execute(
         "INSERT INTO reels "
         "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
-        "transcript_snippet, takeaways_json, base_score, generation_id, created_at) "
-        "VALUES (?, 'm1', 'c1', ?, '', 0, 30, '', '[]', 1, ?, ?)",
-        (reel_id, video_id, generation_id, created_at),
+        "transcript_snippet, takeaways_json, base_score, generation_id, "
+        "search_context_json, created_at) "
+        "VALUES (?, 'm1', 'c1', ?, '', 0, 30, '', '[]', 1, ?, ?, ?)",
+        (
+            reel_id,
+            video_id,
+            generation_id,
+            json.dumps({
+                "surface_eligible": True,
+                "boundary_status": "verified",
+                "boundary_diagnostics": {
+                    "method": "energy_silence",
+                    "acoustic_verified": True,
+                },
+            }),
+            created_at,
+        ),
     )
     return {
         "reel_id": reel_id,
@@ -91,6 +105,7 @@ def _set_reel_boundary_state(
     reel_id: str,
     boundary_status: str,
     surface_eligible: bool = True,
+    acoustic_verified: bool | None = None,
 ) -> None:
     conn.execute(
         "UPDATE reels SET search_context_json = ? WHERE id = ?",
@@ -98,6 +113,14 @@ def _set_reel_boundary_state(
             json.dumps({
                 "surface_eligible": surface_eligible,
                 "boundary_status": boundary_status,
+                "boundary_diagnostics": {
+                    "method": "energy_silence",
+                    "acoustic_verified": (
+                        boundary_status == "verified"
+                        if acoustic_verified is None
+                        else acoustic_verified
+                    ),
+                },
                 "selection_contract_version": "confidence_v1",
                 "directly_teaches_topic": True,
                 "substantive": True,
@@ -471,10 +494,19 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
         worker_conn.execute(
             "INSERT INTO reels "
             "(id, material_id, concept_id, video_id, video_url, t_start, t_end, "
-            "transcript_snippet, takeaways_json, base_score, generation_id, created_at) "
+            "transcript_snippet, takeaways_json, base_score, generation_id, "
+            "search_context_json, created_at) "
             "VALUES ('source-chain-reel', 'm1', 'c1', 'source-chain-video', '', "
-            "0, 30, '', '[]', 1, ?, ?)",
-            (str(kwargs["generation_id"]), now.isoformat()),
+            "0, 30, '', '[]', 1, ?, ?, ?)",
+            (
+                str(kwargs["generation_id"]),
+                json.dumps({
+                    "surface_eligible": True,
+                    "boundary_status": "verified",
+                    "boundary_diagnostics": {"acoustic_verified": True},
+                }),
+                now.isoformat(),
+            ),
         )
 
     monkeypatch.setattr(main.reel_service, "generate_reels", create_one_reel)
@@ -664,7 +696,11 @@ def test_slow_generation_bootstraps_then_deepens_with_shared_caps(monkeypatch) -
         assert [call["retrieval_profile"] for call in calls] == ["bootstrap", "deep"]
         assert [call["max_new_reels"] for call in calls] == [2, 2]
         assert calls[0]["max_generation_videos"] == 3
-        assert calls[1]["max_generation_videos"] == 3
+        assert calls[1]["max_generation_videos"] == 6
+        assert all(
+            call["generation_context"].require_acoustic_boundaries
+            for call in calls
+        )
         assert set(calls[1]["exclude_video_ids"]) == {
             "manual-exclusion",
             "bootstrap-video",
@@ -1078,11 +1114,25 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
     )
     leased = generation_jobs.lease_job(conn, job_id=job["id"], lease_owner="worker")
     assert leased
+    _insert_generation_reel(
+        conn,
+        generation_id="stream-generation",
+        reel_id="provisional",
+        video_id="stream-video",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
     generation_jobs.append_event(
         conn,
         job_id=job["id"],
         event_type="candidate",
         payload={"reel": {"reel_id": "provisional"}, "provisional": True},
+        lease_owner="worker",
+    )
+    generation_jobs.append_event(
+        conn,
+        job_id=job["id"],
+        event_type="candidate",
+        payload={"reel": {"reel_id": "caption-only"}, "provisional": True},
         lease_owner="worker",
     )
     generation_jobs.append_event(
@@ -1111,7 +1161,7 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
     try:
         events = asyncio.run(collect())
         assert [event["type"] for event in events] == ["candidate", "final", "terminal"]
-        assert [event["seq"] for event in events] == [1, 2, 3]
+        assert [event["seq"] for event in events] == [1, 3, 4]
         assert all(event["job_id"] == job["id"] and event["timestamp"] for event in events)
     finally:
         conn.close()
@@ -1153,6 +1203,19 @@ def test_authoritative_job_inventory_retains_every_streamed_candidate(monkeypatc
         lease_owner="candidate-retention-worker",
         now=now,
     )
+    _insert_generation_reel(
+        conn,
+        generation_id="generation-1",
+        reel_id="streamed-reel",
+        video_id="streamed-video",
+        created_at=now.isoformat(),
+    )
+    _set_reel_boundary_state(
+        conn,
+        reel_id="streamed-reel",
+        boundary_status="verified",
+        acoustic_verified=False,
+    )
     monkeypatch.setattr(
         main,
         "_ranked_request_reels",
@@ -1163,12 +1226,38 @@ def test_authoritative_job_inventory_retains_every_streamed_candidate(monkeypatc
         "result_generation_id": "generation-1",
     }
 
+    stale_reels = main._generation_job_reels(conn, job_row)
+    assert [reel["reel_id"] for reel in stale_reels] == ["ranked-reel"]
+
+    _set_reel_boundary_state(
+        conn,
+        reel_id="streamed-reel",
+        boundary_status="verified",
+        acoustic_verified=True,
+    )
     reels = main._generation_job_reels(conn, job_row)
 
     assert [reel["reel_id"] for reel in reels] == [
         "ranked-reel",
         "streamed-reel",
     ]
+
+    monkeypatch.setattr(
+        main,
+        "_ranked_request_reels",
+        lambda *_args, **_kwargs: [
+            {
+                "reel_id": f"ranked-reel-{index}",
+                "video_id": f"ranked-video-{index}",
+                "t_start": float(index * 30),
+                "t_end": float(index * 30 + 20),
+            }
+            for index in range(4)
+        ],
+    )
+    capped = main._generation_job_reels(conn, job_row)
+    assert len(capped) == 4
+    assert "streamed-reel" in {reel["reel_id"] for reel in capped}
     conn.close()
 
 
@@ -1363,6 +1452,9 @@ def test_cross_level_reservoir_rejects_unverified_or_implicit_surface_rows() -> 
         video_id="legacy-child-video",
         created_at=completed_at,
     )
+    conn.execute(
+        "UPDATE reels SET search_context_json = '{}' WHERE id = 'legacy-child-reel'"
+    )
     _terminal_job_for_generation(
         conn,
         request_key="prior-child",
@@ -1384,6 +1476,20 @@ def test_cross_level_reservoir_rejects_unverified_or_implicit_surface_rows() -> 
             conn,
             reel_id="legacy-child-reel",
             boundary_status="caption_aligned",
+        )
+        assert main._verified_cross_request_source_generation(
+            conn,
+            material_id="m1",
+            learner_id="learner-1",
+            request_key="new-level-request",
+            concept_id=None,
+        ) is None
+
+        _set_reel_boundary_state(
+            conn,
+            reel_id="legacy-child-reel",
+            boundary_status="verified",
+            acoustic_verified=False,
         )
         assert main._verified_cross_request_source_generation(
             conn,

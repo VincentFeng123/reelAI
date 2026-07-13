@@ -68,8 +68,8 @@ def _transcript() -> dict:
         "segments": [
             {
                 "cue_id": f"cue-{index}",
-                "start": index * 10.0,
-                "end": (index + 1) * 10.0,
+                "start": index * 11.0,
+                "end": (index + 1) * 11.0,
                 "text": text,
             }
             for index, text in enumerate(texts)

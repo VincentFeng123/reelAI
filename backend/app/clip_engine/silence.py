@@ -630,13 +630,37 @@ def verify_acoustic_boundaries(
                 )
 
             adjusted_start = max(
+                max(0.0, original_start - START_CUSHION_MS / 1000.0),
                 start_quiet.start_sec,
                 start_quiet.end_sec - START_CUSHION_MS / 1000.0,
             )
             adjusted_end = min(
+                original_end + END_CUSHION_MS / 1000.0,
                 end_quiet.end_sec,
                 end_quiet.start_sec + END_CUSHION_MS / 1000.0,
             )
+            if (
+                start_quiet.end_sec - adjusted_start + 1e-9
+                < START_CUSHION_MS / 1000.0
+            ):
+                return _unavailable(
+                    original_start,
+                    original_end,
+                    stage="analyze",
+                    reason="start_cushion_outside_selected_range",
+                    started=started,
+                )
+            if (
+                adjusted_end - end_quiet.start_sec + 1e-9
+                < END_CUSHION_MS / 1000.0
+            ):
+                return _unavailable(
+                    original_start,
+                    original_end,
+                    stage="analyze",
+                    reason="end_cushion_outside_selected_range",
+                    started=started,
+                )
             if adjusted_end <= adjusted_start:
                 return _unavailable(
                     original_start,

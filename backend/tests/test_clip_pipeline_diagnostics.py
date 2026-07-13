@@ -270,7 +270,7 @@ def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypat
     assert counters["persisted_clips"] == 1
 
 
-def test_topic_generation_uses_supadata_boundaries_without_media_fetch(
+def test_topic_generation_requires_acoustic_boundaries_before_emit(
     monkeypatch,
 ) -> None:
     transcript = {
@@ -320,8 +320,30 @@ def test_topic_generation_uses_supadata_boundaries_without_media_fetch(
 
     pipeline = _pipeline()
     monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    prepared = mock.sentinel.prepared_audio
+    prepare_audio = mock.Mock(return_value=prepared)
+    verify_audio = mock.Mock(return_value=mock.Mock(
+        verified=True,
+        start_sec=0.0,
+        end_sec=10.0,
+        diagnostics={
+            "threshold_dbfs": -38.0,
+            "start_quiet": [0.0, 0.2],
+            "end_quiet": [9.8, 10.1],
+        },
+    ))
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        prepare_audio,
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify_audio,
+    )
     emitted: list[str] = []
-    context = GenerationContext("slow")
+    context = GenerationContext("slow", require_acoustic_boundaries=True)
 
     reels, _ = pipeline.ingest_topic(
         topic="Intro to Python",
@@ -341,18 +363,221 @@ def test_topic_generation_uses_supadata_boundaries_without_media_fetch(
     assert boundary["boundary_status"] == "verified"
     assert boundary["surface_eligible"] is True
     assert boundary["boundary_diagnostics"] == {
-        "method": "supadata_cue_timing",
-        "acoustic_verified": False,
-        "start_cue_id": "one",
-        "end_cue_id": "one",
-        "start_padding_ms": 0,
-        "end_padding_ms": 0,
-        "preceding_gap_ms": 0,
-        "following_gap_ms": 0,
+        "method": "energy_silence",
+        "acoustic_verified": True,
+        "caption": {
+            "method": "supadata_cue_timing",
+            "acoustic_verified": False,
+            "start_cue_id": "one",
+            "end_cue_id": "one",
+            "start_padding_ms": 0,
+            "end_padding_ms": 0,
+            "preceding_gap_ms": 0,
+            "following_gap_ms": 0,
+        },
+        "acoustic": {
+            "threshold_dbfs": -38.0,
+            "start_quiet": [0.0, 0.2],
+            "end_quiet": [9.8, 10.1],
+        },
     }
+    prepare_audio.assert_called_once()
+    verify_audio.assert_called_once_with(
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        0.0,
+        10.0,
+        prepared=prepared,
+        timeout_sec=mock.ANY,
+        cancel_check=mock.ANY,
+    )
     assert context.counters()["stored_clips"] == 1
     assert context.counters()["deferred_clips"] == 0
     assert context.counters()["persisted_clips"] == 1
+
+
+def test_level_mismatch_is_verified_and_stored_without_streaming(monkeypatch) -> None:
+    transcript = _transcript()
+    engine_out = {
+        "clips": [{
+            "start": 0.0,
+            "end": 10.0,
+            "cue_ids": ["python"],
+            "informativeness": 0.9,
+            "topic_relevance": 0.9,
+            "educational_importance": 0.9,
+            "difficulty": 0.95,
+            "boundary_confidence": 0.9,
+            "is_standalone": True,
+            "selection_candidate_id": "advanced-functions",
+            "prerequisite_ids": [],
+            "uncertainty": "low",
+            "directly_teaches_topic": True,
+            "substantive": True,
+            "topic_evidence_quote": (
+                "Python functions package reusable instructions"
+            ),
+        }],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        mock.Mock(return_value=mock.Mock(
+            verified=True,
+            start_sec=0.0,
+            end_sec=10.0,
+            diagnostics={"threshold_dbfs": -38.0},
+        )),
+    )
+    stored: list[dict] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        stored.append(clip)
+        return ("advanced-reservoir", mock.sentinel.metadata)
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    emitted: list[str] = []
+    context = GenerationContext("slow", require_acoustic_boundaries=True)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        knowledge_level="beginner",
+        generation_context=context,
+        retrieval_profile="bootstrap",
+        max_videos=1,
+        max_reels=1,
+        on_reel_created=emitted.append,
+    )
+
+    assert reels == []
+    assert emitted == []
+    assert len(stored) == 1
+    boundary = stored[0]["search_context"]
+    assert boundary["boundary_status"] == "verified"
+    assert boundary["surface_eligible"] is False
+    assert boundary["surface_reason"] == "level_mismatch"
+    assert context.counters()["stored_clips"] == 1
+    assert context.counters()["deferred_clips"] == 1
+    assert context.counters()["persisted_clips"] == 0
+
+
+@pytest.mark.parametrize(
+    ("verification", "expected_reason"),
+    [
+        (
+            {
+                "verified": False,
+                "start_sec": 0.0,
+                "end_sec": 10.0,
+                "diagnostics": {
+                    "stage": "analyze",
+                    "reason": "start_silence_not_found",
+                },
+            },
+            "start_silence_not_found",
+        ),
+        (
+            {
+                "verified": True,
+                "start_sec": 0.0,
+                "end_sec": 0.5,
+                "diagnostics": {},
+            },
+            "acoustic_adjusted_duration_invalid",
+        ),
+    ],
+)
+def test_acoustic_failure_is_stored_but_never_emitted(
+    monkeypatch,
+    verification: dict,
+    expected_reason: str,
+) -> None:
+    transcript = _transcript()
+    quote = "Python functions package reusable instructions"
+    engine_out = {
+        "clips": [{
+            "start": 0.0,
+            "end": 10.0,
+            "cue_ids": ["python"],
+            "informativeness": 0.8,
+            "topic_relevance": 0.8,
+            "educational_importance": 0.8,
+            "difficulty": 0.2,
+            "boundary_confidence": 0.9,
+            "is_standalone": True,
+            "selection_candidate_id": "python-functions",
+            "prerequisite_ids": [],
+            "uncertainty": "low",
+            "directly_teaches_topic": True,
+            "substantive": True,
+            "topic_evidence_quote": quote,
+        }],
+        "transcript": transcript,
+        "notes": "",
+    }
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        mock.Mock(return_value=mock.Mock(**verification)),
+    )
+    stored: list[dict] = []
+    pipeline = _pipeline()
+
+    def persist(*, clip, **_kwargs):
+        stored.append(clip)
+        return ("deferred-reel", mock.sentinel.metadata)
+
+    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
+    emitted: list[str] = []
+    context = GenerationContext("slow", require_acoustic_boundaries=True)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        retrieval_profile="bootstrap",
+        max_videos=1,
+        max_reels=1,
+        on_reel_created=emitted.append,
+    )
+
+    assert reels == []
+    assert emitted == []
+    assert len(stored) == 1
+    boundary = stored[0]["search_context"]
+    assert boundary["surface_eligible"] is False
+    assert boundary["boundary_status"] == "unavailable"
+    assert boundary["surface_reason"] == expected_reason
+    assert context.counters()["stored_clips"] == 1
+    assert context.counters()["deferred_clips"] == 1
+    assert context.counters()["persisted_clips"] == 0
 
 
 def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
@@ -365,11 +590,36 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
             {"search_context_json": '{"surface_eligible": false}'},
             {"search_context_json": '{"surface_eligible": "false"}'},
             {"search_context_json": '{"surface_eligible": true, "boundary_status": "unavailable"}'},
-            {"search_context_json": '{"surface_eligible": true, "boundary_status": "verified"}'},
+            {"search_context_json": '{"surface_eligible": true}'},
+            {"search_context_json": '{"surface_eligible": true, "boundary_status": "caption_aligned"}'},
+            {"search_context_json": '{"surface_eligible": true, "boundary_status": "verified", "boundary_diagnostics": {"acoustic_verified": false}}'},
+            {"search_context_json": '{"surface_eligible": true, "boundary_status": "verified", "boundary_diagnostics": {"acoustic_verified": true}}'},
         ],
     )
 
     assert main._count_generation_reels(object(), "generation") == 1
+
+
+def test_failed_and_level_deferred_storage_does_not_consume_ready_material_cap(
+    monkeypatch,
+) -> None:
+    deferred = [
+        {
+            "search_context_json": (
+                '{"surface_eligible": false, "boundary_status": "unavailable"}'
+            )
+        }
+        for _ in range(main.MAX_REELS_PER_MATERIAL + 5)
+    ]
+    deferred.append({
+        "search_context_json": (
+            '{"surface_eligible": true, "boundary_status": "verified", '
+            '"boundary_diagnostics": {"acoustic_verified": true}}'
+        ),
+    })
+    monkeypatch.setattr(main, "fetch_all", lambda *_args, **_kwargs: deferred)
+
+    assert main._count_material_ready_reels(object(), "material") == 1
 
 
 def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
@@ -729,6 +979,101 @@ def test_joint_one_plus_one_initial_yield_uses_one_aggregate_pro_fallback(
 
     assert len(reels) == 3
     assert any(str(reel).endswith(":10.0") for reel in reels)
+    pro_fallback.assert_called_once()
+
+
+def test_raw_flash_yield_does_not_block_pro_when_acoustic_yield_is_zero(
+    monkeypatch,
+) -> None:
+    first = _video()
+    second = {
+        **_video(),
+        "id": "9bZkp7q19f0",
+        "url": "https://www.youtube.com/watch?v=9bZkp7q19f0",
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: {
+            **_discovery(),
+            "videos": [first, second],
+        },
+    )
+    pipeline = _pipeline()
+
+    def clip_and_filter(video, *_args, engine_out_override=None, **_kwargs):
+        clips = [{
+            "start": 0.0,
+            "end": 10.0,
+            "cue_ids": ["python"],
+            "score": 0.9,
+            "selection_candidate_id": f"{video['id']}::root",
+            "prerequisite_ids": [],
+            "search_context": {"surface_eligible": True},
+        }]
+        if engine_out_override is None:
+            clips.append({
+                "start": 10.0,
+                "end": 20.0,
+                "cue_ids": ["garden"],
+                "score": 0.8,
+                "selection_candidate_id": f"{video['id']}::second",
+                "prerequisite_ids": [],
+                "search_context": {"surface_eligible": True},
+            })
+        return video, clips, (
+            engine_out_override
+            or {"transcript": _transcript(), "clips": []}
+        )
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    pro_fallback = mock.Mock(return_value={
+        "transcript": _transcript(),
+        "clips": [{"start": 0.0, "end": 10.0, "cue_ids": ["python"]}],
+        "notes": "fallback",
+    })
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_run,
+        "pro_boundary_fallback",
+        pro_fallback,
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        mock.Mock(return_value=mock.Mock(
+            verified=False,
+            start_sec=0.0,
+            end_sec=10.0,
+            diagnostics={"reason": "start_silence_not_found"},
+        )),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(side_effect=lambda **kwargs: (
+            f"{kwargs['v']['id']}:{kwargs['clip']['start']}",
+            mock.sentinel.metadata,
+        )),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        max_videos=2,
+        max_reels=3,
+        generation_context=GenerationContext(
+            "slow",
+            require_acoustic_boundaries=True,
+        ),
+    )
+
+    assert reels == []
     pro_fallback.assert_called_once()
 
 

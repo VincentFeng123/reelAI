@@ -2556,6 +2556,17 @@ def _shape_reels_for_request_context(
     return shaped_rows
 
 
+def _search_context_has_verified_acoustic_boundary(context: Any) -> bool:
+    if not isinstance(context, dict):
+        return False
+    diagnostics = context.get("boundary_diagnostics")
+    return bool(
+        str(context.get("boundary_status") or "").strip().lower() == "verified"
+        and isinstance(diagnostics, dict)
+        and diagnostics.get("acoustic_verified") is True
+    )
+
+
 def _count_generation_reels(conn, generation_id: str) -> int:
     try:
         rows = fetch_all(
@@ -2566,12 +2577,7 @@ def _count_generation_reels(conn, generation_id: str) -> int:
     except Exception as exc:
         if "search_context_json" not in str(exc).lower():
             raise
-        legacy = fetch_one(
-            conn,
-            "SELECT COUNT(*) AS reel_count FROM reels WHERE generation_id = ?",
-            (generation_id,),
-        )
-        return max(0, int((legacy or {}).get("reel_count") or 0))
+        return 0
     count = 0
     for row in rows:
         try:
@@ -2586,10 +2592,55 @@ def _count_generation_reels(conn, generation_id: str) -> int:
                 }
             if not surface_eligible:
                 continue
-            if str(context.get("boundary_status") or "").strip().lower() == "unavailable":
+            if not _search_context_has_verified_acoustic_boundary(context):
                 continue
         count += 1
     return count
+
+
+def _count_material_ready_reels(conn, material_id: str) -> int:
+    rows = fetch_all(
+        conn,
+        "SELECT search_context_json FROM reels WHERE material_id = ?",
+        (material_id,),
+    )
+    count = 0
+    for row in rows:
+        try:
+            context = json.loads(str(row.get("search_context_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        surface_eligible = context.get("surface_eligible") if isinstance(context, dict) else None
+        if isinstance(surface_eligible, str):
+            surface_eligible = surface_eligible.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        if surface_eligible is True and _search_context_has_verified_acoustic_boundary(context):
+            count += 1
+    return count
+
+
+def _verified_acoustic_reel_ids(conn, reel_ids: list[str]) -> set[str]:
+    normalized = list(dict.fromkeys(
+        str(reel_id or "").strip() for reel_id in reel_ids if str(reel_id or "").strip()
+    ))
+    if not normalized:
+        return set()
+    placeholders = ", ".join("?" for _ in normalized)
+    rows = fetch_all(
+        conn,
+        f"SELECT id, search_context_json FROM reels WHERE id IN ({placeholders})",
+        tuple(normalized),
+    )
+    verified: set[str] = set()
+    for row in rows:
+        try:
+            context = json.loads(str(row.get("search_context_json") or "{}"))
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if _search_context_has_verified_acoustic_boundary(context):
+            verified.add(str(row.get("id") or ""))
+    return verified
 
 
 def _fetch_generation_row(conn, generation_id: str | None) -> dict[str, Any] | None:
@@ -2859,9 +2910,14 @@ def _verified_cross_request_source_generation(
             surface_eligible = surface_eligible.strip().lower() in {
                 "1", "true", "yes", "on",
             }
-        if not surface_eligible:
+        surface_reason = str(context.get("surface_reason") or "").strip().lower()
+        deferred_for_level = (
+            not surface_eligible
+            and surface_reason == "level_mismatch"
+        )
+        if not surface_eligible and not deferred_for_level:
             continue
-        if str(context.get("boundary_status") or "").strip().lower() != "verified":
+        if not _search_context_has_verified_acoustic_boundary(context):
             return None
         verified_surfaceable_count += 1
     return generation_id if verified_surfaceable_count else None
@@ -2931,6 +2987,7 @@ def _ranked_request_reels(
             {
                 "video_ids": sorted({_bare_video_id(value) for value in (exclude_video_ids or []) if _bare_video_id(value)}),
                 "reel_ids": sorted({str(value) for value in (exclude_reel_ids or []) if str(value)}),
+                "verified_acoustic_boundaries": True,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -2953,6 +3010,7 @@ def _ranked_request_reels(
                 learner_id=learner_id,
                 exclusions_fingerprint=exclusions_fingerprint,
                 content_fingerprint=content_fingerprint,
+                require_verified_boundaries=True,
             )
             for current_generation_id in generation_ids
             if current_generation_id
@@ -2968,6 +3026,7 @@ def _ranked_request_reels(
             learner_id=learner_id,
             exclusions_fingerprint=exclusions_fingerprint,
             content_fingerprint=content_fingerprint,
+            require_verified_boundaries=True,
         )
     excluded_video_id_set = {
         _bare_video_id(video_id)
@@ -3182,7 +3241,38 @@ def _generation_job_reels(conn, job_row: dict[str, Any]) -> list[dict[str, Any]]
         reel = payload.get("reel") if isinstance(payload, dict) else None
         if isinstance(reel, dict):
             provisional.append(dict(reel))
-    return _merge_request_reel_lists(ranked, provisional)[:requested]
+    verified_provisional_ids = _verified_acoustic_reel_ids(
+        conn,
+        [str(reel.get("reel_id") or "") for reel in provisional],
+    )
+    provisional = [
+        reel for reel in provisional
+        if str(reel.get("reel_id") or "") in verified_provisional_ids
+    ]
+    merged = _merge_request_reel_lists(ranked, provisional)
+    if len(merged) <= requested:
+        return merged
+    selected = merged[:requested]
+    selected_identities = {_reel_identity_key(reel) for reel in selected}
+    required_provisional = [
+        reel for reel in provisional
+        if _reel_identity_key(reel) not in selected_identities
+    ]
+    provisional_identities = {
+        _reel_identity_key(reel) for reel in provisional
+    }
+    for reel in required_provisional:
+        replace_index = next(
+            (
+                index for index in range(len(selected) - 1, -1, -1)
+                if _reel_identity_key(selected[index]) not in provisional_identities
+            ),
+            None,
+        )
+        if replace_index is None:
+            break
+        selected[replace_index] = reel
+    return selected
 
 
 def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, Any]:
@@ -3224,6 +3314,38 @@ def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, A
         "started_at": _normalize_datetime_for_api(job_row.get("started_at")),
         "completed_at": _normalize_datetime_for_api(job_row.get("completed_at")),
     }
+
+
+def _sanitize_generation_replay_events(
+    conn,
+    job_row: dict[str, Any] | None,
+    events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    candidate_reel_ids = [
+        str(((event.get("payload") or {}).get("reel") or {}).get("reel_id") or "")
+        for event in events
+        if str(event.get("type") or "") == "candidate"
+    ]
+    verified_candidate_ids = _verified_acoustic_reel_ids(conn, candidate_reel_ids)
+    sanitized: list[dict[str, Any]] = []
+    authoritative_reels: list[dict[str, Any]] | None = None
+    for raw_event in events:
+        event = dict(raw_event)
+        event_type = str(event.get("type") or "")
+        payload = dict(event.get("payload") or {})
+        if event_type == "candidate":
+            reel = payload.get("reel")
+            reel_id = str((reel or {}).get("reel_id") or "") if isinstance(reel, dict) else ""
+            if reel_id not in verified_candidate_ids:
+                continue
+        elif event_type == "final" and job_row is not None:
+            if authoritative_reels is None:
+                authoritative_reels = _generation_job_reels(conn, job_row)
+            payload["reels"] = authoritative_reels
+            payload["authoritative"] = True
+            event["payload"] = payload
+        sanitized.append(event)
+    return sanitized
 
 
 def _generation_job_db_should_stop(
@@ -3385,6 +3507,7 @@ def _run_leased_generation_job(
         generation_id=job_id,
         usage_sink=lambda record: _persist_generation_provider_usage(job_id, record),
         cache_store=DatabaseProviderCache(),
+        require_acoustic_boundaries=True,
     )
     generation_id = ""
     try:
@@ -3567,7 +3690,7 @@ def _run_leased_generation_job(
                     )
 
                 deep_video_budget = min(
-                    max(0, 5 - len(bootstrap_analyzed_video_ids)),
+                    max(0, 8 - len(bootstrap_analyzed_video_ids)),
                     context.budget.remaining("transcript"),
                     context.budget.remaining("segmentation"),
                 )
@@ -5028,16 +5151,28 @@ async def generation_stream(request: Request, job_id: str, after_seq: int = 0):
         while True:
             with get_conn(transactional=True) as conn:
                 expire_stale_generation_job(conn, job_id=clean_job_id)
-                events = replay_generation_events(
+                replayed_events = replay_generation_events(
                     conn,
                     job_id=clean_job_id,
                     after_seq=cursor,
                 )
                 job_row = get_generation_job(conn, clean_job_id)
+                if replayed_events:
+                    cursor = max(
+                        cursor,
+                        max(int(event.get("seq") or 0) for event in replayed_events),
+                    )
+                events = _sanitize_generation_replay_events(
+                    conn,
+                    job_row,
+                    replayed_events,
+                )
             for event in events:
-                cursor = max(cursor, int(event.get("seq") or 0))
                 yield f"{json.dumps(event, default=str, separators=(',', ':'))}\n"
-            if any(str(event.get("type") or "") == "terminal" for event in events):
+            if any(
+                str(event.get("type") or "") == "terminal"
+                for event in replayed_events
+            ):
                 return
             if not job_row or (
                 str(job_row.get("status") or "") in GENERATION_TERMINAL_STATUSES
@@ -5721,21 +5856,11 @@ def feed(
         page_end = page_start + limit
         sparse = len(ranked) < page_end
         unseen_ready = max(0, len(ranked) - page_end)
-        material_count = int(
-            (
-                fetch_one(
-                    conn,
-                    "SELECT COUNT(*) AS reel_count FROM reels WHERE material_id = ?",
-                    (material_id,),
-                )
-                or {}
-            ).get("reel_count")
-            or 0
-        )
+        material_ready_count = _count_material_ready_reels(conn, material_id)
         if (
             autofill
             and (cross_request_source or sparse or unseen_ready <= 4)
-            and material_count < MAX_REELS_PER_MATERIAL
+            and material_ready_count < MAX_REELS_PER_MATERIAL
         ):
             target_total = min(
                 MAX_REELS_PER_MATERIAL,
