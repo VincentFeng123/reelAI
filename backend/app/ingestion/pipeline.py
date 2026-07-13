@@ -2395,8 +2395,13 @@ class IngestionPipeline:
         metadata = clip_engine_bridge.to_metadata(v["id"], meta, v["url"])
         cues = clip_engine_bridge.to_cues(engine_out["transcript"])
         chosen = clip_engine_bridge.to_segment(clip, engine_out["transcript"])
-        snippet = clip_engine_bridge.window_text(
-            engine_out["transcript"], chosen.t_start, chosen.t_end
+        snippet = (
+            clip_engine_bridge.cue_text(
+                engine_out["transcript"], clip.get("cue_ids")
+            )
+            or clip_engine_bridge.window_text(
+                engine_out["transcript"], chosen.t_start, chosen.t_end
+            )
         )[:7000]
 
         reel = self._persist_ingest(
@@ -2459,6 +2464,11 @@ class IngestionPipeline:
         )
 
         details = clip_details if isinstance(clip_details, dict) else {}
+        selected_cue_ids = [
+            str(cue_id)
+            for cue_id in (details.get("cue_ids") or [])
+            if str(cue_id or "").strip()
+        ]
         selection_context = (
             dict(details.get("search_context") or {})
             if isinstance(details.get("search_context"), dict)
@@ -2542,11 +2552,6 @@ class IngestionPipeline:
             upsert_video(conn, platform=adapter_result.platform, source_id=adapter_result.source_id, metadata=metadata)
 
             raise_if_cancelled(should_cancel)
-            selected_cue_ids = [
-                str(cue_id)
-                for cue_id in (details.get("cue_ids") or [])
-                if str(cue_id or "").strip()
-            ]
             existing_candidate = load_reel_by_selection_candidate(
                 conn,
                 material_id=effective_material_id,
@@ -2646,8 +2651,11 @@ class IngestionPipeline:
         # clip-relative timestamps (legacy `_build_caption_cues` semantics), so the
         # client renders captions aligned to the trimmed clip, not the source video.
         captions = []
+        selected_cue_id_set = set(selected_cue_ids)
         for cue in cues:
             if not cue.text:
+                continue
+            if selected_cue_id_set and cue.cue_id not in selected_cue_id_set:
                 continue
             if cue.end <= clip_start or cue.start >= clip_end:
                 continue  # no overlap with the clip window

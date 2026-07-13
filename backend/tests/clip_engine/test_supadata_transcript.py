@@ -156,6 +156,39 @@ def test_transcription_adapter_matches_practice_chunk_and_word_timing(monkeypatc
     assert result["transcript_mode"] == "auto"
 
 
+def test_transcription_adapter_rejects_wrong_returned_language(monkeypatch) -> None:
+    artifact = TranscriptArtifact(
+        artifact_key="supadata-transcript:v4:french",
+        video_id=VIDEO_ID,
+        provider="supadata",
+        requested_language="en",
+        returned_language="fr",
+        native_mode=False,
+        schema_version=TRANSCRIPT_SCHEMA_VERSION,
+        segments=[{
+            "cue_id": "fr-0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Les ligatures relient plusieurs formes de lettres.",
+            "lang": "fr",
+        }],
+        duration_sec=4.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    monkeypatch.setattr(
+        supadata_client,
+        "fetch_transcript_artifact",
+        lambda *_args, **_kwargs: artifact,
+    )
+
+    with pytest.raises(TranscriptUnavailableError, match="requested language"):
+        transcribe_supadata(
+            VIDEO_URL,
+            VIDEO_ID,
+            {"language": "en", "provider_cache": MemoryProviderCache()},
+        )
+
+
 def test_unavailable_timestamped_transcript_is_typed_per_video(monkeypatch) -> None:
     _install_client(monkeypatch, lambda *args: _Response(404, {"message": "not found"}))
     with pytest.raises(TranscriptUnavailableError):

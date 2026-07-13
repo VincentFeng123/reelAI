@@ -168,7 +168,7 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
     ) is None
 
 
-def test_segment_cache_rejects_clip_over_requested_max() -> None:
+def test_segment_cache_treats_requested_max_as_preference() -> None:
     transcript = _transcript()
     transcript["segments"] = [{
         "cue_id": "long-cue",
@@ -184,7 +184,7 @@ def test_segment_cache_rejects_clip_over_requested_max() -> None:
         [clip],
         transcript=transcript,
         settings={"_segment_target_max_sec": 55},
-    ) is None
+    ) == [clip]
     assert segment_cache._valid_clips(
         [clip],
         transcript=transcript,

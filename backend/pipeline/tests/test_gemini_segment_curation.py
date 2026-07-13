@@ -505,10 +505,10 @@ def test_production_ligature_clip_repairs_elliptical_instruction_to_r_context():
     assert G._cue_clip_text(segments, clip["_start_line"], clip["_end_line"]).startswith(
         "We have the first R"
     )
-    assert clip["end"] - clip["start"] <= 55
+    assert 55 < clip["end"] - clip["start"] <= 180
 
 
-def test_oversized_repair_rewrites_objective_when_omitted_cues_owned_its_details():
+def test_complete_clean_range_is_not_shortened_to_duration_preference():
     segments = [
         {
             "cue_id": "life-definition",
@@ -572,12 +572,9 @@ def test_oversized_repair_rewrites_objective_when_omitted_cues_owned_its_details
 
     assert len(report.clips) == 1
     clip = report.clips[0]
-    assert clip["cue_ids"] == ["life-definition"]
-    assert clip["learning_objective"].startswith(
-        "Understand this transcript-grounded point:"
-    )
-    assert "regulation" not in clip["learning_objective"].casefold()
-    assert "regulation" not in clip["title"].casefold()
+    assert clip["cue_ids"] == ["life-definition", "regulation", "reproduction"]
+    assert clip["learning_objective"] == proposal.learning_objective
+    assert clip["title"] == proposal.title
 
 
 def test_range_repair_keeps_paraphrased_objective_without_lost_support():

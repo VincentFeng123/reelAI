@@ -182,12 +182,9 @@ def _valid_clips(
     if bounds is None:
         return None
     transcript_start, transcript_end = bounds
-    requested_max = policy["target_max_sec"]
-    hard_max = (
-        180.0
-        if requested_max is None
-        else min(180.0, float(requested_max))
-    )
+    # Requested duration is an editing preference. A cached clip remains valid
+    # when preserving its complete setup/conclusion needs more time.
+    hard_max = 180.0
     clips: list[dict[str, Any]] = []
     previous_start = -1.0
     for index, raw in enumerate(value, start=1):

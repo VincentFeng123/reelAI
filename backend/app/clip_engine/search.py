@@ -70,17 +70,17 @@ def _search_coverage_tokens(text: object) -> set[str]:
     return tokens
 
 
-def _bootstrap_pool_has_subject_coverage(result_sets: list[dict], subject: str) -> bool:
+def _bootstrap_pool_has_subject_coverage(videos: list[dict], subject: str) -> bool:
+    """Check only the ranked videos the bootstrap stage can actually analyze."""
     subject_tokens = _search_coverage_tokens(subject)
     if len(subject_tokens) < 2:
         return True
-    for result_set in result_sets:
-        for video in result_set.get("videos") or []:
-            metadata_tokens = _search_coverage_tokens(
-                f"{video.get('title') or ''} {video.get('description') or ''}"
-            )
-            if len(subject_tokens & metadata_tokens) >= 2:
-                return True
+    for video in videos:
+        metadata_tokens = _search_coverage_tokens(
+            f"{video.get('title') or ''} {video.get('description') or ''}"
+        )
+        if len(subject_tokens & metadata_tokens) >= 2:
+            return True
     return False
 
 
@@ -514,7 +514,9 @@ def discover_practice_fast(
         niche_backoff
         and eligible_initial
         and len(initial_queries) < query_count
-        and not _bootstrap_pool_has_subject_coverage(per_query, niche_backoff)
+        and not _bootstrap_pool_has_subject_coverage(
+            eligible_initial[:max(0, int(limit))], niche_backoff
+        )
     ):
         recovery_query = _difficulty_bootstrap_query(niche_backoff, level)
         recovery_key = " ".join(recovery_query.casefold().split())

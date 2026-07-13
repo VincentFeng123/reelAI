@@ -430,6 +430,65 @@ def test_bootstrap_strong_exact_pool_skips_niche_backoff(monkeypatch):
     assert [video["id"] for video in result["videos"]] == ["direct"]
 
 
+def test_bootstrap_niche_coverage_only_counts_videos_that_will_be_analyzed(monkeypatch):
+    calls = []
+
+    def fake_search_all(queries, filters=None, **kwargs):
+        calls.append(list(queries))
+        if len(calls) == 1:
+            return {
+                "per_query": [{
+                    "query": queries[0],
+                    "videos": [
+                        {"id": "generic-1", "title": "Advanced calligraphy flourishes"},
+                        {"id": "generic-2", "title": "How to improve cursive handwriting"},
+                        {"id": "generic-3", "title": "Beautiful lettering tutorial"},
+                        {
+                            "id": "buried-match",
+                            "title": "Carolingian minuscule ligature identification",
+                        },
+                    ],
+                }],
+                "credits_used": 1,
+                "warning": None,
+            }
+        return {
+            "per_query": [{
+                "query": queries[0],
+                "videos": [{
+                    "id": "direct-recovery",
+                    "title": "Carolingian minuscule ligatures explained",
+                }],
+            }],
+            "credits_used": 1,
+            "warning": None,
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(
+        search.rank,
+        "merge_and_rank",
+        lambda result_sets, **_kwargs: [
+            video
+            for result_set in result_sets
+            for video in result_set.get("videos") or []
+        ],
+    )
+
+    result = search.discover_practice_fast(
+        "Carolingian minuscule ligature identification",
+        limit=3,
+        level="advanced",
+        retrieval_profile="bootstrap",
+    )
+
+    assert calls == [
+        ["advanced Carolingian minuscule ligature identification"],
+        ["advanced Carolingian minuscule ligature"],
+    ]
+    assert result["videos"][0]["id"] == "direct-recovery"
+
+
 def test_bootstrap_reserves_raw_fallback_before_niche_recovery(monkeypatch):
     calls = []
 

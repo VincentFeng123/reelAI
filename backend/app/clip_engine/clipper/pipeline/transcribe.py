@@ -5,6 +5,8 @@ from typing import Callable, Optional
 
 from .. import config
 from ...cancellation import raise_if_cancelled
+from ...errors import TranscriptUnavailableError
+from ...provider_cache import normalize_language
 
 ProgressCb = Optional[Callable[[float, str], None]]
 
@@ -36,6 +38,22 @@ def transcribe_supadata(
         deadline_monotonic=settings.get("deadline_monotonic"),
         chunk_size=config.SUPADATA_CHUNK_SIZE,
     )
+    requested_language = normalize_language(
+        artifact.requested_language or settings.get("language", "en")
+    )
+    returned_language = normalize_language(artifact.returned_language)
+    requested_base = requested_language.split("-", 1)[0]
+    returned_base = returned_language.split("-", 1)[0]
+    if requested_base and returned_base and requested_base != returned_base:
+        raise TranscriptUnavailableError(
+            "Supadata returned a transcript outside the requested language.",
+            provider="supadata",
+            operation="transcript",
+            detail=(
+                f"requested_language={requested_language};"
+                f"returned_language={returned_language}"
+            ),
+        )
     segments = [dict(cue) for cue in artifact.segments]
     words: list[dict] = []
     for segment in segments:

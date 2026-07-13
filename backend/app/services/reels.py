@@ -6586,14 +6586,21 @@ class ReelService:
         clip_start: float,
         clip_end: float,
         fallback_text: str | None = None,
+        selected_cue_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         if clip_end <= clip_start:
             return []
 
         clip_len = max(0.2, float(clip_end - clip_start))
         cues: list[dict[str, Any]] = []
+        selected_cue_id_set = {
+            str(cue_id) for cue_id in (selected_cue_ids or []) if str(cue_id).strip()
+        }
 
-        for entry in transcript:
+        for index, entry in enumerate(transcript):
+            cue_id = str(entry.get("cue_id") or f"cue-{index}")
+            if selected_cue_id_set and cue_id not in selected_cue_id_set:
+                continue
             text = str(entry.get("text") or "").replace("\n", " ").strip()
             if not text:
                 continue
@@ -6603,16 +6610,22 @@ class ReelService:
             except (TypeError, ValueError):
                 continue
 
+            explicit_end = entry.get("end")
+            try:
+                entry_end = float(explicit_end) if explicit_end is not None else None
+            except (TypeError, ValueError):
+                entry_end = None
+
             duration_value = entry.get("duration")
             try:
                 entry_duration = float(duration_value) if duration_value is not None else 0.0
             except (TypeError, ValueError):
                 entry_duration = 0.0
 
-            if entry_duration <= 0:
-                entry_duration = 1.8
-
-            entry_end = entry_start + entry_duration
+            if entry_end is None or entry_end <= entry_start:
+                if entry_duration <= 0:
+                    entry_duration = 1.8
+                entry_end = entry_start + entry_duration
             if entry_end <= clip_start or entry_start >= clip_end:
                 continue
 
@@ -7220,6 +7233,7 @@ class ReelService:
                 clip_start=float(clean_item.get("t_start") or 0.0),
                 clip_end=float(clean_item.get("t_end") or 0.0),
                 fallback_text=str(clean_item.get("transcript_snippet") or ""),
+                selected_cue_ids=list(clean_item.get("selected_cue_ids") or []),
             )
             response_rows.append(clean_item)
 

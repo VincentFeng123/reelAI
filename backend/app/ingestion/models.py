@@ -91,6 +91,7 @@ class IngestTranscriptWord(BaseModel):
 
 
 class IngestTranscriptCue(BaseModel):
+    cue_id: str = ""
     start: float = Field(ge=0.0)
     end: float = Field(ge=0.0)
     text: str

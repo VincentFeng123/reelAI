@@ -21,10 +21,15 @@ _TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)*", re.UNICODE)
 def to_cues(transcript: dict) -> list[IngestTranscriptCue]:
     """Convert transcript segments to IngestTranscriptCues, skipping blank text."""
     cues = []
-    for seg in transcript.get("segments", []):
+    for index, seg in enumerate(transcript.get("segments", [])):
         if not seg.get("text", "").strip():
             continue
-        cues.append(IngestTranscriptCue(start=seg["start"], end=seg["end"], text=seg["text"]))
+        cues.append(IngestTranscriptCue(
+            cue_id=str(seg.get("cue_id") or f"cue-{index}"),
+            start=seg["start"],
+            end=seg["end"],
+            text=seg["text"],
+        ))
     return cues
 
 

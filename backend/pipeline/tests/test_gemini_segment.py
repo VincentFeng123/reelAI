@@ -595,10 +595,10 @@ def test_production_flash_receives_requested_duration_contract():
         target_max_sec=55,
     )
 
-    assert "requested range is 10 to 55 seconds" in user
+    assert "requested 10 to 55 second range" in user
     assert "40-second target" in user
-    assert "MUST be at most 55 seconds" in user
-    assert "minimum is a preference, not a rejection rule" in user
+    assert "duration preference" in user
+    assert "180-second safety ceiling" in user
 
 
 def test_compound_topic_requires_the_relationship_between_named_ideas():

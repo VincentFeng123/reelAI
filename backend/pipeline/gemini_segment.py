@@ -315,14 +315,27 @@ def _topic_rule(topic: str) -> str:
     topic = topic.strip()
     if not topic:
         return "No topic filter was supplied; return every substantive educational unit."
+    if "," in topic or ";" in topic:
+        compound_rule = (
+            "When the topic lists multiple requested ideas, a span directly matches when "
+            "it deeply teaches any one requested component. Require a relationship between "
+            "components only when the viewer explicitly asks to compare, connect, relate, "
+            "or apply them together. "
+        )
+    else:
+        compound_rule = (
+            "When the topic names multiple linked ideas, the span must explain the requested "
+            "relationship or application between those ideas; teaching only one component "
+            "or a nearby prerequisite is not a direct match. "
+        )
     return (
         f"The viewer is studying {topic!r}. Return only units that directly teach that "
         "topic, and make each learning objective name the relevant idea. Set "
         "directly_teaches_topic=true only when the selected transcript span itself teaches "
         "the requested subject, not when it merely names the subject, course, institution, "
-        "or speaker. When the topic names multiple linked ideas, the span must explain the "
-        "requested relationship or application between those ideas; teaching only one "
-        "component or a nearby prerequisite is not a direct match. When the topic requests "
+        "or speaker. "
+        f"{compound_rule}"
+        "When the topic requests "
         "identification, recognition, diagnosis, derivation, comparison, or application, "
         "the span must teach or perform that task for the named object; its history or "
         "definition alone is not a direct match."
@@ -433,10 +446,10 @@ def _boundary_prompts(
             min(requested_max, float(target_sec or requested_max)),
         )
         duration_rule = (
-            f"the requested range is {requested_min:g} to {requested_max:g} seconds "
-            f"with a {requested_target:g}-second target. The selected source span MUST "
-            f"be at most {requested_max:g} seconds; the minimum is a preference, not a "
-            "rejection rule."
+            f"the requested {requested_min:g} to {requested_max:g} second range and "
+            f"{requested_target:g}-second target are a duration preference. A complete "
+            "focused unit may exceed that preference when its setup or conclusion requires "
+            "it, but it must stay within the 180-second safety ceiling."
         )
     candidate_limit = max(
         1,
@@ -467,6 +480,12 @@ def _boundary_prompts(
         "for that fiction; real terminology inside fictional lore is not a valid lesson. "
         "Set factually_grounded=false for those invented claims and true only when the teaching "
         "claim is academically sound within the requested subject. "
+        "Score educational_importance by centrality to what this learner most needs from the "
+        "requested topic. For broad beginner topics, field-wide foundations, core organizing "
+        "principles, and canonical mechanisms outrank niche case studies, jokes, novelty, or "
+        "institutional prestige. For an exact niche topic, centrality to that exact requested "
+        "task remains authoritative. Use low scores to rank weaker valid teaching later, not "
+        "as a reason to omit a directly relevant substantive clip. "
         "Use a unique candidate_id for every moment. A non-standalone moment must list the "
         "candidate_id(s) that provide its required context; a standalone moment must list no "
         "prerequisites. "
@@ -1303,7 +1322,7 @@ def _configured_clip_limit(settings: dict) -> int:
 
 
 def _requested_duration_policy(settings: dict) -> tuple[float, float, float]:
-    """Return advisory min/target and the requested hard maximum."""
+    """Return the requested advisory min, target, and preferred maximum."""
     raw_max = settings.get("_segment_target_max_sec")
     maximum = (
         _MAX_CLIP_S
@@ -1584,7 +1603,10 @@ def _plan_to_report(
         range_before_size_repair = (a, b)
         text_before_size_repair = _cue_clip_text(segments, a, b)
         range_was_size_repaired = False
-        if duration > requested_max:
+        contains_structural_filler = _cue_range_contains_structural_filler(
+            segments, a, b
+        )
+        if duration > _MAX_CLIP_S or contains_structural_filler:
             repaired_range = _repair_oversized_cue_range(
                 segments,
                 a,
@@ -1606,7 +1628,11 @@ def _plan_to_report(
                 ),
                 minimum_duration=requested_min,
                 target_duration=requested_target,
-                maximum_duration=requested_max,
+                maximum_duration=(
+                    requested_max
+                    if contains_structural_filler
+                    else min(_LONG_RANGE_REPAIR_MAX_S, _MAX_CLIP_S)
+                ),
             )
             if repaired_range is not None:
                 a, b = repaired_range
@@ -1614,7 +1640,7 @@ def _plan_to_report(
                 start, end = _padded_cue_bounds(segments, a, b)
                 start, end = round(start, 3), round(end, 3)
                 duration = round(end - start, 3)
-        if duration < _MIN_CLIP_S or duration > requested_max:
+        if duration < _MIN_CLIP_S or duration > _MAX_CLIP_S:
             report.rejected_reasons.append(f"{prefix}:invalid_duration")
             continue
 
@@ -1627,7 +1653,7 @@ def _plan_to_report(
             start, end = _padded_cue_bounds(segments, a, b)
             start, end = round(start, 3), round(end, 3)
             duration = round(end - start, 3)
-            if duration < _MIN_CLIP_S or duration > requested_max:
+            if duration < _MIN_CLIP_S or duration > _MAX_CLIP_S:
                 report.rejected_reasons.append(f"{prefix}:invalid_duration")
                 continue
 
