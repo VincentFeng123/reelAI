@@ -1376,6 +1376,15 @@ class IngestionPipeline:
             prepared_audio_results[video_id] = result
             return result
 
+        def record_boundary_unavailable(reason: str) -> None:
+            if generation_context is None:
+                return
+            generation_context.increment_counter("boundary_unavailable")
+            generation_context.record_segment_event({
+                "event": "segment_completed",
+                "rejection_reasons": [f"acoustic:{reason}"],
+            })
+
         def enrich_persisted_batch(batch: list[dict[str, Any]]) -> None:
             if generation_context is None or not batch:
                 return
@@ -1494,7 +1503,7 @@ class IngestionPipeline:
                         surface_eligible = False
                         search_context["boundary_status"] = "unavailable"
                         search_context["surface_reason"] = "supadata_boundary_unavailable"
-                        generation_context.increment_counter("boundary_unavailable")
+                        record_boundary_unavailable("supadata_boundary_unavailable")
                     elif require_acoustic_boundaries:
                         original_start = float(clip.get("start") or 0.0)
                         original_end = float(clip.get("end") or 0.0)
@@ -1534,11 +1543,11 @@ class IngestionPipeline:
                             >= max(
                                 0.0,
                                 original_start
-                                - clip_engine_silence.START_CUSHION_MS / 1000.0,
+                                - clip_engine_silence.EDGE_WINDOW_SEC / 2.0,
                             )
                             and acoustic.end_sec
                             <= original_end
-                            + clip_engine_silence.END_CUSHION_MS / 1000.0
+                            + clip_engine_silence.EDGE_WINDOW_SEC / 2.0
                             + 1e-3
                             and acoustic.start_sec <= first_start + 0.05
                             and acoustic.end_sec + 0.05 >= last_end
@@ -1563,7 +1572,9 @@ class IngestionPipeline:
                                     else "acoustic_boundary_outside_selected_range"
                                 )
                             )
-                            generation_context.increment_counter("boundary_unavailable")
+                            record_boundary_unavailable(
+                                str(search_context["surface_reason"])
+                            )
                         else:
                             clip["start"] = round(float(acoustic.start_sec), 3)
                             clip["end"] = round(float(acoustic.end_sec), 3)

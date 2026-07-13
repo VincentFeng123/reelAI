@@ -80,6 +80,26 @@ def test_final_cue_can_extend_into_measured_end_silence(tmp_path: Path) -> None:
     assert result.diagnostics["end_shift_sec"] == 0.2
 
 
+def test_background_noise_uses_bounded_adaptive_quiet_threshold(tmp_path: Path) -> None:
+    start_wav = tmp_path / "noisy-start.wav"
+    end_wav = tmp_path / "noisy-end.wav"
+    _write_wav(start_wav, [(2.7, 12000), (0.40, 1000), (2.90, 12000)])
+    _write_wav(end_wav, [(3.0, 12000), (0.30, 1000), (2.70, 12000)])
+
+    def fake_decode(_source, *, window_start_sec, output_path, **_kwargs):
+        shutil.copyfile(start_wav if window_start_sec < 8 else end_wav, output_path)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ", 10.0, 20.0, prepared=_prepared()
+        )
+
+    assert result.verified
+    assert result.diagnostics["adaptive_quiet"] is True
+    assert result.diagnostics["start_threshold_dbfs"] == -24.0
+    assert result.diagnostics["end_threshold_dbfs"] == -24.0
+
+
 def test_missing_start_silence_is_unavailable_and_keeps_original_range(tmp_path: Path) -> None:
     tone = tmp_path / "tone.wav"
     end_wav = tmp_path / "end.wav"

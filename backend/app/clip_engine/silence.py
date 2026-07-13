@@ -35,6 +35,7 @@ DEFAULT_TIMEOUT_SEC = 20.0
 DEFAULT_PREPARE_TIMEOUT_SEC = 10.0
 EDGE_WINDOW_SEC = 6.0
 QUIET_THRESHOLD_DBFS = -38.0
+ADAPTIVE_QUIET_THRESHOLD_DBFS = -24.0
 MIN_QUIET_MS = 120
 START_CUSHION_MS = 100
 END_CUSHION_MS = 200
@@ -612,6 +613,30 @@ def verify_acoustic_boundaries(
             )
             start_quiet = _pick_start_interval(start_intervals, original_start)
             end_quiet = _pick_end_interval(end_intervals, original_end)
+            start_threshold_dbfs = QUIET_THRESHOLD_DBFS
+            end_threshold_dbfs = QUIET_THRESHOLD_DBFS
+            if start_quiet is None:
+                start_quiet = _pick_start_interval(
+                    _quiet_intervals(
+                        edge_paths["start"],
+                        absolute_start_sec=start_window,
+                        threshold_dbfs=ADAPTIVE_QUIET_THRESHOLD_DBFS,
+                        min_quiet_ms=MIN_QUIET_MS,
+                    ),
+                    original_start,
+                )
+                start_threshold_dbfs = ADAPTIVE_QUIET_THRESHOLD_DBFS
+            if end_quiet is None:
+                end_quiet = _pick_end_interval(
+                    _quiet_intervals(
+                        edge_paths["end"],
+                        absolute_start_sec=end_window,
+                        threshold_dbfs=ADAPTIVE_QUIET_THRESHOLD_DBFS,
+                        min_quiet_ms=MIN_QUIET_MS,
+                    ),
+                    original_end,
+                )
+                end_threshold_dbfs = ADAPTIVE_QUIET_THRESHOLD_DBFS
             if start_quiet is None:
                 return _unavailable(
                     original_start,
@@ -630,37 +655,13 @@ def verify_acoustic_boundaries(
                 )
 
             adjusted_start = max(
-                max(0.0, original_start - START_CUSHION_MS / 1000.0),
                 start_quiet.start_sec,
                 start_quiet.end_sec - START_CUSHION_MS / 1000.0,
             )
             adjusted_end = min(
-                original_end + END_CUSHION_MS / 1000.0,
                 end_quiet.end_sec,
                 end_quiet.start_sec + END_CUSHION_MS / 1000.0,
             )
-            if (
-                start_quiet.end_sec - adjusted_start + 1e-9
-                < START_CUSHION_MS / 1000.0
-            ):
-                return _unavailable(
-                    original_start,
-                    original_end,
-                    stage="analyze",
-                    reason="start_cushion_outside_selected_range",
-                    started=started,
-                )
-            if (
-                adjusted_end - end_quiet.start_sec + 1e-9
-                < END_CUSHION_MS / 1000.0
-            ):
-                return _unavailable(
-                    original_start,
-                    original_end,
-                    stage="analyze",
-                    reason="end_cushion_outside_selected_range",
-                    started=started,
-                )
             if adjusted_end <= adjusted_start:
                 return _unavailable(
                     original_start,
@@ -689,6 +690,13 @@ def verify_acoustic_boundaries(
     diagnostics = {
         "format_id": source.format_id,
         "threshold_dbfs": QUIET_THRESHOLD_DBFS,
+        "adaptive_threshold_dbfs": ADAPTIVE_QUIET_THRESHOLD_DBFS,
+        "start_threshold_dbfs": start_threshold_dbfs,
+        "end_threshold_dbfs": end_threshold_dbfs,
+        "adaptive_quiet": bool(
+            start_threshold_dbfs != QUIET_THRESHOLD_DBFS
+            or end_threshold_dbfs != QUIET_THRESHOLD_DBFS
+        ),
         "min_quiet_ms": MIN_QUIET_MS,
         "start_cushion_ms": START_CUSHION_MS,
         "end_cushion_ms": END_CUSHION_MS,
