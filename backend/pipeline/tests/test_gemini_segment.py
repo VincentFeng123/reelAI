@@ -187,14 +187,14 @@ def test_near_exact_topic_evidence_is_repaired_to_transcript_words():
     assert report.clips[0]["_quote_repaired"] is True
 
 
-def test_selector_metadata_preserves_explicit_prerequisite_chain():
+def test_selector_rejects_clip_that_requires_a_separate_prerequisite():
     segs = _segs(3)
     setup = _topic(
         "Setup",
         0,
         0,
         candidate_id="setup",
-        educational_importance=0.7,
+        educational_importance=0.75,
     )
     application = _topic(
         "Application",
@@ -206,23 +206,21 @@ def test_selector_metadata_preserves_explicit_prerequisite_chain():
         prerequisite_candidate_ids=["setup"],
     )
 
-    clips = _convert(G._Plan(topics=[setup, application]), segs)
-    by_id = {clip["selection_candidate_id"]: clip for clip in clips}
-    assert by_id["setup"]["chain_id"] == "chain:setup"
-    assert by_id["setup"]["chain_position"] == 0
-    assert by_id["application"]["chain_id"] == "chain:setup"
-    assert by_id["application"]["chain_position"] == 1
-    assert by_id["application"]["prerequisite_ids"] == ["setup"]
+    report = G._plan_to_report(
+        G._Plan(topics=[setup, application]), segs, _words(segs), {},
+    )
+    assert [clip["selection_candidate_id"] for clip in report.clips] == ["setup"]
+    assert report.rejected_reasons == ["proposal_1:not_standalone"]
 
 
-def test_prerequisite_bundle_refills_when_dependent_does_not_fit_limit():
+def test_nonstandalone_candidate_cannot_displace_standalone_candidate():
     segs = _segs(3)
     setup = _topic(
         "Setup",
         0,
         0,
         candidate_id="setup",
-        educational_importance=0.61,
+        educational_importance=0.75,
     )
     dependent = _topic(
         "Dependent",
@@ -245,7 +243,7 @@ def test_clip_limit_uses_importance_before_chronology():
         0,
         0,
         candidate_id="early",
-        educational_importance=0.61,
+        educational_importance=0.75,
         informativeness=0.8,
         topic_relevance=0.8,
     )
@@ -322,6 +320,13 @@ def test_span_covering_eighty_percent_of_shorter_is_deduplicated():
     segs = _segs(4)
     clips = _convert(_plan(("A", 0, 2), ("B", 0, 3)), segs)
     assert [clip["title"] for clip in clips] == ["A"]
+
+
+def test_identical_single_token_facets_are_semantic_restatements():
+    first = {"learning_objective": "Photosynthesis", "facet": ""}
+    second = {"learning_objective": "Photosynthesis", "facet": ""}
+
+    assert G._semantic_restatement(first, second)
 
 
 def test_cue_quotes_are_authoritative_when_word_timing_is_missing_or_untrusted():
@@ -549,7 +554,7 @@ def test_medium_uncertainty_is_accepted_but_high_uncertainty_is_rejected():
     assert classification == G._Classification("green", ())
 
 
-def test_medium_uncertainty_ranks_below_equally_scored_clean_clip():
+def test_equal_quality_ranking_is_stable_and_not_duration_or_uncertainty_shaped():
     segs = _segs(2)
     plan = G._Plan(topics=[
         _topic(
@@ -564,7 +569,7 @@ def test_medium_uncertainty_ranks_below_equally_scored_clean_clip():
 
     clips = G._plan_to_clips(plan, segs, [], {"max_clips": 1})
 
-    assert [clip["title"] for clip in clips] == ["clean"]
+    assert [clip["title"] for clip in clips] == ["ambiguous"]
 
 
 def test_production_flash_is_compact_global_boundary_first():
@@ -572,8 +577,8 @@ def test_production_flash_is_compact_global_boundary_first():
     prompt = f"{system}\n{user}".casefold()
 
     assert G.PRODUCTION_FLASH_PROFILE == G.FLASH_SPLIT_PROFILE
-    assert "at most 150 seconds" in prompt
-    assert "20 to 90 seconds" in prompt
+    assert "duration is never a selection criterion" in prompt
+    assert "each at least 0.75" in prompt
     assert "low or medium uncertainty" in prompt
     assert "omit only high-uncertainty" in prompt
     assert G._BOUNDARY_OUTPUT_TOKENS == 8192
@@ -585,20 +590,16 @@ def test_production_flash_is_compact_global_boundary_first():
     assert "learning details and assessments are generated later" in prompt
 
 
-def test_production_flash_receives_requested_duration_contract():
-    _system, user = G._boundary_prompts(
-        "[0] 00:00 lesson",
-        1,
-        "chemistry",
-        target_sec=40,
-        target_min_sec=10,
-        target_max_sec=55,
+def test_production_flash_has_no_requested_duration_contract():
+    system, user = G._boundary_prompts(
+        "[0] 00:00 lesson", 1, "chemistry",
     )
+    prompt = f"{system}\n{user}"
 
-    assert "requested 10 to 55 second range" in user
-    assert "40-second target" in user
-    assert "duration preference" in user
-    assert "180-second safety ceiling" in user
+    assert "requested 10 to 55 second range" not in prompt
+    assert "40-second target" not in prompt
+    assert "180-second safety ceiling" not in prompt
+    assert "regardless of its duration" in prompt
 
 
 def test_compound_topic_requires_the_relationship_between_named_ideas():

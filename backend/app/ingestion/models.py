@@ -33,33 +33,20 @@ class IngestRequest(BaseModel):
     source_url: str = Field(min_length=1, max_length=2000)
     material_id: str | None = Field(default=None, max_length=240)
     concept_id: str | None = Field(default=None, max_length=240)
-    target_clip_duration_sec: int = Field(default=45, ge=15, le=180)
-    target_clip_duration_min_sec: int = Field(default=15, ge=15, le=180)
-    target_clip_duration_max_sec: int = Field(default=60, ge=15, le=180)
+    target_clip_duration_sec: int | None = None
+    target_clip_duration_min_sec: int | None = None
+    target_clip_duration_max_sec: int | None = None
     language: str = Field(default="en", min_length=2, max_length=8)
     multi_platform_search: bool = False
-
-    @model_validator(mode="after")
-    def validate_duration_bounds(self) -> "IngestRequest":
-        if self.target_clip_duration_max_sec < self.target_clip_duration_min_sec:
-            raise ValueError("target_clip_duration_max_sec must be >= target_clip_duration_min_sec.")
-        if not (
-            self.target_clip_duration_min_sec
-            <= self.target_clip_duration_sec
-            <= self.target_clip_duration_max_sec
-        ):
-            raise ValueError("target_clip_duration_sec must fall within the min/max range.")
-        return self
-
 
 class IngestFeedRequest(BaseModel):
     feed_url: str = Field(min_length=1, max_length=2000)
     max_items: int = Field(default=6, ge=1, le=20)
     material_id: str | None = Field(default=None, max_length=240)
     concept_id: str | None = Field(default=None, max_length=240)
-    target_clip_duration_sec: int = Field(default=45, ge=15, le=180)
-    target_clip_duration_min_sec: int = Field(default=15, ge=15, le=180)
-    target_clip_duration_max_sec: int = Field(default=60, ge=15, le=180)
+    target_clip_duration_sec: int | None = None
+    target_clip_duration_min_sec: int | None = None
+    target_clip_duration_max_sec: int | None = None
     language: str = Field(default="en", min_length=2, max_length=8)
     multi_platform_search: bool = False
 
@@ -172,6 +159,10 @@ class ReelOutWithAttribution(ReelOut):
     chain_position: float = 0.0
     selection_candidate_id: str = ""
     prerequisite_ids: list[str] = Field(default_factory=list)
+    selection_quality_floor: float | None = Field(default=None, exclude=True)
+    selection_quality_mean: float | None = Field(default=None, exclude=True)
+    selection_topic_relevance: float | None = Field(default=None, exclude=True)
+    selection_source_rank: int = Field(default=0, exclude=True)
 
 
 class IngestResult(BaseModel):
@@ -216,9 +207,9 @@ class IngestSearchRequest(BaseModel):
     max_per_platform: int = Field(default=5, ge=1, le=15)
     material_id: str | None = Field(default=None, max_length=240)
     concept_id: str | None = Field(default=None, max_length=240)
-    target_clip_duration_sec: int = Field(default=45, ge=15, le=180)
-    target_clip_duration_min_sec: int = Field(default=15, ge=15, le=180)
-    target_clip_duration_max_sec: int = Field(default=60, ge=15, le=180)
+    target_clip_duration_sec: int | None = None
+    target_clip_duration_min_sec: int | None = None
+    target_clip_duration_max_sec: int | None = None
     language: str = Field(default="en", min_length=2, max_length=8)
     # Bare source_id strings (no prefix) of reels the client already has. The server
     # skips any resolved URL whose extracted source_id is in this set. This is the

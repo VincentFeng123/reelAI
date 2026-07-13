@@ -1,6 +1,4 @@
 from datetime import datetime, timedelta, timezone
-import threading
-import time
 
 import pytest
 
@@ -62,9 +60,9 @@ def test_transcript_cache_version_invalidates_coarser_cue_artifacts() -> None:
 def test_generation_budgets_match_fast_and_slow_contracts() -> None:
     fast = GenerationBudget.for_mode("fast")
     slow = GenerationBudget.for_mode("slow")
-    assert fast.snapshot()["limits"] == {"search": 3, "transcript": 3, "segmentation": 3}
+    assert fast.snapshot()["limits"] == {"search": 3, "transcript": 2, "segmentation": 2}
     assert (fast.max_passes, fast.max_no_growth_passes) == (1, 0)
-    assert slow.snapshot()["limits"] == {"search": 12, "transcript": 10, "segmentation": 10}
+    assert slow.snapshot()["limits"] == {"search": 4, "transcript": 3, "segmentation": 3}
     assert (slow.max_passes, slow.max_no_growth_passes) == (1, 0)
     for _ in range(3):
         fast.reserve("search")
@@ -134,7 +132,7 @@ def test_generation_context_maps_live_gemini_telemetry_and_cache_hits() -> None:
 
 def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> None:
     context = GenerationContext("fast", generation_id="job-budget")
-    for _ in range(3):
+    for _ in range(2):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
@@ -149,34 +147,22 @@ def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> No
             max_output_tokens=4096,
         )
 
-    pro_context = GenerationContext("slow", generation_id="job-pro-budget")
-    for _ in range(2):
-        pro_context.reserve_gemini_call(
+    with pytest.raises(ProviderBudgetExceededError):
+        context.reserve_gemini_call(
             operation="pro_authoritative",
             model="gemini-3.1-pro-preview",
             prompt_text="transcript",
             max_output_tokens=4096,
         )
-    pro_context.reserve_gemini_call(
-        operation="pro_fallback",
-        model="gemini-3.1-pro-preview",
-        prompt_text="transcript",
-        max_output_tokens=4096,
-    )
-    with pytest.raises(ProviderBudgetExceededError):
-        pro_context.reserve_gemini_call(
-            operation="pro_fallback",
-            model="gemini-3.1-pro-preview",
-            prompt_text="transcript",
-            max_output_tokens=4096,
-        )
 
-    budget = pro_context.budget.snapshot()["gemini"]
-    assert budget["pro_fallback_calls"] == 1
-    assert budget["pro_fallback_call_limit"] == 1
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["flash_selector_calls"] == 2
+    assert budget["flash_selector_limit"] == 2
+    assert budget["pro_fallback_calls"] == 0
+    assert budget["pro_fallback_call_limit"] == 0
 
     slow_flash = GenerationContext("slow", generation_id="job-slow-flash-budget")
-    for _ in range(8):
+    for _ in range(3):
         slow_flash.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
@@ -187,52 +173,31 @@ def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> No
         slow_flash.reserve_gemini_call(
             operation="flash_boundary_selector",
             model="gemini-3.5-flash",
-            prompt_text="ninth transcript",
+            prompt_text="fourth transcript",
             max_output_tokens=8192,
         )
     slow_budget = slow_flash.budget.snapshot()["gemini"]
-    assert slow_budget["flash_selector_calls"] == 8
-    assert slow_budget["cost_limit_usd"] == pytest.approx(0.9)
+    assert slow_budget["flash_selector_calls"] == 3
+    assert slow_budget["flash_selector_limit"] == 3
+    assert slow_budget["cost_limit_usd"] == pytest.approx(0.45)
 
 
-def test_pro_fallback_gate_waits_for_joint_initial_flash_yield() -> None:
-    context = GenerationContext("slow", generation_id="job-fallback-gate")
-    context.configure_pro_fallback_gate(2)
+@pytest.mark.parametrize("mode", ["fast", "slow"])
+def test_pro_dispatch_is_disabled_for_every_generation_mode(mode: str) -> None:
+    context = GenerationContext(mode, generation_id=f"job-no-pro-{mode}")
 
-    decisions: list[bool] = []
-    first = threading.Thread(
-        target=lambda: decisions.append(
-            context.allow_pro_fallback(
-                accepted_count=0,
-                video_id="first",
-                candidate_rank=0,
-                deadline_monotonic=time.monotonic() + 1.0,
+    for operation in ("pro_authoritative", "pro_fallback"):
+        with pytest.raises(ProviderBudgetExceededError, match="Pro"):
+            context.reserve_gemini_call(
+                operation=operation,
+                model="gemini-3.1-pro-preview",
+                prompt_text="transcript",
+                max_output_tokens=4096,
             )
-        )
-    )
-    first.start()
-    context.record_pro_fallback_cohort_result(
-        candidate_rank=1,
-        accepted_count=2,
-        fallback_eligible=False,
-    )
-    first.join(timeout=1.0)
-    assert decisions == [True]
-    assert context.allow_pro_fallback(accepted_count=0, video_id="later") is False
 
-    sufficient = GenerationContext("slow", generation_id="job-no-fallback")
-    sufficient.configure_pro_fallback_gate(2)
-    sufficient.record_pro_fallback_cohort_result(
-        candidate_rank=0,
-        accepted_count=1,
-        fallback_eligible=False,
-    )
-    assert sufficient.allow_pro_fallback(
-        accepted_count=2,
-        video_id="second",
-        candidate_rank=1,
-    ) is False
-    assert sufficient.allow_pro_fallback(accepted_count=0, video_id="later") is False
+    budget = context.budget.snapshot()["gemini"]
+    assert budget["pro_calls"] == 0
+    assert budget["pro_call_limit"] == 0
 
 
 def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -> None:

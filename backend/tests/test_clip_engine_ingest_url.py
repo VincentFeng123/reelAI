@@ -45,19 +45,34 @@ def _fake_engine_out(video_id: str = "dQw4w9WgXcQ") -> dict:
                 "end": 75.0,
                 "cut_end": 75.0,
                 "title": "The chorus",
-                "facet": "music",
-                "reason": "catchy hook",
+                "facet": "promise-and-response structure",
+                "reason": "Directly explains the promise-and-response structure.",
+                "learning_objective": "Identify the promise-and-response structure.",
+                "kind": "educational",
+                "informativeness": 0.9,
+                "topic_relevance": 0.9,
+                "educational_importance": 0.9,
+                "self_contained": True,
+                "is_standalone": True,
+                "directly_teaches_topic": True,
+                "substantive": True,
+                "factually_grounded": True,
+                "topic_evidence_quote": "Never gonna give you up Never gonna let you down",
+                "cue_ids": ["cue-0", "cue-1"],
                 "sequence_index": 0,
                 "embed_url": f"https://www.youtube.com/embed/{video_id}?start=30&end=75",
             }
         ],
         "transcript": {
             "segments": [
-                {"start": 30.0, "end": 55.0, "text": "Never gonna give you up."},
-                {"start": 55.0, "end": 75.0, "text": "Never gonna let you down."},
+                {"cue_id": "cue-0", "start": 30.0, "end": 55.0, "text": "Never gonna give you up."},
+                {"cue_id": "cue-1", "start": 55.0, "end": 75.0, "text": "Never gonna let you down."},
             ],
             "words": [],
             "duration": 300.0,
+            "source": "supadata",
+            "artifact_key": f"supadata:{video_id}",
+            "native_mode": True,
         },
         "notes": "test notes",
     }
@@ -86,6 +101,30 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/test"
+            ),
+        )
+        self._prepare_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "prepare_audio_source",
+            return_value=prepared,
+        )
+        self._verify_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "verify_acoustic_boundaries",
+            side_effect=lambda _url, start, end, **_kwargs: (
+                pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                    "verified", start, end, {"threshold_dbfs": -38.0}
+                )
+            ),
+        )
+        self._prepare_patch.start()
+        self._verify_patch.start()
+        self.addCleanup(self._prepare_patch.stop)
+        self.addCleanup(self._verify_patch.stop)
         with db_module.get_conn(transactional=True) as conn:
             db_module.insert(
                 conn,
@@ -200,13 +239,13 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
         self.assertEqual(UnsupportedSourceError.status_code, 400)
 
     # --------------------------------------------------------------------- #
-    # Best-clip selection: clip closest to target_clip_duration_sec is chosen
+    # Candidate order is authoritative; deprecated duration inputs are inert.
     # --------------------------------------------------------------------- #
 
-    def test_ingest_url_selects_closest_duration_clip(self) -> None:
+    def test_ingest_url_selects_first_ranked_clip_regardless_of_duration(self) -> None:
         source_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
 
-        # Two clips: one 20 s long, one 44 s long. Target = 45 s → second wins.
+        # The first clip ranks first even though the deprecated target is 45s.
         multi_clip_engine_out = {
             "video_id": "dQw4w9WgXcQ",
             "clips": [
@@ -215,8 +254,20 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
                     "end": 20.0,
                     "cut_end": 20.0,
                     "title": "intro",
-                    "facet": "",
-                    "reason": "",
+                    "facet": "first concept",
+                    "reason": "Provides the first complete informational concept.",
+                    "learning_objective": "Explain the first informational concept.",
+                    "kind": "educational",
+                    "informativeness": 0.92,
+                    "topic_relevance": 0.92,
+                    "educational_importance": 0.92,
+                    "self_contained": True,
+                    "is_standalone": True,
+                    "directly_teaches_topic": True,
+                    "substantive": True,
+                    "factually_grounded": True,
+                    "topic_evidence_quote": "The first concept explains a complete useful idea",
+                    "cue_ids": ["cue-0"],
                     "sequence_index": 0,
                     "embed_url": "",
                 },
@@ -225,19 +276,34 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
                     "end": 74.0,
                     "cut_end": 74.0,
                     "title": "chorus",
-                    "facet": "",
-                    "reason": "",
+                    "facet": "second concept",
+                    "reason": "Provides a second complete informational concept.",
+                    "learning_objective": "Explain the second informational concept.",
+                    "kind": "educational",
+                    "informativeness": 0.9,
+                    "topic_relevance": 0.9,
+                    "educational_importance": 0.9,
+                    "self_contained": True,
+                    "is_standalone": True,
+                    "directly_teaches_topic": True,
+                    "substantive": True,
+                    "factually_grounded": True,
+                    "topic_evidence_quote": "The second concept also explains a complete useful idea",
+                    "cue_ids": ["cue-1"],
                     "sequence_index": 1,
                     "embed_url": "",
                 },
             ],
             "transcript": {
                 "segments": [
-                    {"start": 0.0, "end": 20.0, "text": "intro text"},
-                    {"start": 30.0, "end": 74.0, "text": "chorus text"},
+                    {"cue_id": "cue-0", "start": 0.0, "end": 20.0, "text": "The first concept explains a complete useful idea."},
+                    {"cue_id": "cue-1", "start": 30.0, "end": 74.0, "text": "The second concept also explains a complete useful idea."},
                 ],
                 "words": [],
                 "duration": 212.0,
+                "source": "supadata",
+                "artifact_key": "supadata:dQw4w9WgXcQ",
+                "native_mode": True,
             },
             "notes": "",
         }
@@ -260,9 +326,8 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
                 language="en",
             )
 
-        # 44 s clip is closer to target=45 s than 20 s clip
-        self.assertAlmostEqual(result.reel.t_start, 30.0)
-        self.assertAlmostEqual(result.reel.t_end, 74.0)
+        self.assertAlmostEqual(result.reel.t_start, 0.0)
+        self.assertAlmostEqual(result.reel.t_end, 20.0)
 
     # --------------------------------------------------------------------- #
     # Idempotency: calling ingest_url twice with the same URL + material_id

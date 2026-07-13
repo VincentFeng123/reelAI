@@ -1,10 +1,11 @@
-"""Bounded, energy-only acoustic verification for hosted YouTube clips.
+"""Progressive, energy-only acoustic verification for hosted YouTube clips.
 
 The production selector already supplies complete transcript cue boundaries.
 This module performs the smaller final check that captions cannot provide: it
-seeks two six-second audio windows and proves that each cut lands in silence.
-It never downloads or transcribes the full source and every failure is returned
-as ``unavailable`` so callers can keep searching for another clip.
+seeks short audio windows outward from each required speech edge and proves that
+each cut lands in silence. It never downloads or transcribes the full source and
+every failure is returned as ``unavailable`` so callers can keep searching for
+another clip.
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from array import array
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Sequence
+from typing import Any, Callable, Iterator, Literal, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from backend.app.config import get_settings
@@ -41,6 +42,7 @@ MIN_QUIET_MS = 120
 START_CUSHION_MS = 100
 END_CUSHION_MS = 200
 _FRAME_MS = 10
+_FRAME_SEC = _FRAME_MS / 1000.0
 _YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _YT_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"})
 
@@ -540,7 +542,7 @@ def _decode_window(
     deadline: float,
     cancel_check: CancelCheck | None,
 ) -> None:
-    duration = min(EDGE_WINDOW_SEC, max(4.0, window_duration_sec))
+    duration = min(EDGE_WINDOW_SEC, max(0.01, window_duration_sec))
     command = [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
     if source.proxy_url.startswith(("http://", "https://")):
         command.extend(["-http_proxy", source.proxy_url])
@@ -633,8 +635,7 @@ def _pick_start_interval(
         interval
         for interval in intervals
         if interval.followed_by_sound
-        and interval.end_sec >= rough_start - 2.5
-        and interval.start_sec <= rough_start + 0.35
+        and interval.start_sec <= rough_start
         and interval.duration_sec + 1e-9 >= START_CUSHION_MS / 1000.0
     ]
     if not candidates:
@@ -643,24 +644,30 @@ def _pick_start_interval(
     def priority(interval: _QuietInterval) -> tuple[int, float]:
         if interval.start_sec <= rough_start <= interval.end_sec:
             return 0, abs(interval.end_sec - rough_start)
-        if interval.end_sec <= rough_start:
-            return 1, rough_start - interval.end_sec
-        return 2, interval.start_sec - rough_start
+        return 1, rough_start - interval.end_sec
 
     return min(candidates, key=priority)
 
 
 def _pick_end_interval(
-    intervals: Sequence[_QuietInterval], rough_end: float
+    intervals: Sequence[_QuietInterval],
+    rough_end: float,
+    *,
+    allow_source_edge: bool = False,
 ) -> _QuietInterval | None:
     candidates = [
         interval
         for interval in intervals
         if interval.preceded_by_sound
-        and interval.end_sec >= rough_end
-        and interval.start_sec >= rough_end - 0.35
-        and interval.start_sec <= rough_end + 2.5
-        and interval.duration_sec + 1e-9 >= END_CUSHION_MS / 1000.0
+        and (
+            interval.end_sec - _FRAME_SEC + 1e-9 >= rough_end
+            or (
+                allow_source_edge
+                and abs(interval.end_sec - rough_end) <= _FRAME_SEC + 1e-9
+            )
+        )
+        and interval.duration_sec + 1e-9
+        >= END_CUSHION_MS / 1000.0 + _FRAME_SEC
     ]
     if not candidates:
         return None
@@ -671,6 +678,139 @@ def _pick_end_interval(
         return 1, interval.start_sec - rough_end
 
     return min(candidates, key=priority)
+
+
+@dataclass(frozen=True)
+class _EdgeSearchResult:
+    quiet: _QuietInterval | None
+    windows: tuple[tuple[float, float], ...]
+
+
+def _start_search_windows(
+    required_start: float,
+    *,
+    search_start_limit: float,
+    search_end_limit: float,
+) -> Iterator[tuple[float, float]]:
+    """Return nearest-first, non-overlapping windows extending backward."""
+    half_window = EDGE_WINDOW_SEC / 2.0
+    nearest_start = max(search_start_limit, required_start - half_window)
+    nearest_end = min(search_end_limit, required_start + half_window)
+    yield nearest_start, nearest_end
+    cursor = nearest_start
+    while cursor > search_start_limit + 1e-9:
+        window_start = max(search_start_limit, cursor - EDGE_WINDOW_SEC)
+        yield window_start, cursor
+        cursor = window_start
+
+
+def _end_search_windows(
+    required_end: float,
+    *,
+    search_start_limit: float,
+    search_end_limit: float,
+) -> Iterator[tuple[float, float]]:
+    """Return nearest-first, non-overlapping windows extending forward."""
+    half_window = EDGE_WINDOW_SEC / 2.0
+    nearest_start = max(search_start_limit, required_end - half_window)
+    nearest_end = min(search_end_limit, required_end + half_window)
+    yield nearest_start, nearest_end
+    cursor = nearest_end
+    while cursor < search_end_limit - 1e-9:
+        window_end = min(search_end_limit, cursor + EDGE_WINDOW_SEC)
+        yield cursor, window_end
+        cursor = window_end
+
+
+def _search_quiet(
+    source: PreparedAudioSource,
+    *,
+    edge: Literal["start", "end"],
+    required_boundary: float,
+    search_start_limit: float,
+    search_end_limit: float,
+    temp_dir: Path,
+    ffmpeg_bin: str,
+    deadline: float,
+    cancel_check: CancelCheck | None,
+) -> _EdgeSearchResult:
+    if edge == "start":
+        windows = _start_search_windows(
+            required_boundary,
+            search_start_limit=search_start_limit,
+            search_end_limit=search_end_limit,
+        )
+        picker = _pick_start_interval
+    else:
+        windows = _end_search_windows(
+            required_boundary,
+            search_start_limit=search_start_limit,
+            search_end_limit=search_end_limit,
+        )
+        picker = _pick_end_interval
+
+    searched: list[tuple[float, float]] = []
+    adjacent_window_edge_is_quiet: bool | None = None
+    for index, (window_start, window_end) in enumerate(windows):
+        output_path = temp_dir / f"{edge}-{index}.wav"
+        _decode_window(
+            source,
+            window_start_sec=window_start,
+            window_duration_sec=window_end - window_start,
+            output_path=output_path,
+            ffmpeg_bin=ffmpeg_bin,
+            deadline=deadline,
+            cancel_check=cancel_check,
+        )
+        searched.append((window_start, window_end))
+        intervals = _quiet_intervals(
+            output_path,
+            absolute_start_sec=window_start,
+            threshold_dbfs=QUIET_THRESHOLD_DBFS,
+            min_quiet_ms=MIN_QUIET_MS,
+        )
+        if index and adjacent_window_edge_is_quiet is False:
+            stitched: list[_QuietInterval] = []
+            for interval in intervals:
+                if edge == "start" and abs(interval.end_sec - window_end) <= _FRAME_SEC:
+                    interval = _QuietInterval(
+                        interval.start_sec,
+                        interval.end_sec,
+                        interval.preceded_by_sound,
+                        True,
+                    )
+                elif edge == "end" and abs(interval.start_sec - window_start) <= _FRAME_SEC:
+                    interval = _QuietInterval(
+                        interval.start_sec,
+                        interval.end_sec,
+                        True,
+                        interval.followed_by_sound,
+                    )
+                stitched.append(interval)
+            intervals = stitched
+        quiet = (
+            picker(intervals, required_boundary)
+            if edge == "start"
+            else _pick_end_interval(
+                intervals,
+                required_boundary,
+                allow_source_edge=abs(required_boundary - search_end_limit)
+                <= _FRAME_SEC + 1e-9,
+            )
+        )
+        if quiet is not None:
+            return _EdgeSearchResult(quiet, tuple(searched))
+        if edge == "start":
+            adjacent_window_edge_is_quiet = any(
+                abs(interval.start_sec - window_start) <= _FRAME_SEC
+                for interval in intervals
+            )
+        else:
+            adjacent_window_edge_is_quiet = any(
+                abs(interval.end_sec - window_end) <= _FRAME_SEC
+                for interval in intervals
+            )
+    return _EdgeSearchResult(None, tuple(searched))
 
 
 def _unavailable(
@@ -697,12 +837,20 @@ def verify_acoustic_boundaries(
     start_sec: float,
     end_sec: float,
     *,
+    search_start_limit_sec: float | None = None,
+    search_end_limit_sec: float | None = None,
     prepared: AudioPreparationResult | None = None,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
     cancel_check: CancelCheck | None = None,
     ffmpeg_bin: str = "ffmpeg",
 ) -> SilenceVerificationResult:
     """Verify and adjust one clip to measured quiet edge intervals.
+
+    ``start_sec`` and ``end_sec`` are required speech boundaries: a verified
+    start never moves later and a verified end never moves earlier. The optional
+    search limits are semantic/source bounds and let the verifier progressively
+    inspect additional non-overlapping windows without imposing a clip-duration
+    limit. Omitting them retains the former single-window search footprint.
 
     ``prepared`` may be produced concurrently with transcript selection. On any
     resolution, decoding, cancellation, timeout, or silence failure, this
@@ -725,6 +873,40 @@ def verify_acoustic_boundaries(
     ):
         return _unavailable(
             original_start, original_end, stage="input", reason="invalid_range", started=started
+        )
+    try:
+        search_start_limit = (
+            max(0.0, original_start - EDGE_WINDOW_SEC / 2.0)
+            if search_start_limit_sec is None
+            else float(search_start_limit_sec)
+        )
+        search_end_limit = (
+            original_end + EDGE_WINDOW_SEC / 2.0
+            if search_end_limit_sec is None
+            else float(search_end_limit_sec)
+        )
+    except (TypeError, ValueError, OverflowError):
+        return _unavailable(
+            original_start,
+            original_end,
+            stage="input",
+            reason="invalid_search_limits",
+            started=started,
+        )
+    if (
+        not math.isfinite(search_start_limit)
+        or not math.isfinite(search_end_limit)
+        or search_start_limit < 0
+        or search_start_limit > original_start
+        or search_end_limit < original_end
+        or search_end_limit <= search_start_limit
+    ):
+        return _unavailable(
+            original_start,
+            original_end,
+            stage="input",
+            reason="invalid_search_limits",
+            started=started,
         )
     deadline = started + timeout_sec
     if _is_cancelled(cancel_check):
@@ -758,45 +940,43 @@ def verify_acoustic_boundaries(
             source = prepared.source
             preparation_diagnostics = prepared.diagnostics
 
-        start_window = max(0.0, original_start - EDGE_WINDOW_SEC / 2.0)
-        end_window = max(0.0, original_end - EDGE_WINDOW_SEC / 2.0)
         with tempfile.TemporaryDirectory(prefix="reelai_silence_") as temp_dir:
-            edge_paths = {
-                "start": Path(temp_dir) / "start.wav",
-                "end": Path(temp_dir) / "end.wav",
-            }
-            windows = {"start": start_window, "end": end_window}
+            edge_temp_dir = Path(temp_dir)
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="silence-edge") as pool:
                 futures = {
                     pool.submit(
-                        _decode_window,
+                        _search_quiet,
                         source,
-                        window_start_sec=window_start,
-                        window_duration_sec=EDGE_WINDOW_SEC,
-                        output_path=edge_paths[name],
+                        edge="start",
+                        required_boundary=original_start,
+                        search_start_limit=search_start_limit,
+                        search_end_limit=search_end_limit,
+                        temp_dir=edge_temp_dir,
                         ffmpeg_bin=ffmpeg_bin,
                         deadline=deadline,
                         cancel_check=cancel_check,
-                    ): name
-                    for name, window_start in windows.items()
+                    ): "start",
+                    pool.submit(
+                        _search_quiet,
+                        source,
+                        edge="end",
+                        required_boundary=original_end,
+                        search_start_limit=search_start_limit,
+                        search_end_limit=search_end_limit,
+                        temp_dir=edge_temp_dir,
+                        ffmpeg_bin=ffmpeg_bin,
+                        deadline=deadline,
+                        cancel_check=cancel_check,
+                    ): "end",
                 }
+                edge_results: dict[str, _EdgeSearchResult] = {}
                 for future in as_completed(futures):
-                    future.result()
+                    edge_results[futures[future]] = future.result()
 
-            start_intervals = _quiet_intervals(
-                edge_paths["start"],
-                absolute_start_sec=start_window,
-                threshold_dbfs=QUIET_THRESHOLD_DBFS,
-                min_quiet_ms=MIN_QUIET_MS,
-            )
-            end_intervals = _quiet_intervals(
-                edge_paths["end"],
-                absolute_start_sec=end_window,
-                threshold_dbfs=QUIET_THRESHOLD_DBFS,
-                min_quiet_ms=MIN_QUIET_MS,
-            )
-            start_quiet = _pick_start_interval(start_intervals, original_start)
-            end_quiet = _pick_end_interval(end_intervals, original_end)
+            start_result = edge_results["start"]
+            end_result = edge_results["end"]
+            start_quiet = start_result.quiet
+            end_quiet = end_result.quiet
             if start_quiet is None:
                 return _unavailable(
                     original_start,
@@ -804,6 +984,12 @@ def verify_acoustic_boundaries(
                     stage="analyze",
                     reason="start_silence_not_found",
                     started=started,
+                    extra={
+                        "start_windows": [
+                            [round(start, 3), round(end, 3)]
+                            for start, end in start_result.windows
+                        ]
+                    },
                 )
             if end_quiet is None:
                 return _unavailable(
@@ -812,17 +998,53 @@ def verify_acoustic_boundaries(
                     stage="analyze",
                     reason="end_silence_not_found",
                     started=started,
+                    extra={
+                        "end_windows": [
+                            [round(start, 3), round(end, 3)]
+                            for start, end in end_result.windows
+                        ]
+                    },
                 )
 
-            adjusted_start = max(
-                start_quiet.start_sec,
-                start_quiet.end_sec - START_CUSHION_MS / 1000.0,
+            adjusted_start = min(
+                original_start,
+                max(
+                    start_quiet.start_sec,
+                    start_quiet.end_sec - START_CUSHION_MS / 1000.0,
+                ),
             )
-            adjusted_end = min(
-                end_quiet.end_sec,
-                end_quiet.start_sec + END_CUSHION_MS / 1000.0,
+            end_is_verified_source_edge = bool(
+                abs(original_end - search_end_limit) <= _FRAME_SEC + 1e-9
+                and abs(end_quiet.end_sec - search_end_limit)
+                <= _FRAME_SEC + 1e-9
             )
-            if adjusted_end <= adjusted_start:
+            adjusted_end = (
+                original_end
+                if end_is_verified_source_edge
+                else max(
+                    original_end,
+                    min(
+                        end_quiet.end_sec - _FRAME_SEC,
+                        end_quiet.start_sec + END_CUSHION_MS / 1000.0,
+                    ),
+                )
+            )
+            cuts_are_inside_quiet = bool(
+                start_quiet.start_sec - 1e-9
+                <= adjusted_start
+                < start_quiet.end_sec + 1e-9
+                and end_quiet.start_sec + 1e-9
+                <= adjusted_end
+                and (
+                    adjusted_end < end_quiet.end_sec
+                    or (
+                        end_is_verified_source_edge
+                        and adjusted_end
+                        <= end_quiet.end_sec + _FRAME_SEC + 1e-9
+                    )
+                )
+            )
+            if adjusted_end <= adjusted_start or not cuts_are_inside_quiet:
                 return _unavailable(
                     original_start,
                     original_end,
@@ -853,8 +1075,24 @@ def verify_acoustic_boundaries(
         "min_quiet_ms": MIN_QUIET_MS,
         "start_cushion_ms": START_CUSHION_MS,
         "end_cushion_ms": END_CUSHION_MS,
-        "start_window": [round(start_window, 3), round(start_window + EDGE_WINDOW_SEC, 3)],
-        "end_window": [round(end_window, 3), round(end_window + EDGE_WINDOW_SEC, 3)],
+        "search_start_limit_sec": round(search_start_limit, 3),
+        "search_end_limit_sec": round(search_end_limit, 3),
+        "start_window": [
+            round(start_result.windows[0][0], 3),
+            round(start_result.windows[0][1], 3),
+        ],
+        "end_window": [
+            round(end_result.windows[0][0], 3),
+            round(end_result.windows[0][1], 3),
+        ],
+        "start_windows": [
+            [round(start, 3), round(end, 3)]
+            for start, end in start_result.windows
+        ],
+        "end_windows": [
+            [round(start, 3), round(end, 3)]
+            for start, end in end_result.windows
+        ],
         "start_quiet": [round(start_quiet.start_sec, 3), round(start_quiet.end_sec, 3)],
         "end_quiet": [round(end_quiet.start_sec, 3), round(end_quiet.end_sec, 3)],
         "start_shift_sec": round(adjusted_start - original_start, 3),

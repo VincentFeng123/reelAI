@@ -13,6 +13,7 @@ Module._resolveFilename = function resolveFrontendAlias(request, parent, isMain,
 require("sucrase/register/ts");
 
 const {
+  checkReelsCanGenerate,
   fetchFeed,
   fetchGenerationStatus,
   generateReels,
@@ -131,6 +132,74 @@ test("generation submission timeout remains active after response headers", TEST
     global.fetch = originalFetch;
     global.setTimeout = originalSetTimeout;
   }
+});
+
+test("generation and feed requests omit deprecated clip-duration preferences", TEST_OPTIONS, async () => {
+  const originalFetch = global.fetch;
+  const requests = [];
+  global.fetch = async (url, init = {}) => {
+    requests.push({ url: String(url), init });
+    if (String(url).includes("/reels/generate")) {
+      return new Response(JSON.stringify({ reels: [], response_profile: "unified" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response(JSON.stringify({ reels: [], total: 0, page: 1, limit: 5 }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  };
+
+  try {
+    await generateReels({
+      materialId: "material-duration-compat",
+      generationMode: "fast",
+      numReels: 2,
+      targetClipDurationSec: 55,
+      targetClipDurationMinSec: 20,
+      targetClipDurationMaxSec: 90,
+    });
+    await generateReels({
+      materialId: "material-duration-compat",
+      generationMode: "slow",
+      numReels: 2,
+    });
+    await checkReelsCanGenerate({
+      materialId: "material-duration-compat",
+      generationMode: "fast",
+    });
+    await checkReelsCanGenerate({
+      materialId: "material-duration-compat",
+      generationMode: "slow",
+    });
+    await fetchFeed({
+      materialId: "material-duration-compat",
+      page: 1,
+      limit: 5,
+      generationMode: "slow",
+      targetClipDurationSec: 55,
+      targetClipDurationMinSec: 20,
+      targetClipDurationMaxSec: 90,
+    });
+  } finally {
+    global.fetch = originalFetch;
+  }
+
+  const generationBody = JSON.parse(requests[0].init.body);
+  const slowGenerationBody = JSON.parse(requests[1].init.body);
+  const fastAvailabilityBody = JSON.parse(requests[2].init.body);
+  const slowAvailabilityBody = JSON.parse(requests[3].init.body);
+  assert.equal(generationBody.num_reels, 8);
+  assert.equal(generationBody.generation_mode, "fast");
+  assert.equal(slowGenerationBody.num_reels, 12);
+  assert.equal(slowGenerationBody.generation_mode, "slow");
+  assert.equal(fastAvailabilityBody.num_reels, 8);
+  assert.equal(slowAvailabilityBody.num_reels, 12);
+  assert.equal(Object.hasOwn(generationBody, "target_clip_duration_sec"), false);
+  assert.equal(Object.hasOwn(generationBody, "target_clip_duration_min_sec"), false);
+  assert.equal(Object.hasOwn(generationBody, "target_clip_duration_max_sec"), false);
+  assert.doesNotMatch(requests[4].url, /target_clip_duration/);
 });
 
 test("generation status timeout remains active after response headers", TEST_OPTIONS, async () => {

@@ -252,18 +252,6 @@ function formatHistoryInfoSeconds(value: string | null | undefined): string | nu
   return `${Math.round(parsed)} sec`;
 }
 
-function formatHistoryInfoClipRange(minValue: string | null, maxValue: string | null): string | null {
-  const minLabel = formatHistoryInfoSeconds(minValue);
-  const maxLabel = formatHistoryInfoSeconds(maxValue);
-  if (!minLabel && !maxLabel) {
-    return null;
-  }
-  if (minLabel && maxLabel) {
-    return minLabel === maxLabel ? minLabel : `${minLabel} to ${maxLabel}`;
-  }
-  return minLabel || maxLabel;
-}
-
 function formatHistoryInfoStrictness(value: string | null | undefined): string | null {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) {
@@ -313,12 +301,6 @@ function buildHistoryInfoSections(item: HistoryItem): HistoryInfoSection[] {
   pushHistoryInfoField(summaryFields, "Return set ID", params?.get("return_community_set_id"));
 
   pushHistoryInfoField(searchFields, "Strictness", formatHistoryInfoStrictness(params?.get("min_relevance")));
-  pushHistoryInfoField(searchFields, "Target clip length", formatHistoryInfoSeconds(params?.get("target_clip_duration_sec")));
-  pushHistoryInfoField(
-    searchFields,
-    "Clip length range",
-    formatHistoryInfoClipRange(params?.get("target_clip_duration_min_sec") || null, params?.get("target_clip_duration_max_sec") || null),
-  );
   pushHistoryInfoField(searchFields, "Preferred duration", formatHistoryInfoToken(params?.get("preferred_video_duration")));
   pushHistoryInfoField(searchFields, "Start muted", formatHistoryInfoBooleanQuery(params?.get("start_muted") || null));
   pushHistoryInfoField(searchFields, "Creative Commons only", formatHistoryInfoBooleanQuery(params?.get("creative_commons_only") || null));

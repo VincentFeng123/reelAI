@@ -15,27 +15,6 @@ class MaterialResponse(BaseModel):
     extracted_concepts: list[ConceptOut]
 
 
-def _validate_clip_duration_bounds(
-    target: int | None,
-    min_sec: int | None,
-    max_sec: int | None,
-) -> tuple[int | None, int | None, int | None]:
-    """
-    Ensure min <= target <= max. Swap min/max if inverted and clamp the target
-    into the range. main._resolve_target_clip_duration_bounds does the final
-    hard clamp; this just rejects obviously nonsensical combinations early so
-    we don't propagate `min=180, max=15` through the retrieval pipeline.
-    """
-    if min_sec is not None and max_sec is not None and min_sec > max_sec:
-        min_sec, max_sec = max_sec, min_sec
-    if target is not None:
-        if min_sec is not None and target < min_sec:
-            target = min_sec
-        if max_sec is not None and target > max_sec:
-            target = max_sec
-    return target, min_sec, max_sec
-
-
 class ReelsGenerateRequest(BaseModel):
     material_id: str = Field(min_length=1, max_length=128)
     concept_id: str | None = Field(default=None, max_length=128)
@@ -45,22 +24,11 @@ class ReelsGenerateRequest(BaseModel):
     generation_mode: Literal["slow", "fast"] = "slow"
     min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
-    target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
-    target_clip_duration_min_sec: int | None = Field(default=None, ge=15, le=180)
-    target_clip_duration_max_sec: int | None = Field(default=None, ge=15, le=180)
+    # Deprecated compatibility fields. The relevance/silence pipeline ignores them.
+    target_clip_duration_sec: int | None = None
+    target_clip_duration_min_sec: int | None = None
+    target_clip_duration_max_sec: int | None = None
     multi_platform_search: bool = False
-
-    @model_validator(mode="after")
-    def _validate_clip_bounds(self) -> "ReelsGenerateRequest":
-        target, min_sec, max_sec = _validate_clip_duration_bounds(
-            self.target_clip_duration_sec,
-            self.target_clip_duration_min_sec,
-            self.target_clip_duration_max_sec,
-        )
-        self.target_clip_duration_sec = target or 55
-        self.target_clip_duration_min_sec = min_sec
-        self.target_clip_duration_max_sec = max_sec
-        return self
 
 
 class CaptionCue(BaseModel):
@@ -158,22 +126,10 @@ class ReelsCanGenerateAnyRequest(BaseModel):
     generation_mode: Literal["slow", "fast"] = "slow"
     min_relevance: float | None = Field(default=None, ge=-1.0, le=1.2)
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
-    target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
-    target_clip_duration_min_sec: int | None = Field(default=None, ge=15, le=180)
-    target_clip_duration_max_sec: int | None = Field(default=None, ge=15, le=180)
+    target_clip_duration_sec: int | None = None
+    target_clip_duration_min_sec: int | None = None
+    target_clip_duration_max_sec: int | None = None
     multi_platform_search: bool = False
-
-    @model_validator(mode="after")
-    def _validate_clip_bounds(self) -> "ReelsCanGenerateAnyRequest":
-        target, min_sec, max_sec = _validate_clip_duration_bounds(
-            self.target_clip_duration_sec,
-            self.target_clip_duration_min_sec,
-            self.target_clip_duration_max_sec,
-        )
-        self.target_clip_duration_sec = target or 55
-        self.target_clip_duration_min_sec = min_sec
-        self.target_clip_duration_max_sec = max_sec
-        return self
 
 
 class ReelsCanGenerateAnyResponse(BaseModel):

@@ -33,8 +33,6 @@ from ..ingestion.segment import normalize_clip_window as _normalize_clip_window_
 from ..clip_engine.cancellation import raise_if_cancelled as _raise_if_clip_cancelled
 from ..clip_engine.errors import CancellationError as _ClipEngineCancellationError
 from ..clip_engine.errors import ProviderError as _ClipEngineProviderError
-from ..clip_engine.config import SEGMENT_MAX_CLIP_S as _SEGMENT_MAX_CLIP_S
-from ..clip_engine.config import SEGMENT_MAX_CLIPS as _SEGMENT_MAX_CLIPS
 from ..clip_engine.metadata import extract_video_id as _extract_embed_video_id
 from ..clip_engine.metadata import normalize_youtube_video_id
 from ..clip_engine.provider_cache import validate_transcript_payload
@@ -52,10 +50,6 @@ from .search_query_plan import build_search_query_plan
 from .topic_expansion import TopicExpansionService
 from .structural_classifier import classify_passage
 from .knowledge_level import effective_level_target
-
-# Serving-side ceiling: legacy whole-video slabs (persisted before the engine's
-# SEGMENT_MAX_CLIP_S curation gate existed) must not surface in ranked feeds.
-_SERVING_MAX_CLIP_SEC = min(180.0, float(_SEGMENT_MAX_CLIP_S))
 
 logger = logging.getLogger(__name__)
 
@@ -1200,7 +1194,8 @@ class ReelService:
     # v13: full caption text and the current transcript-semantic surfaceability
     # gates must be recomputed instead of replaying pre-gate cached rows.
     # v14: discard rows accepted only by the retired -24 dBFS adaptive verifier.
-    RANKED_FEED_CACHE_VERSION = 14
+    RANKED_FEED_CACHE_VERSION = 15
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v2"
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -1340,6 +1335,7 @@ class ReelService:
             "content_fingerprint": str(content_fingerprint),
             "require_verified_boundaries": bool(require_verified_boundaries),
             "version": self.RANKED_FEED_CACHE_VERSION,
+            "selection_contract_version": self.RANKED_FEED_CACHE_CONTRACT_VERSION,
         }
         serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -1361,8 +1357,8 @@ class ReelService:
                 SELECT r.id, r.video_id, r.created_at
                 FROM reels r
                 WHERE {reel_where}
-                  AND (r.t_end - r.t_start) >= 1
-                  AND (r.t_end - r.t_start) <= {_SERVING_MAX_CLIP_SEC}
+                  AND r.t_start >= 0
+                  AND r.t_end > r.t_start
             )
         """
         reel_stats = fetch_one(
@@ -1398,8 +1394,8 @@ class ReelService:
                 r.search_context_json
             FROM reels r
             WHERE {reel_where}
-              AND (r.t_end - r.t_start) >= 1
-              AND (r.t_end - r.t_start) <= {_SERVING_MAX_CLIP_SEC}
+              AND r.t_start >= 0
+              AND r.t_end > r.t_start
             ORDER BY r.id ASC
             """,
             reel_params,
@@ -1444,6 +1440,7 @@ class ReelService:
         summary_mode = "fallback" if fast_mode or not self.llm_available else f"ai:{self.chat_model}"
         payload = {
             "version": self.RANKED_FEED_CACHE_VERSION,
+            "selection_contract_version": self.RANKED_FEED_CACHE_CONTRACT_VERSION,
             "material_id": material_id,
             "generation_id": generation_id or "",
             "fast_mode": bool(fast_mode),
@@ -1618,7 +1615,6 @@ class ReelService:
         self._generation_state.min_relevance_threshold = max(
             0.0, min(1.0, float(min_relevance_threshold))
         )
-        safe_page_hint = max(1, int(page_hint or 1))
         params: tuple[Any, ...] = (material_id,)
         concept_where = "WHERE material_id = ?"
         if concept_id:
@@ -1714,11 +1710,9 @@ class ReelService:
             concept_index = max(0, int(acquisition_concept_offset)) % len(concepts)
             concepts = [concepts[concept_index]]
         safe_video_duration_pref = self._normalize_preferred_video_duration(preferred_video_duration)
-        clip_min_len, clip_max_len, safe_target_clip_duration = self._resolve_clip_duration_bounds(
-            target_clip_duration_sec=target_clip_duration_sec,
-            target_clip_duration_min_sec=target_clip_duration_min_sec,
-            target_clip_duration_max_sec=target_clip_duration_max_sec,
-        )
+        # Deprecated request fields remain in the public signature, but clip
+        # completeness and silence—not duration—define the selected range.
+        clip_min_len, clip_max_len, safe_target_clip_duration = (0, 0, 0)
 
         existing_reels_where, existing_reels_params = self._reel_scope_where(
             material_id=material_id,
@@ -1783,11 +1777,6 @@ class ReelService:
         }
         generated_video_counts: dict[str, int] = {}
         generated_clip_keys: set[str] = set()
-        default_max_segments_per_video = self._request_page_segment_cap(
-            video_duration_sec=0,
-            fast_mode=fast_mode,
-            page_hint=safe_page_hint,
-        )
         excluded_generation_ids = [
             candidate_id
             for candidate_id in (exclude_generation_ids or [])
@@ -1907,7 +1896,9 @@ class ReelService:
                 break
             ingest_reel_cap = min(
                 remaining_reel_capacity,
-                (
+                video_budget * 8
+                if generation_context is not None
+                else (
                     new_reel_limit - len(generated)
                     if new_reel_limit is not None
                     else max(3, num_reels - len(generated)) + 2
@@ -2408,6 +2399,18 @@ class ReelService:
             "prerequisite_ids": list(
                 getattr(reel_obj, "prerequisite_ids", None) or []
             ),
+            "_selection_quality_floor": getattr(
+                reel_obj, "selection_quality_floor", None
+            ),
+            "_selection_quality_mean": getattr(
+                reel_obj, "selection_quality_mean", None
+            ),
+            "_selection_topic_relevance": getattr(
+                reel_obj, "selection_topic_relevance", None
+            ),
+            "_selection_source_rank": int(
+                getattr(reel_obj, "selection_source_rank", 0) or 0
+            ),
         }
 
     def _finalize_generated_reels(
@@ -2418,6 +2421,43 @@ class ReelService:
     ) -> list[dict[str, Any]]:
         if not generated or num_reels <= 0:
             return []
+        if all(
+            str(reel.get("selection_contract_version") or "").strip()
+            == "quality_silence_v2"
+            for reel in generated
+        ):
+            ordered = sorted(
+                enumerate(generated),
+                key=lambda pair: (
+                    float(
+                        pair[1].get("_selection_quality_floor")
+                        if pair[1].get("_selection_quality_floor") is not None
+                        else pair[1].get("score") or 0.0
+                    ),
+                    float(
+                        pair[1].get("_selection_quality_mean")
+                        if pair[1].get("_selection_quality_mean") is not None
+                        else pair[1].get("score") or 0.0
+                    ),
+                    float(
+                        pair[1].get("_selection_topic_relevance")
+                        if pair[1].get("_selection_topic_relevance") is not None
+                        else pair[1].get("relevance_score") or 0.0
+                    ),
+                    -int(pair[1].get("_selection_source_rank") or 0),
+                    -float(pair[1].get("t_start") or 0.0),
+                    -pair[0],
+                ),
+                reverse=True,
+            )
+            return [
+                {
+                    key: value
+                    for key, value in reel.items()
+                    if not key.startswith("_selection_")
+                }
+                for _index, reel in ordered[:num_reels]
+            ]
         if preferred_video_duration != "any" or num_reels <= 1:
             return self._group_by_video(generated[:num_reels])
 
@@ -5540,6 +5580,9 @@ class ReelService:
             "_selection_boundary_confidence": cls._selection_number(
                 parsed.get("boundary_confidence"), 0.0
             ),
+            "_selection_self_contained": selection_bool(
+                "self_contained", False
+            ),
             "_selection_is_standalone": bool(standalone),
             "_selection_chain_id": str(parsed.get("chain_id") or "").strip(),
             "_selection_prerequisite_ids": [
@@ -5549,6 +5592,15 @@ class ReelService:
                 parsed.get("selection_candidate_id") or parsed.get("candidate_id") or ""
             ).strip(),
         }
+        for source_key, metadata_key in (
+            ("quality_floor", "_selection_quality_floor"),
+            ("quality_mean", "_selection_quality_mean"),
+            ("informativeness", "_selection_informativeness"),
+            ("topic_relevance", "_selection_topic_relevance"),
+            ("educational_importance", "_selection_educational_importance"),
+        ):
+            if parsed.get(source_key) is not None:
+                metadata[metadata_key] = cls._selection_number(parsed.get(source_key))
         if "surface_eligible" in parsed:
             surface_eligible = parsed.get("surface_eligible")
             if isinstance(surface_eligible, str):
@@ -5566,9 +5618,11 @@ class ReelService:
             parsed.get("surface_reason") or ""
         ).strip().lower()
         metadata["_selection_directly_teaches_topic"] = selection_bool(
-            "directly_teaches_topic", True
+            "directly_teaches_topic", version != "quality_silence_v2"
         )
-        metadata["_selection_substantive"] = selection_bool("substantive", True)
+        metadata["_selection_substantive"] = selection_bool(
+            "substantive", version != "quality_silence_v2"
+        )
         metadata["_selection_factually_grounded"] = selection_bool(
             "factually_grounded", False
         )
@@ -5579,6 +5633,12 @@ class ReelService:
             parsed.get("uncertainty") or "low"
         ).strip().lower()
         metadata["_selection_deferred_level"] = selection_bool("deferred_level", False)
+        try:
+            metadata["_selection_source_rank"] = max(
+                0, int(parsed.get("source_rank") or 0)
+            )
+        except (TypeError, ValueError):
+            metadata["_selection_source_rank"] = 0
         try:
             metadata["_selection_chain_position"] = float(
                 parsed.get("chain_position") or 0.0
@@ -5623,21 +5683,10 @@ class ReelService:
             reel_id = str(item.get("reel_id") or "").strip()
             node_id = reel_id or f"selection-node-{index}"
             item["_selection_node_id"] = node_id
-            concept_id = str(item.get("concept_id") or "")
-            concept_target = max(
-                0.0,
-                min(1.0, level_target + concept_adjustments.get(concept_id, 0.0)),
-            )
-            level_fit = 1.0 - abs(self._difficulty(item) - concept_target)
-            content_score = self._selection_number(
-                item.get("_selection_content_score"), 0.0
-            )
-            uncertainty_penalty = (
-                0.05 if item.get("_selection_uncertainty") == "medium" else 0.0
-            )
-            item["score"] = max(
-                0.0,
-                0.85 * content_score + 0.15 * level_fit - uncertainty_penalty,
+            item["_selection_input_order"] = index
+            item["score"] = self._selection_number(
+                item.get("_selection_quality_floor"),
+                self._selection_number(item.get("_selection_content_score"), 0.0),
             )
             nodes[node_id] = item
             aliases[node_id] = node_id
@@ -5696,14 +5745,24 @@ class ReelService:
                 if not eligible:
                     return []
 
-            def priority(node_id: str) -> tuple[float, float, str, str]:
+            def priority(node_id: str) -> tuple[float, float, float, int, float, int]:
                 row = nodes[node_id]
-                base = float(row.get("score") or 0.0)
+                compatibility_score = self._selection_number(
+                    row.get("_selection_content_score"), 0.0
+                )
                 return (
-                    base,
-                    1.0 if not last_video or str(row.get("video_id") or "") != last_video else 0.0,
-                    str(row.get("created_at") or ""),
-                    node_id,
+                    self._selection_number(
+                        row.get("_selection_quality_floor"), compatibility_score
+                    ),
+                    self._selection_number(
+                        row.get("_selection_quality_mean"), compatibility_score
+                    ),
+                    self._selection_number(
+                        row.get("_selection_topic_relevance"), compatibility_score
+                    ),
+                    -int(row.get("_selection_source_rank") or 0),
+                    -float(row.get("t_start") or 0.0),
+                    -int(row.get("_selection_input_order") or 0),
                 )
 
             chosen_id = max(eligible, key=priority)
@@ -6911,8 +6970,8 @@ class ReelService:
               ON f.reel_id = r.id
              AND f.learner_id = ?
             WHERE {reel_where}
-              AND (r.t_end - r.t_start) >= 1
-              AND (r.t_end - r.t_start) <= {_SERVING_MAX_CLIP_SEC}
+              AND r.t_start >= 0
+              AND r.t_end > r.t_start
             GROUP BY
                 r.id,
                 r.concept_id,
@@ -7057,6 +7116,23 @@ class ReelService:
                 selection_version = str(
                     selection_metadata.get("_selection_contract_version") or ""
                 ).strip()
+                if selection_version == "quality_silence_v2" and (
+                    min(
+                        self._selection_number(
+                            selection_metadata.get("_selection_informativeness"), 0.0
+                        ),
+                        self._selection_number(
+                            selection_metadata.get("_selection_topic_relevance"), 0.0
+                        ),
+                        self._selection_number(
+                            selection_metadata.get("_selection_educational_importance"), 0.0
+                        ),
+                    ) < 0.75
+                    or not selection_metadata.get("_selection_self_contained")
+                    or not selection_metadata.get("_selection_is_standalone")
+                    or not selection_metadata.get("_selection_topic_evidence_quote")
+                ):
+                    continue
                 if (
                     not selection_metadata.get("_selection_directly_teaches_topic", True)
                     or not selection_metadata.get("_selection_substantive", True)
@@ -7164,20 +7240,11 @@ class ReelService:
             )
             learner_signal = learner_coverage.get(str(row["concept_id"]), {})
             if self._has_selection_contract(selection_metadata):
-                content_score = self._selection_number(
-                    selection_metadata.get("_selection_content_score"), 0.0
-                )
-                current_level_fit = 1.0 - abs(_diff - concept_target)
-                uncertainty_penalty = (
-                    0.05
-                    if selection_metadata.get("_selection_uncertainty") == "medium"
-                    else 0.0
-                )
-                score = max(
-                    0.0,
-                    0.85 * content_score
-                    + 0.15 * current_level_fit
-                    - uncertainty_penalty,
+                score = self._selection_number(
+                    selection_metadata.get("_selection_quality_floor"),
+                    self._selection_number(
+                        selection_metadata.get("_selection_content_score"), 0.0
+                    ),
                 )
             else:
                 score = (
@@ -7296,6 +7363,21 @@ class ReelService:
         for item in deduped:
             clean_item = dict(item)
             selection_ordered = self._has_selection_contract(clean_item)
+            selection_contract_version = str(
+                clean_item.get("_selection_contract_version") or ""
+            ).strip()
+            selection_quality_floor = self._selection_number(
+                clean_item.get("_selection_quality_floor"), 0.0
+            )
+            selection_quality_mean = self._selection_number(
+                clean_item.get("_selection_quality_mean"), 0.0
+            )
+            selection_topic_relevance = self._selection_number(
+                clean_item.get("_selection_topic_relevance"), 0.0
+            )
+            selection_source_rank = int(
+                clean_item.get("_selection_source_rank") or 0
+            )
             for internal_key in [
                 key for key in clean_item if key.startswith("_selection_")
             ]:
@@ -7303,6 +7385,14 @@ class ReelService:
             # Request shaping preserves relative order, so main can avoid
             # accidentally applying the legacy chronological scheduler again.
             clean_item["_selection_ordered"] = selection_ordered
+            if selection_contract_version:
+                clean_item["selection_contract_version"] = (
+                    selection_contract_version
+                )
+                clean_item["_selection_quality_floor"] = selection_quality_floor
+                clean_item["_selection_quality_mean"] = selection_quality_mean
+                clean_item["_selection_topic_relevance"] = selection_topic_relevance
+                clean_item["_selection_source_rank"] = selection_source_rank
             # Keep video_id on the response row so downstream filters (notably
             # main._ranked_request_reels's exclude_video_ids filter) can match
             # on it. Stripping it here silently defeated client pagination.

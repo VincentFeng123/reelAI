@@ -6,6 +6,8 @@ const ts = require("typescript");
 
 const filePath = path.join(__dirname, "page.tsx");
 const source = fs.readFileSync(filePath, "utf8");
+const reelCardSource = fs.readFileSync(path.join(__dirname, "../../components/ReelCard.tsx"), "utf8");
+const feedQuerySource = fs.readFileSync(path.join(__dirname, "../../lib/feedQuery.ts"), "utf8");
 const sourceFile = ts.createSourceFile(
   filePath,
   source,
@@ -97,8 +99,13 @@ test("generation finals cannot reconcile after their search scope is invalidated
   }
 });
 
-test("feed generation keeps a twelve-clip unseen reservoir and resumes durable jobs", () => {
-  assert.match(source, /const READY_RESERVOIR_TARGET = 12;/);
+test("feed generation uses the shared fast and slow ready ceilings and resumes durable jobs", () => {
+  assert.match(source, /const FAST_READY_RESERVOIR_TARGET = 8;/);
+  assert.match(source, /const SLOW_READY_RESERVOIR_TARGET = 12;/);
+  assert.match(source, /return mode === "fast" \? FAST_READY_RESERVOIR_TARGET : SLOW_READY_RESERVOIR_TARGET;/);
+  assert.match(source, /prefetch: readyReservoirTarget\(requestGenerationMode\)/);
+  assert.match(source, /Math\.min\(readyReservoirTarget\(generationMode\), currentCount \+ perTopicBatch\)/);
+  assert.match(source, /Math\.min\(readyReservoirTarget\("fast"\), currentCount \+ perTopicBatch\)/);
   assert.match(source, /const READY_RESERVOIR_REFILL_THRESHOLD = 4;/);
   assert.match(source, /rememberFeedGenerationJob\(row\.materialId, row\.data!\)/);
   assert.match(source, /generationJobId: activeGenerationJob\?\.jobId/);
@@ -163,7 +170,8 @@ test("a restored feed reconciles durable inventory with its restored mode and a 
   const loadPageEnd = source.indexOf("const requestMore = useCallback(", loadPageStart);
   assert.ok(loadPageStart >= 0 && loadPageEnd > loadPageStart);
   const loadPageText = source.slice(loadPageStart, loadPageEnd);
-  assert.match(loadPageText, /generationMode: options\?\.generationMode \?\? generationMode/);
+  assert.match(loadPageText, /const requestGenerationMode = options\?\.generationMode \?\? generationMode/);
+  assert.match(loadPageText, /generationMode: requestGenerationMode/);
   assert.match(
     loadPageText,
     /reconcileGeneratedReels\(\[\], fetchedReels, \{ preserveUnmatchedUnseen: false \}\)/,
@@ -199,7 +207,7 @@ test("bootstrap consumes duplicate persisted pages before considering generation
     PAGE_SIZE: 5,
     reelsRef,
     activeIndexRef: { current: 0 },
-    READY_RESERVOIR_TARGET: 12,
+    readyReservoirTarget: () => 12,
     generationMode: "slow",
     loadPage: async (targetPage, options) => {
       pageLoads.push({ targetPage, options });
@@ -245,6 +253,49 @@ test("authoritative finals lock the watched prefix and reorder only the unseen t
   assert.match(source, /const lockedPrefix = currentRows\.slice\(0, lockedPrefixLength\)/);
   assert.match(source, /const stableUnseenRows = currentRows\.slice\(lockedPrefixLength\)/);
   assert.match(source, /const reordered = dedupeByIdentity\(\[\.\.\.lockedPrefix, \.\.\.authoritativeTail\]\)/);
+});
+
+test("same-source clips remain distinct when their authoritative float ranges differ", () => {
+  const normalizeClipKeyTime = compileUseCallback("normalizeClipKeyTime", {});
+  const reelClipKey = compileUseCallback("reelClipKey", {
+    normalizeClipKeyTime,
+    sourceVideoKeyFromUrl: () => "same-video",
+  });
+  const dedupeByIdentity = compileUseCallback("dedupeByIdentity", { reelClipKey });
+  const rows = dedupeByIdentity([
+    { reel_id: "facet-a", video_url: "https://youtu.be/same", t_start: 10.125, t_end: 31.875 },
+    { reel_id: "facet-b", video_url: "https://youtu.be/same", t_start: 45.25, t_end: 80.5 },
+    { reel_id: "duplicate-range", video_url: "https://youtu.be/same", t_start: 10.125, t_end: 31.875 },
+  ]);
+  assert.deepEqual(rows.map((reel) => reel.reel_id), ["facet-a", "facet-b"]);
+});
+
+test("legacy duration settings are readable but removed from newly written feed URLs", () => {
+  assert.match(feedQuerySource, /getParam\("target_clip_duration_sec"\)/);
+  assert.match(feedQuerySource, /params\.delete\("target_clip_duration_sec"\)/);
+  assert.match(feedQuerySource, /params\.delete\("target_clip_duration_min_sec"\)/);
+  assert.match(feedQuerySource, /params\.delete\("target_clip_duration_max_sec"\)/);
+  assert.doesNotMatch(feedQuerySource, /params\.set\("target_clip_duration/);
+});
+
+test("YouTube playback honors float boundaries with a sub-50ms end watchdog", () => {
+  assert.match(reelCardSource, /const CLIP_END_POLL_INTERVAL_MS = 20;/);
+  assert.match(reelCardSource, /clipEndRaw > clipStart \? clipEndRaw : clipStart/);
+  assert.match(reelCardSource, /if \(playerTime >= clipEnd\)/);
+  assert.match(
+    reelCardSource,
+    /if \(playerTime >= clipEnd\) \{[\s\S]*?if \(!didHandleClipEndRef\.current\) \{[\s\S]*?player\.pauseVideo\(\);[\s\S]*?if \(autoplayEnabledRef\.current/,
+  );
+  assert.match(reelCardSource, /event\.target\.seekTo\(clipStart, true\)/);
+  assert.doesNotMatch(reelCardSource, /clipStart \+ 1/);
+
+  const endedHandler = reelCardSource.match(
+    /else if \(state === playerState\.ENDED\) \{([\s\S]*?)\n\s*} else if \(/,
+  )?.[1] || "";
+  assert.match(endedHandler, /event\.target\.pauseVideo\(\)/);
+  assert.match(endedHandler, /setCurrentSec\(clipDuration\)/);
+  assert.doesNotMatch(endedHandler, /seekTo\(clipStart/);
+  assert.doesNotMatch(endedHandler, /playVideo\(\)/);
 });
 
 test("a tail gesture is retained until the next reel arrives", () => {

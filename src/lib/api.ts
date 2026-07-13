@@ -828,19 +828,20 @@ function normalizeReelIdList(values: string[] | undefined): string[] {
     : normalized;
 }
 
+function generationModeCeiling(mode: "slow" | "fast" | undefined): number {
+  return mode === "fast" ? 8 : 12;
+}
+
 function buildGenerateReelsRequestBody(params: GenerateReelsParams): Record<string, unknown> {
   return {
     material_id: params.materialId,
     concept_id: params.conceptId,
-    num_reels: params.numReels ?? 20,
+    num_reels: generationModeCeiling(params.generationMode),
     exclude_video_ids: normalizeVideoIdList(params.excludeVideoIds),
     creative_commons_only: params.creativeCommonsOnly === true,
     generation_mode: params.generationMode ?? "slow",
     min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
     preferred_video_duration: params.preferredVideoDuration ?? "any",
-    target_clip_duration_sec: params.targetClipDurationSec,
-    target_clip_duration_min_sec: params.targetClipDurationMinSec,
-    target_clip_duration_max_sec: params.targetClipDurationMaxSec,
   };
 }
 
@@ -928,9 +929,6 @@ export async function ingestUrl(params: IngestUrlParams): Promise<IngestResult> 
     source_url: params.sourceUrl,
     material_id: params.materialId ?? undefined,
     concept_id: params.conceptId ?? undefined,
-    target_clip_duration_sec: params.targetClipDurationSec,
-    target_clip_duration_min_sec: params.targetClipDurationMinSec,
-    target_clip_duration_max_sec: params.targetClipDurationMaxSec,
     language: params.language,
   };
 
@@ -1240,14 +1238,11 @@ export async function checkReelsCanGenerate(params: {
     body: JSON.stringify({
       material_id: params.materialId,
       concept_id: params.conceptId,
-      num_reels: 1,
+      num_reels: generationModeCeiling(params.generationMode),
       creative_commons_only: params.creativeCommonsOnly === true,
       generation_mode: params.generationMode ?? "slow",
       min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
       preferred_video_duration: params.preferredVideoDuration ?? "any",
-      target_clip_duration_sec: params.targetClipDurationSec,
-      target_clip_duration_min_sec: params.targetClipDurationMinSec,
-      target_clip_duration_max_sec: params.targetClipDurationMaxSec,
     }),
   });
   return parseJsonResponse<ReelsCanGenerateResponse>(res);
@@ -1278,9 +1273,6 @@ export async function checkReelsCanGenerateAny(params: {
       generation_mode: params.generationMode ?? "slow",
       min_relevance: Number.isFinite(params.minRelevance) ? params.minRelevance : undefined,
       preferred_video_duration: params.preferredVideoDuration ?? "any",
-      target_clip_duration_sec: params.targetClipDurationSec,
-      target_clip_duration_min_sec: params.targetClipDurationMinSec,
-      target_clip_duration_max_sec: params.targetClipDurationMaxSec,
     }),
   });
   return parseJsonResponse<ReelsCanGenerateAnyResponse>(res);
@@ -1312,9 +1304,6 @@ export async function fetchFeed(params: {
     creative_commons_only: String(params.creativeCommonsOnly === true),
     generation_mode: params.generationMode ?? "slow",
     preferred_video_duration: params.preferredVideoDuration ?? "any",
-    target_clip_duration_sec: String(params.targetClipDurationSec ?? 55),
-    target_clip_duration_min_sec: String(params.targetClipDurationMinSec ?? 20),
-    target_clip_duration_max_sec: String(params.targetClipDurationMaxSec ?? 55),
   });
   if (Number.isFinite(params.minRelevance)) {
     query.set("min_relevance", String(params.minRelevance));
@@ -1874,9 +1863,6 @@ export async function replaceCommunitySettings(settings: StudyReelsSettings): Pr
       start_muted: settings.startMuted,
       creative_commons_only: settings.creativeCommonsOnly,
       preferred_video_duration: settings.preferredVideoDuration,
-      target_clip_duration_sec: settings.targetClipDurationSec,
-      target_clip_duration_min_sec: settings.targetClipDurationMinSec,
-      target_clip_duration_max_sec: settings.targetClipDurationMaxSec,
     }),
   });
   return normalizeCommunitySettings(await parseJsonResponse<unknown>(res));

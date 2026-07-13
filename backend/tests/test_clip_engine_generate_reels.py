@@ -78,11 +78,60 @@ def _discover_result(video_id: str = VIDEO_ID) -> dict:
     }
 
 
+def _quality_v2_engine_out(engine_out: dict) -> dict:
+    transcript = engine_out["transcript"]
+    transcript.update(
+        source="supadata",
+        artifact_key=f"supadata:{engine_out['video_id']}",
+        native_mode=True,
+    )
+    segments = transcript["segments"]
+    for index, segment in enumerate(segments):
+        segment.setdefault("cue_id", f"cue-{index}")
+    for index, clip in enumerate(engine_out["clips"]):
+        selected = [
+            segment
+            for segment in segments
+            if float(segment["start"]) >= float(clip["start"]) - 1e-6
+            and float(segment["end"]) <= float(clip["end"]) + 1e-6
+        ]
+        if not selected:
+            continue
+        words = " ".join(str(segment["text"]) for segment in selected).split()
+        if len(words) < 5:
+            selected[0]["text"] = (
+                f"{selected[0]['text']} with complete grounded explanatory context"
+            )
+            words = " ".join(str(segment["text"]) for segment in selected).split()
+        clip.update(
+            cue_ids=[str(segment["cue_id"]) for segment in selected],
+            kind="educational",
+            learning_objective=clip.get("learning_objective")
+            or f"Explain {clip.get('title') or 'this concept'}.",
+            facet=clip.get("facet") or f"facet-{index}",
+            reason=clip.get("reason") or "Provides a complete grounded explanation.",
+            self_contained=True,
+            is_standalone=True,
+            directly_teaches_topic=True,
+            substantive=True,
+            factually_grounded=True,
+            topic_evidence_quote=" ".join(words[:40]),
+            boundary_confidence=0.9,
+            prerequisite_ids=[],
+            selection_candidate_id=clip.get("selection_candidate_id")
+            or f"candidate-{index}",
+        )
+        clip.setdefault("informativeness", 0.9)
+        clip.setdefault("topic_relevance", 0.9)
+        clip.setdefault("educational_importance", 0.9)
+    return engine_out
+
+
 def _multi_clip_engine_out() -> dict:
     """Two relevance-surviving clips from one video's transcript. Each clip's
     window text contains the topic tokens ('cellular respiration') so
     clip_engine_bridge.filter_by_query keeps both."""
-    return {
+    return _quality_v2_engine_out({
         "video_id": VIDEO_ID,
         "clips": [
             {
@@ -125,13 +174,13 @@ def _multi_clip_engine_out() -> dict:
             "duration": 300.0,
         },
         "notes": "",
-    }
+    })
 
 
 def _five_minute_engine_out() -> dict:
     """One 300s whole-topic clip — the kind the practice (Gemini) engine cuts for
     a long lecture segment. RAW-PRACTICE: it must persist and be served intact."""
-    return {
+    return _quality_v2_engine_out({
         "video_id": VIDEO_ID,
         "clips": [
             {
@@ -153,7 +202,7 @@ def _five_minute_engine_out() -> dict:
             "duration": 300.0,
         },
         "notes": "",
-    }
+    })
 
 
 class ClipEngineGenerateReelsTests(unittest.TestCase):
@@ -174,6 +223,30 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/test"
+            ),
+        )
+        self._prepare_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "prepare_audio_source",
+            return_value=prepared,
+        )
+        self._verify_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "verify_acoustic_boundaries",
+            side_effect=lambda _url, start, end, **_kwargs: (
+                pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                    "verified", start, end, {"threshold_dbfs": -38.0}
+                )
+            ),
+        )
+        self._prepare_patch.start()
+        self._verify_patch.start()
+        self.addCleanup(self._prepare_patch.stop)
+        self.addCleanup(self._verify_patch.stop)
 
         self._seed_material_and_concept()
 
@@ -216,7 +289,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.addCleanup(mock_search.stop)
         self.addCleanup(mock_run.stop)
         search.discover.return_value = _discover_result()
-        run.clip.return_value = engine_out
+        run.clip.return_value = _quality_v2_engine_out(engine_out)
         return search, run
 
     # ------------------------------------------------------------------ #
@@ -285,7 +358,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertTrue(str(first.get("ai_summary") or "").strip())
         self.assertTrue(str(first.get("match_reason") or "").strip())
 
-    def test_zero_quality_and_difficulty_scores_round_trip_without_inflation(self) -> None:
+    def test_below_threshold_quality_is_rejected(self) -> None:
         engine_out = _multi_clip_engine_out()
         engine_out["clips"] = [{
             **engine_out["clips"][0],
@@ -327,13 +400,9 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 generation_id="gen-low-score",
             )
 
-        self.assertIsNotNone(stored)
-        self.assertEqual(float(stored["informativeness"]), 0.0)
-        self.assertEqual(float(stored["difficulty"]), 0.0)
-        self.assertEqual(generated[0]["informativeness"], 0.0)
-        self.assertEqual(generated[0]["difficulty"], 0.0)
-        self.assertEqual(feed[0]["informativeness"], 0.0)
-        self.assertEqual(feed[0]["difficulty"], 0.0)
+        self.assertIsNone(stored)
+        self.assertEqual(generated, [])
+        self.assertEqual(feed, [])
 
     def test_one_pass_clips_never_call_legacy_summary_model(self) -> None:
         self._patched_engine(_multi_clip_engine_out())
@@ -429,7 +498,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             video_id = biological_video_id if is_biological else SAP_ADVANCED_ATP_VIDEO_ID
             title = biological_title if is_biological else SAP_ADVANCED_ATP_TITLE
             transcript = biological_transcript if is_biological else SAP_ADVANCED_ATP_TRANSCRIPT
-            return {
+            return _quality_v2_engine_out({
                 "video_id": video_id,
                 "clips": [{
                     "start": 0.0,
@@ -447,7 +516,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                     "duration": 300.0,
                 },
                 "notes": "",
-            }
+            })
 
         search.discover.side_effect = discovery
         run.clip.side_effect = clip
@@ -706,6 +775,62 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 conn, material_id=MATERIAL_ID, generation_id="gen-cap"
             )
         self.assertEqual(len(feed), 2)
+        self.assertTrue(all(
+            reel.get("selection_contract_version") == "quality_silence_v2"
+            for reel in feed
+        ))
+
+    def test_quality_silence_v2_response_applies_global_quality_order(self) -> None:
+        generated = [
+            {
+                "reel_id": "a-late",
+                "video_id": "source-a",
+                "t_start": 90.75,
+                "score": 0.88,
+                "_selection_quality_floor": 0.88,
+                "_selection_quality_mean": 0.94,
+                "_selection_topic_relevance": 0.96,
+                "_selection_source_rank": 0,
+                "selection_contract_version": "quality_silence_v2",
+            },
+            {
+                "reel_id": "b",
+                "video_id": "source-b",
+                "t_start": 20.5,
+                "score": 0.84,
+                "_selection_quality_floor": 0.84,
+                "_selection_quality_mean": 0.97,
+                "_selection_topic_relevance": 0.99,
+                "_selection_source_rank": 1,
+                "selection_contract_version": "quality_silence_v2",
+            },
+            {
+                "reel_id": "a-early",
+                "video_id": "source-a",
+                "t_start": 10.25,
+                "score": 0.91,
+                "_selection_quality_floor": 0.91,
+                "_selection_quality_mean": 0.92,
+                "_selection_topic_relevance": 0.93,
+                "_selection_source_rank": 0,
+                "selection_contract_version": "quality_silence_v2",
+            },
+        ]
+
+        result = main_module.reel_service._finalize_generated_reels(
+            generated=generated,
+            num_reels=3,
+            preferred_video_duration="any",
+        )
+
+        self.assertEqual(
+            [reel["reel_id"] for reel in result],
+            ["a-early", "a-late", "b"],
+        )
+        self.assertTrue(all(
+            not any(key.startswith("_selection_") for key in reel)
+            for reel in result
+        ))
 
     def test_safe_batch_caps_progressive_ingest_to_requested_buffer(self) -> None:
         with mock.patch.object(
@@ -807,10 +932,9 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertEqual(int(added["count"]), 1)
 
     # ------------------------------------------------------------------ #
-    # Curation: clips outside the global 1-180 second safety envelope are
-    # rejected before persistence and therefore cannot be served.
+    # Complete teaching spans are not rejected because of their duration.
     # ------------------------------------------------------------------ #
-    def test_five_minute_clip_is_not_persisted_or_served(self) -> None:
+    def test_five_minute_complete_clip_is_persisted_and_served(self) -> None:
         self._patched_engine(_five_minute_engine_out())
 
         with db_module.get_conn() as conn:
@@ -829,13 +953,15 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "SELECT id, t_start, t_end FROM reels WHERE generation_id = ?",
                 ("gen-5min",),
             )
-        self.assertEqual(rows, [])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(float(rows[0]["t_start"]), 0.0)
+        self.assertEqual(float(rows[0]["t_end"]), 300.0)
 
         with db_module.get_conn() as conn:
             feed = main_module.reel_service.ranked_feed(
                 conn, material_id=MATERIAL_ID, generation_id="gen-5min"
             )
-        self.assertEqual(len(feed), 0)
+        self.assertEqual(len(feed), 1)
 
     # ------------------------------------------------------------------ #
     # dry_run: discover-only viability probe, zero DB writes, non-empty
@@ -1055,7 +1181,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 14)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 15)
 
 
 if __name__ == "__main__":

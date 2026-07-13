@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
@@ -84,6 +85,44 @@ def _discovery() -> dict:
     }
 
 
+def _quality_clip(
+    *,
+    cue_id: str = "python",
+    start: float = 0.0,
+    end: float = 10.0,
+    quote: str = "Python functions package reusable instructions.",
+    candidate_id: str | None = None,
+    score: float = 0.9,
+    **overrides,
+) -> dict:
+    """A complete quality_silence_v2 selector result grounded to one cue."""
+    clip = {
+        "start": start,
+        "end": end,
+        "cue_ids": [cue_id],
+        "informativeness": score,
+        "topic_relevance": score,
+        "educational_importance": score,
+        "difficulty": 0.2,
+        "boundary_confidence": 0.9,
+        "self_contained": True,
+        "is_standalone": True,
+        "selection_candidate_id": candidate_id or cue_id,
+        "prerequisite_ids": [],
+        "uncertainty": "low",
+        "directly_teaches_topic": True,
+        "substantive": True,
+        "factually_grounded": True,
+        "topic_evidence_quote": quote,
+        "title": f"Teaching unit: {candidate_id or cue_id}",
+        "learning_objective": f"Understand {candidate_id or cue_id}",
+        "facet": candidate_id or cue_id,
+        "reason": "A complete, transcript-grounded teaching unit.",
+    }
+    clip.update(overrides)
+    return clip
+
+
 def test_generation_stage_counters_are_thread_safe() -> None:
     context = GenerationContext("slow")
 
@@ -141,44 +180,10 @@ def test_ingest_topic_records_stage_counts_and_propagates_shared_deadline(
     counters = context.counters()
     assert counters["discovered_videos"] == 1
     assert counters["usable_transcripts"] == 1
-    assert counters["gemini_empty_results"] == 2
+    assert counters["gemini_empty_results"] == 1
 
 
-def test_bootstrap_uses_one_end_to_end_deadline_from_search_through_segmentation(
-    monkeypatch,
-) -> None:
-    captured_discovery: dict = {}
-    captured_settings: list[dict] = []
-
-    def discover(*_args, **kwargs):
-        captured_discovery.update(kwargs)
-        return _discovery()
-
-    def fake_clip(_url, *, topic, settings, should_cancel):
-        del topic, should_cancel
-        captured_settings.append(settings)
-        return {"clips": [], "transcript": _transcript(), "notes": ""}
-
-    monkeypatch.setattr(pipeline_module, "_discover", discover)
-    monkeypatch.setattr(pipeline_module.clip_engine_run, "clip", fake_clip)
-    started = time.monotonic()
-
-    _pipeline().ingest_topic(
-        topic="Intro to Python",
-        material_id="material",
-        concept_id="concept",
-        generation_context=GenerationContext("slow"),
-        retrieval_profile="bootstrap",
-        max_videos=1,
-    )
-
-    discovery_deadline = float(captured_discovery["deadline_monotonic"])
-    assert discovery_deadline == captured_settings[0]["deadline_monotonic"]
-    assert started + 44.0 <= discovery_deadline <= started + 46.0
-    assert captured_discovery["retrieval_profile"] == "bootstrap"
-
-
-def test_bootstrap_records_discovered_sources_before_video_timeout(monkeypatch) -> None:
+def test_generation_records_discovered_sources_before_video_timeout(monkeypatch) -> None:
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
     monkeypatch.setattr(
         _pipeline().__class__,
@@ -200,7 +205,7 @@ def test_bootstrap_records_discovered_sources_before_video_timeout(monkeypatch) 
             material_id="material",
             concept_id="concept",
             generation_context=GenerationContext("slow"),
-            retrieval_profile="bootstrap",
+            retrieval_profile="deep",
             max_videos=1,
             retrieved_video_ids=retrieved,
         )
@@ -239,8 +244,14 @@ def test_ingest_topic_uses_literal_identity_for_segmentation(monkeypatch) -> Non
 def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypatch) -> None:
     engine_out = {
         "clips": [
-            {"start": 0.0, "end": 10.0, "cue_ids": ["python"], "informativeness": 0.9},
-            {"start": 10.0, "end": 20.0, "cue_ids": ["garden"], "informativeness": 0.9},
+            _quality_clip(),
+            _quality_clip(
+                cue_id="garden",
+                start=10.0,
+                end=20.0,
+                quote="Garden soil needs regular watering.",
+                directly_teaches_topic=False,
+            ),
         ],
         "transcript": _transcript(),
         "notes": "",
@@ -270,17 +281,8 @@ def test_ingest_topic_rejects_transcript_window_without_topic_evidence(monkeypat
     assert counters["persisted_clips"] == 1
 
 
-@pytest.mark.parametrize(
-    ("retrieval_profile", "expected_phase_timeout"),
-    [
-        ("bootstrap", 20.0),
-        ("deep", 45.0),
-    ],
-)
-def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phase(
+def test_topic_generation_prepares_audio_once_overlaps_three_acoustic_checks_and_streams_in_order(
     monkeypatch,
-    retrieval_profile,
-    expected_phase_timeout,
 ) -> None:
     transcript = {
         "source": "supadata",
@@ -293,74 +295,52 @@ def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phas
             {"cue_id": "three", "start": 20.0, "end": 30.0, "text": "Python dictionaries connect unique keys to stored values."},
         ],
     }
-    clips = []
-    for index, (cue_id, quote) in enumerate(
-        [
-            ("one", "Python functions package reusable instructions for later calls"),
-            ("two", "Python loops repeat a block while a condition remains true"),
-            ("three", "Python dictionaries connect unique keys to stored values"),
-        ]
-    ):
-        clips.append({
-            "start": float(index * 10),
-            "end": float((index + 1) * 10),
-            "cue_ids": [cue_id],
-            "informativeness": 0.9 - index * 0.1,
-            "topic_relevance": 0.9 - index * 0.1,
-            "educational_importance": 0.9 - index * 0.1,
-            "difficulty": 0.2,
-            "boundary_confidence": 0.9,
-            "is_standalone": True,
-            "selection_candidate_id": cue_id,
-            "prerequisite_ids": [],
-            "uncertainty": "low",
-                "directly_teaches_topic": True,
-                "substantive": True,
-                "factually_grounded": True,
-                "topic_evidence_quote": quote,
-        })
+    clips = [
+        _quality_clip(
+            cue_id="one",
+            start=0.0,
+            end=10.0,
+            quote="Python functions package reusable instructions for later calls.",
+            score=0.9,
+        ),
+        _quality_clip(
+            cue_id="two",
+            start=10.0,
+            end=20.0,
+            quote="Python loops repeat a block while a condition remains true.",
+            score=0.85,
+        ),
+        _quality_clip(
+            cue_id="three",
+            start=20.0,
+            end=30.0,
+            quote="Python dictionaries connect unique keys to stored values.",
+            score=0.8,
+        ),
+    ]
     engine_out = {"clips": clips, "transcript": transcript, "notes": ""}
-    selection_deadline: list[float] = []
 
-    def run_clip(*_args, deadline_monotonic, **_kwargs):
-        selection_deadline.append(float(deadline_monotonic))
+    def run_clip(*_args, **_kwargs):
         return engine_out
 
-    monkeypatch.setattr(pipeline_module, "INGEST_TOPIC_VIDEO_TIMEOUT_SEC", 0.05)
-    monkeypatch.setattr(pipeline_module, "INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC", 0.05)
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
     monkeypatch.setattr(pipeline_module, "_run_clip", run_clip)
-    original_caption_diagnostics = pipeline_module._supadata_boundary_diagnostics
-    caption_calls = 0
-
-    def caption_after_selection_deadline(*args, **kwargs):
-        nonlocal caption_calls
-        caption_calls += 1
-        if caption_calls == 1:
-            time.sleep(max(0.0, selection_deadline[0] - time.monotonic()) + 0.02)
-        return original_caption_diagnostics(*args, **kwargs)
-
-    monkeypatch.setattr(
-        pipeline_module,
-        "_supadata_boundary_diagnostics",
-        caption_after_selection_deadline,
-    )
     persisted_clips: list[dict] = []
 
     def persist(*, clip, **_kwargs):
         persisted_clips.append(clip)
-        return (f"verified-reel-{len(persisted_clips)}", mock.sentinel.metadata)
+        candidate_id = str(clip["selection_candidate_id"]).split("::")[-1]
+        return (f"verified-reel-{candidate_id}", mock.sentinel.metadata)
 
     pipeline = _pipeline()
     monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
     prepared = mock.sentinel.prepared_audio
 
-    def delayed_prepare(*_args, **_kwargs):
-        time.sleep(0.25)
-        return prepared
-
-    prepare_audio = mock.Mock(side_effect=delayed_prepare)
-    verification_windows: list[tuple[float, float]] = []
+    prepare_audio = mock.Mock(return_value=prepared)
+    verification_started: dict[float, float] = {}
+    verification_finished: dict[float, float] = {}
+    verification_lock = threading.Lock()
+    all_started = threading.Event()
 
     def verify_audio(
         _source,
@@ -370,9 +350,14 @@ def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phas
         timeout_sec,
         **_kwargs,
     ):
-        verification_windows.append((time.monotonic(), timeout_sec))
-        if len(verification_windows) == 1:
-            time.sleep(0.05)
+        with verification_lock:
+            verification_started[start_sec] = time.monotonic()
+            if len(verification_started) == 3:
+                all_started.set()
+        assert all_started.wait(timeout=1.0)
+        time.sleep(0.02 if start_sec == 0.0 else 0.15)
+        with verification_lock:
+            verification_finished[start_sec] = time.monotonic()
         return mock.Mock(
             verified=True,
             start_sec=start_sec,
@@ -396,6 +381,12 @@ def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phas
         verify_audio_mock,
     )
     emitted: list[str] = []
+    emitted_at: list[float] = []
+
+    def emit(reel: str) -> None:
+        emitted.append(reel)
+        emitted_at.append(time.monotonic())
+
     context = GenerationContext("slow", require_acoustic_boundaries=True)
 
     reels, _ = pipeline.ingest_topic(
@@ -405,12 +396,12 @@ def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phas
         generation_context=context,
         max_videos=1,
         max_reels=3,
-        on_reel_created=emitted.append,
-        retrieval_profile=retrieval_profile,
+        on_reel_created=emit,
+        retrieval_profile="deep",
     )
 
-    assert reels == ["verified-reel-1", "verified-reel-2", "verified-reel-3"]
-    assert emitted == ["verified-reel-1", "verified-reel-2", "verified-reel-3"]
+    assert reels == ["verified-reel-one", "verified-reel-two", "verified-reel-three"]
+    assert emitted == ["verified-reel-one", "verified-reel-two", "verified-reel-three"]
     assert len(persisted_clips) == 3
     boundary = persisted_clips[0]["search_context"]
     assert boundary["boundary_status"] == "verified"
@@ -434,111 +425,22 @@ def test_topic_generation_waits_for_delayed_preparation_and_shares_acoustic_phas
             "end_quiet": [9.8, 10.1],
         },
     }
-    assert verification_windows[0][0] > selection_deadline[0]
-    assert (
-        0.0
-        < verification_windows[1][1]
-        < verification_windows[0][1]
-        <= expected_phase_timeout
-    )
-    assert verification_windows[0][1] > expected_phase_timeout - 1.0
-    phase_deadlines = [started + timeout for started, timeout in verification_windows]
-    assert phase_deadlines == pytest.approx([phase_deadlines[0]] * 3, abs=0.01)
+    assert max(verification_started.values()) < min(verification_finished.values())
+    assert emitted_at[0] < verification_finished[10.0]
+    assert emitted_at[0] < verification_finished[20.0]
     prepare_audio.assert_called_once()
     assert verify_audio_mock.call_count == 3
     assert all(
         call.kwargs["prepared"] is prepared
         for call in verify_audio_mock.call_args_list
     )
+    assert {
+        (call.kwargs["search_start_limit_sec"], call.kwargs["search_end_limit_sec"])
+        for call in verify_audio_mock.call_args_list
+    } == {(0.0, 30.0)}
     assert context.counters()["stored_clips"] == 3
     assert context.counters()["deferred_clips"] == 0
     assert context.counters()["persisted_clips"] == 3
-
-
-def test_level_mismatch_is_verified_and_stored_without_streaming(monkeypatch) -> None:
-    transcript = _transcript()
-    engine_out = {
-        "clips": [{
-            "start": 0.0,
-            "end": 10.0,
-            "cue_ids": ["python"],
-            "informativeness": 0.9,
-            "topic_relevance": 0.9,
-            "educational_importance": 0.9,
-            "difficulty": 0.95,
-            "boundary_confidence": 0.9,
-            "is_standalone": True,
-            "selection_candidate_id": "advanced-functions",
-            "prerequisite_ids": [],
-            "uncertainty": "low",
-            "directly_teaches_topic": True,
-            "substantive": True,
-            "factually_grounded": True,
-            "topic_evidence_quote": (
-                "Python functions package reusable instructions"
-            ),
-        }],
-        "transcript": transcript,
-        "notes": "",
-    }
-    monkeypatch.setattr(
-        pipeline_module,
-        "_discover",
-        lambda *_args, **_kwargs: _discovery(),
-    )
-    monkeypatch.setattr(
-        pipeline_module,
-        "_run_clip",
-        lambda *_args, **_kwargs: engine_out,
-    )
-    monkeypatch.setattr(
-        pipeline_module.clip_engine_silence,
-        "prepare_audio_source",
-        mock.Mock(return_value=mock.sentinel.prepared_audio),
-    )
-    monkeypatch.setattr(
-        pipeline_module.clip_engine_silence,
-        "verify_acoustic_boundaries",
-        mock.Mock(return_value=mock.Mock(
-            verified=True,
-            start_sec=0.0,
-            end_sec=10.0,
-            diagnostics={"threshold_dbfs": -38.0},
-        )),
-    )
-    stored: list[dict] = []
-    pipeline = _pipeline()
-
-    def persist(*, clip, **_kwargs):
-        stored.append(clip)
-        return ("advanced-reservoir", mock.sentinel.metadata)
-
-    monkeypatch.setattr(pipeline, "_persist_engine_clip", persist)
-    emitted: list[str] = []
-    context = GenerationContext("slow", require_acoustic_boundaries=True)
-
-    reels, _ = pipeline.ingest_topic(
-        topic="Intro to Python",
-        material_id="material",
-        concept_id="concept",
-        knowledge_level="beginner",
-        generation_context=context,
-        retrieval_profile="bootstrap",
-        max_videos=1,
-        max_reels=1,
-        on_reel_created=emitted.append,
-    )
-
-    assert reels == []
-    assert emitted == []
-    assert len(stored) == 1
-    boundary = stored[0]["search_context"]
-    assert boundary["boundary_status"] == "verified"
-    assert boundary["surface_eligible"] is False
-    assert boundary["surface_reason"] == "level_mismatch"
-    assert context.counters()["stored_clips"] == 1
-    assert context.counters()["deferred_clips"] == 1
-    assert context.counters()["persisted_clips"] == 0
 
 
 @pytest.mark.parametrize(
@@ -560,10 +462,10 @@ def test_level_mismatch_is_verified_and_stored_without_streaming(monkeypatch) ->
             {
                 "verified": True,
                 "start_sec": 0.0,
-                "end_sec": 0.5,
+                "end_sec": 9.5,
                 "diagnostics": {},
             },
-            "acoustic_adjusted_duration_invalid",
+            "acoustic_boundary_outside_source_or_required_speech",
         ),
     ],
 )
@@ -573,26 +475,8 @@ def test_acoustic_failure_is_stored_but_never_emitted(
     expected_reason: str,
 ) -> None:
     transcript = _transcript()
-    quote = "Python functions package reusable instructions"
     engine_out = {
-        "clips": [{
-            "start": 0.0,
-            "end": 10.0,
-            "cue_ids": ["python"],
-            "informativeness": 0.8,
-            "topic_relevance": 0.8,
-            "educational_importance": 0.8,
-            "difficulty": 0.2,
-            "boundary_confidence": 0.9,
-            "is_standalone": True,
-            "selection_candidate_id": "python-functions",
-            "prerequisite_ids": [],
-            "uncertainty": "low",
-            "directly_teaches_topic": True,
-            "substantive": True,
-            "factually_grounded": True,
-            "topic_evidence_quote": quote,
-        }],
+        "clips": [_quality_clip(candidate_id="python-functions", score=0.8)],
         "transcript": transcript,
         "notes": "",
     }
@@ -624,7 +508,7 @@ def test_acoustic_failure_is_stored_but_never_emitted(
         material_id="material",
         concept_id="concept",
         generation_context=context,
-        retrieval_profile="bootstrap",
+        retrieval_profile="deep",
         max_videos=1,
         max_reels=1,
         on_reel_created=emitted.append,
@@ -671,11 +555,11 @@ def test_generation_count_excludes_all_explicitly_deferred_boundary_rows(
     )
 
     # Count only current strict diagnostics; missing, adaptive, noisier, and
-    # non-object metadata must never stop verified deep backfill.
+    # non-object metadata never count as ready v2 inventory.
     assert main._count_generation_reels(object(), "generation") == 1
 
 
-def test_failed_and_level_deferred_storage_does_not_consume_ready_material_cap(
+def test_failed_boundary_storage_does_not_consume_ready_material_cap(
     monkeypatch,
 ) -> None:
     deferred = [
@@ -723,63 +607,31 @@ def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
     }
     engine_out = {
         "clips": [
-            {
-                "start": 0.0,
-                "end": 10.0,
-                "cue_ids": ["logistics"],
-                "informativeness": 0.0,
-                "topic_relevance": 0.0,
-                "educational_importance": 0.0,
-                "difficulty": 0.1,
-                "boundary_confidence": 0.9,
-                "is_standalone": True,
-                "selection_candidate_id": "logistics",
-                "prerequisite_ids": [],
-                "uncertainty": "low",
-                "directly_teaches_topic": False,
-                "substantive": False,
-                "factually_grounded": False,
-                "topic_evidence_quote": "Welcome to biology at Stanford University",
-            },
-            {
-                "start": 10.0,
-                "end": 20.0,
-                "cue_ids": ["teaching"],
-                "informativeness": 0.0,
-                "topic_relevance": 0.0,
-                "educational_importance": 0.0,
-                "difficulty": 0.8,
-                "boundary_confidence": 0.9,
-                "is_standalone": True,
-                "selection_candidate_id": "cell-energy",
-                "prerequisite_ids": [],
-                "uncertainty": "medium",
-                "directly_teaches_topic": True,
-                "substantive": True,
-                "factually_grounded": True,
-                "topic_evidence_quote": (
-                    "Cells convert nutrient energy into ATP through a sequence of enzyme controlled reactions"
-                ),
-            },
-            {
-                "start": 10.0,
-                "end": 20.0,
-                "cue_ids": ["teaching"],
-                "informativeness": 0.9,
-                "topic_relevance": 0.9,
-                "educational_importance": 0.9,
-                "difficulty": 0.2,
-                "boundary_confidence": 0.9,
-                "is_standalone": True,
-                "selection_candidate_id": "missing-grounding-contract",
-                "prerequisite_ids": [],
-                "uncertainty": "low",
-                "directly_teaches_topic": True,
-                "substantive": True,
-                "topic_evidence_quote": (
-                    "Cells convert nutrient energy into ATP through a sequence of enzyme controlled reactions"
-                ),
-            },
+            _quality_clip(
+                cue_id="logistics",
+                quote="Welcome to biology at Stanford University",
+                candidate_id="logistics",
+                score=0.0,
+                directly_teaches_topic=False,
+                substantive=False,
+                factually_grounded=False,
+            ),
+            _quality_clip(
+                cue_id="teaching",
+                start=10.0,
+                end=20.0,
+                quote="Cells convert nutrient energy into ATP through a sequence of enzyme controlled reactions.",
+                candidate_id="cell-energy",
+                score=0.8,
+            ),
+            _quality_clip(
+                cue_id="teaching",
+                start=10.0,
+                end=20.0,
+                quote="Cells convert nutrient energy into ATP through a sequence of enzyme controlled reactions.",
+                candidate_id="missing-grounding-contract",
+                factually_grounded=None,
+            ),
         ],
         "transcript": transcript,
         "notes": "",
@@ -798,10 +650,9 @@ def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
     assert [clip["selection_candidate_id"] for clip in clips] == [
         "dQw4w9WgXcQ::cell-energy"
     ]
-    assert clips[0]["score"] == 0.0
+    assert clips[0]["score"] == 0.8
     assert clips[0]["search_context"]["topic_evidence_quote"].startswith("Cells convert")
     assert clips[0]["search_context"]["factually_grounded"] is True
-    assert clips[0]["search_context"]["deferred_level"] is True
 
 
 def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
@@ -828,11 +679,12 @@ def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
         ],
     }
     clip_defaults = {
-        "informativeness": 0.5,
-        "topic_relevance": 0.5,
-        "educational_importance": 0.5,
+        "informativeness": 0.8,
+        "topic_relevance": 0.8,
+        "educational_importance": 0.8,
         "difficulty": 0.4,
         "boundary_confidence": 0.9,
+        "self_contained": True,
         "is_standalone": True,
         "prerequisite_ids": [],
         "uncertainty": "low",
@@ -879,28 +731,55 @@ def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
 
 
 @pytest.mark.parametrize(
-    ("knowledge_level", "expected_start"),
-    [("beginner", 0.0), ("advanced", 10.0)],
+    ("quality_axis", "value", "accepted"),
+    [
+        ("informativeness", 0.74, False),
+        ("informativeness", 0.75, True),
+        ("topic_relevance", 0.74, False),
+        ("topic_relevance", 0.75, True),
+        ("educational_importance", 0.74, False),
+        ("educational_importance", 0.75, True),
+    ],
 )
-def test_practice_clips_are_reordered_for_learner_level(
-    monkeypatch, knowledge_level: str, expected_start: float
+def test_each_quality_axis_has_an_independent_hard_point_seven_five_gate(
+    monkeypatch,
+    quality_axis: str,
+    value: float,
+    accepted: bool,
+) -> None:
+    engine_out = {
+        "clips": [_quality_clip(**{quality_axis: value})],
+        "transcript": _transcript(),
+        "notes": "",
+    }
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+
+    _, clips, _ = _pipeline()._clip_and_filter(
+        _video(), "Intro to Python", "en"
+    )
+
+    assert bool(clips) is accepted
+
+
+@pytest.mark.parametrize("knowledge_level", ["beginner", "advanced"])
+def test_quality_ranking_is_learner_level_neutral(
+    monkeypatch, knowledge_level: str
 ) -> None:
     engine_out = {
         "clips": [
-            {
-                "start": 0.0,
-                "end": 10.0,
-                "informativeness": 0.9,
-                "topic_relevance": 0.9,
-                "difficulty": 0.1,
-            },
-            {
-                "start": 10.0,
-                "end": 20.0,
-                "informativeness": 0.9,
-                "topic_relevance": 0.9,
-                "difficulty": 0.9,
-            },
+            _quality_clip(score=0.8, difficulty=0.1),
+            _quality_clip(
+                cue_id="garden",
+                start=10.0,
+                end=20.0,
+                quote="Garden soil needs regular watering.",
+                score=0.9,
+                difficulty=0.9,
+            ),
         ],
         "transcript": _transcript(),
         "notes": "",
@@ -910,26 +789,22 @@ def test_practice_clips_are_reordered_for_learner_level(
 
     _, clips, _ = _pipeline()._clip_and_filter(video, "Intro to Python", "en")
 
-    assert clips[0]["start"] == expected_start
+    assert [clip["start"] for clip in clips] == [10.0, 0.0]
+    assert [clip["score"] for clip in clips] == [0.9, 0.8]
 
 
 def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None:
     engine_out = {
-        "clips": [{
-            "start": 0.0,
-            "end": 10.0,
-            "cue_ids": ["python"],
-            "informativeness": 0.7,
-            "topic_relevance": 0.8,
-            "educational_importance": 0.9,
-            "boundary_confidence": 0.85,
-            "is_standalone": True,
-            "chain_id": "python-functions",
-            "chain_position": 2,
-            "selection_candidate_id": "python-functions-2",
-            "prerequisite_ids": [],
-            "difficulty": 0.95,
-        }],
+        "clips": [_quality_clip(
+            informativeness=0.8,
+            topic_relevance=0.85,
+            educational_importance=0.9,
+            boundary_confidence=0.85,
+            chain_id="python-functions",
+            chain_position=2,
+            candidate_id="python-functions-2",
+            difficulty=0.95,
+        )],
         "transcript": _transcript(),
         "notes": "",
     }
@@ -942,7 +817,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "confidence_v1"
+        assert context["selection_contract_version"] == "quality_silence_v2"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
@@ -950,39 +825,22 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         assert context["selection_candidate_id"] == "dQw4w9WgXcQ::python-functions-2"
         assert context["prerequisite_ids"] == []
 
-    assert scores == pytest.approx([0.815, 0.815])
+    assert scores == pytest.approx([0.8, 0.8])
 
 
-def test_filter_orders_prerequisite_before_higher_score_dependent(monkeypatch) -> None:
+def test_filter_rejects_non_standalone_dependent_instead_of_repairing_it(
+    monkeypatch,
+) -> None:
     engine_out = {
         "clips": [
-            {
-                "start": 0.0,
-                "end": 10.0,
-                "cue_ids": ["python"],
-                "informativeness": 0.7,
-                "topic_relevance": 0.7,
-                "educational_importance": 0.61,
-                "boundary_confidence": 0.9,
-                "is_standalone": True,
-                "selection_candidate_id": "root",
-                "prerequisite_ids": [],
-                "difficulty": 0.5,
-            },
-                    {
-                        "start": 0.0,
-                        "end": 10.0,
-                        "cue_ids": ["python"],
-                "cue_ids": ["python"],
-                "informativeness": 0.95,
-                "topic_relevance": 0.95,
-                "educational_importance": 0.99,
-                "boundary_confidence": 0.9,
-                "is_standalone": False,
-                "selection_candidate_id": "dependent",
-                "prerequisite_ids": ["root"],
-                "difficulty": 0.5,
-            },
+            _quality_clip(candidate_id="root", score=0.8),
+            _quality_clip(
+                candidate_id="dependent",
+                score=0.99,
+                self_contained=False,
+                is_standalone=False,
+                prerequisite_ids=["root"],
+            ),
         ],
         "transcript": _transcript(),
         "notes": "",
@@ -993,11 +851,10 @@ def test_filter_orders_prerequisite_before_higher_score_dependent(monkeypatch) -
 
     assert [clip["selection_candidate_id"] for clip in clips] == [
         "dQw4w9WgXcQ::root",
-        "dQw4w9WgXcQ::dependent",
     ]
 
 
-def test_joint_one_plus_one_initial_yield_uses_one_aggregate_pro_fallback(
+def test_multiple_flash_source_results_never_trigger_pro_fallback(
     monkeypatch,
 ) -> None:
     first = _video()
@@ -1076,12 +933,11 @@ def test_joint_one_plus_one_initial_yield_uses_one_aggregate_pro_fallback(
         generation_context=GenerationContext("slow"),
     )
 
-    assert len(reels) == 3
-    assert any(str(reel).endswith(":10.0") for reel in reels)
-    pro_fallback.assert_called_once()
+    assert len(reels) == 2
+    pro_fallback.assert_not_called()
 
 
-def test_raw_flash_yield_does_not_block_pro_when_acoustic_yield_is_zero(
+def test_acoustic_failures_fail_closed_without_pro_repair(
     monkeypatch,
 ) -> None:
     first = _video()
@@ -1173,10 +1029,10 @@ def test_raw_flash_yield_does_not_block_pro_when_acoustic_yield_is_zero(
     )
 
     assert reels == []
-    pro_fallback.assert_called_once()
+    pro_fallback.assert_not_called()
 
 
-def test_bootstrap_skips_pro_fallback_and_optional_enrichment(monkeypatch) -> None:
+def test_generation_skips_pro_repair_and_synchronous_enrichment(monkeypatch) -> None:
     video = _video()
     discovery_limits: list[int] = []
 
@@ -1202,19 +1058,13 @@ def test_bootstrap_skips_pro_fallback_and_optional_enrichment(monkeypatch) -> No
     monkeypatch.setattr(
         pipeline,
         "_persist_engine_clip",
-        mock.Mock(return_value=("bootstrap-reel", mock.sentinel.metadata)),
+        mock.Mock(return_value=("v2-reel", mock.sentinel.metadata)),
     )
     pro_fallback = mock.Mock()
-    enrichment = mock.Mock()
     monkeypatch.setattr(
         pipeline_module.clip_engine_run,
         "pro_boundary_fallback",
         pro_fallback,
-    )
-    monkeypatch.setattr(
-        pipeline_module.live_gemini_segment,
-        "enrich_accepted_clips",
-        enrichment,
     )
     context = GenerationContext("slow")
     analyzed: set[str] = set()
@@ -1226,33 +1076,37 @@ def test_bootstrap_skips_pro_fallback_and_optional_enrichment(monkeypatch) -> No
         max_videos=3,
         max_reels=2,
         generation_context=context,
-        retrieval_profile="bootstrap",
+        retrieval_profile="deep",
         analyzed_video_ids=analyzed,
     )
 
-    assert reels == ["bootstrap-reel"]
-    assert discovery_limits == [3]
+    assert reels == ["v2-reel"]
+    assert len(discovery_limits) == 1
     assert analyzed == {video["id"]}
     pro_fallback.assert_not_called()
-    enrichment.assert_not_called()
-    assert context.claim_aggregate_pro_fallback(validated_count=0) is True
+    assert not hasattr(pipeline_module, "live_gemini_segment")
+    assert context.counters()["boundary_repairs"] == 0
+    assert context.counters()["pro_fallbacks"] == 0
 
 
-def test_bootstrap_clip_call_closes_pro_fallback_gate(monkeypatch) -> None:
+def test_clip_call_uses_one_low_thinking_flash_selector_and_ignores_duration(
+    monkeypatch,
+) -> None:
     captured: dict = {}
 
     def clip(_url, **kwargs):
         captured.update(kwargs["settings"])
         return {"clips": [], "transcript": {"segments": []}}
 
-    monkeypatch.setattr(pipeline_module.clip_engine_run, "clip", clip)
+    clip_mock = mock.Mock(side_effect=clip)
+    monkeypatch.setattr(pipeline_module.clip_engine_run, "clip", clip_mock)
 
     pipeline_module._run_clip(
         "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         topic="Intro to Python",
         language="en",
         should_cancel=None,
-        retrieval_profile="bootstrap",
+        retrieval_profile="deep",
         target_clip_duration_sec=40,
         target_clip_duration_min_sec=10,
         target_clip_duration_max_sec=55,
@@ -1263,12 +1117,16 @@ def test_bootstrap_clip_call_closes_pro_fallback_gate(monkeypatch) -> None:
     assert fallback_gate(accepted_count=0, video_id="dQw4w9WgXcQ") is False
     assert captured["_segment_routing_mode"] == "flash_only"
     assert captured["_segment_thinking_level"] == "low"
-    assert captured["_segment_target_sec"] == 40
-    assert captured["_segment_target_min_sec"] == 10
-    assert captured["_segment_target_max_sec"] == 55
+    assert "_segment_target_sec" not in captured
+    assert "_segment_target_min_sec" not in captured
+    assert "_segment_target_max_sec" not in captured
+    assert clip_mock.call_count == 1
 
 
-def test_deep_clip_call_uses_low_thinking_to_preserve_candidate_output(monkeypatch) -> None:
+@pytest.mark.parametrize("mode", ["fast", "slow"])
+def test_fast_and_slow_clip_calls_use_identical_quality_routing(
+    monkeypatch, mode: str
+) -> None:
     captured: dict = {}
 
     def clip(_url, **kwargs):
@@ -1282,15 +1140,19 @@ def test_deep_clip_call_uses_low_thinking_to_preserve_candidate_output(monkeypat
         topic="Intro to Python",
         language="en",
         should_cancel=None,
+        generation_context=GenerationContext(mode),
         retrieval_profile="deep",
     )
 
     assert captured["_segment_thinking_level"] == "low"
-    assert "_segment_routing_mode" not in captured
-    assert "_segment_pro_fallback_gate" not in captured
+    assert captured["_segment_routing_mode"] == "flash_only"
+    assert captured["_segment_pro_fallback_gate"](
+        accepted_count=0,
+        video_id="dQw4w9WgXcQ",
+    ) is False
 
 
-def test_aggregate_pro_fallback_targets_lowest_yield_initial_video(
+def test_low_yield_source_does_not_trigger_pro_or_extra_backfill(
     monkeypatch,
 ) -> None:
     first = _video()
@@ -1346,11 +1208,11 @@ def test_aggregate_pro_fallback_targets_lowest_yield_initial_video(
         generation_context=GenerationContext("slow"),
     )
 
-    assert len(reels) == 3
-    assert pro_fallback.call_args.kwargs["video_id"] == second["id"]
+    assert len(reels) == 2
+    pro_fallback.assert_not_called()
 
 
-def test_unusable_initial_transcripts_do_not_consume_aggregate_pro_slot(
+def test_unusable_transcripts_never_trigger_pro_fallback(
     monkeypatch,
 ) -> None:
     first = _video()
@@ -1387,7 +1249,7 @@ def test_unusable_initial_transcripts_do_not_consume_aggregate_pro_slot(
 
     assert reels == []
     pro_fallback.assert_not_called()
-    assert context.claim_aggregate_pro_fallback(validated_count=0) is True
+    assert context.counters()["pro_fallbacks"] == 0
 
 
 def test_ingest_topic_counts_shared_clip_fetch_timeout_separately(monkeypatch) -> None:
@@ -1415,18 +1277,28 @@ def test_ingest_topic_counts_shared_clip_fetch_timeout_separately(monkeypatch) -
     assert context.counters()["transcript_timeouts"] == 0
 
 
-def test_fast_generation_retains_backfill_pool_without_exceeding_analysis_budget(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("mode", "expected_sources"),
+    [("fast", 2), ("slow", 3)],
+)
+def test_mode_source_budgets_are_analyzed_concurrently_without_backfill(
+    monkeypatch, mode: str, expected_sources: int
 ) -> None:
     videos = [
         {**_video(), "id": f"video-{index}", "url": f"https://youtu.be/video-{index}"}
         for index in range(5)
     ]
-    discover_limits: list[int] = []
+    discovery_calls = 0
     analyzed: list[str] = []
+    concurrency_lock = threading.Lock()
+    all_started = threading.Event()
+    active = 0
+    max_active = 0
 
     def discover(*_args, **kwargs):
-        discover_limits.append(kwargs["limit"])
+        nonlocal discovery_calls
+        del kwargs
+        discovery_calls += 1
         return {
             "corrected": "Intro to Python",
             "videos": videos,
@@ -1434,9 +1306,19 @@ def test_fast_generation_retains_backfill_pool_without_exceeding_analysis_budget
             "warning": None,
         }
 
-    def clip_and_filter(video, *_args):
-        analyzed.append(video["id"])
-        return video, [], {"transcript": {}}
+    def clip_and_filter(video, *_args, **_kwargs):
+        nonlocal active, max_active
+        with concurrency_lock:
+            analyzed.append(video["id"])
+            active += 1
+            max_active = max(max_active, active)
+            if active == expected_sources:
+                all_started.set()
+        assert all_started.wait(timeout=1.0)
+        time.sleep(0.02)
+        with concurrency_lock:
+            active -= 1
+        return video, [], {"transcript": _transcript()}
 
     pipeline = _pipeline()
     monkeypatch.setattr(pipeline_module, "_discover", discover)
@@ -1446,12 +1328,13 @@ def test_fast_generation_retains_backfill_pool_without_exceeding_analysis_budget
         topic="Intro to Python",
         material_id="material",
         concept_id="concept",
-        generation_context=GenerationContext("fast"),
+        generation_context=GenerationContext(mode),
         max_videos=5,
     )
 
-    assert discover_limits == [5]
-    assert len(analyzed) == 3
+    assert discovery_calls == 1
+    assert len(analyzed) == expected_sources
+    assert max_active == expected_sources
 
 
 def test_ingest_topic_distinguishes_unavailable_transcript_from_provider_failure(

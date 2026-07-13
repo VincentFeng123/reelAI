@@ -152,13 +152,9 @@ function pushPointAwayFromPoint(
 }
 
 function buildHeuristicAvailabilityState(settings: StudyReelsSettings): SettingsAvailabilityState {
-  const clipWidth = settings.targetClipDurationMaxSec - settings.targetClipDurationMinSec;
   const limitingFactors: string[] = [];
   if (settings.minRelevanceThreshold >= 0.45) {
     limitingFactors.push("high similarity threshold");
-  }
-  if (clipWidth < 20) {
-    limitingFactors.push("narrow clip range");
   }
   if (settings.preferredVideoDuration === "long") {
     limitingFactors.push("long source preference");
@@ -735,8 +731,8 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   };
 
   const settingsSummary = useMemo(() => {
-    return `Match ${minRelevanceThreshold.toFixed(2)}+ · ${durationSummaryLabel[preferredVideoDuration]} source videos · prefer ${targetClipDurationMinSec}-${targetClipDurationMaxSec}s clips · ${creativeCommonsOnly ? "Creative Commons" : "Any license"} · ${startMuted ? "Muted" : "Sound on"} · ${autoplayNextReel ? "Auto-next on" : "Auto-next off"}`;
-  }, [autoplayNextReel, creativeCommonsOnly, minRelevanceThreshold, preferredVideoDuration, startMuted, targetClipDurationMaxSec, targetClipDurationMinSec]);
+    return `Match ${minRelevanceThreshold.toFixed(2)}+ · ${durationSummaryLabel[preferredVideoDuration]} source videos · ${creativeCommonsOnly ? "Creative Commons" : "Any license"} · ${startMuted ? "Muted" : "Sound on"} · ${autoplayNextReel ? "Auto-next on" : "Auto-next off"}`;
+  }, [autoplayNextReel, creativeCommonsOnly, minRelevanceThreshold, preferredVideoDuration, startMuted]);
 
   const hasUnsavedChanges = useMemo(() => {
     if (!savedPreferences) {
@@ -1017,7 +1013,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
             <div className="rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
               <div className="flex items-center gap-1.5">
                 <p className="text-sm font-semibold text-white/95">Source video length</p>
-                <SettingsInfoTooltip text="Prefer short, medium, or long source videos. This is a retrieval filter, separate from clip-length preferences." />
+                <SettingsInfoTooltip text="Prefer short, medium, or long source videos. This only filters source selection; clip boundaries follow the complete idea." />
               </div>
               <div className="relative mt-3 grid h-11 grid-cols-4 items-center rounded-2xl border border-white/20 bg-white/[0.08] p-1">
                 <span

@@ -43,8 +43,7 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-# v7 also invalidates jobs created with the resolver that lacked browser impersonation.
-REQUEST_SCHEMA_VERSION = "generation-request-v7-browser-audio"
+REQUEST_SCHEMA_VERSION = "quality_silence_v2"
 
 
 class JobLeaseLostError(RuntimeError):
@@ -182,8 +181,10 @@ def build_request_key(
     target_clip_duration_min_sec: int | None,
     target_clip_duration_max_sec: int | None,
     language: str = "en",
+    min_relevance: float | None = None,
+    exclude_video_ids: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> str:
-    """Build the normalized request key; deprecated planner fields are intentionally absent."""
+    """Build the normalized request key; deprecated clip-duration fields are inert."""
     payload = {
         "schema_version": REQUEST_SCHEMA_VERSION,
         "material_id": str(material_id),
@@ -193,10 +194,17 @@ def build_request_key(
         "generation_mode": generation_mode,
         "creative_commons_only": bool(creative_commons_only),
         "source_duration": _normalize_text(source_duration).lower() or "any",
-        "target_clip_duration_sec": int(target_clip_duration_sec),
-        "target_clip_duration_min_sec": int(target_clip_duration_min_sec or 0),
-        "target_clip_duration_max_sec": int(target_clip_duration_max_sec or 0),
         "language": _normalize_text(language).lower() or "en",
+        "min_relevance": (
+            None if min_relevance is None else round(float(min_relevance), 6)
+        ),
+        "exclude_video_ids": sorted(
+            {
+                _normalize_text(video_id).removeprefix("yt:")
+                for video_id in (exclude_video_ids or [])
+                if _normalize_text(video_id)
+            }
+        ),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -242,9 +250,7 @@ def find_completed_job(conn: Any, request_key: str) -> dict[str, Any] | None:
         """
         SELECT * FROM reel_generation_jobs
         WHERE request_key = ?
-          AND status IN ('completed', 'partial')
-          AND result_generation_id IS NOT NULL
-          AND TRIM(result_generation_id) <> ''
+          AND status IN ('completed', 'partial', 'exhausted')
         ORDER BY completed_at DESC, created_at DESC, id DESC
         LIMIT 1
         """,

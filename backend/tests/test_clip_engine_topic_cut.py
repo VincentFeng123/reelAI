@@ -6,9 +6,9 @@ clip_engine_meta.youtube_metadata so no network/disk I/O occurs. _persist_ingest
 writes to a temp SQLite DB.
 
 Coverage:
-  * query="chain rule" → only the on-topic clip survives filter_by_query; off-topic
-    "cooking" clip is dropped; reel_count=1, is_short=False.
-  * query=None → BOTH clips are returned (no relevance filter applied).
+  * query="chain rule" → the whole-transcript selector returns one on-topic clip;
+    reel_count=1, is_short=False.
+  * query=None → two selector-approved informational clips are returned.
   * Each reel's video_url is the YouTube embed URL with its own start/end params.
 """
 
@@ -159,10 +159,17 @@ class ClipEngineTopicCutTests(unittest.TestCase):
         with (
             mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
             mock.patch.object(pipeline_module, "clip_engine_meta") as mock_meta,
+            mock.patch.object(
+                pipeline_module,
+                "_verified_direct_adapter_clips",
+                side_effect=lambda **kwargs: list(kwargs["engine_out"]["clips"]),
+            ) as mock_verify,
         ):
             mock_meta.extract_video_id.return_value = "dQw4w9WgXcQ"
             mock_meta.youtube_metadata.return_value = _FAKE_META
-            mock_run.clip.return_value = _fake_engine_out_two_clips()
+            engine_out = _fake_engine_out_two_clips()
+            engine_out["clips"] = engine_out["clips"][:1]
+            mock_run.clip.return_value = engine_out
 
             result = main_module.ingestion_pipeline.ingest_topic_cut(
                 source_url=source_url,
@@ -170,7 +177,9 @@ class ClipEngineTopicCutTests(unittest.TestCase):
                 language="en",
             )
 
-        # Only the on-topic clip should survive relevance filtering
+        mock_verify.assert_called_once()
+
+        # The exact-topic selector returns only the chain-rule teaching unit.
         self.assertFalse(result.is_short)
         self.assertEqual(result.reel_count, 1)
         self.assertEqual(len(result.reels), 1)
@@ -194,7 +203,7 @@ class ClipEngineTopicCutTests(unittest.TestCase):
         self.assertAlmostEqual(result.duration_sec, 300.0)
 
     # --------------------------------------------------------------------- #
-    # query=None → BOTH clips are returned (no relevance filter)
+    # query=None → both selector-approved clips are returned
     # --------------------------------------------------------------------- #
 
     def test_no_query_returns_all_clips(self) -> None:
@@ -203,6 +212,11 @@ class ClipEngineTopicCutTests(unittest.TestCase):
         with (
             mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
             mock.patch.object(pipeline_module, "clip_engine_meta") as mock_meta,
+            mock.patch.object(
+                pipeline_module,
+                "_verified_direct_adapter_clips",
+                side_effect=lambda **kwargs: list(kwargs["engine_out"]["clips"]),
+            ) as mock_verify,
         ):
             mock_meta.extract_video_id.return_value = "dQw4w9WgXcQ"
             mock_meta.youtube_metadata.return_value = _FAKE_META
@@ -214,7 +228,9 @@ class ClipEngineTopicCutTests(unittest.TestCase):
                 language="en",
             )
 
-        # No query → filter_by_query returns the full list unchanged
+        mock_verify.assert_called_once()
+
+        # With no additional interest, both selector-approved facets persist.
         self.assertFalse(result.is_short)
         self.assertEqual(result.reel_count, 2)
         self.assertEqual(len(result.reels), 2)

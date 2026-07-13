@@ -115,8 +115,8 @@ class GenerationBudget:
 
     _LIMITS: dict[GenerationMode, dict[BudgetedProviderOperation, int]] = {
         # Reservations count provider attempts, including retries.
-        "fast": {"search": 3, "transcript": 3, "segmentation": 3},
-        "slow": {"search": 12, "transcript": 10, "segmentation": 10},
+        "fast": {"search": 3, "transcript": 2, "segmentation": 2},
+        "slow": {"search": 4, "transcript": 3, "segmentation": 3},
     }
     _PASS_LIMITS: dict[GenerationMode, tuple[int, int]] = {
         "fast": (1, 0),
@@ -124,13 +124,13 @@ class GenerationBudget:
     }
     _GEMINI_COST_LIMIT_USD: dict[GenerationMode, float] = {
         "fast": 0.25,
-        "slow": 0.90,
+        "slow": 0.45,
     }
     _FLASH_SELECTOR_LIMIT: dict[GenerationMode, int] = {
-        "fast": 3,
-        "slow": 8,
+        "fast": 2,
+        "slow": 3,
     }
-    _PRO_FALLBACK_CALL_LIMIT = 1
+    _PRO_FALLBACK_CALL_LIMIT = 0
 
     def __init__(self, mode: GenerationMode) -> None:
         self.mode = mode
@@ -211,12 +211,18 @@ class GenerationBudget:
         )
         reservation = max(0.0, float(estimated_cost_usd))
         with self._lock:
+            if is_pro:
+                raise ProviderBudgetExceededError(
+                    "Gemini Pro is disabled for generation.",
+                    provider="gemini",
+                    operation=operation,
+                )
             if (
                 is_pro_fallback
                 and self._pro_fallback_calls >= self._PRO_FALLBACK_CALL_LIMIT
             ):
                 raise ProviderBudgetExceededError(
-                    "Gemini Pro fallback budget exhausted (1 maximum).",
+                    "Gemini Pro fallback is disabled.",
                     provider="gemini",
                     operation=operation,
                 )

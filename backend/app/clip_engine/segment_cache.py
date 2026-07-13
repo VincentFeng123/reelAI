@@ -17,8 +17,9 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_CACHE_VERSION = 3
+SEGMENT_CACHE_VERSION = 4
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
+SELECTION_CONTRACT_VERSION = "quality_silence_v2"
 
 
 def _canonical_json(value: Any) -> str:
@@ -27,36 +28,16 @@ def _canonical_json(value: Any) -> str:
 
 def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     fine_snap = settings.get("segment_fine_snap")
-    info_floor = settings.get("segment_informativeness_min")
-    relevance_floor = settings.get("segment_topic_relevance_min")
-    max_clips = settings.get("max_clips")
     return {
         "fine_snap": (
             bool(pipeline_config.SEGMENT_FINE_SNAP)
             if fine_snap is None
             else bool(fine_snap)
         ),
-        "informativeness_min": float(
-            pipeline_config.SEGMENT_INFORMATIVENESS_MIN
-            if info_floor is None
-            else info_floor
-        ),
-        "topic_relevance_min": float(
-            pipeline_config.SEGMENT_TOPIC_RELEVANCE_MIN
-            if relevance_floor is None
-            else relevance_floor
-        ),
-        "max_clips": max(
-            0,
-            min(
-                40,
-                int(pipeline_config.SEGMENT_MAX_CLIPS if max_clips is None else max_clips),
-            ),
-        ),
-        "enrich_clips": bool(settings.get("segment_enrich_clips", False)),
-        "target_sec": settings.get("_segment_target_sec"),
-        "target_min_sec": settings.get("_segment_target_min_sec"),
-        "target_max_sec": settings.get("_segment_target_max_sec"),
+        "knowledge_level": " ".join(
+            str(settings.get("_knowledge_level") or "").split()
+        ).lower(),
+        "language": " ".join(str(settings.get("language") or "en").split()).lower(),
     }
 
 
@@ -96,23 +77,21 @@ def segment_cache_key(
     }
     payload = {
         "version": SEGMENT_CACHE_VERSION,
+        "selection_contract_version": SELECTION_CONTRACT_VERSION,
         "video_id": str(video_id or "").strip(),
         "topic": " ".join(str(topic or "").split()),
         "transcript_sha256": hashlib.sha256(
             _canonical_json(transcript_payload).encode("utf-8")
         ).hexdigest(),
-        "routing_mode": str(
-            settings.get("_segment_routing_mode")
-            or pipeline_config.SEGMENT_ROUTING_MODE
-        ).strip().lower(),
-        "hybrid_percent": float(pipeline_config.SEGMENT_HYBRID_PERCENT),
         "flash_model": pipeline_config.SEGMENT_FLASH_MODEL,
-        "pro_model": pipeline_config.SEGMENT_PRO_MODEL,
         "segmenter_source_sha256": _segmenter_source_signature(),
         "settings": _relevant_settings(settings),
     }
     digest = hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
-    return f"clip-segmentation:v{SEGMENT_CACHE_VERSION}:{digest}"
+    return (
+        f"clip-segmentation:{SELECTION_CONTRACT_VERSION}:"
+        f"v{SEGMENT_CACHE_VERSION}:{digest}"
+    )
 
 
 def _age_seconds(created_at: object) -> float:
@@ -171,20 +150,15 @@ def _valid_clips(
     transcript: Mapping[str, Any],
     settings: Mapping[str, Any],
 ) -> list[dict[str, Any]] | None:
-    policy = _relevant_settings(settings)
     if (
         not isinstance(value, list)
-        or not value
-        or len(value) > int(policy["max_clips"])
+        or len(value) > 8
     ):
         return None
     bounds = _transcript_bounds(transcript)
     if bounds is None:
         return None
     transcript_start, transcript_end = bounds
-    # Requested duration is an editing preference. A cached clip remains valid
-    # when preserving its complete setup/conclusion needs more time.
-    hard_max = 180.0
     clips: list[dict[str, Any]] = []
     previous_start = -1.0
     for index, raw in enumerate(value, start=1):
@@ -249,12 +223,16 @@ def _valid_clips(
             or start < transcript_start - 0.001
             or end > transcript_end + 0.001
             or start < previous_start
-            or not 1 <= end - start <= hard_max
+            or end <= start
             or not 0 <= informativeness <= 1
             or not 0 <= topic_relevance <= 1
             or not 0 <= educational_importance <= 1
+            or informativeness < 0.75
+            or topic_relevance < 0.75
+            or educational_importance < 0.75
             or not 0 <= difficulty <= 1
             or raw.get("self_contained") is not True
+            or raw.get("is_standalone") is not True
             or raw.get("directly_teaches_topic") is not True
             or raw.get("substantive") is not True
             or raw.get("factually_grounded") is not True
@@ -262,7 +240,10 @@ def _valid_clips(
             or raw.get("kind") != "educational"
             or uncertainty not in {"low", "medium"}
             or not isinstance(uncertainty_reasons, list)
-            or any(not str(raw.get(field) or "").strip() for field in ("title", "facet", "reason"))
+            or any(
+                not str(raw.get(field) or "").strip()
+                for field in ("title", "learning_objective", "facet", "reason")
+            )
             or any(field not in raw for field in ("summary", "takeaways", "match_reason", "assessment"))
             or raw.get("sequence_index") != index
             or not isinstance(raw.get("takeaways"), list)
@@ -312,6 +293,7 @@ def load_segment_result(
     if (
         not isinstance(payload, dict)
         or payload.get("version") != SEGMENT_CACHE_VERSION
+        or payload.get("selection_contract_version") != SELECTION_CONTRACT_VERSION
         or payload.get("video_id") != video_id
     ):
         return None
@@ -343,6 +325,7 @@ def store_segment_result(
                     "response_json": dumps_json(
                         {
                             "version": SEGMENT_CACHE_VERSION,
+                            "selection_contract_version": SELECTION_CONTRACT_VERSION,
                             "video_id": video_id,
                             "clips": validated,
                             "notes": str(notes or ""),

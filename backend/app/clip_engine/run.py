@@ -121,9 +121,8 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
         raise UnsupportedURLError(f"Not a recognized YouTube URL: {url}")
     settings = dict(settings or {})
     settings.setdefault("segment_fine_snap", config.SEGMENT_FINE_SNAP)
-    settings.setdefault("segment_min_clip_s", config.SEGMENT_MIN_CLIP_S)
-    # A Flash response with any rejected proposal is not safe to ship partially.
-    settings.setdefault("segment_accept_partial_flash", False)
+    # Candidates are independently gated; one weak proposal must not poison others.
+    settings.setdefault("segment_accept_partial_flash", True)
     settings["should_cancel"] = should_cancel
 
     canonical_url = f"https://www.youtube.com/watch?v={video_id}"
@@ -170,15 +169,14 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
                         )
                 else:
                     clips, notes = run_segmenter()
-                    if clips:
-                        segment_cache.store_segment_result(
-                            cache_key,
-                            clips,
-                            notes,
-                            video_id=video_id,
-                            transcript=transcript,
-                            settings=settings,
-                        )
+                    segment_cache.store_segment_result(
+                        cache_key,
+                        clips,
+                        notes,
+                        video_id=video_id,
+                        transcript=transcript,
+                        settings=settings,
+                    )
         raise_if_cancelled(should_cancel)
     except CancellationError:
         raise
