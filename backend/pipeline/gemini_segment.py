@@ -310,7 +310,9 @@ def _topic_rule(topic: str) -> str:
         "topic, and make each learning objective name the relevant idea. Set "
         "directly_teaches_topic=true only when the selected transcript span itself teaches "
         "the requested subject, not when it merely names the subject, course, institution, "
-        "or speaker."
+        "or speaker. When the topic names multiple linked ideas, the span must explain the "
+        "requested relationship or application between those ideas; teaching only one "
+        "component or a nearby prerequisite is not a direct match."
     )
 
 

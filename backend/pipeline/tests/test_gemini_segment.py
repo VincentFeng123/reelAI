@@ -600,6 +600,18 @@ def test_production_flash_receives_requested_duration_contract():
     assert "minimum is a preference, not a rejection rule" in user
 
 
+def test_compound_topic_requires_the_relationship_between_named_ideas():
+    _system, user = G._boundary_prompts(
+        "[0] 00:00 lesson",
+        1,
+        "renormalization group in quantum chromodynamics",
+    )
+
+    assert "multiple linked ideas" in user
+    assert "teaching only one component" in user
+    assert "nearby prerequisite is not a direct match" in user
+
+
 def test_budget_is_reserved_once_before_dispatch_and_provider_retry_is_disabled(monkeypatch):
     order = []
     payload = {}
