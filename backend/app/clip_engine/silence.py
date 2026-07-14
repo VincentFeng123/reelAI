@@ -1060,9 +1060,11 @@ def verify_acoustic_boundaries(
     With ``require_speech_handoff``, both caption timestamps are treated as
     semantic fences: a one-second decode-only halo may complete a quiet run
     across each fence, but no later quiet run separated by sound can qualify.
-    The per-edge handoff arguments override that legacy all-edges switch. A
-    two-sided progressive search may also prove a real quiet gap between native
-    lexical ownership fences without treating either word onset as the cut.
+    The per-edge handoff arguments override that legacy all-edges switch. The
+    same observation-only halo gives two-sided lexical searches enough audio
+    to prove surrounding sound. A start gap must begin on the selected side of
+    its fence; an end gap may straddle its fence, but the persisted cut remains
+    on the authorized side.
 
     ``prepared`` may be produced concurrently with transcript selection. On any
     resolution, decoding, cancellation, timeout, or silence failure, this
@@ -1171,14 +1173,14 @@ def verify_acoustic_boundaries(
             semantic_end_limit = min(semantic_end_limit, source_duration)
         start_observation_start_limit = (
             max(0.0, semantic_start_limit - HANDOFF_OBSERVATION_HALO_SEC)
-            if start_speech_handoff
+            if start_speech_handoff or require_start_two_sided
             else semantic_start_limit
         )
         start_observation_end_limit = semantic_end_limit
         end_observation_start_limit = semantic_start_limit
         end_observation_end_limit = (
             semantic_end_limit + HANDOFF_OBSERVATION_HALO_SEC
-            if end_speech_handoff
+            if end_speech_handoff or require_end_two_sided
             else semantic_end_limit
         )
         if (
@@ -1245,6 +1247,20 @@ def verify_acoustic_boundaries(
             end_result = edge_results["end"]
             start_quiet = start_result.quiet
             end_quiet = end_result.quiet
+            if (
+                start_quiet is not None
+                and require_start_two_sided
+                and not start_speech_handoff
+                and start_quiet.start_sec < semantic_start_limit - _FRAME_SEC
+            ):
+                start_quiet = None
+            if (
+                end_quiet is not None
+                and require_end_two_sided
+                and end_quiet.start_sec
+                > semantic_end_limit + HANDOFF_TIMESTAMP_TOLERANCE_SEC
+            ):
+                end_quiet = None
             if start_quiet is None:
                 return _unavailable(
                     original_start,
@@ -1278,11 +1294,9 @@ def verify_acoustic_boundaries(
                 start_quiet.start_sec,
                 start_quiet.end_sec - START_CUSHION_MS / 1000.0,
             )
-            adjusted_start = (
-                quiet_start_cut
-                if start_speech_handoff
-                else min(original_start, quiet_start_cut)
-            )
+            adjusted_start = min(original_start, quiet_start_cut)
+            if not start_speech_handoff:
+                adjusted_start = max(semantic_start_limit, adjusted_start)
             end_is_verified_source_edge = bool(
                 end_is_physical_source_edge
                 and abs(end_quiet.end_sec - end_observation_end_limit)
@@ -1296,10 +1310,13 @@ def verify_acoustic_boundaries(
                     end_quiet.start_sec + END_CUSHION_MS / 1000.0,
                 )
             )
-            adjusted_end = (
-                quiet_end_cut
-                if end_speech_handoff
-                else max(original_end, quiet_end_cut)
+            adjusted_end = max(original_end, quiet_end_cut)
+            if not end_speech_handoff:
+                adjusted_end = min(semantic_end_limit, adjusted_end)
+            end_cushion_is_preserved = bool(
+                end_is_verified_source_edge
+                or adjusted_end + 1e-9
+                >= end_quiet.start_sec + END_CUSHION_MS / 1000.0
             )
             cuts_are_inside_quiet = bool(
                 start_quiet.start_sec - 1e-9
@@ -1315,6 +1332,7 @@ def verify_acoustic_boundaries(
                         <= end_quiet.end_sec + _FRAME_SEC + 1e-9
                     )
                 )
+                and end_cushion_is_preserved
             )
             if adjusted_end <= adjusted_start or not cuts_are_inside_quiet:
                 return _unavailable(

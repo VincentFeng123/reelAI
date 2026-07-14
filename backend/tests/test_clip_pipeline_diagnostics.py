@@ -819,11 +819,11 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
         return_value=mock.Mock(
             verified=True,
             start_sec=9.9,
-            end_sec=20.2,
+            end_sec=20.0,
             diagnostics={
                 "threshold_dbfs": -38.0,
                 "start_speech_handoff_verified": True,
-                "end_speech_handoff_verified": True,
+                "end_speech_handoff_verified": False,
                 "start_two_sided_required": True,
                 "end_two_sided_required": True,
                 "semantic_start_limit_sec": 10.0,
@@ -832,7 +832,7 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
                 "observation_end_limit_sec": 21.0,
                 "handoff_timestamp_tolerance_sec": 0.05,
                 "start_quiet": [9.8, 10.1],
-                "end_quiet": [20.0, 20.3],
+                "end_quiet": [19.8, 20.1],
             },
         )
     )
@@ -883,11 +883,11 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
     assert verify.call_args.args[1:] == (10.0, 20.0)
     assert verify.call_args.kwargs["require_speech_handoff"] is False
     assert verify.call_args.kwargs["require_start_speech_handoff"] is True
-    assert verify.call_args.kwargs["require_end_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_end_speech_handoff"] is False
     assert verify.call_args.kwargs["require_start_two_sided"] is True
     assert verify.call_args.kwargs["require_end_two_sided"] is True
     assert persisted[0]["start"] == 9.9
-    assert persisted[0]["end"] == 20.2
+    assert persisted[0]["end"] == 20.0
 
 
 def test_acoustic_result_crossing_unselected_speech_fails_closed(
@@ -1597,13 +1597,13 @@ def test_production_boundary_path_mixes_projected_start_with_last_speech_end(
 
     assert reels == ["stored-mixed-edge"]
     assert persisted[0]["start"] == 12.0
-    assert persisted[0]["end"] == 29.9
+    assert persisted[0]["end"] == 30.0
     assert verify.call_args.kwargs["require_start_speech_handoff"] is False
     assert verify.call_args.kwargs["require_end_speech_handoff"] is True
     assert verify.call_args.kwargs["require_start_two_sided"] is True
     assert verify.call_args.kwargs["require_end_two_sided"] is False
     acoustic = persisted[0]["search_context"]["boundary_diagnostics"]["acoustic"]
-    assert acoustic["start_windows"] == [[11.0, 15.0]]
+    assert acoustic["start_windows"] == [[10.0, 15.0]]
     assert acoustic["end_windows"] == [[27.0, 33.0]]
 
 
@@ -1712,7 +1712,12 @@ def test_partial_cue_projection_fails_closed_without_native_lexical_words() -> N
 
 
 @pytest.mark.parametrize(
-    ("segments", "expected_corridor", "expected_handoffs"),
+    (
+        "segments",
+        "expected_corridor",
+        "expected_handoffs",
+        "expected_two_sided",
+    ),
     [
         (
             [
@@ -1721,6 +1726,7 @@ def test_partial_cue_projection_fails_closed_without_native_lexical_words() -> N
             ],
             (10.0, 20.0),
             (True, False),
+            (True, False),
         ),
         (
             [
@@ -1728,12 +1734,13 @@ def test_partial_cue_projection_fails_closed_without_native_lexical_words() -> N
                 {"cue_id": "next", "start": 9.9995, "end": 20.0, "text": "Next."},
             ],
             (0.0, 10.0),
+            (False, False),
             (False, True),
         ),
     ],
 )
 def test_rolling_caption_overlap_uses_cue_onset_handoffs(
-    segments, expected_corridor, expected_handoffs,
+    segments, expected_corridor, expected_handoffs, expected_two_sided,
 ) -> None:
     transcript = {
         "source": "supadata",
@@ -1769,8 +1776,53 @@ def test_rolling_caption_overlap_uses_cue_onset_handoffs(
     assert error is None
     assert (start, end) == expected_corridor
     assert plan is not None
+    assert plan[1] == selected["end"]
     assert plan[2:4] == expected_handoffs
-    assert plan[4:6] == expected_handoffs
+    assert plan[4:6] == expected_two_sided
+
+
+def test_nonlexical_end_progresses_from_required_speech_to_next_cue_fence() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:caption-gap",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "The selected explanation reaches its conclusion.",
+            },
+            {
+                "cue_id": "next",
+                "start": 10.5,
+                "end": 20.0,
+                "text": "The next teaching unit begins here.",
+            },
+        ],
+    }
+    clip = {"cue_ids": ["selected"], "start": 0.0, "end": 10.0}
+    diagnostics = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert diagnostics is not None
+    start, end, error = pipeline_module._selected_speech_corridor(
+        transcript,
+        clip,
+        diagnostics,
+        source_end_sec=20.0,
+    )
+
+    plan = pipeline_module._acoustic_boundary_plan(
+        transcript,
+        clip,
+        {},
+        speech_bounds=(0.0, 10.0),
+        search_limits=(start, end),
+    )
+
+    assert error is None
+    assert (start, end) == (0.0, 10.5)
+    assert plan == (0.0, 10.0, False, False, False, True)
 
 
 def test_caption_overlap_larger_than_ownership_epsilon_fails_closed() -> None:

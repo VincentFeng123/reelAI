@@ -822,11 +822,7 @@ def _acoustic_boundary_plan(
     start_target = float(speech_bounds[0])
     start_is_lexical = isinstance(projection_diagnostics.get("start"), dict)
     end_is_lexical = isinstance(projection_diagnostics.get("end"), dict)
-    end_target = (
-        float(speech_bounds[1])
-        if end_is_lexical or last_index + 1 >= len(segments)
-        else float(segments[last_index + 1]["start"])
-    )
+    end_target = float(speech_bounds[1])
     search_start, search_end = search_limits
     if (
         not all(
@@ -850,11 +846,8 @@ def _acoustic_boundary_plan(
         )
     )
     end_handoff = not end_is_lexical and (
-        end_two_sided
-        or (
-            last_index + 1 >= len(segments)
-            and end_target < search_end - SPEECH_OWNERSHIP_EPSILON_SEC
-        )
+        last_index + 1 >= len(segments)
+        and end_target < search_end - SPEECH_OWNERSHIP_EPSILON_SEC
     )
     return (
         start_target,
