@@ -31,7 +31,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
-PRACTICE_FAST_EXPAND_TIMEOUT_MS = 8_000
+# Gemini rejects manually configured deadlines below ten seconds.
+PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 1_024
 PRACTICE_FAST_EXPAND_CACHE_VERSION = 3
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
