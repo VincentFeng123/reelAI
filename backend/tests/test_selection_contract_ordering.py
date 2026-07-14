@@ -531,6 +531,98 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ["hard-v3"],
         )
 
+    def test_v13_reservoir_uses_nearest_level_only_when_exact_level_is_empty(self) -> None:
+        def insert_current(
+            reel_id: str,
+            video_id: str,
+            difficulty: float,
+            *,
+            surface_eligible: bool,
+        ) -> None:
+            self._insert_versioned_reel(
+                reel_id=reel_id,
+                video_id=video_id,
+                start=10,
+                difficulty=difficulty,
+                base_score=0.8,
+            )
+            row = self.conn.execute(
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                (reel_id,),
+            ).fetchone()
+            context = json.loads(row[0])
+            context.update({
+                "selection_contract_version": "quality_silence_v13",
+                "self_contained": True,
+                "topic_evidence_quote": (
+                    "Chemical bonding explains how atoms share or transfer electrons"
+                ),
+                "surface_eligible": surface_eligible,
+                "surface_reason": "" if surface_eligible else "level_mismatch",
+                "deferred_level": not surface_eligible,
+                "boundary_status": "verified",
+                "boundary_diagnostics": {
+                    "acoustic_verified": True,
+                    "acoustic": {"threshold_dbfs": -38.0},
+                },
+                "speech_corridor_verified": True,
+            })
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (json.dumps(context), reel_id),
+            )
+
+        insert_current("intermediate", "video-a", 0.50, surface_eligible=False)
+        insert_current("advanced", "video-b", 0.85, surface_eligible=False)
+
+        self.assertEqual(
+            [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
+            ["intermediate"],
+        )
+
+        insert_current("beginner", "video-c", 0.15, surface_eligible=True)
+        self.conn.execute("DELETE FROM ranked_feed_cache")
+        self.assertEqual(
+            [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
+            ["beginner"],
+        )
+
+        self.service.set_learner_level(
+            self.conn, self.MATERIAL, self.LEARNER, "advanced",
+        )
+        self.assertEqual(
+            [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
+            ["advanced"],
+        )
+
+    def test_nearest_level_fallback_is_stable_for_every_requested_level(self) -> None:
+        def item(reel_id: str, difficulty: float) -> dict:
+            return {
+                "reel_id": reel_id,
+                "difficulty": difficulty,
+                "selection_contract_version": "quality_silence_v13",
+            }
+
+        easy = item("easy", 0.15)
+        intermediate = item("intermediate", 0.50)
+        advanced = item("advanced", 0.85)
+        cases = (
+            ("beginner", [intermediate, advanced], "intermediate"),
+            ("intermediate", [easy, advanced], "easy"),
+            ("advanced", [easy, intermediate], "intermediate"),
+        )
+        for level, inventory, expected in cases:
+            with self.subTest(level=level):
+                self.assertEqual(
+                    [
+                        row["reel_id"]
+                        for row in self.service.select_difficulty_inventory(
+                            inventory, level
+                        )
+                    ],
+                    [expected],
+                )
+
     def test_v3_and_v9_historical_inventory_remains_viewable(self) -> None:
         for version in ("quality_silence_v3", "quality_silence_v9"):
             reel_id = f"historical-{version}"

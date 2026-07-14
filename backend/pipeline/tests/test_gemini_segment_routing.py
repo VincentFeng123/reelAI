@@ -757,7 +757,7 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("low", 12_288, 90.0, "flash_boundary_selector", "gemini-3.5-flash")),
+         ("low", 12_288, 45.0, "flash_boundary_selector", "gemini-3-flash-preview")),
         (G.PRO_BOUNDARY_PROFILE,
          ("high", 12_288, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
@@ -1188,6 +1188,15 @@ def test_telemetry_cost_uses_recorded_usage_and_stays_internal(monkeypatch):
     assert completed["cost_per_accepted_clip_usd"] > 0
     assert "model" not in result.clips[0]
     assert "gemini" not in result.notes.lower()
+
+
+def test_preview_flash_cost_uses_current_input_and_output_rates():
+    assert G._model_cost({
+        "model": "gemini-3-flash-preview",
+        "prompt_tokens": 1_000_000,
+        "candidate_tokens": 100_000,
+        "thought_tokens": 50_000,
+    }) == pytest.approx(0.95)
 
 
 def test_cancelled_worker_never_publishes_late_boundary_or_done_progress(monkeypatch):

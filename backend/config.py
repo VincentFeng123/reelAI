@@ -59,11 +59,9 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 TOPIC_MODEL = os.environ.get("TOPIC_MODEL", "gemini-3.1-pro-preview")
 
 # ── Gemini-segment clip engine (default) ────────────────────────────────────
-# A single Gemini pass reads the timestamped supadata transcript and returns substantive
-# topic clips {title,start,end} directly — NO punctuation / structure understanding / whisper
-# refine / multimodal. Flash is attempted first for every video; uncertain or
-# invalid output falls back to Pro. Boundaries are fine-snapped onto Supadata's
-# interpolated per-word times when SEGMENT_FINE_SNAP is on.
+# A single Flash pass reads the complete timestamped Supadata transcript and returns
+# substantive topic clips. Production generation never falls back to Pro; deterministic
+# discourse checks and acoustic silence verification fail closed around its output.
 _segment_routing_mode = os.environ.get("SEGMENT_ROUTING_MODE", "hybrid").strip().lower()
 SEGMENT_ROUTING_MODE = (
     _segment_routing_mode
@@ -71,7 +69,7 @@ SEGMENT_ROUTING_MODE = (
     else "pro_only"
 )
 SEGMENT_FLASH_MODEL = (
-    os.environ.get("SEGMENT_FLASH_MODEL", "").strip() or "gemini-3.5-flash"
+    os.environ.get("SEGMENT_FLASH_MODEL", "").strip() or "gemini-3-flash-preview"
 )
 # SEGMENT_MODEL was the original Pro-only selector model. Keep it as the
 # highest-precedence migration override so existing deployments do not change models.
@@ -91,7 +89,7 @@ if not math.isfinite(_segment_hybrid_percent):
 SEGMENT_HYBRID_PERCENT = max(0.0, min(100.0, _segment_hybrid_percent))
 SEGMENT_FINE_SNAP = os.environ.get("SEGMENT_FINE_SNAP", "1") not in ("0", "false", "")
 SEGMENT_MIN_CLIP_S = 1.0                                             # fixed validity guard
-SEGMENT_MAX_CLIP_S = 180.0                                           # reject; never hard-cut
+SEGMENT_MAX_CLIP_S = 180.0  # legacy evaluation compatibility; inactive in production selection
 SEGMENT_INFORMATIVENESS_MIN = float(os.environ.get("SEGMENT_INFORMATIVENESS_MIN", "0.6"))
 SEGMENT_TOPIC_RELEVANCE_MIN = float(os.environ.get("SEGMENT_TOPIC_RELEVANCE_MIN", "0.6"))
 SEGMENT_MAX_CLIPS = int(os.environ.get("SEGMENT_MAX_CLIPS", "40"))        # safety ceiling

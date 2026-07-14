@@ -203,12 +203,21 @@ _TERMINAL_INCOMPLETE_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _TERMINAL_BARE_SUBJECT_RE = re.compile(
-    r"\b(?:and|as|because|but|if|or|since|so|that|though|unless|until|when|while)"
+    r"\b(?:and|as|because|but|if|or|since|so|that|though|unless|until|when|"
+    r"where|which|while|who)"
     r"\s+(?:i|we|you|he|she|it|they)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_PRIME_DIRECTION_RE = re.compile(
+    r"\b(?:three|five|3|5)\s+to\s+(?:three|five|3|5)\s*$",
     re.IGNORECASE,
 )
 _TERMINAL_DANGLING_ARTICLE_RE = re.compile(
     r"\b(?:a|an|the)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_DANGLING_LINK_RE = re.compile(
+    r"\b(?:among|between|than|versus)\s*[.!?]?[\"')\]]*$",
     re.IGNORECASE,
 )
 _TERMINAL_DANGLING_DEGREE_RE = re.compile(
@@ -228,6 +237,34 @@ _TRAILING_FORWARD_SETUP_RE = re.compile(
 )
 _FORWARD_SOLUTION_CONTINUATION_RE = re.compile(
     r"^\s*(?:so\s+)?instead\b",
+    re.IGNORECASE,
+)
+_TOPIC_NAVIGATION_ACTION_PATTERN = (
+    r"(?:cover|discuss|move\s+on|switch\s+to|"
+    r"talk\s+about|turn\s+to)"
+)
+_FORWARD_TOPIC_TRANSITION_RE = re.compile(
+    r"^\s*(?:(?:all\s+right|okay|ok|so)\s*[,;:]?\s+)*"
+    rf"(?:now\s+(?:we\s+(?:got|have|need)\s+to\s+"
+    rf"{_TOPIC_NAVIGATION_ACTION_PATTERN}|"
+    r"let(?:['’]?s|\s+us)\s+(?:back\s+up|move\s+on|turn\s+to))|"
+    rf"next\s+(?:we|i)(?:\s+will|['’]ll)\s+"
+    rf"{_TOPIC_NAVIGATION_ACTION_PATTERN}|"
+    r"(?:now\s+)?(?:the\s+)?next\s+(?:topic|concept|section|part)|"
+    r"let(?:['’]?s|\s+us)\s+(?:back\s+up|move\s+on|turn\s+to))\b",
+    re.IGNORECASE,
+)
+_TRAILING_TRANSITION_FRAGMENT_RE = re.compile(
+    r"\bthough\s+now\s*[,;:.!?]*\s*$",
+    re.IGNORECASE,
+)
+_EDGE_ONLY_FRAMING_RE = re.compile(
+    r"^\s*(?:remember\s+)?(?:on|in|for|with)\b.{0,80}\b"
+    r"(?:right\s+)?we\s+(?:talked|spoke|learned|covered|went\s+over)\s+"
+    r"(?:about\s+)?(?:that|this|it)\s*[.!?]?\s*$|"
+    r"^\s*(?:so\s+)?now\s+(?:the\s+)?next\s+"
+    r"(?:goal|thing|step)(?:\s+here)?\s+is(?:\s+that)?\s+(?:we|i)\b"
+    r"\s*[.!?]?\s*$",
     re.IGNORECASE,
 )
 _TERMINAL_EXEMPLIFICATION_RE = re.compile(
@@ -281,9 +318,9 @@ SEGMENT_PROFILES = (
     PRO_BOUNDARY_PROFILE,
 )
 
-_TOTAL_DEADLINE_S = 150.0
+_TOTAL_DEADLINE_S = 90.0
 _FLASH_SINGLE_TIMEOUT_S = 45.0
-_FLASH_BOUNDARY_TIMEOUT_S = 90.0
+_FLASH_BOUNDARY_TIMEOUT_S = 45.0
 _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
@@ -305,6 +342,7 @@ _CARD_ENRICHMENT_PROMPT_VERSION = "accepted_clip_enrichment_v1"
 _PRICING_VERSION = "gemini-standard-2026-07-11"
 _PRICING_PER_MILLION = {
     "flash": {"input": 1.50, "output": 9.00},
+    "flash_preview": {"input": 0.50, "output": 3.00},
     "pro": {"input": 2.00, "output": 12.00},
 }
 
@@ -1036,13 +1074,14 @@ def _cue_opens_mid_thought_at(
     if index > 0:
         previous_text = str(segments[index - 1].get("text") or "")
         if (
-            not _cue_is_only_structural_filler(previous_text)
-            and _cue_has_explicit_dangling_end(
+            _cue_has_explicit_dangling_end(
                 previous_text,
                 text,
             )
         ):
             return True
+    if _cue_begins_standalone_question(text):
+        return False
     opening_terminator = re.search(r"[.!?]", text)
     lexical_index = first_lexical_character_index(text)
     starts_lowercase = bool(
@@ -1111,6 +1150,18 @@ def _cue_has_weak_end(
     raw_text = str(text or "").strip()
     if _cue_has_explicit_dangling_end(raw_text, next_text):
         return True
+    question_mark = raw_text.find("?")
+    answer_words = _toks(raw_text[question_mark + 1:]) if question_mark >= 0 else []
+    has_local_answer = bool(
+        len(answer_words) >= 2
+        or (answer_words and answer_words[0] in {"no", "yes"})
+    )
+    if (
+        question_mark >= 0
+        and _cue_begins_standalone_question(raw_text)
+        and not has_local_answer
+    ):
+        return True
     guarded = _guard_text(raw_text, ignore_caption_case=ignore_caption_case)
     terminator = classify_terminator(guarded)
     if terminator and _TERMINAL_STRANDED_PREPOSITION_RE.search(guarded):
@@ -1142,6 +1193,12 @@ def _cue_has_weak_end(
     if explicit_closure_words.intersection(raw_words[-5:]):
         return False
     next_words = _toks(next_text)
+    if (
+        next_words
+        and next_words[0] == "prime"
+        and _TERMINAL_PRIME_DIRECTION_RE.search(raw_text)
+    ):
+        return True
     if (
         next_words
         and len(next_words[0]) > 5
@@ -1198,6 +1255,7 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
         or _TERMINAL_BARE_SUBJECT_RE.search(raw_text)
         or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
+        or _TERMINAL_DANGLING_LINK_RE.search(raw_text)
         or _TERMINAL_DANGLING_DEGREE_RE.search(raw_text)
         or ambiguous_degree_continues
         or _has_unfinished_exemplification_tail(raw_text)
@@ -1250,6 +1308,9 @@ def _trim_trailing_incomplete_suffix(
             solution_continues
             and _TRAILING_FORWARD_SETUP_RE.search(suffix)
         )
+        forward_transition = bool(
+            line == end_line and _FORWARD_TOPIC_TRANSITION_RE.match(suffix)
+        )
         dangling_degree = bool(_TERMINAL_DANGLING_DEGREE_RE.search(suffix))
         ambiguous_degree = _TERMINAL_AMBIGUOUS_DEGREE_RE.search(suffix)
         following_lexical_index = first_lexical_character_index(following_text)
@@ -1269,12 +1330,19 @@ def _trim_trailing_incomplete_suffix(
             or dangling_ambiguous_degree
             or dangling_bare_subject
             or forward_setup
+            or forward_transition
         ):
             continue
         previous_line = line - 1
         if previous_line < start_line:
             return end_line if forward_setup else None
         previous_text = str(segments[previous_line].get("text") or "").strip()
+        if (
+            forward_transition
+            and len(_toks(previous_text)) >= 3
+            and not _cue_has_explicit_dangling_end(previous_text, "")
+        ):
+            return previous_line
         if classify_terminator(previous_text):
             return previous_line
         return end_line if forward_setup else None
@@ -1425,6 +1493,8 @@ def _close_cue_context(
             if end_line + 1 < len(segments)
             else ""
         )
+        if next_text and _FORWARD_TOPIC_TRANSITION_RE.match(next_text):
+            break
         if not force_end_clause_completion and not _cue_has_weak_end(
             current_end_text,
             next_text,
@@ -1443,6 +1513,8 @@ def _close_cue_context(
         if end_line + 1 < len(segments)
         else ""
     )
+    if next_text and _FORWARD_TOPIC_TRANSITION_RE.match(next_text):
+        next_text = ""
     final_end_text = (
         _cue_clip_text(segments, original_end, end_line)
         if end_line > original_end
@@ -1524,6 +1596,8 @@ def _structural_match_is_edge(
 
 
 def _cue_is_only_structural_filler(text: str) -> bool:
+    if _EDGE_ONLY_FRAMING_RE.fullmatch(str(text or "")):
+        return True
     matches = _structural_filler_matches(text)
     if not matches:
         return False
@@ -2592,6 +2666,12 @@ def _plan_to_report(
                 if len(preliminary_end_spans) == 1
                 else len(end_text)
             )
+            terminal_suffix = re.match(
+                r"\s*[.!?]+[\"'’”)]*",
+                end_text[end_right:],
+            )
+            if terminal_suffix is not None:
+                end_right += terminal_suffix.end()
             if a == b:
                 if start_left < end_right:
                     closure_segments[a]["text"] = start_text[start_left:end_right]
@@ -2677,8 +2757,23 @@ def _plan_to_report(
             continue
 
         if b != selected_end_before_context:
+            expanded_end_text = str(segments[b].get("text") or "")
+            following_end_text = (
+                str(segments[b + 1].get("text") or "")
+                if b + 1 < len(segments)
+                else ""
+            )
+            if (
+                following_end_text
+                and _FORWARD_TOPIC_TRANSITION_RE.match(following_end_text)
+            ):
+                trimmed_end_text = _TRAILING_TRANSITION_FRAGMENT_RE.sub(
+                    "", expanded_end_text
+                ).rstrip()
+                if _WORD_RE.search(trimmed_end_text):
+                    expanded_end_text = trimmed_end_text
             end_quote, edge_error = _expanded_context_edge_quote(
-                str(segments[b].get("text") or ""), want="end"
+                expanded_end_text, want="end"
             )
             if edge_error:
                 report.rejected_reasons.append(f"{prefix}:{edge_error}")
@@ -3101,7 +3196,11 @@ def _exception_telemetry(exc: Exception) -> dict:
 
 def _model_cost(call: dict) -> float:
     model = str(call.get("model") or "").lower()
-    rates = _PRICING_PER_MILLION["flash" if "flash" in model else "pro"]
+    if "gemini-3-flash" in model and "gemini-3.5-flash" not in model:
+        tier = "flash_preview"
+    else:
+        tier = "flash" if "flash" in model else "pro"
+    rates = _PRICING_PER_MILLION[tier]
     prompt = int(call.get("prompt_tokens") or call.get("prompt_token_count") or 0)
     candidate = int(
         call.get("candidate_tokens") or call.get("candidates_token_count") or 0

@@ -1202,8 +1202,22 @@ class ReelService:
     # v19: require the current acoustic-boundary inventory contract.
     # v20: reject openings with unresolved explicit backward references.
     # v22: require exact cross-cue boundary grounding from the current selector.
-    RANKED_FEED_CACHE_VERSION = 22
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v12"
+    # v23: prefer the requested difficulty bin, with a nearest valid-bin fallback.
+    RANKED_FEED_CACHE_VERSION = 23
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v13"
+    DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
+        "quality_silence_v3",
+        "quality_silence_v4",
+        "quality_silence_v5",
+        "quality_silence_v6",
+        "quality_silence_v7",
+        "quality_silence_v8",
+        "quality_silence_v9",
+        "quality_silence_v10",
+        "quality_silence_v11",
+        "quality_silence_v12",
+        "quality_silence_v13",
+    })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -2443,6 +2457,7 @@ class ReelService:
                 "quality_silence_v10",
                 "quality_silence_v11",
                 "quality_silence_v12",
+                "quality_silence_v13",
             }
             for reel in generated
         ):
@@ -5522,6 +5537,49 @@ class ReelService:
             return 1
         return 2
 
+    @classmethod
+    def select_difficulty_inventory(
+        cls,
+        items: list[dict[str, Any]],
+        knowledge_level: str | None,
+    ) -> list[dict[str, Any]]:
+        """Keep the requested difficulty bin, or the nearest valid bin if empty."""
+        staged = [
+            item
+            for item in items
+            if str(
+                item.get("_selection_contract_version")
+                or item.get("selection_contract_version")
+                or ""
+            ).strip()
+            in cls.DIFFICULTY_FALLBACK_CONTRACTS
+        ]
+        if not staged:
+            return list(items)
+        target_stage = {
+            "beginner": 0,
+            "intermediate": 1,
+            "advanced": 2,
+        }.get(str(knowledge_level or "").strip().lower(), 0)
+        available_stages = {
+            cls._selection_difficulty_stage(item) for item in staged
+        }
+        chosen_stage = min(
+            available_stages,
+            key=lambda stage: (abs(stage - target_stage), stage),
+        )
+        return [
+            item
+            for item in items
+            if str(
+                item.get("_selection_contract_version")
+                or item.get("selection_contract_version")
+                or ""
+            ).strip()
+            not in cls.DIFFICULTY_FALLBACK_CONTRACTS
+            or cls._selection_difficulty_stage(item) == chosen_stage
+        ]
+
     @staticmethod
     def _selection_number(value: Any, default: float = 0.0) -> float:
         try:
@@ -5709,6 +5767,7 @@ class ReelService:
                 "quality_silence_v10",
                 "quality_silence_v11",
                 "quality_silence_v12",
+                "quality_silence_v13",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5725,6 +5784,7 @@ class ReelService:
                 "quality_silence_v10",
                 "quality_silence_v11",
                 "quality_silence_v12",
+                "quality_silence_v13",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7205,39 +7265,23 @@ class ReelService:
                     "quality_silence_v10",
                     "quality_silence_v11",
                     "quality_silence_v12",
+                    "quality_silence_v13",
                 }
                 else legacy_difficulty_matches_level
             )
-            deferred_level_ready = bool(
-                surface_reason == "level_mismatch" and difficulty_matches_level
+            deferred_level_candidate = (
+                surface_reason == "level_mismatch"
+                and (
+                    difficulty_matches_level
+                    or selection_version in self.DIFFICULTY_FALLBACK_CONTRACTS
+                )
             )
             prerequisite_may_become_ready = (
                 surface_reason == "prerequisite_not_surfaceable"
                 and difficulty_matches_level
             )
             if surface_eligible is False and not (
-                deferred_level_ready or prerequisite_may_become_ready
-            ):
-                continue
-            if (
-                selection_metadata.get("_selection_deferred_level")
-                and not difficulty_matches_level
-            ):
-                continue
-            if (
-                selection_version in {
-                    "quality_silence_v3",
-                    "quality_silence_v4",
-                    "quality_silence_v5",
-                    "quality_silence_v6",
-                    "quality_silence_v7",
-                    "quality_silence_v8",
-                    "quality_silence_v9",
-                    "quality_silence_v10",
-                    "quality_silence_v11",
-                    "quality_silence_v12",
-                }
-                and not difficulty_matches_level
+                deferred_level_candidate or prerequisite_may_become_ready
             ):
                 continue
             boundary_status = selection_metadata.get(
@@ -7258,6 +7302,7 @@ class ReelService:
                             "quality_silence_v10",
                             "quality_silence_v11",
                             "quality_silence_v12",
+                            "quality_silence_v13",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -7280,6 +7325,7 @@ class ReelService:
                     "quality_silence_v10",
                     "quality_silence_v11",
                     "quality_silence_v12",
+                    "quality_silence_v13",
                 } and (
                     (
                         min(
@@ -7303,6 +7349,7 @@ class ReelService:
                             "quality_silence_v10",
                             "quality_silence_v11",
                             "quality_silence_v12",
+                            "quality_silence_v13",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -7486,6 +7533,10 @@ class ReelService:
                 }
             )
 
+        scored = self.select_difficulty_inventory(
+            scored,
+            str(progress.get("selected_level") or "beginner"),
+        )
         scored.sort(key=lambda x: (x["score"], x["created_at"]), reverse=True)
         deduped: list[dict[str, Any]] = []
         seen_reel_ids: set[str] = set()
@@ -7624,6 +7675,7 @@ class ReelService:
                 "quality_silence_v10",
                 "quality_silence_v11",
                 "quality_silence_v12",
+                "quality_silence_v13",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7651,6 +7703,7 @@ class ReelService:
                         "quality_silence_v10",
                         "quality_silence_v11",
                         "quality_silence_v12",
+                        "quality_silence_v13",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

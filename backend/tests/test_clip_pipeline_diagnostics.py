@@ -642,35 +642,36 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
     assert context.counters()["persisted_clips"] == 3
 
 
-def test_queued_acoustic_candidate_gets_a_fresh_verification_timeout(
+def test_many_queued_acoustic_candidates_share_source_deadline_and_cancel(
     monkeypatch,
 ) -> None:
+    candidate_count = 40
     transcript = {
         "source": "supadata",
         "native_mode": False,
         "artifact_key": "supadata-transcript:v2:queued-acoustic",
-        "duration": 40.0,
+        "duration": float(candidate_count),
         "segments": [
             {
                 "cue_id": f"unit-{index}",
-                "start": index * 10.0,
-                "end": (index + 1) * 10.0,
+                "start": float(index),
+                "end": float(index + 1),
                 "text": f"Python teaching unit {index} explains a distinct concept.",
             }
-            for index in range(4)
+            for index in range(candidate_count)
         ],
     }
     clips = [
         {
-            "start": index * 10.0,
-            "end": (index + 1) * 10.0,
+            "start": float(index),
+            "end": float(index + 1),
             "cue_ids": [f"unit-{index}"],
             "score": 0.9 - index * 0.01,
             "selection_candidate_id": f"unit-{index}",
             "prerequisite_ids": [],
             "search_context": {"surface_eligible": True},
         }
-        for index in range(4)
+        for index in range(candidate_count)
     ]
     engine_out = {"clips": clips, "transcript": transcript, "notes": ""}
     pipeline = _pipeline()
@@ -706,9 +707,8 @@ def test_queued_acoustic_candidate_gets_a_fresh_verification_timeout(
             timeouts.append(timeout_sec)
             if len(started) == 3:
                 first_wave_started.set()
-        if start_sec < 30.0:
-            assert first_wave_started.wait(timeout=1.0)
-            time.sleep(0.08)
+        assert first_wave_started.wait(timeout=1.0)
+        time.sleep(0.08)
         return mock.Mock(
             verified=True,
             start_sec=start_sec,
@@ -717,9 +717,9 @@ def test_queued_acoustic_candidate_gets_a_fresh_verification_timeout(
                 "start_quiet": [start_sec, start_sec + 0.2],
                 "end_quiet": [end_sec - 0.2, end_sec + 0.1],
                 "start_speech_handoff_verified": start_sec > 0.0,
-                "end_speech_handoff_verified": end_sec < 40.0,
+                "end_speech_handoff_verified": end_sec < candidate_count,
                 "start_two_sided_required": start_sec > 0.0,
-                "end_two_sided_required": end_sec < 40.0,
+                "end_two_sided_required": end_sec < candidate_count,
                 "semantic_start_limit_sec": start_sec,
                 "semantic_end_limit_sec": end_sec,
             },
@@ -740,22 +740,26 @@ def test_queued_acoustic_candidate_gets_a_fresh_verification_timeout(
         ),
     )
 
+    started_at = time.monotonic()
+    context = GenerationContext("slow", require_acoustic_boundaries=True)
     reels, _ = pipeline.ingest_topic(
         topic="Intro to Python",
         material_id="material",
         concept_id="concept",
-        generation_context=GenerationContext(
-            "slow", require_acoustic_boundaries=True
-        ),
+        generation_context=context,
         retrieval_profile="deep",
         max_videos=1,
-        max_reels=4,
+        max_reels=candidate_count,
     )
+    elapsed = time.monotonic() - started_at
 
-    assert reels == [f"unit-{index}" for index in range(4)]
-    assert verify.call_count == 4
-    assert 30.0 in started
-    assert timeouts == pytest.approx([0.05] * 4)
+    assert reels == []
+    assert elapsed < 0.3
+    assert verify.call_count == 3
+    assert len(started) == 3
+    assert all(0.0 < timeout <= 0.05 for timeout in timeouts)
+    assert context.counters()["boundary_unavailable"] == candidate_count
+    assert context.counters()["permanently_rejected_clips"] == candidate_count
 
 
 def test_final_caption_clip_verifies_last_speech_without_forcing_source_outro(
@@ -3014,7 +3018,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v12"
+        assert context["selection_contract_version"] == "quality_silence_v13"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

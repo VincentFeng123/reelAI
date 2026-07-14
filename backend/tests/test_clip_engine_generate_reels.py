@@ -439,8 +439,8 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertTrue(served)
         self.assertTrue(all(reel["ai_summary"] for reel in served))
 
-    def test_learner_level_override_reaches_discovery(self) -> None:
-        search, _run = self._patched_engine(_multi_clip_engine_out())
+    def test_learner_level_override_does_not_narrow_discovery(self) -> None:
+        search, run = self._patched_engine(_multi_clip_engine_out())
         with db_module.get_conn() as conn:
             main_module.reel_service.generate_reels(
                 conn,
@@ -451,7 +451,11 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 generation_id="gen-level-override",
                 knowledge_level_override="advanced",
             )
-        self.assertEqual(search.discover.call_args.kwargs.get("level"), "advanced")
+        self.assertIsNone(search.discover.call_args.kwargs.get("level"))
+        self.assertEqual(
+            run.clip.call_args.kwargs["settings"]["_knowledge_level"],
+            "advanced",
+        )
 
     def test_full_material_generation_keeps_subject_as_literal_topic(self) -> None:
         with db_module.get_conn(transactional=True) as conn:
@@ -839,7 +843,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v12"
+            reel.get("selection_contract_version") == "quality_silence_v13"
             for reel in feed
         ))
 
@@ -1270,7 +1274,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 22)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 23)
 
 
 if __name__ == "__main__":

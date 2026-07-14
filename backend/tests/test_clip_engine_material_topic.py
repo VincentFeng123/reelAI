@@ -348,6 +348,50 @@ class IngestTopicTests(unittest.TestCase):
         rows = self._reels_for_generation("gen-3")
         self.assertEqual(len(rows), 3)
 
+    def test_retry_reuse_does_not_consume_remaining_persistence_capacity(self) -> None:
+        first_result = _build_engine_out("vidAAAAAAAA")
+        first_result["clips"] = first_result["clips"][:1]
+        retry_result = _build_engine_out("vidAAAAAAAA")
+
+        with _Patched() as (mock_search, mock_run):
+            mock_search.discover.side_effect = (
+                lambda topic, limit, exclude_video_ids=None, **kw: {
+                    "corrected": topic,
+                    "videos": [VID_A],
+                    "credits_used": 0,
+                    "warning": None,
+                }
+            )
+            mock_run.clip.side_effect = [first_result, retry_result]
+            first_reels, _ = main_module.ingestion_pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="mat-3",
+                concept_id="con-3",
+                generation_id="gen-cap-retry",
+                max_videos=1,
+                max_reels=2,
+                max_persisted_reels=1,
+            )
+            retry_reels, _ = main_module.ingestion_pipeline.ingest_topic(
+                topic=TOPIC,
+                material_id="mat-3",
+                concept_id="con-3",
+                generation_id="gen-cap-retry",
+                max_videos=1,
+                max_reels=2,
+                max_persisted_reels=1,
+            )
+
+        self.assertEqual([reel.t_start for reel in first_reels], [30.0])
+        self.assertEqual(
+            [reel.t_start for reel in retry_reels],
+            [30.0, 120.0],
+        )
+        self.assertEqual(
+            [row["t_start"] for row in self._reels_for_generation("gen-cap-retry")],
+            [30.0, 120.0],
+        )
+
     # ---- 4. on_reel_created fires once per reel, in order ---- #
 
     def test_on_reel_created_order(self) -> None:
@@ -770,7 +814,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
             )
 
         self.assertEqual(len(reels), 1)
-        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v12")
+        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v13")
         self.assertEqual(reels[0].t_start, 12.001)
         self.assertEqual(reels[0].t_end, 433.012)
         self.assertGreater(reels[0].t_end - reels[0].t_start, 180.0)
@@ -813,7 +857,10 @@ class EmbedUrlCeilTests(IngestTopicTests):
                     learner_id="owner:long-v3",
                     require_verified_boundaries=True,
                 )
-            self.assertEqual(advanced_feed, [])
+            self.assertEqual(
+                [item["reel_id"] for item in advanced_feed],
+                [reels[0].reel_id],
+            )
 
             with db_module.get_conn(transactional=True) as conn:
                 main_module.reel_service.set_learner_level(
@@ -830,7 +877,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
 
         self.assertEqual(len(beginner_feed), 1)
         self.assertEqual(
-            beginner_feed[0]["selection_contract_version"], "quality_silence_v12"
+            beginner_feed[0]["selection_contract_version"], "quality_silence_v13"
         )
         self.assertIsInstance(beginner_feed[0]["t_start"], float)
         self.assertIsInstance(beginner_feed[0]["t_end"], float)
@@ -918,7 +965,7 @@ class DifficultyPersistenceTests(IngestTopicTests):
 
 
 class LevelThreadingTests(IngestTopicTests):
-    def test_ingest_topic_passes_level_to_discover(self) -> None:
+    def test_ingest_topic_keeps_discovery_level_neutral(self) -> None:
         with _Patched() as (mock_search, mock_run):
             mock_run.clip.side_effect = _clip_side_effect
             main_module.ingestion_pipeline.ingest_topic(
@@ -926,7 +973,11 @@ class LevelThreadingTests(IngestTopicTests):
                 generation_id="gen-lvl", max_videos=1, knowledge_level="advanced",
             )
             _, kwargs = mock_search.discover.call_args
-            self.assertEqual(kwargs.get("level"), "advanced")
+            self.assertIsNone(kwargs.get("level"))
+            self.assertEqual(
+                mock_run.clip.call_args.kwargs["settings"]["_knowledge_level"],
+                "advanced",
+            )
 
 
 class IngestTopicProgressTests(unittest.TestCase):

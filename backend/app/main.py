@@ -352,7 +352,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v12"
+SELECTION_CONTRACT_VERSION = "quality_silence_v13"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -3261,6 +3261,22 @@ def _ranked_request_reels(
             exclusions_fingerprint=exclusions_fingerprint,
             content_fingerprint=content_fingerprint,
             require_verified_boundaries=True,
+        )
+    if any(
+        str(
+            reel.get("_selection_contract_version")
+            or reel.get("selection_contract_version")
+            or ""
+        ).strip()
+        in reel_service.DIFFICULTY_FALLBACK_CONTRACTS
+        for reel in ranked
+    ):
+        difficulty_progress = reel_service.learner_progress(
+            conn, material_id, learner_id
+        )
+        ranked = reel_service.select_difficulty_inventory(
+            ranked,
+            str(difficulty_progress.get("selected_level") or "beginner"),
         )
     excluded_video_id_set = {
         _bare_video_id(video_id)

@@ -172,6 +172,24 @@ def test_demonstrative_noun_phrase_expands_to_its_antecedent() -> None:
     ) == (0, 1, None)
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Causes include fiscal crisis and inequality.",
+        "Uses include generating electricity and heating water.",
+        "Returns diminish as more labor is added to fixed capital.",
+        "Causes can be identified by examining the evidence.",
+        "Causes are classified by using their mechanisms.",
+    ],
+)
+def test_plural_noun_subject_is_complete_at_source_edge(text: str) -> None:
+    segments = [{"start": 0.0, "end": 6.0, "text": text}]
+
+    assert G._close_cue_context(
+        segments, 0, 0, ignore_caption_case=True
+    ) == (0, 0, None)
+
+
 def test_qcd_back_reference_expands_to_cold_viewer_context() -> None:
     contextual = {
         "start": 0.0,
@@ -588,6 +606,362 @@ def test_dangling_degree_transition_trims_to_prior_complete_teaching() -> None:
     assert G._close_cue_context(
         segments, 0, 1, ignore_caption_case=True
     ) == (0, 0, None)
+
+
+def test_dangling_edge_framing_cannot_be_trimmed_into_a_fragment() -> None:
+    texts = [
+        "On this strand, we talked about that.",
+        "So now the next goal here is that we",
+        "have to remove",
+        "those primers, but before we do that",
+        "I need to mention one more thing.",
+        "DNA polymerase proofreads the new strand and removes a mismatched base.",
+    ]
+    segments = [
+        {"start": index * 5.0, "end": (index + 1) * 5.0, "text": text}
+        for index, text in enumerate(texts)
+    ]
+
+    assert G._close_cue_context(
+        segments, 0, 5, ignore_caption_case=True
+    ) == (0, 5, None)
+    assert G._trim_structural_filler_edges(
+        segments, 0, 5, ignore_caption_case=True
+    ) is None
+
+
+def test_anaphoric_function_expands_to_subject_and_completes_comparison() -> None:
+    texts = [
+        "How do we get rid of the RNA primers?",
+        "Well, DNA polymerase III is not the answer.",
+        "The next enzyme, as if there aren't enough enzymes,",
+        "is called DNA polymerase I.",
+        "DNA polymerase I removes each primer and replaces it with DNA.",
+        "You know what else it can do? One more function.",
+        "It proofreads a mismatch, cuts it out, and inserts the correct nucleotide.",
+        "The last function of DNA polymerase I is proofreading incorrect base pairs.",
+        "Okay, so the big difference, if you are asked between",
+        (
+            "DNA polymerase I and DNA polymerase III is that polymerase I also "
+            "removes RNA primers."
+        ),
+        "The next thing is DNA ligase.",
+    ]
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": index * 5.0,
+            "end": (index + 1) * 5.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    proposal = G._BoundaryTopic(
+        candidate_id="polymerase-proofreading",
+        start_line=5,
+        end_line=8,
+        start_quote="You know what else it can",
+        end_quote="if you are asked between",
+        title="Polymerase I proofreading",
+        learning_objective="Explain how polymerase I proofreads mismatches.",
+        facet="mismatch proofreading",
+        reason="Directly explains mismatch proofreading.",
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.5,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote="proofreads a mismatch, cuts it out",
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="DNA polymerase proofreading mismatches",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"] == [
+        "cue-4", "cue-5", "cue-6", "cue-7", "cue-8", "cue-9",
+    ]
+    assert report.clips[0]["start_quote"].startswith("DNA polymerase I")
+    assert report.clips[0]["end_quote"].endswith("removes RNA primers")
+
+
+def test_only_explicit_topic_resets_stop_context_expansion() -> None:
+    assert G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Okay, now we got to discuss RNA primers."
+    )
+    assert G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Next we will discuss integration."
+    )
+    assert G._FORWARD_TOPIC_TRANSITION_RE.match("The next topic is DNA ligase.")
+    assert G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Now we need to move on to integration."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Now we need to multiply by the inner derivative."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Now we have to apply the chain rule."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "The next step is we multiply both sides by two."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Now the next thing is we compare opportunity cost with sunk cost."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Next we will differentiate the outer function."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Now we got to multiply by two."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Now we need to look at the denominator."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "Now we need to examine the sign."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "The next thing is multiplication."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match(
+        "The next step is substitution."
+    )
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match("Let's say x equals two.")
+    assert not G._FORWARD_TOPIC_TRANSITION_RE.match("How do we solve this example?")
+
+
+def test_procedural_now_step_remains_part_of_worked_example() -> None:
+    texts = [
+        "What is the derivative of y equals three x squared?",
+        "Now we need to multiply by",
+        "the inner derivative, so the final derivative is eighteen x.",
+    ]
+    segments = [
+        {"start": index * 5.0, "end": (index + 1) * 5.0, "text": text}
+        for index, text in enumerate(texts)
+    ]
+
+    assert G._close_cue_context(
+        segments, 0, 0, ignore_caption_case=True
+    ) == (0, 2, None)
+
+
+def test_substantive_next_step_and_thing_complete_the_selected_question() -> None:
+    cases = [
+        (
+            "How do we isolate x?",
+            "The next step is we multiply both sides by two.",
+        ),
+        (
+            "How should we compare the two costs?",
+            "Now the next thing is we compare opportunity cost with sunk cost.",
+        ),
+    ]
+
+    for question, answer in cases:
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": question},
+            {"start": 5.0, "end": 10.0, "text": answer},
+        ]
+        assert G._close_cue_context(
+            segments, 0, 0, ignore_caption_case=True
+        ) == (0, 1, None)
+
+
+def test_procedural_next_and_now_answers_are_not_topic_resets() -> None:
+    cases = [
+        (
+            "How should the outer function be differentiated?",
+            "Next we will differentiate the outer function.",
+        ),
+        (
+            "What factor should multiply both sides?",
+            "Now we got to multiply by two.",
+        ),
+        (
+            "What part of the fraction should be checked?",
+            "Now we need to look at the denominator.",
+        ),
+        (
+            "How do we determine whether the result is positive?",
+            "Now we need to examine the sign.",
+        ),
+    ]
+
+    for question, answer in cases:
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": question},
+            {"start": 5.0, "end": 10.0, "text": answer},
+        ]
+        assert G._close_cue_context(
+            segments, 0, 0, ignore_caption_case=True
+        ) == (0, 1, None)
+
+
+def test_answer_shaped_named_steps_are_not_topic_resets() -> None:
+    for answer in (
+        "The next thing is multiplication.",
+        "The next step is substitution.",
+    ):
+        segments = [
+                {
+                    "start": 0.0,
+                    "end": 5.0,
+                    "text": (
+                        "Two x equals four is an equation that requires one operation."
+                    ),
+                },
+            {"start": 5.0, "end": 10.0, "text": "How do we solve it?"},
+            {"start": 10.0, "end": 15.0, "text": answer},
+        ]
+        assert G._close_cue_context(
+            segments, 0, 1, ignore_caption_case=True
+        ) == (0, 2, None)
+
+
+def test_substantive_next_step_is_not_structural_filler() -> None:
+    substantive = "Now the next step is we multiply both sides by two."
+    dangling = "So now the next goal here is that we"
+
+    assert G._cue_is_only_structural_filler(substantive) is False
+    assert G._cue_is_only_structural_filler(dangling) is True
+
+
+def test_question_only_clip_fails_before_a_topic_transition() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 5.0,
+            "text": "How does DNA polymerase proofread a mismatched base?",
+        },
+        {
+            "start": 5.0,
+            "end": 10.0,
+            "text": "The next topic is DNA ligase.",
+        },
+    ]
+
+    assert G._close_cue_context(
+        segments, 0, 0, ignore_caption_case=True
+    ) == (0, 0, "unresolved_weak_end")
+
+
+def test_question_only_model_range_fails_after_quote_projection() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "How does DNA polymerase proofread a mismatched base?",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 10.0,
+            "text": "The next topic is DNA ligase.",
+        },
+    ]
+    proposal = G._BoundaryTopic(
+        candidate_id="question-only",
+        start_line=0,
+        end_line=0,
+        start_quote="How does DNA polymerase proofread",
+        end_quote="proofread a mismatched base",
+        title="DNA polymerase proofreading",
+        learning_objective="Explain how DNA polymerase proofreads a mismatch.",
+        facet="proofreading mechanism",
+        reason="Teach DNA polymerase proofreading.",
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.5,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote="DNA polymerase proofread a mismatched base",
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="DNA polymerase proofreading",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:unresolved_weak_end"]
+
+
+def test_semantic_for_now_survives_expanded_end_projection() -> None:
+    texts = [
+        "The approximation works because",
+        "the neglected terms are small for now.",
+        "The next topic is exact solutions.",
+    ]
+    segments = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": index * 5.0,
+            "end": (index + 1) * 5.0,
+            "text": text,
+        }
+        for index, text in enumerate(texts)
+    ]
+    proposal = G._BoundaryTopic(
+        candidate_id="approximation-validity",
+        start_line=0,
+        end_line=0,
+        start_quote="The approximation works because",
+        end_quote="approximation works because",
+        title="Approximation validity",
+        learning_objective="Explain why the approximation works.",
+        facet="small neglected terms",
+        reason="Explains the approximation's validity.",
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.5,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote=(
+            "The approximation works because the neglected terms"
+        ),
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="approximation validity",
+    )
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["_clip_text"].endswith("small for now.")
+    assert report.clips[0]["end_quote"].endswith("small for now")
+    assert G._TRAILING_TRANSITION_FRAGMENT_RE.sub(
+        "", "Everything else is the same though now."
+    ).rstrip() == "Everything else is the same"
 
 
 def test_mixed_complete_thought_and_dangling_cta_fails_closed() -> None:

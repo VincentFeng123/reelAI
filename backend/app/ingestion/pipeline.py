@@ -1468,7 +1468,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v12",
+            selection_contract_version="quality_silence_v13",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -2413,7 +2413,7 @@ class IngestionPipeline:
 
         try:
             disc = _discover(
-                topic, limit=discovery_limit, exclude_video_ids=bare_exclusions, level=knowledge_level,
+                topic, limit=discovery_limit, exclude_video_ids=bare_exclusions, level=None,
                 should_cancel=should_cancel,
                 creative_commons_only=creative_commons_only,
                 preferred_video_duration=preferred_video_duration,
@@ -2519,6 +2519,7 @@ class IngestionPipeline:
         audio_preparation_futures: dict[str, Any] = {}
         prepared_audio_results: dict[str, Any] = {}
         audio_preparation_deadlines: dict[str, float] = {}
+        acoustic_verification_deadlines: dict[str, float] = {}
         acoustic_phase_timeout_sec = (
             clip_engine_silence.DEFAULT_TIMEOUT_SEC
             if retrieval_profile == "bootstrap"
@@ -2773,6 +2774,13 @@ class IngestionPipeline:
             prepared_audio = (
                 prepared_audio_for(v) if require_acoustic_boundaries else None
             )
+            verification_deadline = None
+            if require_acoustic_boundaries:
+                source_key = str(v.get("id") or "")
+                verification_deadline = acoustic_verification_deadlines.setdefault(
+                    source_key,
+                    time.monotonic() + acoustic_phase_timeout_sec,
+                )
             media_end = _prepared_media_end_sec(
                 prepared_audio,
                 transcript_end_sec=transcript_end,
@@ -2849,6 +2857,17 @@ class IngestionPipeline:
                     start_two_sided,
                     end_two_sided,
                 ) = boundary_plan
+                assert verification_deadline is not None
+                remaining_verification_sec = (
+                    verification_deadline - time.monotonic()
+                )
+                if remaining_verification_sec <= 0:
+                    return caption, clip_engine_silence.SilenceVerificationResult(
+                        "unavailable",
+                        required_start,
+                        required_end,
+                        {"stage": "verify", "reason": "deadline_exceeded"},
+                    ), projection, speech_bounds
                 acoustic = clip_engine_silence.verify_acoustic_boundaries(
                     str(v.get("url") or v.get("id") or ""),
                     start_target,
@@ -2861,9 +2880,7 @@ class IngestionPipeline:
                     require_start_two_sided=start_two_sided,
                     require_end_two_sided=end_two_sided,
                     prepared=prepared_audio,
-                    # This worker may have waited behind three earlier candidates.
-                    # Start its bounded verification budget only when it runs.
-                    timeout_sec=acoustic_phase_timeout_sec,
+                    timeout_sec=remaining_verification_sec,
                     cancel_check=should_cancel,
                 )
                 crossed_semantic_fence = bool(
@@ -2922,14 +2939,73 @@ class IngestionPipeline:
                     boundary_executor.submit(verify_boundary, clip): index
                     for index, clip in enumerate(candidate_clips)
                 }
+                yielded_indices: set[int] = set()
                 try:
-                    ordered_futures = (
-                        as_completed(futures)
-                        if completion_order_safe and not storage_is_limited
-                        else iter(futures)
-                    )
-                    for future in ordered_futures:
-                        yield futures[future], future.result()
+                    if verification_deadline is None:
+                        ordered_futures = (
+                            as_completed(futures)
+                            if completion_order_safe and not storage_is_limited
+                            else iter(futures)
+                        )
+                        for future in ordered_futures:
+                            index = futures[future]
+                            yielded_indices.add(index)
+                            yield index, future.result()
+                    elif completion_order_safe and not storage_is_limited:
+                        remaining = max(
+                            0.0, verification_deadline - time.monotonic()
+                        )
+                        try:
+                            for future in as_completed(futures, timeout=remaining):
+                                index = futures[future]
+                                yielded_indices.add(index)
+                                yield index, future.result()
+                        except FutureTimeoutError:
+                            pass
+                    else:
+                        for future, index in futures.items():
+                            remaining = verification_deadline - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            try:
+                                result = future.result(timeout=remaining)
+                            except FutureTimeoutError:
+                                break
+                            yielded_indices.add(index)
+                            yield index, result
+
+                    if verification_deadline is not None:
+                        unfinished = [
+                            (future, index)
+                            for future, index in futures.items()
+                            if index not in yielded_indices
+                        ]
+                        for future, _index in unfinished:
+                            future.cancel()
+                        for _future, index in unfinished:
+                            clip = candidate_clips[index]
+                            caption = _supadata_boundary_diagnostics(
+                                engine_out["transcript"], clip
+                            )
+                            speech_bounds = (
+                                _required_speech_bounds(clip, caption)
+                                if caption is not None
+                                else (0.0, 0.0)
+                            )
+                            yield index, (
+                                caption,
+                                clip_engine_silence.SilenceVerificationResult(
+                                    "unavailable",
+                                    speech_bounds[0],
+                                    speech_bounds[1],
+                                    {
+                                        "stage": "verify",
+                                        "reason": "deadline_exceeded",
+                                    },
+                                ),
+                                {},
+                                speech_bounds,
+                            )
                 finally:
                     boundary_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -3079,6 +3155,12 @@ class IngestionPipeline:
                             "permanently_rejected_clips"
                         )
                     continue
+                created_new_reel = True
+
+                def record_persistence_result(created: bool) -> None:
+                    nonlocal created_new_reel
+                    created_new_reel = created
+
                 reel, _ = self._persist_engine_clip(
                     v=v,
                     clip=clip,
@@ -3087,11 +3169,14 @@ class IngestionPipeline:
                     concept_id=concept_id,
                     target_max=0,
                     generation_id=generation_id,
+                    on_persistence_result=record_persistence_result,
                     should_cancel=should_cancel,
                 )
-                stored_count += 1
+                if created_new_reel:
+                    stored_count += 1
                 if generation_context is not None:
-                    generation_context.increment_counter("stored_clips")
+                    if created_new_reel:
+                        generation_context.increment_counter("stored_clips")
                     if boundary_verified_for_storage:
                         generation_context.increment_counter("verified_clips")
                 if not surface_eligible:
@@ -3577,7 +3662,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v12",
+                    selection_contract_version="quality_silence_v13",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,
@@ -3756,6 +3841,7 @@ class IngestionPipeline:
         concept_id: str | None,
         target_max: int,
         generation_id: str | None = None,
+        on_persistence_result: Callable[[bool], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> tuple[ReelOutWithAttribution, IngestMetadata]:
         """
@@ -3805,6 +3891,7 @@ class IngestionPipeline:
                 None if clip.get("difficulty") is None else float(clip["difficulty"])
             ),
             clip_details=clip,
+            on_persistence_result=on_persistence_result,
             should_cancel=should_cancel,
         )
         return reel, metadata
@@ -3825,6 +3912,7 @@ class IngestionPipeline:
         clip_title: str = "",
         clip_difficulty: float | None = None,
         clip_details: dict[str, Any] | None = None,
+        on_persistence_result: Callable[[bool], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> ReelOutWithAttribution:
         raise_if_cancelled(should_cancel)
@@ -3975,6 +4063,7 @@ class IngestionPipeline:
                 ),
             )
             if existing_candidate:
+                created_new_reel = False
                 reel_id = str(existing_candidate["id"])
                 existing_context = {}
                 try:
@@ -4024,6 +4113,7 @@ class IngestionPipeline:
                     selected_cue_ids=selected_cue_ids,
                     search_context=selection_context,
                 )
+                created_new_reel = bool(inserted)
 
             if not inserted:
                 # Unique index collision — load the existing row and reuse it.
@@ -4086,7 +4176,7 @@ class IngestionPipeline:
         except (TypeError, ValueError):
             chain_position = 0.0
 
-        return ReelOutWithAttribution(
+        persisted_reel = ReelOutWithAttribution(
             reel_id=reel_id,
             material_id=effective_material_id,
             concept_id=effective_concept_id,
@@ -4166,6 +4256,9 @@ class IngestionPipeline:
             ),
             source_attribution=attribution,
         )
+        if on_persistence_result is not None:
+            on_persistence_result(created_new_reel)
+        return persisted_reel
 
 
 # --------------------------------------------------------------------- #

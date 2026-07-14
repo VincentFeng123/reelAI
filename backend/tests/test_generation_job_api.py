@@ -34,8 +34,8 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
         main.SELECTION_CONTRACT_VERSION,
         generation_jobs.REQUEST_SCHEMA_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-    } == {"quality_silence_v12"}
-    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v12"
+    } == {"quality_silence_v13"}
+    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v13"
 
 
 def test_reel_response_schema_retains_v3_source_and_selector_metadata() -> None:
@@ -121,7 +121,7 @@ def _insert_generation_reel(
             json.dumps({
                 "surface_eligible": True,
                 "boundary_status": "verified",
-                "selection_contract_version": "quality_silence_v12",
+                "selection_contract_version": "quality_silence_v13",
                 "speech_corridor_verified": True,
                 "directly_teaches_topic": True,
                 "substantive": True,
@@ -150,7 +150,7 @@ def _insert_generation_reel(
         "video_id": video_id,
         "t_start": 0.0,
         "t_end": 30.0,
-        "selection_contract_version": "quality_silence_v12",
+        "selection_contract_version": "quality_silence_v13",
     }
 
 
@@ -179,7 +179,7 @@ def _set_reel_boundary_state(
                     "acoustic_verified": verified,
                     "acoustic": ({"threshold_dbfs": -38.0} if verified else {}),
                 },
-                "selection_contract_version": "quality_silence_v12",
+                "selection_contract_version": "quality_silence_v13",
                 "directly_teaches_topic": True,
                 "substantive": True,
                 "factually_grounded": True,
@@ -250,7 +250,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
             "takeaways": [],
             "score": 0.93,
             "relevance_score": 0.13,
-            "_selection_contract_version": "quality_silence_v12",
+            "_selection_contract_version": "quality_silence_v13",
             "_selection_topic_relevance": 0.93,
             "_selection_source_rank": 0,
         }],
@@ -272,7 +272,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
 
         assert len(reels) == 1
         assert reels[0]["video_id"] == "AbCdEf12345"
-        assert reels[0]["selection_contract_version"] == "quality_silence_v12"
+        assert reels[0]["selection_contract_version"] == "quality_silence_v13"
         assert reels[0]["relevance_score"] == 0.13
         assert reels[0]["topic_relevance"] == 0.93
         assert not any(key.startswith("_selection_") for key in reels[0])
@@ -798,7 +798,7 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
                 json.dumps({
                         "surface_eligible": True,
                         "boundary_status": "verified",
-                        "selection_contract_version": "quality_silence_v12",
+                        "selection_contract_version": "quality_silence_v13",
                         "speech_corridor_verified": True,
                         "directly_teaches_topic": True,
                         "substantive": True,
@@ -1411,7 +1411,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
                 "video_id": f"{mode}-video-{index % expected_source_cap}",
                 "t_start": float(index * 10),
                 "t_end": float(index * 10 + 8),
-                "selection_contract_version": "quality_silence_v12",
+                "selection_contract_version": "quality_silence_v13",
             }
             kwargs["on_reel_created"](reel)
         generated_count += int(kwargs["max_new_reels"])
@@ -1428,7 +1428,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         lambda *_args, **_kwargs: [
             {
                 "reel_id": f"{mode}-reel-{index}",
-                "selection_contract_version": "quality_silence_v12",
+                "selection_contract_version": "quality_silence_v13",
             }
             for index in range(expected_reel_cap)
         ],
@@ -1905,7 +1905,7 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         payload={
             "reel": {
                 "reel_id": "provisional",
-                "selection_contract_version": "quality_silence_v12",
+                "selection_contract_version": "quality_silence_v13",
             },
             "provisional": True,
         },
@@ -1980,7 +1980,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": "streamed-video",
                 "t_start": 10.0,
                 "t_end": 40.0,
-                "selection_contract_version": "quality_silence_v12",
+                "selection_contract_version": "quality_silence_v13",
             },
             "provisional": True,
         },
@@ -2005,7 +2005,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{
             "reel_id": "ranked-reel",
-            "selection_contract_version": "quality_silence_v12",
+            "selection_contract_version": "quality_silence_v13",
         }],
     )
     monkeypatch.setattr(
@@ -2066,7 +2066,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": f"ranked-video-{index}",
                 "t_start": float(index * 30),
                 "t_end": float(index * 30 + 20),
-                "selection_contract_version": "quality_silence_v12",
+                "selection_contract_version": "quality_silence_v13",
             }
             for index in range(4)
         ],
@@ -2733,7 +2733,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
             "_selection_topic_relevance": relevance,
             "_selection_source_rank": source_rank,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v12",
+            "selection_contract_version": "quality_silence_v13",
         }
 
     root_reels = [
@@ -2747,7 +2747,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
         ),
         reel(
             "root-prerequisite",
-            difficulty=0.5,
+            difficulty=0.1,
             relevance=0.7,
             quality=0.79,
             source_rank=0,
@@ -2755,7 +2755,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
         ),
         reel(
             "root-dependent-high-value",
-            difficulty=0.5,
+            difficulty=0.1,
             relevance=0.99,
             quality=0.99,
             source_rank=0,
@@ -2765,7 +2765,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
     child_reels = [
         reel(
             "child-best-independent",
-            difficulty=0.5,
+            difficulty=0.1,
             relevance=0.80,
             quality=0.95,
             source_rank=1,
@@ -2773,7 +2773,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
         ),
         reel(
             "child-mean-independent",
-            difficulty=0.5,
+            difficulty=0.1,
             relevance=0.95,
             quality=0.85,
             source_rank=0,
@@ -2781,7 +2781,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
         ),
         reel(
             "child-low-value",
-            difficulty=0.5,
+            difficulty=0.1,
             relevance=0.99,
             quality=0.10,
             source_rank=0,
@@ -2819,13 +2819,84 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
         )
 
         assert [item["reel_id"] for item in ranked] == [
-            "easy-stage",
             "child-best-independent",
             "child-mean-independent",
+            "easy-stage",
             "root-prerequisite",
             "root-dependent-high-value",
             "child-low-value",
         ]
+    finally:
+        conn.close()
+
+
+def test_generation_chain_uses_nearest_difficulty_across_all_batches(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    root_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="difficulty-root",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    child_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="difficulty-child",
+        generation_mode="slow",
+        retrieval_profile="unified",
+        source_generation_id=root_generation_id,
+    )
+
+    def reel(reel_id: str, difficulty: float) -> dict:
+        return {
+            "reel_id": reel_id,
+            "video_id": reel_id,
+            "t_start": 10.0,
+            "t_end": 20.0,
+            "difficulty": difficulty,
+            "_selection_quality_floor": 0.9,
+            "_selection_quality_mean": 0.9,
+            "_selection_topic_relevance": 0.9,
+            "_selection_source_rank": 0,
+            "_selection_ordered": True,
+            "selection_contract_version": "quality_silence_v13",
+        }
+
+    monkeypatch.setattr(
+        main.reel_service,
+        "ranked_feed",
+        lambda *_args, **kwargs: (
+            [reel("advanced-only", 0.85)]
+            if kwargs.get("generation_id") == root_generation_id
+            else [reel("intermediate-only", 0.50)]
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "_shape_request_page_reels",
+        lambda rows, **_kwargs: list(rows),
+    )
+    try:
+        ranked = main._ranked_request_reels(
+            conn,
+            material_id="m1",
+            fast_mode=False,
+            generation_id=child_generation_id,
+            min_relevance=None,
+            preferred_video_duration="any",
+            target_clip_duration_sec=0,
+            target_clip_duration_min_sec=None,
+            target_clip_duration_max_sec=None,
+            page=1,
+            limit=20,
+        )
+
+        assert [item["reel_id"] for item in ranked] == ["intermediate-only"]
     finally:
         conn.close()
 
@@ -3005,7 +3076,7 @@ def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v12",
+                "selection_contract_version": "quality_silence_v13",
             }
         ],
     )
@@ -3031,7 +3102,7 @@ def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v12",
+                "selection_contract_version": "quality_silence_v13",
             }
         ]
         assert conn.execute(

@@ -133,8 +133,8 @@ class GenerationBudget:
         # plus two/three 40k-input, 12,288-output Flash selectors. Actual
         # structured responses are normally much smaller; these ceilings only
         # keep a valid long transcript from being rejected before dispatch.
-        "fast": 0.38,
-        "slow": 0.55,
+        "fast": 0.13,
+        "slow": 0.19,
     }
     _FLASH_SELECTOR_LIMIT: dict[GenerationMode, int] = {
         "fast": 2,
@@ -320,9 +320,22 @@ def _gemini_token_rates(model: str) -> tuple[float, float, float]:
     normalized = str(model or "").casefold()
     if "flash-lite" in normalized:
         return 0.25, 0.025, 1.50
+    if "gemini-3-flash" in normalized and "gemini-3.5-flash" not in normalized:
+        return 0.50, 0.05, 3.00
     if "pro" in normalized:
         return 2.00, 0.20, 12.00
     return 1.50, 0.15, 9.00
+
+
+def _gemini_physical_attempts(record: Mapping[str, Any]) -> int:
+    """Count a logical call's transport attempts without inventing token usage."""
+    retries = (record.get("metadata") or {}).get("retries")
+    if retries is None:
+        return 1
+    try:
+        return max(1, int(retries) + 1)
+    except (TypeError, ValueError, OverflowError):
+        return 1
 
 
 class GenerationContext:
@@ -754,6 +767,7 @@ class GenerationContext:
                 stage,
                 {
                     "calls": 0,
+                    "attempts": 0,
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "thought_tokens": 0,
@@ -764,6 +778,9 @@ class GenerationContext:
                 },
             )
             bucket["calls"] = int(bucket["calls"]) + 1
+            bucket["attempts"] = int(bucket["attempts"]) + (
+                _gemini_physical_attempts(row)
+            )
             bucket["input_tokens"] = int(bucket["input_tokens"]) + int(
                 row.get("input_tokens") or 0
             )
@@ -805,6 +822,9 @@ class GenerationContext:
         )
         summary = {
             "gemini_calls": len(gemini_calls),
+            "gemini_attempts": sum(
+                _gemini_physical_attempts(row) for row in gemini_calls
+            ),
             "flash_calls": sum(
                 1
                 for row in gemini_calls

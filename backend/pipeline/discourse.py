@@ -49,6 +49,41 @@ _UNRESOLVED_ACTION_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_UNRESOLVED_EMBEDDED_ANAPHOR_RE = re.compile(
+    r"^(?:(?:do|did)\s+)?you\s+know\s+(?:what|how|why)\s+"
+    r"(?:else\s+)?(?:it|this|that|these|those|they|he|she)\b|"
+    r"^(?:what|how|why)\s+(?:else\s+)?"
+    r"(?:it|this|that|these|those|they|he|she)\b|"
+    r"^(?:one|another)\s+(?:thing|function)\s+"
+    r"(?:it|this|that|these|those|they|he|she)\s+can\s+do\b",
+    re.IGNORECASE,
+)
+
+_OPENING_UNRESOLVED_OBJECT_RE = re.compile(
+    r"^(?:[a-z0-9']+\s+){1,5}(?:(?:this|that)\s+one|it|them)\b"
+    r"(?=\s*(?:$|[,.!?;:]|\b(?:away|by|from|into|onto|out|using|via|with)\b))",
+    re.IGNORECASE,
+)
+
+_OPENING_DEICTIC_LOCATION_RE = re.compile(
+    r"^(?!(?:here|there)\s+(?:is|are|was|were)\b)"
+    r"(?![^.!?]{0,80}\b(?:(?:is|are|was|were)\s+there|"
+    r"there\s+(?:is|are|was|were))\b)(?:"
+    r"(?:(?:right|over|up|down)\s+)?(?:here|there)\b|"
+    r"(?:what|where|how|why|which|who)\b[^.!?]{0,80}\b(?:here|there)\b|"
+    r"let(?:['’]?s|\s+us)\s+(?:say\s+)?(?:here|there)\b|"
+    r"(?:[a-z0-9'-]+\s+){0,5}(?:base|end|line|point|position|side|strand)\s+"
+    r"(?:right\s+)?(?:here|there)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_OPENING_BARE_PREDICATE_RE = re.compile(
+    r"^(?:(?:have|has|had)\s+to|"
+    r"(?:is|are|was|were)\s+(?:called|defined|found|known|located|made|used))\b",
+    re.IGNORECASE,
+)
+
 _OPENING_QUANTIFIED_DEMONSTRATIVE_RE = re.compile(
     r"^(?:"
     r"(?:one|any|some|each|either|neither)\s+of\s+(?:these|those)|"
@@ -183,6 +218,14 @@ _DEMONSTRATIVE_DETERMINERS = frozenset({"this", "that", "these", "those"})
 
 _FRAMING_WINDOW_WORDS = 20
 
+_ANTICIPATORY_IT_RE = re.compile(
+    r"^it\s+(?:is|was|can\s+be|could\s+be|may\s+be|might\s+be|"
+    r"will\s+be|would\s+be)\s+(?:(?:especially|often|sometimes|very)\s+)?"
+    r"(?:clear|crucial|difficult|easy|easier|essential|hard|harder|helpful|"
+    r"important|likely|necessary|possible|unlikely|useful)\b",
+    re.IGNORECASE,
+)
+
 
 def _words(text: str) -> list[str]:
     return _WORD_RE.findall(text or "")
@@ -217,7 +260,13 @@ def _is_framing_or_question(text: str, words: list[str]) -> bool:
         return True
     if len(opening_words) > _FRAMING_WINDOW_WORDS:
         opening_text = opening_text[:opening_words[_FRAMING_WINDOW_WORDS - 1].end()]
-    if any(pat in opening_text for pat in _FRAMING_PATTERNS):
+    if any(
+        re.search(
+            rf"(?<![a-z0-9']){re.escape(pat.strip())}(?![a-z0-9'])",
+            opening_text,
+        )
+        for pat in _FRAMING_PATTERNS
+    ):
         return True
     # A question that lost its '?' in ASR: starts with a pure interrogative word.
     if words and words[0].lower() in _INTERROGATIVE_WORDS:
@@ -378,6 +427,10 @@ def opens_mid_thought(text: str) -> bool:
         or _OPENING_ASIDE_RE.match(lexical_text)
         or _ELLIPTICAL_SPATIAL_INSTRUCTION_RE.match(lexical_text)
         or _UNRESOLVED_ACTION_REFERENCE_RE.match(lexical_text)
+        or _UNRESOLVED_EMBEDDED_ANAPHOR_RE.match(lexical_text)
+        or _OPENING_UNRESOLVED_OBJECT_RE.match(lexical_text)
+        or _OPENING_DEICTIC_LOCATION_RE.match(lexical_text)
+        or _OPENING_BARE_PREDICATE_RE.match(lexical_text)
         or _OPENING_QUANTIFIED_DEMONSTRATIVE_RE.match(lexical_text)
         or _CONTEXTUAL_REFORMULATION_RE.match(lexical_text)
     ):
@@ -393,6 +446,8 @@ def opens_mid_thought(text: str) -> bool:
 
     w0 = words[0].lower()
     w1 = words[1].lower() if len(words) > 1 else ""
+    if _ANTICIPATORY_IT_RE.match(lexical_text):
+        return False
     if w0 in CONTINUATION_MARKERS and _ANAPHORIC_QUESTION_RE.search(stripped):
         return True
     if w0 in CONTINUATION_MARKERS and w1 in _DEMONSTRATIVE_DETERMINERS:

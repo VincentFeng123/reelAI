@@ -153,14 +153,14 @@ def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> No
     for _ in range(2):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
-            model="gemini-3.5-flash",
+            model="gemini-3-flash-preview",
             prompt_text="short transcript",
             max_output_tokens=4096,
         )
     with pytest.raises(ProviderBudgetExceededError):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
-            model="gemini-3.5-flash",
+            model="gemini-3-flash-preview",
             prompt_text="another transcript",
             max_output_tokens=4096,
         )
@@ -183,26 +183,26 @@ def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> No
     for _ in range(3):
         slow_flash.reserve_gemini_call(
             operation="flash_boundary_selector",
-            model="gemini-3.5-flash",
+            model="gemini-3-flash-preview",
             prompt_text="short transcript",
             max_output_tokens=8192,
         )
     with pytest.raises(ProviderBudgetExceededError):
         slow_flash.reserve_gemini_call(
             operation="flash_boundary_selector",
-            model="gemini-3.5-flash",
+            model="gemini-3-flash-preview",
             prompt_text="fourth transcript",
             max_output_tokens=8192,
         )
     slow_budget = slow_flash.budget.snapshot()["gemini"]
     assert slow_budget["flash_selector_calls"] == 3
     assert slow_budget["flash_selector_limit"] == 3
-    assert slow_budget["cost_limit_usd"] == pytest.approx(0.55)
+    assert slow_budget["cost_limit_usd"] == pytest.approx(0.19)
 
 
 @pytest.mark.parametrize(
     ("mode", "selector_count", "cost_limit"),
-    [("fast", 2, 0.38), ("slow", 3, 0.55)],
+    [("fast", 2, 0.13), ("slow", 3, 0.19)],
 )
 def test_job_cost_budget_fits_expansion_and_realistic_long_transcript_selectors(
     mode: str,
@@ -219,7 +219,7 @@ def test_job_cost_budget_fits_expansion_and_realistic_long_transcript_selectors(
     for _ in range(selector_count):
         context.reserve_gemini_call(
             operation="flash_boundary_selector",
-            model="gemini-3.5-flash",
+            model="gemini-3-flash-preview",
             estimated_input_tokens=40_000,
             max_output_tokens=12_288,
         )
@@ -228,7 +228,7 @@ def test_job_cost_budget_fits_expansion_and_realistic_long_transcript_selectors(
     expected_reserved_cost = (
         1_000 * 0.25
         + 1_024 * 1.5
-        + selector_count * (40_000 * 1.5 + 12_288 * 9.0)
+        + selector_count * (40_000 * 0.5 + 12_288 * 3.0)
     ) / 1_000_000.0
     assert budget["flash_selector_calls"] == selector_count
     assert budget["reserved_cost_usd"] == pytest.approx(expected_reserved_cost)
@@ -322,7 +322,64 @@ def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -
         "request_failure:RuntimeError": 1,
     }
     assert payload["by_stage"]["selection"]["calls"] == 1
-    assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.38
+    assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.13
+
+
+def test_generation_usage_counts_selector_retries_as_physical_attempts_once() -> None:
+    context = GenerationContext("fast", generation_id="job-retried-selector")
+    context.record_gemini(
+        attempt=3,
+        model_used="gemini-3-flash-preview",
+        quality_degraded=False,
+        stage="selection",
+        usage={
+            "retries": 2,
+            "prompt_tokens": 100,
+            "candidate_tokens": 20,
+            "thought_tokens": 10,
+            "total_tokens": 130,
+            "dispatched": True,
+        },
+    )
+
+    payload = context.usage_payload()
+    assert payload["summary"]["gemini_calls"] == 1
+    assert payload["summary"]["gemini_attempts"] == 3
+    assert payload["by_stage"]["selection"]["calls"] == 1
+    assert payload["by_stage"]["selection"]["attempts"] == 3
+    assert payload["summary"]["input_tokens"] == 100
+    assert payload["summary"]["output_tokens"] == 30
+    assert payload["summary"]["estimated_cost_usd"] == pytest.approx(
+        (100 * 0.5 + 30 * 3.0) / 1_000_000.0
+    )
+    assert payload["summary"]["billing_unknown_calls"] == 0
+
+
+def test_failed_retries_add_attempts_without_inventing_token_billing() -> None:
+    context = GenerationContext("fast", generation_id="job-failed-selector")
+    context.record_gemini(
+        attempt=3,
+        model_used="gemini-3-flash-preview",
+        quality_degraded=False,
+        stage="selection",
+        usage={
+            "retries": 2,
+            "dispatched": True,
+            "reserved_cost_usd": 0.05,
+        },
+        status_code=None,
+        error_code="model_call_failed",
+    )
+
+    payload = context.usage_payload()
+    assert payload["summary"]["gemini_calls"] == 1
+    assert payload["summary"]["gemini_attempts"] == 3
+    assert payload["by_stage"]["selection"]["attempts"] == 3
+    assert payload["summary"]["input_tokens"] == 0
+    assert payload["summary"]["output_tokens"] == 0
+    assert payload["summary"]["estimated_cost_usd"] == 0.0
+    assert payload["summary"]["billing_unknown_calls"] == 1
+    assert payload["by_stage"]["selection"]["billing_unknown_calls"] == 1
 
 
 def test_one_physical_pro_fallback_counts_once_for_multiple_reasons() -> None:

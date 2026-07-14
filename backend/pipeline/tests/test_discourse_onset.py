@@ -213,6 +213,52 @@ def test_elliptical_instruction_and_action_reference_are_weak():
     assert opens_mid_thought("I can just do that.")
 
 
+def test_embedded_anaphor_and_bare_predicate_require_prior_context():
+    assert opens_mid_thought("You know what else it can do: one more function.")
+    assert opens_mid_thought("The next enzyme, as if there isn't enough enzymes.")
+    assert opens_mid_thought("Have to remove those primers.")
+
+
+def test_plural_noun_subjects_are_complete_openings():
+    assert is_onset("Causes include fiscal crisis and inequality.")
+    assert is_onset("Uses include generating electricity and heating water.")
+    assert is_onset("Returns diminish as more labor is added to fixed capital.")
+    assert is_onset("Causes can be identified by examining the evidence.")
+    assert is_onset("Causes are classified by using their mechanisms.")
+
+
+def test_deictic_worked_example_openers_are_weak_but_existentials_are_onsets():
+    assert opens_mid_thought("What do I need to add here?")
+    assert opens_mid_thought("Let's say here we had our three-prime end.")
+    assert opens_mid_thought("Five-prime end here, the new strand would continue.")
+    assert is_onset("Here is the proofreading rule.")
+    assert is_onset("Two proofreading mechanisms operate independently.")
+
+
+def test_dummy_and_existential_pronouns_do_not_require_prior_context():
+    assert is_onset("DNA makes it possible to transmit hereditary information.")
+    assert is_onset("When it rains, roads get slippery.")
+    assert is_onset("It is important to distinguish correlation from causation.")
+    assert is_onset("What happens when there is a mismatch?")
+    assert is_onset("Why are there seasons?")
+
+
+def test_referential_objects_and_deictic_locations_still_require_context():
+    assert opens_mid_thought("We can remove them with DNA polymerase I.")
+    assert opens_mid_thought("To solve it, factor the polynomial.")
+    assert opens_mid_thought("What should I place there?")
+
+
+def test_plural_noun_subjects_are_not_mistaken_for_bare_predicates():
+    assert is_onset(
+        "Causes of the French Revolution include fiscal crisis and inequality."
+    )
+    assert is_onset("Returns to scale describe how output changes with inputs.")
+    assert is_onset("Means testing determines eligibility for benefits.")
+    assert is_onset("Cuts in interest rates stimulate aggregate demand.")
+    assert is_onset("Starts and stops in DNA regulate transcription.")
+
+
 def test_complete_little_below_statement_is_an_onset():
     assert is_onset("A little below the boiling point, water remains liquid.")
 
