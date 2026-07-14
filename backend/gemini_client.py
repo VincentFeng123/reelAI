@@ -360,10 +360,11 @@ def generate_json_v3(
 ) -> GenerationResult:
     """Run one Gemini 3 structured call with bounded transport behavior.
 
-    SDK retries are disabled so ``max_retries=1`` means at most one
-    application-controlled retry. ``deadline_monotonic`` is an absolute
-    ``time.monotonic()`` deadline shared by the caller's complete workflow.
-    Cancellation is cooperative between in-flight HTTP requests.
+    SDK retries are disabled so ``max_retries`` is the application-controlled
+    retry ceiling. A second retry is permitted only after an HTTP 503;
+    non-503 failures remain capped at one retry. ``deadline_monotonic`` is an
+    absolute ``time.monotonic()`` deadline shared by the caller's complete
+    workflow. Cancellation is cooperative between in-flight HTTP requests.
     """
     mdl = str(model or "").strip()
     level = str(thinking_level or "").strip().lower()
@@ -378,8 +379,8 @@ def generate_json_v3(
     if deadline_monotonic is not None and not math.isfinite(float(deadline_monotonic)):
         raise ValueError("deadline_monotonic must be finite")
     if (isinstance(max_retries, bool) or not isinstance(max_retries, int)
-            or max_retries not in (0, 1)):
-        raise ValueError("max_retries must be 0 or 1")
+            or max_retries not in (0, 1, 2)):
+        raise ValueError("max_retries must be 0, 1, or 2")
 
     started = time.perf_counter()
     operation_deadline = (
@@ -459,11 +460,20 @@ def generate_json_v3(
                 raise GeminiDeadlineExceededError(
                     "Gemini call deadline exceeded", telemetry,
                 ) from error
-            if not retryable or attempt + 1 >= max_attempts:
+            # The production selector may request one extra attempt for a
+            # short-lived Gemini capacity spike. Other transient failures keep
+            # the original one-retry ceiling so quota and latency cannot grow.
+            retry_limit = (
+                max_retries
+                if _gemini_status_code(error) == 503
+                else min(max_retries, 1)
+            )
+            if not retryable or attempt >= retry_limit:
                 raise GeminiTransportError(str(error), telemetry) from error
 
+            delay_floor_s = 2.0 ** attempt
             wait_s = max(
-                random.uniform(0.8, 1.2),
+                random.uniform(delay_floor_s, delay_floor_s * 2.0),
                 _gemini_retry_after(error) or 0.0,
             )
             remaining_after_wait_s = operation_deadline - time.monotonic() - wait_s

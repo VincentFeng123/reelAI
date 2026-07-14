@@ -319,7 +319,7 @@ def test_gemini3_cancellation_during_jitter_prevents_retry(monkeypatch):
     assert exc_info.value.telemetry.retries == 0
 
 
-def test_gemini3_never_exceeds_one_application_retry(monkeypatch):
+def test_gemini3_one_retry_ceiling_remains_available(monkeypatch):
     fake = _FakeClient(_HTTPError(503), _HTTPError(503), _FakeResponse())
     monkeypatch.setattr(gc.time, "sleep", lambda _: None)
 
@@ -343,6 +343,145 @@ def test_gemini3_never_exceeds_one_application_retry(monkeypatch):
             "retryable": True,
         },
     )
+
+
+def test_gemini3_503_can_succeed_on_third_attempt_with_exponential_jitter(monkeypatch):
+    fake = _FakeClient(_HTTPError(503), _HTTPError(503), _FakeResponse())
+    sleeps = []
+    jitter_ranges = []
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+
+    def lowest_jitter(lo, hi):
+        jitter_ranges.append((lo, hi))
+        return lo
+
+    monkeypatch.setattr(gc.random, "uniform", lowest_jitter)
+
+    result = _call_v3(monkeypatch, fake, max_retries=2)
+
+    assert len(fake.models.calls) == 3
+    assert sleeps == [1.0, 2.0]
+    assert jitter_ranges == [(1.0, 2.0), (2.0, 4.0)]
+    assert result.telemetry.retries == 2
+    assert [item["provider_status_code"] for item in result.telemetry.error_history] == [
+        503,
+        503,
+    ]
+
+
+def test_gemini3_three_503s_fail_after_two_exponential_retries(monkeypatch):
+    fake = _FakeClient(_HTTPError(503), _HTTPError(503), _HTTPError(503))
+    sleeps = []
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+    monkeypatch.setattr(gc.random, "uniform", lambda lo, _hi: lo)
+
+    with pytest.raises(gc.GeminiTransportError) as exc_info:
+        _call_v3(monkeypatch, fake, max_retries=2)
+
+    assert len(fake.models.calls) == 3
+    assert sleeps == [1.0, 2.0]
+    assert exc_info.value.telemetry.retries == 2
+    assert len(exc_info.value.telemetry.error_history) == 3
+
+
+@pytest.mark.parametrize("status_code", [429, 500, 502, 504])
+def test_gemini3_non_503_remains_capped_at_one_retry(monkeypatch, status_code):
+    fake = _FakeClient(
+        _HTTPError(status_code),
+        _HTTPError(status_code),
+        _FakeResponse(),
+    )
+    monkeypatch.setattr(gc.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(gc.GeminiTransportError) as exc_info:
+        _call_v3(monkeypatch, fake, max_retries=2)
+
+    assert len(fake.models.calls) == 2
+    assert exc_info.value.telemetry.retries == 1
+
+
+def test_gemini3_second_503_retry_honors_retry_after(monkeypatch):
+    fake = _FakeClient(
+        _HTTPError(503),
+        _HTTPError(503, retry_after="3.5"),
+        _FakeResponse(),
+    )
+    sleeps = []
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+    monkeypatch.setattr(gc.random, "uniform", lambda lo, _hi: lo)
+
+    result = _call_v3(monkeypatch, fake, max_retries=2)
+
+    assert result.telemetry.retries == 2
+    assert sleeps == [1.0, 3.5]
+
+
+def test_gemini3_second_503_retry_respects_absolute_deadline(monkeypatch):
+    clock = {"now": 0.0}
+
+    class Models:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, model, contents, config):
+            self.calls.append({"config": config})
+            if len(self.calls) == 1:
+                clock["now"] = 1.0
+            else:
+                clock["now"] = 6.0
+            raise _HTTPError(503)
+
+    fake = SimpleNamespace(models=Models())
+    sleeps = []
+    monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
+
+    def advance(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(gc.time, "sleep", advance)
+    monkeypatch.setattr(gc.random, "uniform", lambda lo, _hi: lo)
+
+    with pytest.raises(gc.GeminiDeadlineExceededError) as exc_info:
+        _call_v3(
+            monkeypatch,
+            fake,
+            timeout_s=20.0,
+            deadline_monotonic=12.0,
+            max_retries=2,
+        )
+
+    assert len(fake.models.calls) == 2
+    assert sleeps == [1.0]
+    assert exc_info.value.telemetry.retries == 1
+
+
+def test_gemini3_cancellation_during_second_503_backoff_prevents_third_attempt(
+    monkeypatch,
+):
+    fake = _FakeClient(_HTTPError(503), _HTTPError(503), _FakeResponse())
+    clock = {"now": 0.0}
+    state = {"cancelled": False}
+
+    def advance(seconds):
+        clock["now"] += seconds
+        if len(fake.models.calls) == 2:
+            state["cancelled"] = True
+
+    monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(gc.time, "sleep", advance)
+    monkeypatch.setattr(gc.random, "uniform", lambda lo, _hi: lo)
+
+    with pytest.raises(gc.GeminiCancelledError) as exc_info:
+        _call_v3(
+            monkeypatch,
+            fake,
+            max_retries=2,
+            cancelled=lambda: state["cancelled"],
+        )
+
+    assert len(fake.models.calls) == 2
+    assert exc_info.value.telemetry.retries == 1
 
 
 def test_gemini3_does_not_retry_non_transient_error(monkeypatch):
@@ -580,7 +719,7 @@ def test_dedicated_gemini3_api_requires_explicit_gemini3_model(monkeypatch, mode
     assert fake.models.calls == []
 
 
-@pytest.mark.parametrize("max_retries", [-1, 2, True, 1.0])
+@pytest.mark.parametrize("max_retries", [-1, 3, True, 1.0])
 def test_dedicated_gemini3_api_rejects_invalid_retry_counts(monkeypatch, max_retries):
     fake = _FakeClient(_FakeResponse())
     monkeypatch.setattr(gc, "get_client", lambda: fake)

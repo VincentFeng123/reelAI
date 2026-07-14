@@ -215,6 +215,63 @@ def test_caption_handoff_rejects_nearby_silence_separated_by_sound(
     assert result.diagnostics["end_windows"] == [[17.0, 21.0]]
 
 
+@pytest.mark.parametrize(
+    ("end_quiet", "expected_verified"),
+    [
+        ((7.88, 8.18), True),
+        ((8.18, 8.48), False),
+        (None, False),
+    ],
+)
+def test_rolling_caption_end_handoff_requires_the_same_straddling_quiet_run(
+    tmp_path: Path,
+    end_quiet: tuple[float, float] | None,
+    expected_verified: bool,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_start_sec,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        if output_path.name == "start-0.wav":
+            quiet_start, quiet_end = 0.0, 0.30
+        elif end_quiet is None:
+            _write_wav(output_path, [(window_duration_sec, 12000)])
+            return
+        else:
+            quiet_start, quiet_end = end_quiet
+        before = quiet_start - window_start_sec
+        after = window_duration_sec - before - (quiet_end - quiet_start)
+        _write_wav(
+            output_path,
+            [(before, 12000), (quiet_end - quiet_start, 0), (after, 12000)],
+        )
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            0.01,
+            8.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=8.0,
+            require_end_speech_handoff=True,
+            require_end_two_sided=True,
+            prepared=_prepared(),
+        )
+
+    assert result.verified is expected_verified
+    if expected_verified:
+        assert result.end_sec == 8.0
+        assert result.diagnostics["end_quiet"] == [7.88, 8.18]
+        assert result.diagnostics["observation_end_limit_sec"] == 9.0
+    else:
+        assert result.diagnostics["reason"] == "end_silence_not_found"
+        assert result.diagnostics["end_windows"] == [[5.0, 9.0]]
+
+
 def test_lexical_ownership_corridor_accepts_real_one_hundred_ten_ms_gaps(
     tmp_path: Path,
 ) -> None:

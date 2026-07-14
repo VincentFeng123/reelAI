@@ -694,7 +694,7 @@ def test_compound_topic_allows_grounded_related_facets():
     assert "genuinely needed to understand or apply the exact requested topic" in user.casefold()
 
 
-def test_budget_is_reserved_once_and_selector_allows_one_transient_retry(monkeypatch):
+def test_budget_is_reserved_once_and_default_call_allows_one_transient_retry(monkeypatch):
     order = []
     payload = {}
 

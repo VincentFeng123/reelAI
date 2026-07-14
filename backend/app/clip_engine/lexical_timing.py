@@ -245,9 +245,13 @@ def _parse_event(raw_event: object) -> list[LexicalWord]:
     if not lexical:
         return []
     if lexical[0][1] is None:
-        # JSON3 commonly omits zero for the first word.  It is safe only when
-        # every sibling proves that this is a word-timed event.
-        if len(lexical) < 2 or any(offset is None for _, offset in lexical[1:]):
+        # JSON3 commonly omits zero for the first word. A one-token event has
+        # no second lexical position to interpolate: its explicit event start
+        # is the onset of that sole word. Multi-token events still need every
+        # later sibling offset to prove that the event is word-timed.
+        if len(lexical) > 1 and any(
+            offset is None for _, offset in lexical[1:]
+        ):
             return []
         lexical[0] = (lexical[0][0], 0.0)
     elif any(offset is None for _, offset in lexical):

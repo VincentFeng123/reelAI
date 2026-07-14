@@ -3347,8 +3347,9 @@ def _run_selection_profile(
         cancelled=cancelled,
         budget_reserve=settings.get("_segment_budget_reserve"),
         # Keep the production selector to one logical, once-reserved call while
-        # allowing one same-model retry for transient provider failures.
-        max_retries=1,
+        # allowing a 503-only third physical attempt for a short capacity spike.
+        # All other profiles and transient failures retain one retry.
+        max_retries=2 if profile == FLASH_SPLIT_PROFILE else 1,
     )
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)

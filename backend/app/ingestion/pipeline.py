@@ -120,12 +120,24 @@ INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
 )
 PARTIAL_CUE_MATERIALITY_SEC = 0.05
 SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
+MAX_PLAUSIBLE_CAPTION_WORDS_PER_SEC = 8.0
 _QUOTE_WORD_RE = re.compile(
     r"[\w+#]+(?:['\u2018\u2019\u02bc-][\w+#]+)*",
     re.UNICODE,
 )
 _QUOTE_APOSTROPHES = str.maketrans(
     {"\u2018": "'", "\u2019": "'", "\u02bc": "'"}
+)
+_NO_SPACE_SCRIPT_NAME_MARKERS = (
+    "BOPOMOFO",
+    "CJK",
+    "HANGUL",
+    "HIRAGANA",
+    "KATAKANA",
+    "KHMER",
+    "LAO",
+    "MYANMAR",
+    "THAI",
 )
 
 
@@ -135,6 +147,27 @@ def _quote_token(value: str) -> str:
         .translate(_QUOTE_APOSTROPHES)
         .casefold()
     )
+
+
+def _caption_speech_units(text: str) -> int:
+    """Count plausible spoken units without treating no-space scripts as one word."""
+    units = 0
+    for token in _QUOTE_WORD_RE.findall(str(text or "")):
+        ordinary_run = False
+        for character in token:
+            if not character.isalnum():
+                continue
+            unicode_name = unicodedata.name(character, "")
+            if any(
+                marker in unicode_name
+                for marker in _NO_SPACE_SCRIPT_NAME_MARKERS
+            ):
+                units += 1
+            else:
+                ordinary_run = True
+        if ordinary_run:
+            units += 1
+    return units
 
 
 def _quote_character_spans(text: str, quote: str) -> list[tuple[int, int]]:
@@ -359,6 +392,89 @@ def _required_speech_bounds(
     )
 
 
+def _overlapping_caption_end_handoff(
+    transcript: dict[str, Any],
+    raw_clip: dict[str, Any],
+) -> tuple[float, dict[str, Any]] | None:
+    """Use the next cue onset only as an acoustically proven overlap handoff.
+
+    Hosted rolling captions commonly keep one cue displayed after the next cue
+    begins.  The stale display end is not a speech timestamp.  This helper does
+    not authorize a cut by itself; it records the adjacent onset that the
+    acoustic gate must later prove lies inside one two-sided quiet run.
+    """
+    segments = [
+        segment
+        for segment in (transcript.get("segments") or [])
+        if isinstance(segment, dict)
+    ]
+    index_by_id = {
+        str(segment.get("cue_id") or f"cue-{index}"): index
+        for index, segment in enumerate(segments)
+    }
+    cue_ids = [str(value or "").strip() for value in (raw_clip.get("cue_ids") or [])]
+    if not cue_ids or any(cue_id not in index_by_id for cue_id in cue_ids):
+        return None
+    indices = [index_by_id[cue_id] for cue_id in cue_ids]
+    if indices != list(range(indices[0], indices[-1] + 1)):
+        return None
+    last_index = indices[-1]
+    if last_index + 1 >= len(segments):
+        return None
+    selected = segments[last_index]
+    following = segments[last_index + 1]
+    try:
+        selected_start = float(selected.get("start"))
+        display_end = float(selected.get("end"))
+        next_onset = float(following.get("start"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    selected_speech_units = _caption_speech_units(
+        str(selected.get("text") or "")
+    )
+    minimum_selected_span = max(
+        PARTIAL_CUE_MATERIALITY_SEC,
+        selected_speech_units / MAX_PLAUSIBLE_CAPTION_WORDS_PER_SEC,
+    )
+    if (
+        not math.isfinite(selected_start)
+        or not math.isfinite(display_end)
+        or not math.isfinite(next_onset)
+        or next_onset < 0.0
+        or not selected_speech_units
+        or next_onset < selected_start + minimum_selected_span
+        or next_onset + SPEECH_OWNERSHIP_EPSILON_SEC >= display_end
+    ):
+        return None
+    return next_onset, {
+        "mode": "next_cue_onset_two_sided_quiet",
+        "selected_cue_id": cue_ids[-1],
+        "next_cue_id": str(
+            following.get("cue_id") or f"cue-{last_index + 1}"
+        ),
+        "display_end_sec": round(display_end, 3),
+        "next_cue_onset_sec": round(next_onset, 3),
+        "overlap_sec": round(display_end - next_onset, 3),
+    }
+
+
+def _caption_overlap_end_handoff_is_valid(
+    transcript: dict[str, Any],
+    raw_clip: dict[str, Any],
+    *,
+    required_end: float,
+    projection_diagnostics: dict[str, Any],
+) -> bool:
+    canonical = _overlapping_caption_end_handoff(transcript, raw_clip)
+    return bool(
+        canonical is not None
+        and math.isfinite(required_end)
+        and abs(required_end - canonical[0]) <= SPEECH_OWNERSHIP_EPSILON_SEC
+        and projection_diagnostics.get("caption_overlap_end_handoff")
+        == canonical[1]
+    )
+
+
 def _projected_speech_bounds(
     transcript: dict[str, Any],
     raw_clip: dict[str, Any],
@@ -373,6 +489,25 @@ def _projected_speech_bounds(
     source = getattr(prepared, "source", None)
     words = tuple(getattr(source, "lexical_words", ()) or ())
     if not words:
+        overlap_handoff = (
+            None
+            if isinstance(projections.get("end"), dict)
+            else _overlapping_caption_end_handoff(transcript, raw_clip)
+        )
+        if (
+            not projections
+            and overlap_handoff is not None
+            and abs(fallback[1] - overlap_handoff[1]["display_end_sec"])
+            <= SPEECH_OWNERSHIP_EPSILON_SEC
+        ):
+            next_onset, overlap_diagnostics = overlap_handoff
+            if next_onset <= fallback[0]:
+                return fallback, {}, "caption_overlap_handoff_invalid"
+            return (
+                (fallback[0], next_onset),
+                {"caption_overlap_end_handoff": overlap_diagnostics},
+                None,
+            )
         return (
             (fallback, {}, "lexical_timing_unavailable")
             if projections
@@ -513,17 +648,43 @@ def _projected_speech_bounds(
         or required_end <= required_start
     ):
         return fallback, {}, "lexical_projection_invalid"
-    if not verified:
-        return fallback, {}, None
+    overlap_handoff = (
+        None
+        if "end" in verified or isinstance(projections.get("end"), dict)
+        else _overlapping_caption_end_handoff(transcript, raw_clip)
+    )
+    if (
+        overlap_handoff is not None
+        and abs(fallback[1] - overlap_handoff[1]["display_end_sec"])
+        > SPEECH_OWNERSHIP_EPSILON_SEC
+    ):
+        overlap_handoff = None
+    if overlap_handoff is not None:
+        required_end, overlap_diagnostics = overlap_handoff
+    else:
+        overlap_diagnostics = None
+    if required_end <= required_start:
+        return fallback, {}, "caption_overlap_handoff_invalid"
     return (
         (required_start, required_end),
         {
-            "lexical_boundary_verified": True,
-            "lexical_projection_verified": any(
-                details.get("mode") == "projected"
-                for details in verified.values()
+            **(
+                {
+                    "lexical_boundary_verified": True,
+                    "lexical_projection_verified": any(
+                        details.get("mode") == "projected"
+                        for details in verified.values()
+                    ),
+                }
+                if verified
+                else {}
             ),
             **verified,
+            **(
+                {"caption_overlap_end_handoff": overlap_diagnostics}
+                if overlap_diagnostics is not None
+                else {}
+            ),
         },
         None,
     )
@@ -721,11 +882,25 @@ def _selected_speech_corridor(
     end_boundary = lexical_boundaries.get("end")
     start_is_lexical = isinstance(start_boundary, dict)
     end_is_lexical = isinstance(end_boundary, dict)
+    end_is_overlap_handoff = _caption_overlap_end_handoff_is_valid(
+        transcript,
+        raw_clip,
+        required_end=required_end,
+        projection_diagnostics=(
+            projection_diagnostics
+            if isinstance(projection_diagnostics, dict)
+            else {}
+        ),
+    )
     start_is_partial = required_start > first_start + PARTIAL_CUE_MATERIALITY_SEC
     end_is_partial = required_end < last_end - PARTIAL_CUE_MATERIALITY_SEC
     if (
         (start_is_partial and not start_is_lexical)
-        or (end_is_partial and not end_is_lexical)
+        or (
+            end_is_partial
+            and not end_is_lexical
+            and not end_is_overlap_handoff
+        )
     ):
         return 0.0, source_end, "partial_cue_edge_requires_projection"
 
@@ -800,8 +975,16 @@ def _acoustic_boundary_plan(
     ):
         return None
     start_two_sided = start_is_lexical or first_index > 0
+    end_is_overlap_handoff = _caption_overlap_end_handoff_is_valid(
+        transcript,
+        raw_clip,
+        required_end=end_target,
+        projection_diagnostics=projection_diagnostics,
+    )
     end_two_sided = (
-        end_is_lexical or last_index + 1 < len(segments)
+        end_is_lexical
+        or end_is_overlap_handoff
+        or last_index + 1 < len(segments)
     )
     start_handoff = not start_is_lexical and (
         start_two_sided
@@ -810,8 +993,9 @@ def _acoustic_boundary_plan(
             and start_target > search_start + SPEECH_OWNERSHIP_EPSILON_SEC
         )
     )
-    end_handoff = not end_is_lexical and (
-        last_index + 1 >= len(segments)
+    end_handoff = end_is_overlap_handoff or (
+        not end_is_lexical
+        and last_index + 1 >= len(segments)
         and end_target < search_end - SPEECH_OWNERSHIP_EPSILON_SEC
     )
     return (

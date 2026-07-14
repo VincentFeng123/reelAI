@@ -664,6 +664,8 @@ def test_production_selector_reserves_once_and_retries_transient_failure(monkeyp
         "get_client",
         lambda: type("Client", (), {"models": models})(),
     )
+    monkeypatch.setattr(GC.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(GC.random, "uniform", lambda lower, _upper: lower)
     reservations = []
 
     def reserve(**kwargs):
@@ -678,9 +680,9 @@ def test_production_selector_reserves_once_and_retries_transient_failure(monkeyp
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert len(models.calls) == 2
+    assert len(models.calls) == 3
     assert len(reservations) == 1
-    assert result.calls[0]["retries"] == 1
+    assert result.calls[0]["retries"] == 2
     assert result.calls[0]["provider_error_type"] == "TransientHTTPError"
     assert result.calls[0]["provider_status_code"] == 503
     assert result.calls[0]["retryable"] is True
@@ -786,7 +788,7 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         timeout,
         operation,
         expected_model,
-        1,
+        2 if profile == G.FLASH_SPLIT_PROFILE else 1,
     )
 
 

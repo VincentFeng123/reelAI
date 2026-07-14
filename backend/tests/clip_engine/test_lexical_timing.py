@@ -167,7 +167,7 @@ def test_track_selection_fails_closed_for_alias_translation_and_wrong_language(
     assert select_original_json3_track(info, expected_language=language) is None
 
 
-def test_json3_parser_uses_only_explicit_offsets_and_proven_first_word_zero() -> None:
+def test_json3_parser_uses_explicit_offsets_and_proven_zero_onsets() -> None:
     payload = {
         "events": [
             {
@@ -186,8 +186,61 @@ def test_json3_parser_uses_only_explicit_offsets_and_proven_first_word_zero() ->
     assert parse_json3_words(payload) == (
         _word("alpha", 1.0),
         _word("beta", 1.25),
+        _word("untimed", 2.0),
         _word("gamma", 4.125),
     )
+
+
+def test_singleton_event_start_restores_a_grounded_end_anchor() -> None:
+    words = parse_json3_words(
+        {
+            "events": [
+                {
+                    "tStartMs": 1_000,
+                    "segs": [
+                        {"utf8": "get", "tOffsetMs": 0},
+                        {"utf8": "rid", "tOffsetMs": 100},
+                        {"utf8": "of", "tOffsetMs": 200},
+                        {"utf8": "these", "tOffsetMs": 300},
+                        {"utf8": "RNA", "tOffsetMs": 400},
+                    ],
+                },
+                {"tStartMs": 1_500, "segs": [{"utf8": "primers"}]},
+                {"tStartMs": 2_000, "segs": [{"utf8": "how"}]},
+            ]
+        }
+    )
+
+    anchor = align_edge_anchor(
+        words,
+        cue_text="get rid of these RNA primers. How do we remove them?",
+        quote="get rid of these RNA primers",
+        edge="end",
+        cue_start_sec=0.95,
+        cue_end_sec=2.1,
+    )
+
+    assert anchor is not None
+    assert anchor.quote_last_onset_sec == 1.5
+    assert anchor.excluded_neighbor_onset_sec == 2.0
+
+
+def test_singleton_zero_does_not_admit_multiword_or_unproven_events() -> None:
+    payload = {
+        "events": [
+            {"tStartMs": 1_000, "segs": [{"utf8": "two words"}]},
+            {"tStartMs": 2_000, "segs": [{"utf8": "   "}]},
+            {
+                "tStartMs": 3_000,
+                "segs": [
+                    {"utf8": "one"},
+                    {"utf8": "two"},
+                ],
+            },
+        ]
+    }
+
+    assert parse_json3_words(payload) == ()
 
 
 def test_json3_parser_rejects_partially_timed_or_nonmonotonic_events() -> None:

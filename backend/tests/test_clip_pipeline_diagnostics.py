@@ -1960,6 +1960,244 @@ def test_nonlexical_end_progresses_from_required_speech_to_next_cue_fence() -> N
     assert plan == (0.0, 10.0, False, False, False, True)
 
 
+def test_rolling_display_end_uses_only_a_two_sided_next_onset_handoff() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:rolling-display-end",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "The selected explanation reaches its conclusion.",
+            },
+            {
+                "cue_id": "next",
+                "start": 8.0,
+                "end": 20.0,
+                "text": "The next teaching unit begins here.",
+            },
+        ],
+    }
+    clip = {
+        "cue_ids": ["selected"],
+        "start": 0.0,
+        "end": 10.0,
+        "start_quote": "The selected explanation reaches",
+        "end_quote": "explanation reaches its conclusion",
+    }
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a"
+        ),
+    )
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        prepared,
+    )
+    corridor = pipeline_module._selected_speech_corridor(
+        transcript,
+        clip,
+        caption,
+        source_end_sec=20.0,
+        required_speech_bounds=bounds,
+        projection_diagnostics=projection,
+    )
+    plan = pipeline_module._acoustic_boundary_plan(
+        transcript,
+        clip,
+        projection,
+        speech_bounds=bounds,
+        search_limits=corridor[:2],
+    )
+
+    assert error is None
+    assert bounds == (0.0, 8.0)
+    assert projection == {
+        "caption_overlap_end_handoff": {
+            "mode": "next_cue_onset_two_sided_quiet",
+            "selected_cue_id": "selected",
+            "next_cue_id": "next",
+            "display_end_sec": 10.0,
+            "next_cue_onset_sec": 8.0,
+            "overlap_sec": 2.0,
+        }
+    }
+    assert corridor == (0.0, 8.0, None)
+    assert plan == (0.0, 8.0, False, True, False, True)
+
+
+def test_native_lexical_end_wins_over_rolling_display_overlap() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:lexical-overlap-end",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "Selected teaching reaches the conclusion",
+            },
+            {
+                "cue_id": "next",
+                "start": 8.0,
+                "end": 20.0,
+                "text": "Next topic begins here",
+            },
+        ],
+    }
+    clip = {
+        "cue_ids": ["selected"],
+        "start": 0.0,
+        "end": 10.0,
+        "end_quote": "teaching reaches the conclusion",
+    }
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+    lexical_words = tuple(
+        pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(word, onset)
+        for word, onset in (
+            ("selected", 4.0),
+            ("teaching", 5.0),
+            ("reaches", 6.0),
+            ("the", 6.5),
+            ("conclusion", 7.0),
+            ("next", 8.2),
+        )
+    )
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            lexical_words=lexical_words,
+        ),
+    )
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        prepared,
+    )
+    corridor = pipeline_module._selected_speech_corridor(
+        transcript,
+        clip,
+        caption,
+        source_end_sec=20.0,
+        required_speech_bounds=bounds,
+        projection_diagnostics=projection,
+    )
+    plan = pipeline_module._acoustic_boundary_plan(
+        transcript,
+        clip,
+        projection,
+        speech_bounds=bounds,
+        search_limits=corridor[:2],
+    )
+
+    assert error is None
+    assert bounds == (0.0, 7.0)
+    assert "caption_overlap_end_handoff" not in projection
+    assert projection["end"]["excluded_neighbor_onset_sec"] == 8.2
+    assert corridor == (0.0, 8.2, None)
+    assert plan == (0.0, 7.0, False, False, False, True)
+
+
+@pytest.mark.parametrize("next_onset", [5.0, 5.001, 5.04, 5.5, 5.749])
+def test_rolling_display_handoff_never_discards_the_selected_last_cue(
+    next_onset: float,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:shared-onset",
+        "duration": 12.0,
+        "segments": [
+            {"cue_id": "a", "start": 0.0, "end": 5.0, "text": "Setup."},
+            {
+                "cue_id": "selected-end",
+                "start": 5.0,
+                "end": 10.0,
+                "text": "The required conclusion is spoken here.",
+            },
+            {
+                "cue_id": "next",
+                "start": next_onset,
+                "end": 12.0,
+                "text": "The following cue begins here.",
+            },
+        ],
+    }
+    clip = {
+        "cue_ids": ["a", "selected-end"],
+        "start": 0.0,
+        "end": 10.0,
+    }
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a"
+        ),
+    )
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        prepared,
+    )
+
+    assert error is None
+    assert bounds == (0.0, 10.0)
+    assert projection == {}
+
+
+@pytest.mark.parametrize(
+    "selected_text",
+    [
+        "这是一个非常重要的结论",
+        "这是 一个非常重要的结论",
+        "DNA 复制这是一个非常重要的结论",
+    ],
+)
+def test_rolling_display_handoff_counts_no_space_script_speech_units(
+    selected_text: str,
+) -> None:
+    transcript = {
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 0.0,
+                "end": 2.0,
+                "text": selected_text,
+            },
+            {
+                "cue_id": "next",
+                "start": 0.25,
+                "end": 3.0,
+                "text": "下一个解释开始",
+            },
+        ]
+    }
+
+    assert pipeline_module._overlapping_caption_end_handoff(
+        transcript,
+        {"cue_ids": ["selected"]},
+    ) is None
+
+
 def test_caption_overlap_larger_than_ownership_epsilon_fails_closed() -> None:
     transcript = {
         "source": "supadata",
