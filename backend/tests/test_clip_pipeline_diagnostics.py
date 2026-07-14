@@ -434,6 +434,8 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
         time.sleep({0.0: 0.15, 10.0: 0.02, 20.0: 0.10}[start_sec])
         with verification_lock:
             verification_finished[start_sec] = time.monotonic()
+        start_handoff = start_sec > 0.0
+        end_handoff = end_sec < 30.0
         return mock.Mock(
             verified=True,
             start_sec=start_sec,
@@ -442,6 +444,12 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
                 "threshold_dbfs": -38.0,
                 "start_quiet": [start_sec, start_sec + 0.2],
                 "end_quiet": [end_sec - 0.2, end_sec + 0.1],
+                "start_speech_handoff_verified": start_handoff,
+                "end_speech_handoff_verified": end_handoff,
+                "start_two_sided_required": start_handoff,
+                "end_two_sided_required": end_handoff,
+                "semantic_start_limit_sec": start_sec,
+                "semantic_end_limit_sec": end_sec,
             },
         )
 
@@ -503,6 +511,12 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
             "threshold_dbfs": -38.0,
             "start_quiet": [0.0, 0.2],
             "end_quiet": [9.8, 10.1],
+            "start_speech_handoff_verified": False,
+            "end_speech_handoff_verified": True,
+            "start_two_sided_required": False,
+            "end_two_sided_required": True,
+            "semantic_start_limit_sec": 0.0,
+            "semantic_end_limit_sec": 10.0,
         },
     }
     assert max(verification_started.values()) < min(verification_finished.values())
@@ -595,7 +609,16 @@ def test_queued_acoustic_candidate_gets_a_fresh_verification_timeout(
             verified=True,
             start_sec=start_sec,
             end_sec=end_sec,
-            diagnostics={},
+            diagnostics={
+                "start_quiet": [start_sec, start_sec + 0.2],
+                "end_quiet": [end_sec - 0.2, end_sec + 0.1],
+                "start_speech_handoff_verified": start_sec > 0.0,
+                "end_speech_handoff_verified": end_sec < 40.0,
+                "start_two_sided_required": start_sec > 0.0,
+                "end_two_sided_required": end_sec < 40.0,
+                "semantic_start_limit_sec": start_sec,
+                "semantic_end_limit_sec": end_sec,
+            },
         )
 
     verify = mock.Mock(side_effect=verify_audio)
@@ -631,7 +654,7 @@ def test_queued_acoustic_candidate_gets_a_fresh_verification_timeout(
     assert timeouts == pytest.approx([0.05] * 4)
 
 
-def test_final_caption_clip_uses_progressive_source_corridor_for_quiet_pad(
+def test_final_caption_clip_verifies_last_speech_without_forcing_source_outro(
     monkeypatch,
 ) -> None:
     transcript = {
@@ -672,17 +695,15 @@ def test_final_caption_clip_uses_progressive_source_corridor_for_quiet_pad(
         return_value=mock.Mock(
             verified=True,
             start_sec=0.0,
-            end_sec=10.2,
+            end_sec=10.1,
             diagnostics={
                 "threshold_dbfs": -38.0,
-                "speech_handoff_verified": True,
-                "semantic_start_limit_sec": 0.0,
-                "semantic_end_limit_sec": 10.0,
-                "observation_start_limit_sec": 0.0,
-                "observation_end_limit_sec": 11.0,
-                "handoff_timestamp_tolerance_sec": 0.05,
                 "start_quiet": [0.0, 0.2],
-                "end_quiet": [10.0, 10.3],
+                "end_quiet": [9.8, 10.2],
+                "end_speech_handoff_verified": True,
+                "end_two_sided_required": False,
+                "semantic_start_limit_sec": 0.0,
+                "semantic_end_limit_sec": 12.0,
             },
         )
     )
@@ -727,10 +748,12 @@ def test_final_caption_clip_uses_progressive_source_corridor_for_quiet_pad(
     )
 
     assert reels == ["verified-tail"]
-    assert persisted[0]["end"] == 10.2
+    assert persisted[0]["end"] == 10.1
+    assert verify.call_args.args[1:] == (0.0, 10.0)
     assert verify.call_args.kwargs["search_end_limit_sec"] == 12.0
     assert verify.call_args.kwargs["require_speech_handoff"] is False
-    assert verify.call_args.kwargs["require_end_speech_handoff"] is False
+    assert verify.call_args.kwargs["require_end_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_end_two_sided"] is False
     assert persisted[0]["search_context"]["boundary_status"] == "verified"
     assert persisted[0]["search_context"]["boundary_diagnostics"]["acoustic"][
         "threshold_dbfs"
@@ -747,10 +770,22 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
         "duration": 30.0,
         "segments": [
             {
+                "cue_id": "prior",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "The prior section explains a different language feature.",
+            },
+            {
                 "cue_id": "required-speech",
                 "start": 10.0,
                 "end": 20.0,
                 "text": "A Python closure retains variables from its enclosing scope.",
+            },
+            {
+                "cue_id": "following",
+                "start": 20.0,
+                "end": 30.0,
+                "text": "The following section moves to a separate topic.",
             },
         ],
     }
@@ -773,7 +808,10 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
             end_sec=20.2,
             diagnostics={
                 "threshold_dbfs": -38.0,
-                "speech_handoff_verified": True,
+                "start_speech_handoff_verified": True,
+                "end_speech_handoff_verified": True,
+                "start_two_sided_required": True,
+                "end_two_sided_required": True,
                 "semantic_start_limit_sec": 10.0,
                 "semantic_end_limit_sec": 20.0,
                 "observation_start_limit_sec": 9.0,
@@ -830,8 +868,10 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
     assert reels == ["verified-padded-speech"]
     assert verify.call_args.args[1:] == (10.0, 20.0)
     assert verify.call_args.kwargs["require_speech_handoff"] is False
-    assert verify.call_args.kwargs["require_start_speech_handoff"] is False
-    assert verify.call_args.kwargs["require_end_speech_handoff"] is False
+    assert verify.call_args.kwargs["require_start_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_end_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_start_two_sided"] is True
+    assert verify.call_args.kwargs["require_end_two_sided"] is True
     assert persisted[0]["start"] == 9.9
     assert persisted[0]["end"] == 20.2
 
@@ -1157,7 +1197,7 @@ def test_native_json3_quotes_authorize_only_the_exact_partial_cue_corridor() -> 
     ]
 
 
-def test_production_boundary_path_mixes_projected_start_with_progressive_end(
+def test_production_boundary_path_mixes_projected_start_with_last_speech_end(
     monkeypatch,
 ) -> None:
     text = (
@@ -1238,8 +1278,8 @@ def test_production_boundary_path_mixes_projected_start_with_progressive_end(
                 (0.3, 0),
                 (window_duration_sec - quiet_start - 0.3, 12000),
             ]
-        elif output_path.name == "end-1.wav":
-            quiet_start = 36.0 - window_start_sec
+        elif output_path.name == "end-0.wav":
+            quiet_start = 29.8 - window_start_sec
             spans = [
                 (quiet_start, 12000),
                 (0.3, 0),
@@ -1299,12 +1339,14 @@ def test_production_boundary_path_mixes_projected_start_with_progressive_end(
 
     assert reels == ["stored-mixed-edge"]
     assert persisted[0]["start"] == 12.0
-    assert persisted[0]["end"] == 36.2
+    assert persisted[0]["end"] == 30.0
     assert verify.call_args.kwargs["require_start_speech_handoff"] is True
-    assert verify.call_args.kwargs["require_end_speech_handoff"] is False
+    assert verify.call_args.kwargs["require_end_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_start_two_sided"] is True
+    assert verify.call_args.kwargs["require_end_two_sided"] is False
     acoustic = persisted[0]["search_context"]["boundary_diagnostics"]["acoustic"]
     assert acoustic["start_windows"] == [[11.0, 15.0]]
-    assert acoustic["end_windows"] == [[27.0, 33.0], [33.0, 39.0]]
+    assert acoustic["end_windows"] == [[27.0, 33.0]]
 
 
 def test_mixed_boundary_safety_rejects_missing_proof_and_speech_crossings() -> None:
@@ -1330,6 +1372,7 @@ def test_mixed_boundary_safety_rejects_missing_proof_and_speech_crossings() -> N
             "diagnostics": diagnostics,
             "require_start_handoff": True,
             "require_end_handoff": False,
+            "require_start_two_sided": True,
         }
         values.update(overrides)
         return pipeline_module._acoustic_range_is_safe(**values)
@@ -1364,6 +1407,7 @@ def test_mixed_boundary_safety_rejects_missing_proof_and_speech_crossings() -> N
         diagnostics=projected_end_diagnostics,
         require_start_handoff=False,
         require_end_handoff=True,
+        require_end_two_sided=True,
     ) is True
 
 
@@ -1409,19 +1453,29 @@ def test_partial_cue_projection_fails_closed_without_native_lexical_words() -> N
 
 
 @pytest.mark.parametrize(
-    "segments",
+    ("segments", "expected_corridor", "expected_handoffs"),
     [
-        [
-            {"cue_id": "prior", "start": 0.0, "end": 10.02, "text": "Prior."},
-            {"cue_id": "selected", "start": 10.0, "end": 20.0, "text": "Selected."},
-        ],
-        [
-            {"cue_id": "selected", "start": 0.0, "end": 10.0, "text": "Selected."},
-            {"cue_id": "next", "start": 9.98, "end": 20.0, "text": "Next."},
-        ],
+        (
+            [
+                {"cue_id": "prior", "start": 0.0, "end": 10.02, "text": "Prior."},
+                {"cue_id": "selected", "start": 10.0, "end": 20.0, "text": "Selected."},
+            ],
+            (10.0, 20.0),
+            (True, False),
+        ),
+        (
+            [
+                {"cue_id": "selected", "start": 0.0, "end": 10.0, "text": "Selected."},
+                {"cue_id": "next", "start": 9.98, "end": 20.0, "text": "Next."},
+            ],
+            (0.0, 9.98),
+            (False, True),
+        ),
     ],
 )
-def test_overlapping_unselected_cue_has_no_speech_free_corridor(segments) -> None:
+def test_rolling_caption_overlap_uses_cue_onset_handoffs(
+    segments, expected_corridor, expected_handoffs,
+) -> None:
     transcript = {
         "source": "supadata",
         "native_mode": False,
@@ -1438,17 +1492,41 @@ def test_overlapping_unselected_cue_has_no_speech_free_corridor(segments) -> Non
     diagnostics = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
     assert diagnostics is not None
 
-    _start, _end, error = pipeline_module._selected_speech_corridor(
+    start, end, error = pipeline_module._selected_speech_corridor(
         transcript,
         clip,
         diagnostics,
         source_end_sec=20.0,
     )
 
-    assert error == "unselected_speech_overlaps_required_range"
+    plan = pipeline_module._acoustic_boundary_plan(
+        transcript,
+        clip,
+        {},
+        speech_bounds=(selected["start"], selected["end"]),
+        search_limits=(start, end),
+    )
+
+    assert error is None
+    assert (start, end) == expected_corridor
+    assert plan is not None
+    assert plan[2:4] == expected_handoffs
+    assert plan[4:6] == expected_handoffs
 
 
-def test_single_caption_cue_uses_source_edges_as_progressive_corridor() -> None:
+def test_acoustic_boundary_plan_fails_closed_for_missing_cue_ids() -> None:
+    transcript = _transcript()
+
+    assert pipeline_module._acoustic_boundary_plan(
+        transcript,
+        {"cue_ids": ["missing"]},
+        {},
+        speech_bounds=(0.0, 10.0),
+        search_limits=(0.0, 10.0),
+    ) is None
+
+
+def test_transcript_edge_speech_inside_media_uses_one_sided_handoffs() -> None:
     transcript = {
         "source": "supadata",
         "native_mode": False,
@@ -1473,9 +1551,17 @@ def test_single_caption_cue_uses_source_edges_as_progressive_corridor() -> None:
         diagnostics,
         source_end_sec=100.0,
     )
+    plan = pipeline_module._acoustic_boundary_plan(
+        transcript,
+        clip,
+        {},
+        speech_bounds=(10.0, 20.0),
+        search_limits=(start_limit, end_limit),
+    )
 
     assert error is None
     assert (start_limit, end_limit) == (0.0, 100.0)
+    assert plan == (10.0, 20.0, True, True, False, False)
 
 
 @pytest.mark.parametrize(
@@ -1709,20 +1795,8 @@ def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
     assert clips[0]["search_context"]["factually_grounded"] is True
 
 
-@pytest.mark.parametrize(
-    ("literal_match", "semantic_score", "accepted"),
-    [
-        (False, 0.199, False),
-        (False, 0.20, True),
-        (True, 0.119, False),
-        (True, 0.12, True),
-    ],
-)
-def test_exact_topic_semantic_corroboration_uses_inclusive_floors(
+def test_modern_selector_paraphrase_survives_without_local_semantic_model(
     monkeypatch,
-    literal_match: bool,
-    semantic_score: float,
-    accepted: bool,
 ) -> None:
     quote = (
         "Cells convert nutrient energy into ATP through a sequence of enzyme "
@@ -1730,54 +1804,44 @@ def test_exact_topic_semantic_corroboration_uses_inclusive_floors(
     )
     engine_out = _one_cue_selector_result(quote, score=1.0)
     monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
-    pipeline, embedding = _pipeline_with_semantic(semantic_score)
     context = GenerationContext("slow")
-    video = {
-        **_video(),
-        "literal_match": literal_match,
-        "_topic_terms": ["biology"],
-    }
 
-    _video_row, clips, _engine = pipeline._clip_and_filter(
-        video,
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(
+        {**_video(), "literal_match": False, "_topic_terms": ["biology"]},
         "biology",
         "en",
         generation_context=context,
     )
 
-    assert bool(clips) is accepted
-    assert embedding.inputs[0][0] == "biology"
-    assert context.counters()["topic_rejections"] == (0 if accepted else 1)
-    assert context.usage_payload()["summary"]["rejection_reason_counts"] == (
-        {} if accepted else {"uncorroborated_exact_topic": 1}
-    )
+    assert len(clips) == 1
+    assert clips[0]["topic_evidence_terms"] == [quote]
+    assert context.counters()["topic_rejections"] == 0
+    assert context.usage_payload()["summary"]["rejection_reason_counts"] == {}
 
 
 @pytest.mark.parametrize(
-    ("quote", "semantic_score"),
+    "hard_gate_override",
     [
-        (
-            "An operating system schedules processes, manages virtual memory, and "
-            "provides file system abstractions.",
-            0.15,
-        ),
-        (
-            "This video game power system lets players spend mana to cast abilities "
-            "and regenerate energy after combat.",
-            0.08,
-        ),
+        {"topic_relevance": 0.74},
+        {"directly_teaches_topic": False},
     ],
 )
-def test_high_selector_scores_cannot_self_certify_unrelated_biology_clips(
+def test_hard_gemini_contract_rejects_off_topic_candidates(
     monkeypatch,
-    quote: str,
-    semantic_score: float,
+    hard_gate_override: dict[str, object],
 ) -> None:
-    engine_out = _one_cue_selector_result(quote, score=1.0)
+    quote = (
+        "An operating system schedules processes, manages virtual memory, and "
+        "provides file system abstractions."
+    )
+    engine_out = _one_cue_selector_result(
+        quote,
+        score=1.0,
+        **hard_gate_override,
+    )
     monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
-    pipeline, _embedding = _pipeline_with_semantic(semantic_score)
 
-    _video_row, clips, _engine = pipeline._clip_and_filter(
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(
         {**_video(), "literal_match": False, "_topic_terms": ["biology"]},
         "biology",
         "en",
@@ -1801,21 +1865,20 @@ def test_topic_mention_elsewhere_cannot_rescue_an_unrelated_evidence_quote(
         evidence_quote,
         clip_text=clip_text,
         score=1.0,
+        directly_teaches_topic=False,
     )
     monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
-    pipeline, embedding = _pipeline_with_semantic(0.15)
 
-    _video_row, clips, _engine = pipeline._clip_and_filter(
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(
         {**_video(), "literal_match": False, "_topic_terms": ["biology"]},
         "biology",
         "en",
     )
 
     assert clips == []
-    assert embedding.inputs == [["biology", evidence_quote]]
 
 
-def test_exact_topic_corroboration_fails_closed_without_semantic_inference(
+def test_grounded_paraphrase_does_not_require_semantic_inference(
     monkeypatch,
 ) -> None:
     quote = "Cells convert nutrient energy into ATP through enzyme controlled reactions."
@@ -1830,11 +1893,10 @@ def test_exact_topic_corroboration_fails_closed_without_semantic_inference(
         generation_context=context,
     )
 
-    assert clips == []
-    assert context.counters()["topic_rejections"] == 1
-    assert context.usage_payload()["summary"]["rejection_reason_counts"] == {
-        "uncorroborated_exact_topic": 1,
-    }
+    assert len(clips) == 1
+    assert clips[0]["topic_evidence_terms"] == [quote]
+    assert context.counters()["topic_rejections"] == 0
+    assert context.usage_payload()["summary"]["rejection_reason_counts"] == {}
 
 
 def test_exact_topic_lexical_proof_survives_without_semantic_inference(
@@ -1871,18 +1933,21 @@ def test_exact_comparison_component_survives_without_semantic_inference(
     assert clips[0]["topic_evidence_terms"] == [quote]
 
 
-def test_expanded_search_terms_never_become_corroboration_anchors(
+def test_expanded_search_terms_cannot_override_hard_exact_topic_contract(
     monkeypatch,
 ) -> None:
     quote = (
         "An operating system schedules processes, manages virtual memory, and "
         "provides file system abstractions."
     )
-    engine_out = _one_cue_selector_result(quote, score=1.0)
+    engine_out = _one_cue_selector_result(
+        quote,
+        score=1.0,
+        directly_teaches_topic=False,
+    )
     monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
-    pipeline, embedding = _pipeline_with_semantic(0.19)
 
-    _video_row, clips, _engine = pipeline._clip_and_filter(
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(
         {
             **_video(),
             "literal_match": False,
@@ -1893,8 +1958,6 @@ def test_expanded_search_terms_never_become_corroboration_anchors(
     )
 
     assert clips == []
-    assert embedding.inputs[0][0] == "biology"
-    assert all(value != "operating systems" for value in embedding.inputs[0])
 
 
 def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
@@ -2118,7 +2181,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v6"
+        assert context["selection_contract_version"] == "quality_silence_v7"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

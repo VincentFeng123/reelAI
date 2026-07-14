@@ -1,7 +1,6 @@
 import hashlib
 import json
 import logging
-import os
 import threading
 from typing import Iterable
 
@@ -12,71 +11,18 @@ from ..db import dumps_json, fetch_one, now_iso, upsert
 logger = logging.getLogger(__name__)
 
 
-# Sentence-transformers model id. all-MiniLM-L6-v2 is ~90MB, 384-dim, English-
-# biased, and near-SOTA for its size. Trade-off vs. hash embeddings: real
-# semantic similarity ("ML" ≈ "machine learning") at the cost of ~5s cold
-# start and pytorch-in-the-image. Switched on Railway; serverless (Vercel)
-# auto-degrades to the hash path because pytorch cold-starts are too slow
-# for function timeouts and the model isn't in that requirements.txt.
-_SEMANTIC_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
-_SEMANTIC_DIM = 384
 _HASH_DIM = 256
-
-
-def _serverless_mode() -> bool:
-    return bool(os.getenv("VERCEL") or os.getenv("AWS_LAMBDA_FUNCTION_NAME") or os.getenv("K_SERVICE"))
-
-
-# Singleton model handle — lazy-loaded on first use, None means "we already
-# tried and the model path is unavailable; never retry this process".
-_semantic_model_lock = threading.Lock()
 _semantic_inference_lock = threading.Lock()
-_semantic_model: object | None = None
-_semantic_model_tried = False
-
-
-def _get_semantic_model() -> object | None:
-    """Lazy-load sentence-transformers. Returns None when unavailable so
-    EmbeddingService degrades to hash embeddings without raising.
-    """
-    global _semantic_model, _semantic_model_tried
-    if _semantic_model_tried:
-        return _semantic_model
-    if _serverless_mode():
-        _semantic_model_tried = True
-        return None
-    with _semantic_model_lock:
-        if _semantic_model_tried:
-            return _semantic_model
-        _semantic_model_tried = True
-        try:
-            from sentence_transformers import SentenceTransformer
-        except Exception as exc:
-            logger.info("sentence-transformers not available, using hash embeddings: %s", exc)
-            return None
-        try:
-            model = SentenceTransformer(_SEMANTIC_MODEL_ID, device="cpu")
-        except Exception:
-            logger.exception("could not load %s, using hash embeddings", _SEMANTIC_MODEL_ID)
-            return None
-        _semantic_model = model
-        logger.info("loaded semantic embedding model %s (dim=%d)", _SEMANTIC_MODEL_ID, _SEMANTIC_DIM)
-        return _semantic_model
 
 
 class EmbeddingService:
     def __init__(self) -> None:
-        # Dimension is decided at init time, keyed on which backend we can
-        # actually load. The cache layer (_load_cached_embedding) compares
-        # stored vectors against self.dim and invalidates on mismatch — so
-        # rolling from hash (256) → semantic (384) simply expires old rows.
-        model = _get_semantic_model()
-        if model is None:
-            self._semantic_model = None
-            self.dim = _HASH_DIM
-        else:
-            self._semantic_model = model
-            self.dim = _SEMANTIC_DIM
+        # The production selector's whole-transcript Gemini verdict is the
+        # semantic authority. These fixed-size lexical vectors only support
+        # inexpensive persistence and deterministic ranking; they are never
+        # accepted as semantic proof by callers.
+        self._semantic_model = None
+        self.dim = _HASH_DIM
 
     @property
     def semantic_available(self) -> bool:
@@ -84,7 +30,7 @@ class EmbeddingService:
 
     @property
     def backend_name(self) -> str:
-        return _SEMANTIC_MODEL_ID if self.semantic_available else "hash-lexical-fallback"
+        return "hash-lexical-v1"
 
     def embed_texts(self, conn, texts: Iterable[str]) -> np.ndarray:
         text_list = [t.strip() for t in texts]

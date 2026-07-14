@@ -26,27 +26,6 @@ VIDEO_ID = "dQw4w9WgXcQ"
 SOURCE_URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
 
 
-class _SemanticVector:
-    def __init__(self, score: float) -> None:
-        self.score = score
-
-    def dot(self, _other) -> float:
-        return self.score
-
-
-class _FixedSemanticEmbedding:
-    semantic_available = True
-
-    def __init__(self, score: float) -> None:
-        self.score = score
-        self.inputs: list[list[str]] = []
-
-    def embed_semantic(self, texts):
-        values = [str(text) for text in texts]
-        self.inputs.append(values)
-        return [_SemanticVector(self.score) for _text in values]
-
-
 def _media_tail_engine_out() -> dict:
     text = "Photosynthesis converts light energy into stored chemical energy for plants."
     return {
@@ -137,8 +116,10 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
             {
                 "threshold_dbfs": -38.0,
                 "speech_handoff_verified": True,
+                "end_speech_handoff_verified": True,
+                "end_two_sided_required": False,
                 "semantic_start_limit_sec": 0.0,
-                "semantic_end_limit_sec": 10.0,
+                "semantic_end_limit_sec": 12.0,
                 "observation_start_limit_sec": 0.0,
                 "observation_end_limit_sec": 11.0,
                 "handoff_timestamp_tolerance_sec": 0.05,
@@ -233,7 +214,7 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
             mock_verify.call_args.kwargs["search_end_limit_sec"], 12.0
         )
         self.assertFalse(mock_verify.call_args.kwargs["require_speech_handoff"])
-        self.assertFalse(
+        self.assertTrue(
             mock_verify.call_args.kwargs["require_end_speech_handoff"]
         )
         self._assert_persisted_tail(result.reel.reel_id)
@@ -263,7 +244,7 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
             mock_verify.call_args.kwargs["search_end_limit_sec"], 12.0
         )
         self.assertFalse(mock_verify.call_args.kwargs["require_speech_handoff"])
-        self.assertFalse(
+        self.assertTrue(
             mock_verify.call_args.kwargs["require_end_speech_handoff"]
         )
         self._assert_persisted_tail(result.reels[0].reel_id)
@@ -390,7 +371,7 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
 
         self.assertEqual(len(clips), 1)
 
-    def test_direct_topic_gate_rejects_unrelated_self_certified_clip(self) -> None:
+    def test_direct_topic_gate_rejects_failed_hard_gemini_contract(self) -> None:
         engine_out = _media_tail_engine_out()
         unrelated = (
             "An operating system schedules processes, manages virtual memory, "
@@ -398,7 +379,7 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         )
         engine_out["transcript"]["segments"][0]["text"] = unrelated
         engine_out["clips"][0]["topic_evidence_quote"] = unrelated
-        embedding = _FixedSemanticEmbedding(0.199)
+        engine_out["clips"][0]["directly_teaches_topic"] = False
 
         with (
             mock.patch.object(
@@ -415,15 +396,13 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
                 engine_out=engine_out,
                 should_cancel=None,
                 exact_topic="biology",
-                embedding_service=embedding,
             )
 
         self.assertEqual(clips, [])
-        self.assertEqual(embedding.inputs, [["biology", unrelated]])
         prepare.assert_not_called()
         verify.assert_not_called()
 
-    def test_direct_topic_gate_accepts_semantic_floor_with_one_batched_call(self) -> None:
+    def test_direct_topic_gate_accepts_paraphrases_without_semantic_model(self) -> None:
         first_quote = (
             "Giving up the next best alternative is the real economic sacrifice "
             "made whenever a person chooses."
@@ -451,7 +430,6 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
             "sequence_index": 1,
         }
         engine_out["clips"] = [first_clip, second_clip]
-        embedding = _FixedSemanticEmbedding(0.20)
         prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
             "ready",
             source=pipeline_module.clip_engine_silence.PreparedAudioSource(
@@ -460,9 +438,22 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
             ),
         )
 
-        def verify(_source_url, start_sec, end_sec, **_kwargs):
+        def verify(_source_url, start_sec, end_sec, **kwargs):
+            tolerance = pipeline_module.clip_engine_silence.HANDOFF_TIMESTAMP_TOLERANCE_SEC
             return pipeline_module.clip_engine_silence.SilenceVerificationResult(
-                "verified", start_sec, end_sec, {}
+                "verified",
+                start_sec,
+                end_sec,
+                {
+                    "semantic_start_limit_sec": kwargs["search_start_limit_sec"],
+                    "semantic_end_limit_sec": kwargs["search_end_limit_sec"],
+                    "start_speech_handoff_verified": True,
+                    "end_speech_handoff_verified": True,
+                    "start_two_sided_required": kwargs["require_start_two_sided"],
+                    "end_two_sided_required": kwargs["require_end_two_sided"],
+                    "start_quiet": [start_sec - tolerance, start_sec + tolerance],
+                    "end_quiet": [end_sec - tolerance, end_sec + tolerance],
+                },
             )
 
         with mock.patch.object(
@@ -476,20 +467,9 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
                 should_cancel=None,
                 prepared_audio=prepared,
                 exact_topic="opportunity cost versus sunk cost",
-                embedding_service=embedding,
             )
 
         self.assertEqual(len(clips), 2)
-        self.assertEqual(
-            embedding.inputs,
-            [[
-                "opportunity cost versus sunk cost",
-                "opportunity cost",
-                "sunk cost",
-                first_quote,
-                second_quote,
-            ]],
-        )
 
     def test_direct_topic_gate_accepts_explicit_comparison_component_lexically(self) -> None:
         engine_out = _media_tail_engine_out()
@@ -499,7 +479,6 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         )
         engine_out["transcript"]["segments"][0]["text"] = quote
         engine_out["clips"][0]["topic_evidence_quote"] = quote
-        embedding = _FixedSemanticEmbedding(0.0)
         prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
             "ready",
             source=pipeline_module.clip_engine_silence.PreparedAudioSource(
@@ -522,11 +501,9 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
                 should_cancel=None,
                 prepared_audio=prepared,
                 exact_topic="opportunity cost versus sunk cost",
-                embedding_service=embedding,
             )
 
         self.assertEqual(len(clips), 1)
-        self.assertEqual(embedding.inputs, [])
 
 
 if __name__ == "__main__":

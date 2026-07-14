@@ -1199,8 +1199,9 @@ class ReelService:
     # v14: discard rows accepted only by the retired -24 dBFS adaptive verifier.
     # v17: retain public source identity and authoritative selector relevance.
     # v18: bind captions to an immutable selection-time cue snapshot.
-    RANKED_FEED_CACHE_VERSION = 18
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v6"
+    # v19: require the current acoustic-boundary inventory contract.
+    RANKED_FEED_CACHE_VERSION = 19
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v7"
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -2434,6 +2435,7 @@ class ReelService:
                 "quality_silence_v4",
                 "quality_silence_v5",
                 "quality_silence_v6",
+                "quality_silence_v7",
             }
             for reel in generated
         ):
@@ -5694,6 +5696,7 @@ class ReelService:
                 "quality_silence_v4",
                 "quality_silence_v5",
                 "quality_silence_v6",
+                "quality_silence_v7",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5704,6 +5707,7 @@ class ReelService:
                 "quality_silence_v4",
                 "quality_silence_v5",
                 "quality_silence_v6",
+                "quality_silence_v7",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7178,6 +7182,7 @@ class ReelService:
                     "quality_silence_v4",
                     "quality_silence_v5",
                     "quality_silence_v6",
+                    "quality_silence_v7",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7203,6 +7208,7 @@ class ReelService:
                     "quality_silence_v4",
                     "quality_silence_v5",
                     "quality_silence_v6",
+                    "quality_silence_v7",
                 }
                 and not difficulty_matches_level
             ):
@@ -7216,7 +7222,11 @@ class ReelService:
                     or selection_metadata.get("_selection_acoustic_verified") is not True
                     or (
                         selection_version
-                        in {"quality_silence_v5", "quality_silence_v6"}
+                        in {
+                            "quality_silence_v5",
+                            "quality_silence_v6",
+                            "quality_silence_v7",
+                        }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
                         ) is not True
@@ -7232,6 +7242,7 @@ class ReelService:
                     "quality_silence_v4",
                     "quality_silence_v5",
                     "quality_silence_v6",
+                    "quality_silence_v7",
                 } and (
                     (
                         min(
@@ -7246,7 +7257,11 @@ class ReelService:
                             ),
                         ) < 0.75
                         if selection_version
-                        in {"quality_silence_v2", "quality_silence_v6"}
+                        in {
+                            "quality_silence_v2",
+                            "quality_silence_v6",
+                            "quality_silence_v7",
+                        }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
                         ) < 0.75
@@ -7561,6 +7576,7 @@ class ReelService:
             elif selection_contract_version in {
                 "quality_silence_v5",
                 "quality_silence_v6",
+                "quality_silence_v7",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7579,7 +7595,11 @@ class ReelService:
                 fallback_text=(
                     ""
                     if selection_contract_version
-                    in {"quality_silence_v5", "quality_silence_v6"}
+                    in {
+                        "quality_silence_v5",
+                        "quality_silence_v6",
+                        "quality_silence_v7",
+                    }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")
                 ),

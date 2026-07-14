@@ -21,7 +21,7 @@ class _ConstrainedSchema(BaseModel):
 class _FakeResponse:
     def __init__(self, text: str = '{"ok": true}', *, finish_reason="STOP",
                  prompt_tokens=11, candidate_tokens=7, thought_tokens=5,
-                 total_tokens=23):
+                 total_tokens=23, cached_tokens=3):
         self.text = text
         self.candidates = [SimpleNamespace(
             finish_reason=SimpleNamespace(value=finish_reason),
@@ -31,6 +31,7 @@ class _FakeResponse:
             candidates_token_count=candidate_tokens,
             thoughts_token_count=thought_tokens,
             total_token_count=total_tokens,
+            cached_content_token_count=cached_tokens,
         )
 
 
@@ -126,7 +127,7 @@ def test_gemini3_uses_provider_compatible_json_schema_and_keeps_required_types(m
     schema = fake.models.calls[0]["config"].response_json_schema
     rendered = str(schema)
     assert "minLength" not in rendered
-    assert "maxItems" not in rendered
+    assert schema["properties"]["labels"]["maxItems"] == 2
     assert schema["required"] == ["name", "labels"]
     assert schema["properties"]["name"]["type"] == "string"
     assert schema["properties"]["labels"]["minItems"] == 1
@@ -147,7 +148,8 @@ def test_gemini3_returns_immutable_usage_and_finish_telemetry(monkeypatch):
         telemetry.candidate_tokens,
         telemetry.thought_tokens,
         telemetry.total_tokens,
-    ) == (11, 7, 5, 23)
+        telemetry.cached_tokens,
+    ) == (11, 7, 5, 23, 3)
     assert telemetry.retries == 0 and telemetry.latency_ms >= 0
     assert telemetry.as_dict()["total_tokens"] == 23
     with pytest.raises(FrozenInstanceError):
@@ -166,6 +168,7 @@ def test_gemini3_tolerates_absent_usage_and_finish_metadata(monkeypatch):
     assert result.telemetry.candidate_tokens is None
     assert result.telemetry.thought_tokens is None
     assert result.telemetry.total_tokens is None
+    assert result.telemetry.cached_tokens is None
 
 
 def test_gemini3_retries_one_transient_error_with_short_jitter(monkeypatch):

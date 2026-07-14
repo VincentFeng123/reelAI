@@ -185,18 +185,19 @@ GENERATION_HEARTBEAT_SEC = max(
     ),
 )
 GENERATION_WORKER_POLL_SEC = max(
-    0.1,
-    min(30.0, float(settings.generation_job_poll_sec)),
+    900.0,
+    min(3600.0, float(settings.generation_job_poll_sec)),
 )
-GENERATION_WORKER_COUNT = max(
-    1,
-    min(8, int(settings.generation_job_worker_count)),
-)
+# One job already analyzes its Fast/Slow source budget concurrently. Keep one
+# process worker so a stale Railway environment override cannot multiply CPU,
+# RAM, or Gemini spend on the Hobby deployment.
+GENERATION_WORKER_COUNT = 1
 _generation_worker_ids = tuple(
     f"worker-{uuid.uuid4()}" for _index in range(GENERATION_WORKER_COUNT)
 )
 _generation_worker_id = _generation_worker_ids[0]
 _generation_worker_stop = threading.Event()
+_generation_worker_wake = threading.Event()
 _generation_worker_lock = threading.Lock()
 _generation_worker_thread: threading.Thread | None = None
 _generation_worker_threads: list[threading.Thread] = []
@@ -350,7 +351,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v6"
+SELECTION_CONTRACT_VERSION = "quality_silence_v7"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -4077,6 +4078,9 @@ def _generation_worker_loop(
 ) -> None:
     worker_id = lease_owner or _generation_worker_id
     while not stop_event.is_set():
+        # Clear before the database sweep. A submit committed during the sweep
+        # leaves the Event set, so the following wait returns immediately.
+        _generation_worker_wake.clear()
         try:
             with get_conn(transactional=True) as conn:
                 job_row = lease_next_job(
@@ -4089,7 +4093,13 @@ def _generation_worker_loop(
                 continue
         except Exception:
             logger.exception("generation worker poll failed")
-        stop_event.wait(GENERATION_WORKER_POLL_SEC)
+        if stop_event.is_set():
+            break
+        _generation_worker_wake.wait(GENERATION_WORKER_POLL_SEC)
+
+
+def _wake_generation_worker() -> None:
+    _generation_worker_wake.set()
 
 
 def _start_generation_worker() -> None:
@@ -4099,6 +4109,7 @@ def _start_generation_worker() -> None:
         if any(thread.is_alive() for thread in _generation_worker_threads):
             return
         _generation_worker_stop = threading.Event()
+        _generation_worker_wake.clear()
         _generation_worker_ids = tuple(
             f"worker-{uuid.uuid4()}" for _index in range(GENERATION_WORKER_COUNT)
         )
@@ -4122,6 +4133,7 @@ def _stop_generation_worker() -> None:
     with _generation_worker_lock:
         threads = list(_generation_worker_threads)
         _generation_worker_stop.set()
+        _generation_worker_wake.set()
         join_deadline = time.monotonic() + 5.0
         for thread in threads:
             thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
@@ -4477,6 +4489,7 @@ def admin_health() -> dict:
         "generation_worker_alive": generation_pool_ready,
         "generation_worker_count": GENERATION_WORKER_COUNT,
         "generation_workers_alive": generation_workers_alive,
+        "generation_worker_recovery_sec": GENERATION_WORKER_POLL_SEC,
         "supadata_configured": bool(os.getenv("SUPADATA_API_KEY", "").strip()),
         "gemini_primary_configured": bool(os.getenv("GEMINI_API_KEY", "").strip()),
         "gemini_chat_configured": bool(os.getenv("GEMINI_API_KEY_2", "").strip()),
@@ -5332,6 +5345,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             request_params=request_params,
             source_generation_id=source_generation_id,
         )
+    _wake_generation_worker()
     job_id = str(job_row.get("id") or "")
     status = str(job_row.get("status") or "queued")
     return JSONResponse(
@@ -6037,6 +6051,7 @@ def feed(
     safe_relevance = _normalize_min_relevance(min_relevance)
     excluded_videos = _parse_excluded_video_ids_param(exclude_video_ids)
     excluded_reels = _parse_excluded_reel_ids_param(exclude_reel_ids)
+    job_submitted = False
     with get_conn(transactional=True) as conn:
         material = fetch_one(conn, "SELECT id FROM materials WHERE id = ?", (material_id,))
         if not material:
@@ -6167,8 +6182,9 @@ def feed(
                 request_params={**request_params, "num_reels": target_total},
                 source_generation_id=generation_id,
             )
+            job_submitted = True
         reels = ranked[page_start:page_end]
-        return {
+        response = {
             "page": page,
             "limit": limit,
             "total": len(ranked),
@@ -6182,6 +6198,9 @@ def feed(
             "knowledge_level": knowledge_level,
             "effective_level_target": effective_level,
         }
+    if job_submitted:
+        _wake_generation_worker()
+    return response
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(request: Request, payload: ChatRequest):

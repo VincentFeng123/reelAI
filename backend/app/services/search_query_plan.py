@@ -22,7 +22,7 @@ from . import llm_router
 from .embeddings import EmbeddingService
 
 
-PLAN_VERSION = 3
+PLAN_VERSION = 4
 PLAN_TTL_SEC = 24 * 60 * 60
 FALLBACK_PLAN_TTL_SEC = 15 * 60
 
@@ -391,6 +391,7 @@ def build_search_query_plan(
                 )
                 if summary_rejection is None and (
                     _lexically_coherent(literal, candidate_summary)
+                    or summary_scores is None
                     or summary_score >= 0.34
                 ):
                     search_summary = candidate_summary
@@ -415,6 +416,7 @@ def build_search_query_plan(
             canonical_coherent = (
                 not ai_canonical
                 or _lexically_coherent(literal, ai_canonical)
+                or canonical_scores is None
                 or canonical_score >= 0.34
             )
             if ai_canonical and canonical_rejection is None and canonical_coherent:
@@ -458,7 +460,11 @@ def build_search_query_plan(
                     semantic_score = float(
                         (curriculum_scores or {}).get(normalize_query(term), 0.0)
                     )
-                    if not lexical_match and semantic_score < threshold:
+                    if (
+                        not lexical_match
+                        and curriculum_scores is not None
+                        and semantic_score < threshold
+                    ):
                         rejection_reasons.append(
                             f"{field_name}[{index}]: not semantically anchored to literal topic"
                         )
@@ -490,6 +496,7 @@ def build_search_query_plan(
             )
             if retrieval_rejection is None and (
                 any(_lexically_coherent(anchor, retrieval_topic) for anchor in retrieval_anchors)
+                or retrieval_scores is None
                 or retrieval_score >= 0.34
             ):
                 one_word_topic = retrieval_topic
@@ -529,7 +536,11 @@ def build_search_query_plan(
                 semantic_score = float(
                     (synonym_scores or {}).get(normalize_query(synonym), 0.0)
                 )
-                if not lexical_match and semantic_score < 0.40:
+                if (
+                    not lexical_match
+                    and synonym_scores is not None
+                    and semantic_score < 0.40
+                ):
                     rejection_reasons.append(
                         f"one_word_synonyms[{index}]: not semantically anchored to topic"
                     )

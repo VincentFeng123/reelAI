@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import wave
 from array import array
@@ -35,8 +36,8 @@ VerificationStatus = Literal["verified", "unavailable"]
 PreparationStatus = Literal["ready", "unavailable"]
 
 DEFAULT_TIMEOUT_SEC = 20.0
-DEEP_PHASE_TIMEOUT_SEC = 45.0
-DEFAULT_PREPARE_TIMEOUT_SEC = 32.0
+DEEP_PHASE_TIMEOUT_SEC = 24.0
+DEFAULT_PREPARE_TIMEOUT_SEC = 24.0
 EDGE_WINDOW_SEC = 6.0
 QUIET_THRESHOLD_DBFS = -38.0
 MIN_QUIET_MS = 120
@@ -48,6 +49,8 @@ _FRAME_MS = 10
 _FRAME_SEC = _FRAME_MS / 1000.0
 _YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _YT_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"})
+_MAX_CONCURRENT_DECODES = 4
+_decode_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_DECODES)
 
 
 @dataclass(frozen=True)
@@ -177,7 +180,11 @@ def _process_failure_reason(stage: str, stderr: bytes) -> str:
     """Classify resolver failures without retaining sensitive command output."""
     if stage != "resolve":
         return "process_failed"
-    message = stderr.decode("utf-8", errors="ignore").casefold()
+    decoded = stderr.decode("utf-8", errors="ignore")
+    terminal_errors = [
+        line for line in decoded.splitlines() if line.lstrip().casefold().startswith("error:")
+    ]
+    message = (terminal_errors[-1] if terminal_errors else decoded).casefold()
     if "sign in to confirm" in message or "not a bot" in message:
         return "youtube_bot_challenge"
     if "proxy" in message and any(
@@ -310,7 +317,7 @@ def _yt_dlp_command(
     watch_url: str,
     *,
     proxy_url: str | None = None,
-    embedded_client: bool = False,
+    player_client: str = "default",
 ) -> list[str]:
     settings = get_settings()
     command = [
@@ -332,7 +339,7 @@ def _yt_dlp_command(
         "--impersonate",
         "chrome",
         "--format",
-        "bestaudio/best",
+        "worstaudio[acodec!=none][vcodec=none]",
     ]
     cookie_file = str(os.environ.get("YT_COOKIES_FILE") or "").strip()
     if cookie_file and os.path.isfile(cookie_file):
@@ -349,39 +356,57 @@ def _yt_dlp_command(
         command.extend(
             ["--extractor-args", f"youtubepot-bgutilhttp:base_url={provider_url}"]
         )
-    if embedded_client:
+    if player_client != "default":
         command.extend(
             [
                 "--extractor-args",
-                "youtube:player_client=web_embedded;player_skip=webpage",
+                f"youtube:player_client={player_client};player_skip=webpage",
             ]
         )
     command.append(watch_url)
     return command
 
 
+def _audio_bitrate(entry: Mapping[str, Any]) -> float | None:
+    for key in ("tbr", "abr"):
+        try:
+            bitrate = float(entry.get(key))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(bitrate) and bitrate > 0.0:
+            return bitrate
+    return None
+
+
+def _is_audio_only_entry(entry: object) -> bool:
+    return bool(
+        isinstance(entry, Mapping)
+        and isinstance(entry.get("url"), str)
+        and str(entry.get("url") or "").strip()
+        and str(entry.get("acodec") or "none").casefold() != "none"
+        and str(entry.get("vcodec") or "none").casefold() == "none"
+        and _audio_bitrate(entry) is not None
+    )
+
+
 def _audio_entry(info: Mapping[str, Any]) -> Mapping[str, Any]:
     requested = info.get("requested_downloads")
     if isinstance(requested, list):
-        for entry in requested:
-            if isinstance(entry, Mapping) and isinstance(entry.get("url"), str):
-                return entry
-    if isinstance(info.get("url"), str):
+        requested_audio = [entry for entry in requested if _is_audio_only_entry(entry)]
+        if requested_audio:
+            return min(
+                requested_audio,
+                key=lambda entry: _audio_bitrate(entry) or math.inf,
+            )
+    if _is_audio_only_entry(info):
         return info
     formats = info.get("formats")
     if not isinstance(formats, list):
         return {}
-    audio = [
-        entry
-        for entry in formats
-        if isinstance(entry, Mapping)
-        and isinstance(entry.get("url"), str)
-        and str(entry.get("acodec") or "none") != "none"
-        and str(entry.get("vcodec") or "none") == "none"
-    ]
-    if not audio:
+    fallback_audio = [entry for entry in formats if _is_audio_only_entry(entry)]
+    if not fallback_audio:
         return {}
-    return max(audio, key=lambda entry: float(entry.get("abr") or entry.get("tbr") or 0.0))
+    return min(fallback_audio, key=lambda entry: _audio_bitrate(entry) or math.inf)
 
 
 def _prepare_audio_source(
@@ -395,14 +420,30 @@ def _prepare_audio_source(
     if watch_url is None:
         raise _Unavailable("resolve", "invalid_youtube_source")
     configured_routes = _proxy_urls()[:3]
-    routes = [*configured_routes, ""] if configured_routes else [""]
-    attempts = [
-        (route, embedded_client)
-        for embedded_client in (False, True)
-        for route in routes
+    provider_configured = bool(
+        str(get_settings().ytdlp_pot_provider_url or "").strip()
+    )
+    if not configured_routes:
+        default_routes = [""]
+    elif len(configured_routes) == 1:
+        default_routes = [configured_routes[0], ""]
+    else:
+        default_routes = configured_routes[:2]
+    attempts: list[tuple[str, str]] = [
+        (route, "default") for route in default_routes
     ]
+    fallback_profiles = (
+        ("mweb", "web_embedded")
+        if provider_configured
+        else ("web_embedded",)
+    )
+    for profile in fallback_profiles:
+        if len(attempts) >= 3:
+            break
+        attempts.append(("", profile))
+    attempts = attempts[:3]
     attempt_reasons: list[str] = []
-    for attempt_index, (proxy, embedded_client) in enumerate(attempts):
+    for attempt_index, (proxy, player_client) in enumerate(attempts):
         try:
             remaining = _remaining(deadline, "resolve")
             attempts_left = len(attempts) - attempt_index
@@ -411,7 +452,7 @@ def _prepare_audio_source(
                 _yt_dlp_command(
                     watch_url,
                     proxy_url=proxy,
-                    embedded_client=embedded_client,
+                    player_client=player_client,
                 ),
                 deadline=attempt_deadline,
                 cancel_check=cancel_check,
@@ -487,8 +528,7 @@ def _prepare_audio_source(
                 else:
                     reason = "attempt_timeout"
             route = "proxy" if proxy else "direct"
-            client = "embedded" if embedded_client else "default"
-            attempt_reasons.append(f"{route}:{client}:{reason}")
+            attempt_reasons.append(f"{route}:{player_client}:{reason}")
             if reason == "deadline_exceeded":
                 break
 
@@ -588,33 +628,46 @@ def _decode_window(
     deadline: float,
     cancel_check: CancelCheck | None,
 ) -> None:
-    duration = min(EDGE_WINDOW_SEC, max(0.01, window_duration_sec))
-    command = [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
-    if source.proxy_url.startswith(("http://", "https://")):
-        command.extend(["-http_proxy", source.proxy_url])
-    if source.headers:
-        command.extend(["-headers", _ffmpeg_headers(source.headers)])
-    command.extend(
-        [
-            "-rw_timeout",
-            str(max(1, int(min(8.0, _remaining(deadline, "decode")) * 1_000_000))),
-            "-ss",
-            f"{max(0.0, window_start_sec):.3f}",
-            "-i",
-            source.url,
-            "-t",
-            f"{duration:.3f}",
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-c:a",
-            "pcm_s16le",
-            str(output_path),
-        ]
-    )
-    _run_command(command, deadline=deadline, cancel_check=cancel_check, stage="decode")
+    acquired = False
+    while not acquired:
+        if _is_cancelled(cancel_check):
+            raise _Unavailable("decode", "cancelled")
+        remaining = _remaining(deadline, "decode")
+        acquired = _decode_slots.acquire(timeout=min(0.1, remaining))
+    try:
+        if _is_cancelled(cancel_check):
+            raise _Unavailable("decode", "cancelled")
+        duration = min(EDGE_WINDOW_SEC, max(0.01, window_duration_sec))
+        command = [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
+        if source.proxy_url.startswith(("http://", "https://")):
+            command.extend(["-http_proxy", source.proxy_url])
+        if source.headers:
+            command.extend(["-headers", _ffmpeg_headers(source.headers)])
+        command.extend(
+            [
+                "-rw_timeout",
+                str(max(1, int(min(8.0, _remaining(deadline, "decode")) * 1_000_000))),
+                "-ss",
+                f"{max(0.0, window_start_sec):.3f}",
+                "-threads",
+                "1",
+                "-i",
+                source.url,
+                "-t",
+                f"{duration:.3f}",
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-c:a",
+                "pcm_s16le",
+                str(output_path),
+            ]
+        )
+        _run_command(command, deadline=deadline, cancel_check=cancel_check, stage="decode")
+    finally:
+        _decode_slots.release()
     if not output_path.is_file() or output_path.stat().st_size <= 44:
         raise _Unavailable("decode", "empty_audio_window")
 

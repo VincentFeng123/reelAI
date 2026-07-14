@@ -37,6 +37,7 @@ class GeminiCallTelemetry:
     candidate_tokens: Optional[int]
     thought_tokens: Optional[int]
     total_tokens: Optional[int]
+    cached_tokens: Optional[int] = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -168,6 +169,7 @@ def _call_telemetry(*, model: str, operation: str, prompt_version: str,
         candidate_tokens=_field(usage, "candidates_token_count"),
         thought_tokens=_field(usage, "thoughts_token_count"),
         total_tokens=_field(usage, "total_token_count"),
+        cached_tokens=_field(usage, "cached_content_token_count"),
     )
 
 
@@ -209,7 +211,7 @@ def _cancel_requested(cancelled) -> bool:
 
 _GEMINI3_JSON_SCHEMA_KEYS = {
     "$id", "$defs", "$ref", "$anchor", "type", "format", "title",
-    "description", "enum", "items", "prefixItems", "minItems", "minimum",
+    "description", "enum", "items", "prefixItems", "minItems", "maxItems", "minimum",
     "maximum", "anyOf", "oneOf", "properties", "required", "propertyOrdering",
 }
 

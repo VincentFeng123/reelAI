@@ -409,7 +409,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 require_verified_boundaries=require_verified_boundaries,
             )
 
-    def test_v6_ranked_feed_requires_each_quality_score_at_threshold(self) -> None:
+    def test_v7_ranked_feed_requires_each_quality_score_at_threshold(self) -> None:
         self._insert_versioned_reel(
             reel_id="v6-quality",
             video_id="video-a",
@@ -422,7 +422,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         baseline = json.loads(row[0])
         baseline.update({
-            "selection_contract_version": "quality_silence_v6",
+            "selection_contract_version": "quality_silence_v7",
             "self_contained": True,
             "is_standalone": True,
             "topic_evidence_quote": (

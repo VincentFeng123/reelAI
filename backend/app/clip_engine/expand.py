@@ -304,6 +304,9 @@ async def _practice_fast_gemini_raw_async(
                     "prompt_token_count": usage_field("prompt_token_count"),
                     "candidates_token_count": usage_field("candidates_token_count"),
                     "thoughts_token_count": usage_field("thoughts_token_count"),
+                    "cached_content_token_count": usage_field(
+                        "cached_content_token_count"
+                    ),
                     "total_token_count": usage_field("total_token_count"),
                     **reservation,
                     "dispatched": True,

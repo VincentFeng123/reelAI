@@ -102,11 +102,8 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         {"segment_enrich_clips": False},
     )
     assert _key(transcript, {"_segment_routing_mode": "flash_only"}) == baseline
-    assert _key(transcript, {"_knowledge_level": "beginner"}) != _key(
+    assert _key(transcript, {"_knowledge_level": "beginner"}) == _key(
         transcript, {"_knowledge_level": "advanced"},
-    )
-    assert _key(transcript, {"_knowledge_level": " Beginner "}) == _key(
-        transcript, {"_knowledge_level": "beginner"},
     )
 
     monkeypatch.setattr(segment_cache.pipeline_config, "SEGMENT_FLASH_MODEL", "new-model")

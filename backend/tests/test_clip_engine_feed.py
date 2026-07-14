@@ -39,6 +39,33 @@ from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
 _VIDEO_ID = "dQw4w9WgXcQ"
 _VIDEO_URL = f"https://www.youtube.com/watch?v={_VIDEO_ID}"
 
+
+def _verified_acoustic_result(_url: str, start: float, end: float, **kwargs):
+    tolerance = (
+        pipeline_module.clip_engine_silence.HANDOFF_TIMESTAMP_TOLERANCE_SEC
+    )
+    return pipeline_module.clip_engine_silence.SilenceVerificationResult(
+        "verified",
+        start,
+        end,
+        {
+            "threshold_dbfs": -38.0,
+            "semantic_start_limit_sec": kwargs["search_start_limit_sec"],
+            "semantic_end_limit_sec": kwargs["search_end_limit_sec"],
+            "start_speech_handoff_verified": kwargs[
+                "require_start_speech_handoff"
+            ],
+            "end_speech_handoff_verified": kwargs[
+                "require_end_speech_handoff"
+            ],
+            "start_two_sided_required": kwargs["require_start_two_sided"],
+            "end_two_sided_required": kwargs["require_end_two_sided"],
+            "start_quiet": [start - tolerance, start + tolerance],
+            "end_quiet": [end - tolerance, end + tolerance],
+        },
+    )
+
+
 _FAKE_ENGINE_OUT = {
     "video_id": _VIDEO_ID,
     "clips": [
@@ -117,11 +144,7 @@ class ClipEngineFeedTests(unittest.TestCase):
         self._verify_patch = mock.patch.object(
             pipeline_module.clip_engine_silence,
             "verify_acoustic_boundaries",
-            side_effect=lambda _url, start, end, **_kwargs: (
-                pipeline_module.clip_engine_silence.SilenceVerificationResult(
-                    "verified", start, end, {"threshold_dbfs": -38.0}
-                )
-            ),
+            side_effect=_verified_acoustic_result,
         )
         self._prepare_patch.start()
         self._verify_patch.start()

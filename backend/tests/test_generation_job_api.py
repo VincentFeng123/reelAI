@@ -4,8 +4,10 @@ import asyncio
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from fastapi.responses import JSONResponse
 import pytest
@@ -27,13 +29,13 @@ def test_generate_request_supports_full_material_inventory() -> None:
         ReelsGenerateRequest(material_id="m1", num_reels=301)
 
 
-def test_current_quality_contract_versions_stay_synchronized() -> None:
+def test_fresh_inventory_versions_advance_without_invalidating_segment_cache() -> None:
     assert {
         main.SELECTION_CONTRACT_VERSION,
         generation_jobs.REQUEST_SCHEMA_VERSION,
-        segment_cache.SELECTION_CONTRACT_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-    } == {"quality_silence_v6"}
+    } == {"quality_silence_v7"}
+    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v6"
 
 
 def test_reel_response_schema_retains_v3_source_and_selector_metadata() -> None:
@@ -119,7 +121,7 @@ def _insert_generation_reel(
             json.dumps({
                 "surface_eligible": True,
                 "boundary_status": "verified",
-                "selection_contract_version": "quality_silence_v6",
+                "selection_contract_version": "quality_silence_v7",
                 "speech_corridor_verified": True,
                 "directly_teaches_topic": True,
                 "substantive": True,
@@ -148,7 +150,7 @@ def _insert_generation_reel(
         "video_id": video_id,
         "t_start": 0.0,
         "t_end": 30.0,
-        "selection_contract_version": "quality_silence_v6",
+        "selection_contract_version": "quality_silence_v7",
     }
 
 
@@ -177,7 +179,7 @@ def _set_reel_boundary_state(
                     "acoustic_verified": verified,
                     "acoustic": ({"threshold_dbfs": -38.0} if verified else {}),
                 },
-                "selection_contract_version": "quality_silence_v6",
+                "selection_contract_version": "quality_silence_v7",
                 "directly_teaches_topic": True,
                 "substantive": True,
                 "factually_grounded": True,
@@ -248,7 +250,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
             "takeaways": [],
             "score": 0.93,
             "relevance_score": 0.13,
-            "_selection_contract_version": "quality_silence_v6",
+            "_selection_contract_version": "quality_silence_v7",
             "_selection_topic_relevance": 0.93,
             "_selection_source_rank": 0,
         }],
@@ -270,7 +272,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
 
         assert len(reels) == 1
         assert reels[0]["video_id"] == "AbCdEf12345"
-        assert reels[0]["selection_contract_version"] == "quality_silence_v6"
+        assert reels[0]["selection_contract_version"] == "quality_silence_v7"
         assert reels[0]["relevance_score"] == 0.13
         assert reels[0]["topic_relevance"] == 0.93
         assert not any(key.startswith("_selection_") for key in reels[0])
@@ -278,21 +280,21 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
         conn.close()
 
 
-def test_generation_job_reels_reject_stale_v5_inventory(monkeypatch) -> None:
+def test_generation_job_reels_reject_stale_v6_inventory(monkeypatch) -> None:
     conn = _conn()
     monkeypatch.setattr(
         main,
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{
-            "reel_id": "stale-v5-reel",
-            "selection_contract_version": "quality_silence_v5",
+            "reel_id": "stale-v6-reel",
+            "selection_contract_version": "quality_silence_v6",
         }],
     )
     try:
         assert main._generation_job_reels(
             conn,
             {
-                "result_generation_id": "stale-v5-generation",
+                "result_generation_id": "stale-v6-generation",
                 "material_id": "m1",
                 "concept_id": "c1",
                 "learner_id": "learner-1",
@@ -361,7 +363,7 @@ def test_reusable_generation_requires_every_quality_score_at_threshold(
         conn.close()
 
 
-def test_generation_worker_pool_executes_two_jobs_concurrently_with_distinct_owners(
+def test_generation_worker_uses_one_hobby_safe_process_worker(
     monkeypatch,
 ) -> None:
     main._stop_generation_worker()
@@ -386,8 +388,7 @@ def test_generation_worker_pool_executes_two_jobs_concurrently_with_distinct_own
     def run_job(job_row: dict, _worker_stop: threading.Event) -> None:
         with state_lock:
             running_jobs.append((str(job_row["id"]), str(job_row["lease_owner"])))
-            if len(running_jobs) == 2:
-                entered.set()
+            entered.set()
         assert release.wait(timeout=2.0)
 
     monkeypatch.setattr(main, "get_conn", connection)
@@ -397,22 +398,105 @@ def test_generation_worker_pool_executes_two_jobs_concurrently_with_distinct_own
     try:
         main._start_generation_worker()
         assert entered.wait(timeout=2.0)
-        assert len(main._generation_worker_threads) == main.GENERATION_WORKER_COUNT == 2
+        assert len(main._generation_worker_threads) == main.GENERATION_WORKER_COUNT == 1
         worker_threads = list(main._generation_worker_threads)
         main._start_generation_worker()
         assert main._generation_worker_threads == worker_threads
-        assert len({owner for _job_id, owner in running_jobs}) == 2
+        assert len({owner for _job_id, owner in running_jobs}) == 1
         assert all(owner.startswith("worker-") for _job_id, owner in running_jobs)
         assert 0 < main.GENERATION_HEARTBEAT_SEC < main.GENERATION_LEASE_SEC
-        assert main.GENERATION_WORKER_POLL_SEC > 0
+        assert main.GENERATION_WORKER_POLL_SEC > 600
         health = main.admin_health()
         assert health["generation_worker_alive"] is True
-        assert health["generation_worker_count"] == 2
-        assert health["generation_workers_alive"] == 2
+        assert health["generation_worker_count"] == 1
+        assert health["generation_workers_alive"] == 1
+        assert health["generation_worker_recovery_sec"] > 600
     finally:
         release.set()
         main._stop_generation_worker()
     assert main._generation_worker_threads == []
+
+
+def test_idle_generation_worker_sweeps_once_then_wakes_immediately_on_signal(
+    monkeypatch,
+) -> None:
+    main._stop_generation_worker()
+    first_poll = threading.Event()
+    second_poll = threading.Event()
+    poll_count = 0
+    poll_lock = threading.Lock()
+
+    @contextmanager
+    def connection(**_kwargs):
+        yield object()
+
+    def lease_next(_conn, **_kwargs):
+        nonlocal poll_count
+        with poll_lock:
+            poll_count += 1
+            if poll_count == 1:
+                first_poll.set()
+            elif poll_count == 2:
+                second_poll.set()
+        return None
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    monkeypatch.setattr(main, "lease_next_job", lease_next)
+
+    try:
+        main._start_generation_worker()
+        assert first_poll.wait(timeout=1.0)
+        time.sleep(0.05)
+        with poll_lock:
+            assert poll_count == 1
+
+        main._wake_generation_worker()
+        assert second_poll.wait(timeout=1.0)
+
+        started = time.monotonic()
+        main._stop_generation_worker()
+        assert time.monotonic() - started < 1.0
+    finally:
+        main._stop_generation_worker()
+
+    assert main._generation_worker_threads == []
+
+
+def test_generation_worker_does_not_lose_wake_committed_during_sweep(
+    monkeypatch,
+) -> None:
+    stop = threading.Event()
+    poll_count = 0
+
+    @contextmanager
+    def connection(**_kwargs):
+        yield object()
+
+    def lease_next(_conn, **_kwargs):
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count == 1:
+            main._wake_generation_worker()
+        else:
+            stop.set()
+        return None
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    monkeypatch.setattr(main, "lease_next_job", lease_next)
+    main._generation_worker_wake.clear()
+    worker = threading.Thread(
+        target=main._generation_worker_loop,
+        args=("worker-race-test", stop),
+    )
+    worker.start()
+    worker.join(timeout=1.0)
+    if worker.is_alive():
+        stop.set()
+        main._wake_generation_worker()
+        worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert poll_count == 2
 
 
 def test_generation_worker_stop_retains_live_pool_and_restart_uses_fresh_state(
@@ -484,14 +568,15 @@ def test_admin_health_requires_the_full_worker_pool_but_basic_health_stays_compa
     monkeypatch.setattr(
         main,
         "_generation_worker_threads",
-        [StateThread(True), StateThread(False)],
+        [StateThread(False)],
     )
 
     admin = main.admin_health()
     assert admin["ok"] is False
     assert admin["generation_worker_alive"] is False
-    assert admin["generation_worker_count"] == 2
-    assert admin["generation_workers_alive"] == 1
+    assert admin["generation_worker_count"] == 1
+    assert admin["generation_workers_alive"] == 0
+    assert admin["generation_worker_recovery_sec"] > 600
     assert main.health() == {"ok": True}
 
 
@@ -706,7 +791,7 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
                 json.dumps({
                         "surface_eligible": True,
                         "boundary_status": "verified",
-                        "selection_contract_version": "quality_silence_v6",
+                        "selection_contract_version": "quality_silence_v7",
                         "speech_corridor_verified": True,
                         "directly_teaches_topic": True,
                         "substantive": True,
@@ -1096,7 +1181,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
                 "video_id": f"{mode}-video-{index % expected_source_cap}",
                 "t_start": float(index * 10),
                 "t_end": float(index * 10 + 8),
-                "selection_contract_version": "quality_silence_v6",
+                "selection_contract_version": "quality_silence_v7",
             }
             kwargs["on_reel_created"](reel)
         generated_count += int(kwargs["max_new_reels"])
@@ -1113,7 +1198,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         lambda *_args, **_kwargs: [
             {
                 "reel_id": f"{mode}-reel-{index}",
-                "selection_contract_version": "quality_silence_v6",
+                "selection_contract_version": "quality_silence_v7",
             }
             for index in range(expected_reel_cap)
         ],
@@ -1374,6 +1459,24 @@ def test_status_and_stream_terminalize_stale_queue_without_duplicate_events(
 def test_generate_returns_202_and_idempotently_reuses_active_job(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
+    inside_transaction = False
+
+    @contextmanager
+    def committed_connection(**_kwargs):
+        nonlocal inside_transaction
+        assert not inside_transaction
+        inside_transaction = True
+        try:
+            yield conn
+        finally:
+            inside_transaction = False
+
+    def assert_committed_wake() -> None:
+        assert not inside_transaction
+
+    wake = mock.Mock(side_effect=assert_committed_wake)
+    monkeypatch.setattr(main, "get_conn", committed_connection)
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
     payload = ReelsGenerateRequest(material_id="m1", concept_id="c1", num_reels=3)
     try:
         first = asyncio.run(main.generate_reels(object(), payload))
@@ -1388,6 +1491,7 @@ def test_generate_returns_202_and_idempotently_reuses_active_job(monkeypatch) ->
         assert conn.execute(
             "SELECT COUNT(*) FROM reel_generation_jobs WHERE status IN ('queued', 'running')"
         ).fetchone()[0] == 1
+        assert wake.call_count == 2
     finally:
         conn.close()
 
@@ -1493,7 +1597,7 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         payload={
             "reel": {
                 "reel_id": "provisional",
-                "selection_contract_version": "quality_silence_v6",
+                "selection_contract_version": "quality_silence_v7",
             },
             "provisional": True,
         },
@@ -1568,7 +1672,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": "streamed-video",
                 "t_start": 10.0,
                 "t_end": 40.0,
-                "selection_contract_version": "quality_silence_v6",
+                "selection_contract_version": "quality_silence_v7",
             },
             "provisional": True,
         },
@@ -1593,7 +1697,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{
             "reel_id": "ranked-reel",
-            "selection_contract_version": "quality_silence_v6",
+            "selection_contract_version": "quality_silence_v7",
         }],
     )
     monkeypatch.setattr(
@@ -1654,7 +1758,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": f"ranked-video-{index}",
                 "t_start": float(index * 30),
                 "t_end": float(index * 30 + 20),
-                "selection_contract_version": "quality_silence_v6",
+                "selection_contract_version": "quality_silence_v7",
             }
             for index in range(4)
         ],
@@ -1799,6 +1903,25 @@ def test_preflight_uses_one_metadata_search_and_no_generation(monkeypatch) -> No
 def test_feed_autofill_false_never_submits_and_true_submits_before_return(monkeypatch) -> None:
     conn = _conn()
     _patch_request_context(monkeypatch, conn)
+    inside_transaction = False
+
+    @contextmanager
+    def committed_connection(**_kwargs):
+        nonlocal inside_transaction
+        assert not inside_transaction
+        inside_transaction = True
+        try:
+            yield conn
+        finally:
+            inside_transaction = False
+
+    def assert_committed_wake() -> None:
+        assert not inside_transaction
+
+    wake = mock.Mock(side_effect=assert_committed_wake)
+    monkeypatch.setattr(main, "get_conn", committed_connection)
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+
     def fail_on_unversioned_feed(*_args, **_kwargs):
         raise AssertionError("fresh feed must not rank base/legacy inventory")
 
@@ -1814,6 +1937,7 @@ def test_feed_autofill_false_never_submits_and_true_submits_before_return(monkey
         assert queued["generation_job_id"]
         assert queued["generation_job_status"] == "queued"
         assert conn.execute("SELECT COUNT(*) FROM reel_generation_jobs").fetchone()[0] == 1
+        wake.assert_called_once_with()
     finally:
         conn.close()
 
@@ -2191,7 +2315,7 @@ def test_cross_request_reuse_skips_newer_invalid_chain_for_older_valid_chain() -
         conn.close()
 
 
-def test_v6_feed_merges_value_ranked_batches_without_breaking_batch_topology(
+def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -2233,7 +2357,7 @@ def test_v6_feed_merges_value_ranked_batches_without_breaking_batch_topology(
             "_selection_topic_relevance": relevance,
             "_selection_source_rank": source_rank,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v6",
+            "selection_contract_version": "quality_silence_v7",
         }
 
     root_reels = [
@@ -2505,7 +2629,7 @@ def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v6",
+                "selection_contract_version": "quality_silence_v7",
             }
         ],
     )
@@ -2531,7 +2655,7 @@ def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v6",
+                "selection_contract_version": "quality_silence_v7",
             }
         ]
         assert conn.execute(

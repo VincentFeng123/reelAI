@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import shutil
+import threading
+import time
 import wave
 from array import array
 from pathlib import Path
@@ -22,6 +24,11 @@ def test_hosted_image_includes_yt_dlp_javascript_runtime() -> None:
     assert "yt-dlp[default,curl-cffi]==2026.7.4" in requirements
     assert "curl_cffi==0.15.0" in requirements
     assert "import yt_dlp.networking._curlcffi" in dockerfile
+    assert "OMP_NUM_THREADS=1" in dockerfile
+    assert "OPENBLAS_NUM_THREADS=1" in dockerfile
+    assert "MKL_NUM_THREADS=1" in dockerfile
+    assert "NUMEXPR_NUM_THREADS=1" in dockerfile
+    assert "TOKENIZERS_PARALLELISM=false" in dockerfile
 
 
 def _write_wav(path: Path, spans: list[tuple[float, float]], *, sample_rate: int = 16000) -> None:
@@ -904,6 +911,179 @@ def test_ffmpeg_uses_bounded_seek_before_input(tmp_path: Path) -> None:
     assert float(command[command.index("-t") + 1]) == 6.0
     assert "-http_proxy" in command
     assert "-headers" in command
+    assert command[command.index("-threads") + 1] == "1"
+    assert command.index("-threads") < command.index("-i")
+    assert command[command.index("-ar") + 1] == "16000"
+
+
+def test_ffmpeg_decodes_are_globally_bounded_to_four(tmp_path: Path) -> None:
+    active = 0
+    peak_active = 0
+    active_lock = threading.Lock()
+    four_entered = threading.Event()
+
+    def fake_run(command, **_kwargs):
+        nonlocal active, peak_active
+        with active_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            if active == 4:
+                four_entered.set()
+        assert four_entered.wait(timeout=1.0)
+        time.sleep(0.02)
+        _write_wav(Path(command[-1]), [(0.2, 0)])
+        with active_lock:
+            active -= 1
+        return b"", b""
+
+    source = silence.PreparedAudioSource(url="https://media.example/audio.m4a")
+    decode_slots = threading.BoundedSemaphore(4)
+    with mock.patch.object(silence, "_decode_slots", decode_slots), mock.patch.object(
+        silence, "_run_command", side_effect=fake_run
+    ):
+        with silence.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [
+                executor.submit(
+                    silence._decode_window,
+                    source,
+                    window_start_sec=float(index),
+                    window_duration_sec=0.2,
+                    output_path=tmp_path / f"edge-{index}.wav",
+                    ffmpeg_bin="ffmpeg",
+                    deadline=time.monotonic() + 2.0,
+                    cancel_check=None,
+                )
+                for index in range(8)
+            ]
+            for future in futures:
+                future.result(timeout=2.0)
+
+    assert peak_active == 4
+
+
+def test_ffmpeg_decode_slot_wait_is_cancellable(tmp_path: Path) -> None:
+    cancelled = False
+
+    class BusySlots:
+        def acquire(self, *, timeout: float) -> bool:
+            nonlocal cancelled
+            assert timeout <= 0.1
+            cancelled = True
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("an unacquired slot must not be released")
+
+    with mock.patch.object(silence, "_decode_slots", BusySlots()), mock.patch.object(
+        silence, "_run_command"
+    ) as run:
+        with pytest.raises(silence._Unavailable) as exc:
+            silence._decode_window(
+                silence.PreparedAudioSource(url="https://media.example/audio.m4a"),
+                window_start_sec=0.0,
+                window_duration_sec=1.0,
+                output_path=tmp_path / "cancelled.wav",
+                ffmpeg_bin="ffmpeg",
+                deadline=time.monotonic() + 1.0,
+                cancel_check=lambda: cancelled,
+            )
+
+    assert exc.value.reason == "cancelled"
+    run.assert_not_called()
+
+
+def test_audio_entry_chooses_lowest_valid_requested_audio_without_format_override() -> None:
+    selected = silence._audio_entry(
+        {
+            "requested_downloads": [
+                {
+                    "url": "https://media.example/high.opus",
+                    "format_id": "251",
+                    "acodec": "opus",
+                    "vcodec": "none",
+                    "tbr": 132.0,
+                },
+                {
+                    "url": "https://media.example/selected-low.opus",
+                    "format_id": "250",
+                    "acodec": "opus",
+                    "vcodec": "none",
+                    "tbr": 64.0,
+                },
+            ],
+            "url": "https://media.example/video.mp4",
+            "format_id": "18",
+            "acodec": "aac",
+            "vcodec": "h264",
+            "tbr": 500.0,
+            "formats": [
+                {
+                    "url": "https://media.example/unknown.m4a",
+                    "format_id": "none",
+                    "acodec": "aac",
+                    "vcodec": "none",
+                    "tbr": 0,
+                },
+                {
+                    "url": "https://media.example/low.m4a",
+                    "format_id": "139",
+                    "acodec": "aac",
+                    "vcodec": "none",
+                    "tbr": 49.0,
+                },
+            ],
+        }
+    )
+
+    assert selected["format_id"] == "250"
+
+
+def test_audio_entry_prefers_valid_selected_root_before_formats_fallback() -> None:
+    selected = silence._audio_entry(
+        {
+            "url": "https://media.example/selected.m4a",
+            "format_id": "140",
+            "acodec": "aac",
+            "vcodec": "none",
+            "tbr": 64.0,
+            "formats": [
+                {
+                    "url": "https://media.example/unselected.m4a",
+                    "format_id": "139",
+                    "acodec": "aac",
+                    "vcodec": "none",
+                    "tbr": 49.0,
+                }
+            ],
+        }
+    )
+
+    assert selected["format_id"] == "140"
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {
+            "url": "https://media.example/video.mp4",
+            "acodec": "aac",
+            "vcodec": "h264",
+            "tbr": 49.0,
+        },
+        {
+            "url": "https://media.example/unknown.m4a",
+            "tbr": 49.0,
+        },
+        {
+            "url": "https://media.example/audio.m4a",
+            "acodec": "aac",
+            "vcodec": "none",
+            "tbr": 0.0,
+        },
+    ],
+)
+def test_audio_entry_rejects_video_unknown_and_nonpositive_formats(entry) -> None:
+    assert silence._audio_entry({"requested_downloads": [entry]}) == {}
 
 
 def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monkeypatch) -> None:
@@ -920,6 +1100,7 @@ def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monke
     )
     payload = (
         b'{"url":"https://media.example/audio.m4a","format_id":"140",'
+        b'"acodec":"aac","vcodec":"none","tbr":49.0,'
         b'"duration":123.456,"http_headers":{"User-Agent":"agent"}}'
     )
     with mock.patch.object(silence, "_run_command", return_value=(payload, b"")) as run:
@@ -933,6 +1114,9 @@ def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monke
         "youtubepot-bgutilhttp:base_url=http://pot.internal:4416"
     )
     assert command[command.index("--impersonate") + 1] == "chrome"
+    assert command[command.index("--format") + 1] == (
+        "worstaudio[acodec!=none][vcodec=none]"
+    )
     assert "--no-remote-components" in command
     assert "--remote-components" not in command
     assert result.source is not None and result.source.format_id == "140"
@@ -950,6 +1134,7 @@ def test_prepare_fetches_json3_words_once_from_the_existing_ytdlp_metadata(
     )
     payload = (
         b'{"url":"https://media.example/audio.m4a","format_id":"140",'
+        b'"acodec":"aac","vcodec":"none","tbr":49.0,'
         b'"automatic_captions":{"en-orig":[{"ext":"json3",'
         b'"url":"https://captions.example/timed?sig=secret"}]}}'
     )
@@ -974,7 +1159,8 @@ def test_prepare_fetches_json3_words_once_from_the_existing_ytdlp_metadata(
     assert "captions.example" not in repr(result.source)
 
 
-def test_prepare_rotates_to_the_next_configured_proxy(monkeypatch) -> None:
+@pytest.mark.parametrize("first_reason", ["proxy_failed", "youtube_bot_challenge"])
+def test_prepare_rotates_to_the_next_configured_proxy(monkeypatch, first_reason: str) -> None:
     monkeypatch.setattr(
         silence,
         "get_settings",
@@ -983,13 +1169,16 @@ def test_prepare_rotates_to_the_next_configured_proxy(monkeypatch) -> None:
             ytdlp_pot_provider_url="",
         ),
     )
-    payload = b'{"url":"https://media.example/audio.m4a","format_id":"140"}'
+    payload = (
+        b'{"url":"https://media.example/audio.m4a","format_id":"140",'
+        b'"acodec":"aac","vcodec":"none","tbr":49.0}'
+    )
     commands: list[list[str]] = []
 
     def fake_run(command, **_kwargs):
         commands.append(list(command))
         if len(commands) == 1:
-            raise silence._Unavailable("resolve", "proxy_failed")
+            raise silence._Unavailable("resolve", first_reason)
         return payload, b""
 
     with mock.patch.object(silence, "_run_command", side_effect=fake_run):
@@ -1011,7 +1200,10 @@ def test_prepare_uses_direct_route_after_all_configured_proxies_fail(monkeypatch
             ytdlp_pot_provider_url="",
         ),
     )
-    payload = b'{"url":"https://media.example/audio.m4a","format_id":"251"}'
+    payload = (
+        b'{"url":"https://media.example/audio.m4a","format_id":"251",'
+        b'"acodec":"opus","vcodec":"none","tbr":49.0}'
+    )
     commands: list[list[str]] = []
 
     def fake_run(command, **_kwargs):
@@ -1035,7 +1227,10 @@ def test_prepare_retries_bot_challenge_with_embedded_player(monkeypatch) -> None
         "get_settings",
         lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
     )
-    payload = b'{"url":"https://media.example/audio.m4a","format_id":"251"}'
+    payload = (
+        b'{"url":"https://media.example/audio.m4a","format_id":"251",'
+        b'"acodec":"opus","vcodec":"none","tbr":49.0}'
+    )
     commands: list[list[str]] = []
 
     def fake_run(command, **_kwargs):
@@ -1048,8 +1243,75 @@ def test_prepare_retries_bot_challenge_with_embedded_player(monkeypatch) -> None
         result = silence.prepare_audio_source("dQw4w9WgXcQ")
 
     assert result.ready
-    assert "youtube:player_client=web_embedded;player_skip=webpage" not in commands[0]
-    assert "youtube:player_client=web_embedded;player_skip=webpage" in commands[1]
+    assert "youtube:player_client=web_embedded" not in commands[0]
+    assert (
+        "youtube:player_client=web_embedded;player_skip=webpage" in commands[1]
+    )
+
+
+def test_prepare_uses_mweb_when_pot_provider_is_configured(monkeypatch) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(
+            proxy_urls="",
+            ytdlp_pot_provider_url="http://pot.internal:4416",
+        ),
+    )
+    payload = (
+        b'{"url":"https://media.example/audio.m4a","format_id":"251",'
+        b'"acodec":"opus","vcodec":"none","tbr":49.0}'
+    )
+    commands: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(list(command))
+        if len(commands) == 1:
+            raise silence._Unavailable("resolve", "youtube_bot_challenge")
+        return payload, b""
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ")
+
+    assert result.ready
+    assert "youtube:player_client=mweb;player_skip=webpage" in commands[1]
+    assert "youtubepot-bgutilhttp:base_url=http://pot.internal:4416" in commands[1]
+
+
+def test_prepare_caps_route_plan_and_gives_each_attempt_viable_time(monkeypatch) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(
+            proxy_urls=(
+                "http://one.example:8080,http://two.example:8080,"
+                "http://three.example:8080"
+            ),
+            ytdlp_pot_provider_url="",
+        ),
+    )
+    budgets: list[float] = []
+    commands: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        commands.append(list(command))
+        budgets.append(float(kwargs["deadline"]) - silence.time.monotonic())
+        raise silence._Unavailable("resolve", "proxy_failed")
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ")
+
+    assert result.status == "unavailable"
+    assert len(budgets) == 3
+    assert min(budgets) >= 7.5
+    assert "--proxy" in commands[0]
+    assert "http://one.example:8080" in commands[0]
+    assert "--proxy" in commands[1]
+    assert "http://two.example:8080" in commands[1]
+    assert "--proxy" not in commands[2]
+    assert (
+        "youtube:player_client=web_embedded;player_skip=webpage" in commands[2]
+    )
 
 
 def test_prepare_reserves_time_for_fallback_after_attempt_timeout(monkeypatch) -> None:
@@ -1058,7 +1320,10 @@ def test_prepare_reserves_time_for_fallback_after_attempt_timeout(monkeypatch) -
         "get_settings",
         lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
     )
-    payload = b'{"url":"https://media.example/audio.m4a","format_id":"251"}'
+    payload = (
+        b'{"url":"https://media.example/audio.m4a","format_id":"251",'
+        b'"acodec":"opus","vcodec":"none","tbr":49.0}'
+    )
     deadlines: list[float] = []
 
     def fake_run(_command, **kwargs):
@@ -1093,7 +1358,7 @@ def test_prepare_preserves_actionable_reasons_across_failed_attempts(monkeypatch
     assert result.diagnostics["reason"] == "youtube_bot_challenge"
     assert result.diagnostics["attempt_reasons"] == [
         "direct:default:youtube_bot_challenge",
-        "direct:embedded:process_failed",
+        "direct:web_embedded:process_failed",
     ]
 
 
@@ -1105,7 +1370,7 @@ def test_preparation_attempt_reasons_reach_boundary_diagnostics() -> None:
             "reason": "youtube_bot_challenge",
             "attempt_reasons": [
                 "proxy:default:proxy_failed",
-                "direct:embedded:youtube_bot_challenge",
+                "direct:web_embedded:youtube_bot_challenge",
             ],
             "elapsed_ms": 123,
         },
@@ -1160,6 +1425,15 @@ def test_resolver_process_failures_are_safely_classified(stderr: bytes, reason: 
             )
 
     assert exc.value.reason == reason
+
+
+def test_resolver_classifies_terminal_error_not_prior_warning() -> None:
+    stderr = (
+        b"WARNING: Sign in to confirm you're not a bot\n"
+        b"ERROR: Requested format is not available\n"
+    )
+
+    assert silence._process_failure_reason("resolve", stderr) == "format_unavailable"
 
 
 def test_invalid_source_fails_before_yt_dlp() -> None:

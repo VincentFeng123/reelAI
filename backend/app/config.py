@@ -96,8 +96,10 @@ class Settings(BaseSettings):
     clip_search_max_videos: int = 5
     generation_job_heartbeat_sec: int = 15
     generation_job_lease_sec: int = 90
-    generation_job_poll_sec: float = 1.0
-    generation_job_worker_count: int = 2
+    # Job submissions wake the local worker immediately. This is only the
+    # crash-recovery sweep, kept beyond Railway's ten-minute idle-sleep window.
+    generation_job_poll_sec: float = 900.0
+    generation_job_worker_count: int = 1
 
 
 @lru_cache

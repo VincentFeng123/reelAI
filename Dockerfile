@@ -49,6 +49,11 @@ COPY backend ./backend
 # Railway injects $PORT. Bind to 0.0.0.0 so the container is reachable from
 # the Railway edge proxy. `backend.app.main:app` is the FastAPI entrypoint.
 ENV PYTHONUNBUFFERED=1 \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    NUMEXPR_NUM_THREADS=1 \
+    TOKENIZERS_PARALLELISM=false \
     PORT=8000
 
 EXPOSE 8000

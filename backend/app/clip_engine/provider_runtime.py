@@ -309,6 +309,16 @@ def _usage_field(usage: Any, name: str) -> Any:
     return getattr(usage, name, None)
 
 
+def _gemini_token_rates(model: str) -> tuple[float, float, float]:
+    """Return current per-million uncached/cached-input/output rates."""
+    normalized = str(model or "").casefold()
+    if "flash-lite" in normalized:
+        return 0.25, 0.025, 1.50
+    if "pro" in normalized:
+        return 2.00, 0.20, 12.00
+    return 1.50, 0.15, 9.00
+
+
 class GenerationContext:
     """Thread-safe budget and usage ledger shared by all calls in one generation."""
 
@@ -359,9 +369,7 @@ class GenerationContext:
             else max(1, math.ceil(len(str(prompt_text or "")) / 4))
         )
         output_tokens = max(1, int(max_output_tokens))
-        is_pro = "pro" in str(model or "").casefold()
-        input_rate = 2.0 if is_pro else 1.5
-        output_rate = 12.0 if is_pro else 9.0
+        input_rate, _cached_input_rate, output_rate = _gemini_token_rates(model)
         estimated_cost = (
             prompt_tokens * input_rate + output_tokens * output_rate
         ) / 1_000_000.0
@@ -641,6 +649,12 @@ class GenerationContext:
             "thoughts_token_count",
             "thoughtsTokenCount",
         )
+        cached_tokens = _usage_value(
+            usage,
+            "cached_tokens",
+            "cached_content_token_count",
+            "cachedContentTokenCount",
+        )
         output_tokens = (
             candidate_tokens + thought_tokens
             if candidate_tokens or thought_tokens
@@ -651,6 +665,7 @@ class GenerationContext:
             "provider_call": True,
             "candidate_tokens": candidate_tokens,
             "thought_tokens": thought_tokens,
+            "cached_tokens": cached_tokens,
         }
         if stage:
             record_metadata["stage"] = str(stage)
@@ -695,11 +710,18 @@ class GenerationContext:
 
     @staticmethod
     def _gemini_cost(record: Mapping[str, Any]) -> float:
-        model = str(record.get("model_used") or "").casefold()
-        input_rate = 2.0 if "pro" in model else 1.5
-        output_rate = 12.0 if "pro" in model else 9.0
+        input_rate, cached_input_rate, output_rate = _gemini_token_rates(
+            str(record.get("model_used") or "")
+        )
+        input_tokens = max(0, int(record.get("input_tokens") or 0))
+        cached_tokens = min(
+            input_tokens,
+            max(0, int((record.get("metadata") or {}).get("cached_tokens") or 0)),
+        )
+        uncached_tokens = input_tokens - cached_tokens
         return (
-            int(record.get("input_tokens") or 0) * input_rate
+            uncached_tokens * input_rate
+            + cached_tokens * cached_input_rate
             + int(record.get("output_tokens") or 0) * output_rate
         ) / 1_000_000.0
 
@@ -724,6 +746,7 @@ class GenerationContext:
                     "input_tokens": 0,
                     "output_tokens": 0,
                     "thought_tokens": 0,
+                    "cached_tokens": 0,
                     "estimated_cost_usd": 0.0,
                     "reserved_cost_usd": 0.0,
                     "billing_unknown_calls": 0,
@@ -738,6 +761,9 @@ class GenerationContext:
             )
             bucket["thought_tokens"] = int(bucket["thought_tokens"]) + int(
                 metadata.get("thought_tokens") or 0
+            )
+            bucket["cached_tokens"] = int(bucket["cached_tokens"]) + int(
+                metadata.get("cached_tokens") or 0
             )
             bucket["estimated_cost_usd"] = (
                 float(bucket["estimated_cost_usd"]) + self._gemini_cost(row)
@@ -786,6 +812,10 @@ class GenerationContext:
             ),
             "thought_tokens": sum(
                 int((row.get("metadata") or {}).get("thought_tokens") or 0)
+                for row in gemini_calls
+            ),
+            "cached_tokens": sum(
+                int((row.get("metadata") or {}).get("cached_tokens") or 0)
                 for row in gemini_calls
             ),
             "estimated_cost_usd": round(estimated_cost, 8),

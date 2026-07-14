@@ -119,9 +119,6 @@ INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
 )
 PARTIAL_CUE_MATERIALITY_SEC = 0.05
 SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
-EXACT_TOPIC_SEMANTIC_MIN = 0.20
-EXACT_TOPIC_LITERAL_SOURCE_SEMANTIC_MIN = 0.12
-EXACT_TOPIC_REJECTION_REASON = "uncorroborated_exact_topic"
 
 
 def _run_clip(
@@ -562,7 +559,7 @@ def _selected_speech_corridor(
     required_speech_bounds: tuple[float, float] | None = None,
     projection_diagnostics: dict[str, Any] | None = None,
 ) -> tuple[float, float, str | None]:
-    """Keep acoustic padding inside the selected cues' speech-free corridor."""
+    """Use cue onsets as the acoustic fences around selected rolling captions."""
     segments = [
         segment
         for segment in list(transcript.get("segments") or [])
@@ -616,6 +613,8 @@ def _selected_speech_corridor(
         and projection_diagnostics.get("lexical_projection_verified") is True
         else {}
     )
+    start_is_projected = "start" in projection
+    end_is_projected = "end" in projection
     start_is_partial = required_start > first_start + PARTIAL_CUE_MATERIALITY_SEC
     end_is_partial = required_end < last_end - PARTIAL_CUE_MATERIALITY_SEC
     if (
@@ -626,24 +625,83 @@ def _selected_speech_corridor(
 
     start_limit = (
         required_start
-        if start_is_partial
+        if start_is_projected
         else 0.0
         if first_index == 0
-        else float(segments[first_index - 1].get("end") or 0.0)
+        else first_start
     )
     end_limit = (
         required_end
-        if end_is_partial
+        if end_is_projected
         else source_end
         if last_index + 1 >= len(segments)
-        else float(segments[last_index + 1].get("start") or last_end)
+        else float(segments[last_index + 1]["start"])
     )
-    if (
-        start_limit > required_start + SPEECH_OWNERSHIP_EPSILON_SEC
-        or end_limit + SPEECH_OWNERSHIP_EPSILON_SEC < required_end
-    ):
-        return start_limit, end_limit, "unselected_speech_overlaps_required_range"
+    if end_limit <= start_limit:
+        return start_limit, end_limit, "selected_cue_range_unavailable"
     return max(0.0, start_limit), min(source_end, end_limit), None
+
+
+def _acoustic_boundary_plan(
+    transcript: dict[str, Any],
+    raw_clip: dict[str, Any],
+    projection_diagnostics: dict[str, Any],
+    *,
+    speech_bounds: tuple[float, float],
+    search_limits: tuple[float, float],
+) -> tuple[float, float, bool, bool, bool, bool] | None:
+    """Separate speech targets from their allowed acoustic search corridors."""
+    segments = list(transcript.get("segments") or [])
+    index_by_id = {
+        str(segment.get("cue_id") or f"cue-{index}"): index
+        for index, segment in enumerate(segments)
+        if isinstance(segment, dict)
+    }
+    cue_ids = [str(cue_id) for cue_id in (raw_clip.get("cue_ids") or [])]
+    if not cue_ids or any(cue_id not in index_by_id for cue_id in cue_ids):
+        return None
+    indices = [index_by_id[cue_id] for cue_id in cue_ids]
+    if indices != list(range(indices[0], indices[-1] + 1)):
+        return None
+    first_index = min(indices)
+    last_index = max(indices)
+    start_target = float(speech_bounds[0])
+    end_target = (
+        float(speech_bounds[1])
+        if "end" in projection_diagnostics or last_index + 1 >= len(segments)
+        else float(segments[last_index + 1]["start"])
+    )
+    search_start, search_end = search_limits
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (start_target, end_target, search_start, search_end)
+        )
+        or start_target < search_start - SPEECH_OWNERSHIP_EPSILON_SEC
+        or end_target > search_end + SPEECH_OWNERSHIP_EPSILON_SEC
+        or end_target <= start_target
+    ):
+        return None
+    start_two_sided = "start" in projection_diagnostics or first_index > 0
+    end_two_sided = (
+        "end" in projection_diagnostics or last_index + 1 < len(segments)
+    )
+    start_handoff = start_two_sided or (
+        first_index == 0
+        and start_target > search_start + SPEECH_OWNERSHIP_EPSILON_SEC
+    )
+    end_handoff = end_two_sided or (
+        last_index + 1 >= len(segments)
+        and end_target < search_end - SPEECH_OWNERSHIP_EPSILON_SEC
+    )
+    return (
+        start_target,
+        end_target,
+        start_handoff,
+        end_handoff,
+        start_two_sided,
+        end_two_sided,
+    )
 
 
 def _acoustic_range_is_safe(
@@ -658,6 +716,8 @@ def _acoustic_range_is_safe(
     diagnostics: dict[str, Any],
     require_start_handoff: bool = False,
     require_end_handoff: bool = False,
+    require_start_two_sided: bool = False,
+    require_end_two_sided: bool = False,
 ) -> bool:
     """Validate progressive and projected acoustic edges independently."""
     values = (
@@ -703,7 +763,10 @@ def _acoustic_range_is_safe(
             explicit_verified is None and legacy_handoff
         ):
             return False
-        if diagnostics.get(f"{edge}_two_sided_required") is not True:
+        require_two_sided = (
+            require_start_two_sided if edge == "start" else require_end_two_sided
+        )
+        if diagnostics.get(f"{edge}_two_sided_required") is not require_two_sided:
             return False
         try:
             diagnostic_start_limit = float(
@@ -881,26 +944,6 @@ def _verified_direct_adapter_clips(
     if not candidates:
         return []
 
-    normalized_topic, lexical_support, semantic_scores = (
-        _exact_topic_corroboration_scores(
-            exact_topic,
-            [candidate["_grounded_topic_evidence_quote"] for candidate in candidates],
-            embedding_service=embedding_service,
-        )
-    )
-    if normalized_topic:
-        candidates = [
-            candidate
-            for index, candidate in enumerate(candidates)
-            if lexical_support[index]
-            or (
-                semantic_scores[index] is not None
-                and semantic_scores[index] >= EXACT_TOPIC_SEMANTIC_MIN
-            )
-        ]
-        if not candidates:
-            return []
-
     candidates.sort(
         key=lambda candidate: (
             (
@@ -969,17 +1012,39 @@ def _verified_direct_adapter_clips(
                 end_sec,
                 {"stage": "semantic_corridor", "reason": corridor_error},
             ), projection, speech_bounds
+        boundary_plan = _acoustic_boundary_plan(
+            transcript,
+            raw_clip,
+            projection,
+            speech_bounds=speech_bounds,
+            search_limits=(search_start_limit, search_end_limit),
+        )
+        if boundary_plan is None:
+            return diagnostics, clip_engine_silence.SilenceVerificationResult(
+                "unavailable",
+                start_sec,
+                end_sec,
+                {"stage": "semantic_corridor", "reason": "boundary_plan_invalid"},
+            ), projection, speech_bounds
+        (
+            start_target,
+            end_target,
+            start_handoff,
+            end_handoff,
+            start_two_sided,
+            end_two_sided,
+        ) = boundary_plan
         acoustic = clip_engine_silence.verify_acoustic_boundaries(
             source_url,
-            start_sec,
-            end_sec,
+            start_target,
+            end_target,
             search_start_limit_sec=search_start_limit,
             search_end_limit_sec=search_end_limit,
             require_speech_handoff=False,
-            require_start_speech_handoff="start" in projection,
-            require_end_speech_handoff="end" in projection,
-            require_start_two_sided="start" in projection,
-            require_end_two_sided="end" in projection,
+            require_start_speech_handoff=start_handoff,
+            require_end_speech_handoff=end_handoff,
+            require_start_two_sided=start_two_sided,
+            require_end_two_sided=end_two_sided,
             prepared=prepared,
             cancel_check=should_cancel,
         )
@@ -995,14 +1060,16 @@ def _verified_direct_adapter_clips(
             and not _acoustic_range_is_safe(
                 start_sec=float(acoustic.start_sec),
                 end_sec=float(acoustic.end_sec),
-                required_start_sec=start_sec,
-                required_end_sec=end_sec,
+                required_start_sec=start_target,
+                required_end_sec=end_target,
                 semantic_start_limit_sec=search_start_limit,
                 semantic_end_limit_sec=search_end_limit,
                 source_end_sec=media_end,
                 diagnostics=dict(acoustic.diagnostics or {}),
-                require_start_handoff="start" in projection,
-                require_end_handoff="end" in projection,
+                require_start_handoff=start_handoff,
+                require_end_handoff=end_handoff,
+                require_start_two_sided=start_two_sided,
+                require_end_two_sided=end_two_sided,
             )
         ):
             return diagnostics, clip_engine_silence.SilenceVerificationResult(
@@ -1030,7 +1097,6 @@ def _verified_direct_adapter_clips(
         raise_if_cancelled(should_cancel)
         if caption is None or acoustic is None or not acoustic.verified:
             continue
-        required_first_speech, required_last_speech = speech_bounds
         semantic_start, semantic_end, corridor_error = _selected_speech_corridor(
             transcript,
             raw_clip,
@@ -1039,17 +1105,36 @@ def _verified_direct_adapter_clips(
             required_speech_bounds=speech_bounds,
             projection_diagnostics=projection,
         )
-        if corridor_error or not _acoustic_range_is_safe(
+        boundary_plan = _acoustic_boundary_plan(
+            transcript,
+            raw_clip,
+            projection,
+            speech_bounds=speech_bounds,
+            search_limits=(semantic_start, semantic_end),
+        )
+        if corridor_error or boundary_plan is None:
+            continue
+        (
+            start_target,
+            end_target,
+            start_handoff,
+            end_handoff,
+            start_two_sided,
+            end_two_sided,
+        ) = boundary_plan
+        if not _acoustic_range_is_safe(
             start_sec=float(acoustic.start_sec),
             end_sec=float(acoustic.end_sec),
-            required_start_sec=required_first_speech,
-            required_end_sec=required_last_speech,
+            required_start_sec=start_target,
+            required_end_sec=end_target,
             semantic_start_limit_sec=semantic_start,
             semantic_end_limit_sec=semantic_end,
             source_end_sec=media_end,
             diagnostics=dict(acoustic.diagnostics or {}),
-            require_start_handoff="start" in projection,
-            require_end_handoff="end" in projection,
+            require_start_handoff=start_handoff,
+            require_end_handoff=end_handoff,
+            require_start_two_sided=start_two_sided,
+            require_end_two_sided=end_two_sided,
         ):
             continue
         clip = dict(raw_clip)
@@ -1071,7 +1156,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v6",
+            selection_contract_version="quality_silence_v7",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -1228,76 +1313,6 @@ def _topic_evidence(
     if semantic_score is not None and semantic_score >= 0.72 and text.strip():
         return [f"semantic:{semantic_score:.2f}"]
     return []
-
-
-def _exact_topic_corroboration_terms(topic: str) -> list[str]:
-    """Keep explicit comparison components from the exact request as valid anchors."""
-    exact = " ".join(str(topic or "").split())
-    if not exact:
-        return []
-    components = [
-        " ".join(component.split()).strip(" ,;:/|")
-        for component in re.split(
-            r"\s+(?:vs\.?|versus|compared\s+(?:with|to))\s+|[/|]",
-            exact,
-            flags=re.IGNORECASE,
-        )
-    ]
-    if len([component for component in components if component]) < 2:
-        return [exact]
-    return list(dict.fromkeys([exact, *(component for component in components if component)]))
-
-
-def _exact_topic_corroboration_scores(
-    topic: str,
-    grounded_quotes: list[str],
-    *,
-    embedding_service: Any,
-) -> tuple[str, list[bool], list[float | None]]:
-    """Corroborate selector evidence against only the user's exact request."""
-    exact_topic = " ".join(str(topic or "").split())
-    exact_topic_terms = _exact_topic_corroboration_terms(exact_topic)
-    if not exact_topic_terms:
-        return exact_topic, [True] * len(grounded_quotes), [None] * len(grounded_quotes)
-
-    lexical_support = [
-        bool(_topic_evidence(quote, exact_topic_terms)) if quote else False
-        for quote in grounded_quotes
-    ]
-    semantic_scores: list[float | None] = [None] * len(grounded_quotes)
-    semantic_candidate_indices = [
-        index
-        for index, quote in enumerate(grounded_quotes)
-        if quote and not lexical_support[index]
-    ]
-    if (
-        not semantic_candidate_indices
-        or embedding_service is None
-        or getattr(embedding_service, "semantic_available", False) is not True
-    ):
-        return exact_topic, lexical_support, semantic_scores
-
-    semantic_inputs = list(exact_topic_terms)
-    anchor_count = len(semantic_inputs)
-    semantic_offsets: dict[int, int] = {}
-    for index in semantic_candidate_indices:
-        semantic_offsets[index] = len(semantic_inputs)
-        semantic_inputs.append(grounded_quotes[index])
-    try:
-        vectors = embedding_service.embed_semantic(semantic_inputs)
-        if vectors is not None and len(vectors) == len(semantic_inputs):
-            for index, offset in semantic_offsets.items():
-                score = max(
-                    float(vectors[offset].dot(anchor))
-                    for anchor in vectors[:anchor_count]
-                )
-                if math.isfinite(score):
-                    semantic_scores[index] = score
-    except Exception:
-        logger.warning(
-            "exact-topic semantic corroboration unavailable; failing closed"
-        )
-    return exact_topic, lexical_support, semantic_scores
 
 
 def _grounded_topic_evidence_quote(text: str, quote: object) -> str:
@@ -2493,17 +2508,42 @@ class IngestionPipeline:
                             "reason": corridor_error,
                         },
                     ), projection, speech_bounds
+                boundary_plan = _acoustic_boundary_plan(
+                    engine_out["transcript"],
+                    raw_clip,
+                    projection,
+                    speech_bounds=speech_bounds,
+                    search_limits=(search_start_limit, search_end_limit),
+                )
+                if boundary_plan is None:
+                    return caption, clip_engine_silence.SilenceVerificationResult(
+                        "unavailable",
+                        required_start,
+                        required_end,
+                        {
+                            "stage": "semantic_corridor",
+                            "reason": "boundary_plan_invalid",
+                        },
+                    ), projection, speech_bounds
+                (
+                    start_target,
+                    end_target,
+                    start_handoff,
+                    end_handoff,
+                    start_two_sided,
+                    end_two_sided,
+                ) = boundary_plan
                 acoustic = clip_engine_silence.verify_acoustic_boundaries(
                     str(v.get("url") or v.get("id") or ""),
-                    required_start,
-                    required_end,
+                    start_target,
+                    end_target,
                     search_start_limit_sec=search_start_limit,
                     search_end_limit_sec=search_end_limit,
                     require_speech_handoff=False,
-                    require_start_speech_handoff="start" in projection,
-                    require_end_speech_handoff="end" in projection,
-                    require_start_two_sided="start" in projection,
-                    require_end_two_sided="end" in projection,
+                    require_start_speech_handoff=start_handoff,
+                    require_end_speech_handoff=end_handoff,
+                    require_start_two_sided=start_two_sided,
+                    require_end_two_sided=end_two_sided,
                     prepared=prepared_audio,
                     # This worker may have waited behind three earlier candidates.
                     # Start its bounded verification budget only when it runs.
@@ -2522,14 +2562,16 @@ class IngestionPipeline:
                     and not _acoustic_range_is_safe(
                         start_sec=float(acoustic.start_sec),
                         end_sec=float(acoustic.end_sec),
-                        required_start_sec=required_start,
-                        required_end_sec=required_end,
+                        required_start_sec=start_target,
+                        required_end_sec=end_target,
                         semantic_start_limit_sec=search_start_limit,
                         semantic_end_limit_sec=search_end_limit,
                         source_end_sec=media_end,
                         diagnostics=dict(acoustic.diagnostics or {}),
-                        require_start_handoff="start" in projection,
-                        require_end_handoff="end" in projection,
+                        require_start_handoff=start_handoff,
+                        require_end_handoff=end_handoff,
+                        require_start_two_sided=start_two_sided,
+                        require_end_two_sided=end_two_sided,
                     )
                 ):
                     return caption, clip_engine_silence.SilenceVerificationResult(
@@ -2607,7 +2649,6 @@ class IngestionPipeline:
                     elif require_acoustic_boundaries:
                         assert acoustic is not None
                         acoustic_diagnostics = dict(acoustic.diagnostics or {})
-                        first_start, last_end = speech_bounds
                         semantic_start, semantic_end, corridor_error = (
                             _selected_speech_corridor(
                                 engine_out["transcript"],
@@ -2618,24 +2659,43 @@ class IngestionPipeline:
                                 projection_diagnostics=projection_diagnostics,
                             )
                         )
+                        boundary_plan = _acoustic_boundary_plan(
+                            engine_out["transcript"],
+                            clip,
+                            projection_diagnostics,
+                            speech_bounds=speech_bounds,
+                            search_limits=(semantic_start, semantic_end),
+                        )
+                        if boundary_plan is None:
+                            start_target, end_target = speech_bounds
+                            start_handoff = end_handoff = False
+                            start_two_sided = end_two_sided = False
+                        else:
+                            (
+                                start_target,
+                                end_target,
+                                start_handoff,
+                                end_handoff,
+                                start_two_sided,
+                                end_two_sided,
+                            ) = boundary_plan
                         acoustic_range_is_safe = bool(
                             acoustic.verified
                             and corridor_error is None
+                            and boundary_plan is not None
                             and _acoustic_range_is_safe(
                                 start_sec=float(acoustic.start_sec),
                                 end_sec=float(acoustic.end_sec),
-                                required_start_sec=first_start,
-                                required_end_sec=last_end,
+                                required_start_sec=start_target,
+                                required_end_sec=end_target,
                                 semantic_start_limit_sec=semantic_start,
                                 semantic_end_limit_sec=semantic_end,
                                 source_end_sec=media_end,
                                 diagnostics=acoustic_diagnostics,
-                                require_start_handoff=(
-                                    "start" in projection_diagnostics
-                                ),
-                                require_end_handoff=(
-                                    "end" in projection_diagnostics
-                                ),
+                                require_start_handoff=start_handoff,
+                                require_end_handoff=end_handoff,
+                                require_start_two_sided=start_two_sided,
+                                require_end_two_sided=end_two_sided,
                             )
                         )
                         boundary_diagnostics = {
@@ -3032,15 +3092,6 @@ class IngestionPipeline:
             )
             for index, clip in enumerate(raw_clips)
         ]
-        exact_topic, exact_lexical_support, exact_topic_semantic_scores = (
-            _exact_topic_corroboration_scores(
-                topic,
-                grounded_selector_quotes,
-                embedding_service=(
-                    self._embedding_service if trusted_transcript else None
-                ),
-            )
-        )
         semantic_scores: list[float | None] = [None] * len(raw_clips)
         if (
             topic_terms
@@ -3101,27 +3152,6 @@ class IngestionPipeline:
                 ):
                     if generation_context is not None:
                         generation_context.increment_counter("topic_rejections")
-                    continue
-                semantic_floor = (
-                    EXACT_TOPIC_LITERAL_SOURCE_SEMANTIC_MIN
-                    if v.get("literal_match") is True
-                    else EXACT_TOPIC_SEMANTIC_MIN
-                )
-                semantic_score = exact_topic_semantic_scores[index]
-                if (
-                    exact_topic
-                    and not exact_lexical_support[index]
-                    and (
-                        semantic_score is None
-                        or semantic_score < semantic_floor
-                    )
-                ):
-                    if generation_context is not None:
-                        generation_context.increment_counter("topic_rejections")
-                        generation_context.record_segment_event({
-                            "event": "segment_completed",
-                            "rejection_reasons": [EXACT_TOPIC_REJECTION_REASON],
-                        })
                     continue
                 evidence = [grounded_evidence_quote]
             else:
@@ -3210,7 +3240,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v6",
+                    selection_contract_version="quality_silence_v7",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

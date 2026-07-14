@@ -150,8 +150,52 @@ def test_plan_runs_one_structured_expansion_and_caches_by_normalized_literal(mon
     assert any("exactly one normalized token" in reason for reason in first.rejection_reasons)
     assert any("low-value intent" in reason for reason in first.rejection_reasons)
     assert conn.execute(
-        "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'search_query_plan:v3:%'"
+        "SELECT COUNT(*) FROM llm_cache WHERE cache_key LIKE 'search_query_plan:v4:%'"
     ).fetchone()[0] == 1
+    conn.close()
+
+
+def test_valid_ai_retrieval_expansion_survives_without_local_semantic_model(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    ai_calls = 0
+
+    def fake_ai(**_kwargs):
+        nonlocal ai_calls
+        ai_calls += 1
+        return _ai_json(
+            canonical_query="Photosynthesis",
+            aliases=["plant carbon assimilation"],
+            subtopics=["Calvin cycle"],
+            related_terms=["photophosphorylation", "college admissions"],
+            one_word_topic="autotrophy",
+            one_word_synonyms=["photoautotrophy", "plant nutrition"],
+        )
+
+    monkeypatch.setattr(query_plan_module.llm_router, "chat_completion", fake_ai)
+    monkeypatch.setattr(
+        query_plan_module,
+        "_semantic_relevance_scores",
+        lambda _anchors, _candidates: None,
+    )
+
+    plan = build_search_query_plan(conn, literal_query="photosynthesis")
+
+    assert ai_calls == 1
+    assert plan.ai_status == "validated"
+    assert plan.accepted_aliases == ["plant carbon assimilation"]
+    assert plan.accepted_subtopics == ["Calvin cycle"]
+    assert plan.accepted_related_terms == ["photophosphorylation"]
+    assert plan.one_word_topic == "autotrophy"
+    assert plan.one_word_synonyms == ["photoautotrophy"]
+    assert [query.text for query in plan.queries] == [
+        "photosynthesis",
+        "autotrophy",
+        "photoautotrophy",
+    ]
+    assert any("low-value intent" in reason for reason in plan.rejection_reasons)
+    assert any("exactly one normalized token" in reason for reason in plan.rejection_reasons)
     conn.close()
 
 
@@ -173,7 +217,7 @@ def test_stale_last_good_plan_survives_transient_model_unavailability(monkeypatc
     good = build_search_query_plan(conn, literal_query="Calculus Basics")
     conn.execute(
         "UPDATE llm_cache SET created_at = '2020-01-01T00:00:00+00:00' "
-        "WHERE cache_key LIKE 'search_query_plan:v3:%'"
+        "WHERE cache_key LIKE 'search_query_plan:v4:%'"
     )
     monkeypatch.setattr(
         query_plan_module.llm_router,
@@ -206,7 +250,7 @@ def test_stale_last_good_plan_survives_invalid_structured_expansion(monkeypatch)
     good = build_search_query_plan(conn, literal_query="Calculus Basics")
     conn.execute(
         "UPDATE llm_cache SET created_at = '2020-01-01T00:00:00+00:00' "
-        "WHERE cache_key LIKE 'search_query_plan:v3:%'"
+        "WHERE cache_key LIKE 'search_query_plan:v4:%'"
     )
     monkeypatch.setattr(
         query_plan_module.llm_router,
@@ -839,12 +883,11 @@ def test_semantic_model_inference_is_serialized_across_source_workers() -> None:
     assert model.max_active == 1
 
 
-def test_failed_semantic_model_load_reports_hash_backend_without_semantic_proof(monkeypatch) -> None:
-    monkeypatch.setattr(embeddings_module, "_get_semantic_model", lambda: None)
+def test_default_embedding_backend_is_lightweight_without_semantic_proof() -> None:
     embedding = embeddings_module.EmbeddingService()
 
     assert embedding.semantic_available is False
-    assert embedding.backend_name == "hash-lexical-fallback"
+    assert embedding.backend_name == "hash-lexical-v1"
 
 
 def test_strict_topic_never_backfills_off_topic_local_cache_candidate() -> None:

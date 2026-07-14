@@ -36,6 +36,32 @@ from backend.app.clip_engine.errors import CancellationError  # noqa: E402
 # --------------------------------------------------------------------- #
 
 
+def _verified_acoustic_result(_url: str, start: float, end: float, **kwargs):
+    tolerance = (
+        pipeline_module.clip_engine_silence.HANDOFF_TIMESTAMP_TOLERANCE_SEC
+    )
+    return pipeline_module.clip_engine_silence.SilenceVerificationResult(
+        "verified",
+        start,
+        end,
+        {
+            "threshold_dbfs": -38.0,
+            "semantic_start_limit_sec": kwargs["search_start_limit_sec"],
+            "semantic_end_limit_sec": kwargs["search_end_limit_sec"],
+            "start_speech_handoff_verified": kwargs[
+                "require_start_speech_handoff"
+            ],
+            "end_speech_handoff_verified": kwargs[
+                "require_end_speech_handoff"
+            ],
+            "start_two_sided_required": kwargs["require_start_two_sided"],
+            "end_two_sided_required": kwargs["require_end_two_sided"],
+            "start_quiet": [start - tolerance, start + tolerance],
+            "end_quiet": [end - tolerance, end + tolerance],
+        },
+    )
+
+
 def _fake_engine_out(video_id: str = "dQw4w9WgXcQ") -> dict:
     return {
         "video_id": video_id,
@@ -115,11 +141,7 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
         self._verify_patch = mock.patch.object(
             pipeline_module.clip_engine_silence,
             "verify_acoustic_boundaries",
-            side_effect=lambda _url, start, end, **_kwargs: (
-                pipeline_module.clip_engine_silence.SilenceVerificationResult(
-                    "verified", start, end, {"threshold_dbfs": -38.0}
-                )
-            ),
+            side_effect=_verified_acoustic_result,
         )
         self._prepare_patch.start()
         self._verify_patch.start()
@@ -299,6 +321,7 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
             "transcript": {
                 "segments": [
                     {"cue_id": "cue-0", "start": 0.0, "end": 20.0, "text": "The first concept explains a complete useful idea."},
+                    {"cue_id": "transition", "start": 20.0, "end": 30.0, "text": "Moving to the next concept."},
                     {"cue_id": "cue-1", "start": 30.0, "end": 74.0, "text": "The second concept also explains a complete useful idea."},
                 ],
                 "words": [],

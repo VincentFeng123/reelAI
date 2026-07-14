@@ -716,8 +716,12 @@ class EmbedUrlCeilTests(IngestTopicTests):
             diagnostics={
                 "threshold_dbfs": -38.0,
                 "speech_handoff_verified": True,
-                "semantic_start_limit_sec": 12.345,
-                "semantic_end_limit_sec": 432.789,
+                "start_speech_handoff_verified": True,
+                "end_speech_handoff_verified": True,
+                "start_two_sided_required": False,
+                "end_two_sided_required": False,
+                "semantic_start_limit_sec": 0.0,
+                "semantic_end_limit_sec": 600.0,
                 "observation_start_limit_sec": 11.345,
                 "observation_end_limit_sec": 433.789,
                 "handoff_timestamp_tolerance_sec": 0.05,
@@ -766,7 +770,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
             )
 
         self.assertEqual(len(reels), 1)
-        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v6")
+        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v7")
         self.assertEqual(reels[0].t_start, 12.001)
         self.assertEqual(reels[0].t_end, 433.012)
         self.assertGreater(reels[0].t_end - reels[0].t_start, 180.0)
@@ -826,7 +830,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
 
         self.assertEqual(len(beginner_feed), 1)
         self.assertEqual(
-            beginner_feed[0]["selection_contract_version"], "quality_silence_v6"
+            beginner_feed[0]["selection_contract_version"], "quality_silence_v7"
         )
         self.assertIsInstance(beginner_feed[0]["t_start"], float)
         self.assertIsInstance(beginner_feed[0]["t_end"], float)

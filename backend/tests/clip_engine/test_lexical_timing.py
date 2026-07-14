@@ -30,7 +30,7 @@ def test_selects_only_original_expected_language_json3_and_hides_url() -> None:
             "fr-orig": [{"ext": "json3", "url": "https://captions.example/fr"}],
             "en-orig": [
                 {"ext": "vtt", "url": "https://captions.example/original.vtt"},
-                {"ext": "json3", "url": secret},
+                {"ext": "json3", "url": secret, "impersonate": True},
             ],
         },
         "subtitles": {"en": [{"ext": "json3", "url": "https://manual.example"}]},
@@ -41,7 +41,49 @@ def test_selects_only_original_expected_language_json3_and_hides_url() -> None:
     assert track is not None
     assert track.language == "en"
     assert track.url == secret
+    assert track.impersonate is True
     assert secret not in repr(track)
+
+
+def test_original_key_precedes_validated_exact_language_asr_alias() -> None:
+    original = "https://captions.example/timed?lang=en&kind=asr&source=orig"
+    alias = "https://captions.example/timed?lang=en&kind=asr&source=alias"
+    info = {
+        "automatic_captions": {
+            "en": [{"ext": "json3", "url": alias}],
+            "en-orig": [{"ext": "json3", "url": original}],
+        }
+    }
+
+    track = select_original_json3_track(info, expected_language="en-US")
+
+    assert track is not None
+    assert track.url == original
+
+
+def test_validated_exact_language_asr_alias_is_safe_fallback() -> None:
+    alias = "https://captions.example/timed?lang=en&kind=asr"
+
+    track = select_original_json3_track(
+        {"automatic_captions": {"en": [{"ext": "json3", "url": alias}]}},
+        expected_language="en-US",
+    )
+
+    assert track == Json3CaptionTrack("en", alias)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://captions.example/timed?lang=en",
+        "https://captions.example/timed?lang=fr&kind=asr",
+        "https://captions.example/timed?lang=en&kind=asr&tlang=en",
+    ],
+)
+def test_unproven_asr_aliases_fail_closed(url: str) -> None:
+    info = {"automatic_captions": {"en": [{"ext": "json3", "url": url}]}}
+
+    assert select_original_json3_track(info, expected_language="en") is None
 
 
 @pytest.mark.parametrize(
@@ -154,6 +196,120 @@ def test_fetches_one_url_with_supplied_transport_bounds(monkeypatch) -> None:
     assert 0 < captured["client"]["timeout"].read <= 0.5
 
 
+def test_impersonated_track_uses_curl_transport_with_same_bounds(monkeypatch) -> None:
+    captured: dict = {}
+    payload = {
+        "events": [
+            {
+                "tStartMs": 500,
+                "segs": [
+                    {"utf8": "exact", "tOffsetMs": 0},
+                    {"utf8": "timing", "tOffsetMs": 100},
+                ],
+            }
+        ]
+    }
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            captured["session"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url, **kwargs):
+            captured["url"] = url
+            captured["request"] = kwargs
+            return type(
+                "Response",
+                (),
+                {"status_code": 200, "content": json.dumps(payload).encode("utf-8")},
+            )()
+
+    monkeypatch.setattr(lexical_timing.curl_requests, "AsyncSession", FakeSession)
+    track = Json3CaptionTrack(
+        "en",
+        "https://captions.example/json3?signature=secret",
+        impersonate=True,
+    )
+
+    words = fetch_json3_words(
+        track,
+        headers={
+            "User-Agent": "StudyReels",
+            "Sec-CH-UA": '"StudyReels";v="1"',
+            "Accept-Encoding": "gzip",
+            "X-Study-Reels": "caption-timing",
+        },
+        proxy_url="http://proxy.example:8080",
+        deadline=time.monotonic() + 0.5,
+    )
+
+    assert words == (_word("exact", 0.5), _word("timing", 0.6))
+    assert captured["session"] == {
+        "impersonate": "chrome",
+        "max_clients": 1,
+        "trust_env": False,
+        "curl_options": {},
+    }
+    assert captured["request"]["headers"] == {
+        "X-Study-Reels": "caption-timing"
+    }
+    assert captured["request"]["proxy"] == "http://proxy.example:8080"
+    assert captured["request"]["allow_redirects"] is False
+    assert 0 < captured["request"]["timeout"] <= 0.5
+
+
+def test_direct_impersonated_fetch_explicitly_disables_environment_proxy(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+    payload = {
+        "events": [
+            {
+                "tStartMs": 500,
+                "segs": [
+                    {"utf8": "exact", "tOffsetMs": 0},
+                    {"utf8": "timing", "tOffsetMs": 100},
+                ],
+            }
+        ]
+    }
+
+    class FakeSession:
+        def __init__(self, **kwargs):
+            captured["session"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, **_kwargs):
+            return type(
+                "Response",
+                (),
+                {"status_code": 200, "content": json.dumps(payload).encode("utf-8")},
+            )()
+
+    monkeypatch.setattr(lexical_timing.curl_requests, "AsyncSession", FakeSession)
+
+    words = fetch_json3_words(
+        Json3CaptionTrack("en", "https://captions.example/json3", impersonate=True),
+        deadline=time.monotonic() + 0.5,
+    )
+
+    assert words == (_word("exact", 0.5), _word("timing", 0.6))
+    assert captured["session"]["trust_env"] is False
+    assert captured["session"]["curl_options"] == {
+        lexical_timing.CurlOpt.PROXY: ""
+    }
+
+
 def test_expired_deadline_makes_no_request_and_cancel_propagates(monkeypatch) -> None:
     calls = 0
 
@@ -212,6 +368,30 @@ def test_fetch_failure_does_not_expose_signed_url(monkeypatch) -> None:
 
     monkeypatch.setattr(lexical_timing.httpx, "AsyncClient", FakeClient)
     track = Json3CaptionTrack("en", secret)
+
+    assert fetch_json3_words(track, deadline=time.monotonic() + 1) == ()
+    assert secret not in repr(track)
+
+
+def test_impersonated_fetch_failure_remains_closed_and_hides_url(monkeypatch) -> None:
+    secret = "https://captions.example/json3?signature=do-not-log"
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, _url, **_kwargs):
+            raise lexical_timing.curl_requests.errors.RequestsError("request failed")
+
+    monkeypatch.setattr(
+        lexical_timing.curl_requests,
+        "AsyncSession",
+        lambda **_kwargs: FakeSession(),
+    )
+    track = Json3CaptionTrack("en", secret, impersonate=True)
 
     assert fetch_json3_words(track, deadline=time.monotonic() + 1) == ()
     assert secret not in repr(track)

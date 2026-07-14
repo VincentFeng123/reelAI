@@ -18,6 +18,8 @@ from typing import Any, Callable, Literal, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+from curl_cffi.const import CurlOpt
+from curl_cffi import requests as curl_requests
 
 from .cancellation import run_cancellable
 
@@ -42,6 +44,7 @@ class Json3CaptionTrack:
 
     language: str
     url: str = field(repr=False)
+    impersonate: bool = False
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,21 @@ def _is_untranslated_url(url: str) -> bool:
     return "tlang" not in parse_qs(parsed.query, keep_blank_values=True)
 
 
+def _is_original_asr_alias(url: str, *, expected_language: str) -> bool:
+    """Accept yt-dlp's duplicate exact-language ASR key, never a translation."""
+    try:
+        query = parse_qs(urlparse(url).query, keep_blank_values=True)
+    except (TypeError, ValueError):
+        return False
+    languages = [_normalize_language(value) for value in query.get("lang", [])]
+    kinds = {str(value or "").strip().casefold() for value in query.get("kind", [])}
+    return bool(
+        "tlang" not in query
+        and "asr" in kinds
+        and any(_language_matches(language, expected_language) for language in languages)
+    )
+
+
 def select_original_json3_track(
     info: Mapping[str, Any],
     *,
@@ -95,9 +113,9 @@ def select_original_json3_track(
 ) -> Json3CaptionTrack | None:
     """Select one original, automatic JSON3 track from yt-dlp metadata.
 
-    Current yt-dlp marks the authoritative ASR language with a ``-orig`` key;
-    translated compatibility entries are deliberately never guessed from.
-    The first usable JSON3 format preserves yt-dlp's deterministic client order.
+    Prefer yt-dlp's authoritative ``-orig`` ASR key. Its duplicate language
+    alias is used only when the signed URL independently proves the same
+    untranslated ASR language. Client and format order remain deterministic.
     """
 
     expected = _normalize_language(expected_language)
@@ -105,21 +123,41 @@ def select_original_json3_track(
     if not expected or not isinstance(automatic, Mapping):
         return None
 
-    for raw_language, raw_formats in automatic.items():
-        keyed_language = _normalize_language(raw_language)
-        if not keyed_language.endswith("-orig"):
-            continue
-        language = keyed_language[: -len("-orig")]
-        if not _language_matches(language, expected) or not isinstance(raw_formats, list):
-            continue
-        for raw_format in raw_formats:
-            if not isinstance(raw_format, Mapping):
+    for aliases_allowed in (False, True):
+        for raw_language, raw_formats in automatic.items():
+            keyed_language = _normalize_language(raw_language)
+            is_original_key = keyed_language.endswith("-orig")
+            language = (
+                keyed_language[: -len("-orig")]
+                if is_original_key
+                else keyed_language
+            )
+            if aliases_allowed and is_original_key:
                 continue
-            if str(raw_format.get("ext") or "").strip().casefold() != "json3":
+            if not aliases_allowed and not is_original_key:
                 continue
-            url = str(raw_format.get("url") or "").strip()
-            if _is_untranslated_url(url):
-                return Json3CaptionTrack(language=language, url=url)
+            if (
+                not _language_matches(language, expected)
+                or not isinstance(raw_formats, list)
+            ):
+                continue
+            for raw_format in raw_formats:
+                if not isinstance(raw_format, Mapping):
+                    continue
+                if str(raw_format.get("ext") or "").strip().casefold() != "json3":
+                    continue
+                url = str(raw_format.get("url") or "").strip()
+                if not _is_untranslated_url(url):
+                    continue
+                if aliases_allowed and not _is_original_asr_alias(
+                    url, expected_language=expected
+                ):
+                    continue
+                return Json3CaptionTrack(
+                    language=language,
+                    url=url,
+                    impersonate=raw_format.get("impersonate") is True,
+                )
     return None
 
 
@@ -201,19 +239,54 @@ async def _fetch_payload(
     proxy_url: str,
     timeout_sec: float,
 ) -> object | None:
-    timeout = httpx.Timeout(timeout_sec)
     try:
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            proxy=proxy_url or None,
-            follow_redirects=False,
-            trust_env=False,
-        ) as client:
-            response = await asyncio.wait_for(
-                client.get(track.url, headers=dict(headers)),
-                timeout=timeout_sec,
-            )
-    except (asyncio.TimeoutError, httpx.HTTPError, OSError, ValueError):
+        if track.impersonate:
+            request_headers = {
+                str(key): str(value)
+                for key, value in headers.items()
+                if str(key).strip().casefold()
+                not in {"user-agent", "accept-encoding"}
+                and not str(key).strip().casefold().startswith("sec-ch-ua")
+            }
+            async with curl_requests.AsyncSession(
+                impersonate="chrome",
+                max_clients=1,
+                trust_env=False,
+                curl_options=(
+                    {}
+                    if proxy_url
+                    else {CurlOpt.PROXY: ""}
+                ),
+            ) as client:
+                response = await asyncio.wait_for(
+                    client.get(
+                        track.url,
+                        headers=request_headers,
+                        proxy=proxy_url or None,
+                        timeout=timeout_sec,
+                        allow_redirects=False,
+                    ),
+                    timeout=timeout_sec,
+                )
+        else:
+            timeout = httpx.Timeout(timeout_sec)
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                proxy=proxy_url or None,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                response = await asyncio.wait_for(
+                    client.get(track.url, headers=dict(headers)),
+                    timeout=timeout_sec,
+                )
+    except (
+        asyncio.TimeoutError,
+        curl_requests.errors.RequestsError,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+    ):
         return None
     if response.status_code != 200 or len(response.content) > MAX_JSON3_BYTES:
         return None

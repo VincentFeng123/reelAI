@@ -158,7 +158,7 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
         conn.close()
 
 
-def test_request_key_version_invalidates_v5_inventory(monkeypatch) -> None:
+def test_request_key_version_invalidates_v6_inventory(monkeypatch) -> None:
     params = {
         "material_id": "material-1",
         "concept_id": "concept-1",
@@ -171,9 +171,9 @@ def test_request_key_version_invalidates_v5_inventory(monkeypatch) -> None:
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v6"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v7"
     verified_key = jobs.build_request_key(**params)
-    monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", "quality_silence_v5")
+    monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", "quality_silence_v6")
 
     assert jobs.build_request_key(**params) != verified_key
 

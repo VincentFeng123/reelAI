@@ -208,14 +208,45 @@ def test_job_cost_budget_fits_expansion_and_realistic_long_transcript_selectors(
 
     budget = context.budget.snapshot()["gemini"]
     expected_reserved_cost = (
-        1_000 * 1.5
-        + 1_024 * 9.0
+        1_000 * 0.25
+        + 1_024 * 1.5
         + selector_count * (40_000 * 1.5 + 12_288 * 9.0)
     ) / 1_000_000.0
     assert budget["flash_selector_calls"] == selector_count
     assert budget["reserved_cost_usd"] == pytest.approx(expected_reserved_cost)
     assert budget["reserved_cost_usd"] <= cost_limit
     assert budget["cost_limit_usd"] == pytest.approx(cost_limit)
+
+
+def test_flash_lite_expansion_uses_its_lower_reservation_and_usage_rates() -> None:
+    context = GenerationContext("fast", generation_id="job-lite-pricing")
+    reservation = context.reserve_gemini_call(
+        operation="expansion",
+        model="gemini-3.1-flash-lite",
+        estimated_input_tokens=1_000,
+        max_output_tokens=100,
+    )
+    context.record_gemini(
+        attempt=1,
+        model_used="gemini-3.1-flash-lite",
+        quality_degraded=False,
+        stage="expansion",
+        usage={
+            "prompt_tokens": 1_000,
+            "candidate_tokens": 100,
+            "cached_content_token_count": 400,
+            "total_tokens": 1_100,
+        },
+    )
+
+    reserved = (1_000 * 0.25 + 100 * 1.5) / 1_000_000.0
+    actual = (600 * 0.25 + 400 * 0.025 + 100 * 1.5) / 1_000_000.0
+    assert reservation["reserved_cost_usd"] == pytest.approx(reserved)
+    assert context.usage_payload()["summary"]["estimated_cost_usd"] == pytest.approx(
+        actual
+    )
+    assert context.usage_payload()["summary"]["cached_tokens"] == 400
+    assert context.usage_payload()["by_stage"]["expansion"]["cached_tokens"] == 400
 
 
 @pytest.mark.parametrize("mode", ["fast", "slow"])
