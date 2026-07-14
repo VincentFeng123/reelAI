@@ -490,17 +490,21 @@ def _prepare_audio_source(
             }
             lexical_words: tuple[lexical_timing.LexicalWord, ...] = ()
             lexical_language = ""
-            track = lexical_timing.select_original_json3_track(
+            tracks = lexical_timing.select_original_json3_tracks(
                 info,
                 expected_language=language,
             )
-            if track is not None:
+            lexical_deadline = min(
+                deadline,
+                time.monotonic() + lexical_timing.MAX_FETCH_TIMEOUT_SEC,
+            )
+            for track in tracks:
                 try:
                     lexical_words = lexical_timing.fetch_json3_words(
                         track,
                         headers=headers,
                         proxy_url=proxy,
-                        deadline=deadline,
+                        deadline=lexical_deadline,
                         cancel_check=cancel_check,
                     )
                 except Exception:
@@ -509,6 +513,7 @@ def _prepare_audio_source(
                     lexical_words = ()
                 if lexical_words:
                     lexical_language = track.language
+                    break
             return PreparedAudioSource(
                 url=media_url,
                 headers=headers,

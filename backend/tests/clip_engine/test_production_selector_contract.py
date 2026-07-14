@@ -101,6 +101,147 @@ def test_duration_settings_do_not_change_a_complete_clip() -> None:
     ]
 
 
+def test_exact_boundary_quote_uniquely_inside_proposed_range_is_reanchored() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Welcome to the channel.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 12.0,
+            "text": "Cells use chlorophyll to capture light energy.",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 12.0,
+            "end": 20.0,
+            "text": "That energy powers the chemical reactions of photosynthesis.",
+        },
+    ]
+    proposal = _proposal(end_line=2).model_copy(update={
+        "start_line": 0,
+        "start_quote": "Cells use chlorophyll to capture light energy",
+        "end_quote": "chemical reactions of photosynthesis",
+        "topic_evidence_quote": (
+            "Cells use chlorophyll to capture light energy"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["cue-1", "cue-2"]
+    assert clip["_quote_repaired"] is True
+
+
+def test_boundary_quote_reanchoring_never_discards_substantive_context() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Water first reaches the leaf through the xylem.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 12.0,
+            "text": "Cells use chlorophyll to capture light energy.",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 12.0,
+            "end": 20.0,
+            "text": "That energy powers the chemical reactions of photosynthesis.",
+        },
+    ]
+    proposal = _proposal(end_line=2).model_copy(update={
+        "start_quote": "Cells use chlorophyll to capture light energy",
+        "end_quote": "chemical reactions of photosynthesis",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+
+
+@pytest.mark.parametrize(
+    "start_quote",
+    [
+        "chlorophyll captures sunlight",  # Paraphrase, not exact transcript text.
+        "Cells use chlorophyll",  # Appears in two cues, so the anchor is ambiguous.
+        "Outside exact anchor words",  # Exact, but outside the proposed cue range.
+    ],
+)
+def test_boundary_quote_reanchoring_remains_exact_unique_and_in_range(
+    start_quote: str,
+) -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "A separate completed idea appears here.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 12.0,
+            "text": "Cells use chlorophyll to capture light energy.",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 12.0,
+            "end": 20.0,
+            "text": (
+                "Cells use chlorophyll while chemical reactions of photosynthesis finish."
+            ),
+        },
+        {
+            "cue_id": "cue-3",
+            "start": 20.0,
+            "end": 24.0,
+            "text": "Outside exact anchor words.",
+        },
+    ]
+    proposal = _proposal(end_line=2).model_copy(update={
+        "start_quote": start_quote,
+        "end_quote": "chemical reactions of photosynthesis finish",
+        "topic_evidence_quote": (
+            "Cells use chlorophyll while chemical reactions of photosynthesis"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+
+
 def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None:
     _system, user = gemini_segment._boundary_prompts(
         "[0] 00:00 Cells use chlorophyll to capture light energy.",
@@ -321,6 +462,149 @@ def test_carolingian_visual_dependent_span_is_rejected() -> None:
 
     assert report.clips == []
     assert "proposal_0:requires_visual_context" in report.rejected_reasons
+
+
+def test_generic_look_at_phrase_is_trimmed_from_the_opening() -> None:
+    text = (
+        "Look at the light-dependent reactions. Chlorophyll captures photons, "
+        "and the resulting electron flow helps cells make ATP."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Look at the light-dependent reactions",
+        "end_quote": "helps cells make ATP",
+        "topic_evidence_quote": (
+            "Chlorophyll captures photons and the resulting electron flow"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_quote"].startswith("Chlorophyll captures photons")
+    assert clip["_clip_text"].startswith("Chlorophyll captures photons")
+    assert "Look at" not in clip["_clip_text"]
+
+
+def test_no_article_look_at_phrase_is_trimmed_from_the_opening() -> None:
+    text = (
+        "Look at photosynthesis. Chlorophyll captures photons, and the resulting "
+        "electron flow helps cells make ATP."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Look at photosynthesis",
+        "end_quote": "helps cells make ATP",
+        "topic_evidence_quote": (
+            "Chlorophyll captures photons and the resulting electron flow"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["_clip_text"].startswith("Chlorophyll captures photons")
+    assert "Look at" not in clip["_clip_text"]
+
+
+def test_bare_look_at_this_remains_visual_dependent() -> None:
+    text = (
+        "Look at this. Chlorophyll captures photons, and the resulting electron "
+        "flow helps cells make ATP."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Look at this",
+        "end_quote": "helps cells make ATP",
+        "topic_evidence_quote": (
+            "Chlorophyll captures photons and the resulting electron flow"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "Look at how chlorophyll captures photons by exciting electrons.",
+        "Look at photosynthesis because it captures light and stores energy.",
+    ],
+)
+def test_substantive_look_at_clause_is_not_classified_as_filler(
+    opening: str,
+) -> None:
+    assert gemini_segment._structural_filler_matches(opening) == []
+
+
+def test_look_at_visual_noun_remains_visual_dependent() -> None:
+    text = (
+        "Look at the diagram. Chlorophyll captures photons, and the arrows show "
+        "how electron flow helps cells make ATP."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Look at the diagram",
+        "end_quote": "helps cells make ATP",
+        "topic_evidence_quote": (
+            "Chlorophyll captures photons and the arrows show how electron flow"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
+
+
+def test_articleless_look_at_visual_noun_remains_visual_dependent() -> None:
+    text = (
+        "Look at diagram. Chlorophyll captures photons, and the arrows show how "
+        "electron flow helps cells make ATP."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Look at diagram",
+        "end_quote": "helps cells make ATP",
+        "topic_evidence_quote": (
+            "Chlorophyll captures photons and the arrows show how electron flow"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
 
 
 def test_short_topic_sentence_with_anaphoric_explanation_remains_a_valid_start() -> None:

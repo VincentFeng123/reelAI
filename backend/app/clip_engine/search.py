@@ -480,7 +480,7 @@ def discover_practice_fast(
     retrieval_profile: str = "deep",
     deadline_monotonic: float | None = None,
 ) -> dict:
-    """Difficulty-first bootstrap or sparse-only AI-expanded production search.
+    """Difficulty-first bootstrap or AI-expanded production search.
 
     The signature intentionally matches ``discover`` so live wiring can switch paths
     without dropping cancellation, budgets, provider caching, filters, or exclusions.
@@ -524,16 +524,25 @@ def discover_practice_fast(
         "provider_used": "literal_fallback",
     }
     if bootstrap:
-        deterministic_queries = (_difficulty_bootstrap_query(literal_query, level),)
+        planned_queries = [_difficulty_bootstrap_query(literal_query, level)]
     else:
-        # Always measure the exact request first. Gemini is a sparse-result
-        # recovery path, never a prerequisite for ordinary retrieval.
-        deterministic_queries = (literal_query,)
-    for candidate in deterministic_queries:
-        key = " ".join(candidate.casefold().split())
-        if key and key not in seen_query_keys:
-            seen_query_keys.add(key)
-            initial_queries.append(candidate)
+        expansion = expand.expand_query_practice_fast(
+            literal_query,
+            # Both modes share one cached plan. Their bounded search budgets
+            # decide whether one or two AI queries are used.
+            expansion_count,
+            level=None,
+            should_cancel=should_cancel,
+            context=context,
+        )
+        planned_queries = list(expansion.get("queries") or []) or [literal_query]
+    for candidate in planned_queries:
+        query = " ".join(str(candidate or "").split())
+        key = " ".join(query.casefold().split())
+        if not key or key in seen_query_keys:
+            continue
+        seen_query_keys.add(key)
+        initial_queries.append(query)
         if len(initial_queries) >= query_count:
             break
 
@@ -589,57 +598,6 @@ def discover_practice_fast(
         video for video in initial_ranked if video.get("id") not in excluded
     ]
 
-    follow_up = {"per_query": [], "credits_used": 0, "warning": None}
-    if not bootstrap:
-        mode_source_budget = (
-            context.budget.remaining("segmentation")
-            if context is not None
-            else 3
-        )
-        source_budget = min(max(0, int(limit)), max(0, int(mode_source_budget)))
-        follow_up_limit = max(0, query_count - 1)
-        if context is not None:
-            follow_up_limit = min(
-                follow_up_limit,
-                context.budget.remaining("search"),
-            )
-        if len(eligible_initial) < source_budget and follow_up_limit > 0:
-            expansion = expand.expand_query_practice_fast(
-                literal_query,
-                # Request the same cached expansion for both modes; only the
-                # bounded number of follow-up queries differs by search budget.
-                expansion_count,
-                # Difficulty is assigned after selection, so every learner
-                # level shares one expansion cache entry.
-                level=None,
-                should_cancel=should_cancel,
-                context=context,
-            )
-            for candidate in expansion.get("queries") or []:
-                query = " ".join(str(candidate or "").split())
-                key = " ".join(query.casefold().split())
-                if not key or key in seen_query_keys:
-                    continue
-                seen_query_keys.add(key)
-                initial_queries.append(query)
-                if len(initial_queries) >= 1 + follow_up_limit:
-                    break
-            expanded_queries = initial_queries[1:]
-            if expanded_queries:
-                follow_up = supadata_search.search_all(
-                    expanded_queries,
-                    filters,
-                    parallel_prefix=len(expanded_queries),
-                    **search_runtime,
-                )
-                raise_if_cancelled(should_cancel)
-                annotate(
-                    follow_up["per_query"],
-                    expanded=(
-                        str(expansion.get("provider_used") or "") == "gemini"
-                    ),
-                )
-                per_query.extend(follow_up["per_query"])
     niche_result = {"per_query": [], "credits_used": 0, "warning": None}
     niche_provider_order: list[str] = []
     niche_backoff = task_backoff_query if bootstrap else None
@@ -755,11 +713,7 @@ def discover_practice_fast(
     # Deep retrieval gathers topic-relevant sources before clip difficulty is
     # assigned and ordered. Applying the learner level here can discard useful
     # sources before their teaching units are ever analyzed.
-    ranked = (
-        rank.merge_and_rank(per_query, level=None)
-        if follow_up["per_query"]
-        else initial_ranked
-    )
+    ranked = initial_ranked
     top_n = max(0, int(limit))
     videos = _select_ranked_candidates(
         ranked,
@@ -782,8 +736,7 @@ def discover_practice_fast(
         "videos": videos,
         "credits_used": (
             int(initial.get("credits_used") or 0)
-            + int(follow_up.get("credits_used") or 0)
         ),
-        "warning": follow_up.get("warning") or initial.get("warning"),
+        "warning": initial.get("warning"),
         "query_plan": query_plan,
     }

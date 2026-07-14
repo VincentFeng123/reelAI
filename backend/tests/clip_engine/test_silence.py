@@ -1266,6 +1266,87 @@ def test_prepare_fetches_json3_words_once_from_the_existing_ytdlp_metadata(
     assert "captions.example" not in repr(result.source)
 
 
+def test_prepare_falls_back_between_tracks_with_one_shared_lexical_deadline(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
+    )
+    payload = (
+        b'{"url":"https://media.example/audio.m4a","format_id":"140",'
+        b'"acodec":"aac","vcodec":"none","tbr":49.0,'
+        b'"automatic_captions":{"en-orig":[{"ext":"json3",'
+        b'"url":"https://captions.example/automatic?lang=en&kind=asr"}]},'
+        b'"subtitles":{"en":[{"ext":"json3",'
+        b'"url":"https://captions.example/manual?lang=en"}]}}'
+    )
+    words = (
+        silence.lexical_timing.LexicalWord("biology", 36.48),
+        silence.lexical_timing.LexicalWord("is", 37.48),
+    )
+    deadline_observations: list[tuple[float, float]] = []
+
+    def fake_fetch(track, **kwargs):
+        deadline_observations.append(
+            (float(kwargs["deadline"]), time.monotonic())
+        )
+        return () if "automatic" in track.url else words
+
+    with mock.patch.object(
+        silence, "_run_command", return_value=(payload, b"")
+    ), mock.patch.object(
+        silence.lexical_timing, "fetch_json3_words", side_effect=fake_fetch
+    ) as fetch:
+        result = silence.prepare_audio_source("dQw4w9WgXcQ", language="en-US")
+
+    assert result.ready and result.source is not None
+    assert fetch.call_count == 2
+    assert deadline_observations[0][0] == deadline_observations[1][0]
+    assert all(
+        0 < deadline - observed_at <= 2.0
+        for deadline, observed_at in deadline_observations
+    )
+    assert result.source.lexical_words == words
+    assert result.source.lexical_language == "en"
+    assert "captions.example" not in repr(result.source)
+    assert "captions.example" not in repr(result)
+
+
+def test_prepare_attempts_at_most_two_tracks_and_keeps_missing_words_closed(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
+    )
+    payload = (
+        b'{"url":"https://media.example/audio.m4a","format_id":"140",'
+        b'"acodec":"aac","vcodec":"none","tbr":49.0,'
+        b'"automatic_captions":{"en-orig":[{"ext":"json3",'
+        b'"url":"https://captions.example/one?lang=en&kind=asr"}],'
+        b'"en":[{"ext":"json3",'
+        b'"url":"https://captions.example/two?lang=en&kind=asr"}]},'
+        b'"subtitles":{"en":[{"ext":"json3",'
+        b'"url":"https://captions.example/three?lang=en"}]}}'
+    )
+    fetch = mock.Mock(return_value=())
+    with mock.patch.object(
+        silence, "_run_command", return_value=(payload, b"")
+    ), mock.patch.object(
+        silence.lexical_timing, "fetch_json3_words", fetch
+    ):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ", language="en-US")
+
+    assert result.ready and result.source is not None
+    assert fetch.call_count == 2
+    assert result.source.lexical_words == ()
+    assert result.source.lexical_language == ""
+    assert result.diagnostics["lexical_word_count"] == 0
+
+
 @pytest.mark.parametrize("first_reason", ["proxy_failed", "youtube_bot_challenge"])
 def test_prepare_rotates_to_the_next_configured_proxy(monkeypatch, first_reason: str) -> None:
     monkeypatch.setattr(

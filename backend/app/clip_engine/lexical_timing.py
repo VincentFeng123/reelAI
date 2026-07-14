@@ -28,6 +28,7 @@ CancelCheck = Callable[[], bool]
 Edge = Literal["start", "end"]
 
 MAX_FETCH_TIMEOUT_SEC = 2.0
+MAX_AUTHORITATIVE_TRACKS = 2
 MAX_JSON3_BYTES = 8 * 1024 * 1024
 CUE_TIME_TOLERANCE_SEC = 0.05
 _WORD_RE = re.compile(r"[^\W_]+(?:['\-][^\W_]+)*", re.UNICODE)
@@ -36,7 +37,7 @@ _APOSTROPHES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u02bc": "'"})
 
 @dataclass(frozen=True)
 class Json3CaptionTrack:
-    """One original-language automatic-caption resource.
+    """One original-language authoritative caption resource.
 
     Caption URLs are signed credentials.  Keeping the URL out of ``repr`` also
     keeps it out of ordinary exception and diagnostic rendering.
@@ -106,25 +107,36 @@ def _is_original_asr_alias(url: str, *, expected_language: str) -> bool:
     )
 
 
-def select_original_json3_track(
+def select_original_json3_tracks(
     info: Mapping[str, Any],
     *,
     expected_language: str,
-) -> Json3CaptionTrack | None:
-    """Select one original, automatic JSON3 track from yt-dlp metadata.
+) -> tuple[Json3CaptionTrack, ...]:
+    """Select up to two unique untranslated JSON3 tracks in trust order.
 
-    Prefer yt-dlp's authoritative ``-orig`` ASR key. Its duplicate language
-    alias is used only when the signed URL independently proves the same
-    untranslated ASR language. Client and format order remain deterministic.
+    Prefer yt-dlp's authoritative automatic ``-orig`` key, then its validated
+    exact-language ASR alias, then exact-language manual captions.  Format and
+    mapping order remain deterministic and duplicate signed URLs are attempted
+    only once.
     """
 
     expected = _normalize_language(expected_language)
     automatic = info.get("automatic_captions") if isinstance(info, Mapping) else None
-    if not expected or not isinstance(automatic, Mapping):
-        return None
+    manual = info.get("subtitles") if isinstance(info, Mapping) else None
+    if not expected:
+        return ()
 
-    for aliases_allowed in (False, True):
-        for raw_language, raw_formats in automatic.items():
+    selected: list[Json3CaptionTrack] = []
+    seen_urls: set[str] = set()
+
+    def add_tracks(
+        collection: object,
+        *,
+        kind: Literal["original", "alias", "manual"],
+    ) -> bool:
+        if not isinstance(collection, Mapping):
+            return False
+        for raw_language, raw_formats in collection.items():
             keyed_language = _normalize_language(raw_language)
             is_original_key = keyed_language.endswith("-orig")
             language = (
@@ -132,9 +144,9 @@ def select_original_json3_track(
                 if is_original_key
                 else keyed_language
             )
-            if aliases_allowed and is_original_key:
+            if kind == "original" and not is_original_key:
                 continue
-            if not aliases_allowed and not is_original_key:
+            if kind == "alias" and is_original_key:
                 continue
             if (
                 not _language_matches(language, expected)
@@ -149,16 +161,46 @@ def select_original_json3_track(
                 url = str(raw_format.get("url") or "").strip()
                 if not _is_untranslated_url(url):
                     continue
-                if aliases_allowed and not _is_original_asr_alias(
+                if kind == "alias" and not _is_original_asr_alias(
                     url, expected_language=expected
                 ):
                     continue
-                return Json3CaptionTrack(
-                    language=language,
-                    url=url,
-                    impersonate=raw_format.get("impersonate") is True,
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                selected.append(
+                    Json3CaptionTrack(
+                        language=language,
+                        url=url,
+                        impersonate=raw_format.get("impersonate") is True,
+                    )
                 )
-    return None
+                if len(selected) >= MAX_AUTHORITATIVE_TRACKS:
+                    return True
+        return False
+
+    for collection, kind in (
+        (automatic, "original"),
+        (automatic, "alias"),
+        (manual, "manual"),
+    ):
+        if add_tracks(collection, kind=kind):
+            break
+    return tuple(selected)
+
+
+def select_original_json3_track(
+    info: Mapping[str, Any],
+    *,
+    expected_language: str,
+) -> Json3CaptionTrack | None:
+    """Return the first authoritative track for compatibility with callers."""
+
+    tracks = select_original_json3_tracks(
+        info,
+        expected_language=expected_language,
+    )
+    return tracks[0] if tracks else None
 
 
 def _number(value: object) -> float | None:

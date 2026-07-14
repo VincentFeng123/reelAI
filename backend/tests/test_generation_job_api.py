@@ -815,6 +815,11 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
     monkeypatch.setattr(main.reel_service, "generate_reels", create_one_reel)
     monkeypatch.setattr(
         main,
+        "_current_level_reusable_generation_reel_count",
+        lambda *_args, **_kwargs: 0,
+    )
+    monkeypatch.setattr(
+        main,
         "_generation_job_reels",
         lambda *_args, **_kwargs: [{"reel_id": "source-chain-reel"}],
     )
@@ -943,7 +948,138 @@ def test_deferred_only_generation_remains_a_reusable_partial_reservoir(
         conn.close()
 
 
-def test_cross_request_source_count_leaves_two_slots_for_fresh_top_up_retrieval(
+def test_deferred_only_slow_reservoir_reuses_after_level_change_without_top_up(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+
+    @contextmanager
+    def connection(**_kwargs):
+        yield conn
+
+    monkeypatch.setattr(main, "get_conn", connection)
+    monkeypatch.setattr(
+        main, "_require_community_client_identity", lambda _request: "owner"
+    )
+    monkeypatch.setattr(
+        main, "_resolve_learner_identity", lambda *_args, **_kwargs: "learner-1"
+    )
+    monkeypatch.setattr(main, "_enforce_rate_limit", lambda *_args, **_kwargs: None)
+    wake = mock.Mock()
+    monkeypatch.setattr(main, "_wake_generation_worker", wake)
+    provider = mock.Mock(side_effect=AssertionError("stored reservoir called provider"))
+    monkeypatch.setattr(main.reel_service, "generate_reels", provider)
+    monkeypatch.setattr(
+        main.reel_service,
+        "_score_text_relevance",
+        lambda *_args, **_kwargs: {
+            "score": 0.99,
+            "concept_overlap": 1.0,
+            "context_overlap": 1.0,
+            "matched_terms": ["cell", "energy"],
+            "off_topic_penalty": 0.0,
+            "reason": "matched exact topic",
+        },
+    )
+    monkeypatch.setattr(main.reel_service, "_build_caption_cues", lambda **_kwargs: [])
+
+    now = datetime.now(timezone.utc)
+    content_fingerprint = generation_jobs.material_content_fingerprint(conn, "m1", None)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id=None,
+        request_key="slow-beginner-deferred-only",
+        generation_mode="slow",
+        retrieval_profile="unified",
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="advanced-deferred-reel",
+        video_id="advanced-deferred-video",
+        created_at=now.isoformat(),
+    )
+    row = conn.execute(
+        "SELECT search_context_json FROM reels WHERE id = 'advanced-deferred-reel'"
+    ).fetchone()
+    context = json.loads(str(row["search_context_json"]))
+    context.update({
+        "surface_eligible": False,
+        "surface_reason": "level_mismatch",
+        "deferred_level": True,
+        "boundary_confidence": 0.9,
+        "selection_candidate_id": "advanced-deferred-video::advanced-unit",
+    })
+    conn.execute(
+        "UPDATE reels SET difficulty = 0.85, search_context_json = ? "
+        "WHERE id = 'advanced-deferred-reel'",
+        (json.dumps(context),),
+    )
+    _terminal_job_for_generation(
+        conn,
+        request_key="slow-beginner-deferred-only",
+        generation_id=source_generation_id,
+        completed_at=now.isoformat(),
+        concept_id=None,
+        content_fingerprint=content_fingerprint,
+        request_params={
+            "generation_mode": "slow",
+            "num_reels": 12,
+            "exclude_video_ids": [],
+            "creative_commons_only": False,
+            "min_relevance": None,
+            "preferred_video_duration": "any",
+            "knowledge_level": "beginner",
+            "language": "en",
+        },
+    )
+    main.reel_service.set_learner_level(conn, "m1", "learner-1", "advanced")
+    initial_jobs = conn.execute(
+        "SELECT COUNT(*) FROM reel_generation_jobs"
+    ).fetchone()[0]
+    initial_provider_rows = conn.execute(
+        "SELECT COUNT(*) FROM generation_provider_usage"
+    ).fetchone()[0]
+
+    try:
+        feed_response = main.feed(
+            object(),
+            material_id="m1",
+            autofill=True,
+            generation_mode="slow",
+        )
+        direct_response = asyncio.run(main.generate_reels(
+            object(),
+            ReelsGenerateRequest(
+                material_id="m1",
+                generation_mode="slow",
+                num_reels=12,
+            ),
+        ))
+
+        assert [reel["reel_id"] for reel in feed_response["reels"]] == [
+            "advanced-deferred-reel"
+        ]
+        assert feed_response["generation_id"] == source_generation_id
+        assert feed_response["generation_job_id"] is None
+        assert [reel["reel_id"] for reel in direct_response["reels"]] == [
+            "advanced-deferred-reel"
+        ]
+        assert direct_response["generation_id"] == source_generation_id
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs"
+        ).fetchone()[0] == initial_jobs
+        assert conn.execute(
+            "SELECT COUNT(*) FROM generation_provider_usage"
+        ).fetchone()[0] == initial_provider_rows
+        provider.assert_not_called()
+        wake.assert_not_called()
+    finally:
+        conn.close()
+
+
+def test_cross_request_current_level_reservoir_does_not_force_fresh_top_up(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -975,18 +1111,100 @@ def test_cross_request_source_count_leaves_two_slots_for_fresh_top_up_retrieval(
         now=now,
     )
     assert leased
-    generated_count = 0
     calls: list[dict] = []
 
-    def count_generation_reels(_conn, generation_id: str) -> int:
-        return 10 if generation_id == source_generation_id else generated_count
+    def generate_stage(_worker_conn, **kwargs) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        main,
+        "_current_level_reusable_generation_reel_count",
+        lambda *_args, **_kwargs: 5,
+    )
+    monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_generation_job_reels",
+        lambda *_args, **_kwargs: [
+            {"reel_id": f"reel-{index}"} for index in range(5)
+        ],
+    )
+    try:
+        main._run_leased_generation_job(leased, threading.Event())
+
+        assert calls == []
+        assert generation_jobs.get_job(conn, job["id"])["status"] == "completed"
+    finally:
+        conn.close()
+
+
+def test_fast_source_generation_limits_slow_top_up_to_one_source(
+    monkeypatch,
+) -> None:
+    conn = _conn()
+    _patch_request_context(monkeypatch, conn)
+    now = datetime.now(timezone.utc)
+    source_generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="prior-fast-source-budget",
+        generation_mode="fast",
+        retrieval_profile="unified",
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=source_generation_id,
+        reel_id="prior-fast-current-level",
+        video_id="prior-fast-video",
+        created_at=now.isoformat(),
+    )
+    _terminal_job_for_generation(
+        conn,
+        request_key="prior-fast-source-budget",
+        generation_id=source_generation_id,
+        completed_at=now.isoformat(),
+        content_fingerprint="fingerprint",
+        request_params={"generation_mode": "fast", "num_reels": 8},
+    )
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key="slow-source-budget-delta",
+        content_fingerprint="fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "slow", "num_reels": 5},
+        source_generation_id=source_generation_id,
+        now=now,
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="worker-source-budget-delta",
+        now=now,
+    )
+    assert leased
+    calls: list[dict] = []
+    generated_count = 0
 
     def generate_stage(_worker_conn, **kwargs) -> None:
         nonlocal generated_count
         calls.append(kwargs)
         generated_count += int(kwargs["max_new_reels"])
 
-    monkeypatch.setattr(main, "_count_generation_reels", count_generation_reels)
+    monkeypatch.setattr(
+        main,
+        "_current_level_reusable_generation_reel_count",
+        lambda *_args, **_kwargs: 1,
+    )
+    monkeypatch.setattr(
+        main,
+        "_count_generation_reels",
+        lambda _conn, generation_id: (
+            0 if generation_id == source_generation_id else generated_count
+        ),
+    )
     monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
     monkeypatch.setattr(
         main,
@@ -1000,8 +1218,8 @@ def test_cross_request_source_count_leaves_two_slots_for_fresh_top_up_retrieval(
 
         assert len(calls) == 1
         assert calls[0]["retrieval_profile"] == "deep"
-        assert calls[0]["max_generation_videos"] == 3
-        assert calls[0]["max_new_reels"] == 2
+        assert calls[0]["max_generation_videos"] == 1
+        assert calls[0]["max_new_reels"] == 4
         assert generation_jobs.get_job(conn, job["id"])["status"] == "completed"
     finally:
         conn.close()
@@ -1077,6 +1295,11 @@ def test_slow_generation_uses_one_deep_retrieval_with_three_source_cap(monkeypat
             kwargs["on_reel_created"](reel)
 
     monkeypatch.setattr(main.reel_service, "generate_reels", generate_stage)
+    monkeypatch.setattr(
+        main,
+        "_current_level_reusable_generation_reel_count",
+        lambda *_args, **_kwargs: 1,
+    )
     monkeypatch.setattr(main, "update_generation_progress", capture_progress)
     monkeypatch.setattr(
         main,

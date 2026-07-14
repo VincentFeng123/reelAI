@@ -3012,53 +3012,53 @@ def _verified_reusable_generation_chain(
     return verified_reusable_count > 0
 
 
+def _generation_chain_analyzed_source_budget(
+    conn,
+    *,
+    generation_id: str,
+) -> int:
+    """Return the broadest source budget already attempted by a terminal job."""
+    generation_ids = _response_generation_ids(conn, generation_id)
+    if not generation_ids:
+        return 0
+
+    placeholders = ", ".join("?" for _ in generation_ids)
+    rows = fetch_all(
+        conn,
+        f"""
+        SELECT DISTINCT generations.generation_mode
+        FROM reel_generations AS generations
+        JOIN reel_generation_jobs AS jobs
+          ON jobs.result_generation_id = generations.id
+        WHERE generations.id IN ({placeholders})
+          AND jobs.status IN ('completed', 'partial')
+        """,
+        tuple(generation_ids),
+    )
+    return max(
+        (
+            GENERATION_SOURCE_BUDGETS[mode]
+            for row in rows
+            for mode in [str(row.get("generation_mode") or "").strip().lower()]
+            if mode in GENERATION_SOURCE_BUDGETS
+        ),
+        default=0,
+    )
+
+
 def _generation_chain_meets_source_budget(
     conn,
     *,
     generation_id: str,
     generation_mode: Literal["slow", "fast"],
 ) -> bool:
-    generation_ids = _response_generation_ids(conn, generation_id)
-    if not generation_ids:
-        return False
-
-    placeholders = ", ".join("?" for _ in generation_ids)
-    rows = fetch_all(
-        conn,
-        f"SELECT video_id, search_context_json FROM reels "
-        f"WHERE generation_id IN ({placeholders})",
-        tuple(generation_ids),
+    return (
+        _generation_chain_analyzed_source_budget(
+            conn,
+            generation_id=generation_id,
+        )
+        >= GENERATION_SOURCE_BUDGETS[generation_mode]
     )
-    source_video_ids: set[str] = set()
-    for row in rows:
-        video_id = str(row.get("video_id") or "").strip()
-        if not video_id:
-            continue
-        try:
-            context = json.loads(str(row.get("search_context_json") or "{}"))
-        except (TypeError, json.JSONDecodeError):
-            continue
-        if not isinstance(context, dict):
-            continue
-        surface_eligible = context.get("surface_eligible")
-        if isinstance(surface_eligible, str):
-            surface_eligible = surface_eligible.strip().lower() in {
-                "1", "true", "yes", "on",
-            }
-        if (
-            not surface_eligible
-            and str(context.get("surface_reason") or "").strip().lower()
-            != "level_mismatch"
-        ):
-            continue
-        if (
-            str(context.get("selection_contract_version") or "").strip()
-            != SELECTION_CONTRACT_VERSION
-            or not _search_context_has_verified_acoustic_boundary(context)
-        ):
-            continue
-        source_video_ids.add(video_id)
-    return len(source_video_ids) >= GENERATION_SOURCE_BUDGETS[generation_mode]
 
 
 def _verified_cross_request_source_generation(
@@ -3537,6 +3537,32 @@ def _reused_generation_reels(
     )
 
 
+def _current_level_reusable_generation_reel_count(
+    conn,
+    *,
+    generation_id: str | None,
+    material_id: str,
+    concept_id: str | None,
+    learner_id: str,
+    request_params: dict[str, Any],
+    requested: int,
+) -> int:
+    """Count source-chain inventory under the learner's current level gates."""
+    if not generation_id:
+        return 0
+    return len(
+        _reused_generation_reels(
+            conn,
+            generation_id=generation_id,
+            material_id=material_id,
+            concept_id=concept_id,
+            learner_id=learner_id,
+            request_params=request_params,
+            requested=requested,
+        )
+    )
+
+
 def _generation_job_status_payload(conn, job_row: dict[str, Any]) -> dict[str, Any]:
     try:
         usage = json.loads(str(job_row.get("usage_json") or "{}"))
@@ -3839,27 +3865,30 @@ def _run_leased_generation_job(
                     )
 
         with get_conn() as conn:
+            source_generation_id = (
+                str(job_row.get("source_generation_id") or "").strip() or None
+            )
             source_generation_ids = _response_generation_ids(
                 conn,
-                str(job_row.get("source_generation_id") or "").strip() or None,
+                source_generation_id,
             )
-            source_reel_count = sum(
-                _count_generation_reels(conn, source_id)
-                for source_id in source_generation_ids
-            )
-            source_generation_row = _fetch_generation_row(
+            source_reel_count = _current_level_reusable_generation_reel_count(
                 conn,
-                str(job_row.get("source_generation_id") or "").strip() or None,
+                generation_id=source_generation_id,
+                material_id=material_id,
+                concept_id=concept_id,
+                learner_id=learner_id,
+                request_params=params,
+                requested=requested_count,
             )
-            if (
-                source_generation_row
-                and str(source_generation_row.get("request_key") or "")
-                != str(job_row.get("request_key") or "")
-            ):
-                source_reel_count = min(
-                    source_reel_count,
-                    max(0, requested_count - 2),
-                )
+            analyzed_source_budget = _generation_chain_analyzed_source_budget(
+                conn,
+                generation_id=source_generation_id or "",
+            )
+            remaining_source_budget = max(
+                0,
+                GENERATION_SOURCE_BUDGETS[mode] - analyzed_source_budget,
+            )
             emitted: set[tuple[str, str]] = set()
             # Candidate events are provisional and reconciled against the
             # authoritative capped final. Every persisted candidate streams as
@@ -3926,7 +3955,7 @@ def _run_leased_generation_job(
             current_count = source_reel_count + _count_generation_reels(
                 conn, generation_id
             )
-            if current_count < requested_count:
+            if current_count < requested_count and remaining_source_budget > 0:
                 context.budget.reserve_pass()
                 if should_cancel():
                     raise GenerationCancelledError("Generation cancelled.")
@@ -3934,7 +3963,7 @@ def _run_leased_generation_job(
                 retrieved_video_ids: set[str] = set()
                 run_retrieval_stage(
                     retrieval_profile="deep",
-                    video_budget=GENERATION_SOURCE_BUDGETS[mode],
+                    video_budget=remaining_source_budget,
                     new_reel_cap=requested_count - current_count,
                     excluded_video_ids=base_exclusions,
                     analyzed_video_ids=analyzed_video_ids,

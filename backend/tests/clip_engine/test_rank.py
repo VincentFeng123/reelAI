@@ -70,6 +70,54 @@ def test_educational_ranking_and_bounds():
     assert ranked_cross[1]["match_count"] == 1
 
 
+def test_scientific_reactions_are_not_misclassified_as_reaction_videos():
+    ranked = merge_and_rank([{"query": "photosynthesis", "videos": [
+        {
+            "id": "science",
+            "title": "Light Reactions of Photosynthesis Explained",
+            "viewCount": 100,
+        },
+        {
+            "id": "entertainment",
+            "title": "Biologist Reacts to a Viral Photosynthesis Video",
+            "viewCount": 100,
+        },
+        {
+            "id": "chemistry",
+            "title": "Chemical Reaction Mechanisms — Organic Chemistry Lecture",
+            "viewCount": 100,
+        },
+        {
+            "id": "retina",
+            "title": "How the Retina Reacts to Light",
+            "viewCount": 100,
+        },
+        {
+            "id": "chemical-video",
+            "title": "Chemical Reaction Video Experiment",
+            "viewCount": 100,
+        },
+        {
+            "id": "light-video",
+            "title": "Light Reaction Video for Photosynthesis",
+            "viewCount": 100,
+        },
+        {
+            "id": "personal-reaction",
+            "title": "My Reaction to a Viral Clip",
+            "viewCount": 100,
+        },
+    ]}])
+
+    by_id = {video["id"]: video for video in ranked}
+    assert by_id["science"]["edu_score"] > by_id["entertainment"]["edu_score"]
+    assert by_id["chemistry"]["edu_score"] >= 0
+    assert by_id["retina"]["edu_score"] == 0
+    assert by_id["chemical-video"]["edu_score"] >= 0
+    assert by_id["light-video"]["edu_score"] >= 0
+    assert by_id["personal-reaction"]["edu_score"] < 0
+
+
 def test_level_score_bands():
     from backend.app.clip_engine.rank import _level_score
     intro = {"title": "Introduction to Physics 101", "channel": ""}

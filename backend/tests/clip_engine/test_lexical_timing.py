@@ -15,6 +15,7 @@ from backend.app.clip_engine.lexical_timing import (
     fetch_json3_words,
     parse_json3_words,
     select_original_json3_track,
+    select_original_json3_tracks,
 )
 
 
@@ -59,6 +60,72 @@ def test_original_key_precedes_validated_exact_language_asr_alias() -> None:
 
     assert track is not None
     assert track.url == original
+
+
+def test_selects_at_most_two_unique_tracks_in_authoritative_priority_order() -> None:
+    original = "https://captions.example/timed?lang=en&kind=asr&source=orig"
+    alias = "https://captions.example/timed?lang=en&kind=asr&source=alias"
+    manual = "https://captions.example/manual?lang=en"
+    info = {
+        "automatic_captions": {
+            "en": [{"ext": "json3", "url": alias}],
+            "en-orig": [
+                {"ext": "json3", "url": original},
+                {"ext": "json3", "url": original},
+            ],
+        },
+        "subtitles": {"en": [{"ext": "json3", "url": manual}]},
+    }
+
+    tracks = select_original_json3_tracks(info, expected_language="en-US")
+
+    assert [track.url for track in tracks] == [original, alias]
+    assert all("captions.example" not in repr(track) for track in tracks)
+
+
+def test_manual_track_follows_duplicate_automatic_alias() -> None:
+    automatic = "https://captions.example/timed?lang=en&kind=asr"
+    manual = "https://captions.example/manual?lang=en"
+    info = {
+        "automatic_captions": {
+            "en-orig": [{"ext": "json3", "url": automatic}],
+            "en": [{"ext": "json3", "url": automatic}],
+        },
+        "subtitles": {"en": [{"ext": "json3", "url": manual}]},
+    }
+
+    tracks = select_original_json3_tracks(info, expected_language="en-US")
+
+    assert [track.url for track in tracks] == [automatic, manual]
+
+
+def test_plural_track_selection_filters_wrong_language_and_translations() -> None:
+    manual = "https://captions.example/manual?lang=en"
+    info = {
+        "automatic_captions": {
+            "fr-orig": [{"ext": "json3", "url": "https://captions.example/fr"}],
+            "en-orig": [
+                {
+                    "ext": "json3",
+                    "url": "https://captions.example/translated?lang=en&tlang=fr",
+                }
+            ],
+        },
+        "subtitles": {
+            "fr": [{"ext": "json3", "url": "https://captions.example/manual-fr"}],
+            "en": [
+                {
+                    "ext": "json3",
+                    "url": "https://captions.example/manual-translated?tlang=en",
+                },
+                {"ext": "json3", "url": manual},
+            ],
+        },
+    }
+
+    tracks = select_original_json3_tracks(info, expected_language="en-US")
+
+    assert [track.url for track in tracks] == [manual]
 
 
 def test_validated_exact_language_asr_alias_is_safe_fallback() -> None:

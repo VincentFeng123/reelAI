@@ -29,7 +29,16 @@ _BOOST_PATTERNS = [
 ]
 
 _PENALTY_PATTERNS = [
-    re.compile(r'\breaction\b', re.I),
+    # Penalise entertainment-style reaction videos without demoting scientific
+    # teaching such as "light reactions" or "chemical reactions".
+    re.compile(
+        r'\b(?:(?:my|our|his|her|their|honest|live|first)\s+reaction\s+video'
+        r'|reaction\s+video\b.{0,80}\b(?:clip|movie|show|trailer|viral)'
+        r'|reaction\s+to\b.{0,80}\b(?:clip|movie|show|trailer|video|viral)'
+        r'|react(?:s|ing)?\s+to\b.{0,80}\b(?:clip|movie|show|trailer|video|viral)'
+        r'|watch(?:ing)?\s+.+\s+react)\b',
+        re.I,
+    ),
     re.compile(r'\bprank\b', re.I),
     re.compile(r'\bfunny\b', re.I),
     re.compile(r'\bmemes?\b', re.I),

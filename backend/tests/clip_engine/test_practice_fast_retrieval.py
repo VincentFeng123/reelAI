@@ -463,7 +463,7 @@ def test_long_topic_deep_searches_only_bounded_ai_queries(monkeypatch):
 
     expanded = "cell biology information flow and homeostasis"
     expected = [topic, f"{topic} explained tutorial", expanded]
-    assert search_calls == [[topic], expected[1:]]
+    assert search_calls == [expected]
     assert expansion_calls == [(topic, 3)]
     assert result["queries"] == expected
     assert result["topic_terms"] == [topic]
@@ -531,7 +531,7 @@ def test_deep_search_runs_only_ai_queries_without_broadening_selection(monkeypat
         retrieval_profile="deep",
     )
 
-    assert calls == [([topic], 1), (["chain rule derivative example"], 1)]
+    assert calls == [([topic, "chain rule derivative example"], 2)]
     assert expansion_calls == [(topic, 3, None)]
     assert result["queries"] == [topic, "chain rule derivative example"]
     assert result["topic_terms"] == [topic]
@@ -586,7 +586,7 @@ def test_deep_source_ranking_does_not_filter_by_learner_level(monkeypatch):
     assert [video["id"] for video in result["videos"]] == ["topic-source"]
 
 
-def test_deep_search_uses_ai_acronym_expansion_only_after_literal_is_sparse(monkeypatch):
+def test_deep_search_uses_ai_acronym_expansion_in_one_stage(monkeypatch):
     topic = "NLP attention mechanism"
     calls = []
     expansion_calls = []
@@ -613,7 +613,10 @@ def test_deep_search_uses_ai_acronym_expansion_only_after_literal_is_sparse(monk
         expansion_calls.append((expansion_topic, n))
         return {
             "corrected": expansion_topic,
-            "queries": ["natural language processing attention mechanism"],
+            "queries": [
+                expansion_topic,
+                "natural language processing attention mechanism",
+            ],
             "provider_used": "gemini",
         }
 
@@ -629,10 +632,7 @@ def test_deep_search_uses_ai_acronym_expansion_only_after_literal_is_sparse(monk
         retrieval_profile="deep",
     )
 
-    assert calls == [
-        [topic],
-        ["natural language processing attention mechanism"],
-    ]
+    assert calls == [[topic, "natural language processing attention mechanism"]]
     assert expansion_calls == [(topic, 3)]
     assert "direct" in [video["id"] for video in result["videos"]]
 
@@ -951,18 +951,11 @@ def test_discover_practice_fast_threads_runtime_args_and_applies_exclude_top_n(m
     assert result["corrected"] == "Calculus"
     assert [video["id"] for video in result["videos"]] == ["keep"]
     assert result["credits_used"] == 3
-    assert [call.pop("should_cancel") for call in seen] == [cancel_probe, cancel_probe]
-    assert [call.pop("parallel_prefix") for call in seen] == [1, 2]
+    assert [call.pop("should_cancel") for call in seen] == [cancel_probe]
+    assert [call.pop("parallel_prefix") for call in seen] == [3]
     assert seen == [
         {
-            "queries": ["calclus"],
-            "filters": {"duration": "medium"},
-            "language": "es",
-            "context": context,
-            "cache_store": cache,
-        },
-        {
-            "queries": ["Calculus", "Derivatives"],
+            "queries": ["Calculus", "Derivatives", "Limits"],
             "filters": {"duration": "medium"},
             "language": "es",
             "context": context,
@@ -997,7 +990,7 @@ def test_discover_practice_fast_limits_ai_queries_to_remaining_search_budget(mon
     search.discover_practice_fast("physics", limit=1, breadth=8, context=context)
 
     assert seen["n"] == 3
-    assert seen["queries"] == [["physics"], ["physics explained"]]
+    assert seen["queries"] == [["physics", "physics explained"]]
 
 
 def test_discover_practice_fast_caps_ai_search_to_three_queries(monkeypatch):
@@ -1026,7 +1019,7 @@ def test_discover_practice_fast_caps_ai_search_to_three_queries(monkeypatch):
 
 
 @pytest.mark.parametrize(("mode", "source_count"), [("fast", 2), ("slow", 3)])
-def test_literal_sufficient_retrieval_skips_expansion_and_follow_up(
+def test_literal_sufficient_retrieval_still_uses_bounded_ai_diversity(
     monkeypatch,
     mode,
     source_count,
@@ -1069,9 +1062,9 @@ def test_literal_sufficient_retrieval_skips_expansion_and_follow_up(
         context=GenerationContext(mode),
     )
 
-    assert calls == [["physics"]]
-    assert expansion_calls == []
-    assert result["provider_used"] == "literal_fallback"
+    assert calls == [["physics", "physics explained tutorial"]]
+    assert expansion_calls == [("physics", 3)]
+    assert result["provider_used"] == "gemini"
     assert len(result["videos"]) == source_count
     assert all(video["retrieval_score"] >= 0.60 for video in result["videos"])
 
@@ -1083,7 +1076,7 @@ def test_literal_sufficient_retrieval_skips_expansion_and_follow_up(
         ("slow", 3, ["physics mechanics", "physics waves"]),
     ],
 )
-def test_sparse_deep_retrieval_runs_one_expansion_and_one_follow_up(
+def test_deep_retrieval_runs_one_expansion_and_one_concurrent_search_stage(
     monkeypatch,
     mode,
     source_budget,
@@ -1135,7 +1128,7 @@ def test_sparse_deep_retrieval_runs_one_expansion_and_one_follow_up(
         retrieval_profile="deep",
     )
 
-    assert search_calls == [[topic], expected_follow_up]
+    assert search_calls == [[topic, *expected_follow_up]]
     assert expansion_calls == [(topic, 3, None)]
     assert result["queries"] == [topic, *expected_follow_up]
     assert result["topic_terms"] == [topic]

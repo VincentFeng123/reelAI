@@ -80,6 +80,13 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"check out (?:our|the) video|"
     r"administrative (?:note|announcement)|course (?:administration|logistics)|"
     r"(?:a\s+)?(?:quick|brief|short) (?:aside|tangent)|"
+    r"look at (?!this\b)(?!(?:the\s+)?(?:animation|chart|diagram|drawing|equation|"
+    r"figure|graph|image|map|object|screen|shape|simulation|slide|table)\b)"
+    r"(?:the\s+)?"
+    r"(?![^.!?]{0,80}\b(?:after|as|because|before|by|how|if|that|the way|when|"
+    r"where|whether|which|while|why)\b)"
+    r"(?=(?:[^\W_]+(?:['’\-][^\W_]+)?\s*){1,5}[.!?])"
+    r"[^.!?]{1,80}(?=[.!?](?:\s|$))|"
     r"(?<!\bare )(?<!\bis )(?<!\bwere )(?<!\byou are )(?<!\byou['’]re )"
     r"\bwelcome(?:\s+back)?(?:\s+to\s+(?:(?:this|the|my|our)\s+)?"
     r"(?:channel|video|lesson|course|show|episode|series)\b|\s+to\b|"
@@ -119,7 +126,9 @@ _VISUAL_DEPENDENCY_RE = re.compile(
     r"\b(?:as you can see|as shown (?:here|on (?:the )?screen)|"
     r"on (?:the )?screen|this (?:diagram|figure|chart|graph|image|slide|drawing)|"
     r"the (?:diagram|figure|chart|graph|image|slide) (?:shows|illustrates)|"
-    r"look (?:here|at this|at the)|over here|watch (?:this|what happens)|"
+    r"look (?:here|at this|at (?:(?:this|the) )?(?:animation|chart|diagram|drawing|equation|"
+    r"figure|graph|image|map|object|screen|shape|simulation|slide|table))|"
+    r"over here|watch (?:this|what happens)|"
     r"I(?:['’]m| am)? (?:drawing|writing)|I(?:['’]ll| will) (?:draw|write))\b",
     re.IGNORECASE,
 )
@@ -2300,22 +2309,66 @@ def _plan_to_report(
                 or not isinstance(b, int) or a < 0 or b < 0 or a >= n or b >= n or a > b):
             report.rejected_reasons.append(f"{prefix}:bad_index")
             continue
-        selected_start_before_context = a
-        selected_end_before_context = b
-        context_repair_source_text = _cue_clip_text(
-            segments, a, min(n - 1, b + 1)
-        )
+        proposed_start, proposed_end = a, b
         start_quote = str(proposal.start_quote or "").strip()
         end_quote = str(proposal.end_quote or "").strip()
         start_text = str(segments[a].get("text") or "").strip()
         end_text = str(segments[b].get("text") or "").strip()
         quote_repaired = False
         if not _contains_quote(start_text, start_quote):
-            report.rejected_reasons.append(f"{prefix}:bad_start_quote")
-            continue
+            matching_lines = [
+                line
+                for line in range(proposed_start, proposed_end + 1)
+                if _contains_quote(
+                    str(segments[line].get("text") or ""), start_quote
+                )
+            ]
+            if len(matching_lines) != 1:
+                report.rejected_reasons.append(f"{prefix}:bad_start_quote")
+                continue
+            anchored_line = matching_lines[0]
+            if any(
+                not _cue_is_only_structural_filler(
+                    str(segments[line].get("text") or "")
+                )
+                for line in range(proposed_start, anchored_line)
+            ):
+                report.rejected_reasons.append(f"{prefix}:bad_start_quote")
+                continue
+            a = anchored_line
+            start_text = str(segments[a].get("text") or "").strip()
+            quote_repaired = True
         if not _contains_quote(end_text, end_quote):
-            report.rejected_reasons.append(f"{prefix}:bad_end_quote")
+            matching_lines = [
+                line
+                for line in range(proposed_start, proposed_end + 1)
+                if _contains_quote(
+                    str(segments[line].get("text") or ""), end_quote
+                )
+            ]
+            if len(matching_lines) != 1:
+                report.rejected_reasons.append(f"{prefix}:bad_end_quote")
+                continue
+            anchored_line = matching_lines[0]
+            if any(
+                not _cue_is_only_structural_filler(
+                    str(segments[line].get("text") or "")
+                )
+                for line in range(anchored_line + 1, proposed_end + 1)
+            ):
+                report.rejected_reasons.append(f"{prefix}:bad_end_quote")
+                continue
+            b = anchored_line
+            end_text = str(segments[b].get("text") or "").strip()
+            quote_repaired = True
+        if a > b:
+            report.rejected_reasons.append(f"{prefix}:reversed_quote_order")
             continue
+        selected_start_before_context = a
+        selected_end_before_context = b
+        context_repair_source_text = _cue_clip_text(
+            segments, a, min(n - 1, b + 1)
+        )
         info = _strict_score(proposal.informativeness)
         relevance = _strict_score(proposal.topic_relevance)
         raw_importance = getattr(proposal, "educational_importance", None)

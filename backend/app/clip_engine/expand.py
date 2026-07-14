@@ -55,6 +55,11 @@ Do this:
 4. Preserve the user's named subject, task, and requested relationship. Cover close synonyms,
    genuinely related informational facets, useful prerequisites, and educational sources, but
    never redirect the search into a merely adjacent field.
+5. After the corrected literal query, prioritize substantive spoken lessons, lectures, or worked
+   explanations with natural pauses and little or no background music. Avoid Shorts, reaction
+   videos, compilations, montages, and explanations that only work when unseen visuals are shown.
+6. Preserve comparisons, causes, misconceptions, identification tasks, and worked-example intent
+   in every query where the user requested them.
 
 Return only the requested JSON object. Put the corrected topic first in queries."""
 
