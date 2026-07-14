@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import math
 import random
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass
 from typing import Optional
 
+import httpx
 from google import genai
-from google.genai import types
+from google.genai import errors as genai_errors, types
 
 from . import config
 
@@ -38,6 +40,9 @@ class GeminiCallTelemetry:
     thought_tokens: Optional[int]
     total_tokens: Optional[int]
     cached_tokens: Optional[int] = None
+    provider_error_type: Optional[str] = None
+    provider_status_code: Optional[int] = None
+    retryable: Optional[bool] = None
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -155,7 +160,8 @@ def _finish_reason(response) -> Optional[str]:
 
 def _call_telemetry(*, model: str, operation: str, prompt_version: str,
                     thinking_level: str, started: float, retries: int,
-                    response=None) -> GeminiCallTelemetry:
+                    response=None, error: Exception | None = None,
+                    retryable: bool | None = None) -> GeminiCallTelemetry:
     usage = _field(response, "usage_metadata") if response is not None else None
     return GeminiCallTelemetry(
         model=model,
@@ -170,24 +176,63 @@ def _call_telemetry(*, model: str, operation: str, prompt_version: str,
         thought_tokens=_field(usage, "thoughts_token_count"),
         total_tokens=_field(usage, "total_token_count"),
         cached_tokens=_field(usage, "cached_content_token_count"),
+        provider_error_type=type(error).__name__ if error is not None else None,
+        provider_status_code=(
+            _gemini_status_code(error) if error is not None else None
+        ),
+        retryable=retryable if error is not None else None,
     )
 
 
-def _transient_gemini_error(error: Exception) -> bool:
-    for attr in ("status_code", "code"):
-        status = getattr(error, attr, None)
-        status = getattr(status, "value", status)
+def _gemini_status_code(error: Exception) -> int | None:
+    """Extract an HTTP status without relying on provider error prose."""
+    response = getattr(error, "response", None)
+    for raw_status in (
+        getattr(error, "status_code", None),
+        getattr(error, "code", None),
+        getattr(response, "status_code", None),
+    ):
+        status = getattr(raw_status, "value", raw_status)
         try:
-            if int(status) in _TRANSIENT_STATUS_CODES:
-                return True
+            return int(status)
         except (TypeError, ValueError):
-            pass
+            continue
+
+    message = str(error)
+    match = re.match(r"\s*(\d{3})\b", message)
+    if match is None:
+        match = re.search(
+            r"\b(?:http(?:\s+status)?|status|code)\s*[:=]?\s*(\d{3})\b",
+            message,
+            re.IGNORECASE,
+        )
+    return int(match.group(1)) if match is not None else None
+
+
+def _transient_gemini_error(error: Exception) -> bool:
+    status = _gemini_status_code(error)
+    if status is not None:
+        # A known status is authoritative. In particular, do not let text such
+        # as "field unavailable" turn a 4xx schema/auth failure into a retry.
+        return status in _TRANSIENT_STATUS_CODES
+    if isinstance(error, genai_errors.ClientError):
+        return False
+    message = str(error).lower()
+    if any(marker in message for marker in (
+        "invalid_argument", "unauthenticated", "permission_denied",
+        "api key", "response schema", "json schema",
+    )):
+        return False
+    if isinstance(error, (httpx.TransportError, httpx.DecodingError)):
+        return True
+    if isinstance(error, genai_errors.UnknownApiResponseError):
+        # The SDK received a successful but malformed/truncated provider body.
+        return True
     if isinstance(error, (TimeoutError, ConnectionError)):
         return True
     name = type(error).__name__.lower()
     if any(marker in name for marker in ("timeout", "connect", "network", "protocol")):
         return True
-    message = str(error).lower()
     return any(
         marker in message
         for marker in (
@@ -343,10 +388,13 @@ def generate_json_v3(
                 model=mdl, contents=user, config=request_config,
             )
         except Exception as error:  # noqa: BLE001
+            retryable = _transient_gemini_error(error)
             telemetry = _call_telemetry(
                 model=mdl, operation=operation, prompt_version=prompt_version,
                 thinking_level=level, started=started,
                 retries=max(0, requests_started - 1),
+                error=error,
+                retryable=retryable,
             )
             if _cancel_requested(cancelled):
                 raise GeminiCancelledError("Gemini call cancelled", telemetry) from error
@@ -354,7 +402,7 @@ def generate_json_v3(
                 raise GeminiDeadlineExceededError(
                     "Gemini call deadline exceeded", telemetry,
                 ) from error
-            if not _transient_gemini_error(error) or attempt + 1 >= max_attempts:
+            if not retryable or attempt + 1 >= max_attempts:
                 raise GeminiTransportError(str(error), telemetry) from error
 
             wait_s = random.uniform(0.1, 0.35)

@@ -681,6 +681,9 @@ def test_production_selector_reserves_and_dispatches_exactly_once(monkeypatch):
     assert len(models.calls) == 1
     assert len(reservations) == 1
     assert result.calls[0]["retries"] == 0
+    assert result.calls[0]["provider_error_type"] == "TransientHTTPError"
+    assert result.calls[0]["provider_status_code"] == 503
+    assert result.calls[0]["retryable"] is True
     assert result.calls[0]["dispatched"] is True
     assert result.calls[0]["reserved_cost_usd"] == 0.25
     assert result.classification_reasons == [
@@ -701,6 +704,9 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
         candidate_tokens=None,
         thought_tokens=None,
         total_tokens=None,
+        provider_error_type="ReadError",
+        provider_status_code=None,
+        retryable=True,
     )
     monkeypatch.setattr(
         GC,
@@ -726,6 +732,9 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
     assert result.calls[0]["retries"] == 1
     assert result.calls[0]["latency_ms"] == 321.0
     assert result.calls[0]["error_type"] == "GeminiTransportError"
+    assert result.calls[0]["provider_error_type"] == "ReadError"
+    assert result.calls[0]["provider_status_code"] is None
+    assert result.calls[0]["retryable"] is True
 
 
 @pytest.mark.parametrize(

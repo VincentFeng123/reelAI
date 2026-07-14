@@ -112,6 +112,9 @@ def test_generation_context_maps_live_gemini_telemetry_and_cache_hits() -> None:
             "thought_tokens": 3,
             "total_tokens": 17,
             "latency_ms": 125.5,
+            "provider_error_type": "ReadError",
+            "provider_status_code": 503,
+            "retryable": True,
         },
     )
     context.increment_counter("segmentation_cache_hits")
@@ -125,6 +128,9 @@ def test_generation_context_maps_live_gemini_telemetry_and_cache_hits() -> None:
     assert provider_call["metadata"]["candidate_tokens"] == 4
     assert provider_call["metadata"]["thought_tokens"] == 3
     assert provider_call["metadata"]["latency_ms"] == 125.5
+    assert provider_call["metadata"]["provider_error_type"] == "ReadError"
+    assert provider_call["metadata"]["provider_status_code"] == 503
+    assert provider_call["metadata"]["retryable"] is True
     assert cache_hit["billable_requests"] == 0
     assert cache_hit["metadata"] == {"provider_call": False, "cache_hit": True}
     assert context.counters()["segmentation_cache_hits"] == 1

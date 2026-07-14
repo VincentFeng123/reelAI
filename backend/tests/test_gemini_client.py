@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from google.genai import errors as genai_errors
 from pydantic import BaseModel, Field
 
 from backend import gemini_client as gc
@@ -151,6 +153,9 @@ def test_gemini3_returns_immutable_usage_and_finish_telemetry(monkeypatch):
         telemetry.cached_tokens,
     ) == (11, 7, 5, 23, 3)
     assert telemetry.retries == 0 and telemetry.latency_ms >= 0
+    assert telemetry.provider_error_type is None
+    assert telemetry.provider_status_code is None
+    assert telemetry.retryable is None
     assert telemetry.as_dict()["total_tokens"] == 23
     with pytest.raises(FrozenInstanceError):
         telemetry.retries = 9
@@ -204,6 +209,73 @@ def test_gemini3_retries_common_remote_disconnects(monkeypatch, error):
     assert result.telemetry.retries == 1
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadError("socket read failed"),
+        httpx.WriteError("socket write failed"),
+        httpx.CloseError("socket close failed"),
+        httpx.ProxyError("proxy handshake failed"),
+        httpx.DecodingError("invalid compressed response"),
+        genai_errors.UnknownApiResponseError("malformed provider response"),
+    ],
+)
+def test_gemini3_retries_sdk_transport_and_malformed_response_once(
+    monkeypatch, error,
+):
+    fake = _FakeClient(error, _FakeResponse())
+    monkeypatch.setattr(gc.time, "sleep", lambda _: None)
+
+    result = _call_v3(monkeypatch, fake, max_retries=1)
+
+    assert len(fake.models.calls) == 2
+    assert result.telemetry.retries == 1
+
+
+@pytest.mark.parametrize(
+    "status,status_name,message",
+    [
+        (400, "INVALID_ARGUMENT", "response schema field unavailable"),
+        (401, "UNAUTHENTICATED", "API key is invalid"),
+        (403, "PERMISSION_DENIED", "permission denied"),
+        (404, "NOT_FOUND", "model not found"),
+        (422, "INVALID_ARGUMENT", "invalid JSON schema"),
+    ],
+)
+def test_gemini3_never_retries_provider_4xx_schema_or_auth_errors(
+    monkeypatch, status, status_name, message,
+):
+    error = genai_errors.ClientError(
+        status,
+        {"error": {"code": status, "status": status_name, "message": message}},
+    )
+    fake = _FakeClient(error, _FakeResponse())
+
+    with pytest.raises(gc.GeminiTransportError) as exc_info:
+        _call_v3(monkeypatch, fake, max_retries=1)
+
+    assert len(fake.models.calls) == 1
+    telemetry = exc_info.value.telemetry
+    assert telemetry.retries == 0
+    assert telemetry.provider_error_type == "ClientError"
+    assert telemetry.provider_status_code == status
+    assert telemetry.retryable is False
+
+
+def test_gemini3_retries_google_rate_limit_once(monkeypatch):
+    error = genai_errors.ClientError(
+        429,
+        {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED"}},
+    )
+    fake = _FakeClient(error, _FakeResponse())
+    monkeypatch.setattr(gc.time, "sleep", lambda _: None)
+
+    result = _call_v3(monkeypatch, fake, max_retries=1)
+
+    assert len(fake.models.calls) == 2
+    assert result.telemetry.retries == 1
+
+
 def test_gemini3_cancellation_during_jitter_prevents_retry(monkeypatch):
     fake = _FakeClient(_HTTPError(503), _FakeResponse())
     state = {"cancelled": False}
@@ -230,6 +302,9 @@ def test_gemini3_never_exceeds_one_application_retry(monkeypatch):
 
     assert len(fake.models.calls) == 2
     assert exc_info.value.telemetry.retries == 1
+    assert exc_info.value.telemetry.provider_error_type == "_HTTPError"
+    assert exc_info.value.telemetry.provider_status_code == 503
+    assert exc_info.value.telemetry.retryable is True
 
 
 def test_gemini3_does_not_retry_non_transient_error(monkeypatch):

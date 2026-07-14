@@ -132,6 +132,115 @@ def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None
     assert "180-second" not in (_system + user)
 
 
+def test_same_cue_trailing_preview_is_trimmed_from_model_end_quote() -> None:
+    text = (
+        "Cells use chlorophyll to capture light energy and power the chemical "
+        "reactions of photosynthesis. But we'll talk more about that next time."
+    )
+    proposal = _proposal().model_copy(update={
+        "end_quote": (
+            "chemical reactions of photosynthesis. But we'll talk more about that "
+            "next time"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["end_quote"] == "power the chemical reactions of photosynthesis"
+    assert clip["edge_projection"]["end"] == {
+        "required": True,
+        "cue_id": "cue-0",
+        "quote": "power the chemical reactions of photosynthesis",
+    }
+    assert clip["_clip_text"].endswith("chemical reactions of photosynthesis")
+    assert "next time" not in clip["_clip_text"]
+
+
+def test_same_cue_leading_welcome_is_trimmed_from_model_start_quote() -> None:
+    text = (
+        "Welcome to the channel. Cells use chlorophyll to capture light energy and "
+        "power the chemical reactions of photosynthesis."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": (
+            "Welcome to the channel. Cells use chlorophyll to capture light energy"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_quote"] == "Cells use chlorophyll to capture light"
+    assert clip["edge_projection"]["start"] == {
+        "required": True,
+        "cue_id": "cue-0",
+        "quote": "Cells use chlorophyll to capture light",
+    }
+    assert clip["_clip_text"].startswith("Cells use chlorophyll")
+    assert "Welcome" not in clip["_clip_text"]
+
+
+def test_trailing_preview_repair_fails_closed_on_incomplete_teaching_prefix() -> None:
+    text = "Cells use chlorophyll because. But we'll talk more about that next time."
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Cells use chlorophyll",
+        "end_quote": text.rstrip("."),
+        "topic_evidence_quote": "Cells use chlorophyll because",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:unresolved_weak_end"]
+
+
+def test_same_cue_preview_inside_teaching_is_tolerated_unchanged() -> None:
+    text = (
+        "Chlorophyll captures light energy for photosynthesis. But we'll talk more "
+        "about that next time. Carbon fixation then converts carbon dioxide into sugar."
+    )
+    proposal = _proposal().model_copy(update={
+        "start_quote": "Chlorophyll captures light energy",
+        "end_quote": "converts carbon dioxide into sugar",
+        "topic_evidence_quote": (
+            "Carbon fixation then converts carbon dioxide into sugar"
+        ),
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "cue-0", "start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert "talk more about that next time" in clip["_clip_text"]
+
+
 def test_carolingian_visual_dependent_span_is_rejected() -> None:
     raw_cues = [
         (577, 2229.04, 2234.16, "tail. Um it really is just like the end of the M."),

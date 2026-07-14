@@ -71,10 +71,19 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"administrative (?:note|announcement)|course (?:administration|logistics)|"
     r"(?:a\s+)?(?:quick|brief|short) (?:aside|tangent)|"
     r"(?<!\bare )(?<!\bis )(?<!\bwere )(?<!\byou are )(?<!\byou['’]re )"
-    r"\bwelcome(?:\s+back)?(?:\s+to\b|(?=[!,.]|\s*$))|"
+    r"\bwelcome(?:\s+back)?(?:\s+to\s+(?:(?:this|the|my|our)\s+)?"
+    r"(?:channel|video|lesson|course|show|episode|series)\b|\s+to\b|"
+    r"(?=[!,.]|\s*$))|"
     r"in this (?:video|lesson|course) we(?:['’]ll| will)|"
     r"before we (?:begin|get started)|let(?:['’]?s| us) move on|"
     r"next we(?:['’]ll| will)|cover (?:that|this) in (?:this|the) course)\b|"
+    r"(?:but\s+)?we(?:['’]ll| will)\s+(?:(?:talk|discuss|learn|say|cover|"
+    r"explore|explain)\s+"
+    r"(?:more\s+)?about\s+(?:that|this|it)|(?:talk|discuss)\s+about\s+"
+    r"(?:that|this|it)\s+more|(?:discuss|cover|revisit|explore|explain)\s+"
+    r"(?:that|this|it)(?:\s+more)?|(?:return|come\s+back)\s+to\s+"
+    r"(?:that|this|it))\s+(?:next\s+time|later|in\s+(?:a|the)\s+"
+    r"(?:next|future)\s+(?:video|lesson|section|episode))\b|"
     r"(?:^|[.!?]\s+)(?:(?:all right|alright|okay|ok|so|now|well|yeah)"
     r"\s*[,;:]?\s+)*(?:"
     r"(?:cool|hey|fun fact|brilliant)\s*[!,.](?=\s|$)|"
@@ -1499,6 +1508,39 @@ def _edge_has_unresolved_structural_filler(
     return False
 
 
+def _replace_structural_edge_quote(
+    text: str,
+    quote: str,
+    *,
+    want: str,
+) -> tuple[str, bool, str | None]:
+    """Replace a model quote that includes removable filler at a cue edge."""
+    if _cue_is_only_structural_filler(text):
+        # The existing cue-level pass can remove this cue without projecting a
+        # boundary inside it. Same-cue repair is only for mixed teaching/filler.
+        return quote, False, None
+    quote_span, _projected, error = _semantic_edge_quote(text, quote, want=want)
+    if error or quote_span is None:
+        # Preserve the normal grounding/ambiguity failure emitted downstream.
+        return quote, False, None
+    if not _edge_has_unresolved_structural_filler(text, quote_span, want=want):
+        return quote, False, None
+
+    replacement, error = _expanded_context_edge_quote(text, want=want)
+    if error:
+        return "", False, "unresolved_edge_filler"
+    replacement_span, projected, error = _semantic_edge_quote(
+        text, replacement, want=want
+    )
+    if error or replacement_span is None or not projected:
+        return "", False, error or "unresolved_edge_filler"
+    if _edge_has_unresolved_structural_filler(
+        text, replacement_span, want=want
+    ):
+        return "", False, "unresolved_edge_filler"
+    return replacement, True, None
+
+
 def _semantic_clip_slice(
     segments: list[dict],
     start_line: int,
@@ -2173,6 +2215,24 @@ def _plan_to_report(
         if uncertainty == "high":
             report.rejected_reasons.append(f"{prefix}:{uncertainty}_uncertainty")
             continue
+
+        start_quote, repaired_start_edge, edge_error = _replace_structural_edge_quote(
+            start_text,
+            start_quote,
+            want="start",
+        )
+        if edge_error:
+            report.rejected_reasons.append(f"{prefix}:{edge_error}")
+            continue
+        end_quote, repaired_end_edge, edge_error = _replace_structural_edge_quote(
+            end_text,
+            end_quote,
+            want="end",
+        )
+        if edge_error:
+            report.rejected_reasons.append(f"{prefix}:{edge_error}")
+            continue
+        quote_repaired = quote_repaired or repaired_start_edge or repaired_end_edge
 
         # Run discourse closure against the teaching slice the model selected, not
         # against hook/joke text that is deliberately outside its exact edge quotes.

@@ -680,6 +680,9 @@ class GenerationContext:
             "reserved_cost_usd",
             "dispatched",
             "error_type",
+            "provider_error_type",
+            "provider_status_code",
+            "retryable",
         ):
             value = _usage_field(usage, field_name)
             if value is not None:
