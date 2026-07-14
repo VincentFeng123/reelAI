@@ -187,6 +187,31 @@ def _select_ranked_candidates(
         for family in (video.get("matched_families") or [])
         if str(family or "").strip()
     }
+    selected_channels = {
+        str(video.get("channel") or "").strip().casefold()
+        for video in selected
+        if str(video.get("channel") or "").strip()
+    }
+    # Do not spend a scarce 2/3-source analysis budget twice on the same
+    # channel when a comparably ranked teaching source is available. Bounding
+    # the pool prevents diversity from promoting an arbitrarily weak result.
+    diversity_pool = non_literal[: max(prefix_limit, prefix_limit * 2)]
+    for video in diversity_pool:
+        video_id = str(video.get("id") or "")
+        channel = str(video.get("channel") or "").strip().casefold()
+        if video_id in selected_ids or not channel or channel in selected_channels:
+            continue
+        families = {
+            str(family)
+            for family in (video.get("matched_families") or [])
+            if str(family or "").strip()
+        }
+        selected.append(video)
+        selected_ids.add(video_id)
+        selected_channels.add(channel)
+        selected_families.update(families)
+        if len(selected) >= prefix_limit:
+            break
     for video in non_literal:
         video_id = str(video.get("id") or "")
         families = {

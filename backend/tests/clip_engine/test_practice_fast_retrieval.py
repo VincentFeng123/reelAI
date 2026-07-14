@@ -40,7 +40,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
         )
         return (
             '{"corrected":"Calculus","queries":['
-            '"calculus", "Derivatives", " derivatives ", "Limits"]}'
+            '"calculus spoken lecture", "Derivatives", " derivatives ", "Limits"]}'
         )
 
     monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fake_raw)
@@ -53,7 +53,7 @@ def test_practice_fast_expansion_uses_flash_and_normalizes_model_output(monkeypa
     assert expand.PRACTICE_FAST_EXPAND_TIMEOUT_MS == 10_000
     assert result == {
         "corrected": "Calculus",
-        "queries": ["Calculus", "Derivatives", "Limits"],
+        "queries": ["calculus spoken lecture", "Derivatives", "Limits"],
         "provider_used": "gemini",
     }
     assert seen == {
@@ -234,8 +234,8 @@ def test_practice_fast_expansion_stores_success_for_reuse(monkeypatch):
 def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypatch):
     cached_row = {
         "response_json": (
-            '{"version":3,"corrected":"Physics",'
-            '"queries":["Physics","mechanics","waves"]}'
+            '{"version":4,"corrected":"Physics",'
+            '"queries":["physics lecture","mechanics","waves"]}'
         ),
         "created_at": (
             datetime.now(timezone.utc)
@@ -258,7 +258,7 @@ def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypa
     cached = expand.expand_query_practice_fast("physics", 3, context=context)
 
     assert expand.PRACTICE_FAST_EXPAND_CACHE_TTL_SEC == 2 * segment_cache.SEGMENT_CACHE_TTL_SEC
-    assert cached["queries"] == ["Physics", "mechanics", "waves"]
+    assert cached["queries"] == ["physics lecture", "mechanics", "waves"]
     assert provider_calls == 0
     assert context.counters()["expansion_cache_hits"] == 1
     assert context.usage()[0]["billable_requests"] == 0
@@ -273,7 +273,7 @@ def test_practice_fast_expansion_cache_outlives_segment_ttl_and_expires(monkeypa
         context=GenerationContext("fast"),
     )
 
-    assert still_cached["queries"] == ["Physics", "mechanics", "waves"]
+    assert still_cached["queries"] == ["physics lecture", "mechanics", "waves"]
     assert provider_calls == 0
 
     cached_row["created_at"] = (
@@ -1202,6 +1202,63 @@ def test_discovery_oversampling_puts_ai_diversity_in_analysis_prefix(
     assert [video["id"] for video in result["videos"]] == expected_ids
     assert result["videos"][0]["literal_match"] is True
     assert sum(not video["literal_match"] for video in result["videos"][:analysis_prefix]) == 1
+
+
+def test_analysis_prefix_uses_a_different_channel_when_available():
+    ranked = [
+        {
+            "id": "top-source",
+            "channel": "Animation Academy",
+            "literal_match": True,
+            "matched_families": ["cell-division"],
+        },
+        {
+            "id": "same-channel",
+            "channel": "Animation Academy",
+            "literal_match": False,
+            "matched_families": ["meiosis"],
+        },
+        {
+            "id": "different-channel",
+            "channel": "Open Biology Lecture",
+            "literal_match": False,
+            "matched_families": ["cell-division"],
+        },
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=3,
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected] == [
+        "top-source",
+        "different-channel",
+        "same-channel",
+    ]
+
+
+def test_analysis_prefix_does_not_promote_a_distant_channel_result():
+    ranked = [
+        {
+            "id": f"ranked-{index}",
+            "channel": "Top Lecture Channel" if index < 5 else "Distant Channel",
+            "literal_match": False,
+            "matched_families": ["cell-division"],
+        }
+        for index in range(6)
+    ]
+
+    selected = search._select_ranked_candidates(
+        ranked,
+        limit=6,
+        excluded=set(),
+        analysis_prefix=2,
+    )
+
+    assert [video["id"] for video in selected[:2]] == ["ranked-0", "ranked-1"]
 
 
 def test_search_all_runs_requested_prefix_concurrently(monkeypatch):

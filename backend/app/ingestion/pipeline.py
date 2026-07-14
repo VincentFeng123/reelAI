@@ -772,7 +772,10 @@ def _selected_speech_corridor(
         if start_is_lexical
         else 0.0
         if first_index == 0
-        else first_start
+        else min(
+            first_start,
+            float(segments[first_index - 1].get("end") or first_start),
+        )
     )
     end_limit = (
         float(end_boundary["excluded_neighbor_onset_sec"])
@@ -1319,7 +1322,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v10",
+            selection_contract_version="quality_silence_v11",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -3430,7 +3433,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v10",
+                    selection_contract_version="quality_silence_v11",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

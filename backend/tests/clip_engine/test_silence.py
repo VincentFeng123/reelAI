@@ -584,6 +584,114 @@ def test_caption_handoff_does_not_scan_an_entire_inter_caption_gap(
     assert result.diagnostics["end_windows"] == [[17.0, 23.0]]
 
 
+@pytest.mark.parametrize(
+    ("quiet_end", "expected_start"),
+    [
+        (20.0, 19.9),
+        (20.4, 20.0),
+    ],
+)
+def test_start_handoff_stitches_one_continuous_quiet_run_beyond_first_window(
+    tmp_path: Path,
+    quiet_end: float,
+    expected_start: float,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_start_sec,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        spans = [(window_duration_sec, 12000)]
+        if output_path.name == "start-0.wav":
+            quiet_duration = quiet_end - window_start_sec
+            spans = [
+                (quiet_duration, 0),
+                (window_duration_sec - quiet_duration, 12000),
+            ]
+        elif output_path.name == "start-1.wav":
+            spans = [(1.0, 12000), (window_duration_sec - 1.0, 0)]
+        elif output_path.name == "end-0.wav":
+            quiet_start = 39.8 - window_start_sec
+            spans = [
+                (quiet_start, 12000),
+                (0.4, 0),
+                (window_duration_sec - quiet_start - 0.4, 12000),
+            ]
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            20.0,
+            40.0,
+            search_start_limit_sec=12.0,
+            search_end_limit_sec=45.0,
+            require_start_speech_handoff=True,
+            require_start_two_sided=True,
+            prepared=_prepared(),
+        )
+
+    assert result.verified
+    assert result.start_sec == expected_start
+    assert result.start_sec <= 20.0
+    assert result.diagnostics["start_quiet"] == [12.0, quiet_end]
+    assert result.diagnostics["start_windows"] == [[17.0, 23.0], [11.0, 17.0]]
+
+
+def test_start_handoff_rejects_earlier_quiet_separated_by_sound(
+    tmp_path: Path,
+) -> None:
+    decoded: list[str] = []
+
+    def fake_decode(
+        _source,
+        *,
+        window_start_sec,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        decoded.append(output_path.name)
+        spans = [(window_duration_sec, 12000)]
+        if output_path.name == "start-0.wav":
+            quiet_duration = 20.0 - window_start_sec
+            spans = [
+                (quiet_duration, 0),
+                (window_duration_sec - quiet_duration, 12000),
+            ]
+        elif output_path.name == "start-1.wav":
+            spans = [(1.0, 12000), (4.0, 0), (1.0, 12000)]
+        elif output_path.name == "end-0.wav":
+            quiet_start = 39.8 - window_start_sec
+            spans = [
+                (quiet_start, 12000),
+                (0.4, 0),
+                (window_duration_sec - quiet_start - 0.4, 12000),
+            ]
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            20.0,
+            40.0,
+            search_start_limit_sec=12.0,
+            search_end_limit_sec=45.0,
+            require_start_speech_handoff=True,
+            require_start_two_sided=True,
+            prepared=_prepared(),
+        )
+
+    assert result.status == "unavailable"
+    assert result.diagnostics["reason"] == "start_silence_not_found"
+    assert "start-0.wav" in decoded
+    assert "start-1.wav" in decoded
+    assert "start-2.wav" not in decoded
+
+
 def test_mixed_edge_modes_keep_exact_start_handoff_and_progressive_end_search(
     tmp_path: Path,
 ) -> None:

@@ -1231,8 +1231,6 @@ def _search_quiet(
         )
         if quiet is not None:
             return _EdgeSearchResult(quiet, tuple(searched))
-        if handoff_band is not None:
-            return _EdgeSearchResult(None, tuple(searched))
         boundary_fragments = [
             interval
             for interval in intervals
@@ -1242,6 +1240,24 @@ def _search_quiet(
                 else abs(interval.end_sec - window_end) <= _FRAME_SEC
             )
         ]
+        if handoff_band is not None:
+            if edge != "start":
+                return _EdgeSearchResult(None, tuple(searched))
+            # Continue backward only while proving the same quiet run that
+            # reaches the required speech onset. Sound at a seam ends the
+            # search, so an earlier unrelated pause can never qualify.
+            boundary_fragments = [
+                interval
+                for interval in boundary_fragments
+                if (
+                    interval.start_sec
+                    <= handoff_band[0] + HANDOFF_TIMESTAMP_TOLERANCE_SEC
+                    and interval.end_sec
+                    >= handoff_band[1] - HANDOFF_TIMESTAMP_TOLERANCE_SEC
+                )
+            ]
+            if not boundary_fragments:
+                return _EdgeSearchResult(None, tuple(searched))
         adjacent_boundary_quiet = max(
             boundary_fragments,
             key=lambda interval: interval.duration_sec,

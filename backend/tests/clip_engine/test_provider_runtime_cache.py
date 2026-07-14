@@ -107,6 +107,7 @@ def test_generation_context_maps_live_gemini_telemetry_and_cache_hits() -> None:
         model_used="gemini-3.5-flash",
         quality_degraded=False,
         usage={
+            "video_id": "source-video-123",
             "prompt_tokens": 10,
             "candidate_tokens": 4,
             "thought_tokens": 3,
@@ -127,6 +128,7 @@ def test_generation_context_maps_live_gemini_telemetry_and_cache_hits() -> None:
     assert provider_call["total_tokens"] == 17
     assert provider_call["metadata"]["candidate_tokens"] == 4
     assert provider_call["metadata"]["thought_tokens"] == 3
+    assert provider_call["metadata"]["video_id"] == "source-video-123"
     assert provider_call["metadata"]["latency_ms"] == 125.5
     assert provider_call["metadata"]["provider_error_type"] == "ReadError"
     assert provider_call["metadata"]["provider_status_code"] == 503

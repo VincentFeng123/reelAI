@@ -1781,6 +1781,50 @@ def test_rolling_caption_overlap_uses_cue_onset_handoffs(
     assert plan[4:6] == expected_two_sided
 
 
+def test_nonlexical_start_corridor_includes_only_the_preceding_caption_gap() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:start-caption-gap",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "prior",
+                "start": 0.0,
+                "end": 4.0,
+                "text": "The prior teaching unit ends here.",
+            },
+            {
+                "cue_id": "selected",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "The selected explanation begins after a long pause.",
+            },
+        ],
+    }
+    clip = {"cue_ids": ["selected"], "start": 10.0, "end": 20.0}
+    diagnostics = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert diagnostics is not None
+
+    start, end, error = pipeline_module._selected_speech_corridor(
+        transcript,
+        clip,
+        diagnostics,
+        source_end_sec=20.0,
+    )
+    plan = pipeline_module._acoustic_boundary_plan(
+        transcript,
+        clip,
+        {},
+        speech_bounds=(10.0, 20.0),
+        search_limits=(start, end),
+    )
+
+    assert error is None
+    assert (start, end) == (4.0, 20.0)
+    assert plan == (10.0, 20.0, True, False, True, False)
+
+
 def test_nonlexical_end_progresses_from_required_speech_to_next_cue_fence() -> None:
     transcript = {
         "source": "supadata",
@@ -2641,7 +2685,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v10"
+        assert context["selection_contract_version"] == "quality_silence_v11"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

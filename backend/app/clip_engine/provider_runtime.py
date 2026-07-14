@@ -676,6 +676,7 @@ class GenerationContext:
         if stage:
             record_metadata["stage"] = str(stage)
         for field_name in (
+            "video_id",
             "latency_ms",
             "retries",
             "finish_reason",

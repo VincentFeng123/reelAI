@@ -34,7 +34,7 @@ PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 # Gemini rejects manually configured deadlines below ten seconds.
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 10_000
 PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 1_024
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 3
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 4
 # An expansion can be nearly one segment-cache lifetime old when it discovers a
 # newly analyzed source. Keeping it for two lifetimes guarantees that source's
 # subsequent valid segment-cache lifetime never triggers another expansion call.
@@ -56,13 +56,14 @@ Do this:
 4. Preserve the user's named subject, task, and requested relationship. Cover close synonyms,
    genuinely related informational facets, useful prerequisites, and educational sources, but
    never redirect the search into a merely adjacent field.
-5. After the corrected literal query, prioritize substantive spoken lessons, lectures, or worked
+5. In the optimized query list, prioritize substantive spoken lessons, lectures, or worked
    explanations with natural pauses and little or no background music. Avoid Shorts, reaction
    videos, compilations, montages, and explanations that only work when unseen visuals are shown.
 6. Preserve comparisons, causes, misconceptions, identification tasks, and worked-example intent
    in every query where the user requested them.
 
-Return only the requested JSON object. Put the corrected topic first in queries."""
+Return only the requested JSON object. Keep corrected separate from queries. Return N
+optimized search queries; do not automatically spend one query on the raw literal wording."""
 
 
 def literal_fallback(topic: str, n: int) -> dict:
@@ -133,7 +134,7 @@ def _read_cached_expansion(cache_key: str, count: int) -> dict | None:
         return None
     corrected = " ".join(str(payload.get("corrected") or "").split())
     queries = _normalize(raw_queries, count)
-    if not corrected or not queries or _key(corrected) != _key(queries[0]):
+    if not corrected or not queries:
         return None
     return {
         "corrected": corrected,
@@ -411,7 +412,7 @@ def expand_query_practice_fast(
             raw = _practice_fast_gemini_raw(topic, count, **kwargs)
             parsed = _PracticeFastExpansion.model_validate_json(raw)
             corrected = " ".join(str(parsed.corrected or topic).split()) or topic
-            queries = _normalize([corrected, *parsed.queries], count)
+            queries = _normalize(parsed.queries, count)
             if not queries:
                 raise ValueError("Gemini returned no usable search queries")
             raise_if_cancelled(should_cancel)

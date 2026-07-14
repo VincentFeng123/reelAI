@@ -422,7 +422,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         baseline = json.loads(row[0])
         baseline.update({
-            "selection_contract_version": "quality_silence_v10",
+            "selection_contract_version": "quality_silence_v11",
             "self_contained": True,
             "is_standalone": True,
             "topic_evidence_quote": (

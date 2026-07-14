@@ -747,7 +747,7 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("low", 12_288, 60.0, "flash_boundary_selector", "gemini-3.5-flash")),
+         ("low", 12_288, 90.0, "flash_boundary_selector", "gemini-3.5-flash")),
         (G.PRO_BOUNDARY_PROFILE,
          ("high", 12_288, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
