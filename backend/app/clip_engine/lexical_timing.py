@@ -8,6 +8,7 @@ all fail closed.
 from __future__ import annotations
 
 import asyncio
+from difflib import SequenceMatcher
 import json
 import math
 import re
@@ -31,6 +32,11 @@ MAX_FETCH_TIMEOUT_SEC = 2.0
 MAX_AUTHORITATIVE_TRACKS = 2
 MAX_JSON3_BYTES = 8 * 1024 * 1024
 CUE_TIME_TOLERANCE_SEC = 0.05
+APPROXIMATE_QUOTE_MIN_TOKENS = 4
+APPROXIMATE_QUOTE_MIN_EXACT_TOKENS = 3
+APPROXIMATE_QUOTE_MIN_CHARACTER_SCORE = 0.82
+APPROXIMATE_QUOTE_MIN_EDGE_SCORE = 0.82
+APPROXIMATE_QUOTE_MIN_MARGIN = 0.04
 _WORD_RE = re.compile(r"[^\W_]+(?:['\-][^\W_]+)*", re.UNICODE)
 _APOSTROPHES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u02bc": "'"})
 
@@ -382,6 +388,103 @@ def _sequence_matches(haystack: Sequence[str], needle: Sequence[str]) -> list[in
     ]
 
 
+def _token_key(value: str) -> str:
+    """Collapse punctuation and compound separators for cross-ASR comparison."""
+    return "".join(character for character in value if character.isalnum())
+
+
+def _character_score(left: Sequence[str], right: Sequence[str]) -> float:
+    left_text = "".join(_token_key(token) for token in left)
+    right_text = "".join(_token_key(token) for token in right)
+    if not left_text or not right_text:
+        return 0.0
+    return SequenceMatcher(None, left_text, right_text, autojunk=False).ratio()
+
+
+def _token_lcs_length(left: Sequence[str], right: Sequence[str]) -> int:
+    left_keys = tuple(_token_key(token) for token in left)
+    right_keys = tuple(_token_key(token) for token in right)
+    previous = [0] * (len(right_keys) + 1)
+    for left_token in left_keys:
+        current = [0]
+        for index, right_token in enumerate(right_keys, start=1):
+            if left_token and left_token == right_token:
+                current.append(previous[index - 1] + 1)
+            else:
+                current.append(max(previous[index], current[-1]))
+        previous = current
+    return previous[-1]
+
+
+def _approximate_quote_span(
+    timed_tokens: Sequence[str],
+    quote_tokens: Sequence[str],
+    *,
+    edge: Edge,
+    cue_neighbor: str,
+) -> tuple[int, int] | None:
+    """Find one strong edge-preserving ASR match without inventing timing.
+
+    Supadata and YouTube JSON3 often disagree on compounds or one inflected
+    word.  A candidate still needs at least three exact ordered tokens, strong
+    character agreement, a strong match on the actual cut-edge word, and one
+    unambiguous timed anchor.  Returned indices always refer to real JSON3
+    words; no word onset is interpolated.
+    """
+
+    quote_width = len(quote_tokens)
+    if quote_width < APPROXIMATE_QUOTE_MIN_TOKENS:
+        return None
+    minimum_exact = max(
+        APPROXIMATE_QUOTE_MIN_EXACT_TOKENS,
+        math.ceil(quote_width * 0.6),
+    )
+    minimum_width = max(2, quote_width - 2)
+    maximum_width = min(len(timed_tokens), quote_width + 2)
+    by_anchor: dict[int, tuple[float, int, int]] = {}
+
+    for width in range(minimum_width, maximum_width + 1):
+        for start in range(0, len(timed_tokens) - width + 1):
+            end = start + width
+            if edge == "start" and start == 0:
+                continue
+            if edge == "end" and end >= len(timed_tokens):
+                continue
+            window = timed_tokens[start:end]
+            edge_score = _character_score(
+                (quote_tokens[0] if edge == "start" else quote_tokens[-1],),
+                (window[0] if edge == "start" else window[-1],),
+            )
+            if edge_score < APPROXIMATE_QUOTE_MIN_EDGE_SCORE:
+                continue
+            exact_tokens = _token_lcs_length(quote_tokens, window)
+            if exact_tokens < minimum_exact:
+                continue
+            character_score = _character_score(quote_tokens, window)
+            if character_score < APPROXIMATE_QUOTE_MIN_CHARACTER_SCORE:
+                continue
+            excluded_token = timed_tokens[start - 1] if edge == "start" else timed_tokens[end]
+            neighbor_score = _character_score((cue_neighbor,), (excluded_token,))
+            score = (
+                0.70 * character_score
+                + 0.20 * (exact_tokens / quote_width)
+                + 0.08 * edge_score
+                + 0.02 * neighbor_score
+            )
+            anchor_index = start if edge == "start" else end - 1
+            current = by_anchor.get(anchor_index)
+            candidate = (score, start, end)
+            if current is None or candidate > current:
+                by_anchor[anchor_index] = candidate
+
+    ranked = sorted(by_anchor.values(), reverse=True)
+    if not ranked:
+        return None
+    if len(ranked) > 1 and ranked[0][0] - ranked[1][0] < APPROXIMATE_QUOTE_MIN_MARGIN:
+        return None
+    return ranked[0][1], ranked[0][2]
+
+
 def align_edge_anchor(
     words: Sequence[LexicalWord],
     *,
@@ -395,9 +498,10 @@ def align_edge_anchor(
 
     ``start`` returns the first required quote onset and requires a nonempty
     excluded cue prefix.  ``end`` returns the first excluded suffix onset and
-    requires a nonempty excluded cue suffix.  The quote and its immediately
-    excluded neighbor must both match; unrelated provider drift elsewhere in a
-    coarse cue cannot invalidate an otherwise corroborated edge.
+    requires a nonempty excluded cue suffix. Exact quotes are preferred; a
+    unique, edge-preserving approximate match tolerates minor ASR spelling and
+    compound drift. The excluded neighbor must have a real onset, but its text
+    may differ between providers.
     """
 
     if edge not in {"start", "end"}:
@@ -432,25 +536,35 @@ def align_edge_anchor(
     timed.sort(key=lambda word: word.onset_sec)
     timed_tokens = [_tokens(word.text)[0] for word in timed]
     timed_quote_matches = _sequence_matches(timed_tokens, quote_tokens)
-    if len(timed_quote_matches) != 1:
+    if len(timed_quote_matches) == 1:
+        timed_quote_start = timed_quote_matches[0]
+        timed_quote_end = timed_quote_start + len(quote_tokens)
+    elif timed_quote_matches:
         return None
-    timed_quote_start = timed_quote_matches[0]
-    timed_quote_end = timed_quote_start + len(quote_tokens)
+    else:
+        cue_neighbor = (
+            cue_tokens[quote_start_index - 1]
+            if edge == "start"
+            else cue_tokens[quote_end_index]
+        )
+        approximate_span = _approximate_quote_span(
+            timed_tokens,
+            quote_tokens,
+            edge=edge,
+            cue_neighbor=cue_neighbor,
+        )
+        if approximate_span is None:
+            return None
+        timed_quote_start, timed_quote_end = approximate_span
     quote_start_word = timed[timed_quote_start]
     quote_last_word = timed[timed_quote_end - 1]
     if edge == "start":
-        if (
-            timed_quote_start == 0
-            or timed_tokens[timed_quote_start - 1] != cue_tokens[quote_start_index - 1]
-        ):
+        if timed_quote_start == 0:
             return None
         excluded_neighbor = timed[timed_quote_start - 1]
         anchor = quote_start_word.onset_sec
     else:
-        if (
-            timed_quote_end >= len(timed)
-            or timed_tokens[timed_quote_end] != cue_tokens[quote_end_index]
-        ):
+        if timed_quote_end >= len(timed):
             return None
         excluded_neighbor = timed[timed_quote_end]
         anchor = excluded_neighbor.onset_sec

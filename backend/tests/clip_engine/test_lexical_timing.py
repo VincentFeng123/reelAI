@@ -605,13 +605,149 @@ def test_alignment_tolerates_provider_drift_away_from_verified_edge(
     assert anchor.anchor_sec == (3.0 if edge == "start" else 8.0)
 
 
+def test_end_alignment_tolerates_caption_compound_drift() -> None:
+    words = [
+        _word("called", 1.0),
+        _word("the", 2.0),
+        _word("intermembrane", 3.0),
+        _word("space", 4.0),
+        _word("atp", 5.0),
+    ]
+
+    anchor = align_edge_anchor(
+        words,
+        cue_text="called the inter membrane space. ATP is generated here.",
+        quote="called the inter membrane space",
+        edge="end",
+        cue_start_sec=0.5,
+        cue_end_sec=5.5,
+    )
+
+    assert anchor is not None
+    assert anchor.quote_start_sec == 1.0
+    assert anchor.quote_last_onset_sec == 4.0
+    assert anchor.excluded_neighbor_onset_sec == 5.0
+
+
+def test_end_alignment_tolerates_one_interior_asr_word_drift() -> None:
+    words = [
+        _word("phosphor", 1.0),
+        _word("adp", 2.0),
+        _word("to", 3.0),
+        _word("generate", 4.0),
+        _word("atp", 5.0),
+        _word("atp", 6.0),
+        _word("synthes", 7.0),
+    ]
+
+    anchor = align_edge_anchor(
+        words,
+        cue_text=(
+            "phosphorylating ADP to generate ATP. ATP synthase has a "
+            "fascinating structure."
+        ),
+        quote="phosphorylating ADP to generate ATP",
+        edge="end",
+        cue_start_sec=0.5,
+        cue_end_sec=7.5,
+    )
+
+    assert anchor is not None
+    assert anchor.quote_start_sec == 1.0
+    assert anchor.quote_last_onset_sec == 5.0
+    assert anchor.excluded_neighbor_onset_sec == 6.0
+
+
+def test_start_alignment_tolerates_one_interior_asr_word_drift() -> None:
+    anchor = align_edge_anchor(
+        [
+            _word("intro", 1.0),
+            _word("oxidative", 2.0),
+            _word("phosphorilation", 3.0),
+            _word("drives", 4.0),
+            _word("atp", 5.0),
+        ],
+        cue_text="Welcome. Oxidative phosphorylation drives ATP production.",
+        quote="Oxidative phosphorylation drives ATP",
+        edge="start",
+        cue_start_sec=0.5,
+        cue_end_sec=5.5,
+    )
+
+    assert anchor is not None
+    assert anchor.quote_start_sec == 2.0
+    assert anchor.quote_last_onset_sec == 5.0
+    assert anchor.excluded_neighbor_onset_sec == 1.0
+
+
+def test_exact_quote_alignment_tolerates_excluded_neighbor_word_drift() -> None:
+    anchor = align_edge_anchor(
+        [
+            _word("hello", 1.0),
+            _word("python", 2.0),
+            _word("functions", 3.0),
+            _word("package", 4.0),
+        ],
+        cue_text="Welcome. Python functions package reusable instructions.",
+        quote="Python functions package",
+        edge="start",
+        cue_start_sec=0.5,
+        cue_end_sec=4.5,
+    )
+
+    assert anchor is not None
+    assert anchor.anchor_sec == 2.0
+    assert anchor.excluded_neighbor_onset_sec == 1.0
+
+
+def test_approximate_alignment_still_requires_the_cut_edge_word() -> None:
+    assert align_edge_anchor(
+        [
+            _word("phosphor", 1.0),
+            _word("adp", 2.0),
+            _word("to", 3.0),
+            _word("generate", 4.0),
+            _word("energy", 5.0),
+            _word("thanks", 6.0),
+        ],
+        cue_text="phosphorylating ADP to generate ATP. Thanks.",
+        quote="phosphorylating ADP to generate ATP",
+        edge="end",
+        cue_start_sec=0.5,
+        cue_end_sec=6.5,
+    ) is None
+
+
+def test_approximate_alignment_fails_closed_for_two_equal_edge_anchors() -> None:
+    assert align_edge_anchor(
+        [
+            _word("phosphor", 1.0),
+            _word("adp", 2.0),
+            _word("to", 3.0),
+            _word("generate", 4.0),
+            _word("atp", 5.0),
+            _word("next", 6.0),
+            _word("phosphor", 7.0),
+            _word("adp", 8.0),
+            _word("to", 9.0),
+            _word("generate", 10.0),
+            _word("atp", 11.0),
+            _word("thanks", 12.0),
+        ],
+        cue_text="Intro. phosphorylating ADP to generate ATP. Thanks.",
+        quote="phosphorylating ADP to generate ATP",
+        edge="end",
+        cue_start_sec=0.5,
+        cue_end_sec=12.5,
+    ) is None
+
+
 @pytest.mark.parametrize(
     ("edge", "words"),
     [
         (
             "start",
             [
-                _word("different", 1),
                 _word("python", 2),
                 _word("functions", 3),
                 _word("package", 4),
@@ -622,7 +758,6 @@ def test_alignment_tolerates_provider_drift_away_from_verified_edge(
             [
                 _word("reusable", 1),
                 _word("instructions", 2),
-                _word("different", 3),
             ],
         ),
     ],
