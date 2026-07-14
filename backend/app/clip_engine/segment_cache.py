@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 SEGMENT_CACHE_VERSION = 5
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v3"
+SELECTION_CONTRACT_VERSION = "quality_silence_v4"
 
 
 def _canonical_json(value: Any) -> str:
@@ -154,7 +154,7 @@ def _valid_clips(
         return None
     transcript_start, transcript_end = bounds
     clips: list[dict[str, Any]] = []
-    previous_order: tuple[float, float, float, str] | None = None
+    previous_order: tuple[int, float, float, float, float, float, str] | None = None
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, dict):
             return None
@@ -172,6 +172,8 @@ def _valid_clips(
         try:
             start = float(raw.get("start"))
             end = float(raw.get("end"))
+            required_start = float(raw.get("required_first_speech_sec", start))
+            required_end = float(raw.get("required_last_speech_sec", end))
             informativeness, topic_relevance, educational_importance, difficulty = (
                 float(score) for score in score_values
             )
@@ -202,8 +204,15 @@ def _valid_clips(
                 for offset in range(len(window_words) - evidence_width + 1)
             )
         )
+        difficulty_stage = 0 if difficulty < 0.34 else 1 if difficulty < 0.67 else 2
+        quality_floor = min(informativeness, topic_relevance, educational_importance)
+        quality_mean = (
+            informativeness + topic_relevance + educational_importance
+        ) / 3.0
         order_key = (
-            difficulty,
+            difficulty_stage,
+            -quality_floor,
+            -quality_mean,
             -topic_relevance,
             start,
             end,
@@ -215,6 +224,8 @@ def _valid_clips(
                 for number in (
                     start,
                     end,
+                    required_start,
+                    required_end,
                     informativeness,
                     topic_relevance,
                     educational_importance,
@@ -225,6 +236,9 @@ def _valid_clips(
             or end > transcript_end + 0.001
             or (previous_order is not None and order_key < previous_order)
             or end <= start
+            or required_start < start
+            or required_end > end
+            or required_end <= required_start
             or not 0 <= informativeness <= 1
             or not 0 <= topic_relevance <= 1
             or not 0 <= educational_importance <= 1

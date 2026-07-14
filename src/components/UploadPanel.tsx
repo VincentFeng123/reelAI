@@ -85,6 +85,17 @@ type MaterialSeed = {
   updatedAt: number;
 };
 
+function pairFulfilledTopicMaterials(
+  topics: string[],
+  settled: PromiseSettledResult<Awaited<ReturnType<typeof uploadMaterial>>>[],
+): Array<{ topic: string; materialId: string }> {
+  return settled.flatMap((result, index) => {
+    const topic = String(topics[index] || "").trim();
+    const materialId = result.status === "fulfilled" ? String(result.value.material_id || "").trim() : "";
+    return topic && materialId ? [{ topic, materialId }] : [];
+  });
+}
+
 type MaterialGroup = {
   materialIds: string[];
   title?: string;
@@ -439,6 +450,7 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         fileName: fileValue?.name ?? "",
       });
       let materialIds: string[] = [];
+      let fulfilledTopicMaterials: Array<{ topic: string; materialId: string }> = [];
       if (inputMode === "topic" && topicList.length > 1) {
         // Multi-topic: accept partial success. A failed upload for one topic
         // must not orphan successfully-created materials for the others —
@@ -449,13 +461,10 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         if (controller.signal.aborted) {
           return;
         }
-        const succeededIds = settled
-          .map((result) =>
-            result.status === "fulfilled" ? result.value.material_id : "",
-          )
-          .filter((id): id is string => Boolean(id));
-        const failedCount = settled.filter((r) => r.status === "rejected").length;
-        if (succeededIds.length === 0) {
+        fulfilledTopicMaterials = pairFulfilledTopicMaterials(topicList, settled);
+        materialIds = fulfilledTopicMaterials.map(({ materialId }) => materialId);
+        const failedCount = settled.length - fulfilledTopicMaterials.length;
+        if (materialIds.length === 0) {
           throw new Error(
             failedCount > 0
               ? `All ${failedCount} topic upload${failedCount > 1 ? "s" : ""} failed.`
@@ -466,10 +475,9 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
           // Log-only: the user proceeds into the feed with the subset that
           // worked rather than losing every successful upload.
           console.warn(
-            `${failedCount} of ${topicList.length} topic uploads failed; continuing with ${succeededIds.length}.`,
+            `${failedCount} of ${topicList.length} topic uploads failed; continuing with ${materialIds.length}.`,
           );
         }
-        materialIds = succeededIds;
       } else {
         const material = await uploadMaterial({
           text: textValue || undefined,
@@ -493,12 +501,8 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));
         const now = Date.now();
         if (inputMode === "topic" && topicList.length > 1) {
-          materialIds.forEach((id, index) => {
-            const topic = topicList[index]?.trim();
-            if (!id || !topic) {
-              return;
-            }
-            seeds[id] = {
+          fulfilledTopicMaterials.forEach(({ topic, materialId }, index) => {
+            seeds[materialId] = {
               topic,
               text: undefined,
               title: topic,

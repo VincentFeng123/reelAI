@@ -1197,8 +1197,9 @@ class ReelService:
     # v13: full caption text and the current transcript-semantic surfaceability
     # gates must be recomputed instead of replaying pre-gate cached rows.
     # v14: discard rows accepted only by the retired -24 dBFS adaptive verifier.
-    RANKED_FEED_CACHE_VERSION = 16
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v3"
+    # v17: retain public source identity and authoritative selector relevance.
+    RANKED_FEED_CACHE_VERSION = 17
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v4"
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -2374,6 +2375,11 @@ class ReelService:
             "captions": captions,
             "score": float(getattr(reel_obj, "score", 0.0) or 0.0),
             "relevance_score": getattr(reel_obj, "relevance_score", None),
+            "topic_relevance": getattr(
+                reel_obj,
+                "selection_topic_relevance",
+                getattr(reel_obj, "topic_relevance", None),
+            ),
             "discovery_score": float(getattr(reel_obj, "discovery_score", None) or 0.0),
             "clipability_score": float(getattr(reel_obj, "clipability_score", None) or 0.0),
             "query_strategy": getattr(reel_obj, "query_strategy", "") or "",
@@ -2427,21 +2433,13 @@ class ReelService:
             return []
         if all(
             str(reel.get("selection_contract_version") or "").strip()
-            == "quality_silence_v3"
+            in {"quality_silence_v3", "quality_silence_v4"}
             for reel in generated
         ):
             ordered = sorted(
                 enumerate(generated),
-                key=lambda pair: (
-                    self._difficulty(pair[1]),
-                    -float(
-                        pair[1].get("_selection_topic_relevance")
-                        if pair[1].get("_selection_topic_relevance") is not None
-                        else pair[1].get("relevance_score") or 0.0
-                    ),
-                    int(pair[1].get("_selection_source_rank") or 0),
-                    float(pair[1].get("t_start") or 0.0),
-                    pair[0],
+                key=lambda pair: self._selection_contract_sort_key(
+                    pair[1], input_order=pair[0]
                 ),
             )
             return [
@@ -5504,6 +5502,16 @@ class ReelService:
         except (TypeError, ValueError):
             return 0.5
 
+    @classmethod
+    def _selection_difficulty_stage(cls, item: dict[str, Any]) -> int:
+        """Return the selector's non-overlapping beginner/intermediate/advanced bin."""
+        difficulty = cls._difficulty(item)
+        if difficulty < 0.34:
+            return 0
+        if difficulty < 0.67:
+            return 1
+        return 2
+
     @staticmethod
     def _selection_number(value: Any, default: float = 0.0) -> float:
         try:
@@ -5511,6 +5519,72 @@ class ReelService:
         except (TypeError, ValueError):
             parsed = float(default)
         return max(0.0, min(1.0, parsed))
+
+    @classmethod
+    def _selection_contract_sort_key(
+        cls,
+        item: dict[str, Any],
+        *,
+        input_order: int = 0,
+    ) -> tuple[int, float, float, float, int, float, int]:
+        """Rank value within a difficulty stage, with deterministic fallbacks."""
+        compatibility_score = cls._selection_number(
+            item.get("_selection_content_score"), 0.0
+        )
+        raw_informativeness = item.get("_selection_informativeness")
+        if raw_informativeness is None:
+            raw_informativeness = item.get("informativeness")
+        raw_topic_relevance = item.get("_selection_topic_relevance")
+        if raw_topic_relevance is None:
+            raw_topic_relevance = item.get("topic_relevance")
+        raw_importance = item.get("_selection_educational_importance")
+        raw_quality_mean = item.get("_selection_quality_mean")
+        if (
+            raw_importance is None
+            and raw_quality_mean is not None
+            and raw_informativeness is not None
+            and raw_topic_relevance is not None
+        ):
+            raw_importance = (
+                3.0 * cls._selection_number(raw_quality_mean)
+                - cls._selection_number(raw_informativeness)
+                - cls._selection_number(raw_topic_relevance)
+            )
+        selector_values = [
+            cls._selection_number(value)
+            for value in (
+                raw_informativeness,
+                raw_topic_relevance,
+                raw_importance,
+            )
+            if value is not None
+        ]
+        if len(selector_values) == 3:
+            quality_floor = min(selector_values)
+            quality_mean = sum(selector_values) / len(selector_values)
+        else:
+            quality_floor = cls._selection_number(
+                item.get("_selection_quality_floor"), compatibility_score
+            )
+            quality_mean = cls._selection_number(
+                item.get("_selection_quality_mean"), quality_floor
+            )
+        topic_relevance = cls._selection_number(
+            raw_topic_relevance, compatibility_score
+        )
+        try:
+            source_rank = max(0, int(item.get("_selection_source_rank") or 0))
+        except (TypeError, ValueError):
+            source_rank = 0
+        return (
+            cls._selection_difficulty_stage(item),
+            -quality_floor,
+            -quality_mean,
+            -topic_relevance,
+            source_rank,
+            float(item.get("t_start") or 0.0),
+            int(input_order),
+        )
 
     @classmethod
     def _selection_metadata(cls, value: Any) -> dict[str, Any]:
@@ -5613,11 +5687,19 @@ class ReelService:
         ).strip().lower()
         metadata["_selection_directly_teaches_topic"] = selection_bool(
             "directly_teaches_topic",
-            version not in {"quality_silence_v2", "quality_silence_v3"},
+            version not in {
+                "quality_silence_v2",
+                "quality_silence_v3",
+                "quality_silence_v4",
+            },
         )
         metadata["_selection_substantive"] = selection_bool(
             "substantive",
-            version not in {"quality_silence_v2", "quality_silence_v3"},
+            version not in {
+                "quality_silence_v2",
+                "quality_silence_v3",
+                "quality_silence_v4",
+            },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
             "factually_grounded", False
@@ -5741,24 +5823,15 @@ class ReelService:
                 if not eligible:
                     return []
 
-            def priority(
-                node_id: str,
-            ) -> tuple[float, float, int, float, int]:
-                row = nodes[node_id]
-                compatibility_score = self._selection_number(
-                    row.get("_selection_content_score"), 0.0
-                )
-                return (
-                    -self._difficulty(row),
-                    self._selection_number(
-                        row.get("_selection_topic_relevance"), compatibility_score
+            chosen_id = min(
+                eligible,
+                key=lambda node_id: self._selection_contract_sort_key(
+                    nodes[node_id],
+                    input_order=int(
+                        nodes[node_id].get("_selection_input_order") or 0
                     ),
-                    -int(row.get("_selection_source_rank") or 0),
-                    -float(row.get("t_start") or 0.0),
-                    -int(row.get("_selection_input_order") or 0),
-                )
-
-            chosen_id = max(eligible, key=priority)
+                ),
+            )
             chosen = nodes[chosen_id]
             ordered.append(chosen)
             remaining.remove(chosen_id)
@@ -7086,7 +7159,7 @@ class ReelService:
                     self._difficulty(row),
                     str(progress.get("selected_level") or "beginner"),
                 )
-                if selection_version == "quality_silence_v3"
+                if selection_version in {"quality_silence_v3", "quality_silence_v4"}
                 else legacy_difficulty_matches_level
             )
             deferred_level_ready = bool(
@@ -7106,7 +7179,7 @@ class ReelService:
             ):
                 continue
             if (
-                selection_version == "quality_silence_v3"
+                selection_version in {"quality_silence_v3", "quality_silence_v4"}
                 and not difficulty_matches_level
             ):
                 continue
@@ -7125,6 +7198,7 @@ class ReelService:
                 if selection_version in {
                     "quality_silence_v2",
                     "quality_silence_v3",
+                    "quality_silence_v4",
                 } and (
                     (
                         min(
@@ -7390,6 +7464,20 @@ class ReelService:
             selection_topic_relevance = self._selection_number(
                 clean_item.get("_selection_topic_relevance"), 0.0
             )
+            selection_informativeness = clean_item.get(
+                "_selection_informativeness"
+            )
+            if selection_informativeness is not None:
+                selection_informativeness = self._selection_number(
+                    selection_informativeness
+                )
+            selection_educational_importance = clean_item.get(
+                "_selection_educational_importance"
+            )
+            if selection_educational_importance is not None:
+                selection_educational_importance = self._selection_number(
+                    selection_educational_importance
+                )
             selection_source_rank = int(
                 clean_item.get("_selection_source_rank") or 0
             )
@@ -7404,9 +7492,18 @@ class ReelService:
                 clean_item["selection_contract_version"] = (
                     selection_contract_version
                 )
+                clean_item["topic_relevance"] = selection_topic_relevance
                 clean_item["_selection_quality_floor"] = selection_quality_floor
                 clean_item["_selection_quality_mean"] = selection_quality_mean
                 clean_item["_selection_topic_relevance"] = selection_topic_relevance
+                if selection_informativeness is not None:
+                    clean_item["_selection_informativeness"] = (
+                        selection_informativeness
+                    )
+                if selection_educational_importance is not None:
+                    clean_item["_selection_educational_importance"] = (
+                        selection_educational_importance
+                    )
                 clean_item["_selection_source_rank"] = selection_source_rank
             # Keep video_id on the response row so downstream filters (notably
             # main._ranked_request_reels's exclude_video_ids filter) can match

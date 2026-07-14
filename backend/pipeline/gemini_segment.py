@@ -42,18 +42,54 @@ CancelledCb = Optional[Callable[[], bool]]
 log = logging.getLogger("clipper.segment")
 
 _WORD_RE = re.compile(r"[a-z0-9']+", re.IGNORECASE)
+_CandidateId = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)
+]
+_BoundaryQuote = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=180)
+]
+_ClipTitle = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
+]
+_LearningObjective = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=240)
+]
+_Facet = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)
+]
+_EvidenceQuote = Annotated[
+    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=480)
+]
+_OptionalReason = Annotated[
+    str, StringConstraints(strip_whitespace=True, max_length=240)
+]
 _STRUCTURAL_FILLER_RE = re.compile(
-    r"\b(?:welcome(?: back)?(?: to)?|thanks? for watching|have a great day|"
-    r"see you next time|like and subscribe|please subscribe|"
-    r"subscribe to (?:this|the|my|our) channel|sponsored by|"
-    r"today'?s sponsor|we (?:made|have) (?:a|an|another|whole) video "
-    r"(?:about|explaining|on)|check out (?:our|the) video|"
-    r"my name is|in this (?:video|lesson|course) we(?:['’]ll| will)|"
+    r"(?:\b(?:thanks? for watching|have a great day|see you next time|"
+    r"like and subscribe|please subscribe|"
+    r"subscribe to (?:this|the|my|our) channel|today'?s sponsor|"
+    r"check out (?:our|the) video|"
+    r"administrative (?:note|announcement)|course (?:administration|logistics)|"
+    r"(?:a\s+)?(?:quick|brief|short) (?:aside|tangent)|"
+    r"(?<!\bare )(?<!\bis )(?<!\bwere )(?<!\byou are )(?<!\byou['’]re )"
+    r"\bwelcome(?:\s+back)?(?:\s+to\b|(?=[!,.]|\s*$))|"
+    r"in this (?:video|lesson|course) we(?:['’]ll| will)|"
     r"before we (?:begin|get started)|let(?:['’]?s| us) move on|"
-    r"next we(?:['’]ll| will)|to (?:recap|summarize)|in summary|"
-    r"we (?:are|'re) reaching (?:a|the) crossroad now|"
-    r"we(?:['’]ve| have) already (?:done|covered|finished)\b.{0,80}|"
-    r"cover (?:that|this) in (?:this|the) course)\b",
+    r"next we(?:['’]ll| will)|cover (?:that|this) in (?:this|the) course)\b|"
+    r"(?:^|[.!?]\s+)(?:(?:all right|alright|okay|ok|so|now|well|yeah)"
+    r"\s*[,;:]?\s+)*(?:"
+    r"sponsored by\b|"
+    r"we (?:made|have) (?:a|an|another|whole) video "
+    r"(?:about|explaining|on)\b|my name is\b|"
+    r"to (?:recap|summarize)(?:\s*[,;:]|\s*$)|"
+    r"in summary(?:\s*[,;:]|\s+(?=(?:we|the|this|these|there|our|a|an)\b))|"
+    r"we (?:are|'re) reaching (?:a|the) crossroad now\b|"
+    r"we(?:['’]ve| have) already (?:done|covered|finished)\b.{0,80}))",
+    re.IGNORECASE,
+)
+_INTERNAL_INTERRUPTION_MARKER_RE = re.compile(
+    r"\b(?:today'?s sponsor|sponsored by|administrative (?:note|announcement)|"
+    r"course (?:administration|logistics)|(?:a\s+)?(?:quick|brief|short) "
+    r"(?:aside|tangent)|housekeeping)\b",
     re.IGNORECASE,
 )
 _VISUAL_DEPENDENCY_RE = re.compile(
@@ -148,12 +184,15 @@ _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
 _SELECTION_OUTPUT_TOKENS = 24_576
-_BOUNDARY_OUTPUT_TOKENS = 8_192
+_BOUNDARY_OUTPUT_TOKENS = 12_288
 _BOUNDARY_REPAIR_OUTPUT_TOKENS = 1_024
 _ENRICH_OUTPUT_TOKENS = 2_048
 _MAX_CLIPS = 40
 _GREEN_SCORE = 0.75
 _DUPLICATE_OVERLAP = 0.8
+_MAX_INTERNAL_FILLER_BLOCKS = 1
+_MAX_INTERNAL_FILLER_DURATION_S = 12.0
+_MAX_INTERNAL_FILLER_WORDS = 32
 _SECTION_RESET_GAP_S = 8.0
 _BOUNDARY_PAD_S = 0.3
 _REPAIR_NEIGHBOR_CUES = 2
@@ -208,15 +247,15 @@ class _AssessmentDraft(_StrictModel):
 
 
 class _BoundaryTopic(_StrictModel):
-    candidate_id: _NonBlank
+    candidate_id: _CandidateId
     start_line: int = Field(ge=0, strict=True)
     end_line: int = Field(ge=0, strict=True)
-    start_quote: _NonBlank
-    end_quote: _NonBlank
-    title: _NonBlank
-    learning_objective: _NonBlank
-    facet: _NonBlank
-    reason: _NonBlank
+    start_quote: _BoundaryQuote
+    end_quote: _BoundaryQuote
+    title: _ClipTitle
+    learning_objective: _LearningObjective
+    facet: _Facet
+    reason: _OptionalReason = ""
     informativeness: float = Field(ge=0.0, le=1.0, strict=True)
     topic_relevance: float = Field(ge=0.0, le=1.0, strict=True)
     educational_importance: float = Field(ge=0.0, le=1.0, strict=True)
@@ -224,12 +263,12 @@ class _BoundaryTopic(_StrictModel):
     directly_teaches_topic: bool = Field(strict=True)
     substantive: bool = Field(strict=True)
     factually_grounded: bool = Field(strict=True)
-    topic_evidence_quote: _NonBlank
+    topic_evidence_quote: _EvidenceQuote
     self_contained: bool = Field(strict=True)
     is_standalone: bool = Field(strict=True)
-    prerequisite_candidate_ids: list[_NonBlank] = Field(max_length=8)
-    uncertainty: Literal["low", "medium", "high"]
-    uncertainty_reasons: list[_UncertaintyReason] = Field(max_length=6)
+    prerequisite_candidate_ids: list[_CandidateId] = Field(default_factory=list, max_length=8)
+    uncertainty: Literal["low", "medium", "high"] = "low"
+    uncertainty_reasons: list[_UncertaintyReason] = Field(default_factory=list, max_length=6)
 
     @model_validator(mode="after")
     def _uncertainty_has_reason(self):
@@ -239,6 +278,7 @@ class _BoundaryTopic(_StrictModel):
 
 
 class _Topic(_BoundaryTopic):
+    reason: _NonBlank
     summary: _NonBlank
     takeaways: list[_NonBlank] = Field(min_length=2, max_length=4)
     match_reason: _NonBlank
@@ -257,7 +297,7 @@ class _Plan(_StrictModel):
 
 
 class _BoundaryPlan(_StrictModel):
-    topics: list[_BoundaryTopic]
+    topics: list[_BoundaryTopic] = Field(max_length=_MAX_CLIPS)
 
 
 class _BoundaryRepairItem(_StrictModel):
@@ -340,19 +380,26 @@ class _ProductionPlan(BaseModel):
 
 _POLICY_AND_EXAMPLES = """Policy:
 - First understand the whole transcript and the viewer's exact request. Return only
-  directly relevant, complete, substantive teaching units that make sense to a cold
-  viewer hearing the clip without seeing the original video.
+  related, complete, substantive teaching units that make sense to a cold viewer hearing
+  the clip without seeing the original video. Related includes the requested subject and
+  clearly useful prerequisite or supporting facets, not merely adjacent material.
 - Include every necessary setup or prerequisite through the explanation's natural
   conclusion. For a worked example, include the question or setup, reasoning, and answer.
 - Omit greetings, credentials, sponsors, administration, promos, transitions, previews,
   recaps, outros, jokes, tangents, repeated restatements, and partial explanations.
+- Keep starts and ends free of that filler. Never add filler or incomplete material at an
+  opening or ending. A brief nonessential aside inside an otherwise
+  valuable complete unit may remain when cutting around it would break the teaching arc;
+  never discard the whole unit solely for a short internal interruption.
 - Omit teaching that depends on a diagram, screen, gesture, drawing, or other missing
   visual context. Mark self_contained and is_standalone false for such material.
-- Exhaustively enumerate every distinct directly relevant teaching unit. Prefer an empty
+- Exhaustively enumerate every distinct related teaching unit, up to 40 per source. Prefer an empty
   slot to filler or an incomplete idea. Do not shorten a complete idea to fit a target
   length; clip duration is never a selection criterion.
 - Keep distinct informational facets from the same source. Do not return two clips that
   teach the same learning objective in different words.
+- Return every qualifying related unit, while scoring the densest, most useful, and most
+  central units highest so the application can prioritize them within difficulty stages.
 - Return a candidate when topic_relevance is at least 0.75 and the spoken unit satisfies
   every substantive, grounding, context, and filler rule. Informativeness and educational
   importance describe the unit but never exclude an otherwise valid relevant unit.
@@ -378,7 +425,17 @@ def _topic_rule(topic: str) -> str:
     topic = topic.strip()
     if not topic:
         return "No topic filter was supplied; return every substantive educational unit."
-    if "," in topic or ";" in topic:
+    if re.search(
+        r"\b(?:versus|vs\.?|compare(?:d|s|ing)?|comparison|contrast|difference between)\b|/",
+        topic,
+        flags=re.IGNORECASE,
+    ):
+        compound_rule = (
+            "For a comparison request, deeply teaching either requested side is relevant, "
+            "as is teaching their relationship. Return separate substantive units for either "
+            "side; do not require every candidate to repeat or compare both sides. "
+        )
+    elif "," in topic or ";" in topic:
         compound_rule = (
             "When the topic lists multiple requested ideas, a span directly matches when "
             "it deeply teaches any one requested component. Require a relationship between "
@@ -387,21 +444,27 @@ def _topic_rule(topic: str) -> str:
         )
     else:
         compound_rule = (
-            "When the topic names multiple linked ideas, the span must explain the requested "
-            "relationship or application between those ideas; teaching only one component "
-            "or a nearby prerequisite is not a direct match. "
+            "When the topic names multiple linked ideas, deeply teaching any one requested "
+            "component or a useful prerequisite facet is relevant. The selected speech or "
+            "its exact evidence quote must still anchor that facet to the named subject; a "
+            "broad word used in an unrelated domain is not enough. "
         )
     return (
-        f"The viewer is studying {topic!r}. Return only units that directly teach that "
-        "topic, and make each learning objective name the relevant idea. Set "
-        "directly_teaches_topic=true only when the selected transcript span itself teaches "
-        "the requested subject, not when it merely names the subject, course, institution, "
-        "or speaker. "
+        f"The viewer is studying {topic!r}. Return only units that teach that topic or a "
+        "clearly useful prerequisite/supporting facet, and make each learning objective name "
+        "the relevant idea. Set directly_teaches_topic=true for either a direct unit or an "
+        "explicitly topic-linked prerequisite/supporting unit. Set it false when the span "
+        "merely names the subject, course, institution, or speaker, or belongs to an adjacent "
+        "field without a useful connection to the request. "
         f"{compound_rule}"
         "When the topic requests "
         "identification, recognition, diagnosis, derivation, comparison, or application, "
-        "the span must teach or perform that task for the named object; its history or "
-        "definition alone is not a direct match."
+        "include units that teach or perform that task for the named object as well as "
+        "separate, explicitly topic-anchored prerequisite facets. A history or definition "
+        "alone is not a direct match to the requested task; return it only as a separate "
+        "facet when exact evidence anchors it to the named subject. Task fulfillment raises "
+        "educational importance and centrality; it does not exclude a genuinely related, "
+        "topic-anchored prerequisite facet."
         " Exclude fictional, supernatural, pseudoscientific, or invented mechanisms unless "
         "the viewer explicitly requested that fictional subject. Borrowing real academic "
         "terminology does not make an invented claim educational evidence."
@@ -433,12 +496,13 @@ def _learner_rule(level: str) -> str:
 def _selection_fields(*, enriched: bool) -> str:
     fields = (
         "candidate_id, start_line, end_line, start_quote, end_quote, title, "
-        "learning_objective, facet, reason, informativeness, topic_relevance, "
+        "learning_objective, facet, informativeness, topic_relevance, "
         "educational_importance, difficulty, directly_teaches_topic, substantive, "
         "factually_grounded, "
         "topic_evidence_quote (an exact 5-40 word quote copied from within the selected "
         "cue range that proves the clip teaches the topic), self_contained, is_standalone, "
-        "prerequisite_candidate_ids, uncertainty, uncertainty_reasons"
+        "prerequisite_candidate_ids (omit it or return []), uncertainty (omit for low), "
+        "uncertainty_reasons (omit for low)"
     )
     if enriched:
         fields += (
@@ -464,9 +528,10 @@ def _prompts(
     learner_rule = _learner_rule(learner_level)
     learner_line = f"{learner_rule}\n" if learner_rule else ""
     user = (
-        f"{_topic_rule(topic)}\n{learner_line}"
         f"Line IDs must be between 0 and {n - 1}.\n\n"
         f"Transcript ({n} lines, formatted `[index] MM:SS text`):\n{lines}\n\n"
+        f"Exact user request: {topic.strip() or '(all educational topics)'}\n"
+        f"{_topic_rule(topic)}\n{learner_line}"
         "Based on the preceding transcript, return the chronological educational units. "
         f"Every item must contain {_selection_fields(enriched=True)}. Return no item for "
         "material that is incomplete or non-educational."
@@ -487,46 +552,37 @@ def _boundary_prompts(
     )
     del learner_level
     user = (
-        f"{_topic_rule(topic)}\n"
-        f"Line IDs must be between 0 and {n - 1}.\n\n"
-        f"Transcript ({n} lines, formatted `[index] MM:SS text`):\n{lines}\n\n"
-        "Scan the whole transcript from first to last and return every distinct educational "
-        "unit that directly teaches the exact requested topic. Do not stop after finding one "
-        "good unit, and do not omit a valid niche fact, example, mechanism, comparison, or "
-        "conclusion merely because another unit is more central. Sequencing happens later. "
-        "For every moment, verify the displayed start/end timestamps before returning it. "
-        "Select the minimum complete span containing all necessary setup, reasoning, and the "
-        "natural conclusion, regardless of its duration. If a useful "
-        "section contains a greeting, channel plug, sponsor, or outro, select a complete "
-        "teaching unit before or after that interruption rather than including it. "
-        "Return every distinct qualifying moment the transcript supports. Never add filler "
-        "or incomplete material. Finish scanning the entire transcript before returning; "
-        "do not stop after an arbitrary count or return only the earliest units. Accept "
-        "moments when boundaries "
-        "and context have low or medium "
-        "uncertainty; omit only high-uncertainty moments. "
-        "Set substantive=true only for a real explanation, worked example, definition, "
-        "mechanism, comparison, or conclusion that teaches something useful. Omit greetings, "
-        "course logistics, speaker credentials, institutional framing, sponsors, previews, "
-        "and transitions even when they mention the topic. Also omit fictional, supernatural, "
-        "pseudoscientific, and invented mechanisms unless the requested topic explicitly asks "
-        "for that fiction; real terminology inside fictional lore is not a valid lesson. "
-        "Set factually_grounded=false for those invented claims and true only when the teaching "
-        "claim is academically sound within the requested subject. "
-        "A candidate is self-contained only when its spoken content is understandable without "
-        "a diagram, screen, gesture, drawing, slide, or other unseen visual. Omit candidates "
-        "that rely on those visuals. "
-        "Score educational_importance by centrality to the exact requested topic, but do not "
-        "use it or informativeness as an exclusion threshold. Omit a candidate only when "
-        "topic_relevance is below 0.75 or a substantive, grounding, context, visual, filler, "
-        "or standalone rule fails. Difficulty is metadata, not an eligibility filter. Score "
-        "difficulty only by assumed prior knowledge: 0.00-0.33 means beginner/no background, "
-        "0.34-0.66 means intermediate/foundational knowledge, and 0.67-1.00 means advanced or "
-        "specialist knowledge. Return units across that entire scale. "
-        "Use a unique candidate_id for every moment. Every returned moment must be standalone "
-        "and list no prerequisite candidate IDs; include required setup inside its own span. "
+        f"Transcript ({n} lines, formatted `[index] MM:SS text`; valid line IDs are "
+        f"0 through {n - 1}):\n{lines}\n\n"
+        f"Exact user request: {topic.strip() or '(all educational topics)'}\n"
+        f"{_topic_rule(topic)}\n\n"
+        "Task:\n"
+        "1. Understand the whole transcript before selecting anything; scan the whole "
+        "transcript from first to last.\n"
+        "2. Map every distinct educational unit related to the exact request, including "
+        "niche facts, useful prerequisite facets, examples, mechanisms, comparisons, and "
+        "conclusions. Return every distinct qualifying moment, up to 40 for this source; "
+        "do not stop after the first few units or at an arbitrary count below that cap.\n"
+        "3. For every qualifying unit, verify its timestamps and choose the minimum complete "
+        "span containing necessary setup, reasoning, and the natural conclusion, regardless "
+        "of its duration. Keep opening and ending edges clean. Split around a substantial "
+        "interruption, but keep a brief internal aside when removing it would break an "
+        "otherwise valuable complete arc. Omit only high-uncertainty boundaries; low or "
+        "medium uncertainty is allowed. Omit material that requires an unseen visual.\n"
+        "4. Score topic relevance, information density, educational value, and difficulty "
+        "honestly. Informativeness and educational_importance prioritize clips later; they "
+        "are not exclusion thresholds. Difficulty is metadata, not an eligibility filter; "
+        "it records prior knowledge only: 0.00-0.33 means "
+        "beginner, 0.34-0.66 means intermediate, and 0.67-1.00 means advanced. Return units "
+        "across that entire scale.\n"
+        "5. Return every distinct qualifying unit. Set substantive and factually_grounded true "
+        "only for academically sound teaching; course logistics and institutional framing are "
+        "not teaching units. Each unit must be standalone, use a unique "
+        "candidate_id, and list no prerequisite candidate IDs because required setup belongs "
+        "inside its span.\n"
         f"Every item must contain {_selection_fields(enriched=False)}. Learning details and "
-        "assessments are generated later, so do not include them."
+        "assessments are generated later. Do not include them, chain-of-thought, or hidden "
+        "reasoning."
     )
     return system, user
 
@@ -567,7 +623,8 @@ def _boundary_repair_prompts(
         blocks.append(
             f"<candidate id={candidate.candidate_id!r} failed_check={candidate.reason!r}>\n"
             f"title: {candidate.proposal.title}\n"
-            f"learning objective: {candidate.proposal.reason}\n"
+            "learning objective: "
+            f"{getattr(candidate.proposal, 'learning_objective', '') or getattr(candidate.proposal, 'reason', '')}\n"
             f"original cue range: {candidate.proposal.start_line}-{candidate.proposal.end_line}\n"
             f"allowed start_line IDs: {sorted(start_lines)}\n"
             f"<start_neighbors>\n{render(start_lines)}\n</start_neighbors>\n"
@@ -1187,18 +1244,124 @@ def _cue_clip_text(segments: list[dict], start_line: int, end_line: int) -> str:
     ).strip()
 
 
+_FILLER_REMAINDER_WORDS = frozenset({
+    "a", "an", "and", "back", "for", "from", "have", "hope", "i", "ll", "no",
+    "our", "that", "the", "thanks", "thank", "to", "today", "we", "we'll", "will", "you",
+    "your",
+})
+
+
+def _structural_filler_matches(text: str) -> list[re.Match[str]]:
+    return list(_STRUCTURAL_FILLER_RE.finditer(str(text or "")))
+
+
+def _cue_is_only_structural_filler(text: str) -> bool:
+    matches = _structural_filler_matches(text)
+    if not matches:
+        return False
+    remainder = list(str(text or ""))
+    for match in matches:
+        remainder[match.start():match.end()] = " " * (match.end() - match.start())
+    return set(_toks("".join(remainder))).issubset(_FILLER_REMAINDER_WORDS)
+
+
+def _quote_character_span(text: str, quote: str) -> tuple[int, int] | None:
+    text_matches = list(_WORD_RE.finditer(str(text or "")))
+    quote_tokens = _toks(quote)
+    if not quote_tokens or len(quote_tokens) > len(text_matches):
+        return None
+    text_tokens = [match.group(0).casefold() for match in text_matches]
+    for index in range(len(text_tokens) - len(quote_tokens) + 1):
+        if text_tokens[index:index + len(quote_tokens)] == quote_tokens:
+            return (
+                text_matches[index].start(),
+                text_matches[index + len(quote_tokens) - 1].end(),
+            )
+    return None
+
+
+def _mixed_edge_required_speech_time(
+    segment: dict,
+    words: list[dict],
+    quote: str,
+    *,
+    want: str,
+) -> tuple[bool, float | None]:
+    """Align a mixed filler/teaching cue to the first or last required quote."""
+    text = str(segment.get("text") or "")
+    matches = _structural_filler_matches(text)
+    if not matches or _cue_is_only_structural_filler(text):
+        return False, None
+    quote_span = _quote_character_span(text, quote)
+    if want == "start":
+        edge_matches = [
+            match
+            for match in matches
+            if not re.search(r"[.!?]", text[:match.start()])
+            and len(_toks(text[:match.start()])) <= 5
+            and _WORD_RE.search(text[match.end():])
+        ]
+        aligned = bool(
+            edge_matches
+            and quote_span is not None
+            and max(match.end() for match in edge_matches) <= quote_span[0]
+        )
+    else:
+        edge_matches = [
+            match
+            for match in matches
+            if _WORD_RE.search(text[:match.start()])
+            and not _WORD_RE.search(text[match.end():])
+        ]
+        aligned = bool(
+            edge_matches
+            and quote_span is not None
+            and min(match.start() for match in edge_matches) >= quote_span[1]
+        )
+    if not edge_matches:
+        return False, None
+    if not aligned:
+        return True, None
+
+    start = float(segment.get("start") or 0.0)
+    end = float(segment.get("end") or start)
+    located = _locate_quote(words, quote, start, end, want)
+    if located is not None:
+        return True, located
+
+    token_matches = list(_WORD_RE.finditer(text))
+    assert quote_span is not None
+    if not token_matches or end <= start:
+        return True, None
+    if want == "start":
+        token_index = next(
+            (index for index, match in enumerate(token_matches) if match.start() == quote_span[0]),
+            None,
+        )
+        fraction = None if token_index is None else token_index / len(token_matches)
+    else:
+        token_index = next(
+            (index for index, match in enumerate(token_matches) if match.end() == quote_span[1]),
+            None,
+        )
+        fraction = None if token_index is None else (token_index + 1) / len(token_matches)
+    return (
+        (True, None)
+        if fraction is None
+        else (True, start + (end - start) * fraction)
+    )
+
+
 def _trim_structural_filler_edges(
     segments: list[dict], start_line: int, end_line: int,
     *,
     ignore_caption_case: bool,
 ) -> tuple[int, int] | None:
-    """Trim contiguous edge filler; reject filler embedded inside teaching."""
-    from .sentences import classify_terminator
-
+    """Trim contiguous edge filler without discarding teaching around an aside."""
     filler_lines = {
         line
         for line in range(start_line, end_line + 1)
-        if _STRUCTURAL_FILLER_RE.search(str(segments[line].get("text") or ""))
+        if _cue_is_only_structural_filler(str(segments[line].get("text") or ""))
     }
     if not filler_lines:
         return start_line, end_line
@@ -1211,16 +1374,65 @@ def _trim_structural_filler_edges(
         trimmed_end -= 1
     if trimmed_start > trimmed_end:
         return None
-    if any(trimmed_start <= line <= trimmed_end for line in filler_lines):
-        return None
     if _cue_opens_mid_thought_at(
         segments, trimmed_start, ignore_caption_case=ignore_caption_case,
     ):
         return None
     trailing_text = str(segments[trimmed_end].get("text") or "").strip()
-    if not classify_terminator(trailing_text):
+    if _cue_has_weak_end(
+        trailing_text,
+        "",
+        ignore_caption_case=ignore_caption_case,
+    ):
         return None
     return trimmed_start, trimmed_end
+
+
+def _internal_structural_filler_reason(
+    segments: list[dict], start_line: int, end_line: int,
+) -> str | None:
+    """Allow one brief interruption, but reject substantial internal filler."""
+    filler_lines = [
+        line
+        for line in range(start_line + 1, end_line)
+        if (
+            _cue_is_only_structural_filler(
+                str(segments[line].get("text") or "")
+            )
+            or _INTERNAL_INTERRUPTION_MARKER_RE.search(
+                str(segments[line].get("text") or "")
+            )
+        )
+    ]
+    if not filler_lines:
+        return None
+
+    block_count = 1 + sum(
+        current != previous + 1
+        for previous, current in zip(filler_lines, filler_lines[1:])
+    )
+    if block_count > _MAX_INTERNAL_FILLER_BLOCKS:
+        return "multiple_internal_filler_blocks"
+
+    duration = 0.0
+    word_count = 0
+    for line in filler_lines:
+        segment = segments[line]
+        try:
+            start = float(segment.get("start") or 0.0)
+            end = float(segment.get("end") or start)
+        except (TypeError, ValueError, OverflowError):
+            return "long_internal_filler_block"
+        if not math.isfinite(start) or not math.isfinite(end) or end < start:
+            return "long_internal_filler_block"
+        duration += end - start
+        word_count += len(_toks(str(segment.get("text") or "")))
+    if (
+        duration > _MAX_INTERNAL_FILLER_DURATION_S
+        or word_count > _MAX_INTERNAL_FILLER_WORDS
+    ):
+        return "long_internal_filler_block"
+    return None
 
 
 def _cue_range_requires_visual_context(
@@ -1472,19 +1684,35 @@ def _configured_clip_limit(settings: dict) -> int | None:
     return None if configured is None else max(0, int(configured))
 
 
+def _quality_order(clip: dict) -> tuple[float, float, float]:
+    scores = (
+        float(clip.get("informativeness") or 0.0),
+        float(clip.get("topic_relevance") or 0.0),
+        float(clip.get("educational_importance") or 0.0),
+    )
+    return min(scores), sum(scores) / len(scores), scores[1]
+
+
+def _difficulty_stage(difficulty: object) -> int:
+    score = float(difficulty or 0.0)
+    return 0 if score < 0.34 else 1 if score < 0.67 else 2
+
+
 def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
-    """Dedupe by relevance and retain every qualifying production candidate."""
-    relevance_order = sorted(
+    """Keep the strongest restatement and stage every qualifying candidate."""
+    quality_order = sorted(
         clips,
         key=lambda clip: (
-            -float(clip["topic_relevance"]),
+            -_quality_order(clip)[0],
+            -_quality_order(clip)[1],
+            -_quality_order(clip)[2],
             float(clip["start"]),
             float(clip["end"]),
             str(clip.get("selection_candidate_id") or ""),
         ),
     )
     kept: list[dict] = []
-    for candidate in relevance_order:
+    for candidate in quality_order:
         if not any(_duplicates(candidate, prior) for prior in kept):
             kept.append(candidate)
     limit = _configured_clip_limit(settings)
@@ -1545,8 +1773,10 @@ def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
             break
     selected.sort(
         key=lambda clip: (
-            float(clip.get("difficulty") or 0.0),
-            -float(clip.get("topic_relevance") or 0.0),
+            _difficulty_stage(clip.get("difficulty")),
+            -_quality_order(clip)[0],
+            -_quality_order(clip)[1],
+            -_quality_order(clip)[2],
             float(clip["start"]),
             float(clip["end"]),
             str(clip.get("selection_candidate_id") or ""),
@@ -1734,10 +1964,37 @@ def _plan_to_report(
             report.rejected_reasons.append(f"{prefix}:contains_filler")
             continue
         a, b = filler_trim
+        internal_filler_reason = _internal_structural_filler_reason(segments, a, b)
+        if internal_filler_reason:
+            report.rejected_reasons.append(f"{prefix}:{internal_filler_reason}")
+            continue
+        has_leading_edge_filler, required_first_speech = (
+            _mixed_edge_required_speech_time(
+                segments[a], words, start_quote, want="start"
+            )
+        )
+        has_trailing_edge_filler, required_last_speech = (
+            _mixed_edge_required_speech_time(
+                segments[b], words, end_quote, want="end"
+            )
+        )
+        if (
+            (has_leading_edge_filler and required_first_speech is None)
+            or (has_trailing_edge_filler and required_last_speech is None)
+        ):
+            report.rejected_reasons.append(f"{prefix}:unresolved_edge_filler_timing")
+            continue
         context_was_trimmed = b < selected_end_before_context
         start, end = _padded_cue_bounds(segments, a, b)
         if not math.isfinite(start) or not math.isfinite(end) or end <= start:
             report.rejected_reasons.append(f"{prefix}:reversed_cue_boundary")
+            continue
+        if (
+            required_first_speech is not None
+            and required_last_speech is not None
+            and required_last_speech <= required_first_speech
+        ):
+            report.rejected_reasons.append(f"{prefix}:reversed_required_speech")
             continue
         start, end = round(start, 3), round(end, 3)
 
@@ -1780,12 +2037,14 @@ def _plan_to_report(
                 quote_repaired = True
         learning_objective = str(
             getattr(proposal, "learning_objective", "")
-            or proposal.reason
+            or getattr(proposal, "reason", "")
             or proposal.title
         ).strip()
         clip_title = str(proposal.title or "").strip()
         clip_facet = str(proposal.facet or "").strip()
-        clip_reason = str(proposal.reason or "").strip()
+        clip_reason = str(
+            getattr(proposal, "reason", "") or learning_objective
+        ).strip()
         if context_was_trimmed:
             repair_source_text = context_repair_source_text
             require_grounding = context_was_trimmed
@@ -1865,6 +2124,10 @@ def _plan_to_report(
             "match_reason": "",
             "assessment": None,
         }
+        if required_first_speech is not None:
+            clip["required_first_speech_sec"] = round(required_first_speech, 3)
+        if required_last_speech is not None:
+            clip["required_last_speech_sec"] = round(required_last_speech, 3)
         if hasattr(proposal, "summary"):
             details, errors = _learning_details(proposal, clip_text, topic)
             clip.update(details)

@@ -350,7 +350,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v3"
+SELECTION_CONTRACT_VERSION = "quality_silence_v4"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -2756,8 +2756,7 @@ def _normalize_reel_identity_time(value: object) -> str:
     return f"{parsed:.3f}"
 
 
-def _reel_identity_key(reel: dict[str, Any]) -> tuple[str, str]:
-    reel_id = str(reel.get("reel_id") or "").strip()
+def _reel_source_video_id(reel: dict[str, Any]) -> str:
     video_url = str(reel.get("video_url") or "").strip()
     video_identity = str(reel.get("video_id") or "").strip()
     if not video_identity:
@@ -2768,6 +2767,36 @@ def _reel_identity_key(reel: dict[str, Any]) -> tuple[str, str]:
             parsed = urlparse(video_url)
             query_video_id = parse_qs(parsed.query).get("v", [""])[0]
             video_identity = query_video_id or parsed.path or video_url
+    return video_identity
+
+
+def _public_generation_reel(reel: dict[str, Any]) -> dict[str, Any]:
+    public_reel = dict(reel)
+    selection_contract_version = str(
+        public_reel.get("selection_contract_version")
+        or public_reel.get("_selection_contract_version")
+        or ""
+    ).strip()
+    if selection_contract_version:
+        public_reel["selection_contract_version"] = selection_contract_version
+    if public_reel.get("topic_relevance") is None:
+        selector_relevance = public_reel.get("_selection_topic_relevance")
+        if selector_relevance is not None:
+            try:
+                public_reel["topic_relevance"] = float(selector_relevance)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    public_reel["video_id"] = _reel_source_video_id(public_reel)
+    return {
+        key: value
+        for key, value in public_reel.items()
+        if not key.startswith("_selection_")
+    }
+
+
+def _reel_identity_key(reel: dict[str, Any]) -> tuple[str, str]:
+    reel_id = str(reel.get("reel_id") or "").strip()
+    video_identity = _reel_source_video_id(reel)
     clip_key = ":".join(
         [
             video_identity,
@@ -2795,6 +2824,50 @@ def _merge_request_reel_lists(*reel_lists: list[dict[str, Any]]) -> list[dict[st
             merged.append(reel)
 
     return merged
+
+
+def _merge_selection_ordered_reel_lists(
+    *reel_lists: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Quality-merge topologically ordered generation batches.
+
+    Only each batch head is eligible, so a dependent can never jump ahead of
+    a prerequisite that the service placed before it.
+    """
+    positions = [0 for _reel_list in reel_lists]
+    input_offsets: list[int] = []
+    offset = 0
+    for reel_list in reel_lists:
+        input_offsets.append(offset)
+        offset += len(reel_list)
+
+    merged: list[dict[str, Any]] = []
+    seen_reel_ids: set[str] = set()
+    seen_clip_keys: set[str] = set()
+    while True:
+        heads = [
+            (
+                reel_service._selection_contract_sort_key(
+                    reel_list[positions[batch_index]],
+                    input_order=input_offsets[batch_index] + positions[batch_index],
+                ),
+                batch_index,
+            )
+            for batch_index, reel_list in enumerate(reel_lists)
+            if positions[batch_index] < len(reel_list)
+        ]
+        if not heads:
+            return merged
+        _priority, batch_index = min(heads)
+        reel = reel_lists[batch_index][positions[batch_index]]
+        positions[batch_index] += 1
+        reel_id, clip_key = _reel_identity_key(reel)
+        if (reel_id and reel_id in seen_reel_ids) or clip_key in seen_clip_keys:
+            continue
+        if reel_id:
+            seen_reel_ids.add(reel_id)
+        seen_clip_keys.add(clip_key)
+        merged.append(reel)
 
 
 def _response_generation_ids(conn, generation_id: str | None) -> list[str]:
@@ -2827,7 +2900,7 @@ def _verified_reusable_generation_chain(
     generation_id: str,
     material_id: str,
 ) -> bool:
-    """Return whether a generation chain contains validated reusable v3 inventory."""
+    """Return whether a chain contains validated inventory for the current contract."""
     generation_ids = _response_generation_ids(conn, generation_id)
     if not generation_ids:
         return False
@@ -3140,7 +3213,7 @@ def _ranked_request_reels(
     generation_ids = _response_generation_ids(conn, generation_id)
     if generation_ids:
         ranked_batches: list[list[dict[str, Any]]] = []
-        for generation_rank, current_generation_id in enumerate(generation_ids):
+        for current_generation_id in generation_ids:
             if not current_generation_id:
                 continue
             batch = reel_service.ranked_feed(
@@ -3154,10 +3227,17 @@ def _ranked_request_reels(
                 content_fingerprint=content_fingerprint,
                 require_verified_boundaries=True,
             )
-            for reel in batch:
-                reel["_selection_generation_rank"] = generation_rank
             ranked_batches.append(batch)
-        ranked = _merge_request_reel_lists(*ranked_batches)
+        if ranked_batches and all(
+            str(reel.get("selection_contract_version") or "").strip()
+            == SELECTION_CONTRACT_VERSION
+            and bool(reel.get("_selection_ordered"))
+            for batch in ranked_batches
+            for reel in batch
+        ):
+            ranked = _merge_selection_ordered_reel_lists(*ranked_batches)
+        else:
+            ranked = _merge_request_reel_lists(*ranked_batches)
     else:
         ranked = reel_service.ranked_feed(
             conn,
@@ -3169,25 +3249,6 @@ def _ranked_request_reels(
             exclusions_fingerprint=exclusions_fingerprint,
             content_fingerprint=content_fingerprint,
             require_verified_boundaries=True,
-        )
-    if ranked and all(
-        str(reel.get("selection_contract_version") or "").strip()
-        == SELECTION_CONTRACT_VERSION
-        for reel in ranked
-    ):
-        ranked.sort(
-            key=lambda reel: (
-                float(
-                    0.5
-                    if reel.get("difficulty") is None
-                    else reel.get("difficulty")
-                ),
-                -float(reel.get("_selection_topic_relevance") or 0.0),
-                int(reel.get("_selection_generation_rank") or 0),
-                int(reel.get("_selection_source_rank") or 0),
-                float(reel.get("t_start") or 0.0),
-                str(reel.get("reel_id") or ""),
-            )
         )
     excluded_video_id_set = {
         _bare_video_id(video_id)
@@ -3431,13 +3492,10 @@ def _generation_job_reels(
         limit=requested,
         learner_id=str(job_row.get("learner_id") or LEGACY_LEARNER_ID),
     )
+    public_reels = [_public_generation_reel(reel) for reel in ranked]
     return [
-        {
-            key: value
-            for key, value in reel.items()
-            if not key.startswith("_selection_")
-        }
-        for reel in ranked
+        reel
+        for reel in public_reels
         if str(reel.get("selection_contract_version") or "").strip()
         == SELECTION_CONTRACT_VERSION
     ][:requested]
@@ -3453,7 +3511,7 @@ def _reused_generation_reels(
     request_params: dict[str, Any],
     requested: int,
 ) -> list[dict[str, Any]]:
-    """Read a compatible v3 reservoir under the current learner-level rules."""
+    """Read a compatible reservoir under the current learner-level rules."""
     return _generation_job_reels(
         conn,
         {
@@ -3802,11 +3860,7 @@ def _run_leased_generation_job(
                 if identity in emitted:
                     return
                 emitted.add(identity)
-                public_reel = {
-                    key: value
-                    for key, value in reel.items()
-                    if not key.startswith("_selection_")
-                }
+                public_reel = _public_generation_reel(reel)
                 append_generation_event(
                     conn,
                     job_id=job_id,

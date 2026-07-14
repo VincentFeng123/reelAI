@@ -96,8 +96,7 @@ def _run(topics: list[G._Topic], segments: list[dict] | None = None,
         "learning_objective", "facet", "reason", "informativeness", "topic_relevance",
         "educational_importance", "difficulty", "directly_teaches_topic", "substantive",
         "factually_grounded", "topic_evidence_quote", "self_contained", "is_standalone",
-        "prerequisite_candidate_ids", "uncertainty", "uncertainty_reasons", "summary",
-        "takeaways", "match_reason", "assessment",
+        "summary", "takeaways", "match_reason", "assessment",
     ],
 )
 def test_every_single_pass_field_is_required(field):
@@ -119,6 +118,53 @@ def test_required_text_fields_reject_blank_values(field):
     data[field] = "   "
     with pytest.raises(ValidationError):
         G._Topic.model_validate(data)
+
+
+def test_boundary_schema_defaults_compact_nonessential_fields():
+    data = {
+        key: value
+        for key, value in _topic(0, 1).model_dump().items()
+        if key in G._BoundaryTopic.model_fields
+    }
+    for field in (
+        "prerequisite_candidate_ids",
+        "uncertainty",
+        "uncertainty_reasons",
+    ):
+        data.pop(field)
+
+    item = G._BoundaryTopic.model_validate(data)
+
+    assert item.prerequisite_candidate_ids == []
+    assert item.uncertainty == "low"
+    assert item.uncertainty_reasons == []
+
+
+def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
+    topics = []
+    for index in range(40):
+        data = {
+            key: value
+            for key, value in _topic(index, index).model_dump().items()
+            if key in G._BoundaryTopic.model_fields
+        }
+        data.update(
+            candidate_id=f"candidate-{index}",
+            title=f"Informational facet {index}",
+            learning_objective=(
+                f"Explain the complete mechanism and educational conclusion for facet {index}."
+            ),
+            facet=f"facet-{index}",
+            start_quote=f"line {index} explains the mechanism",
+            end_quote=f"and reaches conclusion {index}",
+            topic_evidence_quote=(
+                f"line {index} explains this informational mechanism and reaches its conclusion"
+            ),
+        )
+        topics.append(G._BoundaryTopic.model_validate(data))
+    payload = G._BoundaryPlan(topics=topics).model_dump_json(exclude_defaults=True)
+
+    assert (len(payload) + 3) // 4 < G._BOUNDARY_OUTPUT_TOKENS
 
 
 @pytest.mark.parametrize("field", ["start_line", "end_line"])
@@ -274,7 +320,7 @@ def test_long_incomplete_range_is_rejected_for_context_not_duration():
     assert report.rejected_reasons == ["proposal_0:unresolved_weak_end"]
 
 
-def test_internal_channel_bump_rejects_the_whole_candidate():
+def test_brief_internal_channel_bump_does_not_discard_complete_teaching():
     raw_cues = [
         (354.960, 359.240, "Cool! There's just one issue: Your DNA and its information is in the nucleus,"),
         (359.240, 362.680, "but proteins are made in organelles called the ribosomes. How do we get the"),
@@ -340,8 +386,11 @@ def test_internal_channel_bump_rejects_the_whole_candidate():
         topic="biology",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:contains_filler"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == [
+        f"3tisOnOkwzo:cue:{index + 78}" for index in range(len(segments))
+    ]
+    assert "Welcome to Biology Pro Tips" in report.clips[0]["_clip_text"]
 
 
 def test_production_biology_fragment_expands_to_question_and_complete_list():
@@ -567,7 +616,7 @@ def test_range_repair_keeps_paraphrased_objective_without_lost_support():
     ) == objective
 
 
-def test_structural_filler_is_rejected_even_when_scores_are_high():
+def test_structural_filler_edge_is_rejected_when_model_quotes_the_intro():
     segments = [{
         "start": 0.0,
         "end": 10.0,
@@ -588,7 +637,62 @@ def test_structural_filler_is_rejected_even_when_scores_are_high():
     )
 
     assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:contains_filler"]
+    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler_timing"]
+
+
+def test_punctuated_welcome_is_detected_as_structural_filler():
+    assert G._STRUCTURAL_FILLER_RE.search("Welcome.")
+    assert G._STRUCTURAL_FILLER_RE.search("Welcome back.")
+
+
+def test_same_cue_leading_filler_aligns_required_speech_to_teaching_quote():
+    text = (
+        "Welcome back. Photosynthesis converts light energy into chemical energy "
+        "that cells store in sugars."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Photosynthesis converts light energy",
+            end_quote="cells store in sugars",
+            topic_evidence_quote=(
+                "Photosynthesis converts light energy into chemical energy that cells"
+            ),
+        )]),
+        [{"start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert len(report.clips) == 1
+    assert 0.0 < report.clips[0]["required_first_speech_sec"] < 12.0
+
+
+def test_same_cue_trailing_filler_aligns_required_speech_to_conclusion_quote():
+    text = (
+        "Differentiate the outer function, multiply by the inner derivative, and the "
+        "final derivative is two x. Thanks for watching."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Differentiate the outer function",
+            end_quote="final derivative is two x",
+            topic_evidence_quote=(
+                "multiply by the inner derivative and the final derivative is two x"
+            ),
+        )]),
+        [{"start": 0.0, "end": 14.0, "text": text}],
+        [],
+        {},
+        topic="chain rule",
+    )
+
+    assert len(report.clips) == 1
+    assert 0.0 < report.clips[0]["required_last_speech_sec"] < 14.0
 
 
 @pytest.mark.parametrize("topic", ["biology", "biology myths", "Gothic architecture"])
@@ -724,7 +828,7 @@ def test_video_plug_tail_is_rejected_even_after_substantive_teaching():
     )
 
     assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:contains_filler"]
+    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler_timing"]
 
 
 def test_video_recording_example_is_not_mistaken_for_a_channel_plug():
@@ -748,6 +852,133 @@ def test_video_recording_example_is_not_mistaken_for_a_channel_plug():
     )
 
     assert len(report.clips) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "topic", "evidence_quote"),
+    [
+        (
+            "The compiler uses an abstract syntax tree to summarize program structure for later optimization.",
+            "compiler optimization",
+            "compiler uses an abstract syntax tree to summarize program structure for later optimization",
+        ),
+        (
+            "Students are welcome to compare both estimators because each has a different bias.",
+            "estimators",
+            "compare both estimators because each has a different bias",
+        ),
+    ],
+)
+def test_instructional_language_is_not_mistaken_for_structural_filler(
+    text,
+    topic,
+    evidence_quote,
+):
+    segments = [{"start": 0.0, "end": 15.0, "text": text}]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote=" ".join(text.split()[:5]),
+            end_quote=" ".join(text.split()[-5:]),
+            topic_evidence_quote=evidence_quote,
+        )]),
+        segments,
+        [],
+        {},
+        topic=topic,
+    )
+
+    assert len(report.clips) == 1
+
+
+def test_name_led_welcome_intro_remains_structural_filler():
+    text = "Professor Nguyen welcome to the course. Matrices represent linear maps."
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Professor Nguyen welcome to the course",
+            end_quote="represent linear maps",
+            topic_evidence_quote="Matrices represent linear maps in coordinate systems",
+        )]),
+        [{"start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {},
+        topic="linear algebra",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler_timing"]
+
+
+def test_complete_unpunctuated_teaching_trims_a_trailing_outro_cue():
+    segments = [
+        {
+            "cue_id": "teaching",
+            "start": 0.0,
+            "end": 12.0,
+            "text": "A confidence interval estimates a population parameter from sample data",
+        },
+        {
+            "cue_id": "outro",
+            "start": 12.0,
+            "end": 14.0,
+            "text": "Thanks for watching.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            1,
+            start_quote="A confidence interval estimates",
+            end_quote="Thanks for watching",
+            topic_evidence_quote=(
+                "A confidence interval estimates a population parameter from sample data"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic="confidence intervals",
+    )
+
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["teaching"]
+    assert "Thanks for watching" not in report.clips[0]["_clip_text"]
+
+
+def test_trailing_outro_does_not_rescue_a_dangling_teaching_clause():
+    segments = [
+        {
+            "cue_id": "dangling",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "A confidence interval depends on",
+        },
+        {
+            "cue_id": "outro",
+            "start": 8.0,
+            "end": 10.0,
+            "text": "Thanks for watching.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            1,
+            start_quote="A confidence interval depends on",
+            end_quote="Thanks for watching",
+            topic_evidence_quote="A confidence interval depends on the sampled observations",
+        )]),
+        segments,
+        [],
+        {},
+        topic="confidence intervals",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:contains_filler"]
 
 
 def test_course_logistics_suffix_is_trimmed_after_complete_teaching():
@@ -782,6 +1013,135 @@ def test_course_logistics_suffix_is_trimmed_after_complete_teaching():
     assert len(report.clips) == 1
     assert report.clips[0]["_end_line"] == 0
     assert report.clips[0]["end"] == 26.0
+
+
+def test_brief_internal_aside_is_tolerated_inside_complete_teaching():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 8.0,
+            "text": "A derivative measures how an output changes with its input.",
+        },
+        {
+            "start": 8.0,
+            "end": 13.0,
+            "text": "A quick aside.",
+        },
+        {
+            "start": 13.0,
+            "end": 22.0,
+            "text": "The chain rule multiplies those rates through a composition.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            2,
+            start_quote="A derivative measures how",
+            end_quote="rates through a composition",
+            topic_evidence_quote=(
+                "The chain rule multiplies those rates through a composition"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic="chain rule",
+    )
+
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
+
+
+def test_long_internal_sponsor_block_rejects_the_candidate():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 8.0,
+            "text": "Mitochondria make ATP through oxidative phosphorylation.",
+        },
+        {
+            "start": 8.0,
+            "end": 25.0,
+            "text": (
+                "Today's sponsor is Acme, whose premium plan and seasonal discount "
+                "are available through the channel link."
+            ),
+        },
+        {
+            "start": 25.0,
+            "end": 34.0,
+            "text": "That ATP then powers energy-requiring reactions in the cell.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            2,
+            start_quote="Mitochondria make ATP",
+            end_quote="reactions in the cell",
+            topic_evidence_quote=(
+                "Mitochondria make ATP through oxidative phosphorylation"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic="cellular respiration",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:long_internal_filler_block"]
+
+
+def test_multiple_brief_internal_admin_and_tangent_blocks_are_rejected():
+    segments = [
+        {
+            "start": 0.0,
+            "end": 7.0,
+            "text": "Opportunity cost is the value of the best forgone alternative.",
+        },
+        {
+            "start": 7.0,
+            "end": 9.0,
+            "text": "Administrative note: the assignment closes Friday.",
+        },
+        {
+            "start": 9.0,
+            "end": 16.0,
+            "text": "A sunk cost has already been incurred and cannot be recovered.",
+        },
+        {
+            "start": 16.0,
+            "end": 18.0,
+            "text": "A brief tangent about an unrelated conference story.",
+        },
+        {
+            "start": 18.0,
+            "end": 25.0,
+            "text": "Therefore future choices should ignore sunk costs.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            4,
+            start_quote="Opportunity cost is the value",
+            end_quote="should ignore sunk costs",
+            topic_evidence_quote=(
+                "Opportunity cost is the value of the best forgone alternative"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic="opportunity cost versus sunk cost",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == [
+        "proposal_0:multiple_internal_filler_blocks"
+    ]
 
 
 def test_explicit_max_clips_is_respected_below_forty_ceiling():

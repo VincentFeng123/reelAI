@@ -95,7 +95,7 @@ def _quality_clip(
     score: float = 0.9,
     **overrides,
 ) -> dict:
-    """A complete quality_silence_v3 selector result grounded to one cue."""
+    """A complete quality_silence_v4 selector result grounded to one cue."""
     clip = {
         "start": start,
         "end": end,
@@ -121,6 +121,18 @@ def _quality_clip(
     }
     clip.update(overrides)
     return clip
+
+
+def test_required_speech_bounds_prefer_verified_same_cue_edge_quotes() -> None:
+    assert pipeline_module._required_speech_bounds(
+        {
+            "start": 0.0,
+            "end": 12.0,
+            "required_first_speech_sec": 2.5,
+            "required_last_speech_sec": 9.5,
+        },
+        {"start_padding_ms": 0, "end_padding_ms": 0},
+    ) == (2.5, 9.5)
 
 
 def test_generation_stage_counters_are_thread_safe() -> None:
@@ -546,6 +558,92 @@ def test_final_caption_clip_searches_to_true_media_end_and_keeps_verified_quiet_
     ] == -38.0
 
 
+def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:padded-speech",
+        "duration": 30.0,
+        "segments": [
+            {
+                "cue_id": "required-speech",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "A Python closure retains variables from its enclosing scope.",
+            },
+        ],
+    }
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                cue_id="required-speech",
+                start=9.7,
+                end=20.3,
+                quote="A Python closure retains variables from its enclosing scope.",
+            )
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    verify = mock.Mock(
+        return_value=mock.Mock(
+            verified=True,
+            start_sec=9.9,
+            end_sec=20.2,
+            diagnostics={"threshold_dbfs": -38.0},
+        )
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline_module,
+        "_run_clip",
+        lambda *_args, **_kwargs: engine_out,
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify,
+    )
+    persisted: list[dict] = []
+    pipeline = _pipeline()
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        lambda *, clip, **_kwargs: (
+            persisted.append(clip) or "verified-padded-speech",
+            mock.sentinel.metadata,
+        ),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext(
+            "slow", require_acoustic_boundaries=True
+        ),
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == ["verified-padded-speech"]
+    assert verify.call_args.args[1:] == (10.0, 20.0)
+    assert persisted[0]["start"] == 9.9
+    assert persisted[0]["end"] == 20.2
+
+
 @pytest.mark.parametrize(
     ("verification", "expected_reason"),
     [
@@ -966,7 +1064,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v3"
+        assert context["selection_contract_version"] == "quality_silence_v4"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"

@@ -23,6 +23,7 @@ export type Reel = {
   video_description_truncated?: boolean;
   ai_summary?: string;
   ai_summary_truncated?: boolean;
+  video_id?: string | null;
   video_url: string;
   t_start: number;
   t_end: number;
@@ -32,6 +33,8 @@ export type Reel = {
   captions?: CaptionCue[];
   score: number;
   relevance_score?: number;
+  topic_relevance?: number | null;
+  selection_contract_version?: string | null;
   matched_terms?: string[];
   relevance_reason?: string;
   match_reason?: string;

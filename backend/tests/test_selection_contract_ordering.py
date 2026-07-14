@@ -1,4 +1,4 @@
-"""Difficulty-first ordering for versioned clipping selections."""
+"""Difficulty-stage and value ordering for versioned clipping selections."""
 from __future__ import annotations
 
 import json
@@ -61,13 +61,16 @@ class SelectionContractOrderingTests(unittest.TestCase):
         start: float,
         content_score: float,
         difficulty: float = 0.15,
+        informativeness: float | None = None,
+        topic_relevance: float | None = None,
+        educational_importance: float | None = None,
         boundary_confidence: float = 0.90,
         is_standalone: bool = True,
         chain_id: str = "",
         chain_position: int = 0,
         prerequisite_ids: list[str] | None = None,
     ) -> dict:
-        return {
+        item = {
             "reel_id": reel_id,
             "concept_id": "c1",
             "video_id": video_id,
@@ -83,6 +86,13 @@ class SelectionContractOrderingTests(unittest.TestCase):
             "_selection_chain_position": chain_position,
             "_selection_prerequisite_ids": list(prerequisite_ids or []),
         }
+        if informativeness is not None:
+            item["_selection_informativeness"] = informativeness
+        if topic_relevance is not None:
+            item["_selection_topic_relevance"] = topic_relevance
+        if educational_importance is not None:
+            item["_selection_educational_importance"] = educational_importance
+        return item
 
     def test_easier_independent_clip_precedes_higher_quality_advanced_clip(self) -> None:
         items = [
@@ -101,6 +111,55 @@ class SelectionContractOrderingTests(unittest.TestCase):
         )
 
         self.assertEqual([item["reel_id"] for item in ordered], ["early-low", "late-high"])
+
+    def test_same_stage_ranks_minimum_quality_then_mean_then_relevance(self) -> None:
+        items = [
+            self._selection_item(
+                "weaker-floor", video_id="video-a", start=5,
+                content_score=0.99, difficulty=0.05,
+                informativeness=0.79, topic_relevance=0.99,
+                educational_importance=0.99,
+            ),
+            self._selection_item(
+                "stronger-relevance", video_id="video-b", start=20,
+                content_score=0.50, difficulty=0.32,
+                informativeness=0.80, topic_relevance=0.95,
+                educational_importance=0.85,
+            ),
+            self._selection_item(
+                "weaker-relevance", video_id="video-c", start=10,
+                content_score=0.99, difficulty=0.10,
+                informativeness=0.80, topic_relevance=0.85,
+                educational_importance=0.95,
+            ),
+            self._selection_item(
+                "stronger-mean", video_id="video-a", start=40,
+                content_score=0.10, difficulty=0.30,
+                informativeness=0.80, topic_relevance=0.99,
+                educational_importance=0.99,
+            ),
+            self._selection_item(
+                "stronger-floor", video_id="video-b", start=50,
+                content_score=0.10, difficulty=0.33,
+                informativeness=0.90, topic_relevance=0.90,
+                educational_importance=0.90,
+            ),
+        ]
+
+        ordered = self.service.adaptive_curriculum_order(
+            self.conn, self.MATERIAL, self.LEARNER, items,
+        )
+
+        self.assertEqual(
+            [item["reel_id"] for item in ordered],
+            [
+                "stronger-floor",
+                "stronger-mean",
+                "stronger-relevance",
+                "weaker-relevance",
+                "weaker-floor",
+            ],
+        )
 
     def test_explicit_chain_and_prerequisite_edges_remain_ordered(self) -> None:
         items = [
@@ -367,7 +426,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         self.assertEqual([item["reel_id"] for item in advanced], ["easy", "hard"])
         self.assertAlmostEqual(advanced[0]["score"], 0.80)
 
-    def test_v3_reservoir_filters_against_the_current_learner_level(self) -> None:
+    def test_v4_reservoir_filters_against_the_current_learner_level(self) -> None:
         for reel_id, video_id, difficulty in (
             ("easy-v3", "video-a", 0.10),
             ("hard-v3", "video-b", 0.85),
@@ -385,7 +444,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v3",
+                "selection_contract_version": "quality_silence_v4",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"
@@ -410,7 +469,105 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ["hard-v3"],
         )
 
-    def test_v3_deferred_boundary_clips_release_only_in_their_exact_bin(self) -> None:
+    def test_v3_historical_inventory_remains_viewable(self) -> None:
+        self._insert_versioned_reel(
+            reel_id="historical-v3",
+            video_id="video-a",
+            start=10,
+            difficulty=0.10,
+            base_score=0.8,
+        )
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'historical-v3'"
+        ).fetchone()
+        context = json.loads(row[0])
+        context.update({
+            "selection_contract_version": "quality_silence_v3",
+            "directly_teaches_topic": True,
+            "substantive": True,
+            "factually_grounded": True,
+            "self_contained": True,
+            "topic_evidence_quote": (
+                "Chemical bonding explains how atoms share or transfer electrons"
+            ),
+            "surface_eligible": True,
+            "deferred_level": False,
+        })
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'historical-v3'",
+            (json.dumps(context),),
+        )
+
+        result = self._ranked()
+
+        self.assertEqual([item["reel_id"] for item in result], ["historical-v3"])
+        self.assertEqual(result[0]["selection_contract_version"], "quality_silence_v3")
+
+    def test_v4_response_distinguishes_selector_from_deterministic_relevance(self) -> None:
+        self._insert_versioned_reel(
+            reel_id="live-shaped-v3",
+            video_id="video-a",
+            start=10,
+            difficulty=0.15,
+            base_score=0.8,
+        )
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'live-shaped-v3'"
+        ).fetchone()
+        context = json.loads(row[0])
+        context.update({
+            "selection_contract_version": "quality_silence_v4",
+            "topic_relevance": 0.93,
+            "self_contained": True,
+            "topic_evidence_quote": (
+                "Chemical bonding explains how atoms share or transfer electrons"
+            ),
+            "surface_eligible": True,
+            "deferred_level": False,
+        })
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'live-shaped-v3'",
+            (json.dumps(context),),
+        )
+        deterministic_relevance = {
+            "score": 0.13,
+            "concept_overlap": 0.13,
+            "context_overlap": 0.13,
+            "matched_terms": ["bonding"],
+            "off_topic_penalty": 0.0,
+            "reason": "deterministic overlap",
+        }
+
+        with mock.patch.object(
+            self.service,
+            "_score_text_relevance",
+            return_value=deterministic_relevance,
+        ), mock.patch.object(self.service, "_build_caption_cues", return_value=[]):
+            fresh = self.service.ranked_feed(
+                self.conn,
+                material_id=self.MATERIAL,
+                generation_id="selection-generation",
+                fast_mode=True,
+                learner_id=self.LEARNER,
+            )
+        cached = self.service.ranked_feed(
+            self.conn,
+            material_id=self.MATERIAL,
+            generation_id="selection-generation",
+            fast_mode=True,
+            learner_id=self.LEARNER,
+        )
+
+        for result in (fresh, cached):
+            self.assertEqual(len(result), 1)
+            self.assertEqual(result[0]["video_id"], "video-a")
+            self.assertEqual(
+                result[0]["selection_contract_version"], "quality_silence_v4"
+            )
+            self.assertAlmostEqual(result[0]["relevance_score"], 0.13)
+            self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
+
+    def test_v4_deferred_boundary_clips_release_only_in_their_exact_bin(self) -> None:
         cases = (
             ("bin-33", "video-a", 10, 0.33),
             ("bin-34", "video-b", 20, 0.34),
@@ -431,7 +588,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v3",
+                "selection_contract_version": "quality_silence_v4",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"

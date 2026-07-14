@@ -179,7 +179,43 @@ def test_generation_context_enforces_actual_gemini_call_and_cost_budgets() -> No
     slow_budget = slow_flash.budget.snapshot()["gemini"]
     assert slow_budget["flash_selector_calls"] == 3
     assert slow_budget["flash_selector_limit"] == 3
-    assert slow_budget["cost_limit_usd"] == pytest.approx(0.45)
+    assert slow_budget["cost_limit_usd"] == pytest.approx(0.55)
+
+
+@pytest.mark.parametrize(
+    ("mode", "selector_count", "cost_limit"),
+    [("fast", 2, 0.38), ("slow", 3, 0.55)],
+)
+def test_job_cost_budget_fits_expansion_and_realistic_long_transcript_selectors(
+    mode: str,
+    selector_count: int,
+    cost_limit: float,
+) -> None:
+    context = GenerationContext(mode, generation_id=f"job-long-{mode}")
+    context.reserve_gemini_call(
+        operation="expansion",
+        model="gemini-3.1-flash-lite",
+        estimated_input_tokens=1_000,
+        max_output_tokens=1_024,
+    )
+    for _ in range(selector_count):
+        context.reserve_gemini_call(
+            operation="flash_boundary_selector",
+            model="gemini-3.5-flash",
+            estimated_input_tokens=40_000,
+            max_output_tokens=12_288,
+        )
+
+    budget = context.budget.snapshot()["gemini"]
+    expected_reserved_cost = (
+        1_000 * 1.5
+        + 1_024 * 9.0
+        + selector_count * (40_000 * 1.5 + 12_288 * 9.0)
+    ) / 1_000_000.0
+    assert budget["flash_selector_calls"] == selector_count
+    assert budget["reserved_cost_usd"] == pytest.approx(expected_reserved_cost)
+    assert budget["reserved_cost_usd"] <= cost_limit
+    assert budget["cost_limit_usd"] == pytest.approx(cost_limit)
 
 
 @pytest.mark.parametrize("mode", ["fast", "slow"])
@@ -237,7 +273,7 @@ def test_generation_usage_payload_aggregates_stage_tokens_cost_and_fallbacks() -
         "request_failure:RuntimeError": 1,
     }
     assert payload["by_stage"]["selection"]["calls"] == 1
-    assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.25
+    assert payload["budget"]["gemini"]["cost_limit_usd"] == 0.38
 
 
 def test_one_physical_pro_fallback_counts_once_for_multiple_reasons() -> None:

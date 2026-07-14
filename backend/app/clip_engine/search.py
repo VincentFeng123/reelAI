@@ -153,10 +153,20 @@ def _planned_query_offset(context: GenerationContext | None) -> int:
     return 5 + max(0, pass_count - 2) * 2
 
 
-def _select_ranked_candidates(ranked: list[dict], *, limit: int, excluded: set[str]) -> list[dict]:
-    """Keep literal priority while reserving bounded room for AI expansion."""
+def _select_ranked_candidates(
+    ranked: list[dict],
+    *,
+    limit: int,
+    excluded: set[str],
+    analysis_prefix: int | None = None,
+) -> list[dict]:
+    """Keep literal priority while putting bounded AI diversity in analysis."""
     eligible = [video for video in ranked if video.get("id") not in excluded]
-    if limit <= 1 or len(eligible) <= limit:
+    prefix_limit = min(
+        max(0, int(limit)),
+        max(1, int(analysis_prefix if analysis_prefix is not None else limit)),
+    )
+    if limit <= 1 or (len(eligible) <= limit and prefix_limit >= limit):
         return eligible[:limit]
 
     non_literal = [
@@ -167,8 +177,8 @@ def _select_ranked_candidates(ranked: list[dict], *, limit: int, excluded: set[s
     if not non_literal:
         return eligible[:limit]
 
-    reserve = min(2, max(1, limit // 3))
-    selected = eligible[: max(0, limit - reserve)]
+    reserve = min(2, max(1, prefix_limit // 3))
+    selected = eligible[: max(0, prefix_limit - reserve)]
     selected_ids = {str(video.get("id") or "") for video in selected}
     selected_families = {
         str(family)
@@ -189,7 +199,7 @@ def _select_ranked_candidates(ranked: list[dict], *, limit: int, excluded: set[s
         selected.append(video)
         selected_ids.add(video_id)
         selected_families.update(families)
-        if len(selected) >= limit:
+        if len(selected) >= prefix_limit:
             break
     for video in eligible:
         video_id = str(video.get("id") or "")
@@ -437,7 +447,16 @@ def discover(topic: str, limit: int, exclude_video_ids: list[str] | None = None,
     raise_if_cancelled(should_cancel)
     annotate_result_sets(res["per_query"])
     ranked = rank.merge_and_rank(res["per_query"], level=level)
-    videos = _select_ranked_candidates(ranked, limit=limit, excluded=exclude)
+    videos = _select_ranked_candidates(
+        ranked,
+        limit=limit,
+        excluded=exclude,
+        analysis_prefix=(
+            context.budget.remaining("segmentation")
+            if context is not None
+            else None
+        ),
+    )
     return {"corrected": topic, "videos": videos,
             "credits_used": res["credits_used"], "warning": res["warning"],
             "query_plan": effective_plan}
@@ -461,7 +480,7 @@ def discover_practice_fast(
     retrieval_profile: str = "deep",
     deadline_monotonic: float | None = None,
 ) -> dict:
-    """Difficulty-first bootstrap or literal-first conditional expansion.
+    """Difficulty-first bootstrap or one-pass AI-expanded production search.
 
     The signature intentionally matches ``discover`` so live wiring can switch paths
     without dropping cancellation, budgets, provider caching, filters, or exclusions.
@@ -477,32 +496,47 @@ def discover_practice_fast(
         requested = int(breadth if breadth is not None else 8)
     except (TypeError, ValueError, OverflowError):
         requested = 8
+    bootstrap = str(retrieval_profile or "deep").strip().casefold() == "bootstrap"
+    expansion_count = min(3, max(1, requested))
     query_count = max(1, min(12, requested))
     if context is not None:
         if context.budget.mode == "fast":
-            query_count = min(query_count, 3)
+            # Leave one of Fast's three search reservations available for a
+            # transient retry instead of spending the whole budget at once.
+            query_count = min(query_count, 2)
         query_count = min(query_count, context.budget.remaining("search"))
+    if not bootstrap:
+        query_count = min(query_count, 3)
     if query_count <= 0:
         raise SearchError("search budget exhausted")
 
     raise_if_cancelled(should_cancel)
     literal_query = " ".join(str(literal_topic or topic).split()) or topic
-    tutorial_query = f"{literal_query} explained tutorial"
+    task_backoff_query = _niche_bootstrap_backoff_query(literal_query)
     component_queries = _long_topic_component_queries(literal_query)
     initial_queries: list[str] = []
     seen_query_keys: set[str] = set()
-    bootstrap = str(retrieval_profile or "deep").strip().casefold() == "bootstrap"
+    expansion: dict[str, object] = {
+        "corrected": literal_query,
+        "queries": [literal_query],
+        "provider_used": "literal_fallback",
+    }
     if bootstrap:
         deterministic_queries = (_difficulty_bootstrap_query(literal_query, level),)
     else:
-        # Keep the established literal/tutorial surface and leave at least one
-        # provider-search slot for conditional Gemini expansion. Components
-        # are only a bounded recovery surface for unusually long topics.
-        component_limit = max(0, query_count - 3)
-        deterministic_queries = (
+        expansion = expand.expand_query_practice_fast(
             literal_query,
-            tutorial_query,
-            *component_queries[:component_limit],
+            # Fast searches only the first two terms, but requesting the same
+            # three-term expansion as Slow keeps one cache entry across modes.
+            expansion_count,
+            # Difficulty is assigned after selection, so every learner level
+            # shares the same retrieval expansion and cache entry.
+            level=None,
+            should_cancel=should_cancel,
+            context=context,
+        )
+        deterministic_queries = tuple(
+            expansion.get("queries") or [literal_query]
         )
     for candidate in deterministic_queries:
         key = " ".join(candidate.casefold().split())
@@ -545,18 +579,26 @@ def discover_practice_fast(
             )
 
     per_query = list(initial.get("per_query") or [])
-    annotate(per_query)
+    annotate(
+        per_query,
+        expanded=(
+            not bootstrap
+            and str(expansion.get("provider_used") or "") == "gemini"
+        ),
+    )
     excluded = {
         normalize_youtube_video_id(video_id) or str(video_id or "").strip()
         for video_id in (exclude_video_ids or [])
     }
-    initial_ranked = rank.merge_and_rank(per_query, level=level)
-    eligible_initial = [
-        video for video in initial_ranked if video.get("id") not in excluded
-    ]
+    initial_ranked = rank.merge_and_rank(per_query, level=level) if bootstrap else []
+    eligible_initial = (
+        [video for video in initial_ranked if video.get("id") not in excluded]
+        if bootstrap
+        else []
+    )
     niche_result = {"per_query": [], "credits_used": 0, "warning": None}
     niche_provider_order: list[str] = []
-    niche_backoff = _niche_bootstrap_backoff_query(literal_query) if bootstrap else None
+    niche_backoff = task_backoff_query if bootstrap else None
     if (
         niche_backoff
         and eligible_initial
@@ -666,70 +708,31 @@ def discover_practice_fast(
             "query_plan": query_plan,
         }
 
-    good_candidates = sum(
-        1
-        for video in initial_ranked
-        if video.get("id") not in excluded
-        and float(video.get("retrieval_score") or 0.0) >= 0.60
-    )
-    required_sources = (
-        2
-        if context is not None and context.budget.mode == "fast"
-        else 3
-    )
-
-    expansion: dict[str, object] = {
-        "corrected": literal_query,
-        "queries": [],
-        "provider_used": "skipped",
-    }
-    remaining_queries = max(0, query_count - len(initial_queries))
-    expansion_queries: list[str] = []
-    expansion_result = {"per_query": [], "credits_used": 0, "warning": None}
-    if good_candidates < required_sources and remaining_queries > 0:
-        expansion = expand.expand_query_practice_fast(
-            literal_query,
-            min(8, remaining_queries + 2),
-            level=level,
-            should_cancel=should_cancel,
-            context=context,
-        )
-        for candidate in expansion.get("queries") or []:
-            query = " ".join(str(candidate or "").split())
-            key = " ".join(query.casefold().split())
-            if not key or key in seen_query_keys:
-                continue
-            seen_query_keys.add(key)
-            expansion_queries.append(query)
-            if len(expansion_queries) >= remaining_queries:
-                break
-        if expansion_queries:
-            expansion_result = supadata_search.search_all(
-                expansion_queries,
-                filters,
-                **search_runtime,
-            )
-            annotate(expansion_result["per_query"], expanded=True)
-            per_query.extend(expansion_result["per_query"])
-
-    ranked = rank.merge_and_rank(per_query, level=level)
+    # Deep retrieval gathers topic-relevant sources before clip difficulty is
+    # assigned and ordered. Applying the learner level here can discard useful
+    # sources before their teaching units are ever analyzed.
+    ranked = rank.merge_and_rank(per_query, level=None)
     top_n = max(0, int(limit))
-    videos = [video for video in ranked if video.get("id") not in excluded][:top_n]
+    videos = _select_ranked_candidates(
+        ranked,
+        limit=top_n,
+        excluded=excluded,
+        analysis_prefix=(
+            context.budget.remaining("segmentation")
+            if context is not None
+            else None
+        ),
+    )
     corrected = " ".join(str(expansion.get("corrected") or literal_query).split()) or literal_query
-    topic_terms = []
-    seen_terms: set[str] = set()
-    for term in (literal_query, corrected, *expansion_queries):
-        key = " ".join(str(term or "").casefold().split())
-        if key and key not in seen_terms:
-            seen_terms.add(key)
-            topic_terms.append(str(term))
     return {
         "corrected": corrected,
-        "queries": [*initial_queries, *expansion_queries],
-        "topic_terms": topic_terms,
-        "provider_used": expansion.get("provider_used") or "deterministic",
+        "queries": initial_queries,
+        # AI queries discover sources only. The exact user request remains the
+        # sole transcript-selection and evidence identity downstream.
+        "topic_terms": [literal_query],
+        "provider_used": expansion.get("provider_used") or "literal_fallback",
         "videos": videos,
-        "credits_used": int(initial.get("credits_used") or 0) + int(expansion_result.get("credits_used") or 0),
-        "warning": expansion_result.get("warning") or initial.get("warning"),
+        "credits_used": int(initial.get("credits_used") or 0),
+        "warning": initial.get("warning"),
         "query_plan": query_plan,
     }

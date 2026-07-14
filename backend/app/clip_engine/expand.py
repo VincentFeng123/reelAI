@@ -1,10 +1,9 @@
 """Query expansion for the existing planner and the opt-in practice-fast path.
 
 Topic correction, aliases, and semantic expansion are owned by the persisted
-TopicExpansionService. This layer performs no provider calls and spends no model
-credits for the existing ``expand_query`` API; it only adds stable YouTube-oriented
-query templates. ``expand_query_practice_fast`` is a separate reference path that
-uses one Gemini Flash call and falls back to those deterministic templates.
+TopicExpansionService. The existing ``expand_query`` API retains its stable templates.
+Production retrieval uses ``expand_query_practice_fast`` for one cached Flash call and
+falls back only to the user's literal request when the provider is unavailable.
 """
 from __future__ import annotations
 
@@ -22,6 +21,7 @@ from pydantic import BaseModel
 from . import config
 from .cancellation import raise_if_cancelled, run_cancellable
 from .errors import CancellationError
+from .segment_cache import SEGMENT_CACHE_TTL_SEC
 from .singleflight import singleflight
 from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
@@ -32,8 +32,12 @@ logger = logging.getLogger(__name__)
 
 PRACTICE_FAST_EXPAND_MODEL = "gemini-3.1-flash-lite"
 PRACTICE_FAST_EXPAND_TIMEOUT_MS = 8_000
-PRACTICE_FAST_EXPAND_CACHE_VERSION = 2
-PRACTICE_FAST_EXPAND_CACHE_TTL_SEC = 6 * 60 * 60
+PRACTICE_FAST_EXPAND_OUTPUT_TOKENS = 1_024
+PRACTICE_FAST_EXPAND_CACHE_VERSION = 3
+# An expansion can be nearly one segment-cache lifetime old when it discovers a
+# newly analyzed source. Keeping it for two lifetimes guarantees that source's
+# subsequent valid segment-cache lifetime never triggers another expansion call.
+PRACTICE_FAST_EXPAND_CACHE_TTL_SEC = 2 * SEGMENT_CACHE_TTL_SEC
 
 
 class _PracticeFastExpansion(BaseModel):
@@ -47,10 +51,21 @@ YouTube search queries that maximize topical coverage.
 Do this:
 1. Spellcheck and correct the user's input.
 2. Infer the most likely intent or sense.
-3. Produce up to N distinct search queries covering the corrected topic, close synonyms,
-   important sub-topics, and useful educational phrase variants such as tutorials or explainers.
+3. Produce up to N concise queries that a person would actually search on YouTube.
+4. Preserve the user's named subject, task, and requested relationship. Cover close synonyms,
+   genuinely related informational facets, useful prerequisites, and educational sources, but
+   never redirect the search into a merely adjacent field.
 
 Return only the requested JSON object. Put the corrected topic first in queries."""
+
+
+def literal_fallback(topic: str, n: int) -> dict:
+    literal = " ".join(str(topic or "").split())
+    return {
+        "corrected": literal,
+        "queries": [literal] if literal and int(n) > 0 else [],
+        "provider_used": "literal_fallback",
+    }
 
 
 def _expansion_cache_key(topic: str, n: int, level: str | None) -> str:
@@ -242,8 +257,8 @@ async def _practice_fast_gemini_raw_async(
             reserved = context.reserve_gemini_call(
                 operation="expansion",
                 model=model,
-                prompt_text=user,
-                max_output_tokens=2048,
+                prompt_text=f"{_PRACTICE_FAST_SYSTEM}\n\n{user}",
+                max_output_tokens=PRACTICE_FAST_EXPAND_OUTPUT_TOKENS,
             )
             if isinstance(reserved, dict):
                 reservation = dict(reserved)
@@ -255,8 +270,8 @@ async def _practice_fast_gemini_raw_async(
                     system_instruction=_PRACTICE_FAST_SYSTEM,
                     response_mime_type="application/json",
                     response_json_schema=_PracticeFastExpansion.model_json_schema(),
-                    temperature=0.2,
-                    max_output_tokens=2048,
+                    thinking_config=types.ThinkingConfig(thinking_level="low"),
+                    max_output_tokens=PRACTICE_FAST_EXPAND_OUTPUT_TOKENS,
                 ),
             )
         except Exception as exc:
@@ -344,7 +359,7 @@ def expand_query_practice_fast(
     *,
     context: "GenerationContext | None" = None,
 ) -> dict:
-    """One-Flash-call expansion with deterministic fail-soft behavior.
+    """Return cached Flash search terms, failing safely to the literal request.
 
     Expansion deliberately does not reserve the Supadata search budget tracked by
     ``context``. The context enables durable cache reuse and usage accounting.
@@ -352,7 +367,7 @@ def expand_query_practice_fast(
     topic = " ".join(str(topic or "").split())
     count = max(0, int(n))
     if not topic or count == 0:
-        return deterministic_expand(topic, count, level=level)
+        return literal_fallback(topic, count)
     raise_if_cancelled(should_cancel)
     cache_key = _expansion_cache_key(topic, count, level) if context is not None else ""
     cached = _read_cached_expansion(cache_key, count) if cache_key else None
@@ -405,10 +420,10 @@ def expand_query_practice_fast(
             raise_if_cancelled(should_cancel)
             errors.append(f"{PRACTICE_FAST_EXPAND_MODEL}: {exc}")
     logger.info(
-        "practice-fast Gemini expansion unavailable; using deterministic fallback: %s",
+        "practice-fast Gemini expansion unavailable; using literal fallback: %s",
         "; ".join(errors),
     )
-    return deterministic_expand(topic, count, level=level)
+    return literal_fallback(topic, count)
 
 
 def expand_query(

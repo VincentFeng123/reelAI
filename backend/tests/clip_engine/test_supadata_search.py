@@ -1,4 +1,5 @@
 import time
+import threading
 
 import pytest
 
@@ -229,6 +230,35 @@ def test_search_all_keeps_primary_when_optional_retries_consume_budget(monkeypat
     assert [item["query"] for item in result["per_query"]] == ["primary"]
     assert context.budget.remaining("search") == 0
     assert result["warning"] == "Search budget exhausted after partial results."
+
+
+def test_two_query_fast_prefix_keeps_retry_headroom_for_transient_primary(monkeypatch):
+    calls: dict[str, int] = {}
+    calls_lock = threading.Lock()
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        del url, headers, timeout
+        query = params["query"]
+        with calls_lock:
+            calls[query] = calls.get(query, 0) + 1
+            attempt = calls[query]
+        if query == "primary" and attempt == 1:
+            return _Resp(503, {"message": "try again"})
+        return _Resp(200, {"results": [{"id": query, "type": "video"}]})
+
+    monkeypatch.setattr(ss.httpx, "get", fake_get)
+    context = GenerationContext("fast", cache_store=MemoryProviderCache())
+
+    result = ss.search_all(
+        ["primary", "expanded"],
+        context=context,
+        parallel_prefix=2,
+    )
+
+    assert [item["query"] for item in result["per_query"]] == ["primary", "expanded"]
+    assert calls == {"primary": 2, "expanded": 1}
+    assert context.budget.remaining("search") == 0
+    assert result["warning"] is None
 
 
 def test_search_page_token_uses_documented_parameter_without_filters(monkeypatch):

@@ -304,6 +304,44 @@ def _supadata_boundary_diagnostics(
     }
 
 
+def _required_speech_bounds(
+    raw_clip: dict[str, Any],
+    caption_diagnostics: dict[str, Any],
+) -> tuple[float, float]:
+    """Recover immutable first/last speech from a selector's padded cue range."""
+    padded_start = float(raw_clip.get("start") or 0.0)
+    padded_end = float(raw_clip.get("end") or padded_start)
+    cue_start, cue_end = (
+        padded_start
+        + float(caption_diagnostics["start_padding_ms"]) / 1000.0,
+        padded_end
+        - float(caption_diagnostics["end_padding_ms"]) / 1000.0,
+    )
+    try:
+        explicit_start = float(raw_clip.get("required_first_speech_sec"))
+    except (TypeError, ValueError, OverflowError):
+        explicit_start = cue_start
+    try:
+        explicit_end = float(raw_clip.get("required_last_speech_sec"))
+    except (TypeError, ValueError, OverflowError):
+        explicit_end = cue_end
+    required_start = (
+        explicit_start
+        if math.isfinite(explicit_start) and cue_start <= explicit_start < cue_end
+        else cue_start
+    )
+    required_end = (
+        explicit_end
+        if math.isfinite(explicit_end) and cue_start < explicit_end <= cue_end
+        else cue_end
+    )
+    return (
+        (required_start, required_end)
+        if required_end > required_start
+        else (cue_start, cue_end)
+    )
+
+
 def _semantic_section_search_limits(
     transcript: dict[str, Any],
     raw_clip: dict[str, Any],
@@ -424,7 +462,7 @@ def _verified_direct_adapter_clips(
     should_cancel: Callable[[], bool] | None,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Return difficulty-ranked v3 candidates with two verified silence cuts."""
+    """Return difficulty-ranked candidates with two verified silence cuts."""
     transcript = dict(engine_out.get("transcript") or {})
     segments = list(transcript.get("segments") or [])
     transcript_end = max(
@@ -486,7 +524,15 @@ def _verified_direct_adapter_clips(
 
     candidates.sort(
         key=lambda candidate: (
-            float(candidate.get("difficulty") or 0.0),
+            (
+                0
+                if float(candidate.get("difficulty") or 0.0) < 0.34
+                else 1
+                if float(candidate.get("difficulty") or 0.0) < 0.67
+                else 2
+            ),
+            -min(candidate["_quality_scores"]),
+            -(sum(candidate["_quality_scores"]) / 3.0),
             -float(candidate["_quality_scores"][1]),
             float(candidate.get("start") or 0.0),
             float(candidate.get("end") or 0.0),
@@ -507,8 +553,7 @@ def _verified_direct_adapter_clips(
         diagnostics = _supadata_boundary_diagnostics(transcript, raw_clip)
         if diagnostics is None:
             return diagnostics, None
-        start_sec = float(raw_clip.get("start") or 0.0)
-        end_sec = float(raw_clip.get("end") or 0.0)
+        start_sec, end_sec = _required_speech_bounds(raw_clip, diagnostics)
         search_start_limit, search_end_limit = _semantic_section_search_limits(
             transcript,
             raw_clip,
@@ -538,13 +583,8 @@ def _verified_direct_adapter_clips(
         raise_if_cancelled(should_cancel)
         if caption is None or acoustic is None or not acoustic.verified:
             continue
-        original_start = float(raw_clip.get("start") or 0.0)
-        original_end = float(raw_clip.get("end") or 0.0)
-        required_first_speech = (
-            original_start + float(caption["start_padding_ms"]) / 1000.0
-        )
-        required_last_speech = (
-            original_end - float(caption["end_padding_ms"]) / 1000.0
+        required_first_speech, required_last_speech = _required_speech_bounds(
+            raw_clip, caption
         )
         if not (
             math.isfinite(acoustic.start_sec)
@@ -566,13 +606,15 @@ def _verified_direct_adapter_clips(
         informativeness, topic_relevance, educational_importance = raw_clip[
             "_quality_scores"
         ]
-        quality_floor = topic_relevance
+        quality_floor = min(
+            informativeness, topic_relevance, educational_importance
+        )
         quality_mean = (
             informativeness + topic_relevance + educational_importance
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v3",
+            selection_contract_version="quality_silence_v4",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -1833,8 +1875,9 @@ class IngestionPipeline:
                 )
                 if caption is None or not require_acoustic_boundaries:
                     return caption, None
-                original_start = float(raw_clip.get("start") or 0.0)
-                original_end = float(raw_clip.get("end") or 0.0)
+                required_start, required_end = _required_speech_bounds(
+                    raw_clip, caption
+                )
                 search_start_limit, search_end_limit = _semantic_section_search_limits(
                     engine_out["transcript"],
                     raw_clip,
@@ -1844,16 +1887,16 @@ class IngestionPipeline:
                 if remaining <= 0:
                     return caption, clip_engine_silence.SilenceVerificationResult(
                         "unavailable",
-                        original_start,
-                        original_end,
+                        required_start,
+                        required_end,
                         {"stage": "verify", "reason": "deadline_exceeded"},
                     )
                 return caption, clip_engine_silence.verify_acoustic_boundaries(
                     str(v.get("url") or v.get("id") or ""),
-                    original_start,
-                    original_end,
+                    required_start,
+                    required_end,
                     search_start_limit_sec=search_start_limit,
-                    search_end_limit_sec=max(original_end, search_end_limit),
+                    search_end_limit_sec=max(required_end, search_end_limit),
                     prepared=prepared_audio,
                     timeout_sec=remaining,
                     cancel_check=should_cancel,
@@ -1913,17 +1956,10 @@ class IngestionPipeline:
                         search_context["surface_reason"] = "supadata_boundary_unavailable"
                         record_boundary_unavailable("supadata_boundary_unavailable")
                     elif require_acoustic_boundaries:
-                        original_start = float(clip.get("start") or 0.0)
-                        original_end = float(clip.get("end") or 0.0)
                         assert acoustic is not None
                         acoustic_diagnostics = dict(acoustic.diagnostics or {})
-                        first_start = (
-                            original_start
-                            + float(caption_diagnostics["start_padding_ms"]) / 1000.0
-                        )
-                        last_end = (
-                            original_end
-                            - float(caption_diagnostics["end_padding_ms"]) / 1000.0
+                        first_start, last_end = _required_speech_bounds(
+                            clip, caption_diagnostics
                         )
                         acoustic_range_is_safe = bool(
                             acoustic.verified
@@ -2405,7 +2441,9 @@ class IngestionPipeline:
                 importance = educational_importance
                 boundary_confidence = unit(clip.get("boundary_confidence"), 0.5)
                 uncertainty = str(clip.get("uncertainty") or "low").strip().lower()
-                quality_floor = topic_relevance
+                quality_floor = min(
+                    informativeness, topic_relevance, importance
+                )
                 quality_mean = (
                     topic_relevance + importance + informativeness
                 ) / 3.0
@@ -2439,7 +2477,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v3",
+                    selection_contract_version="quality_silence_v4",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

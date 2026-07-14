@@ -1,6 +1,6 @@
 # backend/tests/clip_engine/test_run.py
 import pytest
-from backend.app.clip_engine import run
+from backend.app.clip_engine import expand, run
 from backend.app.clip_engine.errors import (
     ProviderAuthenticationError,
     ProviderQuotaError,
@@ -54,9 +54,13 @@ def test_live_runner_uses_the_canonical_practice_segmenter():
     assert run.gemini_segment.__name__ == "backend.pipeline.gemini_segment"
 
 
-def test_segment_cache_hit_skips_gemini_and_budget(monkeypatch):
+def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
     transcript = {
-        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "segments": [{
+            "start": 0.0,
+            "end": 5.0,
+            "text": "hello world explains the complete cached concept clearly",
+        }],
         "words": [],
         "duration": 5.0,
     }
@@ -66,18 +70,41 @@ def test_segment_cache_hit_skips_gemini_and_budget(monkeypatch):
         "title": "Bit",
         "facet": "concept",
         "reason": "Explains the concept",
+        "learning_objective": "Understand the cached concept",
         "kind": "educational",
         "informativeness": 0.9,
         "topic_relevance": 0.9,
+        "educational_importance": 0.9,
         "self_contained": True,
+        "is_standalone": True,
+        "directly_teaches_topic": True,
+        "substantive": True,
+        "factually_grounded": True,
+        "topic_evidence_quote": "hello world explains the complete cached concept",
         "difficulty": 0.5,
+        "uncertainty": "low",
+        "uncertainty_reasons": [],
         "summary": "",
         "takeaways": [],
         "match_reason": "",
         "assessment": None,
         "sequence_index": 1,
     }
+    assert run.segment_cache._valid_clips(
+        [cached_clip], transcript=transcript, settings={}
+    ) is not None
     context = GenerationContext("slow")
+    expansion_dispatches = 0
+
+    def fail_expansion(*_args, **_kwargs):
+        nonlocal expansion_dispatches
+        expansion_dispatches += 1
+        pytest.fail("A direct URL cache hit must not depend on expansion cache state")
+
+    # A URL-adapter source is already known. Even with no usable expansion
+    # cache, its valid segment result must remain a zero-Gemini path.
+    monkeypatch.setattr(expand, "_read_cached_expansion", lambda *_args: None)
+    monkeypatch.setattr(expand, "_practice_fast_gemini_raw", fail_expansion)
     monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
     monkeypatch.setattr(
         run.segment_cache,
@@ -99,6 +126,8 @@ def test_segment_cache_hit_skips_gemini_and_budget(monkeypatch):
     assert output["clips"][0]["title"] == "Bit"
     assert context.budget.snapshot()["used"]["segmentation"] == 0
     assert context.counters()["segmentation_cache_hits"] == 1
+    assert expansion_dispatches == 0
+    assert len(context.usage()) == 1
     assert context.usage()[0]["metadata"]["cache_hit"] is True
 
 

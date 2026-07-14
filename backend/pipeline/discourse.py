@@ -58,6 +58,20 @@ _ANAPHORIC_QUESTION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_LOCAL_QUESTION_CONTEXT_RE = re.compile(
+    r"(?:[.!?]\s+|(?:,\s*)?\b(?:and|or)\s+)$",
+    re.IGNORECASE,
+)
+
+_QUESTION_CONTEXT_GENERIC_WORDS = frozenset({
+    "a", "an", "and", "are", "be", "been", "can", "clarify", "could", "did",
+    "do", "does", "explain", "finished", "have", "here", "how", "i", "in",
+    "introduction", "is", "it", "matter", "one", "or", "part", "process",
+    "question", "section", "show", "tell", "that", "the", "these", "they",
+    "thing", "this", "those", "to", "topic", "was", "we", "were", "what",
+    "when", "where", "which", "why", "will", "work", "would", "you",
+})
+
 # Bare anaphora that, as the first word before a verb/aux, lack an in-clip antecedent.
 ANAPHORS: frozenset[str] = frozenset({
     "this", "that", "these", "those", "it", "they", "them", "he", "she",
@@ -127,6 +141,30 @@ def _is_framing_or_question(text: str, words: list[str]) -> bool:
     return False
 
 
+def _has_unresolved_question_reference(text: str) -> bool:
+    """Reject only question references without context earlier in the same cue.
+
+    Caption providers can place several complete sentences or coordinated questions in
+    one cue. A later pronoun can therefore resolve to a noun introduced earlier in that
+    cue; treating every later ``why do they`` as dangling makes those valid openings
+    impossible to recover by expanding farther backward.
+    """
+    for match in _DANGLING_QUESTION_REFERENCE_RE.finditer(text):
+        prefix = text[:match.start()]
+        boundary = _LOCAL_QUESTION_CONTEXT_RE.search(prefix)
+        if boundary is None:
+            return True
+        context = prefix[:boundary.start()].strip()
+        context_words = [word.casefold() for word in _words(context)]
+        has_concrete_antecedent = any(
+            len(word) >= 3 and word not in _QUESTION_CONTEXT_GENERIC_WORDS
+            for word in context_words
+        )
+        if not has_concrete_antecedent:
+            return True
+    return False
+
+
 def opens_mid_thought(text: str) -> bool:
     """True when this sentence, as a clip's first line, drops the viewer mid-thought."""
     words = _words(text)
@@ -149,7 +187,7 @@ def opens_mid_thought(text: str) -> bool:
 
     # A question is not self-contained merely because it has punctuation.
     # "How does the cell do that?" still requires the missing prior action.
-    if _DANGLING_QUESTION_REFERENCE_RE.search(stripped):
+    if _has_unresolved_question_reference(stripped):
         return True
 
     w0 = words[0].lower()

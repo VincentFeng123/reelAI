@@ -778,11 +778,11 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v3"
+            reel.get("selection_contract_version") == "quality_silence_v4"
             for reel in feed
         ))
 
-    def test_quality_silence_v3_response_orders_difficulty_before_quality(self) -> None:
+    def test_quality_silence_v4_response_orders_stage_before_quality(self) -> None:
         generated = [
             {
                 "reel_id": "a-late",
@@ -794,7 +794,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "_selection_quality_mean": 0.94,
                 "_selection_topic_relevance": 0.96,
                 "_selection_source_rank": 0,
-                "selection_contract_version": "quality_silence_v3",
+                "selection_contract_version": "quality_silence_v4",
             },
             {
                 "reel_id": "b",
@@ -806,19 +806,19 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "_selection_quality_mean": 0.97,
                 "_selection_topic_relevance": 0.99,
                 "_selection_source_rank": 1,
-                "selection_contract_version": "quality_silence_v3",
+                "selection_contract_version": "quality_silence_v4",
             },
             {
                 "reel_id": "a-early",
                 "video_id": "source-a",
                 "t_start": 10.25,
-                "difficulty": 0.5,
+                "difficulty": 0.3,
                 "score": 0.91,
                 "_selection_quality_floor": 0.91,
                 "_selection_quality_mean": 0.92,
                 "_selection_topic_relevance": 0.93,
                 "_selection_source_rank": 0,
-                "selection_contract_version": "quality_silence_v3",
+                "selection_contract_version": "quality_silence_v4",
             },
         ]
 
@@ -830,7 +830,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
 
         self.assertEqual(
             [reel["reel_id"] for reel in result],
-            ["b", "a-early", "a-late"],
+            ["a-early", "b", "a-late"],
         )
         self.assertTrue(all(
             not any(key.startswith("_selection_") for key in reel)
@@ -1186,7 +1186,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 16)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 17)
 
 
 if __name__ == "__main__":

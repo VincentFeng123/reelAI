@@ -82,6 +82,19 @@ def test_question_with_missing_antecedent_is_weak():
         "And then you have to ask the question, is it renormalizable?"
     )
 
+
+def test_compound_question_can_establish_its_own_pronoun_antecedent():
+    assert is_onset(
+        "What properties do metals have, and why do they conduct electricity?"
+    )
+    assert is_onset(
+        "The enzyme binds DNA. How does it recognize the target sequence?"
+    )
+    assert is_onset("Can you explain osmosis? How does it work?")
+    assert opens_mid_thought("I have one question. Why does it matter?")
+    assert opens_mid_thought("We finished the introduction. How does it work?")
+    assert opens_mid_thought("What does it change?")
+
 def test_context_dependent_np_is_weak():
     assert opens_mid_thought("The answer is fifteen newtons.")
     assert opens_mid_thought("The previous equation tells us the velocity.")

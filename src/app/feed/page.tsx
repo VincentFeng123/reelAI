@@ -1089,6 +1089,8 @@ function FeedPageInner() {
   const historySyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressClearTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const generationJobByMaterialRef = useRef<Map<string, ActiveGenerationJob>>(new Map());
+  const generationConsumerByMaterialRef = useRef<Map<string, { jobId: string; token: symbol }>>(new Map());
+  const generationBatchTokensRef = useRef<Set<symbol>>(new Set());
   const generationExhaustedUntilRef = useRef<Map<string, number>>(new Map());
   const generationExhaustedTimerRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
   const recoveryRequestIdleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1104,6 +1106,30 @@ function FeedPageInner() {
     seq: 0,
     controller: new AbortController(),
   });
+
+  const syncGenerationLockState = useCallback(() => {
+    const active = generationBatchTokensRef.current.size > 0 || generationConsumerByMaterialRef.current.size > 0;
+    isGeneratingRef.current = active;
+    setGeneratingMore(active);
+    setRecoveryPhase(active ? "generating" : "idle");
+  }, []);
+
+  const claimGenerationConsumer = useCallback((materialIdValue: string, jobId: string): symbol | null => {
+    if (generationConsumerByMaterialRef.current.has(materialIdValue)) {
+      return null;
+    }
+    const token = Symbol(jobId || materialIdValue);
+    generationConsumerByMaterialRef.current.set(materialIdValue, { jobId, token });
+    syncGenerationLockState();
+    return token;
+  }, [syncGenerationLockState]);
+
+  const releaseGenerationConsumer = useCallback((materialIdValue: string, token: symbol) => {
+    if (generationConsumerByMaterialRef.current.get(materialIdValue)?.token === token) {
+      generationConsumerByMaterialRef.current.delete(materialIdValue);
+    }
+    syncGenerationLockState();
+  }, [syncGenerationLockState]);
 
   const abortActiveSearchScope = useCallback(() => {
     const scope = activeSearchScopeRef.current;
@@ -1123,6 +1149,8 @@ function FeedPageInner() {
     isFastTopUpRef.current = false;
     isRefreshingFeedRef.current = false;
     isRecoveringMissingMaterialRef.current = false;
+    generationConsumerByMaterialRef.current.clear();
+    generationBatchTokensRef.current.clear();
     resumeLoadingRef.current = false;
     activeRecoveryRequestRef.current = null;
     if (recoveryRequestIdleTimerRef.current) {
@@ -1318,6 +1346,8 @@ function FeedPageInner() {
 
   const clearGenerationTracking = useCallback(() => {
     generationJobByMaterialRef.current.clear();
+    generationConsumerByMaterialRef.current.clear();
+    generationBatchTokensRef.current.clear();
     generationExhaustedUntilRef.current.clear();
     for (const timer of generationExhaustedTimerRef.current.values()) {
       clearTimeout(timer);
@@ -1950,6 +1980,69 @@ function FeedPageInner() {
     [dedupeByIdentity, orderReelsByDifficulty, reelClipKey, updateSessionReels],
   );
 
+  const consumeFeedGenerationJob = useCallback((
+    materialIdValue: string,
+    response: Awaited<ReturnType<typeof fetchFeed>>,
+    searchScope: FeedSearchScope,
+  ): Promise<void> | null => {
+    const jobId = String(response.generation_job_id || "").trim();
+    const status = response.generation_job_status;
+    if (!jobId || (status != null && status !== "queued" && status !== "running")) {
+      return null;
+    }
+    const token = claimGenerationConsumer(materialIdValue, jobId);
+    if (!token) {
+      return null;
+    }
+
+    const streamedReels: Reel[] = [];
+    return (async () => {
+      try {
+        const data = await generateReelsStream({
+          materialId: materialIdValue,
+          generationJobId: jobId,
+          signal: searchScope.controller.signal,
+          idleTimeoutMs: GENERATION_STREAM_IDLE_TIMEOUT_MS,
+          onTerminal: (terminalStatus) => {
+            if (isSearchScopeActive(searchScope)) {
+              noteGenerationTerminal(materialIdValue, terminalStatus);
+            }
+          },
+          onCandidate: (reel) => {
+            if (!isSearchScopeActive(searchScope)) {
+              return;
+            }
+            const appended = appendGeneratedReels([reel]);
+            if (appended.addedCount > 0) {
+              streamedReels.push(...appended.addedReels);
+              markRecoveryProgress(appended.addedCount);
+            }
+          },
+        });
+        if (!isSearchScopeActive(searchScope)) {
+          return;
+        }
+        reconcileGeneratedReels(streamedReels, data.reels, { preserveUnmatchedUnseen: true });
+      } catch (error) {
+        if (isSearchScopeActive(searchScope) && !isRequestInterruptedError(error)) {
+          console.warn(`Feed generation stream failed for topic material ${materialIdValue}:`, error);
+        }
+      } finally {
+        if (isSearchScopeActive(searchScope)) {
+          releaseGenerationConsumer(materialIdValue, token);
+        }
+      }
+    })();
+  }, [
+    appendGeneratedReels,
+    isSearchScopeActive,
+    markRecoveryProgress,
+    noteGenerationTerminal,
+    claimGenerationConsumer,
+    reconcileGeneratedReels,
+    releaseGenerationConsumer,
+  ]);
+
   const loadPage = useCallback(
     async (
       targetPage: number,
@@ -2082,6 +2175,14 @@ function FeedPageInner() {
           console.warn("Some topic feeds failed to load:", failedIds);
         }
         setRecoveryPhase("idle");
+        for (const row of successful) {
+          void consumeFeedGenerationJob(
+            row.materialId,
+            row.data!,
+            searchScope,
+          );
+        }
+        syncGenerationLockState();
         return { addedCount: merged.addedCount, exhausted };
       } catch (e) {
         if (!isSearchScopeActive(searchScope) || isRequestInterruptedError(e)) {
@@ -2111,6 +2212,7 @@ function FeedPageInner() {
     [
       armActiveRecoveryRequest,
       clearRecoveredTransportError,
+      consumeFeedGenerationJob,
       dedupeByIdentity,
       feedPagesExhausted,
       generationMode,
@@ -2128,6 +2230,7 @@ function FeedPageInner() {
       reconcileGeneratedReels,
       rememberFeedGenerationJob,
       settingsScopeReady,
+      syncGenerationLockState,
       updateSessionReels,
       finishActiveRecoveryRequest,
     ],
@@ -2155,9 +2258,9 @@ function FeedPageInner() {
     const unseenReadyCount = Math.max(0, reelsRef.current.length - activeIndexRef.current - 1);
     const requestedReadyCount = Math.max(1, readyReservoirTarget(generationMode) - unseenReadyCount);
     const perTopicBatch = Math.max(1, Math.ceil(requestedReadyCount / feedMaterialIds.length));
-    isGeneratingRef.current = true;
-    setGeneratingMore(true);
-    setRecoveryPhase("generating");
+    const generationBatchToken = Symbol("request-more");
+    generationBatchTokensRef.current.add(generationBatchToken);
+    syncGenerationLockState();
     armActiveRecoveryRequest(searchScope, "generating");
     if (progressClearTimerRef.current) {
       clearTimeout(progressClearTimerRef.current);
@@ -2172,6 +2275,10 @@ function FeedPageInner() {
           const currentCount = countReelsForMaterial(id);
           const targetTotal = Math.min(readyReservoirTarget(generationMode), currentCount + perTopicBatch);
           const activeGenerationJob = generationJobByMaterialRef.current.get(id);
+          const consumerToken = claimGenerationConsumer(id, activeGenerationJob?.jobId || "new-generation");
+          if (!consumerToken) {
+            return { materialId: id, data: null, streamedReels, error: null };
+          }
           try {
             const data = await generateReelsStream({
               materialId: id,
@@ -2221,6 +2328,10 @@ function FeedPageInner() {
               console.warn(`Background reel generation failed for topic material ${id}:`, e);
             }
             return { materialId: id, data: null, streamedReels, error: e };
+          } finally {
+            if (isSearchScopeActive(searchScope)) {
+              releaseGenerationConsumer(id, consumerToken);
+            }
           }
         }),
       );
@@ -2286,12 +2397,12 @@ function FeedPageInner() {
       return [];
     } finally {
       if (isSearchScopeActive(searchScope)) {
+        generationBatchTokensRef.current.delete(generationBatchToken);
+        syncGenerationLockState();
         finishActiveRecoveryRequest(searchScope);
-        setGeneratingMore(false);
-        isGeneratingRef.current = false;
-        if (progressErrored) {
+        if (progressErrored && !isGeneratingRef.current) {
           setGenerationProgress(null);
-        } else {
+        } else if (!isGeneratingRef.current) {
           progressClearTimerRef.current = setTimeout(() => {
             progressClearTimerRef.current = null;
             setGenerationProgress(null);
@@ -2305,6 +2416,7 @@ function FeedPageInner() {
     appendGeneratedReels,
     armActiveRecoveryRequest,
     canRequestMore,
+    claimGenerationConsumer,
     clearRecoveredTransportError,
     countReelsForMaterial,
     dedupeByIdentity,
@@ -2322,7 +2434,9 @@ function FeedPageInner() {
     noteGenerationTerminal,
     recoverMissingMaterial,
     reconcileGeneratedReels,
+    releaseGenerationConsumer,
     settingsScopeReady,
+    syncGenerationLockState,
     finishActiveRecoveryRequest,
   ]);
 
@@ -2786,6 +2900,9 @@ function FeedPageInner() {
       Math.ceil(Math.max(1, readyReservoirTarget("fast") - unseenReadyCount) / feedMaterialIds.length),
     );
     isFastTopUpRef.current = true;
+    const generationBatchToken = Symbol("fast-top-up");
+    generationBatchTokensRef.current.add(generationBatchToken);
+    syncGenerationLockState();
     try {
       const generatedRows = await Promise.all(
         feedMaterialIds.map(async (id) => {
@@ -2793,6 +2910,10 @@ function FeedPageInner() {
           const currentCount = countReelsForMaterial(id);
           const targetTotal = Math.min(readyReservoirTarget("fast"), currentCount + perTopicBatch);
           const activeGenerationJob = generationJobByMaterialRef.current.get(id);
+          const consumerToken = claimGenerationConsumer(id, activeGenerationJob?.jobId || "new-fast-generation");
+          if (!consumerToken) {
+            return null;
+          }
           try {
             const data = await generateReelsStream({
               materialId: id,
@@ -2829,6 +2950,10 @@ function FeedPageInner() {
               console.warn(`Fast mode background top-up failed for topic material ${id}:`, e);
             }
             return null;
+          } finally {
+            if (isSearchScopeActive(searchScope)) {
+              releaseGenerationConsumer(id, consumerToken);
+            }
           }
         }),
       );
@@ -2850,11 +2975,14 @@ function FeedPageInner() {
     } finally {
       if (isSearchScopeActive(searchScope)) {
         isFastTopUpRef.current = false;
+        generationBatchTokensRef.current.delete(generationBatchToken);
+        syncGenerationLockState();
       }
     }
   }, [
     appendGeneratedReels,
     canRequestMore,
+    claimGenerationConsumer,
     countReelsForMaterial,
     dedupeByIdentity,
     generationMode,
@@ -2866,7 +2994,9 @@ function FeedPageInner() {
     markRecoveryProgress,
     noteGenerationTerminal,
     reconcileGeneratedReels,
+    releaseGenerationConsumer,
     settingsScopeReady,
+    syncGenerationLockState,
   ]);
 
   const bootstrapFirstReels = useCallback(

@@ -236,7 +236,7 @@ def test_nonstandalone_candidate_cannot_displace_standalone_candidate():
     assert [clip["selection_candidate_id"] for clip in clips] == ["setup"]
 
 
-def test_clip_limit_uses_relevance_then_stable_chronology():
+def test_clip_limit_uses_overall_quality_before_stable_chronology():
     segs = _segs(3)
     early = _topic(
         "Early",
@@ -258,7 +258,7 @@ def test_clip_limit_uses_relevance_then_stable_chronology():
     )
 
     clips = _convert(G._Plan(topics=[early, later]), segs, max_clips=1)
-    assert [clip["selection_candidate_id"] for clip in clips] == ["early"]
+    assert [clip["selection_candidate_id"] for clip in clips] == ["later"]
 
 
 def test_post_acceptance_enrichment_is_grounded_batched_and_quiz_free(monkeypatch):
@@ -594,7 +594,7 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
     assert "topic_relevance is at least 0.75" in prompt
     assert "low or medium uncertainty" in prompt
     assert "omit only high-uncertainty" in prompt
-    assert G._BOUNDARY_OUTPUT_TOKENS == 8192
+    assert G._BOUNDARY_OUTPUT_TOKENS == 12_288
     assert "scan the whole transcript from first to last" in prompt
     assert "every distinct" in prompt
     assert "return every distinct qualifying moment" in prompt
@@ -617,7 +617,7 @@ def test_production_flash_has_no_requested_duration_contract():
     assert "regardless of its duration" in prompt
 
 
-def test_compound_topic_requires_the_relationship_between_named_ideas():
+def test_compound_topic_allows_grounded_related_facets():
     _system, user = G._boundary_prompts(
         "[0] 00:00 lesson",
         1,
@@ -625,8 +625,8 @@ def test_compound_topic_requires_the_relationship_between_named_ideas():
     )
 
     assert "multiple linked ideas" in user
-    assert "teaching only one component" in user
-    assert "nearby prerequisite is not a direct match" in user
+    assert "useful prerequisite facet is relevant" in user
+    assert "unrelated domain is not enough" in user
 
 
 def test_budget_is_reserved_once_and_selector_dispatch_has_no_retry(monkeypatch):

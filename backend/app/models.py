@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from .clip_engine.metadata import extract_video_id as extract_youtube_video_id
+
 
 class ConceptOut(BaseModel):
     id: str
@@ -42,6 +44,7 @@ class ReelOut(BaseModel):
     material_id: str
     concept_id: str
     concept_title: str
+    video_id: str = ""
     video_title: str = ""
     video_description: str = ""
     channel_name: str = ""
@@ -53,7 +56,10 @@ class ReelOut(BaseModel):
     takeaways: list[str]
     captions: list[CaptionCue] = Field(default_factory=list)
     score: float
+    # Deterministic transcript/query similarity used by retrieval shaping.
     relevance_score: float | None = None
+    # Authoritative selector score used by the current topic-relevance hard gate.
+    topic_relevance: float | None = None
     discovery_score: float | None = None
     clipability_score: float | None = None
     query_strategy: str = ""
@@ -73,6 +79,15 @@ class ReelOut(BaseModel):
     model_used: str | None = None
     quality_degraded: bool = False
     selected_cue_ids: list[str] = Field(default_factory=list)
+    selection_contract_version: str | None = None
+
+    @model_validator(mode="after")
+    def populate_youtube_video_id(self) -> "ReelOut":
+        if not self.video_id:
+            source_id = extract_youtube_video_id(self.video_url)
+            if source_id:
+                object.__setattr__(self, "video_id", source_id)
+        return self
 
 
 class ReelsGenerateResponse(BaseModel):

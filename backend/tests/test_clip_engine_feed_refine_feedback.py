@@ -526,12 +526,12 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_16(self) -> None:
-        """Cache rows must include v3 difficulty, semantic, and acoustic gates."""
+    def test_ranked_feed_cache_version_is_17(self) -> None:
+        """Cache rows must retain public v3 selector and source metadata."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            16,
-            "Current feeds must not reuse stale pre-v3 difficulty rows.",
+            17,
+            "Current feeds must not reuse rows missing public selector metadata.",
         )
 
 

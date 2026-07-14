@@ -619,9 +619,9 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("low", 8_192, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
+         ("low", 12_288, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
         (G.PRO_BOUNDARY_PROFILE,
-         ("high", 8_192, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
+         ("high", 12_288, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -664,7 +664,7 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
     )
 
     assert captured["thinking_level"] == "low"
-    assert captured["max_output_tokens"] == 8_192
+    assert captured["max_output_tokens"] == 12_288
 
 
 def test_boundary_profile_repairs_bad_model_quote_from_cited_cue(monkeypatch):
@@ -778,7 +778,7 @@ def test_production_boundary_selector_keeps_every_candidate_beyond_sixteen(monke
     assert "T16" in {clip["title"] for clip in report.clips}
 
 
-def test_production_order_uses_relevance_not_information_or_importance(monkeypatch):
+def test_production_order_uses_information_and_importance_with_relevance(monkeypatch):
     segments = [
         {
             "cue_id": f"c{index}",
@@ -837,8 +837,8 @@ def test_production_order_uses_relevance_not_information_or_importance(monkeypat
 
     assert classification.status == "green"
     assert [clip["title"] for clip in report.clips] == [
-        "Most relevant",
         "Less relevant",
+        "Most relevant",
     ]
 
 

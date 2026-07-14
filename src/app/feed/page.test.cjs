@@ -8,6 +8,7 @@ const filePath = path.join(__dirname, "page.tsx");
 const source = fs.readFileSync(filePath, "utf8");
 const reelCardSource = fs.readFileSync(path.join(__dirname, "../../components/ReelCard.tsx"), "utf8");
 const feedQuerySource = fs.readFileSync(path.join(__dirname, "../../lib/feedQuery.ts"), "utf8");
+const typesSource = fs.readFileSync(path.join(__dirname, "../../lib/types.ts"), "utf8");
 const sourceFile = ts.createSourceFile(
   filePath,
   source,
@@ -73,7 +74,7 @@ test("generation finals cannot reconcile after their search scope is invalidated
   }
 
   visit(sourceFile);
-  assert.equal(finalReconciliations.length, 2, "both generation paths must remain covered");
+  assert.equal(finalReconciliations.length, 3, "every generation path must remain covered");
   for (const reconciliation of finalReconciliations) {
     const reconciliationCall = reconciliation.expression;
     assert.equal(
@@ -111,6 +112,126 @@ test("feed generation uses the shared fast and slow ready ceilings and resumes d
   assert.match(source, /generationJobId: activeGenerationJob\?\.jobId/);
   assert.match(source, /idleTimeoutMs: GENERATION_STREAM_IDLE_TIMEOUT_MS/);
   assert.match(source, /consecutiveIdleWindows >= 2/);
+});
+
+test("feed-owned jobs start the shared stream immediately and only once per material", async () => {
+  const generationConsumerByMaterialRef = { current: new Map() };
+  const generationBatchTokensRef = { current: new Set() };
+  const isGeneratingRef = { current: false };
+  const streamCalls = [];
+  const appended = [];
+  const reconciled = [];
+  const finishStreams = new Map();
+  let generatingMore = false;
+  let recoveryPhase = "idle";
+  const syncGenerationLockState = compileUseCallback("syncGenerationLockState", {
+    generationConsumerByMaterialRef,
+    generationBatchTokensRef,
+    isGeneratingRef,
+    setGeneratingMore: (active) => {
+      generatingMore = active;
+    },
+    setRecoveryPhase: (phase) => {
+      recoveryPhase = phase;
+    },
+  });
+  const claimGenerationConsumer = compileUseCallback("claimGenerationConsumer", {
+    generationConsumerByMaterialRef,
+    syncGenerationLockState,
+  });
+  const releaseGenerationConsumer = compileUseCallback("releaseGenerationConsumer", {
+    generationConsumerByMaterialRef,
+    syncGenerationLockState,
+  });
+  const callback = compileUseCallback("consumeFeedGenerationJob", {
+    claimGenerationConsumer,
+    releaseGenerationConsumer,
+    GENERATION_STREAM_IDLE_TIMEOUT_MS: 35_000,
+    generateReelsStream: async (params) => {
+      streamCalls.push(params);
+      params.onCandidate({ reel_id: `candidate-${params.materialId}` });
+      await new Promise((resolve) => {
+        finishStreams.set(params.materialId, resolve);
+      });
+      params.onTerminal("completed");
+      return { reels: [{ reel_id: `final-${params.materialId}` }] };
+    },
+    isSearchScopeActive: () => true,
+    noteGenerationTerminal: () => {},
+    appendGeneratedReels: (rows) => {
+      appended.push(...rows);
+      return { reels: rows, addedReels: rows, addedCount: rows.length, updatedCount: 0 };
+    },
+    markRecoveryProgress: () => {},
+    reconcileGeneratedReels: (...args) => reconciled.push(args),
+    isRequestInterruptedError: () => false,
+    console,
+  });
+  const searchScope = { key: "material", seq: 1, controller: new AbortController() };
+
+  const first = callback(
+    "material-a",
+    { generation_job_id: "job-a", generation_job_status: "running" },
+    searchScope,
+  );
+  const duplicate = callback(
+    "material-a",
+    { generation_job_id: "job-a", generation_job_status: "running" },
+    searchScope,
+  );
+  const second = callback(
+    "material-b",
+    { generation_job_id: "job-b", generation_job_status: "queued" },
+    searchScope,
+  );
+
+  assert.ok(first instanceof Promise);
+  assert.ok(second instanceof Promise);
+  assert.equal(duplicate, null);
+  assert.deepEqual(streamCalls.map((call) => call.generationJobId), ["job-a", "job-b"]);
+  assert.equal(isGeneratingRef.current, true);
+  assert.equal(generatingMore, true);
+  assert.equal(recoveryPhase, "generating");
+  assert.deepEqual(appended.map((reel) => reel.reel_id), ["candidate-material-a", "candidate-material-b"]);
+
+  finishStreams.get("material-a")();
+  await first;
+  assert.equal(generationConsumerByMaterialRef.current.size, 1);
+  assert.equal(isGeneratingRef.current, true, "material B must retain the global lock after material A settles");
+
+  const otherGeneration = Symbol("other-generation");
+  generationBatchTokensRef.current.add(otherGeneration);
+  finishStreams.get("material-b")();
+  await second;
+  assert.equal(generationConsumerByMaterialRef.current.size, 0);
+  assert.equal(isGeneratingRef.current, true, "another generation batch must retain the global lock");
+
+  generationBatchTokensRef.current.delete(otherGeneration);
+  syncGenerationLockState();
+
+  assert.equal(isGeneratingRef.current, false);
+  assert.equal(generatingMore, false);
+  assert.equal(recoveryPhase, "idle");
+  assert.equal(reconciled.length, 2);
+  assert.deepEqual(reconciled.map((args) => args[1][0].reel_id), ["final-material-a", "final-material-b"]);
+  assert.ok(reconciled.every((args) => args[2].preserveUnmatchedUnseen === true));
+});
+
+test("feed starts returned generation jobs before yielding to bootstrap", () => {
+  const loadPageStart = source.indexOf("const loadPage = useCallback(");
+  const loadPageEnd = source.indexOf("const requestMore = useCallback(", loadPageStart);
+  const loadPageText = source.slice(loadPageStart, loadPageEnd);
+  const rememberIndex = loadPageText.indexOf("rememberFeedGenerationJob(row.materialId, row.data!)");
+  const consumeIndex = loadPageText.indexOf("void consumeFeedGenerationJob(");
+  assert.ok(rememberIndex >= 0);
+  assert.ok(consumeIndex > rememberIndex, "the feed response must register then immediately consume its durable job");
+  assert.doesNotMatch(loadPageText, /canStartFeedGenerationConsumers/);
+});
+
+test("the Reel contract explicitly retains v4 selection metadata", () => {
+  assert.match(typesSource, /video_id\?: string \| null;/);
+  assert.match(typesSource, /topic_relevance\?: number \| null;/);
+  assert.match(typesSource, /selection_contract_version\?: string \| null;/);
 });
 
 test("restored reconciliation removes cached unseen rows and stream settlement drops rejected provisionals", () => {
