@@ -713,7 +713,17 @@ class EmbedUrlCeilTests(IngestTopicTests):
             "verified",
             start_sec=12.001,
             end_sec=433.012,
-            diagnostics={"threshold_dbfs": -38.0},
+            diagnostics={
+                "threshold_dbfs": -38.0,
+                "speech_handoff_verified": True,
+                "semantic_start_limit_sec": 12.345,
+                "semantic_end_limit_sec": 432.789,
+                "observation_start_limit_sec": 11.345,
+                "observation_end_limit_sec": 433.789,
+                "handoff_timestamp_tolerance_sec": 0.05,
+                "start_quiet": [11.9, 12.4],
+                "end_quiet": [432.7, 433.1],
+            },
         )
 
         with (

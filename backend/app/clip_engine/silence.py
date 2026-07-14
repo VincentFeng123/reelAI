@@ -41,6 +41,8 @@ QUIET_THRESHOLD_DBFS = -38.0
 MIN_QUIET_MS = 120
 START_CUSHION_MS = 100
 END_CUSHION_MS = 200
+HANDOFF_OBSERVATION_HALO_SEC = 1.0
+HANDOFF_TIMESTAMP_TOLERANCE_SEC = 0.05
 _FRAME_MS = 10
 _FRAME_SEC = _FRAME_MS / 1000.0
 _YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -640,13 +642,24 @@ def _quiet_intervals(
 
 
 def _pick_start_interval(
-    intervals: Sequence[_QuietInterval], rough_start: float
+    intervals: Sequence[_QuietInterval],
+    rough_start: float,
+    *,
+    handoff_band: tuple[float, float] | None = None,
 ) -> _QuietInterval | None:
     candidates = [
         interval
         for interval in intervals
         if interval.followed_by_sound
-        and interval.start_sec <= rough_start
+        and (
+            interval.start_sec <= rough_start
+            if handoff_band is None
+            else (
+                interval.start_sec <= handoff_band[0] + _FRAME_SEC
+                and interval.end_sec
+                >= handoff_band[1] - HANDOFF_TIMESTAMP_TOLERANCE_SEC
+            )
+        )
         and interval.duration_sec + 1e-9 >= START_CUSHION_MS / 1000.0
     ]
     if not candidates:
@@ -665,13 +678,23 @@ def _pick_end_interval(
     rough_end: float,
     *,
     allow_source_edge: bool = False,
+    handoff_band: tuple[float, float] | None = None,
 ) -> _QuietInterval | None:
     candidates = [
         interval
         for interval in intervals
         if interval.preceded_by_sound
         and (
-            interval.end_sec - _FRAME_SEC + 1e-9 >= rough_end
+            (
+                interval.end_sec - _FRAME_SEC + 1e-9 >= rough_end
+                if handoff_band is None
+                else (
+                    interval.start_sec
+                    <= handoff_band[0] + HANDOFF_TIMESTAMP_TOLERANCE_SEC
+                    and interval.end_sec
+                    >= handoff_band[1] - HANDOFF_TIMESTAMP_TOLERANCE_SEC
+                )
+            )
             or (
                 allow_source_edge
                 and abs(interval.end_sec - rough_end) <= _FRAME_SEC + 1e-9
@@ -741,6 +764,7 @@ def _search_quiet(
     search_start_limit: float,
     search_end_limit: float,
     allow_source_edge: bool = False,
+    handoff_band: tuple[float, float] | None = None,
     temp_dir: Path,
     ffmpeg_bin: str,
     deadline: float,
@@ -801,16 +825,23 @@ def _search_quiet(
                 stitched.append(interval)
             intervals = stitched
         quiet = (
-            picker(intervals, required_boundary)
+            picker(
+                intervals,
+                required_boundary,
+                handoff_band=handoff_band,
+            )
             if edge == "start"
             else _pick_end_interval(
                 intervals,
                 required_boundary,
                 allow_source_edge=allow_source_edge,
+                handoff_band=handoff_band,
             )
         )
         if quiet is not None:
             return _EdgeSearchResult(quiet, tuple(searched))
+        if handoff_band is not None:
+            return _EdgeSearchResult(None, tuple(searched))
         if edge == "start":
             adjacent_window_edge_is_quiet = any(
                 abs(interval.start_sec - window_start) <= _FRAME_SEC
@@ -850,6 +881,7 @@ def verify_acoustic_boundaries(
     *,
     search_start_limit_sec: float | None = None,
     search_end_limit_sec: float | None = None,
+    require_speech_handoff: bool = False,
     prepared: AudioPreparationResult | None = None,
     timeout_sec: float = DEFAULT_TIMEOUT_SEC,
     cancel_check: CancelCheck | None = None,
@@ -857,11 +889,12 @@ def verify_acoustic_boundaries(
 ) -> SilenceVerificationResult:
     """Verify and adjust one clip to measured quiet edge intervals.
 
-    ``start_sec`` and ``end_sec`` are required speech boundaries: a verified
-    start never moves later and a verified end never moves earlier. The optional
-    search limits are semantic/source bounds and let the verifier progressively
-    inspect additional non-overlapping windows without imposing a clip-duration
-    limit. Omitting them retains the former single-window search footprint.
+    ``start_sec`` and ``end_sec`` are required speech boundaries. Ordinarily a
+    verified start never moves later and a verified end never moves earlier.
+    With ``require_speech_handoff``, caption timestamps are treated as semantic
+    fences: a one-second decode-only halo may complete a quiet run across each
+    fence, but no later quiet run separated by sound can qualify. This tolerates
+    small caption drift without crossing neighboring speech.
 
     ``prepared`` may be produced concurrently with transcript selection. On any
     resolution, decoding, cancellation, timeout, or silence failure, this
@@ -886,12 +919,12 @@ def verify_acoustic_boundaries(
             original_start, original_end, stage="input", reason="invalid_range", started=started
         )
     try:
-        search_start_limit = (
+        semantic_start_limit = (
             max(0.0, original_start - EDGE_WINDOW_SEC / 2.0)
             if search_start_limit_sec is None
             else float(search_start_limit_sec)
         )
-        search_end_limit = (
+        semantic_end_limit = (
             original_end + EDGE_WINDOW_SEC / 2.0
             if search_end_limit_sec is None
             else float(search_end_limit_sec)
@@ -905,12 +938,12 @@ def verify_acoustic_boundaries(
             started=started,
         )
     if (
-        not math.isfinite(search_start_limit)
-        or not math.isfinite(search_end_limit)
-        or search_start_limit < 0
-        or search_start_limit > original_start
-        or search_end_limit < original_end
-        or search_end_limit <= search_start_limit
+        not math.isfinite(semantic_start_limit)
+        or not math.isfinite(semantic_end_limit)
+        or semantic_start_limit < 0
+        or semantic_start_limit > original_start
+        or semantic_end_limit < original_end
+        or semantic_end_limit <= semantic_start_limit
     ):
         return _unavailable(
             original_start,
@@ -957,12 +990,28 @@ def verify_acoustic_boundaries(
             and math.isfinite(source_duration)
             and source_duration >= original_end
         ):
-            search_end_limit = min(search_end_limit, source_duration)
+            semantic_end_limit = min(semantic_end_limit, source_duration)
+        observation_start_limit = (
+            max(0.0, semantic_start_limit - HANDOFF_OBSERVATION_HALO_SEC)
+            if require_speech_handoff
+            else semantic_start_limit
+        )
+        observation_end_limit = (
+            semantic_end_limit + HANDOFF_OBSERVATION_HALO_SEC
+            if require_speech_handoff
+            else semantic_end_limit
+        )
+        if (
+            source_duration is not None
+            and math.isfinite(source_duration)
+            and source_duration >= original_end
+        ):
+            observation_end_limit = min(observation_end_limit, source_duration)
         end_is_physical_source_edge = bool(
             source_duration is not None
             and math.isfinite(source_duration)
             and abs(original_end - source_duration) <= _FRAME_SEC + 1e-9
-            and abs(search_end_limit - source_duration) <= _FRAME_SEC + 1e-9
+            and abs(semantic_end_limit - source_duration) <= _FRAME_SEC + 1e-9
         )
 
         with tempfile.TemporaryDirectory(prefix="reelai_silence_") as temp_dir:
@@ -974,8 +1023,11 @@ def verify_acoustic_boundaries(
                         source,
                         edge="start",
                         required_boundary=original_start,
-                        search_start_limit=search_start_limit,
-                        search_end_limit=search_end_limit,
+                        search_start_limit=observation_start_limit,
+                        search_end_limit=observation_end_limit,
+                        handoff_band=(original_start, original_start)
+                        if require_speech_handoff
+                        else None,
                         temp_dir=edge_temp_dir,
                         ffmpeg_bin=ffmpeg_bin,
                         deadline=deadline,
@@ -986,9 +1038,12 @@ def verify_acoustic_boundaries(
                         source,
                         edge="end",
                         required_boundary=original_end,
-                        search_start_limit=search_start_limit,
-                        search_end_limit=search_end_limit,
+                        search_start_limit=observation_start_limit,
+                        search_end_limit=observation_end_limit,
                         allow_source_edge=end_is_physical_source_edge,
+                        handoff_band=(original_end, original_end)
+                        if require_speech_handoff
+                        else None,
                         temp_dir=edge_temp_dir,
                         ffmpeg_bin=ffmpeg_bin,
                         deadline=deadline,
@@ -1032,28 +1087,32 @@ def verify_acoustic_boundaries(
                     },
                 )
 
-            adjusted_start = min(
-                original_start,
-                max(
-                    start_quiet.start_sec,
-                    start_quiet.end_sec - START_CUSHION_MS / 1000.0,
-                ),
+            quiet_start_cut = max(
+                start_quiet.start_sec,
+                start_quiet.end_sec - START_CUSHION_MS / 1000.0,
+            )
+            adjusted_start = (
+                quiet_start_cut
+                if require_speech_handoff
+                else min(original_start, quiet_start_cut)
             )
             end_is_verified_source_edge = bool(
                 end_is_physical_source_edge
-                and abs(end_quiet.end_sec - search_end_limit)
+                and abs(end_quiet.end_sec - observation_end_limit)
                 <= _FRAME_SEC + 1e-9
             )
-            adjusted_end = (
+            quiet_end_cut = (
                 original_end
                 if end_is_verified_source_edge
-                else max(
-                    original_end,
-                    min(
-                        end_quiet.end_sec - _FRAME_SEC,
-                        end_quiet.start_sec + END_CUSHION_MS / 1000.0,
-                    ),
+                else min(
+                    end_quiet.end_sec - _FRAME_SEC,
+                    end_quiet.start_sec + END_CUSHION_MS / 1000.0,
                 )
+            )
+            adjusted_end = (
+                quiet_end_cut
+                if require_speech_handoff
+                else max(original_end, quiet_end_cut)
             )
             cuts_are_inside_quiet = bool(
                 start_quiet.start_sec - 1e-9
@@ -1101,8 +1160,8 @@ def verify_acoustic_boundaries(
         "min_quiet_ms": MIN_QUIET_MS,
         "start_cushion_ms": START_CUSHION_MS,
         "end_cushion_ms": END_CUSHION_MS,
-        "search_start_limit_sec": round(search_start_limit, 3),
-        "search_end_limit_sec": round(search_end_limit, 3),
+        "search_start_limit_sec": round(semantic_start_limit, 3),
+        "search_end_limit_sec": round(semantic_end_limit, 3),
         "start_window": [
             round(start_result.windows[0][0], 3),
             round(start_result.windows[0][1], 3),
@@ -1125,6 +1184,15 @@ def verify_acoustic_boundaries(
         "end_shift_sec": round(adjusted_end - original_end, 3),
         "elapsed_ms": round((time.monotonic() - started) * 1000),
     }
+    if require_speech_handoff:
+        diagnostics.update(
+            speech_handoff_verified=True,
+            semantic_start_limit_sec=round(semantic_start_limit, 3),
+            semantic_end_limit_sec=round(semantic_end_limit, 3),
+            observation_start_limit_sec=round(observation_start_limit, 3),
+            observation_end_limit_sec=round(observation_end_limit, 3),
+            handoff_timestamp_tolerance_sec=HANDOFF_TIMESTAMP_TOLERANCE_SEC,
+        )
     if source.duration_sec is not None:
         diagnostics["source_duration_sec"] = round(source.duration_sec, 3)
     if preparation_diagnostics:

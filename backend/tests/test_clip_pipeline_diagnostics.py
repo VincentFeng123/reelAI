@@ -524,7 +524,7 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
     assert context.counters()["persisted_clips"] == 3
 
 
-def test_final_caption_clip_searches_to_true_media_end_and_keeps_verified_quiet_pad(
+def test_final_caption_clip_uses_handoff_halo_and_keeps_verified_quiet_pad(
     monkeypatch,
 ) -> None:
     transcript = {
@@ -568,6 +568,12 @@ def test_final_caption_clip_searches_to_true_media_end_and_keeps_verified_quiet_
             end_sec=10.2,
             diagnostics={
                 "threshold_dbfs": -38.0,
+                "speech_handoff_verified": True,
+                "semantic_start_limit_sec": 0.0,
+                "semantic_end_limit_sec": 10.0,
+                "observation_start_limit_sec": 0.0,
+                "observation_end_limit_sec": 11.0,
+                "handoff_timestamp_tolerance_sec": 0.05,
                 "start_quiet": [0.0, 0.2],
                 "end_quiet": [10.0, 10.3],
             },
@@ -615,7 +621,8 @@ def test_final_caption_clip_searches_to_true_media_end_and_keeps_verified_quiet_
 
     assert reels == ["verified-tail"]
     assert persisted[0]["end"] == 10.2
-    assert verify.call_args.kwargs["search_end_limit_sec"] == 12.0
+    assert verify.call_args.kwargs["search_end_limit_sec"] == 10.0
+    assert verify.call_args.kwargs["require_speech_handoff"] is True
     assert persisted[0]["search_context"]["boundary_status"] == "verified"
     assert persisted[0]["search_context"]["boundary_diagnostics"]["acoustic"][
         "threshold_dbfs"
@@ -656,7 +663,17 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
             verified=True,
             start_sec=9.9,
             end_sec=20.2,
-            diagnostics={"threshold_dbfs": -38.0},
+            diagnostics={
+                "threshold_dbfs": -38.0,
+                "speech_handoff_verified": True,
+                "semantic_start_limit_sec": 10.0,
+                "semantic_end_limit_sec": 20.0,
+                "observation_start_limit_sec": 9.0,
+                "observation_end_limit_sec": 21.0,
+                "handoff_timestamp_tolerance_sec": 0.05,
+                "start_quiet": [9.8, 10.1],
+                "end_quiet": [20.0, 20.3],
+            },
         )
     )
     monkeypatch.setattr(
@@ -704,6 +721,7 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
 
     assert reels == ["verified-padded-speech"]
     assert verify.call_args.args[1:] == (10.0, 20.0)
+    assert verify.call_args.kwargs["require_speech_handoff"] is True
     assert persisted[0]["start"] == 9.9
     assert persisted[0]["end"] == 20.2
 
@@ -982,6 +1000,36 @@ def test_overlapping_unselected_cue_has_no_speech_free_corridor(segments) -> Non
     )
 
     assert error == "unselected_speech_overlaps_required_range"
+
+
+def test_single_caption_cue_uses_its_own_edges_as_semantic_fences() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:bounded-single-cue",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "selected",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "Python closures retain values from their enclosing scope.",
+            }
+        ],
+    }
+    clip = {"cue_ids": ["selected"], "start": 10.0, "end": 20.0}
+    diagnostics = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert diagnostics is not None
+
+    start_limit, end_limit, error = pipeline_module._selected_speech_corridor(
+        transcript,
+        clip,
+        diagnostics,
+        source_end_sec=100.0,
+    )
+
+    assert error is None
+    assert (start_limit, end_limit) == (10.0, 20.0)
 
 
 @pytest.mark.parametrize(

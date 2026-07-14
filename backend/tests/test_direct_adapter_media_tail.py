@@ -1,4 +1,4 @@
-"""Regression coverage for verified cuts beyond the final caption timestamp."""
+"""Regression coverage for quiet handoffs beyond the final caption timestamp."""
 
 from __future__ import annotations
 
@@ -112,7 +112,17 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
             "verified",
             0.0,
             10.2,
-            {"threshold_dbfs": -38.0},
+            {
+                "threshold_dbfs": -38.0,
+                "speech_handoff_verified": True,
+                "semantic_start_limit_sec": 0.0,
+                "semantic_end_limit_sec": 10.0,
+                "observation_start_limit_sec": 0.0,
+                "observation_end_limit_sec": 11.0,
+                "handoff_timestamp_tolerance_sec": 0.05,
+                "start_quiet": [0.0, 0.2],
+                "end_quiet": [10.0, 10.3],
+            },
         )
         return (
             mock.patch.object(pipeline_module, "clip_engine_run"),
@@ -159,8 +169,9 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         self.assertAlmostEqual(result.reel.t_end, 10.2)
         self.assertAlmostEqual(result.metadata.duration_sec, 12.0)
         self.assertAlmostEqual(
-            mock_verify.call_args.kwargs["search_end_limit_sec"], 12.0
+            mock_verify.call_args.kwargs["search_end_limit_sec"], 10.0
         )
+        self.assertTrue(mock_verify.call_args.kwargs["require_speech_handoff"])
         self._assert_persisted_tail(result.reel.reel_id)
 
     def test_topic_cut_adapter_persists_acoustic_tail_within_prepared_media(self) -> None:
@@ -185,8 +196,9 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         self.assertAlmostEqual(result.duration_sec, 12.0)
         self.assertAlmostEqual(result.metadata.duration_sec, 12.0)
         self.assertAlmostEqual(
-            mock_verify.call_args.kwargs["search_end_limit_sec"], 12.0
+            mock_verify.call_args.kwargs["search_end_limit_sec"], 10.0
         )
+        self.assertTrue(mock_verify.call_args.kwargs["require_speech_handoff"])
         self._assert_persisted_tail(result.reels[0].reel_id)
 
     def test_direct_adapter_rejects_acoustic_crossing_next_unselected_cue(self) -> None:

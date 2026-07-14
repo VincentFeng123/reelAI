@@ -434,12 +434,12 @@ def _selected_speech_corridor(
         return 0.0, source_end, "partial_cue_edge_requires_projection"
 
     start_limit = (
-        0.0
+        first_start
         if first_index == 0
         else float(segments[first_index - 1].get("end") or 0.0)
     )
     end_limit = (
-        source_end
+        last_end
         if last_index + 1 >= len(segments)
         else float(segments[last_index + 1].get("start") or last_end)
     )
@@ -451,17 +451,114 @@ def _selected_speech_corridor(
     return max(0.0, start_limit), min(source_end, end_limit), None
 
 
-def _acoustic_exits_selected_speech_corridor(
+def _acoustic_range_is_safe(
     *,
     start_sec: float,
     end_sec: float,
-    search_start_limit_sec: float,
-    search_end_limit_sec: float,
+    required_start_sec: float,
+    required_end_sec: float,
+    semantic_start_limit_sec: float,
+    semantic_end_limit_sec: float,
+    source_end_sec: float,
+    diagnostics: dict[str, Any],
 ) -> bool:
-    """Defense in depth for mocked or provider-returned out-of-corridor cuts."""
+    """Accept caption drift only when one measured quiet run proves each handoff."""
+    values = (
+        start_sec,
+        end_sec,
+        required_start_sec,
+        required_end_sec,
+        semantic_start_limit_sec,
+        semantic_end_limit_sec,
+        source_end_sec,
+    )
+    if (
+        not all(math.isfinite(value) for value in values)
+        or start_sec < 0.0
+        or end_sec <= start_sec
+        or end_sec > source_end_sec + 1e-3
+    ):
+        return False
+
+    nominal_range_is_owned = bool(
+        start_sec
+        >= semantic_start_limit_sec - SPEECH_OWNERSHIP_EPSILON_SEC
+        and start_sec <= required_start_sec + SPEECH_OWNERSHIP_EPSILON_SEC
+        and end_sec + SPEECH_OWNERSHIP_EPSILON_SEC >= required_end_sec
+        and end_sec <= semantic_end_limit_sec + SPEECH_OWNERSHIP_EPSILON_SEC
+    )
+    if nominal_range_is_owned:
+        return True
+    if diagnostics.get("speech_handoff_verified") is not True:
+        return False
+
+    try:
+        diagnostic_start_limit = float(diagnostics["semantic_start_limit_sec"])
+        diagnostic_end_limit = float(diagnostics["semantic_end_limit_sec"])
+        start_quiet = tuple(float(value) for value in diagnostics["start_quiet"])
+        end_quiet = tuple(float(value) for value in diagnostics["end_quiet"])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    diagnostic_values = (
+        diagnostic_start_limit,
+        diagnostic_end_limit,
+        *start_quiet,
+        *end_quiet,
+    )
+    if (
+        len(start_quiet) != 2
+        or len(end_quiet) != 2
+        or not all(math.isfinite(value) for value in diagnostic_values)
+        or abs(diagnostic_start_limit - semantic_start_limit_sec) > 1e-3
+        or abs(diagnostic_end_limit - semantic_end_limit_sec) > 1e-3
+        or start_quiet[0] > start_quiet[1]
+        or end_quiet[0] > end_quiet[1]
+    ):
+        return False
+
+    cut_epsilon = 0.011
+    tolerance = clip_engine_silence.HANDOFF_TIMESTAMP_TOLERANCE_SEC
+    handoffs_are_quiet = bool(
+        start_quiet[0] <= required_start_sec + cut_epsilon
+        and start_quiet[1] >= required_start_sec - tolerance
+        and end_quiet[0] <= required_end_sec + tolerance
+        and end_quiet[1] >= required_end_sec - tolerance
+        and start_quiet[0] - cut_epsilon
+        <= start_sec
+        <= start_quiet[1] + cut_epsilon
+        and end_quiet[0] - cut_epsilon <= end_sec <= end_quiet[1] + cut_epsilon
+        and start_sec
+        >= max(
+            0.0,
+            semantic_start_limit_sec
+            - clip_engine_silence.HANDOFF_OBSERVATION_HALO_SEC,
+        )
+        - cut_epsilon
+        and end_sec
+        <= min(
+            source_end_sec,
+            semantic_end_limit_sec
+            + clip_engine_silence.HANDOFF_OBSERVATION_HALO_SEC,
+        )
+        + cut_epsilon
+    )
+    if not handoffs_are_quiet:
+        return False
+    start_crosses_fence = start_sec < (
+        semantic_start_limit_sec - SPEECH_OWNERSHIP_EPSILON_SEC
+    )
+    end_crosses_fence = end_sec > (
+        semantic_end_limit_sec + SPEECH_OWNERSHIP_EPSILON_SEC
+    )
     return bool(
-        start_sec < search_start_limit_sec - SPEECH_OWNERSHIP_EPSILON_SEC
-        or end_sec > search_end_limit_sec + SPEECH_OWNERSHIP_EPSILON_SEC
+        (
+            not start_crosses_fence
+            or start_quiet[1] >= semantic_start_limit_sec - tolerance
+        )
+        and (
+            not end_crosses_fence
+            or end_quiet[0] <= semantic_end_limit_sec + tolerance
+        )
     )
 
 
@@ -623,14 +720,29 @@ def _verified_direct_adapter_clips(
             end_sec,
             search_start_limit_sec=search_start_limit,
             search_end_limit_sec=search_end_limit,
+            require_speech_handoff=True,
             prepared=prepared,
             cancel_check=should_cancel,
         )
-        if acoustic.verified and _acoustic_exits_selected_speech_corridor(
-            start_sec=float(acoustic.start_sec),
-            end_sec=float(acoustic.end_sec),
-            search_start_limit_sec=search_start_limit,
-            search_end_limit_sec=search_end_limit,
+        crossed_semantic_fence = bool(
+            float(acoustic.start_sec)
+            < search_start_limit - SPEECH_OWNERSHIP_EPSILON_SEC
+            or float(acoustic.end_sec)
+            > search_end_limit + SPEECH_OWNERSHIP_EPSILON_SEC
+        )
+        if (
+            acoustic.verified
+            and crossed_semantic_fence
+            and not _acoustic_range_is_safe(
+                start_sec=float(acoustic.start_sec),
+                end_sec=float(acoustic.end_sec),
+                required_start_sec=start_sec,
+                required_end_sec=end_sec,
+                semantic_start_limit_sec=search_start_limit,
+                semantic_end_limit_sec=search_end_limit,
+                source_end_sec=media_end,
+                diagnostics=dict(acoustic.diagnostics or {}),
+            )
         ):
             return diagnostics, clip_engine_silence.SilenceVerificationResult(
                 "unavailable",
@@ -660,16 +772,21 @@ def _verified_direct_adapter_clips(
         required_first_speech, required_last_speech = _required_speech_bounds(
             raw_clip, caption
         )
-        if not (
-            math.isfinite(acoustic.start_sec)
-            and math.isfinite(acoustic.end_sec)
-            and acoustic.start_sec >= 0.0
-            and acoustic.end_sec > acoustic.start_sec
-            and acoustic.start_sec
-            <= required_first_speech + SPEECH_OWNERSHIP_EPSILON_SEC
-            and acoustic.end_sec + SPEECH_OWNERSHIP_EPSILON_SEC
-            >= required_last_speech
-            and acoustic.end_sec <= media_end + 1e-3
+        semantic_start, semantic_end, corridor_error = _selected_speech_corridor(
+            transcript,
+            raw_clip,
+            caption,
+            source_end_sec=media_end,
+        )
+        if corridor_error or not _acoustic_range_is_safe(
+            start_sec=float(acoustic.start_sec),
+            end_sec=float(acoustic.end_sec),
+            required_start_sec=required_first_speech,
+            required_end_sec=required_last_speech,
+            semantic_start_limit_sec=semantic_start,
+            semantic_end_limit_sec=semantic_end,
+            source_end_sec=media_end,
+            diagnostics=dict(acoustic.diagnostics or {}),
         ):
             continue
         clip = dict(raw_clip)
@@ -1992,15 +2109,30 @@ class IngestionPipeline:
                     required_end,
                     search_start_limit_sec=search_start_limit,
                     search_end_limit_sec=search_end_limit,
+                    require_speech_handoff=True,
                     prepared=prepared_audio,
                     timeout_sec=remaining,
                     cancel_check=should_cancel,
                 )
-                if acoustic.verified and _acoustic_exits_selected_speech_corridor(
-                    start_sec=float(acoustic.start_sec),
-                    end_sec=float(acoustic.end_sec),
-                    search_start_limit_sec=search_start_limit,
-                    search_end_limit_sec=search_end_limit,
+                crossed_semantic_fence = bool(
+                    float(acoustic.start_sec)
+                    < search_start_limit - SPEECH_OWNERSHIP_EPSILON_SEC
+                    or float(acoustic.end_sec)
+                    > search_end_limit + SPEECH_OWNERSHIP_EPSILON_SEC
+                )
+                if (
+                    acoustic.verified
+                    and crossed_semantic_fence
+                    and not _acoustic_range_is_safe(
+                        start_sec=float(acoustic.start_sec),
+                        end_sec=float(acoustic.end_sec),
+                        required_start_sec=required_start,
+                        required_end_sec=required_end,
+                        semantic_start_limit_sec=search_start_limit,
+                        semantic_end_limit_sec=search_end_limit,
+                        source_end_sec=media_end,
+                        diagnostics=dict(acoustic.diagnostics or {}),
+                    )
                 ):
                     return caption, clip_engine_silence.SilenceVerificationResult(
                         "unavailable",
@@ -2073,17 +2205,27 @@ class IngestionPipeline:
                         first_start, last_end = _required_speech_bounds(
                             clip, caption_diagnostics
                         )
+                        semantic_start, semantic_end, corridor_error = (
+                            _selected_speech_corridor(
+                                engine_out["transcript"],
+                                clip,
+                                caption_diagnostics,
+                                source_end_sec=media_end,
+                            )
+                        )
                         acoustic_range_is_safe = bool(
                             acoustic.verified
-                            and math.isfinite(acoustic.start_sec)
-                            and math.isfinite(acoustic.end_sec)
-                            and acoustic.start_sec >= 0.0
-                            and acoustic.end_sec > acoustic.start_sec
-                            and acoustic.start_sec
-                            <= first_start + SPEECH_OWNERSHIP_EPSILON_SEC
-                            and acoustic.end_sec + SPEECH_OWNERSHIP_EPSILON_SEC
-                            >= last_end
-                            and acoustic.end_sec <= media_end + 1e-3
+                            and corridor_error is None
+                            and _acoustic_range_is_safe(
+                                start_sec=float(acoustic.start_sec),
+                                end_sec=float(acoustic.end_sec),
+                                required_start_sec=first_start,
+                                required_end_sec=last_end,
+                                semantic_start_limit_sec=semantic_start,
+                                semantic_end_limit_sec=semantic_end,
+                                source_end_sec=media_end,
+                                diagnostics=acoustic_diagnostics,
+                            )
                         )
                         boundary_diagnostics = {
                             "method": "energy_silence",
