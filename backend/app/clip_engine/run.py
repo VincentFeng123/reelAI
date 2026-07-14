@@ -2,6 +2,8 @@
 """Inline adapter for practice's fast Supadata -> Gemini -> iframe path."""
 from __future__ import annotations
 
+import math
+
 from . import config
 from . import segment_cache
 from .cancellation import raise_if_cancelled
@@ -12,10 +14,55 @@ from .errors import (
     CancellationError,
     ClipError,
     ProviderError,
+    ProviderRequestError,
+    ProviderTransientError,
     TranscriptError,
     UnsupportedURLError,
 )
 from .metadata import extract_video_id
+
+
+def is_valid_timestamped_supadata_transcript(transcript: dict) -> bool:
+    """Verify the provenance markers and cue invariants used by ingestion."""
+    if (
+        transcript.get("source") != "supadata"
+        or not str(transcript.get("artifact_key") or "").strip()
+        or not isinstance(transcript.get("native_mode"), bool)
+    ):
+        return False
+    segments = transcript.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return False
+
+    seen_ids: set[str] = set()
+    previous_start = -1.0
+    previous_end = -1.0
+    for cue in segments:
+        if not isinstance(cue, dict):
+            return False
+        cue_id = str(cue.get("cue_id") or "").strip()
+        text = " ".join(str(cue.get("text") or "").split()).strip()
+        try:
+            start = float(cue.get("start"))
+            end = float(cue.get("end"))
+        except (TypeError, ValueError):
+            return False
+        if (
+            not cue_id
+            or cue_id in seen_ids
+            or not text
+            or not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end <= start
+            or start + 1e-9 < previous_start
+            or end + 1e-9 < previous_end
+        ):
+            return False
+        seen_ids.add(cue_id)
+        previous_start = start
+        previous_end = end
+    return True
 
 
 def _segment_usage_stage(operation: object) -> str:
@@ -130,6 +177,13 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     raise_if_cancelled(should_cancel)
     if not (transcript.get("segments")):
         raise TranscriptError(f"Empty transcript for {video_id}")
+    context = settings.get("generation_context") or settings.get("provider_context")
+    trusted_transcript = is_valid_timestamped_supadata_transcript(transcript)
+    transcript_usage_recorded = context is not None and trusted_transcript
+    if transcript_usage_recorded:
+        # Record transcript success before Gemini runs so a selector outage is
+        # never misreported as missing captions.
+        context.increment_counter("usable_transcripts")
 
     try:
         def run_segmenter() -> tuple[list[dict], str]:
@@ -183,12 +237,55 @@ def clip(url: str, topic: str, settings: dict | None = None, *, should_cancel=No
     except ProviderError:
         raise
     except Exception as exc:
+        raise_if_cancelled(should_cancel)
+        telemetry = getattr(exc, "telemetry", None)
+        if isinstance(telemetry, dict):
+            raw_status = telemetry.get("provider_status_code")
+            try:
+                status_code = int(raw_status) if raw_status is not None else None
+            except (TypeError, ValueError, OverflowError):
+                status_code = None
+            error_type = str(telemetry.get("error_type") or type(exc).__name__)
+            provider_error_type = str(
+                telemetry.get("provider_error_type") or ""
+            )
+            raw_retryable = telemetry.get("retryable")
+            if isinstance(raw_retryable, bool):
+                transient = raw_retryable
+            else:
+                transient = error_type in {
+                    "GeminiDeadlineExceededError",
+                    "GeminiTransportError",
+                } and status_code is None
+            error_class = ProviderTransientError if transient else ProviderRequestError
+            message = (
+                "Gemini is temporarily unavailable."
+                if transient
+                else "Gemini rejected the segmentation request."
+            )
+            raise error_class(
+                message,
+                provider="gemini",
+                operation="segmentation",
+                status_code=status_code,
+                detail=(
+                    f"{error_type}:{provider_error_type}"
+                    if provider_error_type
+                    else error_type
+                ),
+            ) from exc
         raise ClipError(f"Gemini segmentation failed for {video_id}: {exc}") from exc
 
     for c in clips:
         raise_if_cancelled(should_cancel)
         c["embed_url"] = embed.embed_url(video_id, c["start"], c["end"])
-    return {"video_id": video_id, "clips": clips, "transcript": transcript, "notes": notes}
+    return {
+        "video_id": video_id,
+        "clips": clips,
+        "transcript": transcript,
+        "notes": notes,
+        "_transcript_usage_recorded": transcript_usage_recorded,
+    }
 
 
 def pro_boundary_fallback(

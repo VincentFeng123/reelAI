@@ -2,8 +2,11 @@
 import pytest
 from backend.app.clip_engine import expand, run
 from backend.app.clip_engine.errors import (
+    CancellationError,
     ProviderAuthenticationError,
     ProviderQuotaError,
+    ProviderRequestError,
+    ProviderTransientError,
     UnsupportedURLError,
 )
 from backend.app.clip_engine.provider_runtime import GenerationContext
@@ -58,12 +61,16 @@ def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
     assert run.segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v11"
     transcript = {
         "segments": [{
+            "cue_id": "cached-cue",
             "start": 0.0,
             "end": 5.0,
             "text": "hello world explains the complete cached concept clearly",
         }],
         "words": [],
         "duration": 5.0,
+        "source": "supadata",
+        "artifact_key": "supadata-transcript:v2:cached",
+        "native_mode": False,
     }
     cached_clip = {
         "start": 1.0,
@@ -126,6 +133,7 @@ def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
 
     assert output["clips"][0]["title"] == "Bit"
     assert context.budget.snapshot()["used"]["segmentation"] == 0
+    assert context.counters()["usable_transcripts"] == 1
     assert context.counters()["segmentation_cache_hits"] == 1
     assert expansion_dispatches == 0
     assert len(context.usage()) == 1
@@ -134,9 +142,17 @@ def test_direct_url_segment_cache_hit_skips_all_gemini_and_budget(monkeypatch):
 
 def test_segment_cache_miss_reserves_generic_and_per_dispatch_budgets(monkeypatch):
     transcript = {
-        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "segments": [{
+            "cue_id": "budget-cue",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "hello world",
+        }],
         "words": [],
         "duration": 5.0,
+        "source": "supadata",
+        "artifact_key": "supadata-transcript:v2:budget",
+        "native_mode": False,
     }
     context = GenerationContext("slow")
 
@@ -152,12 +168,14 @@ def test_segment_cache_miss_reserves_generic_and_per_dispatch_budgets(monkeypatc
     monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
     monkeypatch.setattr(run.gemini_segment, "segment_clips", fake_segment)
 
-    run.clip(
+    output = run.clip(
         "https://youtu.be/dQw4w9WgXcQ",
         "topic",
         settings={"generation_context": context},
     )
 
+    assert output["_transcript_usage_recorded"] is True
+    assert context.counters()["usable_transcripts"] == 1
     budget = context.budget.snapshot()
     assert budget["used"]["segmentation"] == 1
     assert budget["gemini"]["flash_selector_calls"] == 1
@@ -165,7 +183,12 @@ def test_segment_cache_miss_reserves_generic_and_per_dispatch_budgets(monkeypatc
 
 def test_empty_selector_result_is_cached(monkeypatch):
     transcript = {
-        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "segments": [{
+            "cue_id": "outage-cue",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "hello world",
+        }],
         "words": [],
         "duration": 5.0,
     }
@@ -204,6 +227,12 @@ def test_failed_selector_result_is_not_cached(monkeypatch):
             "Segmentation model call failed.",
             "flash_only",
             "invalid",
+            calls=[{
+                "error_type": "GeminiTransportError",
+                "provider_error_type": "ClientError",
+                "provider_status_code": 400,
+                "retryable": False,
+            }],
             error="GeminiTransportError: status 400",
         ),
     )
@@ -213,10 +242,135 @@ def test_failed_selector_result_is_not_cached(monkeypatch):
         lambda _key, clips, *_args, **_kwargs: stored.append(clips),
     )
 
-    with pytest.raises(run.ClipError, match="Gemini segmentation failed"):
+    with pytest.raises(ProviderRequestError, match="rejected"):
         run.clip("https://youtu.be/dQw4w9WgXcQ", "topic")
 
     assert stored == []
+
+
+def test_selector_outage_preserves_transcript_success_and_typed_failure(monkeypatch):
+    transcript = {
+        "segments": [{
+            "cue_id": "outage-cue",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "hello world",
+        }],
+        "words": [],
+        "duration": 5.0,
+        "source": "supadata",
+        "artifact_key": "supadata-transcript:v2:outage",
+        "native_mode": False,
+    }
+    context = GenerationContext("fast")
+    failure = RuntimeError("segmentation provider call failed")
+    failure.telemetry = {
+        "error_type": "GeminiTransportError",
+        "provider_error_type": "ServerError",
+        "provider_status_code": 503,
+        "retryable": True,
+    }
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "segment_clips",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(ProviderTransientError) as exc_info:
+        run.clip(
+            "https://youtu.be/dQw4w9WgXcQ",
+            "topic",
+            settings={"generation_context": context},
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.operation == "segmentation"
+    assert context.counters()["usable_transcripts"] == 1
+
+
+def test_explicit_nonretryable_selector_error_without_status_is_request_failure(
+    monkeypatch,
+):
+    transcript = {
+        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "words": [],
+        "duration": 5.0,
+    }
+    failure = RuntimeError("segmentation provider call failed")
+    failure.telemetry = {
+        "error_type": "GeminiTransportError",
+        "provider_error_type": "MalformedResponse",
+        "provider_status_code": None,
+        "retryable": False,
+    }
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "segment_clips",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    with pytest.raises(ProviderRequestError):
+        run.clip("https://youtu.be/dQw4w9WgXcQ", "topic")
+
+
+def test_malformed_transcript_is_not_recorded_as_usable(monkeypatch):
+    transcript = {
+        "segments": [{"start": 0.0, "end": 5.0, "text": "missing cue id"}],
+        "words": [],
+        "duration": 5.0,
+        "source": "supadata",
+        "artifact_key": "supadata-transcript:v2:malformed",
+        "native_mode": False,
+    }
+    context = GenerationContext("fast")
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "segment_clips",
+        lambda *_args, **_kwargs: ([], "No qualifying clips."),
+    )
+
+    output = run.clip(
+        "https://youtu.be/dQw4w9WgXcQ",
+        "topic",
+        settings={"generation_context": context},
+    )
+
+    assert output["_transcript_usage_recorded"] is False
+    assert context.counters()["usable_transcripts"] == 0
+
+
+def test_cancellation_during_segmentation_remains_cancellation(monkeypatch):
+    transcript = {
+        "segments": [{
+            "cue_id": "cancel-cue",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "hello world",
+        }],
+        "words": [],
+        "duration": 5.0,
+        "source": "supadata",
+        "artifact_key": "supadata-transcript:v2:cancelled",
+        "native_mode": False,
+    }
+    state = {"cancelled": False}
+
+    def cancel_segment(*_args, **_kwargs):
+        state["cancelled"] = True
+        raise RuntimeError("selector interrupted")
+
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(run.gemini_segment, "segment_clips", cancel_segment)
+
+    with pytest.raises(CancellationError):
+        run.clip(
+            "https://youtu.be/dQw4w9WgXcQ",
+            "topic",
+            should_cancel=lambda: state["cancelled"],
+        )
 
 
 def test_boundary_repair_usage_is_recorded_in_repair_stage():

@@ -56,9 +56,12 @@ class _FakeClient:
 
 
 class _HTTPError(RuntimeError):
-    def __init__(self, status_code: int):
+    def __init__(self, status_code: int, *, retry_after: str | None = None):
         super().__init__(f"HTTP status {status_code}")
         self.status_code = status_code
+        self.response = SimpleNamespace(
+            headers={} if retry_after is None else {"Retry-After": retry_after},
+        )
 
 
 class _RemoteProtocolError(RuntimeError):
@@ -183,15 +186,32 @@ def test_gemini3_retries_one_transient_error_with_short_jitter(
     fake = _FakeClient(_HTTPError(status_code), _FakeResponse())
     sleeps = []
     monkeypatch.setattr(gc.time, "sleep", sleeps.append)
-    monkeypatch.setattr(gc.random, "uniform", lambda lo, hi: 0.2)
+    monkeypatch.setattr(gc.random, "uniform", lambda lo, hi: 1.0)
 
     result = _call_v3(monkeypatch, fake, max_retries=1)
 
     assert len(fake.models.calls) == 2
     assert result.telemetry.retries == 1
-    assert sleeps == [0.2]
+    assert sleeps == [1.0]
+    assert result.telemetry.error_history == ({
+        "provider_error_type": "_HTTPError",
+        "provider_status_code": status_code,
+        "retryable": True,
+    },)
     assert all(call["config"].http_options.retry_options.attempts == 1
                for call in fake.models.calls)
+
+
+def test_gemini3_honors_retry_after_over_jitter(monkeypatch):
+    fake = _FakeClient(_HTTPError(429, retry_after="2.5"), _FakeResponse())
+    sleeps = []
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+    monkeypatch.setattr(gc.random, "uniform", lambda _lo, _hi: 0.9)
+
+    result = _call_v3(monkeypatch, fake, max_retries=1)
+
+    assert result.telemetry.retries == 1
+    assert sleeps == [2.5]
 
 
 @pytest.mark.parametrize(
@@ -280,10 +300,12 @@ def test_gemini3_retries_google_rate_limit_once(monkeypatch):
 
 
 def test_gemini3_cancellation_during_jitter_prevents_retry(monkeypatch):
-    fake = _FakeClient(_HTTPError(503), _FakeResponse())
+    fake = _FakeClient(_HTTPError(503, retry_after="30"), _FakeResponse())
     state = {"cancelled": False}
+    sleeps = []
 
-    def cancel_during_sleep(_):
+    def cancel_during_sleep(seconds):
+        sleeps.append(seconds)
         state["cancelled"] = True
 
     monkeypatch.setattr(gc.time, "sleep", cancel_during_sleep)
@@ -293,6 +315,7 @@ def test_gemini3_cancellation_during_jitter_prevents_retry(monkeypatch):
             cancelled=lambda: state["cancelled"],
         )
     assert len(fake.models.calls) == 1
+    assert sleeps == [0.05]
     assert exc_info.value.telemetry.retries == 0
 
 
@@ -308,6 +331,18 @@ def test_gemini3_never_exceeds_one_application_retry(monkeypatch):
     assert exc_info.value.telemetry.provider_error_type == "_HTTPError"
     assert exc_info.value.telemetry.provider_status_code == 503
     assert exc_info.value.telemetry.retryable is True
+    assert exc_info.value.telemetry.error_history == (
+        {
+            "provider_error_type": "_HTTPError",
+            "provider_status_code": 503,
+            "retryable": True,
+        },
+        {
+            "provider_error_type": "_HTTPError",
+            "provider_status_code": 503,
+            "retryable": True,
+        },
+    )
 
 
 def test_gemini3_does_not_retry_non_transient_error(monkeypatch):
@@ -390,12 +425,94 @@ def test_operation_timeout_is_shared_across_transient_retry(monkeypatch):
     fake = SimpleNamespace(models=Models())
     monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
     monkeypatch.setattr(gc.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(gc.random, "uniform", lambda _lo, _hi: 0.2)
+    monkeypatch.setattr(gc.random, "uniform", lambda _lo, _hi: 1.0)
     result = _call_v3(monkeypatch, fake, timeout_s=45.0, max_retries=1)
     assert result.telemetry.retries == 1
     first, second = [call["config"].http_options.timeout for call in fake.models.calls]
     assert first == 45_000
     assert second == 15_000
+
+
+def test_explicit_deadline_allows_second_per_request_timeout(monkeypatch):
+    clock = {"now": 0.0}
+
+    class Models:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, model, contents, config):
+            self.calls.append({"config": config})
+            if len(self.calls) == 1:
+                clock["now"] = 90.0
+                raise _HTTPError(503)
+            return _FakeResponse()
+
+    fake = SimpleNamespace(models=Models())
+    monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        gc.time, "sleep", lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    monkeypatch.setattr(gc.random, "uniform", lambda _lo, _hi: 1.0)
+
+    result = _call_v3(
+        monkeypatch,
+        fake,
+        timeout_s=90.0,
+        deadline_monotonic=150.0,
+        max_retries=1,
+    )
+
+    assert result.telemetry.retries == 1
+    first, second = [call["config"].http_options.timeout for call in fake.models.calls]
+    assert first == 90_000
+    assert second == 59_000
+
+
+def test_retry_fails_closed_without_five_useful_seconds(monkeypatch):
+    clock = {"now": 0.0}
+
+    class Models:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, model, contents, config):
+            self.calls.append({"config": config})
+            clock["now"] = 39.5
+            raise _HTTPError(503)
+
+    fake = SimpleNamespace(models=Models())
+    sleeps = []
+    monkeypatch.setattr(gc.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(gc.time, "sleep", sleeps.append)
+    monkeypatch.setattr(gc.random, "uniform", lambda _lo, _hi: 1.0)
+
+    with pytest.raises(gc.GeminiDeadlineExceededError) as exc_info:
+        _call_v3(monkeypatch, fake, timeout_s=45.0, max_retries=1)
+
+    assert len(fake.models.calls) == 1
+    assert sleeps == []
+    assert exc_info.value.telemetry.error_history[0]["retryable"] is True
+
+
+def test_error_history_never_retains_provider_prose_or_prompt(monkeypatch):
+    errors = [
+        RuntimeError("connection reset private provider prose"),
+        RuntimeError("connection reset second private provider prose"),
+    ]
+    fake = _FakeClient(*errors)
+    monkeypatch.setattr(gc.time, "sleep", lambda _: None)
+
+    with pytest.raises(gc.GeminiTransportError) as exc_info:
+        _call_v3(monkeypatch, fake, max_retries=1)
+
+    history = exc_info.value.telemetry.as_dict()["error_history"]
+    assert len(history) == 2
+    assert all(set(item) == {
+        "provider_error_type", "provider_status_code", "retryable",
+    } for item in history)
+    assert "private provider prose" not in str(history)
+    assert "system" not in str(history)
+    assert "user" not in str(history)
 
 
 def test_generic_generate_json_uses_gemini3_high_without_sampling(monkeypatch):

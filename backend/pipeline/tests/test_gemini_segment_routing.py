@@ -712,15 +712,18 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
         GC,
         "generate_json_v3",
         lambda *args, **kwargs: (_ for _ in ()).throw(
-            GC.GeminiTransportError("status 503", provider_telemetry)
+            GC.GeminiTransportError(
+                "status 503 private provider prose", provider_telemetry,
+            )
         ),
     )
+    events = []
 
-    result = G.run_segment_profile(
+    result = G.segment_clips_detailed(
         _transcript(),
-        {},
-        G.FLASH_SPLIT_PROFILE,
+        {"_segment_telemetry": events.append},
         topic="calculus",
+        routing_mode="flash_only",
     )
 
     assert result.classification_reasons == [
@@ -735,6 +738,11 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
     assert result.calls[0]["provider_error_type"] == "ReadError"
     assert result.calls[0]["provider_status_code"] is None
     assert result.calls[0]["retryable"] is True
+    assert [event["event"] for event in events if event["event"] == "segment_error"] == [
+        "segment_error"
+    ]
+    assert "private provider prose" not in str(result.error)
+    assert "private provider prose" not in str(events)
 
 
 @pytest.mark.parametrize(

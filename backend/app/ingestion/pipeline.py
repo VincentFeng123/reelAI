@@ -261,45 +261,7 @@ def _discover(
 
 def _is_valid_timestamped_supadata_transcript(transcript: dict[str, Any]) -> bool:
     """Verify the provenance markers and cue invariants used by the final gate."""
-    if (
-        transcript.get("source") != "supadata"
-        or not str(transcript.get("artifact_key") or "").strip()
-        or not isinstance(transcript.get("native_mode"), bool)
-    ):
-        return False
-    segments = transcript.get("segments")
-    if not isinstance(segments, list) or not segments:
-        return False
-
-    seen_ids: set[str] = set()
-    previous_start = -1.0
-    previous_end = -1.0
-    for cue in segments:
-        if not isinstance(cue, dict):
-            return False
-        cue_id = str(cue.get("cue_id") or "").strip()
-        text = " ".join(str(cue.get("text") or "").split()).strip()
-        try:
-            start = float(cue.get("start"))
-            end = float(cue.get("end"))
-        except (TypeError, ValueError):
-            return False
-        if (
-            not cue_id
-            or cue_id in seen_ids
-            or not text
-            or not math.isfinite(start)
-            or not math.isfinite(end)
-            or start < 0
-            or end <= start
-            or start + 1e-9 < previous_start
-            or end + 1e-9 < previous_end
-        ):
-            return False
-        seen_ids.add(cue_id)
-        previous_start = start
-        previous_end = end
-    return True
+    return clip_engine_run.is_valid_timestamped_supadata_transcript(transcript)
 
 
 def _supadata_boundary_diagnostics(
@@ -3228,14 +3190,12 @@ class IngestionPipeline:
             else None
         )
         trusted_transcript = _is_valid_timestamped_supadata_transcript(transcript)
-        if generation_context is not None and trusted_transcript and record_transcript_usage:
-            generation_context.increment_counter("usable_transcripts")
-        elif (
-            generation_context is not None
-            and record_transcript_usage
-            and (query_plan is not None or v.get("_topic_terms"))
-        ):
-            generation_context.increment_counter("transcript_failures")
+        if generation_context is not None and record_transcript_usage:
+            if trusted_transcript:
+                if engine_out.get("_transcript_usage_recorded") is not True:
+                    generation_context.increment_counter("usable_transcripts")
+            elif query_plan is not None or v.get("_topic_terms"):
+                generation_context.increment_counter("transcript_failures")
 
         raw_clips = list(engine_out["clips"])
         if not raw_clips:

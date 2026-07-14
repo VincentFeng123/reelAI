@@ -11,7 +11,10 @@ import random
 import re
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Optional
 
 import httpx
@@ -43,6 +46,7 @@ class GeminiCallTelemetry:
     provider_error_type: Optional[str] = None
     provider_status_code: Optional[int] = None
     retryable: Optional[bool] = None
+    error_history: tuple[dict[str, object], ...] = ()
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -161,7 +165,8 @@ def _finish_reason(response) -> Optional[str]:
 def _call_telemetry(*, model: str, operation: str, prompt_version: str,
                     thinking_level: str, started: float, retries: int,
                     response=None, error: Exception | None = None,
-                    retryable: bool | None = None) -> GeminiCallTelemetry:
+                    retryable: bool | None = None,
+                    error_history=()) -> GeminiCallTelemetry:
     usage = _field(response, "usage_metadata") if response is not None else None
     return GeminiCallTelemetry(
         model=model,
@@ -181,6 +186,7 @@ def _call_telemetry(*, model: str, operation: str, prompt_version: str,
             _gemini_status_code(error) if error is not None else None
         ),
         retryable=retryable if error is not None else None,
+        error_history=tuple(dict(item) for item in error_history),
     )
 
 
@@ -245,6 +251,30 @@ def _transient_gemini_error(error: Exception) -> bool:
     )
 
 
+def _gemini_retry_after(error: Exception, *, maximum: float = 30.0) -> float | None:
+    """Return a bounded provider Retry-After delay without retaining error prose."""
+    response = getattr(error, "response", None)
+    headers = getattr(error, "headers", None) or getattr(response, "headers", None)
+    if not isinstance(headers, Mapping):
+        return None
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        try:
+            target = parsedate_to_datetime(str(raw).strip())
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            seconds = (target - datetime.now(timezone.utc)).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if not math.isfinite(seconds):
+        return None
+    return max(0.0, min(float(maximum), seconds))
+
+
 def _cancel_requested(cancelled) -> bool:
     if cancelled is None:
         return False
@@ -252,6 +282,21 @@ def _cancel_requested(cancelled) -> bool:
         return bool(cancelled())
     is_set = getattr(cancelled, "is_set", None)
     return bool(is_set()) if callable(is_set) else bool(cancelled)
+
+
+def _sleep_before_retry(seconds: float, cancelled) -> bool:
+    """Wait for a retry while polling the generation cancellation callback."""
+    if cancelled is None:
+        time.sleep(seconds)
+        return True
+    wait_deadline = time.monotonic() + seconds
+    while True:
+        if _cancel_requested(cancelled):
+            return False
+        remaining_s = wait_deadline - time.monotonic()
+        if remaining_s <= 0:
+            return True
+        time.sleep(min(0.05, remaining_s))
 
 
 _GEMINI3_JSON_SCHEMA_KEYS = {
@@ -337,10 +382,16 @@ def generate_json_v3(
         raise ValueError("max_retries must be 0 or 1")
 
     started = time.perf_counter()
-    operation_deadline = time.monotonic() + float(timeout_s)
+    operation_deadline = (
+        float(deadline_monotonic)
+        if deadline_monotonic is not None
+        else time.monotonic() + float(timeout_s)
+    )
     client = None
     max_attempts = max_retries + 1
     requests_started = 0
+    error_history: list[dict[str, object]] = []
+    last_failure_telemetry: GeminiCallTelemetry | None = None
 
     for attempt in range(max_attempts):
         if _cancel_requested(cancelled):
@@ -348,18 +399,17 @@ def generate_json_v3(
                 model=mdl, operation=operation, prompt_version=prompt_version,
                 thinking_level=level, started=started,
                 retries=max(0, requests_started - 1),
+                error_history=error_history,
             )
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
 
-        effective_deadline = operation_deadline
-        if deadline_monotonic is not None:
-            effective_deadline = min(effective_deadline, float(deadline_monotonic))
-        remaining_s = effective_deadline - time.monotonic()
-        if remaining_s <= 0:
-            telemetry = _call_telemetry(
+        remaining_s = operation_deadline - time.monotonic()
+        if remaining_s <= 0 or (attempt > 0 and remaining_s < 5.0):
+            telemetry = last_failure_telemetry or _call_telemetry(
                 model=mdl, operation=operation, prompt_version=prompt_version,
                 thinking_level=level, started=started,
                 retries=max(0, requests_started - 1),
+                error_history=error_history,
             )
             raise GeminiDeadlineExceededError("Gemini call deadline exceeded", telemetry)
         request_timeout_s = min(float(timeout_s), remaining_s)
@@ -389,39 +439,55 @@ def generate_json_v3(
             )
         except Exception as error:  # noqa: BLE001
             retryable = _transient_gemini_error(error)
+            error_history.append({
+                "provider_error_type": type(error).__name__,
+                "provider_status_code": _gemini_status_code(error),
+                "retryable": retryable,
+            })
             telemetry = _call_telemetry(
                 model=mdl, operation=operation, prompt_version=prompt_version,
                 thinking_level=level, started=started,
                 retries=max(0, requests_started - 1),
                 error=error,
                 retryable=retryable,
+                error_history=error_history,
             )
+            last_failure_telemetry = telemetry
             if _cancel_requested(cancelled):
                 raise GeminiCancelledError("Gemini call cancelled", telemetry) from error
-            if time.monotonic() >= effective_deadline:
+            if time.monotonic() >= operation_deadline:
                 raise GeminiDeadlineExceededError(
                     "Gemini call deadline exceeded", telemetry,
                 ) from error
             if not retryable or attempt + 1 >= max_attempts:
                 raise GeminiTransportError(str(error), telemetry) from error
 
-            wait_s = random.uniform(0.1, 0.35)
-            remaining_s = effective_deadline - time.monotonic()
-            if remaining_s <= wait_s:
+            wait_s = max(
+                random.uniform(0.8, 1.2),
+                _gemini_retry_after(error) or 0.0,
+            )
+            remaining_after_wait_s = operation_deadline - time.monotonic() - wait_s
+            if remaining_after_wait_s < 5.0:
                 raise GeminiDeadlineExceededError(
-                    "Gemini call deadline exceeded before retry", telemetry,
+                    "Gemini call deadline leaves no useful retry window", telemetry,
                 ) from error
-            time.sleep(wait_s)
+            if not _sleep_before_retry(wait_s, cancelled):
+                raise GeminiCancelledError("Gemini call cancelled", telemetry) from error
+            if operation_deadline - time.monotonic() < 5.0:
+                raise GeminiDeadlineExceededError(
+                    "Gemini call deadline leaves no useful retry window", telemetry,
+                ) from error
             continue
 
         telemetry = _call_telemetry(
             model=mdl, operation=operation, prompt_version=prompt_version,
             thinking_level=level, started=started,
             retries=max(0, requests_started - 1), response=response,
+            error_history=error_history,
         )
         if _cancel_requested(cancelled):
             raise GeminiCancelledError("Gemini call cancelled", telemetry)
-        if time.monotonic() >= effective_deadline:
+        if time.monotonic() >= operation_deadline:
             raise GeminiDeadlineExceededError("Gemini call deadline exceeded", telemetry)
         finish_reason = (telemetry.finish_reason or "").upper()
         if finish_reason.endswith("MAX_TOKENS"):

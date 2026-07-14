@@ -2974,7 +2974,7 @@ def _call_model(
             raise
         provider_telemetry = _telemetry_dict(getattr(exc, "telemetry", None))
         raise _ModelCallError(
-            f"{type(exc).__name__}: {exc}",
+            f"{type(exc).__name__}: Gemini model call failed",
             {
                 "model": model,
                 "operation": operation,
@@ -3487,10 +3487,16 @@ def run_segment_profile(
             rejection_reasons=list(report.rejected_reasons),
         )
     except Exception as exc:  # callers decide whether an invalid profile should fall back
+        if _cancel_requested(cancelled):
+            raise
         call = _exception_telemetry(exc)
         calls = [call] if call else []
         error_type = str(call.get("error_type") or type(exc).__name__)
         failure_reason = f"request_failure:{error_type}"
+        status_code = call.get("provider_status_code")
+        safe_error = f"{error_type}: Gemini model call failed"
+        if isinstance(status_code, int):
+            safe_error = f"{safe_error}; status {status_code}"
         return SegmentResult(
             [],
             "Segmentation model call failed.",
@@ -3498,7 +3504,7 @@ def run_segment_profile(
             "invalid",
             [failure_reason],
             calls=calls,
-            error=f"{type(exc).__name__}: {exc}",
+            error=safe_error,
             rejection_reasons=[failure_reason],
         )
 
@@ -3849,5 +3855,10 @@ def segment_clips(
         # A provider/schema/transport failure is not a valid empty selection.
         # Raising prevents the caller from persisting a poisoned empty cache
         # entry while successful zero-match responses remain cacheable.
-        raise RuntimeError("segmentation provider call failed")
+        telemetry = dict(result.calls[-1]) if result.calls else {}
+        telemetry.setdefault(
+            "error_type",
+            str(result.error).split(":", 1)[0] or "SegmentationProviderError",
+        )
+        raise _ModelCallError("segmentation provider call failed", telemetry)
     return result.clips, result.notes

@@ -690,6 +690,7 @@ class GenerationContext:
             "provider_error_type",
             "provider_status_code",
             "retryable",
+            "error_history",
         ):
             value = _usage_field(usage, field_name)
             if value is not None:

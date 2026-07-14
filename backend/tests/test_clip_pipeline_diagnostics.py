@@ -8,6 +8,7 @@ from unittest import mock
 
 import pytest
 
+from backend import gemini_client as gemini_client_module
 from backend.app import main
 from backend.app.clip_engine.errors import (
     ProviderRateLimitError,
@@ -244,10 +245,12 @@ def test_ingest_topic_records_stage_counts_and_propagates_shared_deadline(
     def fake_clip(_url, *, topic, settings, should_cancel):
         del topic, should_cancel
         captured_settings.append(settings)
+        settings["generation_context"].increment_counter("usable_transcripts")
         return {
             "clips": [],
             "transcript": _transcript(),
             "notes": "",
+            "_transcript_usage_recorded": True,
         }
 
     monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
@@ -269,6 +272,7 @@ def test_ingest_topic_records_stage_counts_and_propagates_shared_deadline(
     counters = context.counters()
     assert counters["discovered_videos"] == 1
     assert counters["usable_transcripts"] == 1
+    assert counters["transcript_failures"] == 0
     assert counters["gemini_empty_results"] == 1
 
 
@@ -3290,6 +3294,72 @@ def test_ingest_topic_distinguishes_unavailable_transcript_from_provider_failure
     assert timeout_context.counters()["transcript_failures"] == 1
     assert timeout_context.counters()["transcript_timeouts"] == 1
     assert timeout_context.counters()["provider_failures"] == 1
+
+
+def test_selector_transport_failure_preserves_transcript_and_provider_counters(
+    monkeypatch,
+) -> None:
+    telemetry = gemini_client_module.GeminiCallTelemetry(
+        model="gemini-3.5-flash",
+        operation="flash_boundary_selector",
+        prompt_version="quality_silence_v11",
+        thinking_level="low",
+        latency_ms=10.0,
+        retries=1,
+        finish_reason=None,
+        prompt_tokens=None,
+        candidate_tokens=None,
+        thought_tokens=None,
+        total_tokens=None,
+        provider_error_type="ServerError",
+        provider_status_code=503,
+        retryable=True,
+        error_history=({
+            "provider_error_type": "ServerError",
+            "provider_status_code": 503,
+            "retryable": True,
+        },),
+    )
+
+    def fail_selector(*_args, **_kwargs):
+        raise gemini_client_module.GeminiTransportError(
+            "private provider response",
+            telemetry,
+        )
+
+    monkeypatch.setattr(pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery())
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_run,
+        "_transcribe",
+        lambda *_args, **_kwargs: _transcript(),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_run.segment_cache,
+        "cache_enabled",
+        lambda: False,
+    )
+    monkeypatch.setattr(gemini_client_module, "generate_json_v3", fail_selector)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        lambda *_args, **_kwargs: None,
+    )
+    context = GenerationContext("fast")
+
+    with pytest.raises(ProviderTransientError):
+        _pipeline().ingest_topic(
+            topic="Intro to Python",
+            material_id="material",
+            concept_id="concept",
+            generation_context=context,
+            max_videos=1,
+        )
+
+    counters = context.counters()
+    assert counters["usable_transcripts"] == 1
+    assert counters["transcript_failures"] == 0
+    assert counters["provider_failures"] == 1
+    assert context.usage()[0]["metadata"]["error_history"] == telemetry.error_history
 
 
 def test_exhaustion_messages_are_stage_specific_and_source_neutral() -> None:
