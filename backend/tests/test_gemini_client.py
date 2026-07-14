@@ -176,8 +176,11 @@ def test_gemini3_tolerates_absent_usage_and_finish_metadata(monkeypatch):
     assert result.telemetry.cached_tokens is None
 
 
-def test_gemini3_retries_one_transient_error_with_short_jitter(monkeypatch):
-    fake = _FakeClient(_HTTPError(503), _FakeResponse())
+@pytest.mark.parametrize("status_code", [503, 504])
+def test_gemini3_retries_one_transient_error_with_short_jitter(
+    monkeypatch, status_code,
+):
+    fake = _FakeClient(_HTTPError(status_code), _FakeResponse())
     sleeps = []
     monkeypatch.setattr(gc.time, "sleep", sleeps.append)
     monkeypatch.setattr(gc.random, "uniform", lambda lo, hi: 0.2)

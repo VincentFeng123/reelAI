@@ -283,7 +283,7 @@ SEGMENT_PROFILES = (
 
 _TOTAL_DEADLINE_S = 150.0
 _FLASH_SINGLE_TIMEOUT_S = 45.0
-_FLASH_BOUNDARY_TIMEOUT_S = 45.0
+_FLASH_BOUNDARY_TIMEOUT_S = 60.0
 _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
@@ -3255,7 +3255,9 @@ def _run_selection_profile(
         prompt_version=profile,
         cancelled=cancelled,
         budget_reserve=settings.get("_segment_budget_reserve"),
-        max_retries=0 if profile == FLASH_SPLIT_PROFILE else 1,
+        # Keep the production selector to one logical, once-reserved call while
+        # allowing one same-model retry for transient provider failures.
+        max_retries=1,
     )
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)

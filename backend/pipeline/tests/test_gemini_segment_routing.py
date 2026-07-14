@@ -646,7 +646,7 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
     assert telemetry["model"] == G.config.SEGMENT_FLASH_MODEL
 
 
-def test_production_selector_reserves_and_dispatches_exactly_once(monkeypatch):
+def test_production_selector_reserves_once_and_retries_transient_failure(monkeypatch):
     class TransientHTTPError(RuntimeError):
         status_code = 503
 
@@ -678,9 +678,9 @@ def test_production_selector_reserves_and_dispatches_exactly_once(monkeypatch):
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert len(models.calls) == 1
+    assert len(models.calls) == 2
     assert len(reservations) == 1
-    assert result.calls[0]["retries"] == 0
+    assert result.calls[0]["retries"] == 1
     assert result.calls[0]["provider_error_type"] == "TransientHTTPError"
     assert result.calls[0]["provider_status_code"] == 503
     assert result.calls[0]["retryable"] is True
@@ -747,7 +747,7 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("low", 12_288, 45.0, "flash_boundary_selector", "gemini-3.5-flash")),
+         ("low", 12_288, 60.0, "flash_boundary_selector", "gemini-3.5-flash")),
         (G.PRO_BOUNDARY_PROFILE,
          ("high", 12_288, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
@@ -778,7 +778,7 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         timeout,
         operation,
         expected_model,
-        0 if profile == G.FLASH_SPLIT_PROFILE else 1,
+        1,
     )
 
 
