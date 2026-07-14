@@ -224,7 +224,9 @@ def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
         topics.append(G._BoundaryTopic.model_validate(data))
     payload = G._BoundaryPlan(topics=topics).model_dump_json(exclude_defaults=True)
 
-    assert (len(payload) + 3) // 4 < G._BOUNDARY_OUTPUT_TOKENS
+    estimated_tokens = (len(payload) + 3) // 4
+    assert estimated_tokens < G._BOUNDARY_OUTPUT_TOKENS
+    assert estimated_tokens + 1_024 < G._BOUNDARY_OUTPUT_TOKENS
 
 
 @pytest.mark.parametrize("field", ["start_line", "end_line"])

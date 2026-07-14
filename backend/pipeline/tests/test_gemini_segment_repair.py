@@ -1553,7 +1553,9 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
     assert schema is G._BoundaryPlan
     assert kwargs["model"] == G.config.SEGMENT_FLASH_MODEL
     assert kwargs["thinking_level"] == "low"
-    assert kwargs["max_output_tokens"] == 12_288
+    assert kwargs["max_output_tokens"] == 8_192
+    assert kwargs["timeout_s"] == 28.0
+    assert kwargs["max_retries"] == 1
     assert kwargs["operation"] == "flash_boundary_selector"
     assert kwargs["prompt_version"] == G.FLASH_SPLIT_PROFILE
     assert kwargs["budget_reserve"] is reserve

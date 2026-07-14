@@ -654,7 +654,7 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
     ) in prompt
     assert "low or medium uncertainty" in prompt
     assert "omit only high-uncertainty" in prompt
-    assert G._BOUNDARY_OUTPUT_TOKENS == 12_288
+    assert G._BOUNDARY_OUTPUT_TOKENS == 8_192
     assert "scan the whole transcript from first to last" in prompt
     assert "every distinct" in prompt
     assert "return every distinct qualifying moment" in prompt
@@ -663,6 +663,12 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
     assert "never add filler or incomplete material" in prompt
     assert "difficulty is metadata, not an eligibility filter" in prompt
     assert "learning details and assessments are generated later" in prompt
+
+
+def test_production_flash_has_a_bounded_latency_tail():
+    assert G._TOTAL_DEADLINE_S == 36.0
+    assert G._FLASH_BOUNDARY_TIMEOUT_S == 28.0
+    assert G._FLASH_BOUNDARY_TIMEOUT_S < G._TOTAL_DEADLINE_S
 
 
 def test_production_flash_has_no_requested_duration_contract():

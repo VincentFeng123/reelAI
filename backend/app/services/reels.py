@@ -203,7 +203,7 @@ class ReelService:
     MIN_TARGET_CLIP_DURATION_SEC = 15
     MAX_TARGET_CLIP_DURATION_SEC = 180
     MIN_TARGET_CLIP_DURATION_RANGE_GAP_SEC = 15
-    DEFAULT_RETRIEVAL_PROFILE: RetrievalProfile = "bootstrap"
+    DEFAULT_RETRIEVAL_PROFILE: RetrievalProfile = "deep"
     BOOTSTRAP_CONCEPT_LIMIT = 4
     BOOTSTRAP_PRIMARY_QUERY_COUNT = 3
     BOOTSTRAP_WEAK_POOL_MIN_KEPT = 3
@@ -1203,7 +1203,8 @@ class ReelService:
     # v20: reject openings with unresolved explicit backward references.
     # v22: require exact cross-cue boundary grounding from the current selector.
     # v23: prefer the requested difficulty bin, with a nearest valid-bin fallback.
-    RANKED_FEED_CACHE_VERSION = 23
+    # v24: expose current selector relevance consistently in cached feed rows.
+    RANKED_FEED_CACHE_VERSION = 24
     RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v13"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
@@ -2051,8 +2052,8 @@ class ReelService:
         return "any"
 
     def _normalize_retrieval_profile(self, value: str | None) -> RetrievalProfile:
-        if value == "deep":
-            return "deep"
+        if value == "bootstrap":
+            return "bootstrap"
         return self.DEFAULT_RETRIEVAL_PROFILE
 
     def _normalize_target_clip_duration(self, value: int | float | None) -> int:
@@ -7509,7 +7510,15 @@ class ReelService:
                     "transcript_snippet": transcript_snippet,
                     "takeaways": takeaways,
                     "score": score,
-                    "relevance_score": float(relevance_context.get("score") or 0.0),
+                    "relevance_score": (
+                        self._selection_number(
+                            selection_metadata.get("_selection_topic_relevance"),
+                            0.0,
+                        )
+                        if selection_version
+                        == self.RANKED_FEED_CACHE_CONTRACT_VERSION
+                        else float(relevance_context.get("score") or 0.0)
+                    ),
                     "discovery_score": float(retrieval_candidate.get("discovery_score") or relevance_context.get("score") or 0.0),
                     "clipability_score": float(
                         retrieval_candidate.get("clipability_score")

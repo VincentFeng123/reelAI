@@ -318,14 +318,14 @@ SEGMENT_PROFILES = (
     PRO_BOUNDARY_PROFILE,
 )
 
-_TOTAL_DEADLINE_S = 90.0
+_TOTAL_DEADLINE_S = 36.0
 _FLASH_SINGLE_TIMEOUT_S = 45.0
-_FLASH_BOUNDARY_TIMEOUT_S = 45.0
+_FLASH_BOUNDARY_TIMEOUT_S = 28.0
 _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
 _SELECTION_OUTPUT_TOKENS = 24_576
-_BOUNDARY_OUTPUT_TOKENS = 12_288
+_BOUNDARY_OUTPUT_TOKENS = 8_192
 _BOUNDARY_REPAIR_OUTPUT_TOKENS = 1_024
 _ENRICH_OUTPUT_TOKENS = 2_048
 _MAX_CLIPS = 40
@@ -3445,10 +3445,9 @@ def _run_selection_profile(
         prompt_version=profile,
         cancelled=cancelled,
         budget_reserve=settings.get("_segment_budget_reserve"),
-        # Keep the production selector to one logical, once-reserved call while
-        # allowing a 503-only third physical attempt for a short capacity spike.
-        # All other profiles and transient failures retain one retry.
-        max_retries=2 if profile == FLASH_SPLIT_PROFILE else 1,
+        # Keep the production selector to one logical, once-reserved call with
+        # one bounded retry for a transient provider failure.
+        max_retries=1,
     )
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)

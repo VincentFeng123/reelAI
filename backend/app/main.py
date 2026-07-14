@@ -2791,13 +2791,22 @@ def _public_generation_reel(reel: dict[str, Any]) -> dict[str, Any]:
     ).strip()
     if selection_contract_version:
         public_reel["selection_contract_version"] = selection_contract_version
-    if public_reel.get("topic_relevance") is None:
-        selector_relevance = public_reel.get("_selection_topic_relevance")
-        if selector_relevance is not None:
-            try:
-                public_reel["topic_relevance"] = float(selector_relevance)
-            except (TypeError, ValueError, OverflowError):
-                pass
+    selector_relevance = public_reel.get("_selection_topic_relevance")
+    if selector_relevance is None:
+        selector_relevance = public_reel.get("topic_relevance")
+    if selector_relevance is not None:
+        try:
+            parsed_selector_relevance = float(selector_relevance)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        else:
+            if math.isfinite(parsed_selector_relevance):
+                parsed_selector_relevance = max(
+                    0.0, min(1.0, parsed_selector_relevance)
+                )
+                public_reel["topic_relevance"] = parsed_selector_relevance
+                if selection_contract_version == SELECTION_CONTRACT_VERSION:
+                    public_reel["relevance_score"] = parsed_selector_relevance
     public_reel["video_id"] = _reel_source_video_id(public_reel)
     return {
         key: value

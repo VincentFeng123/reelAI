@@ -61,6 +61,20 @@ def test_reel_response_schema_retains_v3_source_and_selector_metadata() -> None:
     assert serialized["topic_relevance"] == 0.93
 
 
+def test_public_generation_reel_keeps_legacy_relevance_semantics() -> None:
+    public = main._public_generation_reel({
+        "reel_id": "legacy-reel",
+        "video_url": "https://www.youtube.com/embed/AbCdEf12345",
+        "selection_contract_version": "quality_silence_v4",
+        "relevance_score": 0.13,
+        "_selection_topic_relevance": 0.93,
+    })
+
+    assert public["relevance_score"] == 0.13
+    assert public["topic_relevance"] == 0.93
+    assert not any(key.startswith("_selection_") for key in public)
+
+
 def _conn() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:", check_same_thread=False, isolation_level=None)
     conn.row_factory = sqlite3.Row
@@ -273,7 +287,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
         assert len(reels) == 1
         assert reels[0]["video_id"] == "AbCdEf12345"
         assert reels[0]["selection_contract_version"] == "quality_silence_v13"
-        assert reels[0]["relevance_score"] == 0.13
+        assert reels[0]["relevance_score"] == 0.93
         assert reels[0]["topic_relevance"] == 0.93
         assert not any(key.startswith("_selection_") for key in reels[0])
     finally:

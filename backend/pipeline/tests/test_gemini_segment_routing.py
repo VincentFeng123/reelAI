@@ -184,6 +184,37 @@ def test_route_event_uses_selected_authoritative_prompt_version(monkeypatch):
     assert selected["prompt_version"] == G.CORRECTED_PRO_PROFILE
 
 
+@pytest.mark.parametrize(
+    ("configured_deadline", "expected_deadline"),
+    [(None, 136.0), (120.0, 120.0), (200.0, 136.0)],
+)
+def test_production_route_caps_and_respects_the_shared_deadline(
+    monkeypatch,
+    configured_deadline,
+    expected_deadline,
+):
+    captured = {}
+
+    def fake_run(transcript, settings, profile, **kwargs):
+        captured.update(kwargs)
+        return _result(profile, "green", title="flash")
+
+    monkeypatch.setattr(G.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(G, "run_segment_profile", fake_run)
+    settings = {}
+    if configured_deadline is not None:
+        settings["deadline_monotonic"] = configured_deadline
+
+    G.segment_clips_detailed(
+        _transcript(),
+        settings,
+        video_id="video",
+        routing_mode="flash_only",
+    )
+
+    assert captured["deadline_monotonic"] == expected_deadline
+
+
 def test_green_hybrid_flash_never_calls_pro(monkeypatch):
     seen = []
     monkeypatch.setattr(G.config, "SEGMENT_HYBRID_PERCENT", 100.0)
@@ -680,9 +711,9 @@ def test_production_selector_reserves_once_and_retries_transient_failure(monkeyp
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert len(models.calls) == 3
+    assert len(models.calls) == 2
     assert len(reservations) == 1
-    assert result.calls[0]["retries"] == 2
+    assert result.calls[0]["retries"] == 1
     assert result.calls[0]["provider_error_type"] == "TransientHTTPError"
     assert result.calls[0]["provider_status_code"] == 503
     assert result.calls[0]["retryable"] is True
@@ -757,9 +788,9 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("low", 12_288, 45.0, "flash_boundary_selector", "gemini-3-flash-preview")),
+         ("low", 8_192, 28.0, "flash_boundary_selector", "gemini-3-flash-preview")),
         (G.PRO_BOUNDARY_PROFILE,
-         ("high", 12_288, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
+         ("high", 8_192, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -788,7 +819,7 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         timeout,
         operation,
         expected_model,
-        2 if profile == G.FLASH_SPLIT_PROFILE else 1,
+        1,
     )
 
 
@@ -810,7 +841,7 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
     )
 
     assert captured["thinking_level"] == "low"
-    assert captured["max_output_tokens"] == 12_288
+    assert captured["max_output_tokens"] == 8_192
 
 
 def test_boundary_profile_rejects_bad_model_quote_from_cited_cue(monkeypatch):

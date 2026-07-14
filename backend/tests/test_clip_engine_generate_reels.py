@@ -972,6 +972,16 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
         self.assertIs(kwargs["retrieved_video_ids"], retrieved)
         self.assertEqual(retrieved, {VIDEO_ID})
 
+    def test_retrieval_defaults_and_invalid_values_use_ai_expansion(self) -> None:
+        service = main_module.reel_service
+
+        self.assertEqual(service.DEFAULT_RETRIEVAL_PROFILE, "deep")
+        self.assertEqual(service._normalize_retrieval_profile(None), "deep")
+        self.assertEqual(service._normalize_retrieval_profile("invalid"), "deep")
+        self.assertEqual(
+            service._normalize_retrieval_profile("bootstrap"), "bootstrap"
+        )
+
     def test_material_inventory_never_exceeds_300_reels(self) -> None:
         existing_video_id = "inventory-video"
         with db_module.get_conn(transactional=True) as conn:
@@ -1274,7 +1284,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 23)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 24)
 
 
 if __name__ == "__main__":

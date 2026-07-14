@@ -727,6 +727,69 @@ class SelectionContractOrderingTests(unittest.TestCase):
             self.assertAlmostEqual(result[0]["relevance_score"], 0.13)
             self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
 
+    def test_v13_response_exposes_authoritative_selector_relevance(self) -> None:
+        self._insert_versioned_reel(
+            reel_id="live-shaped-v13",
+            video_id="video-a",
+            start=10,
+            difficulty=0.15,
+            base_score=0.8,
+        )
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'live-shaped-v13'"
+        ).fetchone()
+        context = json.loads(row[0])
+        context.update({
+            "selection_contract_version": "quality_silence_v13",
+            "topic_relevance": 0.93,
+            "self_contained": True,
+            "topic_evidence_quote": (
+                "Chemical bonding explains how atoms share or transfer electrons"
+            ),
+            "surface_eligible": True,
+            "deferred_level": False,
+        })
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'live-shaped-v13'",
+            (json.dumps(context),),
+        )
+        deterministic_relevance = {
+            "score": 0.13,
+            "concept_overlap": 0.13,
+            "context_overlap": 0.13,
+            "matched_terms": ["bonding"],
+            "off_topic_penalty": 0.0,
+            "reason": "deterministic overlap",
+        }
+
+        with mock.patch.object(
+            self.service,
+            "_score_text_relevance",
+            return_value=deterministic_relevance,
+        ), mock.patch.object(self.service, "_build_caption_cues", return_value=[]):
+            fresh = self.service.ranked_feed(
+                self.conn,
+                material_id=self.MATERIAL,
+                generation_id="selection-generation",
+                fast_mode=True,
+                learner_id=self.LEARNER,
+            )
+        cached = self.service.ranked_feed(
+            self.conn,
+            material_id=self.MATERIAL,
+            generation_id="selection-generation",
+            fast_mode=True,
+            learner_id=self.LEARNER,
+        )
+
+        for result in (fresh, cached):
+            self.assertEqual(len(result), 1)
+            self.assertEqual(
+                result[0]["selection_contract_version"], "quality_silence_v13"
+            )
+            self.assertAlmostEqual(result[0]["relevance_score"], 0.93)
+            self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
+
     def test_ranked_feed_uses_selector_cue_snapshot_after_artifact_refresh(self) -> None:
         response_video_id = "yt:dQw4w9WgXcQ"
         bare_video_id = "dQw4w9WgXcQ"
