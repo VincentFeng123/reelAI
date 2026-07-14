@@ -150,6 +150,7 @@ from .ingestion.pipeline import IngestionPipeline
 from .services.generation_jobs import (
     DEFAULT_HEARTBEAT_SECONDS,
     DEFAULT_LEASE_SECONDS,
+    GenerationQueueFullError,
     JobLeaseLostError,
     TERMINAL_STATUSES as GENERATION_TERMINAL_STATUSES,
     append_event as append_generation_event,
@@ -351,7 +352,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v8"
+SELECTION_CONTRACT_VERSION = "quality_silence_v9"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -389,7 +390,11 @@ RATE_LIMIT_WINDOW_SEC = 60.0
 CHAT_RATE_LIMIT_PER_WINDOW = 20
 MATERIAL_RATE_LIMIT_PER_WINDOW = 8
 REELS_RATE_LIMIT_PER_WINDOW = 12
-REELS_GENERATE_RATE_LIMIT_PER_WINDOW = 36
+REELS_GENERATE_RATE_LIMIT_PER_WINDOW = 6
+FEED_RATE_LIMIT_PER_WINDOW = 36
+GENERATION_GLOBAL_ACTIVE_LIMIT = 4
+GENERATION_LEARNER_ACTIVE_LIMIT = 2
+GENERATION_QUEUE_RETRY_AFTER_SEC = 30
 GENERATION_JOB_STATUS_RATE_LIMIT_PER_WINDOW = 120
 FEEDBACK_RATE_LIMIT_PER_WINDOW = 60
 ASSESSMENT_PROGRESS_RATE_LIMIT_PER_WINDOW = 240
@@ -4102,6 +4107,27 @@ def _wake_generation_worker() -> None:
     _generation_worker_wake.set()
 
 
+def _submit_bounded_generation_job(conn, **kwargs: Any) -> tuple[dict[str, Any], bool]:
+    try:
+        return submit_generation_job(
+            conn,
+            **kwargs,
+            max_global_active_jobs=GENERATION_GLOBAL_ACTIVE_LIMIT,
+            max_active_jobs_per_learner=GENERATION_LEARNER_ACTIVE_LIMIT,
+        )
+    except GenerationQueueFullError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "generation_queue_full",
+                "message": "Generation is busy. Retry after an active request finishes.",
+                "scope": exc.scope,
+                "limit": exc.limit,
+            },
+            headers={"Retry-After": str(GENERATION_QUEUE_RETRY_AFTER_SEC)},
+        ) from exc
+
+
 def _start_generation_worker() -> None:
     global _generation_worker_id, _generation_worker_ids, _generation_worker_stop
     global _generation_worker_thread, _generation_worker_threads
@@ -5237,7 +5263,6 @@ def update_material_level(material_id: str, request: Request, payload: MaterialL
 )
 async def generate_reels(request: Request, payload: ReelsGenerateRequest):
     _require_community_client_identity(request)
-    _enforce_rate_limit(request, "reels-generate", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
     _reject_multi_platform_search(payload.multi_platform_search)
     min_relevance = _normalize_min_relevance(payload.min_relevance)
     safe_video_duration_pref = _normalize_preferred_video_duration(payload.preferred_video_duration)
@@ -5335,7 +5360,7 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
                         "generation_id": source_generation_id,
                         "response_profile": "unified",
                     }
-        job_row, _created = submit_generation_job(
+        job_row, _created = _submit_bounded_generation_job(
             conn,
             material_id=payload.material_id,
             concept_id=payload.concept_id,
@@ -5344,6 +5369,11 @@ async def generate_reels(request: Request, payload: ReelsGenerateRequest):
             learner_id=learner_id,
             request_params=request_params,
             source_generation_id=source_generation_id,
+            before_create=lambda: _enforce_rate_limit(
+                request,
+                "generation-submit",
+                limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
+            ),
         )
     _wake_generation_worker()
     job_id = str(job_row.get("id") or "")
@@ -6028,7 +6058,7 @@ def feed(
 ):
     from .services.knowledge_level import effective_level_target as _effective_level_target
 
-    _enforce_rate_limit(request, "feed", limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW)
+    _enforce_rate_limit(request, "feed", limit=FEED_RATE_LIMIT_PER_WINDOW)
     _reject_multi_platform_search(multi_platform_search)
     if page < 1:
         page = 1
@@ -6172,17 +6202,27 @@ def feed(
                     len(ranked) + max(limit, prefetch),
                 ),
             )
-            active_job, _created = submit_generation_job(
-                conn,
-                material_id=material_id,
-                concept_id=None,
-                request_key=request_key,
-                content_fingerprint=content_fingerprint,
-                learner_id=learner_id,
-                request_params={**request_params, "num_reels": target_total},
-                source_generation_id=generation_id,
-            )
-            job_submitted = True
+            try:
+                active_job, _created = _submit_bounded_generation_job(
+                    conn,
+                    material_id=material_id,
+                    concept_id=None,
+                    request_key=request_key,
+                    content_fingerprint=content_fingerprint,
+                    learner_id=learner_id,
+                    request_params={**request_params, "num_reels": target_total},
+                    source_generation_id=generation_id,
+                    before_create=lambda: _enforce_rate_limit(
+                        request,
+                        "generation-submit",
+                        limit=REELS_GENERATE_RATE_LIMIT_PER_WINDOW,
+                    ),
+                )
+            except HTTPException as exc:
+                if exc.status_code != 429:
+                    raise
+            else:
+                job_submitted = True
         reels = ranked[page_start:page_end]
         response = {
             "page": page,

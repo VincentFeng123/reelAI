@@ -65,8 +65,16 @@ _EvidenceQuote = Annotated[
 _OptionalReason = Annotated[
     str, StringConstraints(strip_whitespace=True)
 ]
+_NON_SPEECH_MARKER_PATTERN = (
+    r"(?:\[\s*(?:(?:(?:theme|intro|outro|background)\s+)?music|applause|"
+    r"laughter|cheering|inaudible)\s*\]|"
+    r"\(\s*(?:(?:(?:theme|intro|outro|background)\s+)?music|applause|"
+    r"laughter|cheering|inaudible)\s*\)|"
+    r"[\u2669-\u266c]+)"
+)
+_NON_SPEECH_MARKER_RE = re.compile(_NON_SPEECH_MARKER_PATTERN, re.IGNORECASE)
 _STRUCTURAL_FILLER_RE = re.compile(
-    r"(?:\b(?:thanks? for watching|have a great day|see you next time|"
+    rf"(?:{_NON_SPEECH_MARKER_PATTERN}|\b(?:thanks? for watching|have a great day|see you next time|"
     r"like and subscribe|please subscribe|"
     r"subscribe to (?:this|the|my|our) channel|today'?s sponsor|"
     r"check out (?:our|the) video|"
@@ -88,6 +96,8 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"(?:next|future)\s+(?:video|lesson|section|episode))\b|"
     r"(?:^|[.!?]\s+)(?:(?:all right|alright|okay|ok|so|now|well|yeah)"
     r"\s*[,;:]?\s+)*(?:"
+    r"let(?:['’]?s| us)\s+(?:begin|get started|start|dive in|delve)"
+    r"\s*[.!?](?=\s|$)|"
     r"(?:cool|hey|fun fact|brilliant)\s*[!,.](?=\s|$)|"
     r"(?:oh\s*[,;:]?\s*)?(?:yeah\s*[,;:]?\s*)?by the way\b|"
     r"sponsored by\b|"
@@ -120,6 +130,53 @@ _DANGLING_TAIL_PREFIX_RE = re.compile(
 )
 _OPENING_COMPARATIVE_FRAGMENT_RE = re.compile(
     r"^\s*(?:much\s+)?(?:more|less)\s+[a-z][a-z'-]*\?(?:\s+|$)",
+    re.IGNORECASE,
+)
+_EXISTENTIAL_OPENING_RE = re.compile(
+    r"^\s*there\s+(?:is|are|was|were)\s+"
+    r"(?:(?:(?:a|an|no|some|many|several|multiple|numerous|few)|"
+    r"(?:one|two|three|four|five|six|seven|eight|nine|ten)|\d+)\s+)?"
+    r"(?P<tail>[^\W_][^\n.!?]*?)\s*$",
+    re.IGNORECASE,
+)
+_EXISTENTIAL_UNRESOLVED_RE = re.compile(
+    r"\b(?:this|these|those|they|them|their|theirs|he|him|his|she|her|"
+    r"hers|it|its|mine|ours|yours|here|there|"
+    r"such|same|former|latter|above|below|previous|following|earlier|more|"
+    r"other|others|ones)\b",
+    re.IGNORECASE,
+)
+_EXISTENTIAL_CONTEXTUAL_THAT_RE = re.compile(
+    r"(?:^|\b(?:of|for|in|on|about|from|by|to|with|under|over)\s+)that\b",
+    re.IGNORECASE,
+)
+_EXISTENTIAL_TERMINAL_REFERENCE_RE = re.compile(
+    r"(?:\b(?:that|so)|\bthat\s+[a-z0-9][a-z0-9'-]*)\s*$",
+    re.IGNORECASE,
+)
+_EXISTENTIAL_DEMONSTRATIVE_THAT_RE = re.compile(
+    r"(?:\b(?:why|how|when|where|which|who|whose)\s+that\s+[a-z0-9]|"
+    r"\bthat\s+(?:[a-z][a-z'-]*(?:tion|sion|ment|ness|ity|ence|ance|"
+    r"ship|hood|ism|ure|age|acy|ics)|answer|cell|enzyme|example|gene|idea|"
+    r"method|one|pathway|problem|protein|reaction|result|step|subject|theory|"
+    r"thing|topic)\b)",
+    re.IGNORECASE,
+)
+_EXISTENTIAL_BACK_REFERENCE_RE = re.compile(
+    r"\b(?:mentioned|shown|discussed|described|introduced|seen|noted|defined|"
+    r"explained)\s+(?:earlier|before|above|previously)\b",
+    re.IGNORECASE,
+)
+_EXISTENTIAL_SCOPE_RE = re.compile(
+    r"(?:\b(?:of|in|within|among|between|during|under|on|for|about|behind|"
+    r"from|by|to|across|inside|outside)\s+(?:the\s+|a\s+|an\s+)?[a-z]|"
+    r"\b(?:that|which|who|whose|where|when|why|how)\s+[a-z]|"
+    r"\b(?:i|we|you)\s+(?:(?:can|could|will|would|should|do|did)\s+)?"
+    r"[a-z][a-z'-]*\s+(?:the\s+|a\s+|an\s+)?[a-z0-9][a-z0-9'-]*|"
+    r"\b[a-z][a-z'-]*\s+[a-z][a-z'-]*(?:ing|ed)\s+"
+    r"(?:the\s+|a\s+|an\s+)?[a-z0-9]|"
+    r",\s*(?:(?:namely|specifically|called)\s+)?[a-z0-9][a-z0-9'-]*"
+    r"\s+(?:and|or)\s+[a-z0-9][a-z0-9'-]*|[;:]\s*[a-z0-9])",
     re.IGNORECASE,
 )
 _TERMINAL_CALLBACK_RE = re.compile(
@@ -445,8 +502,9 @@ _POLICY_AND_EXAMPLES = """Policy:
 - Give each candidate exactly one coherent learning objective. When adjacent speech teaches
   independent facets, return separate candidates for those facets instead of bundling them.
 - Omit greetings, credentials, sponsors, administration, promos, transitions, previews,
-  recaps, outros, atmospheric hooks, scene-setting, colorful flourishes, audience banter,
-  post-conclusion jokes, tangents, repeated restatements, and partial explanations.
+  recaps, outros, atmospheric hooks, scene-setting, music/applause caption markers,
+  colorful flourishes, audience banter, post-conclusion jokes, tangents, repeated
+  restatements, and partial explanations.
 - Keep starts and ends free of that filler. Never add filler or incomplete material at an
   opening or ending. A brief nonessential aside inside an otherwise
   valuable complete unit may remain when cutting around it would break the teaching arc;
@@ -647,7 +705,8 @@ def _boundary_prompts(
         "span containing necessary setup, reasoning, and the natural conclusion, regardless "
         "of its duration. Give it exactly one learning objective. Split independent adjacent "
         "facets into separate candidates even when they share one coarse transcript line. "
-        "Keep opening and ending edges clean. Split around a substantial "
+        "Keep opening and ending edges clean, including generic lead-ins and bracketed "
+        "non-speech markers. Split around a substantial "
         "interruption, but keep a brief internal aside when removing it would break an "
         "otherwise valuable complete arc. Omit only high-uncertainty boundaries; low or "
         "medium uncertainty is allowed. Omit material that requires an unseen visual.\n"
@@ -920,11 +979,33 @@ def _guard_text(text: str, *, ignore_caption_case: bool) -> str:
 
 
 def _cue_opens_mid_thought(text: str, *, ignore_caption_case: bool) -> bool:
-    from .discourse import opens_mid_thought
+    from .discourse import CONTEXT_DEP_HEADS, opens_mid_thought
 
-    return opens_mid_thought(
-        _guard_text(text, ignore_caption_case=ignore_caption_case)
-    )
+    guarded = _guard_text(text, ignore_caption_case=ignore_caption_case)
+    opening_clause = re.split(r"[.!?]", guarded, maxsplit=1)[0]
+    existential = _EXISTENTIAL_OPENING_RE.fullmatch(opening_clause)
+    if existential is not None:
+        tail = existential.group("tail")
+        tail_words = [word.casefold() for word in _WORD_RE.findall(tail)]
+        that_count = sum(word == "that" for word in tail_words)
+        has_contextual_definite = any(
+            word == "the"
+            and index + 1 < len(tail_words)
+            and tail_words[index + 1] in CONTEXT_DEP_HEADS
+            for index, word in enumerate(tail_words)
+        )
+        if (
+            not _EXISTENTIAL_UNRESOLVED_RE.search(tail)
+            and not _EXISTENTIAL_CONTEXTUAL_THAT_RE.search(tail)
+            and not _EXISTENTIAL_TERMINAL_REFERENCE_RE.search(tail)
+            and not _EXISTENTIAL_DEMONSTRATIVE_THAT_RE.search(tail)
+            and that_count <= 1
+            and not _EXISTENTIAL_BACK_REFERENCE_RE.search(tail)
+            and not has_contextual_definite
+            and _EXISTENTIAL_SCOPE_RE.search(tail)
+        ):
+            return False
+    return opens_mid_thought(guarded)
 
 
 def _cue_opens_mid_thought_at(
@@ -1382,6 +1463,32 @@ def _structural_filler_matches(text: str) -> list[re.Match[str]]:
     return list(_STRUCTURAL_FILLER_RE.finditer(str(text or "")))
 
 
+def _structural_match_is_edge(
+    text: str,
+    match: re.Match[str],
+    *,
+    want: str,
+) -> bool:
+    before = text[:match.start()]
+    after = text[match.end():]
+    is_non_speech_marker = bool(
+        _NON_SPEECH_MARKER_RE.fullmatch(match.group(0))
+    )
+    if want == "start":
+        # A caption marker is removable only when it actually precedes speech.
+        # This keeps a brief marker between teaching clauses inside the clip.
+        clean_prefix = (
+            not _WORD_RE.search(before)
+            if is_non_speech_marker
+            else (
+                not re.search(r"[.!?]", before)
+                and len(_toks(before)) <= 5
+            )
+        )
+        return bool(clean_prefix and _WORD_RE.search(after))
+    return bool(_WORD_RE.search(before) and not _WORD_RE.search(after))
+
+
 def _cue_is_only_structural_filler(text: str) -> bool:
     matches = _structural_filler_matches(text)
     if not matches:
@@ -1497,30 +1604,29 @@ def _expanded_context_edge_quote(
         edge_matches = [
             match
             for match in matches
-            if (
-                (
-                    not re.search(r"[.!?]", sentence[:match.start()])
-                    and len(_toks(sentence[:match.start()])) <= 5
-                    and _WORD_RE.search(sentence[match.end():]) is not None
-                )
-                if want == "start"
-                else (
-                    _WORD_RE.search(sentence[:match.start()]) is not None
-                    and _WORD_RE.search(sentence[match.end():]) is None
-                )
-            )
+            if _structural_match_is_edge(sentence, match, want=want)
         ]
         if edge_matches:
             inline_boundary_applied = False
             if want == "start":
                 match = max(edge_matches, key=lambda value: value.end())
-                separator = re.match(r"\s*[,;:—-]\s*", sentence[match.end():])
+                separator_pattern = (
+                    r"(?:\s+|\s*[,;:—-]\s*)"
+                    if _NON_SPEECH_MARKER_RE.fullmatch(match.group(0))
+                    else r"\s*[,;:—-]\s*"
+                )
+                separator = re.match(separator_pattern, sentence[match.end():])
                 if separator is not None:
                     retained_left = left + match.end() + separator.end()
                     inline_boundary_applied = True
             else:
                 match = min(edge_matches, key=lambda value: value.start())
-                separator = re.search(r"[,;:—-]\s*$", sentence[:match.start()])
+                separator_pattern = (
+                    r"(?:\s+|[,;:—-]\s*)$"
+                    if _NON_SPEECH_MARKER_RE.fullmatch(match.group(0))
+                    else r"[,;:—-]\s*$"
+                )
+                separator = re.search(separator_pattern, sentence[:match.start()])
                 if separator is not None:
                     retained_right = left + separator.start()
                     inline_boundary_applied = True
@@ -1548,21 +1654,29 @@ def _edge_has_unresolved_structural_filler(
 ) -> bool:
     """Reject structural filler that the semantic quote still leaves on an edge."""
     for match in _structural_filler_matches(text):
-        if want == "start":
-            is_edge_match = (
-                not re.search(r"[.!?]", text[:match.start()])
-                and len(_toks(text[:match.start()])) <= 5
-                and _WORD_RE.search(text[match.end():])
+        is_non_speech_marker = bool(
+            _NON_SPEECH_MARKER_RE.fullmatch(match.group(0))
+        )
+        if (
+            want == "start"
+            and is_non_speech_marker
+            and quote_span[0] < match.end()
+        ):
+            selected_prefix = (
+                text[quote_span[0]:match.start()]
+                if quote_span[0] < match.start()
+                else ""
             )
-            if is_edge_match and quote_span[0] < match.end():
+            if (
+                not _WORD_RE.search(selected_prefix)
+                or _cue_is_only_structural_filler(selected_prefix)
+            ):
                 return True
-        else:
-            is_edge_match = (
-                _WORD_RE.search(text[:match.start()])
-                and not _WORD_RE.search(text[match.end():])
-            )
-            if is_edge_match and quote_span[1] > match.start():
-                return True
+        is_edge_match = _structural_match_is_edge(text, match, want=want)
+        if want == "start" and is_edge_match and quote_span[0] < match.end():
+            return True
+        if want == "end" and is_edge_match and quote_span[1] > match.start():
+            return True
     return False
 
 

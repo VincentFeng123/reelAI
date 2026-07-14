@@ -55,6 +55,144 @@ def _submit(conn: sqlite3.Connection, *, request_key: str = "request-1", now=BAS
     )
 
 
+def test_active_capacity_coalesces_identical_requests_before_rejecting_new_work() -> None:
+    conn = _memory_conn()
+    created_callbacks: list[str] = []
+    try:
+        first, created = jobs.submit_or_get_active(
+            conn,
+            material_id="material-1",
+            concept_id="concept-1",
+            request_key="capacity-request",
+            content_fingerprint="fingerprint-1",
+            learner_id="learner-1",
+            request_params={},
+            max_global_active_jobs=1,
+            max_active_jobs_per_learner=1,
+            before_create=lambda: created_callbacks.append("created"),
+        )
+        same, same_created = jobs.submit_or_get_active(
+            conn,
+            material_id="material-1",
+            concept_id="concept-1",
+            request_key="capacity-request",
+            content_fingerprint="fingerprint-1",
+            learner_id="learner-1",
+            request_params={},
+            max_global_active_jobs=1,
+            max_active_jobs_per_learner=1,
+            before_create=lambda: created_callbacks.append("coalesced"),
+        )
+
+        assert created is True
+        assert same_created is False
+        assert same["id"] == first["id"]
+        with pytest.raises(jobs.GenerationQueueFullError) as captured:
+            jobs.submit_or_get_active(
+                conn,
+                material_id="material-1",
+                concept_id="concept-1",
+                request_key="different-request",
+                content_fingerprint="fingerprint-1",
+                learner_id="learner-2",
+                request_params={},
+                max_global_active_jobs=1,
+                max_active_jobs_per_learner=1,
+                before_create=lambda: created_callbacks.append("rejected"),
+            )
+        assert captured.value.scope == "global"
+        assert created_callbacks == ["created"]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM reel_generation_jobs WHERE status IN ('queued', 'running')"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_postgres_submission_lock_is_acquired_before_active_request_recheck(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    winner = {"id": "concurrent-winner", "status": "queued"}
+
+    def find_active(*_args, **_kwargs):
+        events.append("active")
+        return None if events.count("active") == 1 else winner
+
+    def fetch_lock(_conn, query, params=()):
+        assert "pg_advisory_xact_lock" in query
+        assert params == (jobs.GENERATION_SUBMIT_ADVISORY_LOCK_ID,)
+        events.append("lock")
+        return {"acquired": None}
+
+    monkeypatch.setattr(jobs, "find_active_job", find_active)
+    monkeypatch.setattr(jobs, "fetch_one", fetch_lock)
+
+    row, created = jobs.submit_or_get_active(
+        object(),
+        material_id="material-1",
+        concept_id=None,
+        request_key="concurrent-request",
+        content_fingerprint="fingerprint-1",
+        learner_id="learner-1",
+        request_params={},
+        max_global_active_jobs=4,
+        max_active_jobs_per_learner=2,
+        before_create=lambda: events.append("create"),
+    )
+
+    assert row is winner
+    assert created is False
+    assert events == ["active", "lock", "active"]
+
+
+def test_active_capacity_limits_each_learner_without_consuming_remaining_global_slots() -> None:
+    conn = _memory_conn()
+    try:
+        for index in range(2):
+            jobs.submit_or_get_active(
+                conn,
+                material_id="material-1",
+                concept_id="concept-1",
+                request_key=f"learner-one-{index}",
+                content_fingerprint="fingerprint-1",
+                learner_id="learner-1",
+                request_params={},
+                max_global_active_jobs=4,
+                max_active_jobs_per_learner=2,
+            )
+
+        with pytest.raises(jobs.GenerationQueueFullError) as captured:
+            jobs.submit_or_get_active(
+                conn,
+                material_id="material-1",
+                concept_id="concept-1",
+                request_key="learner-one-overflow",
+                content_fingerprint="fingerprint-1",
+                learner_id="learner-1",
+                request_params={},
+                max_global_active_jobs=4,
+                max_active_jobs_per_learner=2,
+            )
+        assert captured.value.scope == "learner"
+
+        other, created = jobs.submit_or_get_active(
+            conn,
+            material_id="material-1",
+            concept_id="concept-1",
+            request_key="learner-two-request",
+            content_fingerprint="fingerprint-1",
+            learner_id="learner-2",
+            request_params={},
+            max_global_active_jobs=4,
+            max_active_jobs_per_learner=2,
+        )
+        assert created is True
+        assert other["learner_id"] == "learner-2"
+    finally:
+        conn.close()
+
+
 def test_request_key_uses_content_and_truthful_controls() -> None:
     assert jobs.ALL_STATUSES == {
         "queued",
@@ -171,7 +309,7 @@ def test_request_key_version_invalidates_v6_inventory(monkeypatch) -> None:
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v8"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v9"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", "quality_silence_v6")
 

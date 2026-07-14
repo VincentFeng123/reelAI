@@ -8,7 +8,7 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from ..db import (
     DatabaseIntegrityError,
@@ -43,11 +43,21 @@ DEFAULT_LEASE_SECONDS = 90
 DEFAULT_DEADLINE_SECONDS = 60 * 60
 DEFAULT_QUEUE_TTL_SECONDS = 8 * 60
 # Request-key version doubles as a production inventory compatibility gate.
-REQUEST_SCHEMA_VERSION = "quality_silence_v8"
+REQUEST_SCHEMA_VERSION = "quality_silence_v9"
+GENERATION_SUBMIT_ADVISORY_LOCK_ID = 0x5354554459524545
 
 
 class JobLeaseLostError(RuntimeError):
     """The worker no longer owns a live lease for the requested write."""
+
+
+class GenerationQueueFullError(RuntimeError):
+    """A distinct request would exceed the configured active-job ceiling."""
+
+    def __init__(self, *, scope: Literal["global", "learner"], limit: int) -> None:
+        self.scope = scope
+        self.limit = int(limit)
+        super().__init__(f"{scope} active generation limit reached ({limit})")
 
 
 def _utc_now(value: datetime | str | None = None) -> datetime:
@@ -258,6 +268,16 @@ def find_completed_job(conn: Any, request_key: str) -> dict[str, Any] | None:
     )
 
 
+def _acquire_generation_submit_lock(conn: Any) -> None:
+    if isinstance(conn, sqlite3.Connection):
+        return
+    fetch_one(
+        conn,
+        "SELECT pg_advisory_xact_lock(?) AS acquired",
+        (GENERATION_SUBMIT_ADVISORY_LOCK_ID,),
+    )
+
+
 def submit_or_get_active(
     conn: Any,
     *,
@@ -272,6 +292,9 @@ def submit_or_get_active(
     now: datetime | str | None = None,
     deadline_seconds: int = DEFAULT_DEADLINE_SECONDS,
     job_id: str | None = None,
+    max_global_active_jobs: int | None = None,
+    max_active_jobs_per_learner: int | None = None,
+    before_create: Callable[[], None] | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Atomically create one queued job or return the active request-key winner."""
     if not str(material_id or "").strip():
@@ -288,6 +311,42 @@ def submit_or_get_active(
     active = find_active_job(conn, request_key, now=started)
     if active:
         return active, False
+    _acquire_generation_submit_lock(conn)
+    active = find_active_job(conn, request_key, now=started)
+    if active:
+        return active, False
+    if max_global_active_jobs is not None or max_active_jobs_per_learner is not None:
+        counts = fetch_one(
+            conn,
+            """
+            SELECT COUNT(*) AS global_active,
+                   COALESCE(SUM(CASE WHEN learner_id = ? THEN 1 ELSE 0 END), 0)
+                       AS learner_active
+            FROM reel_generation_jobs
+            WHERE status IN ('queued', 'running')
+            """,
+            (str(learner_id or "legacy"),),
+        ) or {}
+        learner_active = int(counts.get("learner_active") or 0)
+        global_active = int(counts.get("global_active") or 0)
+        if (
+            max_active_jobs_per_learner is not None
+            and learner_active >= int(max_active_jobs_per_learner)
+        ):
+            raise GenerationQueueFullError(
+                scope="learner",
+                limit=int(max_active_jobs_per_learner),
+            )
+        if (
+            max_global_active_jobs is not None
+            and global_active >= int(max_global_active_jobs)
+        ):
+            raise GenerationQueueFullError(
+                scope="global",
+                limit=int(max_global_active_jobs),
+            )
+    if before_create is not None:
+        before_create()
     for attempt in range(3):
         candidate_id = requested_id if attempt == 0 and requested_id else str(uuid.uuid4())
         row = {
@@ -995,6 +1054,7 @@ __all__ = [
     "DEFAULT_MAX_ATTEMPTS",
     "DEFAULT_QUEUE_TTL_SECONDS",
     "EVENT_TYPES",
+    "GenerationQueueFullError",
     "JobLeaseLostError",
     "TERMINAL_STATUSES",
     "append_event",

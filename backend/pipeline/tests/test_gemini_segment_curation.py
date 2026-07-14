@@ -698,6 +698,187 @@ def test_punctuated_welcome_is_detected_as_structural_filler():
     assert G._STRUCTURAL_FILLER_RE.search("Welcome back.")
 
 
+@pytest.mark.parametrize(
+    "lead_in",
+    [
+        "Let's begin.",
+        "Let's get started.",
+        "Let's start.",
+        "Let's dive in.",
+        "So let's delve.",
+    ],
+)
+def test_generic_opening_lead_in_is_structural_filler(lead_in):
+    assert G._cue_is_only_structural_filler(lead_in)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "[Music]",
+        "(Theme Music)",
+        "[Background Music]",
+        "(Intro Music)",
+        "[Outro Music]",
+        "[Applause]",
+        "(laughter)",
+        "[Cheering]",
+        "(inaudible)",
+        "♪",
+        "♫♫",
+    ],
+)
+def test_non_speech_marker_only_cue_is_structural_filler(marker):
+    assert G._cue_is_only_structural_filler(marker)
+
+
+@pytest.mark.parametrize(
+    "start_quote",
+    [
+        "So let's delve Theme Music There are two sorts",
+        "Theme Music There are two sorts of cells",
+    ],
+)
+def test_live_shaped_opening_lead_in_and_marker_are_trimmed(start_quote):
+    text = (
+        "So let's delve. [Theme Music] There are two sorts of cells. "
+        "Prokaryotic cells lack a nucleus, while eukaryotic cells contain one."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote=start_quote,
+            end_quote="eukaryotic cells contain one",
+            topic_evidence_quote=(
+                "Prokaryotic cells lack a nucleus while eukaryotic cells"
+            ),
+        )]),
+        [{"cue_id": "live-coarse", "start": 0.0, "end": 15.0, "text": text}],
+        [],
+        {},
+        topic="prokaryotic versus eukaryotic cells",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["_clip_text"].startswith("There are two sorts of cells")
+    assert "let's delve" not in clip["_clip_text"].lower()
+    assert "Theme Music" not in clip["_clip_text"]
+    assert clip["edge_projection"]["start"]["quote"] == (
+        "There are two sorts of cells"
+    )
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "There are two sorts of reactions in photosynthesis.",
+        "There are reasons why photosynthesis slows.",
+        "There are enzymes that catalyze photosynthesis.",
+        "There are enzymes that affect photosynthesis.",
+        "There are two causes: taxation and inequality.",
+        "There are two enzymes catalyzing carbon fixation.",
+        "There are two types, C3 and C4.",
+        "There are two photosystems, I and II.",
+        "There are two reasons I recommend spaced repetition.",
+        "There are three ways you can factor quadratic equations.",
+        "There are two approaches we use in calculus.",
+    ],
+)
+def test_self_contained_existential_opening_is_not_a_fragment(opening):
+    assert not G._cue_opens_mid_thought(
+        opening,
+        ignore_caption_case=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        "There are two reasons for this.",
+        "There are several consequences of that decision.",
+        "There are two types of these cells.",
+        "There are two ways to get the same result.",
+        "There are two reasons they fail.",
+        "There are several ways he can solve the problem.",
+        "There are two consequences for her.",
+        "There are two ways to get there.",
+        "There are several reasons we are here.",
+        "There are two reasons yours differs.",
+        "There are two more.",
+        "There are two others.",
+        "There are two reasons.",
+        "There are many consequences.",
+        "There are two reasons for the result.",
+        "There are two types of cells mentioned before.",
+        "There are two reasons, however.",
+        "There are two types, actually.",
+        "There are two causes, both important.",
+        "There are two reasons I think so.",
+        "There are two reasons I believe that.",
+        "There are two reasons you can do so.",
+        "There are two enzymes that do that.",
+        "There are two enzymes that catalyze that reaction.",
+        "There are enzymes that affect that reaction in cells.",
+        "There are reasons why that reaction slows under heat.",
+        "There are reasons why that law matters in physics.",
+        "There are reasons why that force acts on the object.",
+        "There are reasons why that model works in biology.",
+    ],
+)
+def test_context_dependent_existential_opening_remains_a_fragment(opening):
+    assert G._cue_opens_mid_thought(opening, ignore_caption_case=True)
+
+
+def test_trailing_non_speech_marker_is_trimmed_after_teaching():
+    text = "A cell membrane controls what enters and exits. [Outro Music]"
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="A cell membrane controls",
+            end_quote="enters and exits Outro Music",
+            topic_evidence_quote="cell membrane controls what enters and exits",
+        )]),
+        [{"start": 0.0, "end": 10.0, "text": text}],
+        [],
+        {},
+        topic="cell membranes",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["_clip_text"].endswith("enters and exits")
+    assert "Outro Music" not in clip["_clip_text"]
+    assert clip["edge_projection"]["end"]["quote"] == (
+        "membrane controls what enters and exits"
+    )
+
+
+def test_brief_internal_non_speech_marker_remains_between_teaching():
+    text = (
+        "Gravity attracts masses [Applause] and the force weakens as distance "
+        "increases."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Gravity attracts masses",
+            end_quote="weakens as distance increases",
+            topic_evidence_quote="the force weakens as distance increases",
+        )]),
+        [{"start": 0.0, "end": 10.0, "text": text}],
+        [],
+        {},
+        topic="gravity",
+    )
+
+    assert len(report.clips) == 1
+    assert "[Applause]" in report.clips[0]["_clip_text"]
+
+
 def test_same_cue_leading_filler_emits_semantic_edge_projection():
     text = (
         "Welcome back. Photosynthesis converts light energy into chemical energy "
