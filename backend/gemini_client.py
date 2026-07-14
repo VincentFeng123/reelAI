@@ -211,7 +211,7 @@ def _cancel_requested(cancelled) -> bool:
 
 _GEMINI3_JSON_SCHEMA_KEYS = {
     "$id", "$defs", "$ref", "$anchor", "type", "format", "title",
-    "description", "enum", "items", "prefixItems", "minItems", "maxItems", "minimum",
+    "description", "enum", "items", "prefixItems", "minItems", "minimum",
     "maximum", "anyOf", "oneOf", "properties", "required", "propertyOrdering",
 }
 

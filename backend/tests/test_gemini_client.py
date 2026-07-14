@@ -127,7 +127,7 @@ def test_gemini3_uses_provider_compatible_json_schema_and_keeps_required_types(m
     schema = fake.models.calls[0]["config"].response_json_schema
     rendered = str(schema)
     assert "minLength" not in rendered
-    assert schema["properties"]["labels"]["maxItems"] == 2
+    assert "maxItems" not in rendered
     assert schema["required"] == ["name", "labels"]
     assert schema["properties"]["name"]["type"] == "string"
     assert schema["properties"]["labels"]["minItems"] == 1
