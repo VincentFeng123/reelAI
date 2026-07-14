@@ -1284,7 +1284,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v11",
+            selection_contract_version="quality_silence_v12",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -3148,7 +3148,7 @@ class IngestionPipeline:
             for index in range(len(videos))
             for reel in reels_by_video.get(index, [])
         ]
-        if not reels and provider_errors:
+        if not completed_results and provider_errors:
             raise provider_errors[0]
         return reels, resolved_video_ids
 
@@ -3393,7 +3393,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v11",
+                    selection_contract_version="quality_silence_v12",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

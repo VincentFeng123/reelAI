@@ -306,6 +306,93 @@ def test_generation_records_discovered_sources_before_video_timeout(monkeypatch)
     assert retrieved == {"dQw4w9WgXcQ"}
 
 
+def test_mixed_provider_failure_and_successful_empty_source_is_not_total_outage(
+    monkeypatch,
+) -> None:
+    videos = [
+        {**_video(), "id": video_id, "url": f"https://youtu.be/{video_id}"}
+        for video_id in ("dQw4w9WgXcQ", "abcdefghijk", "ABCDEFGHIJK")
+    ]
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: {**_discovery(), "videos": videos},
+    )
+    pipeline = _pipeline()
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        if video["id"] != "dQw4w9WgXcQ":
+            raise ProviderTransientError(
+                "Gemini is temporarily unavailable.",
+                provider="gemini",
+                operation="segmentation",
+                status_code=503,
+            )
+        return video, [], {"transcript": _transcript(), "clips": []}
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    context = GenerationContext("slow", require_acoustic_boundaries=False)
+
+    reels, video_ids = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        max_videos=3,
+    )
+
+    assert reels == []
+    assert video_ids == [video["id"] for video in videos]
+    assert context.counters()["provider_failures"] == 2
+
+
+def test_mixed_provider_failures_do_not_block_a_valid_completed_source(
+    monkeypatch,
+) -> None:
+    videos = [
+        {**_video(), "id": video_id, "url": f"https://youtu.be/{video_id}"}
+        for video_id in ("dQw4w9WgXcQ", "abcdefghijk", "ABCDEFGHIJK")
+    ]
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: {**_discovery(), "videos": videos},
+    )
+    pipeline = _pipeline()
+
+    def clip_and_filter(video, *_args, **_kwargs):
+        if video["id"] != "dQw4w9WgXcQ":
+            raise ProviderTransientError(
+                "Gemini is temporarily unavailable.",
+                provider="gemini",
+                operation="segmentation",
+                status_code=503,
+            )
+        return video, [_quality_clip()], {
+            "transcript": _transcript(),
+            "clips": [],
+        }
+
+    monkeypatch.setattr(pipeline, "_clip_and_filter", clip_and_filter)
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        mock.Mock(return_value=("valid-reel", mock.sentinel.metadata)),
+    )
+    context = GenerationContext("slow", require_acoustic_boundaries=False)
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=context,
+        max_videos=3,
+    )
+
+    assert reels == ["valid-reel"]
+    assert context.counters()["provider_failures"] == 2
+
+
 def test_ingest_topic_uses_literal_identity_for_segmentation(monkeypatch) -> None:
     captured_topics: list[str] = []
     discovery = {
@@ -2689,7 +2776,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v11"
+        assert context["selection_contract_version"] == "quality_silence_v12"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
@@ -3302,7 +3389,7 @@ def test_selector_transport_failure_preserves_transcript_and_provider_counters(
     telemetry = gemini_client_module.GeminiCallTelemetry(
         model="gemini-3.5-flash",
         operation="flash_boundary_selector",
-        prompt_version="quality_silence_v11",
+        prompt_version="quality_silence_v12",
         thinking_level="low",
         latency_ms=10.0,
         retries=1,

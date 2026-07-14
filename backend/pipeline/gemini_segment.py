@@ -1559,6 +1559,69 @@ def _quote_character_span(text: str, quote: str) -> tuple[int, int] | None:
     return spans[0] if spans else None
 
 
+def _cross_cue_quote_matches(
+    segments: list[dict],
+    quote: str,
+    start_line: int,
+    end_line: int,
+) -> list[tuple[int, int, str, str]]:
+    """Return unique literal edge projections for exact adjacent-cue quotes."""
+    quote_tokens = _toks(quote)
+    if not quote_tokens or start_line < 0 or end_line >= len(segments):
+        return []
+
+    flattened: list[tuple[str, int, int, int]] = []
+    texts: dict[int, str] = {}
+    for line in range(start_line, end_line + 1):
+        text = str(segments[line].get("text") or "")
+        texts[line] = text
+        for match in _WORD_RE.finditer(text):
+            [token] = _toks(match.group(0))
+            flattened.append((token, line, match.start(), match.end()))
+    if len(flattened) < len(quote_tokens):
+        return []
+
+    matches: list[tuple[int, int, str, str]] = []
+    for index in range(len(flattened) - len(quote_tokens) + 1):
+        window = flattened[index:index + len(quote_tokens)]
+        if [item[0] for item in window] != quote_tokens:
+            continue
+        first_line = window[0][1]
+        last_line = window[-1][1]
+        if first_line == last_line:
+            continue
+        crossed_lines = sorted({item[1] for item in window})
+        crosses_reset = False
+        for left, right in zip(crossed_lines, crossed_lines[1:]):
+            if right != left + 1:
+                crosses_reset = True
+                break
+            try:
+                gap = float(segments[right].get("start")) - float(
+                    segments[left].get("end")
+                )
+            except (TypeError, ValueError, OverflowError):
+                crosses_reset = True
+                break
+            if not math.isfinite(gap) or gap >= _SECTION_RESET_GAP_S:
+                crosses_reset = True
+                break
+        if crosses_reset:
+            continue
+
+        first_tokens = [item for item in window if item[1] == first_line]
+        last_tokens = [item for item in window if item[1] == last_line]
+        start_quote = texts[first_line][first_tokens[0][2]:first_tokens[-1][3]]
+        end_quote = texts[last_line][last_tokens[0][2]:last_tokens[-1][3]]
+        if (
+            len(_quote_character_spans(texts[first_line], start_quote)) != 1
+            or len(_quote_character_spans(texts[last_line], end_quote)) != 1
+        ):
+            continue
+        matches.append((first_line, last_line, start_quote, end_quote))
+    return matches
+
+
 def _literal_source_quote(
     text: str,
     quote: str,
@@ -2348,10 +2411,24 @@ def _plan_to_report(
                     str(segments[line].get("text") or ""), start_quote
                 )
             ]
-            if len(matching_lines) != 1:
+            cross_matches = (
+                _cross_cue_quote_matches(
+                    segments,
+                    start_quote,
+                    proposed_start,
+                    proposed_end,
+                )
+                if not matching_lines
+                else []
+            )
+            if len(matching_lines) == 1:
+                anchored_line = matching_lines[0]
+            elif len(cross_matches) == 1:
+                anchored_line = cross_matches[0][0]
+                start_quote = cross_matches[0][2]
+            else:
                 report.rejected_reasons.append(f"{prefix}:bad_start_quote")
                 continue
-            anchored_line = matching_lines[0]
             if any(
                 not _cue_is_only_structural_filler(
                     str(segments[line].get("text") or "")
@@ -2371,10 +2448,24 @@ def _plan_to_report(
                     str(segments[line].get("text") or ""), end_quote
                 )
             ]
-            if len(matching_lines) != 1:
+            cross_matches = (
+                _cross_cue_quote_matches(
+                    segments,
+                    end_quote,
+                    proposed_start,
+                    proposed_end,
+                )
+                if not matching_lines
+                else []
+            )
+            if len(matching_lines) == 1:
+                anchored_line = matching_lines[0]
+            elif len(cross_matches) == 1:
+                anchored_line = cross_matches[0][1]
+                end_quote = cross_matches[0][3]
+            else:
                 report.rejected_reasons.append(f"{prefix}:bad_end_quote")
                 continue
-            anchored_line = matching_lines[0]
             if any(
                 not _cue_is_only_structural_filler(
                     str(segments[line].get("text") or "")

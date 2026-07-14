@@ -839,11 +839,11 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v11"
+            reel.get("selection_contract_version") == "quality_silence_v12"
             for reel in feed
         ))
 
-    def test_quality_silence_v11_response_orders_stage_before_quality(self) -> None:
+    def test_quality_silence_v12_response_orders_stage_before_quality(self) -> None:
         generated = [
             {
                 "reel_id": "a-late",
@@ -855,7 +855,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "_selection_quality_mean": 0.94,
                 "_selection_topic_relevance": 0.96,
                 "_selection_source_rank": 0,
-                "selection_contract_version": "quality_silence_v11",
+                "selection_contract_version": "quality_silence_v12",
             },
             {
                 "reel_id": "b",
@@ -867,7 +867,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "_selection_quality_mean": 0.97,
                 "_selection_topic_relevance": 0.99,
                 "_selection_source_rank": 1,
-                "selection_contract_version": "quality_silence_v11",
+                "selection_contract_version": "quality_silence_v12",
             },
             {
                 "reel_id": "a-early",
@@ -879,7 +879,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "_selection_quality_mean": 0.92,
                 "_selection_topic_relevance": 0.93,
                 "_selection_source_rank": 0,
-                "selection_contract_version": "quality_silence_v11",
+                "selection_contract_version": "quality_silence_v12",
             },
         ]
 
@@ -897,6 +897,29 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             not any(key.startswith("_selection_") for key in reel)
             for reel in result
         ))
+
+    def test_quality_silence_v11_history_remains_compatible(self) -> None:
+        legacy = {
+            "reel_id": "legacy-v11",
+            "video_id": "source-a",
+            "t_start": 10.25,
+            "difficulty": 0.3,
+            "score": 0.91,
+            "_selection_quality_floor": 0.91,
+            "_selection_quality_mean": 0.92,
+            "_selection_topic_relevance": 0.93,
+            "_selection_source_rank": 0,
+            "selection_contract_version": "quality_silence_v11",
+        }
+
+        result = main_module.reel_service._finalize_generated_reels(
+            generated=[legacy],
+            num_reels=1,
+            preferred_video_duration="any",
+        )
+
+        self.assertEqual(result[0]["selection_contract_version"], "quality_silence_v11")
+        self.assertFalse(any(key.startswith("_selection_") for key in result[0]))
 
     def test_safe_batch_caps_progressive_ingest_to_requested_buffer(self) -> None:
         with mock.patch.object(
@@ -1247,7 +1270,7 @@ class LevelAwareFeedTests(ClipEngineGenerateReelsTests):
         self.assertEqual(feed[0]["reel_id"], "r-hard")   # the back-of-feed clip re-entered
 
     def test_cache_version_includes_recall_and_stored_details(self) -> None:
-        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 21)
+        self.assertEqual(main_module.reel_service.RANKED_FEED_CACHE_VERSION, 22)
 
 
 if __name__ == "__main__":

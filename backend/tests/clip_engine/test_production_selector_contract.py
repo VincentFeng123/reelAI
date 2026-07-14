@@ -145,6 +145,187 @@ def test_exact_boundary_quote_uniquely_inside_proposed_range_is_reanchored() -> 
     assert clip["_quote_repaired"] is True
 
 
+def test_exact_start_quote_split_across_adjacent_cues_is_projected() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Cells use chlorophyll to",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 12.0,
+            "text": (
+                "capture light energy and power the chemical reactions of photosynthesis."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=1).model_copy(update={
+        "start_quote": "Cells use chlorophyll to capture light energy",
+        "end_quote": "chemical reactions of photosynthesis",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["start_quote"] == "Cells use chlorophyll to"
+    assert clip["_quote_repaired"] is True
+
+
+def test_exact_end_quote_split_across_adjacent_cues_is_projected() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Cells use chlorophyll to capture light energy and power",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 5.0,
+            "end": 12.0,
+            "text": "the chemical reactions of photosynthesis.",
+        },
+    ]
+    proposal = _proposal(end_line=1).model_copy(update={
+        "start_quote": "Cells use chlorophyll to capture light energy",
+        "end_quote": "power the chemical reactions of photosynthesis",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["end_quote"] == "the chemical reactions of photosynthesis"
+    assert clip["_quote_repaired"] is True
+
+
+def test_repeated_cross_cue_boundary_quote_is_rejected_as_ambiguous() -> None:
+    segments = [
+        {"cue_id": "cue-0", "start": 0.0, "end": 2.0, "text": "Cells use"},
+        {
+            "cue_id": "cue-1",
+            "start": 2.0,
+            "end": 5.0,
+            "text": "chlorophyll to capture light energy.",
+        },
+        {"cue_id": "cue-2", "start": 5.0, "end": 7.0, "text": "Cells use"},
+        {
+            "cue_id": "cue-3",
+            "start": 7.0,
+            "end": 12.0,
+            "text": (
+                "chlorophyll to capture light energy and power the chemical reactions "
+                "of photosynthesis."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=3).model_copy(update={
+        "start_quote": "Cells use chlorophyll to capture light energy",
+        "end_quote": "chemical reactions of photosynthesis",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+
+
+def test_cross_cue_boundary_quote_cannot_cross_section_reset() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 2.0,
+            "text": "Cells use chlorophyll to",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 10.0,
+            "end": 15.0,
+            "text": (
+                "capture light energy and power the chemical reactions of photosynthesis."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=1).model_copy(update={
+        "start_quote": "Cells use chlorophyll to capture light energy",
+        "end_quote": "chemical reactions of photosynthesis",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+
+
+def test_cross_cue_reanchoring_never_discards_substantive_context() -> None:
+    segments = [
+        {
+            "cue_id": "cue-0",
+            "start": 0.0,
+            "end": 4.0,
+            "text": "Water reaches the leaf through the xylem before light capture.",
+        },
+        {
+            "cue_id": "cue-1",
+            "start": 4.0,
+            "end": 7.0,
+            "text": "Cells use chlorophyll to",
+        },
+        {
+            "cue_id": "cue-2",
+            "start": 7.0,
+            "end": 14.0,
+            "text": (
+                "capture light energy and power the chemical reactions of photosynthesis."
+            ),
+        },
+    ]
+    proposal = _proposal(end_line=2).model_copy(update={
+        "start_quote": "Cells use chlorophyll to capture light energy",
+        "end_quote": "chemical reactions of photosynthesis",
+    })
+
+    report = gemini_segment._plan_to_report(
+        gemini_segment._BoundaryPlan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+
+
 def test_boundary_quote_reanchoring_never_discards_substantive_context() -> None:
     segments = [
         {

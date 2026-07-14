@@ -1,16 +1,16 @@
 # Graph Report - .  (2026-07-14)
 
 ## Corpus Check
-- 388 files · ~1,060,507 words
+- 388 files · ~1,061,327 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 6598 nodes · 17853 edges · 204 communities detected
-- Extraction: 65% EXTRACTED · 35% INFERRED · 0% AMBIGUOUS · INFERRED: 6161 edges (avg confidence: 0.5)
+- 6608 nodes · 17879 edges · 202 communities detected
+- Extraction: 66% EXTRACTED · 34% INFERRED · 0% AMBIGUOUS · INFERRED: 6162 edges (avg confidence: 0.5)
 - Token cost: 0 input · 0 output
 
 ## God Nodes (most connected - your core abstractions)
-1. `Sentence` - 205 edges
+1. `Sentence` - 206 edges
 2. `ReelService` - 198 edges
 3. `Unit` - 180 edges
 4. `GenerationContext` - 157 edges
@@ -37,23 +37,23 @@
 
 ### Community 0 - "Community 0"
 Cohesion: 0.01
-Nodes (492): _arc_verify_enabled(), ArcCandidate, ArcCheckLLM, ArcVerifyLLM, _concepts(), detect_arcs(), _pair_practice_prompts(), Deterministic instructional-arc detection (Wave 2 P3a).  Scans the time-ordered (+484 more)
+Nodes (417): _arc_verify_enabled(), ArcCandidate, ArcCheckLLM, ArcVerifyLLM, _concepts(), detect_arcs(), _pair_practice_prompts(), Deterministic instructional-arc detection (Wave 2 P3a).  Scans the time-ordered (+409 more)
 
 ### Community 1 - "Community 1"
 Cohesion: 0.06
-Nodes (311): AssessmentCancelledError, AssessmentService, _BackfillPlan, Adaptive recall-check persistence, readiness, and session lifecycle., Promote one named level after sustained, broad mastery evidence.          Manual, Validate and persist one private answer-bearing question for a reel., Choose a stable 2-5 reel cadence, then adapt it to current evidence., Record one distinct forward navigation without changing watch analytics. (+303 more)
+Nodes (312): AssessmentCancelledError, AssessmentService, _BackfillPlan, Adaptive recall-check persistence, readiness, and session lifecycle., Promote one named level after sustained, broad mastery evidence.          Manual, Validate and persist one private answer-bearing question for a reel., Choose a stable 2-5 reel cadence, then adapt it to current evidence., Record one distinct forward navigation without changing watch analytics. (+304 more)
 
 ### Community 2 - "Community 2"
 Cohesion: 0.01
-Nodes (218): _await_with_probe(), is_cancelled(), raise_if_cancelled(), Small async-to-sync bridge for actively cancellable provider requests.  The publ, Run an async request from synchronous pipeline code.      Normal generation work, run_cancellable(), sleep_with_probe(), wait_with_probe() (+210 more)
+Nodes (224): _await_with_probe(), is_cancelled(), raise_if_cancelled(), Small async-to-sync bridge for actively cancellable provider requests.  The publ, Run an async request from synchronous pipeline code.      Normal generation work, run_cancellable(), sleep_with_probe(), wait_with_probe() (+216 more)
 
 ### Community 3 - "Community 3"
-Cohesion: 0.02
-Nodes (60): BaseSettings, get_settings(), Settings, Exception, APIStatusError, BadRequestError, chat(), get_client() (+52 more)
-
-### Community 4 - "Community 4"
 Cohesion: 0.03
 Nodes (218): _activate_generation(), _adaptive_min_relevance_floor(), answer_assessment(), _auto_verify_community_account_if_allowed(), _bare_video_id(), _build_allowed_origins(), _build_generation_head_id(), can_generate_reels() (+210 more)
+
+### Community 4 - "Community 4"
+Cohesion: 0.02
+Nodes (45): BaseSettings, get_settings(), Settings, _ChainBufferingEmitter, _difficulty(), _get_punct_pipeline(), _has_selection_contract(), _importance_ranker_enabled() (+37 more)
 
 ### Community 5 - "Community 5"
 Cohesion: 0.02
@@ -61,47 +61,47 @@ Nodes (160): _artifact_path(), _chunk_path(), load_artifact(), load_chunk(), On-
 
 ### Community 6 - "Community 6"
 Cohesion: 0.02
-Nodes (149): _energy_min_snap(), _ensure_audio(), _gap_after(), _gap_before(), _pick_end(), _pick_start(), Precise boundary refinement with targeted Whisper.  Supadata gives fast but coar, Absolute time of the lowest-RMS ``frame_ms`` frame within ``[a, b]`` — the quiet (+141 more)
+Nodes (185): _jsonable(), Run-artifact persistence (W25-G): every assembled run leaves an auditable trail., Best-effort JSON projection: dataclass → asdict, pydantic → model_dump,     dict, Persist one assembled run's plan/arcs/shipped/ledger under     ``<work_dir>/<vid, write_run_artifacts(), _apply_metadata_signal(), detect_content_type(), _metadata_entertainment_hit() (+177 more)
 
 ### Community 7 - "Community 7"
-Cohesion: 0.03
-Nodes (56): _build_educational_transcript(), End-to-end search simulation — exercise the full pipeline with mocked YouTube /L, Realistic educational transcript — calculus lecture with 3 topic clusters., SearchSimulationTests, _normalise_cue(), Shared transcript quality validation.  This module is intentionally dependency-f, Check whether a transcript adequately covers a video.      Parameters     ------, Result of :func:`validate_transcript`. (+48 more)
+Cohesion: 0.02
+Nodes (147): _energy_min_snap(), _ensure_audio(), _gap_after(), _gap_before(), _pick_end(), _pick_start(), Precise boundary refinement with targeted Whisper.  Supadata gives fast but coar, Absolute time of the lowest-RMS ``frame_ms`` frame within ``[a, b]`` — the quiet (+139 more)
 
 ### Community 8 - "Community 8"
 Cohesion: 0.03
-Nodes (159): _apply_enrichment(), _Assessment, _AssessmentDraft, _authoritative_pro(), _boundary_prompts(), _boundary_repair_prompts(), _BoundaryPlan, _BoundaryRepairCandidate (+151 more)
+Nodes (56): _build_educational_transcript(), End-to-end search simulation — exercise the full pipeline with mocked YouTube /L, Realistic educational transcript — calculus lecture with 3 topic clusters., SearchSimulationTests, _normalise_cue(), Shared transcript quality validation.  This module is intentionally dependency-f, Check whether a transcript adequately covers a video.      Parameters     ------, Result of :func:`validate_transcript`. (+48 more)
 
 ### Community 9 - "Community 9"
-Cohesion: 0.02
-Nodes (16): MediumRegressionTests, Bug 1B: final_unique_reels should increment, not stay at max(current, 1)., Bug 1C: _bootstrap_pool_is_weak should not check has_transcript (never set on ca, Bug 1E: Empty search results should only be cached for 15 minutes, not 2 hours., Quality 5A: Known educational channels should get 'known_educational' tier., Niche 4A: Datamuse should be called for opaque topics, with results filtered., Niche 4C: New static topics should be in STATIC_TOPIC_SUBTOPICS., _validated_query_plan() (+8 more)
+Cohesion: 0.03
+Nodes (161): _apply_enrichment(), _Assessment, _AssessmentDraft, _authoritative_pro(), _boundary_prompts(), _boundary_repair_prompts(), _BoundaryPlan, _BoundaryRepairCandidate (+153 more)
 
 ### Community 10 - "Community 10"
 Cohesion: 0.02
-Nodes (115): extract_concepts(), _extract_concepts_via_llm(), Extract higher-quality concepts via Gemini (falling back to Groq)., _summary_for_terms(), _adapt_query_for_postgres(), _connect_postgres_with_retry(), _database_url(), _db_path() (+107 more)
+Nodes (16): MediumRegressionTests, Bug 1B: final_unique_reels should increment, not stay at max(current, 1)., Bug 1C: _bootstrap_pool_is_weak should not check has_transcript (never set on ca, Bug 1E: Empty search results should only be cached for 15 minutes, not 2 hours., Quality 5A: Known educational channels should get 'known_educational' tier., Niche 4A: Datamuse should be called for opaque topics, with results filtered., Niche 4C: New static topics should be in STATIC_TOPIC_SUBTOPICS., _validated_query_plan() (+8 more)
 
 ### Community 11 - "Community 11"
+Cohesion: 0.02
+Nodes (115): extract_concepts(), _extract_concepts_via_llm(), Extract higher-quality concepts via Gemini (falling back to Groq)., _summary_for_terms(), _adapt_query_for_postgres(), _connect_postgres_with_retry(), _database_url(), _db_path() (+107 more)
+
+### Community 12 - "Community 12"
+Cohesion: 0.03
+Nodes (72): BaseAdapter, CompletenessContract, ContractElement, Adapter framework core (spec §4, §11).  An *adapter* parameterizes the structure, RoleSpec, _rs(), BaseAdapter, CodingAdapter (+64 more)
+
+### Community 13 - "Community 13"
 Cohesion: 0.03
 Nodes (80): _assessment(), Strict shipping contract for the guarded Gemini educational selector., _run(), _segs(), _selection_task_tail(), test_adjacent_facets_inside_one_coarse_cue_remain_distinct(), test_ambiguous_projected_edge_quote_is_rejected(), test_apostrophe_typography_is_grounded_and_source_spelling_is_preserved() (+72 more)
 
-### Community 12 - "Community 12"
-Cohesion: 0.02
-Nodes (125): _jsonable(), Run-artifact persistence (W25-G): every assembled run leaves an auditable trail., Best-effort JSON projection: dataclass → asdict, pydantic → model_dump,     dict, Persist one assembled run's plan/arcs/shipped/ledger under     ``<work_dir>/<vid, write_run_artifacts(), best_match(), find_human_clip(), gold_chapters() (+117 more)
-
-### Community 13 - "Community 13"
-Cohesion: 0.04
-Nodes (69): CompletenessContract, ContractElement, Adapter framework core (spec §4, §11).  An *adapter* parameterizes the structure, RoleSpec, _rs(), BaseAdapter, CodingAdapter, Coding / programming / software adapter (Phase 4). (+61 more)
-
 ### Community 14 - "Community 14"
-Cohesion: 0.05
-Nodes (96): FakeAdapter, _cand(), _overlapping_structure(), _setup(), _spec(), _structure(), test_absorbs_spanned_units_time_ordered(), test_assemble_returns_rejections_and_rejudges_merges() (+88 more)
+Cohesion: 0.04
+Nodes (72): _anchor(), _run_gate(), _sent(), test_card5_no_introducer_no_rescue_kill_stands(), test_card5_no_suppress_when_subject_absent(), test_card5_seeds_from_introducer_when_not_in_referential(), test_card5_suppress_when_first_sentence_names_anchor_concept(), test_card5_suppress_when_first_sentence_names_topic() (+64 more)
 
 ### Community 15 - "Community 15"
-Cohesion: 0.04
-Nodes (79): _anchor(), _run_gate(), _sent(), test_card5_no_introducer_no_rescue_kill_stands(), test_card5_no_suppress_when_subject_absent(), test_card5_seeds_from_introducer_when_not_in_referential(), test_card5_suppress_when_first_sentence_names_anchor_concept(), test_card5_suppress_when_first_sentence_names_topic() (+71 more)
+Cohesion: 0.05
+Nodes (97): FakeAdapter, _cand(), _clean_verdict(), _coverage_units(), _linked(), _mock_judge(), _sev_settings(), _sev_specs() (+89 more)
 
 ### Community 16 - "Community 16"
 Cohesion: 0.03
-Nodes (84): crop_clip(), crop_clip_local(), crop_highlights(), crop_highlights_local(), _cut_subclip(), _ratio(), Local clipping: ffmpeg subclip + OpenCV face-aware vertical crop.  Two stages pe, Submit one autocrop job and return the URL of the rendered short. (+76 more)
+Nodes (78): crop_clip(), crop_clip_local(), crop_highlights(), crop_highlights_local(), _cut_subclip(), _ratio(), Local clipping: ffmpeg subclip + OpenCV face-aware vertical crop.  Two stages pe, Submit one autocrop job and return the URL of the rendered short. (+70 more)
 
 ### Community 17 - "Community 17"
 Cohesion: 0.07
@@ -113,7 +113,7 @@ Nodes (77): assign_segments(), boundary_error(), chapter_coverage(), clip_stradd
 
 ### Community 19 - "Community 19"
 Cohesion: 0.04
-Nodes (44): block_emb(), make_sents(), n sentences, `sec` seconds each; a `gap`-second pause BEFORE each index in gap_a, Unit vectors; block j points along axis j%dim → maximal between-block scatter at, _stub_stages(), test_none_content_map_builds_internally(), test_precompute_vs_internal_structures_identical(), test_precomputed_content_map_skips_internal_build() (+36 more)
+Nodes (69): fetch_chapters(), main(), make_skeleton(), merge_chapters_into_golden(), Dump a golden *skeleton* from the predicted structure, for a human to correct (s, MERGE {"chapters", "chapters_provenance": "creator"} into <golden_dir>/<video_id, Import creator chapters for each id; report + write nothing when a video has non, Creator chapters via the yt_dlp Python API — metadata only     (``extract_info(d (+61 more)
 
 ### Community 20 - "Community 20"
 Cohesion: 0.05
@@ -121,115 +121,115 @@ Nodes (71): aggregate_usage(), calls_cost_usd(), _exception_row(), _first(), _hy
 
 ### Community 21 - "Community 21"
 Cohesion: 0.04
-Nodes (31): _prepared(), A source/caption edge is not proof of an in-cue semantic handoff., test_background_noise_above_required_threshold_is_unavailable(), test_backward_search_stitches_short_quiet_fragments_across_window_seam(), test_caption_handoff_does_not_scan_an_entire_inter_caption_gap(), test_caption_handoff_never_moves_cuts_inside_required_speech(), test_caption_handoff_never_skips_sound_before_a_late_start_quiet_run(), test_caption_handoff_observation_accepts_only_the_straddling_quiet_run() (+23 more)
+Nodes (40): block_emb(), make_sents(), n sentences, `sec` seconds each; a `gap`-second pause BEFORE each index in gap_a, Unit vectors; block j points along axis j%dim → maximal between-block scatter at, _mk_settings(), test_embed_failure_falls_back_to_llm_engine(), test_empty_sentences_video_only(), test_label_failure_keeps_partition() (+32 more)
 
 ### Community 22 - "Community 22"
 Cohesion: 0.09
-Nodes (50): _discovery(), _one_cue_selector_result(), _pipeline(), _pipeline_with_semantic(), _plan(), _quality_clip(), test_acoustic_boundary_plan_fails_closed_for_missing_cue_ids(), test_acoustic_failure_is_diagnostic_only_and_never_persisted_or_emitted() (+42 more)
+Nodes (52): _discovery(), _one_cue_selector_result(), _pipeline(), _pipeline_with_semantic(), _plan(), _quality_clip(), test_acoustic_boundary_plan_fails_closed_for_missing_cue_ids(), test_acoustic_failure_is_diagnostic_only_and_never_persisted_or_emitted() (+44 more)
 
 ### Community 23 - "Community 23"
+Cohesion: 0.04
+Nodes (31): _prepared(), A source/caption edge is not proof of an in-cue semantic handoff., test_background_noise_above_required_threshold_is_unavailable(), test_backward_search_stitches_short_quiet_fragments_across_window_seam(), test_caption_handoff_does_not_scan_an_entire_inter_caption_gap(), test_caption_handoff_never_moves_cuts_inside_required_speech(), test_caption_handoff_never_skips_sound_before_a_late_start_quiet_run(), test_caption_handoff_observation_accepts_only_the_straddling_quiet_run() (+23 more)
+
+### Community 24 - "Community 24"
 Cohesion: 0.08
 Nodes (56): _build_cache_key(), _build_cerebras_client(), _build_gemini_module(), _build_groq_client(), _build_ollama_client(), _cerebras_chat(), chat_completion(), _collect_gemini_api_keys() (+48 more)
 
-### Community 24 - "Community 24"
+### Community 25 - "Community 25"
 Cohesion: 0.07
 Nodes (43): _clip(), _private_clip(), _report(), _result(), _segments(), test_all_authoritative_pro_calls_use_selected_baseline(), test_boundary_profile_rejects_bad_model_quote_from_cited_cue(), test_cancelled_worker_never_publishes_late_boundary_or_done_progress() (+35 more)
 
-### Community 25 - "Community 25"
+### Community 26 - "Community 26"
 Cohesion: 0.1
 Nodes (42): _conn(), _insert_generation_reel(), _patch_request_context(), _set_reel_boundary_state(), _terminal_job_for_generation(), test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(), test_completed_job_status_and_replay_drop_currently_invalid_candidate(), test_cross_level_reservoir_rejects_unverified_or_implicit_surface_rows() (+34 more)
 
-### Community 26 - "Community 26"
+### Community 27 - "Community 27"
 Cohesion: 0.08
 Nodes (38): _audio_bitrate(), _audio_entry(), AudioPreparationResult, _canonical_watch_url(), _decode_window(), _EdgeSearchResult, _end_search_windows(), _ffmpeg_headers() (+30 more)
 
-### Community 27 - "Community 27"
+### Community 28 - "Community 28"
 Cohesion: 0.06
 Nodes (26): buildCommunitySetInformationParagraphs(), createDraftReelRow(), detectYouTubeDurationWithIframeApi(), draftRowsFromReels(), extractYouTubeVideoId(), formatCommunityPlatformSummary(), formatCompact(), formatLastEditedLabel() (+18 more)
 
-### Community 28 - "Community 28"
+### Community 29 - "Community 29"
 Cohesion: 0.08
 Nodes (15): _blend_engine_out(), _build_engine_out(), _clip_side_effect(), _difficulty_engine_out(), DifficultyPersistenceTests, EmbedUrlCeilTests, _fractional_engine_out(), IngestTopicProgressTests (+7 more)
 
-### Community 29 - "Community 29"
+### Community 30 - "Community 30"
 Cohesion: 0.09
 Nodes (43): _by_id(), test_arc_ids_sequential(), test_bus_problem_slice_from_audit_yields_two_arcs(), test_closer_before_steps_does_not_close_the_arc(), test_closer_between_steps_does_not_truncate_the_arc(), test_closer_exactly_at_the_gap_bound_is_accepted(), test_closer_terminal_accepted_only_after_steps(), test_closer_without_steps_is_not_a_terminal() (+35 more)
 
-### Community 30 - "Community 30"
+### Community 31 - "Community 31"
 Cohesion: 0.06
 Nodes (9): test_boundary_plan_rejects_a_quote_removed_with_a_forward_setup(), test_candidates_are_validated_independently_without_model_repair(), test_clean_fast_path_never_dispatches_boundary_repair(), test_dirty_edges_use_only_the_one_low_thinking_selector_call(), test_no_boundary_repair_is_attempted_after_selector_validation(), test_plan_rejects_live_biology_cue_despite_later_framing_sentence(), test_plan_rejects_long_unpunctuated_biology_cue_with_late_framing(), _topic() (+1 more)
 
-### Community 31 - "Community 31"
+### Community 32 - "Community 32"
 Cohesion: 0.08
 Nodes (14): ClipEngineGenerateReelsTests, _discover_result(), _five_minute_engine_out(), LevelAwareFeedTests, _multi_clip_engine_out(), _quality_v2_engine_out(), Tests for the clip-engine-routed ReelService.generate_reels (Task T4).  The lega, Serve-time level scoring: matched clips first, off-level kept at the     back, a (+6 more)
 
-### Community 32 - "Community 32"
+### Community 33 - "Community 33"
+Cohesion: 0.12
+Nodes (39): _collapse_fixture(), _det(), _passing_judge(), W25-F replace bar: a ship-flagged newcomer (hard core failed, phantom evidence), _rel(), _same_model(), _structure(), _superset_fixture() (+31 more)
+
+### Community 34 - "Community 34"
 Cohesion: 0.14
 Nodes (30): _assessment(), _convert(), _plan(), _segs(), test_bad_line_indices_are_rejected_instead_of_clamped(), test_boundary_repair_without_explicit_clip_limit_does_not_compare_none(), test_chemistry_fast_path_closes_two_cues_of_missing_setup(), test_clip_limit_uses_overall_quality_before_stable_chronology() (+22 more)
 
-### Community 33 - "Community 33"
+### Community 35 - "Community 35"
 Cohesion: 0.1
 Nodes (29): _acoustic_boundary_plan(), _acoustic_range_is_safe(), _cli_main(), _direct_adapter_duration_sec(), _discover(), _grounded_topic_evidence_quote(), _is_valid_timestamped_supadata_transcript(), _literal_source_quote() (+21 more)
 
-### Community 34 - "Community 34"
+### Community 36 - "Community 36"
 Cohesion: 0.12
 Nodes (25): _mk_row(), _sent(), _sents(), _spec(), _structure(), test_antecedent_removal_removes_source_unit_sentences(), test_antecedent_removal_skips_when_no_references(), test_antecedent_removal_skips_when_removal_would_empty_clip() (+17 more)
 
-### Community 35 - "Community 35"
+### Community 37 - "Community 37"
 Cohesion: 0.12
 Nodes (32): _dd(), _hard_core_partial(), _mk_cand(), _node_units(), _over_inclusion(), _pass(), _script(), _snap() (+24 more)
 
-### Community 36 - "Community 36"
+### Community 38 - "Community 38"
 Cohesion: 0.06
 Nodes (3): _FakeGeminiClient, test_failed_expansion_dispatch_is_recorded_once(), test_successful_expansion_dispatch_is_not_double_recorded()
 
-### Community 37 - "Community 37"
+### Community 39 - "Community 39"
 Cohesion: 0.05
 Nodes (1): Discourse-onset primitive — text-only, offline. Decides whether a sentence used
 
-### Community 38 - "Community 38"
+### Community 40 - "Community 40"
 Cohesion: 0.14
 Nodes (31): _complete(), Focused adaptive recall-check service tests (SQLite, no network)., _seed_completed_accuracy(), _seed_promotion_outcome(), _seed_reel(), test_answer_reveals_key_then_applies_concept_outcomes_once(), test_attempt_insert_race_reloads_the_winning_choice(), test_auto_promotion_does_not_require_three_separate_sessions() (+23 more)
 
-### Community 39 - "Community 39"
-Cohesion: 0.16
-Nodes (33): _cand(), _clean_verdict(), _coverage_units(), _linked(), _mock_judge(), _sev_settings(), _sev_specs(), _sev_units() (+25 more)
+### Community 41 - "Community 41"
+Cohesion: 0.11
+Nodes (33): _proposal(), test_articleless_look_at_visual_noun_remains_visual_dependent(), test_bare_look_at_this_remains_visual_dependent(), test_boundary_quote_reanchoring_never_discards_substantive_context(), test_boundary_quote_reanchoring_remains_exact_unique_and_in_range(), test_carolingian_visual_dependent_span_is_rejected(), test_chain_rule_query_keeps_related_prerequisite_and_worked_paraphrase(), test_comparison_query_keeps_each_substantive_side_as_its_own_facet() (+25 more)
 
-### Community 40 - "Community 40"
+### Community 42 - "Community 42"
 Cohesion: 0.06
 Nodes (4): _make_clip(), Pure unit tests for backend.app.clip_engine.bridge — no DB, no network., test_pick_best_clip_fallback_when_none_in_bounds(), test_pick_best_clip_prefers_in_bounds()
 
-### Community 41 - "Community 41"
+### Community 43 - "Community 43"
 Cohesion: 0.19
 Nodes (31): _by_id(), _cmap(), _rel(), _same_model(), _structure(), test_arc_verify_outage_note_travels_with_successful_plan(), test_assemble_plan_failure_degrades_to_priority_and_notes_it(), test_assemble_plan_path_ships_the_calculation_final_arc() (+23 more)
 
-### Community 42 - "Community 42"
+### Community 44 - "Community 44"
 Cohesion: 0.13
 Nodes (29): _acquire_generation_submit_lock(), append_event(), _atomic_write(), build_request_key(), expire_stale_queued_job(), _fail_unclaimable_job(), find_active_job(), get_job() (+21 more)
-
-### Community 43 - "Community 43"
-Cohesion: 0.09
-Nodes (28): embed_url(), Canonical YouTube embed-URL helper — the single source of truth shared by the se, YouTube embed URL that plays only [start, end] (whole seconds: floor start / cei, apply_stratum_limit(), build_entries(), build_manifest(), collect_video(), _entry() (+20 more)
-
-### Community 44 - "Community 44"
-Cohesion: 0.11
-Nodes (18): _atomic_write(), _available_questions(), _cadence_session_id(), _cadence_target(), _check_cancelled(), _completed_rows(), _ensure_learner_progress(), _information_units() (+10 more)
 
 ### Community 45 - "Community 45"
 Cohesion: 0.11
 Nodes (30): _cache_age_seconds(), deterministic_expand(), expand_query(), expand_query_practice_fast(), _expansion_cache_key(), free_expand(), _key(), literal_fallback() (+22 more)
 
 ### Community 46 - "Community 46"
+Cohesion: 0.11
+Nodes (18): _atomic_write(), _available_questions(), _cadence_session_id(), _cadence_target(), _check_cancelled(), _completed_rows(), _ensure_learner_progress(), _information_units() (+10 more)
+
+### Community 47 - "Community 47"
 Cohesion: 0.09
 Nodes (7): CommunityAuthSecurityTests, CommunityChangeEmailTests, CommunityDeleteAccountTests, HostedVerificationDeliveryTests, Insert an unverified account + session directly into the DB., VerificationDisabledModeTests, _VerificationTestBase
 
-### Community 47 - "Community 47"
+### Community 48 - "Community 48"
 Cohesion: 0.06
 Nodes (5): AnchorExtraction, BroadQueries, MediumAndNone, NarrowQueries, Golden table tests for ``backend/app/services/query_intent.py``.  The classifier
-
-### Community 48 - "Community 48"
-Cohesion: 0.12
-Nodes (28): _proposal(), test_articleless_look_at_visual_noun_remains_visual_dependent(), test_bare_look_at_this_remains_visual_dependent(), test_boundary_quote_reanchoring_never_discards_substantive_context(), test_boundary_quote_reanchoring_remains_exact_unique_and_in_range(), test_carolingian_visual_dependent_span_is_rejected(), test_chain_rule_query_keeps_related_prerequisite_and_worked_paraphrase(), test_comparison_query_keeps_each_substantive_side_as_its_own_facet() (+20 more)
 
 ### Community 49 - "Community 49"
 Cohesion: 0.12
@@ -492,156 +492,156 @@ Cohesion: 0.39
 Nodes (8): _pick(), _sent(), test_fit_budget_no_terminator_in_budgeted_span(), test_fit_budget_terminator_only_at_window_start(), test_window_clamps_out_of_range(), test_window_moves_start_off_dangling_opener(), test_window_snaps_end_to_terminator(), test_window_truncates_to_budget()
 
 ### Community 114 - "Community 114"
-Cohesion: 0.22
-Nodes (2): test_real_treeseg_inclusive_content_map_reaches_topic_assembly(), test_serial_extract_best_window_failure_isolated()
-
-### Community 115 - "Community 115"
 Cohesion: 0.36
 Nodes (6): _structure(), test_select_keeps_teaching_drops_filler(), test_select_never_zero_on_llm_failure(), test_select_respects_max_clips(), test_target_topic_does_not_fallback_to_off_topic_clips(), test_target_topic_filters_selection_and_reaches_prompt()
 
-### Community 116 - "Community 116"
+### Community 115 - "Community 115"
 Cohesion: 0.56
 Nodes (8): _closure(), _qp_c0t1(), test_after_run_breaks_at_topic_node_boundary(), test_after_run_is_bounded_by_max_extra_units(), test_after_run_spans_the_full_definition_block(), test_before_run_inlines_the_whole_problem_statement(), test_before_run_respects_span_budget_and_flags_truncation(), _u()
 
-### Community 117 - "Community 117"
-Cohesion: 0.36
-Nodes (7): _dump(), _make_fake_extract(), _make_fake_llm(), _run_describe(), _run_extract(), test_scene_dedup_identical_under_reversed_extraction_completion(), test_vision_events_identical_under_reversed_batch_completion()
-
-### Community 118 - "Community 118"
+### Community 116 - "Community 116"
 Cohesion: 0.36
 Nodes (7): Precise-boundary resilience + direction-safe Whisper picks. Offline (no audio, n, _sent(), test_pick_end_never_moves_earlier_than_window_floor(), test_pick_end_normal_path_unchanged(), test_pick_start_keep_first_at_video_start(), test_pick_start_never_moves_later_than_window_ceiling(), test_pick_start_normal_path_unchanged()
 
-### Community 119 - "Community 119"
+### Community 117 - "Community 117"
 Cohesion: 0.22
 Nodes (2): RankedExclusionNormalizationTests, Regression test for Finding #1: client pagination exclusion across the video_id
 
-### Community 120 - "Community 120"
+### Community 118 - "Community 118"
 Cohesion: 0.39
 Nodes (6): comprehension() excludes error verdicts; judge_error_rate accounting. Offline., _Sent, _specs(), test_comprehension_all_errors(), test_comprehension_excludes_error_verdicts(), test_judge_failures_carries_error_flag()
 
-### Community 121 - "Community 121"
+### Community 119 - "Community 119"
 Cohesion: 0.46
 Nodes (6): Energy-minimum snap (Task 3). Synthesizes a tone+silence wav — no whisper, no ff, test_absolute_offset_respected(), test_snaps_to_silent_frame(), test_subframe_interval_returns_none(), _tone_then_silence(), _write_wav()
 
-### Community 122 - "Community 122"
+### Community 120 - "Community 120"
 Cohesion: 0.36
 Nodes (6): _FakeModel, _install_fake(), Refine-model Whisper singleton (Task 2). WhisperModel is stubbed — no real model, test_refine_reuses_full_singleton_when_models_match(), test_refine_singleton_builds_refine_model(), test_refine_singleton_uses_refine_workers()
 
-### Community 123 - "Community 123"
+### Community 121 - "Community 121"
 Cohesion: 0.43
 Nodes (7): Onset START guard — the symmetric twin of the weak-END guard. Offline (no audio/, _sent(), test_backward_extension_bounded_by_node_span(), test_good_onset_start_unchanged(), test_is_weak_start_matches_primitive(), test_only_weak_start_still_places_flagged(), test_weak_start_extends_back_to_onset()
 
-### Community 124 - "Community 124"
+### Community 122 - "Community 122"
 Cohesion: 0.32
 Nodes (7): difficulty_matches_knowledge_level(), effective_level_target(), normalize_knowledge_level(), Knowledge-level semantics: level names, difficulty-scale mapping, and the effect, Lowercased/stripped level name; absent -> 'beginner'; unknown -> ValueError., The difficulty the feed should aim at RIGHT NOW for this material., Match selector difficulty bins without overlap at level boundaries.
 
-### Community 125 - "Community 125"
+### Community 123 - "Community 123"
 Cohesion: 0.29
 Nodes (1): CommunityAuthDbMigrationTests
 
-### Community 126 - "Community 126"
+### Community 124 - "Community 124"
 Cohesion: 0.29
 Nodes (3): ClipEngineContractTests, _fake_engine_out(), HTTP-layer contract smoke test for POST /api/ingest/url (Task 13).  Asserts that
 
-### Community 127 - "Community 127"
+### Community 125 - "Community 125"
 Cohesion: 0.36
 Nodes (1): CommunityHistorySyncTests
 
-### Community 128 - "Community 128"
+### Community 126 - "Community 126"
 Cohesion: 0.32
 Nodes (3): _run_clean_process(), test_embedding_request_cannot_lazy_load_torch(), test_main_import_uses_no_torch_embedding_backend()
 
-### Community 129 - "Community 129"
+### Community 127 - "Community 127"
 Cohesion: 0.25
 Nodes (1): CommunityReelDurationSecurityTests
 
-### Community 130 - "Community 130"
+### Community 128 - "Community 128"
 Cohesion: 0.36
 Nodes (1): CommunitySettingsSyncTests
 
-### Community 131 - "Community 131"
+### Community 129 - "Community 129"
 Cohesion: 0.46
 Nodes (5): historyScopeStorageKey(), normalizeHistoryAccountId(), readScopedHistorySnapshot(), seedGuestHistoryScopeFromActiveHistory(), writeScopedHistorySnapshot()
 
-### Community 132 - "Community 132"
+### Community 130 - "Community 130"
 Cohesion: 0.62
 Nodes (6): _closure(), test_non_onset_required_overflowing_the_soft_budget_is_carded(), test_onset_beyond_the_hard_cap_is_carded_not_inlined(), test_onset_overflowing_into_the_soft_hard_window_is_inlined(), test_required_before_onset_is_inlined_even_past_span_budget(), _u()
 
-### Community 133 - "Community 133"
+### Community 131 - "Community 131"
 Cohesion: 0.48
 Nodes (6): Per-clip orientation cards (feed display). Offline — llm_json monkeypatched, zer, test_extractive_fallback_on_llm_error(), test_grounded_llm_cards_assigned_per_clip(), test_never_blank_and_word_capped(), test_ungrounded_llm_card_rejected(), _units()
 
-### Community 134 - "Community 134"
+### Community 132 - "Community 132"
 Cohesion: 0.29
 Nodes (0):
 
-### Community 135 - "Community 135"
+### Community 133 - "Community 133"
 Cohesion: 0.33
 Nodes (6): classify_passage(), label_penalty(), Structural role classifier for transcript passages.  Labels a passage as INTRO /, Return the structural role of ``text`` with a position-aware prior.      Pass th, Confidence-scaled penalty for ``label`` — caller subtracts from score., StructuralLabel
 
-### Community 136 - "Community 136"
+### Community 134 - "Community 134"
 Cohesion: 0.38
 Nodes (3): _reload_segment_config(), test_legacy_pro_override_wins_then_explicit_pro_model_is_fallback(), test_segment_router_rejects_invalid_values_and_clamps_percent()
 
-### Community 137 - "Community 137"
+### Community 135 - "Community 135"
 Cohesion: 0.33
 Nodes (4): IngestionTopicCutTests, _make_long_transcript_cues(), Integration tests for `POST /api/ingest/topic-cut` and the corresponding `Ingest, 20 cues × 30 seconds = 10 minutes of fake speech, two clearly distinct topics.
 
-### Community 138 - "Community 138"
+### Community 136 - "Community 136"
 Cohesion: 0.48
 Nodes (2): _build_request(), RateLimitClientIpResolutionTests
 
-### Community 139 - "Community 139"
+### Community 137 - "Community 137"
 Cohesion: 0.48
 Nodes (5): _cancel_shortly(), test_active_async_request_is_cancelled_within_three_hundred_ms(), test_chat_http_request_receives_cancellation(), test_gemini_active_request_receives_cancellation(), test_supadata_active_socket_receives_cancellation_and_does_not_retry()
 
-### Community 140 - "Community 140"
+### Community 138 - "Community 138"
 Cohesion: 0.29
 Nodes (0):
 
-### Community 141 - "Community 141"
+### Community 139 - "Community 139"
 Cohesion: 0.43
 Nodes (5): applySearchFeedSettingsToParams(), buildSearchFeedQuery(), parseQueryBoolean(), parseQueryNumber(), readSearchFeedQuerySettings()
 
+### Community 140 - "Community 140"
+Cohesion: 0.33
+Nodes (0):
+
+### Community 141 - "Community 141"
+Cohesion: 0.33
+Nodes (0):
+
 ### Community 142 - "Community 142"
-Cohesion: 0.33
-Nodes (0):
-
-### Community 143 - "Community 143"
-Cohesion: 0.33
-Nodes (0):
-
-### Community 144 - "Community 144"
 Cohesion: 0.33
 Nodes (1): Precise-cutting config surface (Task 1). Pure constants — no audio/whisper.
 
-### Community 145 - "Community 145"
+### Community 143 - "Community 143"
 Cohesion: 0.47
 Nodes (4): _columns(), Assessment/reel-content schema parity for SQLite and PostgreSQL., test_existing_sqlite_reels_and_history_are_migrated_idempotently(), test_fresh_sqlite_schema_contains_assessment_tables_and_private_keys()
 
-### Community 146 - "Community 146"
+### Community 144 - "Community 144"
 Cohesion: 0.33
 Nodes (1): FE1 (embed bleed fix) + FE2 (quality payload) — the serving embed path.  FE1 roo
 
+### Community 145 - "Community 145"
+Cohesion: 0.33
+Nodes (0):
+
+### Community 146 - "Community 146"
+Cohesion: 0.33
+Nodes (0):
+
 ### Community 147 - "Community 147"
-Cohesion: 0.33
-Nodes (0):
-
-### Community 148 - "Community 148"
-Cohesion: 0.33
-Nodes (0):
-
-### Community 149 - "Community 149"
 Cohesion: 0.33
 Nodes (1): VID4 eval columns for the edge probe (advisory rates). Offline, pure functions.
 
-### Community 150 - "Community 150"
+### Community 148 - "Community 148"
 Cohesion: 0.4
 Nodes (1): refine_clip_boundaries wiring (Task 8). Offline: audio + _refine_one stubbed.
 
-### Community 151 - "Community 151"
+### Community 149 - "Community 149"
 Cohesion: 0.5
 Nodes (4): _collect_referenced_names(), Completeness guard: every config.<CONSTANT> referenced in the vendored gemini-pa, Every config.NAME reference in the gemini-path modules must be on the shim., test_shim_exposes_all_referenced_constants()
+
+### Community 150 - "Community 150"
+Cohesion: 0.5
+Nodes (0):
+
+### Community 151 - "Community 151"
+Cohesion: 0.5
+Nodes (0):
 
 ### Community 152 - "Community 152"
 Cohesion: 0.5
@@ -649,31 +649,31 @@ Nodes (0):
 
 ### Community 153 - "Community 153"
 Cohesion: 0.5
-Nodes (0):
-
-### Community 154 - "Community 154"
-Cohesion: 0.5
-Nodes (0):
-
-### Community 155 - "Community 155"
-Cohesion: 0.5
 Nodes (3): Email service using Resend for transactional email delivery., Send a welcome email to a newly registered user.      Errors are caught and logg, send_welcome_email()
 
-### Community 156 - "Community 156"
+### Community 154 - "Community 154"
 Cohesion: 0.67
 Nodes (2): _cue(), QueryFocusedSnippetTests
 
-### Community 157 - "Community 157"
+### Community 155 - "Community 155"
 Cohesion: 0.67
 Nodes (2): _sent(), test_opening_onset_rate_counts_only_good_openers()
 
-### Community 158 - "Community 158"
+### Community 156 - "Community 156"
 Cohesion: 0.5
+Nodes (0):
+
+### Community 157 - "Community 157"
+Cohesion: 0.67
+Nodes (2): createInitialState(), LoadingFlappyMiniGame()
+
+### Community 158 - "Community 158"
+Cohesion: 0.67
 Nodes (0):
 
 ### Community 159 - "Community 159"
 Cohesion: 0.67
-Nodes (2): createInitialState(), LoadingFlappyMiniGame()
+Nodes (1): pysbd's Segmenter is not thread-safe: segment() stashes the input on self.origin
 
 ### Community 160 - "Community 160"
 Cohesion: 0.67
@@ -681,7 +681,7 @@ Nodes (0):
 
 ### Community 161 - "Community 161"
 Cohesion: 0.67
-Nodes (1): pysbd's Segmenter is not thread-safe: segment() stashes the input on self.origin
+Nodes (0):
 
 ### Community 162 - "Community 162"
 Cohesion: 0.67
@@ -700,11 +700,11 @@ Cohesion: 0.67
 Nodes (0):
 
 ### Community 166 - "Community 166"
-Cohesion: 0.67
+Cohesion: 1.0
 Nodes (0):
 
 ### Community 167 - "Community 167"
-Cohesion: 0.67
+Cohesion: 1.0
 Nodes (0):
 
 ### Community 168 - "Community 168"
@@ -843,66 +843,62 @@ Nodes (0):
 Cohesion: 1.0
 Nodes (0):
 
-### Community 202 - "Community 202"
-Cohesion: 1.0
-Nodes (0):
-
-### Community 203 - "Community 203"
-Cohesion: 1.0
-Nodes (0):
-
 ## Knowledge Gaps
 - **391 isolated node(s):** `Submit one autocrop job and return the URL of the rendered short.`, `MuAPI result shapes vary by endpoint — try common keys.`, `Find the most viral-worthy highlights in a transcript.  Logic ported from ViralV`, `Default LLM backend: MuAPI gpt-5-mini.`, `gpt-5-4 sometimes wraps JSON in markdown fences — strip and parse.` (+386 more)
   These have ≤1 connection - possible missing edges or undocumented components.
-- **Thin community `Community 168`** (2 nodes): `ProcessingStepper.tsx`, `ProcessingStepper()`
+- **Thin community `Community 166`** (2 nodes): `ProcessingStepper.tsx`, `ProcessingStepper()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 169`** (2 nodes): `ResultsGrid.tsx`, `ResultsGrid()`
+- **Thin community `Community 167`** (2 nodes): `ResultsGrid.tsx`, `ResultsGrid()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 170`** (2 nodes): `DownloadAll()`, `DownloadAll.tsx`
+- **Thin community `Community 168`** (2 nodes): `DownloadAll()`, `DownloadAll.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 171`** (2 nodes): `VolumetricGlowBackground.tsx`, `VolumetricGlowBackground()`
+- **Thin community `Community 169`** (2 nodes): `VolumetricGlowBackground.tsx`, `VolumetricGlowBackground()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 172`** (2 nodes): `useJobStream.ts`, `useJobStream()`
+- **Thin community `Community 170`** (2 nodes): `useJobStream.ts`, `useJobStream()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 173`** (2 nodes): `test_topics_types.py`, `test_schemas_and_dataclasses_exist()`
+- **Thin community `Community 171`** (2 nodes): `test_topics_types.py`, `test_schemas_and_dataclasses_exist()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 174`** (2 nodes): `test_youtube_transport.py`, `test_youtube_impersonation_target_is_supported()`
+- **Thin community `Community 172`** (2 nodes): `test_youtube_transport.py`, `test_youtube_impersonation_target_is_supported()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 175`** (2 nodes): `test_provider_cache_db.py`, `test_sqlite_provider_cache_round_trip_and_tombstone_filter()`
+- **Thin community `Community 173`** (2 nodes): `test_provider_cache_db.py`, `test_sqlite_provider_cache_round_trip_and_tombstone_filter()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 176`** (2 nodes): `test_singleflight.py`, `test_singleflight_coalesces_identical_concurrent_work()`
+- **Thin community `Community 174`** (2 nodes): `test_singleflight.py`, `test_singleflight_coalesces_identical_concurrent_work()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 177`** (2 nodes): `RootLayout()`, `layout.tsx`
+- **Thin community `Community 175`** (2 nodes): `RootLayout()`, `layout.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 178`** (2 nodes): `Loading()`, `loading.tsx`
+- **Thin community `Community 176`** (2 nodes): `Loading()`, `loading.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 179`** (2 nodes): `FullscreenLoadingScreen()`, `FullscreenLoadingScreen.tsx`
+- **Thin community `Community 177`** (2 nodes): `FullscreenLoadingScreen()`, `FullscreenLoadingScreen.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 180`** (2 nodes): `ViewportModalPortal.tsx`, `ViewportModalPortal()`
+- **Thin community `Community 178`** (2 nodes): `ViewportModalPortal.tsx`, `ViewportModalPortal()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 181`** (2 nodes): `youtubeIframeApi.ts`, `loadYouTubeIframeApi()`
+- **Thin community `Community 179`** (2 nodes): `youtubeIframeApi.ts`, `loadYouTubeIframeApi()`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 182`** (1 nodes): `next-env.d.ts`
+- **Thin community `Community 180`** (1 nodes): `next-env.d.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 183`** (1 nodes): `tailwind.config.ts`
+- **Thin community `Community 181`** (1 nodes): `tailwind.config.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 184`** (1 nodes): `postcss.config.js`
+- **Thin community `Community 182`** (1 nodes): `postcss.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 185`** (1 nodes): `next.config.ts`
+- **Thin community `Community 183`** (1 nodes): `next.config.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 186`** (1 nodes): `tailwind.config.js`
+- **Thin community `Community 184`** (1 nodes): `tailwind.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 187`** (1 nodes): `vite.config.ts`
+- **Thin community `Community 185`** (1 nodes): `vite.config.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 188`** (1 nodes): `postcss.config.js`
+- **Thin community `Community 186`** (1 nodes): `postcss.config.js`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 189`** (1 nodes): `main.tsx`
+- **Thin community `Community 187`** (1 nodes): `main.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 190`** (1 nodes): `types.ts`
+- **Thin community `Community 188`** (1 nodes): `types.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 191`** (1 nodes): `SettingsDrawer.tsx`
+- **Thin community `Community 189`** (1 nodes): `SettingsDrawer.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 192`** (1 nodes): `InputCard.tsx`
+- **Thin community `Community 190`** (1 nodes): `InputCard.tsx`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 191`** (1 nodes): `__init__.py`
+  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
+- **Thin community `Community 192`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 193`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
@@ -918,26 +914,22 @@ Nodes (0):
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 - **Thin community `Community 199`** (1 nodes): `__init__.py`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 200`** (1 nodes): `__init__.py`
+- **Thin community `Community 200`** (1 nodes): `GenerationProgress.tsx`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 201`** (1 nodes): `__init__.py`
-  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 202`** (1 nodes): `GenerationProgress.tsx`
-  Too small to be a meaningful cluster - may be noise or needs more connections extracted.
-- **Thin community `Community 203`** (1 nodes): `types.ts`
+- **Thin community `Community 201`** (1 nodes): `types.ts`
   Too small to be a meaningful cluster - may be noise or needs more connections extracted.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `ReelService` connect `Community 3` to `Community 1`, `Community 7`, `Community 9`, `Community 53`, `Community 94`, `Community 90`, `Community 62`?**
+- **Why does `ReelService` connect `Community 4` to `Community 1`, `Community 8`, `Community 10`, `Community 53`, `Community 94`, `Community 90`, `Community 62`?**
   _High betweenness centrality (0.072) - this node is a cross-community bridge._
-- **Why does `Sentence` connect `Community 0` to `Community 96`, `Community 1`, `Community 100`, `Community 5`, `Community 6`, `Community 101`, `Community 8`, `Community 19`, `Community 118`, `Community 123`, `Community 93`?**
+- **Why does `Sentence` connect `Community 0` to `Community 96`, `Community 1`, `Community 100`, `Community 5`, `Community 101`, `Community 7`, `Community 9`, `Community 12`, `Community 19`, `Community 116`, `Community 21`, `Community 121`, `Community 93`?**
   _High betweenness centrality (0.068) - this node is a cross-community bridge._
-- **Why does `IngestTranscriptCue` connect `Community 1` to `Community 88`, `Community 10`, `Community 3`, `Community 156`?**
+- **Why does `IngestTranscriptCue` connect `Community 1` to `Community 88`, `Community 154`, `Community 11`, `Community 4`?**
   _High betweenness centrality (0.052) - this node is a cross-community bridge._
-- **Are the 199 inferred relationships involving `Sentence` (e.g. with `Precise boundary refinement with targeted Whisper.  Supadata gives fast but coar` and `Absolute time of the lowest-RMS ``frame_ms`` frame within ``[a, b]`` — the quiet`) actually correct?**
-  _`Sentence` has 199 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 200 inferred relationships involving `Sentence` (e.g. with `Precise boundary refinement with targeted Whisper.  Supadata gives fast but coar` and `Absolute time of the lowest-RMS ``frame_ms`` frame within ``[a, b]`` — the quiet`) actually correct?**
+  _`Sentence` has 200 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 81 inferred relationships involving `ReelService` (e.g. with `Core rate limit check against a pre-built key. Raises HTTPException on breach.` and `Preferred rate-limit bucket key for a request. Uses the owner key hash when`) actually correct?**
   _`ReelService` has 81 INFERRED edges - model-reasoned connections that need verification._
 - **Are the 178 inferred relationships involving `Unit` (e.g. with `PlanItemLLM` and `ExtractionPlanLLM`) actually correct?**
