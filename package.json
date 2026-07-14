@@ -6,7 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "test": "node --test src/lib/api.stream.test.cjs src/components/UploadPanel.test.cjs src/app/feed/page.test.cjs",
+    "test": "node --test src/lib/api.stream.test.cjs src/components/UploadPanel.test.cjs src/components/SettingsPanel.test.cjs src/app/feed/page.test.cjs",
     "typecheck": "next typegen && tsc --noEmit --incremental false",
     "lint": "npm run typecheck"
   },

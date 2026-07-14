@@ -993,6 +993,47 @@ def test_context_expansion_projects_past_leading_filler_in_added_cue():
     )
 
 
+def test_qcd_backward_reference_projects_to_its_spoken_antecedent():
+    segments = [
+        {
+            "cue_id": "qcd-context",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "A physical observable X cannot depend on arbitrary "
+                "renormalization parameters."
+            ),
+        },
+        {
+            "cue_id": "qcd-continuation",
+            "start": 8.0,
+            "end": 17.0,
+            "text": (
+                "x could not depend on these parameters in an exactly analogous "
+                "way as before. This gives us the renormalization group equations."
+            ),
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            1,
+            1,
+            start_quote="x could not depend on these parameters",
+            end_quote="renormalization group equations",
+            topic_evidence_quote="This gives us the renormalization group equations",
+        )]),
+        segments,
+        [],
+        {"_segment_ignore_caption_case": True},
+        topic="QCD renormalization group",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"] == ["qcd-context", "qcd-continuation"]
+    assert clip["_clip_text"].startswith("A physical observable X")
+
+
 def test_context_expansion_projects_before_trailing_filler_in_added_cue():
     segments = [
         {

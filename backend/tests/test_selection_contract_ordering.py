@@ -422,7 +422,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         baseline = json.loads(row[0])
         baseline.update({
-            "selection_contract_version": "quality_silence_v9",
+            "selection_contract_version": "quality_silence_v10",
             "self_contained": True,
             "is_standalone": True,
             "topic_evidence_quote": (
@@ -531,39 +531,45 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ["hard-v3"],
         )
 
-    def test_v3_historical_inventory_remains_viewable(self) -> None:
-        self._insert_versioned_reel(
-            reel_id="historical-v3",
-            video_id="video-a",
-            start=10,
-            difficulty=0.10,
-            base_score=0.8,
-        )
-        row = self.conn.execute(
-            "SELECT search_context_json FROM reels WHERE id = 'historical-v3'"
-        ).fetchone()
-        context = json.loads(row[0])
-        context.update({
-            "selection_contract_version": "quality_silence_v3",
-            "directly_teaches_topic": True,
-            "substantive": True,
-            "factually_grounded": True,
-            "self_contained": True,
-            "topic_evidence_quote": (
-                "Chemical bonding explains how atoms share or transfer electrons"
-            ),
-            "surface_eligible": True,
-            "deferred_level": False,
-        })
-        self.conn.execute(
-            "UPDATE reels SET search_context_json = ? WHERE id = 'historical-v3'",
-            (json.dumps(context),),
-        )
+    def test_v3_and_v9_historical_inventory_remains_viewable(self) -> None:
+        for version in ("quality_silence_v3", "quality_silence_v9"):
+            reel_id = f"historical-{version}"
+            with self.subTest(version=version):
+                self._insert_versioned_reel(
+                    reel_id=reel_id,
+                    video_id="video-a",
+                    start=10,
+                    difficulty=0.10,
+                    base_score=0.8,
+                )
+                row = self.conn.execute(
+                    "SELECT search_context_json FROM reels WHERE id = ?",
+                    (reel_id,),
+                ).fetchone()
+                context = json.loads(row[0])
+                context.update({
+                    "selection_contract_version": version,
+                    "directly_teaches_topic": True,
+                    "substantive": True,
+                    "factually_grounded": True,
+                    "self_contained": True,
+                    "topic_evidence_quote": (
+                        "Chemical bonding explains how atoms share or transfer electrons"
+                    ),
+                    "surface_eligible": True,
+                    "deferred_level": False,
+                })
+                self.conn.execute(
+                    "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                    (json.dumps(context), reel_id),
+                )
 
-        result = self._ranked()
+                result = self._ranked()
 
-        self.assertEqual([item["reel_id"] for item in result], ["historical-v3"])
-        self.assertEqual(result[0]["selection_contract_version"], "quality_silence_v3")
+                self.assertEqual([item["reel_id"] for item in result], [reel_id])
+                self.assertEqual(result[0]["selection_contract_version"], version)
+                self.conn.execute("DELETE FROM ranked_feed_cache")
+                self.conn.execute("DELETE FROM reels WHERE id = ?", (reel_id,))
 
     def test_v4_response_distinguishes_selector_from_deterministic_relevance(self) -> None:
         self._insert_versioned_reel(

@@ -3,6 +3,7 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
 
 import {
+  type GenerationMode,
   type PreferredVideoDuration,
   type StudyReelsSettings,
   DEFAULT_STUDY_REELS_SETTINGS,
@@ -62,6 +63,15 @@ const DURATION_OPTIONS: Array<{ value: PreferredVideoDuration; label: string }> 
   { value: "short", label: "Short" },
   { value: "medium", label: "Medium" },
   { value: "long", label: "Long" },
+];
+
+const GENERATION_MODE_OPTIONS: Array<{
+  value: GenerationMode;
+  label: string;
+  detail: string;
+}> = [
+  { value: "fast", label: "Fast", detail: "2 sources · up to 8 clips" },
+  { value: "slow", label: "Slow", detail: "3 sources · up to 12 clips" },
 ];
 
 const durationSummaryLabel: Record<PreferredVideoDuration, string> = {
@@ -183,6 +193,9 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   }: SettingsPanelProps,
   ref,
 ) {
+  const [generationMode, setGenerationMode] = useState<GenerationMode>(
+    DEFAULT_STUDY_REELS_SETTINGS.generationMode,
+  );
   const [minRelevanceThreshold, setMinRelevanceThreshold] = useState(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
   const [startMuted, setStartMuted] = useState(DEFAULT_STUDY_REELS_SETTINGS.startMuted);
   const [autoplayNextReel, setAutoplayNextReel] = useState(DEFAULT_STUDY_REELS_SETTINGS.autoplayNextReel);
@@ -431,7 +444,6 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     }
     return "Balanced";
   }, [targetClipDurationMaxSec, targetClipDurationMinSec]);
-  const generationModeForChecks = savedPreferences?.generationMode ?? DEFAULT_STUDY_REELS_SETTINGS.generationMode;
   const defaultInputModeForSave = savedPreferences?.defaultInputMode ?? DEFAULT_STUDY_REELS_SETTINGS.defaultInputMode;
 
   const normalizeClipRange = useCallback((rawMin: number, rawMax: number): { min: number; max: number } => {
@@ -579,6 +591,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   );
 
   const applySavedSettings = useCallback((saved: StudyReelsSettings) => {
+    setGenerationMode(saved.generationMode);
     setMinRelevanceThreshold(saved.minRelevanceThreshold);
     setStartMuted(saved.startMuted);
     setAutoplayNextReel(saved.autoplayNextReel);
@@ -713,6 +726,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   }, []);
 
   const resetPreferences = () => {
+    setGenerationMode(DEFAULT_STUDY_REELS_SETTINGS.generationMode);
     setMinRelevanceThreshold(DEFAULT_STUDY_REELS_SETTINGS.minRelevanceThreshold);
     setStartMuted(DEFAULT_STUDY_REELS_SETTINGS.startMuted);
     setAutoplayNextReel(DEFAULT_STUDY_REELS_SETTINGS.autoplayNextReel);
@@ -731,8 +745,8 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   };
 
   const settingsSummary = useMemo(() => {
-    return `Match ${minRelevanceThreshold.toFixed(2)}+ · ${durationSummaryLabel[preferredVideoDuration]} source videos · ${creativeCommonsOnly ? "Creative Commons" : "Any license"} · ${startMuted ? "Muted" : "Sound on"} · ${autoplayNextReel ? "Auto-next on" : "Auto-next off"}`;
-  }, [autoplayNextReel, creativeCommonsOnly, minRelevanceThreshold, preferredVideoDuration, startMuted]);
+    return `${generationMode === "fast" ? "Fast" : "Slow"} · Match ${minRelevanceThreshold.toFixed(2)}+ · ${durationSummaryLabel[preferredVideoDuration]} source videos · ${creativeCommonsOnly ? "Creative Commons" : "Any license"} · ${startMuted ? "Muted" : "Sound on"} · ${autoplayNextReel ? "Auto-next on" : "Auto-next off"}`;
+  }, [autoplayNextReel, creativeCommonsOnly, generationMode, minRelevanceThreshold, preferredVideoDuration, startMuted]);
 
   const hasUnsavedChanges = useMemo(() => {
     if (!savedPreferences) {
@@ -741,6 +755,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     const currentMinRelevance = Number(minRelevanceThreshold.toFixed(2));
     return (
       savedPreferences.minRelevanceThreshold !== currentMinRelevance
+      || savedPreferences.generationMode !== generationMode
       || savedPreferences.startMuted !== startMuted
       || savedPreferences.autoplayNextReel !== autoplayNextReel
       || savedPreferences.creativeCommonsOnly !== creativeCommonsOnly
@@ -752,6 +767,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
     autoplayNextReel,
     minRelevanceThreshold,
     creativeCommonsOnly,
+    generationMode,
     preferredVideoDuration,
     savedPreferences,
     startMuted,
@@ -764,7 +780,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
       return;
     }
     const saved = saveStudyReelsSettings({
-      generationMode: generationModeForChecks,
+      generationMode,
       defaultInputMode: defaultInputModeForSave,
       minRelevanceThreshold,
       startMuted,
@@ -782,7 +798,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   }, [
     autoplayNextReel,
     defaultInputModeForSave,
-    generationModeForChecks,
+    generationMode,
     onSettingsSaved,
     minRelevanceThreshold,
     creativeCommonsOnly,
@@ -797,6 +813,7 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
   ]);
   const discardUnsavedChanges = useCallback(() => {
     const saved = savedPreferences ?? readStudyReelsSettings();
+    setGenerationMode(saved.generationMode);
     setMinRelevanceThreshold(saved.minRelevanceThreshold);
     setStartMuted(saved.startMuted);
     setAutoplayNextReel(saved.autoplayNextReel);
@@ -976,6 +993,43 @@ export const SettingsPanel = forwardRef<SettingsPanelHandle, SettingsPanelProps>
                     </div>
                   </div>
                 </div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl bg-white/[0.06] p-3.5 backdrop-blur-[4px] md:p-4">
+              <div className="flex items-center gap-1.5">
+                <p className="text-sm font-semibold text-white/95">Generation speed</p>
+                <SettingsInfoTooltip text="Both modes use the same relevance, context, and silence checks. Fast analyzes up to 2 sources; Slow analyzes up to 3." />
+              </div>
+              <p className="mt-1 text-[11px] text-white/58">
+                Same clip quality rules; choose how many sources to analyze.
+              </p>
+              <div
+                className="mt-3 grid grid-cols-2 gap-2"
+                role="group"
+                aria-label="Generation speed"
+              >
+                {GENERATION_MODE_OPTIONS.map((option) => {
+                  const selected = generationMode === option.value;
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      aria-pressed={selected}
+                      onClick={() => setGenerationMode(option.value)}
+                      className={`rounded-xl border px-3 py-3 text-left transition-colors ${
+                        selected
+                          ? "border-white bg-white text-black"
+                          : "border-white/20 bg-black/30 text-white hover:bg-white/10"
+                      }`}
+                    >
+                      <span className="block text-sm font-semibold">{option.label}</span>
+                      <span className={`mt-1 block text-[10px] ${selected ? "text-black/65" : "text-white/55"}`}>
+                        {option.detail}
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 

@@ -1349,6 +1349,27 @@ def _close_cue_context(
             ):
                 start_line = candidate
                 break
+    selected_start_line = start_line
+    from .discourse import _has_unresolved_opening_back_reference
+
+    selected_start_text = str(segments[selected_start_line].get("text") or "")
+    opening_reference_requires_context = _has_unresolved_opening_back_reference(
+        selected_start_text
+    )
+
+    def opening_reference_is_unresolved() -> bool:
+        if not opening_reference_requires_context:
+            return False
+        prior_text = (
+            _cue_clip_text(segments, start_line, selected_start_line - 1)
+            if start_line < selected_start_line
+            else ""
+        )
+        return _has_unresolved_opening_back_reference(
+            selected_start_text,
+            prior_text=prior_text,
+        )
+
     original_end = end_line
     start_expansions = 0
     while start_expansions < expansion_limit:
@@ -1357,10 +1378,14 @@ def _close_cue_context(
         ):
             force_start_question_setup = False
             break
-        if not force_start_question_setup and not _cue_opens_mid_thought_at(
-            segments,
-            start_line,
-            ignore_caption_case=ignore_caption_case,
+        if (
+            not force_start_question_setup
+            and not _cue_opens_mid_thought_at(
+                segments,
+                start_line,
+                ignore_caption_case=ignore_caption_case,
+            )
+            and not opening_reference_is_unresolved()
         ):
             break
         candidate = start_line - 1
@@ -1374,7 +1399,7 @@ def _close_cue_context(
         segments,
         start_line,
         ignore_caption_case=ignore_caption_case,
-    ):
+    ) or opening_reference_is_unresolved():
         return start_line, end_line, "unresolved_weak_start"
 
     consumed_end_cues = 0

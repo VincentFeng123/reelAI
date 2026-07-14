@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from copy import deepcopy
 from contextlib import contextmanager
@@ -70,7 +71,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v9:v8:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v10:v8:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -385,6 +386,32 @@ def test_segment_cache_sqlite_round_trip_expiry_and_tombstone(monkeypatch) -> No
         transcript=transcript,
         settings=settings,
     ) == ([cached_clip], "cached")
+
+    stale_payload = json.loads(
+        connection.execute(
+            "SELECT response_json FROM llm_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()[0]
+    )
+    stale_payload["selection_contract_version"] = "quality_silence_v9"
+    connection.execute(
+        "UPDATE llm_cache SET response_json = ? WHERE cache_key = ?",
+        (json.dumps(stale_payload), cache_key),
+    )
+    assert segment_cache.load_segment_result(
+        cache_key,
+        video_id=VIDEO_ID,
+        transcript=transcript,
+        settings=settings,
+    ) is None
+    segment_cache.store_segment_result(
+        cache_key,
+        [cached_clip],
+        "cached",
+        video_id=VIDEO_ID,
+        transcript=transcript,
+        settings=settings,
+    )
 
     expired = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
     connection.execute(

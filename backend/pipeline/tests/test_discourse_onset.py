@@ -3,7 +3,11 @@ clip's FIRST line drops the viewer mid-thought. A presentational ``so`` question
 topic, while an adversative question still depends on the preceding contrast."""
 from __future__ import annotations
 
-from backend.pipeline.discourse import opens_mid_thought, is_onset
+from backend.pipeline.discourse import (
+    _has_unresolved_opening_back_reference,
+    is_onset,
+    opens_mid_thought,
+)
 
 # Real bad openers pulled from the shipped corpus — MUST be flagged weak.
 def test_answer_first_is_weak():
@@ -117,6 +121,66 @@ def test_compound_question_can_establish_its_own_pronoun_antecedent():
 def test_context_dependent_np_is_weak():
     assert opens_mid_thought("The answer is fifteen newtons.")
     assert opens_mid_thought("The previous equation tells us the velocity.")
+
+
+def test_explicit_and_technical_back_references_are_weak():
+    assert opens_mid_thought(
+        "X could not depend on these parameters in an exactly analogous way as before."
+    )
+    assert opens_mid_thought("The calculation proceeds as discussed earlier.")
+
+
+def test_locally_introduced_technical_demonstrative_is_an_onset():
+    assert is_onset(
+        "The model has two parameters, and these parameters control the fit."
+    )
+    assert is_onset(
+        "The model defines one approach, and these approaches share its assumptions."
+    )
+
+
+def test_locally_resolved_explicit_back_reference_is_an_onset():
+    assert is_onset(
+        "We first define the baseline rule. As before, the baseline rule controls "
+        "the calculation."
+    )
+
+
+def test_explicit_reference_trigger_verbs_do_not_count_as_antecedents():
+    assert _has_unresolved_opening_back_reference(
+        "The calculation proceeds as discussed earlier.",
+        prior_text="We discussed the course schedule and office hours.",
+    )
+    assert _has_unresolved_opening_back_reference(
+        "The coupling was defined previously.",
+        prior_text="We defined the grading policy before class.",
+    )
+
+
+def test_single_shared_noun_does_not_resolve_an_explicit_reference():
+    assert _has_unresolved_opening_back_reference(
+        "The calculation proceeds as discussed earlier.",
+        prior_text="A homework exercise contains one calculation.",
+    )
+    assert _has_unresolved_opening_back_reference(
+        "The coupling was defined previously.",
+        prior_text="Quantum chromodynamics contains a coupling constant.",
+    )
+    assert _has_unresolved_opening_back_reference(
+        "The calculations proceed as discussed earlier.",
+        prior_text="These calculations are difficult.",
+    )
+    assert _has_unresolved_opening_back_reference(
+        "The couplings were defined previously.",
+        prior_text="This chapter lists several couplings.",
+    )
+
+
+def test_punctuation_free_local_explicit_reference_has_real_antecedent():
+    assert not _has_unresolved_opening_back_reference(
+        "We first define the baseline rule and as before the baseline rule "
+        "controls the calculation"
+    )
 
 
 def test_contextless_precision_reformulation_is_weak():

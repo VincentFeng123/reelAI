@@ -172,6 +172,119 @@ def test_demonstrative_noun_phrase_expands_to_its_antecedent() -> None:
     ) == (0, 1, None)
 
 
+def test_qcd_back_reference_expands_to_cold_viewer_context() -> None:
+    contextual = {
+        "start": 0.0,
+        "end": 8.0,
+        "text": (
+            "A physical observable X cannot depend on arbitrary renormalization "
+            "parameters."
+        ),
+    }
+    back_reference = {
+        "start": 8.0,
+        "end": 16.0,
+        "text": (
+            "x could not depend on these parameters in an exactly analogous way "
+            "as before."
+        ),
+    }
+
+    assert G._cue_opens_mid_thought_at(
+        [contextual, back_reference], 1, ignore_caption_case=True
+    ) is True
+    assert G._close_cue_context(
+        [contextual, back_reference], 1, 1, ignore_caption_case=True
+    ) == (0, 1, None)
+    assert G._close_cue_context(
+        [back_reference], 0, 0, ignore_caption_case=True
+    ) == (0, 0, "unresolved_weak_start")
+
+
+def test_qcd_back_reference_rejects_an_unrelated_prior_cue() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "Welcome back to the lecture.",
+        },
+        {
+            "start": 6.0,
+            "end": 14.0,
+            "text": (
+                "X could not depend on these parameters in an exactly analogous "
+                "way as before."
+            ),
+        },
+    ]
+
+    assert G._close_cue_context(
+        segments, 1, 1, ignore_caption_case=True
+    ) == (0, 1, "unresolved_weak_start")
+
+
+@pytest.mark.parametrize(
+    ("unrelated_context", "back_reference"),
+    [
+        (
+            "We discussed the course schedule and office hours.",
+            "The calculation proceeds as discussed earlier.",
+        ),
+        (
+            "We defined the grading policy before class.",
+            "The coupling was defined previously.",
+        ),
+    ],
+)
+def test_reference_trigger_verbs_do_not_resolve_unrelated_context(
+    unrelated_context: str,
+    back_reference: str,
+) -> None:
+    segments = [
+        {"start": 0.0, "end": 6.0, "text": unrelated_context},
+        {"start": 6.0, "end": 12.0, "text": back_reference},
+    ]
+
+    assert G._close_cue_context(
+        segments, 1, 1, ignore_caption_case=True
+    ) == (0, 1, "unresolved_weak_start")
+
+
+def test_single_shared_noun_does_not_resolve_prior_context() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "A homework exercise contains one calculation.",
+        },
+        {
+            "start": 6.0,
+            "end": 12.0,
+            "text": "The calculation proceeds as discussed earlier.",
+        },
+    ]
+
+    assert G._close_cue_context(
+        segments, 1, 1, ignore_caption_case=True
+    ) == (0, 1, "unresolved_weak_start")
+
+    plural_segments = [
+        {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "This chapter lists several couplings.",
+        },
+        {
+            "start": 6.0,
+            "end": 12.0,
+            "text": "The couplings were defined previously.",
+        },
+    ]
+    assert G._close_cue_context(
+        plural_segments, 1, 1, ignore_caption_case=True
+    ) == (0, 1, "unresolved_weak_start")
+
+
 def test_fronted_quantified_demonstrative_expands_to_its_antecedent() -> None:
     segments = [
         {
@@ -193,12 +306,24 @@ def test_fronted_quantified_demonstrative_expands_to_its_antecedent() -> None:
         segments, 1, 1, ignore_caption_case=True
     ) == (0, 1, None)
 
-    for contextual_opener in (
-        "If these genes are recessive, males express the trait.",
-        "When this happens, the recessive trait becomes visible.",
-        "Although those results are uncommon, they support the model.",
+    for antecedent, contextual_opener in (
+        (
+            segments[0]["text"],
+            "If these genes are recessive, males express the trait.",
+        ),
+        (
+            "A recessive allele can be expressed in a male.",
+            "When this happens, the recessive trait becomes visible.",
+        ),
+        (
+            "The genetic trials produced several uncommon results.",
+            "Although those results are uncommon, they support the model.",
+        ),
     ):
-        contextual_segments = [segments[0], {**segments[1], "text": contextual_opener}]
+        contextual_segments = [
+            {**segments[0], "text": antecedent},
+            {**segments[1], "text": contextual_opener},
+        ]
         assert G._close_cue_context(
             contextual_segments, 1, 1, ignore_caption_case=True
         ) == (0, 1, None)

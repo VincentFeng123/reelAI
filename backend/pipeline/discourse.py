@@ -69,6 +69,44 @@ _CONTEXTUAL_REFORMULATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_EXPLICIT_BACK_REFERENCE_RE = re.compile(
+    r"\b(?:as\s+(?:before|above|earlier|previously)|"
+    r"(?:shown|mentioned|discussed|described|defined|noted)\s+"
+    r"(?:above|before|earlier|previously))\b",
+    re.IGNORECASE,
+)
+
+_CONTEXTUAL_DEMONSTRATIVE_HEADS: frozenset[str] = frozenset({
+    "answer", "answers", "approach", "approaches", "assumption", "assumptions",
+    "calculation", "calculations", "case", "cases", "condition", "conditions",
+    "dependency", "dependencies", "difference", "differences", "equation", "equations",
+    "expression", "expressions", "method", "methods", "parameter", "parameters",
+    "property", "properties", "quantity", "quantities", "reason", "reasons",
+    "relationship", "relationships", "result", "results", "rule", "rules",
+    "solution", "solutions", "step", "steps", "term", "terms", "value", "values",
+    "variable", "variables",
+})
+
+_DEMONSTRATIVE_NP_RE = re.compile(
+    r"\b(?:these|those)\s+(?P<head>[a-z][a-z'-]*)\b",
+    re.IGNORECASE,
+)
+
+_REFERENCE_TERM_STOP_WORDS: frozenset[str] = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "been", "before", "by",
+    "could", "did", "do", "does", "earlier", "for", "from", "had", "has",
+    "have", "in", "is", "it", "not", "of", "on", "or", "previously", "that",
+    "the", "these", "this", "those", "to", "was", "we", "were", "will", "with",
+    "would",
+})
+
+_EXPLICIT_REFERENCE_TRIGGER_WORDS: frozenset[str] = frozenset({
+    "above", "before", "defined", "described", "discussed", "earlier",
+    "mentioned", "noted", "previously", "shown",
+})
+
+_MIN_EXPLICIT_REFERENCE_SHARED_TERMS = 2
+
 _DANGLING_QUESTION_REFERENCE_RE = re.compile(
     r"(?:\b(?:this|that|these|those|it|they|them)\s*\?|"
     r"\b(?:how|why|when|where|what)\s+"
@@ -211,6 +249,115 @@ def _has_unresolved_question_reference(text: str) -> bool:
     return False
 
 
+def _reference_word_variants(word: str) -> set[str]:
+    normalized = word.casefold()
+    variants = {normalized}
+    if normalized.endswith("ies"):
+        variants.add(f"{normalized[:-3]}y")
+    if normalized.endswith("es"):
+        variants.add(normalized[:-2])
+    if normalized.endswith("s"):
+        variants.add(normalized[:-1])
+    return variants
+
+
+def _canonical_reference_term(word: str) -> str:
+    normalized = word.casefold()
+    if len(normalized) > 4 and normalized.endswith("ies"):
+        return f"{normalized[:-3]}y"
+    if len(normalized) > 4 and normalized.endswith(
+        ("ches", "shes", "xes", "zes", "sses", "oes")
+    ):
+        return normalized[:-2]
+    if (
+        len(normalized) > 3
+        and normalized.endswith("s")
+        and not normalized.endswith(("ss", "us", "is"))
+    ):
+        return normalized[:-1]
+    return normalized
+
+
+def _reference_terms(text: str) -> set[str]:
+    return {
+        _canonical_reference_term(word)
+        for word in _words(text)
+        if (
+            len(word) >= 3
+            and word.casefold() not in _REFERENCE_TERM_STOP_WORDS
+            and word.casefold() not in _EXPLICIT_REFERENCE_TRIGGER_WORDS
+        )
+        and len(_canonical_reference_term(word)) >= 3
+    }
+
+
+def _explicit_reference_has_antecedent(
+    text: str,
+    match: re.Match[str],
+    *,
+    prior_text: str,
+) -> bool:
+    sentence_start = max(
+        text.rfind(".", 0, match.start()),
+        text.rfind("!", 0, match.start()),
+        text.rfind("?", 0, match.start()),
+    ) + 1
+    sentence_end_candidates = [
+        index
+        for marker in ".!?"
+        for index in [text.find(marker, match.end())]
+        if index >= 0
+    ]
+    sentence_end = min(sentence_end_candidates, default=len(text))
+    external_context = f"{prior_text} {text[:sentence_start]}".strip()
+    sentence_prefix = text[sentence_start:match.start()]
+    sentence_suffix = text[match.end():sentence_end]
+    reference_terms = _reference_terms(f"{sentence_prefix} {sentence_suffix}")
+    if len(_reference_terms(external_context) & reference_terms) >= (
+        _MIN_EXPLICIT_REFERENCE_SHARED_TERMS
+    ):
+        return True
+
+    # ASR cues do not always contain sentence punctuation. Permit an antecedent
+    # established earlier in the same clause only when its content is repeated
+    # after the backward-reference phrase; the phrase's own trigger verb is not
+    # evidence of context.
+    return len(
+        _reference_terms(sentence_prefix)
+        & _reference_terms(sentence_suffix)
+    ) >= (
+        _MIN_EXPLICIT_REFERENCE_SHARED_TERMS
+    )
+
+
+def _has_unresolved_opening_back_reference(
+    text: str,
+    *,
+    prior_text: str = "",
+) -> bool:
+    """Find opening references without a lexical antecedent in accumulated context."""
+    for match in _EXPLICIT_BACK_REFERENCE_RE.finditer(text):
+        if not _explicit_reference_has_antecedent(
+            text,
+            match,
+            prior_text=prior_text,
+        ):
+            return True
+    for match in _DEMONSTRATIVE_NP_RE.finditer(text):
+        head = match.group("head").casefold()
+        if head not in _CONTEXTUAL_DEMONSTRATIVE_HEADS:
+            continue
+        prefix_words = {
+            variant
+            for word in _words(f"{prior_text} {text[:match.start()]}")
+            for variant in _reference_word_variants(word)
+        }
+        variants = _reference_word_variants(head)
+        if not variants.intersection(prefix_words):
+            return True
+    return False
+
+
 def opens_mid_thought(text: str) -> bool:
     """True when this sentence, as a clip's first line, drops the viewer mid-thought."""
     words = _words(text)
@@ -234,6 +381,9 @@ def opens_mid_thought(text: str) -> bool:
         or _OPENING_QUANTIFIED_DEMONSTRATIVE_RE.match(lexical_text)
         or _CONTEXTUAL_REFORMULATION_RE.match(lexical_text)
     ):
+        return True
+
+    if _has_unresolved_opening_back_reference(lexical_text):
         return True
 
     # A question is not self-contained merely because it has punctuation.

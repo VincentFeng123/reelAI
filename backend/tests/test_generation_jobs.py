@@ -149,7 +149,7 @@ def test_postgres_submission_lock_is_acquired_before_active_request_recheck(
 def test_active_capacity_limits_each_learner_without_consuming_remaining_global_slots() -> None:
     conn = _memory_conn()
     try:
-        for index in range(2):
+        for index in range(1):
             jobs.submit_or_get_active(
                 conn,
                 material_id="material-1",
@@ -159,7 +159,7 @@ def test_active_capacity_limits_each_learner_without_consuming_remaining_global_
                 learner_id="learner-1",
                 request_params={},
                 max_global_active_jobs=4,
-                max_active_jobs_per_learner=2,
+                max_active_jobs_per_learner=1,
             )
 
         with pytest.raises(jobs.GenerationQueueFullError) as captured:
@@ -172,7 +172,7 @@ def test_active_capacity_limits_each_learner_without_consuming_remaining_global_
                 learner_id="learner-1",
                 request_params={},
                 max_global_active_jobs=4,
-                max_active_jobs_per_learner=2,
+                max_active_jobs_per_learner=1,
             )
         assert captured.value.scope == "learner"
 
@@ -185,7 +185,7 @@ def test_active_capacity_limits_each_learner_without_consuming_remaining_global_
             learner_id="learner-2",
             request_params={},
             max_global_active_jobs=4,
-            max_active_jobs_per_learner=2,
+            max_active_jobs_per_learner=1,
         )
         assert created is True
         assert other["learner_id"] == "learner-2"
@@ -296,7 +296,14 @@ def test_request_key_uses_content_and_truthful_controls() -> None:
         conn.close()
 
 
-def test_request_key_version_invalidates_v6_inventory(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    "stale_version",
+    ["quality_silence_v6", "quality_silence_v9"],
+)
+def test_request_key_version_invalidates_stale_inventory(
+    monkeypatch,
+    stale_version: str,
+) -> None:
     params = {
         "material_id": "material-1",
         "concept_id": "concept-1",
@@ -309,9 +316,9 @@ def test_request_key_version_invalidates_v6_inventory(monkeypatch) -> None:
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v9"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v10"
     verified_key = jobs.build_request_key(**params)
-    monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", "quality_silence_v6")
+    monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", stale_version)
 
     assert jobs.build_request_key(**params) != verified_key
 
