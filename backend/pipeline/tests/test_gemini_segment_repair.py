@@ -692,7 +692,7 @@ def test_anaphoric_function_expands_to_subject_and_completes_comparison() -> Non
         "cue-4", "cue-5", "cue-6", "cue-7", "cue-8", "cue-9",
     ]
     assert report.clips[0]["start_quote"].startswith("DNA polymerase I")
-    assert report.clips[0]["end_quote"].endswith("removes RNA primers")
+    assert report.clips[0]["end_quote"].endswith("removes RNA primers.")
 
 
 def test_only_explicit_topic_resets_stop_context_expansion() -> None:
@@ -958,7 +958,7 @@ def test_semantic_for_now_survives_expanded_end_projection() -> None:
 
     assert report.rejected_reasons == []
     assert report.clips[0]["_clip_text"].endswith("small for now.")
-    assert report.clips[0]["end_quote"].endswith("small for now")
+    assert report.clips[0]["end_quote"].endswith("small for now.")
     assert G._TRAILING_TRANSITION_FRAGMENT_RE.sub(
         "", "Everything else is the same though now."
     ).rstrip() == "Everything else is the same"
@@ -1193,7 +1193,7 @@ def test_model_selected_complete_context_survives_a_long_caption_gap() -> None:
     assert (start, end, error) == (0, 1, None)
 
 
-def test_plan_rejects_live_biology_cue_despite_later_framing_sentence() -> None:
+def test_plan_keeps_live_biology_cue_when_only_opening_boundary_is_weak() -> None:
     segments = [
         {
             "cue_id": "tZE_fQFK8EY:cue:12",
@@ -1226,11 +1226,11 @@ def test_plan_rejects_live_biology_cue_despite_later_framing_sentence() -> None:
         topic="biology",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:unresolved_weak_start"]
+    assert len(report.clips) == 1
+    assert "unresolved_weak_start" in report.clips[0]["_boundary_fallback_reasons"]
 
 
-def test_plan_rejects_long_unpunctuated_biology_cue_with_late_framing() -> None:
+def test_plan_keeps_unpunctuated_biology_cue_when_information_is_grounded() -> None:
     segments = [
         {
             "cue_id": "tZE_fQFK8EY:cue:12",
@@ -1263,8 +1263,8 @@ def test_plan_rejects_long_unpunctuated_biology_cue_with_late_framing() -> None:
         topic="biology",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:unresolved_weak_start"]
+    assert len(report.clips) == 1
+    assert "unresolved_weak_start" in report.clips[0]["_boundary_fallback_reasons"]
 
 
 def test_production_end_extends_into_following_gerund_explanation() -> None:
@@ -1454,7 +1454,7 @@ def test_unpunctuated_prefix_expands_into_following_solution() -> None:
     assert (start, end, error) == (0, 3, None)
 
 
-def test_boundary_plan_rejects_a_quote_removed_with_a_forward_setup() -> None:
+def test_boundary_plan_keeps_grounded_unit_when_forward_setup_is_trimmed() -> None:
     segments = [
         {
             "cue_id": "K1a2Bk8NrYQ:cue:110",
@@ -1497,8 +1497,9 @@ def test_boundary_plan_rejects_a_quote_removed_with_a_forward_setup() -> None:
         topic="B-tree deletion rebalancing",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:ungrounded_boundary_quote"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["K1a2Bk8NrYQ:cue:110"]
+    assert "ungrounded_end_quote" in report.clips[0]["_boundary_fallback_reasons"]
 
 
 def test_complete_cannot_explanation_is_not_mistaken_for_a_forward_setup() -> None:
@@ -1553,9 +1554,9 @@ def test_dirty_edges_use_only_the_one_low_thinking_selector_call(monkeypatch):
     assert schema is G._BoundaryPlan
     assert kwargs["model"] == G.config.SEGMENT_FLASH_MODEL
     assert kwargs["thinking_level"] == "low"
-    assert kwargs["max_output_tokens"] == 8_192
+    assert kwargs["max_output_tokens"] == 10_240
     assert kwargs["timeout_s"] == 28.0
-    assert kwargs["max_retries"] == 1
+    assert kwargs["max_retries"] == 0
     assert kwargs["operation"] == "flash_boundary_selector"
     assert kwargs["prompt_version"] == G.FLASH_SPLIT_PROFILE
     assert kwargs["budget_reserve"] is reserve

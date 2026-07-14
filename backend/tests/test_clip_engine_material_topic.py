@@ -814,7 +814,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
             )
 
         self.assertEqual(len(reels), 1)
-        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v13")
+        self.assertEqual(reels[0].selection_contract_version, "quality_silence_v14")
         self.assertEqual(reels[0].t_start, 12.001)
         self.assertEqual(reels[0].t_end, 433.012)
         self.assertGreater(reels[0].t_end - reels[0].t_start, 180.0)
@@ -877,7 +877,7 @@ class EmbedUrlCeilTests(IngestTopicTests):
 
         self.assertEqual(len(beginner_feed), 1)
         self.assertEqual(
-            beginner_feed[0]["selection_contract_version"], "quality_silence_v13"
+            beginner_feed[0]["selection_contract_version"], "quality_silence_v14"
         )
         self.assertIsInstance(beginner_feed[0]["t_start"], float)
         self.assertIsInstance(beginner_feed[0]["t_end"], float)
@@ -1265,11 +1265,25 @@ class IngestTopicProgressTests(unittest.TestCase):
             calls.append(video["id"])
             return video, [{
                 "title": video["id"],
+                "start": 0.0,
+                "end": 1.0,
+                "cue_ids": ["cue-1"],
                 "selection_candidate_id": video["id"],
                 "search_context": {
                     "surface_eligible": video["id"] == "video-2",
                 },
-            }], {"transcript": {}}
+            }], {"transcript": {
+                "source": "supadata",
+                "native_mode": False,
+                "artifact_key": f"supadata:{video['id']}",
+                "duration": 1.0,
+                "segments": [{
+                    "cue_id": "cue-1",
+                    "start": 0.0,
+                    "end": 1.0,
+                    "text": "A complete educational thought.",
+                }],
+            }}
 
         with (
             mock.patch.object(

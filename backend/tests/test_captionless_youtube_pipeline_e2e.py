@@ -256,17 +256,17 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
         reel = reels[0]
         assert reel.video_url == (
             f"https://www.youtube.com/embed/{VIDEO_ID}"
-            "?start=4&end=45&modestbranding=1&rel=0&playsinline=1"
+            "?start=5&end=45&modestbranding=1&rel=0&playsinline=1"
         )
-        assert (reel.t_start, reel.t_end) == (4.7, 45.0)
+        assert (reel.t_start, reel.t_end) == (5.0, 45.0)
         captions = [cue.model_dump() for cue in reel.captions]
         for cue in captions:
             cue["start"] = round(float(cue["start"]), 3)
             cue["end"] = round(float(cue["end"]), 3)
         assert captions == [
-            {"start": 0.3, "end": 10.3, "text": "Python variables store values such as numbers and strings."},
-            {"start": 10.3, "end": 25.3, "text": "In Python, assign a variable with equals and print the value."},
-            {"start": 25.3, "end": 40.3, "text": "This makes a first Python program easy to understand."},
+            {"start": 0.0, "end": 10.0, "text": "Python variables store values such as numbers and strings."},
+            {"start": 10.0, "end": 25.0, "text": "In Python, assign a variable with equals and print the value."},
+            {"start": 25.0, "end": 40.0, "text": "This makes a first Python program easy to understand."},
         ]
 
         assert provider_calls[0][0].endswith("/transcript")
@@ -296,7 +296,7 @@ def test_captionless_candidate_becomes_persisted_timestamped_embed(
             )
         assert persisted is not None
         assert persisted["video_url"] == reel.video_url
-        assert (persisted["t_start"], persisted["t_end"]) == (4.7, 45.0)
+        assert (persisted["t_start"], persisted["t_end"]) == (5.0, 45.0)
         assert "Python variables" in persisted["transcript_snippet"]
     finally:
         db_module._db_ready = False

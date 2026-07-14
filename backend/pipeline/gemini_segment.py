@@ -325,7 +325,7 @@ _FLASH_REPAIR_TIMEOUT_S = 20.0
 _FLASH_ENRICH_TIMEOUT_S = 25.0
 _PRO_TIMEOUT_S = 90.0
 _SELECTION_OUTPUT_TOKENS = 24_576
-_BOUNDARY_OUTPUT_TOKENS = 8_192
+_BOUNDARY_OUTPUT_TOKENS = 10_240
 _BOUNDARY_REPAIR_OUTPUT_TOKENS = 1_024
 _ENRICH_OUTPUT_TOKENS = 2_048
 _MAX_CLIPS = 40
@@ -553,9 +553,10 @@ _POLICY_AND_EXAMPLES = """Policy:
   colorful flourishes, audience banter, post-conclusion jokes, tangents, repeated
   restatements, and partial explanations.
 - Keep starts and ends free of that filler. Never add filler or incomplete material at an
-  opening or ending. A brief nonessential aside inside an otherwise
-  valuable complete unit may remain when cutting around it would break the teaching arc;
-  never discard the whole unit solely for a short internal interruption.
+  opening or ending. Nonessential material inside an otherwise valuable complete unit may
+  remain when cutting around it would break the teaching arc;
+  never discard the whole unit solely for an internal interruption, regardless of that
+  interruption's length.
 - Omit teaching that depends on a diagram, screen, gesture, drawing, or other missing
   visual context. Mark self_contained and is_standalone false for such material.
 - Exhaustively enumerate every distinct related teaching unit, up to 40 per source. Prefer an empty
@@ -753,10 +754,14 @@ def _boundary_prompts(
         "of its duration. Give it exactly one learning objective. Split independent adjacent "
         "facets into separate candidates even when they share one coarse transcript line. "
         "Keep opening and ending edges clean, including generic lead-ins and bracketed "
-        "non-speech markers. Split around a substantial "
-        "interruption, but keep a brief internal aside when removing it would break an "
-        "otherwise valuable complete arc. Omit only high-uncertainty boundaries; low or "
-        "medium uncertainty is allowed. Omit material that requires an unseen visual.\n"
+        "non-speech markers. Split around an internal interruption when separate complete "
+        "units remain; otherwise keep it rather than discard a valuable complete arc. "
+        "Never omit a substantive grounded unit solely "
+        "because its boundary is uncertain: return its complete cue span and mark "
+        "high uncertainty with boundary_ambiguous or overlap_risk. Omit only high content, "
+        "context, or topic uncertainty; severe transcript noise counts as content "
+        "uncertainty. Low or medium uncertainty is allowed. Omit material that requires an "
+        "unseen visual.\n"
         "4. Score topic relevance, information density, educational value, and difficulty "
         "honestly. Return a unit only when topic_relevance, informativeness, and "
         "educational_importance are each at least 0.75. Difficulty is metadata, not an "
@@ -1732,6 +1737,16 @@ def _semantic_edge_quote(
     if not word_matches or not spans:
         return None, False, "ungrounded_boundary_quote"
     span = spans[0] if want == "start" else spans[-1]
+    quote_matches = list(_WORD_RE.finditer(str(quote or "")))
+    if quote_matches:
+        left, right = span
+        prefix = str(quote or "")[:quote_matches[0].start()]
+        suffix = str(quote or "")[quote_matches[-1].end():]
+        if prefix and left >= len(prefix) and text[left - len(prefix):left] == prefix:
+            left -= len(prefix)
+        if suffix and text[right:right + len(suffix)] == suffix:
+            right += len(suffix)
+        span = (left, right)
     projected = bool(
         _WORD_RE.search(text[:span[0]])
         if want == "start"
@@ -1759,10 +1774,26 @@ def _expanded_context_edge_quote(
 
     retained_left = 0
     retained_right = len(raw_text)
+    full_text_edge_matches = [
+        match
+        for match in _structural_filler_matches(raw_text)
+        if _structural_match_is_edge(raw_text, match, want=want)
+    ]
     ordered_spans = sentence_spans if want == "start" else list(reversed(sentence_spans))
     for left, right in ordered_spans:
         sentence = raw_text[left:right]
         matches = _structural_filler_matches(sentence)
+        absolute_edge_match = any(
+            match.start() < right and match.end() > left
+            for match in full_text_edge_matches
+        )
+        if absolute_edge_match and not matches:
+            if want == "start" and right < len(raw_text):
+                retained_left = right
+                continue
+            if want == "end" and left > 0:
+                retained_right = left
+                continue
         if not matches:
             break
         if _cue_is_only_structural_filler(sentence):
@@ -1777,6 +1808,13 @@ def _expanded_context_edge_quote(
             for match in matches
             if _structural_match_is_edge(sentence, match, want=want)
         ]
+        if not edge_matches and absolute_edge_match:
+            if want == "start" and right < len(raw_text):
+                retained_left = right
+                continue
+            if want == "end" and left > 0:
+                retained_right = left
+                continue
         if edge_matches:
             inline_boundary_applied = False
             if want == "start":
@@ -1803,6 +1841,12 @@ def _expanded_context_edge_quote(
                     inline_boundary_applied = True
             if inline_boundary_applied:
                 break
+            if want == "start" and right < len(raw_text):
+                retained_left = right
+                continue
+            if want == "end" and left > 0:
+                retained_right = left
+                continue
             return "", "unresolved_expanded_edge_filler"
         break
 
@@ -1814,7 +1858,18 @@ def _expanded_context_edge_quote(
     if not retained_words:
         return "", "empty_expanded_context_edge"
     chosen = retained_words[:6] if want == "start" else retained_words[-6:]
-    return raw_text[chosen[0].start():chosen[-1].end()], None
+    quote_end = chosen[-1].end()
+    if want == "end":
+        retained_suffix_end = retained_right
+        while (
+            retained_suffix_end > quote_end
+            and raw_text[retained_suffix_end - 1].isspace()
+        ):
+            retained_suffix_end -= 1
+        suffix = raw_text[quote_end:retained_suffix_end]
+        if suffix and not _WORD_RE.search(suffix):
+            quote_end = retained_suffix_end
+    return raw_text[chosen[0].start():quote_end], None
 
 
 def _edge_has_unresolved_structural_filler(
@@ -2477,6 +2532,9 @@ def _plan_to_report(
         start_text = str(segments[a].get("text") or "").strip()
         end_text = str(segments[b].get("text") or "").strip()
         quote_repaired = False
+        fallback_start_edge = False
+        fallback_end_edge = False
+        boundary_fallback_reasons: list[str] = []
         if not _contains_quote(start_text, start_quote):
             matching_lines = [
                 line
@@ -2495,24 +2553,30 @@ def _plan_to_report(
                 if not matching_lines
                 else []
             )
+            anchored_line: int | None = None
+            anchored_quote = start_quote
             if len(matching_lines) == 1:
                 anchored_line = matching_lines[0]
             elif len(cross_matches) == 1:
                 anchored_line = cross_matches[0][0]
-                start_quote = cross_matches[0][2]
-            else:
-                report.rejected_reasons.append(f"{prefix}:bad_start_quote")
-                continue
-            if any(
-                not _cue_is_only_structural_filler(
-                    str(segments[line].get("text") or "")
+                anchored_quote = cross_matches[0][2]
+            can_reanchor = bool(
+                anchored_line is not None
+                and all(
+                    _cue_is_only_structural_filler(
+                        str(segments[line].get("text") or "")
+                    )
+                    for line in range(proposed_start, anchored_line)
                 )
-                for line in range(proposed_start, anchored_line)
-            ):
-                report.rejected_reasons.append(f"{prefix}:bad_start_quote")
-                continue
-            a = anchored_line
-            start_text = str(segments[a].get("text") or "").strip()
+            )
+            if can_reanchor and anchored_line is not None:
+                a = anchored_line
+                start_quote = anchored_quote
+                start_text = str(segments[a].get("text") or "").strip()
+            else:
+                start_quote = _exact_boundary_quote(start_text, want="start")
+                fallback_start_edge = True
+                boundary_fallback_reasons.append("bad_start_quote")
             quote_repaired = True
         if not _contains_quote(end_text, end_quote):
             matching_lines = [
@@ -2532,28 +2596,40 @@ def _plan_to_report(
                 if not matching_lines
                 else []
             )
+            anchored_line = None
+            anchored_quote = end_quote
             if len(matching_lines) == 1:
                 anchored_line = matching_lines[0]
             elif len(cross_matches) == 1:
                 anchored_line = cross_matches[0][1]
-                end_quote = cross_matches[0][3]
-            else:
-                report.rejected_reasons.append(f"{prefix}:bad_end_quote")
-                continue
-            if any(
-                not _cue_is_only_structural_filler(
-                    str(segments[line].get("text") or "")
+                anchored_quote = cross_matches[0][3]
+            can_reanchor = bool(
+                anchored_line is not None
+                and all(
+                    _cue_is_only_structural_filler(
+                        str(segments[line].get("text") or "")
+                    )
+                    for line in range(anchored_line + 1, proposed_end + 1)
                 )
-                for line in range(anchored_line + 1, proposed_end + 1)
-            ):
-                report.rejected_reasons.append(f"{prefix}:bad_end_quote")
-                continue
-            b = anchored_line
-            end_text = str(segments[b].get("text") or "").strip()
+            )
+            if can_reanchor and anchored_line is not None:
+                b = anchored_line
+                end_quote = anchored_quote
+                end_text = str(segments[b].get("text") or "").strip()
+            else:
+                end_quote = _exact_boundary_quote(end_text, want="end")
+                fallback_end_edge = True
+                boundary_fallback_reasons.append("bad_end_quote")
             quote_repaired = True
         if a > b:
-            report.rejected_reasons.append(f"{prefix}:reversed_quote_order")
-            continue
+            a, b = proposed_start, proposed_end
+            start_text = str(segments[a].get("text") or "").strip()
+            end_text = str(segments[b].get("text") or "").strip()
+            start_quote = _exact_boundary_quote(start_text, want="start")
+            end_quote = _exact_boundary_quote(end_text, want="end")
+            fallback_start_edge = fallback_end_edge = True
+            boundary_fallback_reasons.append("reversed_quote_order")
+            quote_repaired = True
         selected_start_before_context = a
         selected_end_before_context = b
         context_repair_source_text = _cue_clip_text(
@@ -2627,9 +2703,20 @@ def _plan_to_report(
         uncertainty = str(getattr(proposal, "uncertainty", "low") or "low")
         uncertainty_reasons = [str(getattr(reason, "value", reason))
                                for reason in (getattr(proposal, "uncertainty_reasons", None) or [])]
-        if uncertainty == "high":
+        boundary_only_uncertainty = bool(
+            uncertainty == "high"
+            and uncertainty_reasons
+            and set(uncertainty_reasons).issubset(
+                {"boundary_ambiguous", "overlap_risk"}
+            )
+        )
+        if uncertainty == "high" and not boundary_only_uncertainty:
             report.rejected_reasons.append(f"{prefix}:{uncertainty}_uncertainty")
             continue
+        if boundary_only_uncertainty:
+            boundary_fallback_reasons.extend(
+                f"model_{reason}" for reason in uncertainty_reasons
+            )
 
         start_quote, repaired_start_edge, edge_error = _replace_structural_edge_quote(
             start_text,
@@ -2637,16 +2724,20 @@ def _plan_to_report(
             want="start",
         )
         if edge_error:
-            report.rejected_reasons.append(f"{prefix}:{edge_error}")
-            continue
+            start_quote = _exact_boundary_quote(start_text, want="start")
+            fallback_start_edge = True
+            boundary_fallback_reasons.append(edge_error)
+            quote_repaired = True
         end_quote, repaired_end_edge, edge_error = _replace_structural_edge_quote(
             end_text,
             end_quote,
             want="end",
         )
         if edge_error:
-            report.rejected_reasons.append(f"{prefix}:{edge_error}")
-            continue
+            end_quote = _exact_boundary_quote(end_text, want="end")
+            fallback_end_edge = True
+            boundary_fallback_reasons.append(edge_error)
+            quote_repaired = True
         quote_repaired = quote_repaired or repaired_start_edge or repaired_end_edge
 
         # Run discourse closure against the teaching slice the model selected, not
@@ -2687,8 +2778,14 @@ def _plan_to_report(
             cue_limit=context_cue_limit,
         )
         if closure_error:
-            report.rejected_reasons.append(f"{prefix}:{closure_error}")
-            continue
+            if closure_error == "unresolved_weak_end":
+                # A setup, question, or example without its answer is not a
+                # complete educational unit; this is a content failure rather
+                # than a demand for exact acoustic timing.
+                report.rejected_reasons.append(f"{prefix}:{closure_error}")
+                continue
+            fallback_start_edge = True
+            boundary_fallback_reasons.append(closure_error)
 
         filler_trim = _trim_structural_filler_edges(
             segments,
@@ -2702,8 +2799,9 @@ def _plan_to_report(
         a, b = filler_trim
         internal_filler_reason = _internal_structural_filler_reason(segments, a, b)
         if internal_filler_reason:
-            report.rejected_reasons.append(f"{prefix}:{internal_filler_reason}")
-            continue
+            boundary_fallback_reasons.append(
+                f"retained_{internal_filler_reason}"
+            )
         context_was_trimmed = b < selected_end_before_context
         start, end = _padded_cue_bounds(segments, a, b)
         if not math.isfinite(start) or not math.isfinite(end) or end <= start:
@@ -2716,16 +2814,14 @@ def _plan_to_report(
             report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
             continue
         if not _contains_quote(full_clip_text, start_quote):
-            if type(proposal) is _BoundaryTopic:
-                report.rejected_reasons.append(f"{prefix}:ungrounded_boundary_quote")
-                continue
             start_quote = _exact_boundary_quote(full_clip_text, want="start")
+            fallback_start_edge = True
+            boundary_fallback_reasons.append("ungrounded_start_quote")
             quote_repaired = True
         if not _contains_quote(full_clip_text, end_quote):
-            if type(proposal) is _BoundaryTopic:
-                report.rejected_reasons.append(f"{prefix}:ungrounded_boundary_quote")
-                continue
             end_quote = _exact_boundary_quote(full_clip_text, want="end")
+            fallback_end_edge = True
+            boundary_fallback_reasons.append("ungrounded_end_quote")
             quote_repaired = True
         if not start_quote or not end_quote:
             report.rejected_reasons.append(f"{prefix}:ungrounded_boundary_quote")
@@ -2738,14 +2834,34 @@ def _plan_to_report(
                 str(segments[a].get("text") or ""), want="start"
             )
             if edge_error:
-                report.rejected_reasons.append(f"{prefix}:{edge_error}")
-                continue
+                start_quote = _exact_boundary_quote(
+                    str(segments[a].get("text") or ""), want="start"
+                )
+                fallback_start_edge = True
+                boundary_fallback_reasons.append(edge_error)
             quote_repaired = True
+        if fallback_start_edge:
+            start_text = str(segments[a].get("text") or "")
+            trimmed_quote, _ = _expanded_context_edge_quote(
+                start_text, want="start"
+            )
+            start_quote = trimmed_quote or _exact_boundary_quote(
+                start_text, want="start"
+            )
         start_span, start_projected, edge_error = _semantic_edge_quote(
             str(segments[a].get("text") or ""), start_quote, want="start"
         )
         if edge_error:
-            report.rejected_reasons.append(f"{prefix}:{edge_error}")
+            start_quote = _exact_boundary_quote(
+                str(segments[a].get("text") or ""), want="start"
+            )
+            start_span, start_projected, edge_error = _semantic_edge_quote(
+                str(segments[a].get("text") or ""), start_quote, want="start"
+            )
+            fallback_start_edge = True
+            boundary_fallback_reasons.append(edge_error or "start_edge_fallback")
+        if edge_error or start_span is None:
+            report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
             continue
         assert start_span is not None
         start_text = str(segments[a].get("text") or "")
@@ -2753,8 +2869,20 @@ def _plan_to_report(
         if _edge_has_unresolved_structural_filler(
             str(segments[a].get("text") or ""), start_span, want="start"
         ):
-            report.rejected_reasons.append(f"{prefix}:unresolved_edge_filler")
-            continue
+            trimmed_quote, _ = _expanded_context_edge_quote(
+                start_text, want="start"
+            )
+            start_quote = trimmed_quote or _exact_boundary_quote(
+                start_text, want="start"
+            )
+            start_span, start_projected, _ = _semantic_edge_quote(
+                start_text, start_quote, want="start"
+            )
+            fallback_start_edge = True
+            boundary_fallback_reasons.append("unresolved_start_edge_filler")
+            if start_span is None:
+                report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
+                continue
 
         if b != selected_end_before_context:
             expanded_end_text = str(segments[b].get("text") or "")
@@ -2776,14 +2904,34 @@ def _plan_to_report(
                 expanded_end_text, want="end"
             )
             if edge_error:
-                report.rejected_reasons.append(f"{prefix}:{edge_error}")
-                continue
+                end_quote = _exact_boundary_quote(
+                    str(segments[b].get("text") or ""), want="end"
+                )
+                fallback_end_edge = True
+                boundary_fallback_reasons.append(edge_error)
             quote_repaired = True
+        if fallback_end_edge:
+            end_text = str(segments[b].get("text") or "")
+            trimmed_quote, _ = _expanded_context_edge_quote(
+                end_text, want="end"
+            )
+            end_quote = trimmed_quote or _exact_boundary_quote(
+                end_text, want="end"
+            )
         end_span, end_projected, edge_error = _semantic_edge_quote(
             str(segments[b].get("text") or ""), end_quote, want="end"
         )
         if edge_error:
-            report.rejected_reasons.append(f"{prefix}:{edge_error}")
+            end_quote = _exact_boundary_quote(
+                str(segments[b].get("text") or ""), want="end"
+            )
+            end_span, end_projected, edge_error = _semantic_edge_quote(
+                str(segments[b].get("text") or ""), end_quote, want="end"
+            )
+            fallback_end_edge = True
+            boundary_fallback_reasons.append(edge_error or "end_edge_fallback")
+        if edge_error or end_span is None:
+            report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
             continue
         assert end_span is not None
         end_text = str(segments[b].get("text") or "")
@@ -2791,8 +2939,20 @@ def _plan_to_report(
         if _edge_has_unresolved_structural_filler(
             str(segments[b].get("text") or ""), end_span, want="end"
         ):
-            report.rejected_reasons.append(f"{prefix}:unresolved_edge_filler")
-            continue
+            trimmed_quote, _ = _expanded_context_edge_quote(
+                end_text, want="end"
+            )
+            end_quote = trimmed_quote or _exact_boundary_quote(
+                end_text, want="end"
+            )
+            end_span, end_projected, _ = _semantic_edge_quote(
+                end_text, end_quote, want="end"
+            )
+            fallback_end_edge = True
+            boundary_fallback_reasons.append("unresolved_end_edge_filler")
+            if end_span is None:
+                report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
+                continue
 
         clip_text, semantic_spans_by_cue = _semantic_clip_slice(
             segments,
@@ -2802,15 +2962,26 @@ def _plan_to_report(
             end_span=end_span if end_projected else None,
         )
         if not clip_text:
-            report.rejected_reasons.append(f"{prefix}:reversed_semantic_boundary")
-            continue
+            start_projected = end_projected = False
+            clip_text, semantic_spans_by_cue = _semantic_clip_slice(
+                segments,
+                a,
+                b,
+                start_span=None,
+                end_span=None,
+            )
+            boundary_fallback_reasons.append("reversed_semantic_boundary")
+            if not clip_text:
+                report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
+                continue
         if _contains_unrequested_vampire_pseudoscience(clip_text, topic):
             report.rejected_reasons.append(f"{prefix}:fictional_framing")
             continue
         same_cue_filler_reason = _same_cue_internal_filler_reason(clip_text)
         if same_cue_filler_reason:
-            report.rejected_reasons.append(f"{prefix}:{same_cue_filler_reason}")
-            continue
+            boundary_fallback_reasons.append(
+                f"retained_{same_cue_filler_reason}"
+            )
         if _clip_requires_visual_context(clip_text):
             report.rejected_reasons.append(f"{prefix}:requires_visual_context")
             continue
@@ -2926,6 +3097,9 @@ def _plan_to_report(
             "_proposal_index": index,
             "_semantic_spans_by_cue": semantic_spans_by_cue,
             "_quote_repaired": quote_repaired,
+            "_boundary_fallback_reasons": list(
+                dict.fromkeys(boundary_fallback_reasons)
+            ),
             "directly_teaches_topic": bool(
                 getattr(proposal, "directly_teaches_topic", True)
             ),
@@ -3445,9 +3619,10 @@ def _run_selection_profile(
         prompt_version=profile,
         cancelled=cancelled,
         budget_reserve=settings.get("_segment_budget_reserve"),
-        # Keep the production selector to one logical, once-reserved call with
-        # one bounded retry for a transient provider failure.
-        max_retries=1,
+        # One uncached source gets exactly one physical selector request. A
+        # second provider attempt would add latency and billable work while
+        # violating the shared source-level cost contract.
+        max_retries=0,
     )
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)

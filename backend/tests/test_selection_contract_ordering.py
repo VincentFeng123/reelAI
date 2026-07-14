@@ -552,7 +552,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             ).fetchone()
             context = json.loads(row[0])
             context.update({
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
                 "self_contained": True,
                 "topic_evidence_quote": (
                     "Chemical bonding explains how atoms share or transfer electrons"
@@ -563,7 +563,12 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 "boundary_status": "verified",
                 "boundary_diagnostics": {
                     "acoustic_verified": True,
-                    "acoustic": {"threshold_dbfs": -38.0},
+                    "final_range": [10.0, 30.0],
+                    "acoustic": {
+                        "threshold_dbfs": -38.0,
+                        "start_quiet": [9.9, 10.1],
+                        "end_quiet": [29.9, 30.1],
+                    },
                 },
                 "speech_corridor_verified": True,
             })
@@ -600,7 +605,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
             return {
                 "reel_id": reel_id,
                 "difficulty": difficulty,
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
             }
 
         easy = item("easy", 0.15)
@@ -740,7 +745,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         ).fetchone()
         context = json.loads(row[0])
         context.update({
-            "selection_contract_version": "quality_silence_v13",
+            "selection_contract_version": "quality_silence_v14",
             "topic_relevance": 0.93,
             "self_contained": True,
             "topic_evidence_quote": (
@@ -785,7 +790,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
         for result in (fresh, cached):
             self.assertEqual(len(result), 1)
             self.assertEqual(
-                result[0]["selection_contract_version"], "quality_silence_v13"
+                result[0]["selection_contract_version"], "quality_silence_v14"
             )
             self.assertAlmostEqual(result[0]["relevance_score"], 0.93)
             self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
@@ -1024,7 +1029,7 @@ class SelectionContractOrderingTests(unittest.TestCase):
 
         self.assertEqual(self._ranked(), [])
 
-    def test_production_feed_requires_measured_acoustic_verification(self) -> None:
+    def test_production_feed_accepts_strict_or_valid_transcript_boundaries(self) -> None:
         states = [
             ("missing", "", {"acoustic_verified": None}),
             ("caption", "caption_aligned", {"acoustic_verified": False}),
@@ -1078,11 +1083,65 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 (json.dumps(context), reel_id),
             )
 
+        for reel_id, start, captions in (
+            (
+                "transcript-aligned",
+                170.0,
+                [{
+                    "cue_id": "cue-1",
+                    "start": 170.0,
+                    "end": 190.0,
+                    "text": "Chemical bonding explains electron sharing.",
+                }],
+            ),
+            ("malformed-transcript", 195.0, [{}]),
+        ):
+            self._insert_versioned_reel(
+                reel_id=reel_id,
+                video_id="video-a",
+                start=start,
+                difficulty=0.15,
+                base_score=0.8,
+            )
+            row = self.conn.execute(
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                (reel_id,),
+            ).fetchone()
+            context = json.loads(row[0])
+            context.update({
+                "selection_contract_version": "quality_silence_v14",
+                "self_contained": True,
+                "topic_evidence_quote": (
+                    "Chemical bonding explains how atoms share or transfer electrons"
+                ),
+                "surface_eligible": True,
+                "speech_corridor_verified": True,
+                "boundary_status": "context_aligned",
+                "selection_caption_cues": captions,
+                "boundary_diagnostics": {
+                    "method": "transcript_context",
+                    "context_aligned": True,
+                    "acoustic_verified": False,
+                    "transcript": {
+                        "context_aligned": True,
+                        "stage": "transcript",
+                        "reason": "complete_discourse_boundary",
+                        "required_speech_range": [start, start + 20.0],
+                        "semantic_range": [start, start + 20.0],
+                        "final_range": [start, start + 20.0],
+                    },
+                },
+            })
+            self.conn.execute(
+                "UPDATE reels SET search_context_json = ? WHERE id = ?",
+                (json.dumps(context), reel_id),
+            )
+
         ranked = self._ranked(require_verified_boundaries=True)
 
         self.assertEqual(
             {item["reel_id"] for item in ranked},
-            {"strict-verified"},
+            {"strict-verified", "transcript-aligned"},
         )
 
     def test_level_mismatched_verified_clip_waits_in_storage_until_ready(self) -> None:

@@ -32,7 +32,7 @@ from . import lexical_timing
 
 
 CancelCheck = Callable[[], bool]
-VerificationStatus = Literal["verified", "unavailable"]
+VerificationStatus = Literal["verified", "context_aligned", "unavailable"]
 PreparationStatus = Literal["ready", "unavailable"]
 
 DEFAULT_TIMEOUT_SEC = 20.0
@@ -210,6 +210,10 @@ class SilenceVerificationResult:
     def verified(self) -> bool:
         return self.status == "verified"
 
+    @property
+    def usable(self) -> bool:
+        return self.status in {"verified", "context_aligned"}
+
 
 @dataclass(frozen=True)
 class _QuietInterval:
@@ -280,6 +284,157 @@ def persisted_boundary_is_verified(context: object) -> bool:
             if not math.isfinite(threshold) or threshold > QUIET_THRESHOLD_DBFS:
                 return False
     return saw_threshold
+
+
+def _diagnostic_range(value: object) -> tuple[float, float] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)) or len(value) != 2:
+        return None
+    try:
+        start, end = (float(item) for item in value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if (
+        not math.isfinite(start)
+        or not math.isfinite(end)
+        or start < 0.0
+        or end <= start
+    ):
+        return None
+    return start, end
+
+
+def persisted_boundary_is_usable(
+    context: object,
+    *,
+    t_start: object | None = None,
+    t_end: object | None = None,
+) -> bool:
+    """Accept strict silence or an explicit, bounded transcript fallback.
+
+    Context-aligned rows remain distinguishable from acoustically verified
+    rows. They are usable only for the current selection contract and only
+    when their final range contains every required word while staying inside
+    the already validated semantic corridor.
+    """
+
+    if not isinstance(context, Mapping):
+        return False
+    persisted_range: tuple[float, float] | None = None
+    if t_start is not None or t_end is not None:
+        persisted_range = _diagnostic_range([t_start, t_end])
+        if persisted_range is None:
+            return False
+    if persisted_boundary_is_verified(context):
+        if persisted_range is None:
+            return True
+        diagnostics = context.get("boundary_diagnostics")
+        if not isinstance(diagnostics, Mapping):
+            return False
+        is_current_contract = bool(
+            str(context.get("selection_contract_version") or "").strip()
+            == "quality_silence_v14"
+        )
+        final = _diagnostic_range(diagnostics.get("final_range"))
+        if final is not None:
+            final_matches = bool(
+                abs(persisted_range[0] - final[0]) <= 1e-3
+                and abs(persisted_range[1] - final[1]) <= 1e-3
+            )
+            if not final_matches or not is_current_contract:
+                return final_matches
+        acoustic = diagnostics.get("acoustic")
+        if not isinstance(acoustic, Mapping):
+            return False
+        start_quiet = _diagnostic_range(acoustic.get("start_quiet"))
+        end_quiet = _diagnostic_range(acoustic.get("end_quiet"))
+        if start_quiet is None or end_quiet is None:
+            return not is_current_contract
+        return bool(
+            start_quiet[0] - 1e-3
+            <= persisted_range[0]
+            <= start_quiet[1] + 1e-3
+            and end_quiet[0] - 1e-3
+            <= persisted_range[1]
+            <= end_quiet[1] + 1e-3
+        )
+    diagnostics = context.get("boundary_diagnostics")
+    captions = context.get("selection_caption_cues")
+    if (
+        str(context.get("selection_contract_version") or "").strip()
+        != "quality_silence_v14"
+        or str(context.get("boundary_status") or "").strip().lower()
+        != "context_aligned"
+        or context.get("speech_corridor_verified") is not True
+        or not isinstance(captions, list)
+        or not captions
+        or not isinstance(diagnostics, Mapping)
+        or diagnostics.get("method") != "transcript_context"
+        or diagnostics.get("context_aligned") is not True
+        or diagnostics.get("acoustic_verified") is not False
+    ):
+        return False
+    transcript = diagnostics.get("transcript")
+    if (
+        not isinstance(transcript, Mapping)
+        or transcript.get("context_aligned") is not True
+        or not str(transcript.get("stage") or "").strip()
+        or not str(transcript.get("reason") or "").strip()
+    ):
+        return False
+    required = _diagnostic_range(transcript.get("required_speech_range"))
+    semantic = _diagnostic_range(transcript.get("semantic_range"))
+    final = _diagnostic_range(transcript.get("final_range"))
+    if required is None or semantic is None or final is None:
+        return False
+    if persisted_range is not None:
+        if (
+            abs(persisted_range[0] - final[0]) > 1e-3
+            or abs(persisted_range[1] - final[1]) > 1e-3
+        ):
+            return False
+    if not (
+        semantic[0] <= final[0] <= required[0]
+        and required[1] <= final[1] <= semantic[1]
+    ):
+        return False
+    caption_ranges: list[tuple[float, float]] = []
+    for caption in captions:
+        if (
+            not isinstance(caption, Mapping)
+            or not str(caption.get("text") or "").strip()
+        ):
+            return False
+        caption_range = _diagnostic_range(
+            [caption.get("start"), caption.get("end")]
+        )
+        if caption_range is None:
+            return False
+        if caption_ranges and (
+            caption_range[0] + 1e-3 < caption_ranges[-1][0]
+            or caption_range[1] + 1e-3 < caption_ranges[-1][1]
+        ):
+            return False
+        caption_ranges.append(caption_range)
+    caption_start = min(item[0] for item in caption_ranges)
+    caption_end = max(item[1] for item in caption_ranges)
+    required_start_covered = any(
+        caption_start_sec <= required[0] + 1e-3
+        and caption_end_sec > required[0] + 1e-3
+        for caption_start_sec, caption_end_sec in caption_ranges
+    )
+    required_end_covered = any(
+        caption_start_sec < required[1] - 1e-3
+        and caption_end_sec + 1e-3 >= required[1]
+        for caption_start_sec, caption_end_sec in caption_ranges
+    )
+    return bool(
+        caption_start <= final[0] + 1e-3
+        and caption_end + 1e-3 >= final[1]
+        and caption_start <= required[0] + 1e-3
+        and caption_end + 1e-3 >= required[1]
+        and required_start_covered
+        and required_end_covered
+    )
 
 
 def _is_cancelled(cancel_check: CancelCheck | None) -> bool:
@@ -1676,6 +1831,7 @@ __all__ = [
     "PreparedAudioSource",
     "SilenceVerificationResult",
     "persisted_boundary_is_verified",
+    "persisted_boundary_is_usable",
     "prepare_audio_source",
     "verify_acoustic_boundaries",
 ]

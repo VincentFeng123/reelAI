@@ -130,7 +130,7 @@ class GenerationBudget:
     }
     _GEMINI_COST_LIMIT_USD: dict[GenerationMode, float] = {
         # Worst-case reservations for one low-thinking Flash-Lite expansion
-        # plus two/three 40k-input, 8,192-output Flash selectors. Actual
+        # plus two/three 40k-input, 10,240-output Flash selectors. Actual
         # structured responses are normally much smaller; these ceilings only
         # keep a valid long transcript from being rejected before dispatch.
         "fast": 0.13,

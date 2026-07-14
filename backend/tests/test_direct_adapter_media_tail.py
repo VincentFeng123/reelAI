@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -100,49 +99,7 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         get_settings.cache_clear()
         main_module.settings = get_settings()
 
-    def _patch_media_tail(self):
-        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
-            "ready",
-            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
-                "https://audio.invalid/tail",
-                format_id="140",
-                duration_sec=12.0,
-            ),
-        )
-        acoustic = pipeline_module.clip_engine_silence.SilenceVerificationResult(
-            "verified",
-            0.0,
-            10.2,
-            {
-                "threshold_dbfs": -38.0,
-                "speech_handoff_verified": True,
-                "end_speech_handoff_verified": True,
-                "end_two_sided_required": False,
-                "semantic_start_limit_sec": 0.0,
-                "semantic_end_limit_sec": 12.0,
-                "observation_start_limit_sec": 0.0,
-                "observation_end_limit_sec": 11.0,
-                "handoff_timestamp_tolerance_sec": 0.05,
-                "start_quiet": [0.0, 0.2],
-                "end_quiet": [10.0, 10.3],
-            },
-        )
-        return (
-            mock.patch.object(pipeline_module, "clip_engine_run"),
-            mock.patch.object(pipeline_module, "clip_engine_meta"),
-            mock.patch.object(
-                pipeline_module.clip_engine_silence,
-                "prepare_audio_source",
-                return_value=prepared,
-            ),
-            mock.patch.object(
-                pipeline_module.clip_engine_silence,
-                "verify_acoustic_boundaries",
-                return_value=acoustic,
-            ),
-        )
-
-    def _assert_persisted_tail(self, reel_id: str) -> None:
+    def _assert_persisted_boundary(self, reel_id: str, expected_end: float) -> None:
         with db_module.get_conn() as conn:
             row = db_module.fetch_one(
                 conn,
@@ -151,37 +108,21 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
             )
         self.assertIsNotNone(row)
         self.assertAlmostEqual(float(row["t_start"]), 0.0)
-        self.assertAlmostEqual(float(row["t_end"]), 10.2)
+        self.assertAlmostEqual(float(row["t_end"]), expected_end)
 
-    def test_direct_selector_overlaps_audio_preparation(self) -> None:
-        audio_started = threading.Event()
-        selector_released_audio = threading.Event()
-        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
-            "ready",
-            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
-                "https://audio.invalid/parallel",
-            ),
-        )
-
-        def prepare(*_args, **_kwargs):
-            audio_started.set()
-            self.assertTrue(selector_released_audio.wait(timeout=1.0))
-            return prepared
-
-        def select(*_args, **_kwargs):
-            self.assertTrue(audio_started.wait(timeout=1.0))
-            selector_released_audio.set()
-            return _media_tail_engine_out()
-
+    def test_direct_selector_does_not_start_audio_preparation(self) -> None:
         with (
             mock.patch.object(
                 pipeline_module.clip_engine_silence,
                 "prepare_audio_source",
-                side_effect=prepare,
+            ) as prepare,
+            mock.patch.object(
+                pipeline_module,
+                "_run_clip",
+                return_value=_media_tail_engine_out(),
             ),
-            mock.patch.object(pipeline_module, "_run_clip", side_effect=select),
         ):
-            engine_out, result = pipeline_module._run_direct_clip_with_audio_prefetch(
+            engine_out = pipeline_module._run_direct_clip(
                 SOURCE_URL,
                 topic="photosynthesis",
                 language="en",
@@ -190,15 +131,36 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
             )
 
         self.assertEqual(engine_out["video_id"], VIDEO_ID)
-        self.assertIs(result, prepared)
+        prepare.assert_not_called()
 
-    def test_url_adapter_persists_acoustic_tail_within_prepared_media(self) -> None:
-        run_patch, meta_patch, prepare_patch, verify_patch = self._patch_media_tail()
+    def test_transcript_only_direct_boundary_verification_is_sequential(self) -> None:
+        with mock.patch.object(
+            pipeline_module,
+            "ThreadPoolExecutor",
+            side_effect=AssertionError(
+                "transcript-only boundary verification must stay sequential"
+            ),
+        ) as executor:
+            clips = pipeline_module._verified_direct_adapter_clips(
+                source_url=SOURCE_URL,
+                engine_out=_media_tail_engine_out(),
+                should_cancel=None,
+                prepared_audio=None,
+            )
+
+        self.assertEqual(len(clips), 1)
+        executor.assert_not_called()
+
+    def test_url_adapter_uses_transcript_boundary_without_audio_work(self) -> None:
         with (
-            run_patch as mock_run,
-            meta_patch as mock_meta,
-            prepare_patch,
-            verify_patch as mock_verify,
+            mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
+            mock.patch.object(pipeline_module, "clip_engine_meta") as mock_meta,
+            mock.patch.object(
+                pipeline_module.clip_engine_silence, "prepare_audio_source"
+            ) as prepare,
+            mock.patch.object(
+                pipeline_module.clip_engine_silence, "verify_acoustic_boundaries"
+            ) as verify,
         ):
             mock_meta.extract_video_id.return_value = VIDEO_ID
             mock_run.clip.return_value = _media_tail_engine_out()
@@ -208,24 +170,22 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
                 language="en",
             )
 
-        self.assertAlmostEqual(result.reel.t_end, 10.2)
-        self.assertAlmostEqual(result.metadata.duration_sec, 12.0)
-        self.assertAlmostEqual(
-            mock_verify.call_args.kwargs["search_end_limit_sec"], 12.0
-        )
-        self.assertFalse(mock_verify.call_args.kwargs["require_speech_handoff"])
-        self.assertTrue(
-            mock_verify.call_args.kwargs["require_end_speech_handoff"]
-        )
-        self._assert_persisted_tail(result.reel.reel_id)
+        self.assertAlmostEqual(result.reel.t_end, 10.0)
+        self.assertAlmostEqual(result.metadata.duration_sec, 10.0)
+        prepare.assert_not_called()
+        verify.assert_not_called()
+        self._assert_persisted_boundary(result.reel.reel_id, 10.0)
 
-    def test_topic_cut_adapter_persists_acoustic_tail_within_prepared_media(self) -> None:
-        run_patch, meta_patch, prepare_patch, verify_patch = self._patch_media_tail()
+    def test_topic_cut_adapter_uses_same_transcript_boundary_path(self) -> None:
         with (
-            run_patch as mock_run,
-            meta_patch as mock_meta,
-            prepare_patch,
-            verify_patch as mock_verify,
+            mock.patch.object(pipeline_module, "clip_engine_run") as mock_run,
+            mock.patch.object(pipeline_module, "clip_engine_meta") as mock_meta,
+            mock.patch.object(
+                pipeline_module.clip_engine_silence, "prepare_audio_source"
+            ) as prepare,
+            mock.patch.object(
+                pipeline_module.clip_engine_silence, "verify_acoustic_boundaries"
+            ) as verify,
         ):
             mock_meta.extract_video_id.return_value = VIDEO_ID
             mock_run.clip.return_value = _media_tail_engine_out()
@@ -234,22 +194,36 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
                 source_url=SOURCE_URL,
                 query="photosynthesis",
                 language="en",
-            )
+        )
 
         self.assertEqual(result.reel_count, 1)
-        self.assertAlmostEqual(result.reels[0].t_end, 10.2)
-        self.assertAlmostEqual(result.duration_sec, 12.0)
-        self.assertAlmostEqual(result.metadata.duration_sec, 12.0)
-        self.assertAlmostEqual(
-            mock_verify.call_args.kwargs["search_end_limit_sec"], 12.0
-        )
-        self.assertFalse(mock_verify.call_args.kwargs["require_speech_handoff"])
-        self.assertTrue(
-            mock_verify.call_args.kwargs["require_end_speech_handoff"]
-        )
-        self._assert_persisted_tail(result.reels[0].reel_id)
+        self.assertAlmostEqual(result.reels[0].t_end, 10.0)
+        self.assertAlmostEqual(result.duration_sec, 10.0)
+        self.assertAlmostEqual(result.metadata.duration_sec, 10.0)
+        prepare.assert_not_called()
+        verify.assert_not_called()
+        self._assert_persisted_boundary(result.reels[0].reel_id, 10.0)
 
-    def test_direct_adapter_rejects_acoustic_crossing_next_unselected_cue(self) -> None:
+    def test_good_clip_survives_drifted_boundary_cue_id(self) -> None:
+        engine_out = _media_tail_engine_out()
+        engine_out["clips"][0]["cue_ids"] = ["stale-provider-cue-id"]
+
+        clips = pipeline_module._verified_direct_adapter_clips(
+            source_url=SOURCE_URL,
+            engine_out=engine_out,
+            should_cancel=None,
+        )
+
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(clips[0]["cue_ids"], ["tail-cue"])
+        self.assertEqual((clips[0]["start"], clips[0]["end"]), (0.0, 10.0))
+        self.assertEqual(
+            clips[0]["search_context"]["boundary_status"], "context_aligned"
+        )
+        caption = clips[0]["search_context"]["boundary_diagnostics"]["caption"]
+        self.assertTrue(caption["recovered_from_timestamp_range"])
+
+    def test_direct_adapter_falls_back_when_acoustic_crosses_next_cue(self) -> None:
         engine_out = _media_tail_engine_out()
         engine_out["transcript"]["segments"].append(
             {
@@ -293,9 +267,14 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
                 source_url=SOURCE_URL,
                 engine_out=engine_out,
                 should_cancel=None,
+                prepared_audio=prepared,
             )
 
-        self.assertEqual(clips, [])
+        self.assertEqual(len(clips), 1)
+        self.assertEqual((clips[0]["start"], clips[0]["end"]), (0.0, 10.0))
+        self.assertEqual(
+            clips[0]["search_context"]["boundary_status"], "context_aligned"
+        )
         self.assertEqual(verify.call_args.kwargs["search_end_limit_sec"], 10.0)
 
     def test_direct_adapter_requires_each_quality_score_at_green_threshold(self) -> None:

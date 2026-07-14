@@ -30,6 +30,63 @@ from backend.app.ingestion.models import (  # noqa: E402
 )
 
 
+def _strict_boundary_context(
+    candidate_id: str,
+    *,
+    start: float,
+    end: float,
+    surface: bool,
+) -> dict:
+    return {
+        "selection_candidate_id": candidate_id,
+        "surface_eligible": surface,
+        "selection_contract_version": "quality_silence_v14",
+        "speech_corridor_verified": True,
+        "boundary_status": "verified",
+        "boundary_diagnostics": {
+            "acoustic_verified": True,
+            "final_range": [start, end],
+            "acoustic": {
+                "threshold_dbfs": -38.0,
+                "start_quiet": [max(0.0, start - 0.1), start + 0.1],
+                "end_quiet": [max(0.0, end - 0.1), end + 0.1],
+            },
+        },
+    }
+
+
+def _transcript_boundary_context(
+    candidate_id: str,
+    *,
+    start: float,
+    end: float,
+    surface: bool,
+) -> dict:
+    return {
+        "selection_candidate_id": candidate_id,
+        "surface_eligible": surface,
+        "selection_contract_version": "quality_silence_v14",
+        "speech_corridor_verified": True,
+        "boundary_status": "context_aligned",
+        "selection_caption_cues": [
+            {"cue_id": "cue-1", "start": start, "end": end, "text": "Teaching"}
+        ],
+        "boundary_diagnostics": {
+            "method": "transcript_context",
+            "context_aligned": True,
+            "acoustic_verified": False,
+            "transcript": {
+                "context_aligned": True,
+                "stage": "transcript",
+                "reason": "complete_discourse_boundary",
+                "required_speech_range": [start, end],
+                "semantic_range": [max(0.0, start - 1.0), end + 1.0],
+                "final_range": [start, end],
+            },
+        },
+    }
+
+
 class PersistenceIntegrityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -77,6 +134,64 @@ class PersistenceIntegrityTests(unittest.TestCase):
             },
         )
 
+    def _boundary_persistence_fixture(self):
+        with db_module.get_conn(transactional=True) as conn:
+            self._seed_identity(conn, "material-a", "concept-a")
+        pipeline = pipeline_module.IngestionPipeline(
+            youtube_service=None,
+            embedding_service=None,
+            serverless_mode=False,
+        )
+        adapter = YouTubeSourceRef(
+            source_id="video-a",
+            source_url="https://www.youtube.com/watch?v=video-a",
+            playback_url="https://www.youtube.com/embed/video-a",
+        )
+        metadata = IngestMetadata(
+            platform="yt",
+            source_id="video-a",
+            source_url=adapter.source_url,
+            playback_url=adapter.playback_url,
+            title="Video A",
+            duration_sec=30.0,
+        )
+        return pipeline, adapter, metadata
+
+    def _persist_boundary_candidate(
+        self,
+        *,
+        pipeline,
+        adapter,
+        metadata,
+        start: float,
+        end: float,
+        context: dict,
+        cue_id: str = "cue-1",
+    ):
+        return pipeline._persist_ingest(
+            adapter_result=adapter,
+            metadata=metadata,
+            cues=[
+                IngestTranscriptCue(
+                    cue_id=cue_id,
+                    start=start,
+                    end=end,
+                    text="Teaching",
+                )
+            ],
+            chosen=IngestSegment(t_start=start, t_end=end, text="Teaching"),
+            snippet="Teaching",
+            material_id="material-a",
+            concept_id="concept-a",
+            clip_window=(start, end),
+            target_max=0,
+            generation_id="generation-a",
+            clip_details={
+                "cue_ids": [cue_id],
+                "selection_candidate_id": context["selection_candidate_id"],
+                "search_context": context,
+            },
+        )
     def test_scratch_concepts_are_scoped_to_their_material(self) -> None:
         with db_module.get_conn(transactional=True) as conn:
             self._seed_identity(conn, "material-a", "concept-a")
@@ -281,7 +396,13 @@ class PersistenceIntegrityTests(unittest.TestCase):
                 "search_context": {
                     "selection_candidate_id": candidate_id,
                     "surface_eligible": True,
+                    "selection_contract_version": "quality_silence_v14",
+                    "speech_corridor_verified": True,
                     "boundary_status": "verified",
+                    "boundary_diagnostics": {
+                        "acoustic_verified": True,
+                        "acoustic": {"threshold_dbfs": -38.0},
+                    },
                 },
             },
         )
@@ -303,6 +424,176 @@ class PersistenceIntegrityTests(unittest.TestCase):
         context = json.loads(rows[0]["search_context_json"])
         self.assertTrue(context["surface_eligible"])
         self.assertEqual(context["boundary_status"], "verified")
+
+    def test_transcript_retry_never_downgrades_verified_boundary_or_return_value(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        candidate_id = "video-a::monotonic-verified"
+        verified = self._persist_boundary_candidate(
+            pipeline=pipeline,
+            adapter=adapter,
+            metadata=metadata,
+            start=9.8,
+            end=20.2,
+            context=_strict_boundary_context(
+                candidate_id, start=9.8, end=20.2, surface=True
+            ),
+            cue_id="cue-verified",
+        )
+        retried = self._persist_boundary_candidate(
+            pipeline=pipeline,
+            adapter=adapter,
+            metadata=metadata,
+            start=10.0,
+            end=20.0,
+            context=_transcript_boundary_context(
+                candidate_id,
+                start=10.0,
+                end=20.0,
+                surface=True,
+            ),
+            cue_id="cue-retry",
+        )
+
+        self.assertEqual(retried.reel_id, verified.reel_id)
+        self.assertEqual((retried.t_start, retried.t_end), (9.8, 20.2))
+        self.assertEqual(retried.selected_cue_ids, ["cue-verified"])
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_one(
+                conn,
+                "SELECT t_start, t_end, selected_cue_ids_json, search_context_json "
+                "FROM reels WHERE id = ?",
+                (verified.reel_id,),
+            )
+        self.assertEqual((row["t_start"], row["t_end"]), (9.8, 20.2))
+        self.assertEqual(json.loads(row["selected_cue_ids_json"]), ["cue-verified"])
+        self.assertEqual(
+            json.loads(row["search_context_json"])["boundary_status"],
+            "verified",
+        )
+
+    def test_verified_retry_promotes_transcript_boundary_even_when_level_deferred(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        candidate_id = "video-a::monotonic-promotion"
+        transcript = self._persist_boundary_candidate(
+            pipeline=pipeline,
+            adapter=adapter,
+            metadata=metadata,
+            start=10.0,
+            end=20.0,
+            context=_transcript_boundary_context(
+                candidate_id,
+                start=10.0,
+                end=20.0,
+                surface=True,
+            ),
+        )
+        promoted = self._persist_boundary_candidate(
+            pipeline=pipeline,
+            adapter=adapter,
+            metadata=metadata,
+            start=9.8,
+            end=20.2,
+            context=_strict_boundary_context(
+                candidate_id, start=9.8, end=20.2, surface=False
+            ),
+        )
+
+        self.assertEqual(promoted.reel_id, transcript.reel_id)
+        self.assertEqual((promoted.t_start, promoted.t_end), (9.8, 20.2))
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_one(
+                conn,
+                "SELECT t_start, t_end, search_context_json FROM reels WHERE id = ?",
+                (transcript.reel_id,),
+            )
+        context = json.loads(row["search_context_json"])
+        self.assertEqual(context["boundary_status"], "verified")
+        self.assertFalse(context["surface_eligible"])
+
+    def test_unavailable_retry_never_downgrades_transcript_boundary(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        candidate_id = "video-a::monotonic-transcript"
+        transcript = self._persist_boundary_candidate(
+            pipeline=pipeline,
+            adapter=adapter,
+            metadata=metadata,
+            start=10.0,
+            end=20.0,
+            context=_transcript_boundary_context(
+                candidate_id,
+                start=10.0,
+                end=20.0,
+                surface=False,
+            ),
+        )
+        retried = self._persist_boundary_candidate(
+            pipeline=pipeline,
+            adapter=adapter,
+            metadata=metadata,
+            start=11.0,
+            end=19.0,
+            context={
+                "selection_candidate_id": candidate_id,
+                "surface_eligible": True,
+                "boundary_status": "unavailable",
+            },
+        )
+
+        self.assertEqual(retried.reel_id, transcript.reel_id)
+        self.assertEqual((retried.t_start, retried.t_end), (10.0, 20.0))
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_one(
+                conn,
+                "SELECT t_start, t_end, search_context_json FROM reels WHERE id = ?",
+                (transcript.reel_id,),
+            )
+        context = json.loads(row["search_context_json"])
+        self.assertEqual(context["boundary_status"], "context_aligned")
+        self.assertFalse(context["surface_eligible"])
+
+    def test_current_transcript_retry_replaces_stale_strict_contract(self) -> None:
+        pipeline, adapter, metadata = self._boundary_persistence_fixture()
+        candidate_id = "video-a::stale-strict"
+        stale_context = _strict_boundary_context(
+            candidate_id, start=9.8, end=20.2, surface=True
+        )
+        stale_context["selection_contract_version"] = "quality_silence_v12"
+        stale = self._persist_boundary_candidate(
+            pipeline=pipeline,
+            adapter=adapter,
+            metadata=metadata,
+            start=9.8,
+            end=20.2,
+            context=stale_context,
+        )
+
+        current = self._persist_boundary_candidate(
+            pipeline=pipeline,
+            adapter=adapter,
+            metadata=metadata,
+            start=10.0,
+            end=20.0,
+            context=_transcript_boundary_context(
+                candidate_id,
+                start=10.0,
+                end=20.0,
+                surface=True,
+            ),
+        )
+
+        self.assertEqual(current.reel_id, stale.reel_id)
+        self.assertEqual((current.t_start, current.t_end), (10.0, 20.0))
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_one(
+                conn,
+                "SELECT search_context_json FROM reels WHERE id = ?",
+                (stale.reel_id,),
+            )
+        context = json.loads(row["search_context_json"])
+        self.assertEqual(
+            context["selection_contract_version"], "quality_silence_v14"
+        )
+        self.assertEqual(context["boundary_status"], "context_aligned")
 
     def test_persisted_candidate_uses_projected_selection_caption_snapshot(self) -> None:
         with db_module.get_conn(transactional=True) as conn:

@@ -135,7 +135,7 @@ from .clip_engine.provider_runtime import GenerationContext, ProviderUsageRecord
 from .clip_engine.clipper.supadata_client import fetch_transcript_artifact
 from .clip_engine.supadata_search import search_one as supadata_search_one
 from .clip_engine.metadata import canonicalize_youtube_url
-from .clip_engine.silence import persisted_boundary_is_verified
+from .clip_engine.silence import persisted_boundary_is_usable
 from .ingestion.models import (
     IngestFeedRequest,
     IngestFeedResult,
@@ -352,7 +352,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v13"
+SELECTION_CONTRACT_VERSION = "quality_silence_v14"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -2549,13 +2549,20 @@ def _shape_reels_for_request_context(
     return shaped_rows
 
 
-def _search_context_has_verified_acoustic_boundary(context: Any) -> bool:
-    if not isinstance(context, dict) or not persisted_boundary_is_verified(context):
+def _search_context_has_usable_boundary(
+    context: Any,
+    *,
+    t_start: object | None = None,
+    t_end: object | None = None,
+) -> bool:
+    if not isinstance(context, dict) or not persisted_boundary_is_usable(
+        context, t_start=t_start, t_end=t_end
+    ):
         return False
     return bool(
         str(context.get("selection_contract_version") or "").strip()
-        != SELECTION_CONTRACT_VERSION
-        or context.get("speech_corridor_verified") is True
+        == SELECTION_CONTRACT_VERSION
+        and context.get("speech_corridor_verified") is True
     )
 
 
@@ -2563,7 +2570,7 @@ def _count_generation_reels(conn, generation_id: str) -> int:
     try:
         rows = fetch_all(
             conn,
-            "SELECT search_context_json FROM reels WHERE generation_id = ?",
+            "SELECT t_start, t_end, search_context_json FROM reels WHERE generation_id = ?",
             (generation_id,),
         )
     except Exception as exc:
@@ -2578,14 +2585,16 @@ def _count_generation_reels(conn, generation_id: str) -> int:
             context = {}
         if not isinstance(context, dict):
             continue
-        surface_eligible = context.get("surface_eligible", True)
+        surface_eligible = context.get("surface_eligible")
         if isinstance(surface_eligible, str):
             surface_eligible = surface_eligible.strip().lower() in {
                 "1", "true", "yes", "on",
             }
-        if not surface_eligible:
+        if surface_eligible is not True:
             continue
-        if not _search_context_has_verified_acoustic_boundary(context):
+        if not _search_context_has_usable_boundary(
+            context, t_start=row.get("t_start"), t_end=row.get("t_end")
+        ):
             continue
         count += 1
     return count
@@ -2594,7 +2603,7 @@ def _count_generation_reels(conn, generation_id: str) -> int:
 def _count_material_ready_reels(conn, material_id: str) -> int:
     rows = fetch_all(
         conn,
-        "SELECT search_context_json FROM reels WHERE material_id = ?",
+        "SELECT t_start, t_end, search_context_json FROM reels WHERE material_id = ?",
         (material_id,),
     )
     count = 0
@@ -2608,12 +2617,14 @@ def _count_material_ready_reels(conn, material_id: str) -> int:
             surface_eligible = surface_eligible.strip().lower() in {
                 "1", "true", "yes", "on",
             }
-        if surface_eligible is True and _search_context_has_verified_acoustic_boundary(context):
+        if surface_eligible is True and _search_context_has_usable_boundary(
+            context, t_start=row.get("t_start"), t_end=row.get("t_end")
+        ):
             count += 1
     return count
 
 
-def _verified_acoustic_reel_ids(conn, reel_ids: list[str]) -> set[str]:
+def _usable_boundary_reel_ids(conn, reel_ids: list[str]) -> set[str]:
     normalized = list(dict.fromkeys(
         str(reel_id or "").strip() for reel_id in reel_ids if str(reel_id or "").strip()
     ))
@@ -2622,18 +2633,27 @@ def _verified_acoustic_reel_ids(conn, reel_ids: list[str]) -> set[str]:
     placeholders = ", ".join("?" for _ in normalized)
     rows = fetch_all(
         conn,
-        f"SELECT id, search_context_json FROM reels WHERE id IN ({placeholders})",
+        f"SELECT id, t_start, t_end, search_context_json FROM reels WHERE id IN ({placeholders})",
         tuple(normalized),
     )
-    verified: set[str] = set()
+    usable: set[str] = set()
     for row in rows:
         try:
             context = json.loads(str(row.get("search_context_json") or "{}"))
         except (TypeError, json.JSONDecodeError):
             continue
-        if _search_context_has_verified_acoustic_boundary(context):
-            verified.add(str(row.get("id") or ""))
-    return verified
+        surface_eligible = (
+            context.get("surface_eligible") if isinstance(context, dict) else False
+        )
+        if isinstance(surface_eligible, str):
+            surface_eligible = surface_eligible.strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+        if surface_eligible is True and _search_context_has_usable_boundary(
+            context, t_start=row.get("t_start"), t_end=row.get("t_end")
+        ):
+            usable.add(str(row.get("id") or ""))
+    return usable
 
 
 def _fetch_generation_row(conn, generation_id: str | None) -> dict[str, Any] | None:
@@ -2940,7 +2960,8 @@ def _verified_reusable_generation_chain(
 
     reel_rows = fetch_all(
         conn,
-        f"SELECT search_context_json, transcript_snippet FROM reels WHERE generation_id IN ({placeholders})",
+        f"SELECT t_start, t_end, search_context_json, transcript_snippet "
+        f"FROM reels WHERE generation_id IN ({placeholders})",
         tuple(generation_ids),
     )
     verified_reusable_count = 0
@@ -3015,7 +3036,9 @@ def _verified_reusable_generation_chain(
         )
         if not surface_eligible and not deferred_for_level:
             continue
-        if not _search_context_has_verified_acoustic_boundary(context):
+        if not _search_context_has_usable_boundary(
+            context, t_start=row.get("t_start"), t_end=row.get("t_end")
+        ):
             return False
         verified_reusable_count += 1
     return verified_reusable_count > 0
@@ -3639,7 +3662,7 @@ def _sanitize_generation_replay_events(
         for event in events
         if str(event.get("type") or "") == "candidate"
     ]
-    verified_candidate_ids = _verified_acoustic_reel_ids(conn, candidate_reel_ids)
+    usable_candidate_ids = _usable_boundary_reel_ids(conn, candidate_reel_ids)
     sanitized: list[dict[str, Any]] = []
     authoritative_reels: list[dict[str, Any]] | None = None
     authoritative_reel_ids: set[str] | None = None
@@ -3662,7 +3685,7 @@ def _sanitize_generation_replay_events(
         if event_type == "candidate":
             reel = payload.get("reel")
             reel_id = str((reel or {}).get("reel_id") or "") if isinstance(reel, dict) else ""
-            if reel_id not in verified_candidate_ids or (
+            if reel_id not in usable_candidate_ids or (
                 authoritative_reel_ids is not None
                 and reel_id not in authoritative_reel_ids
             ):
@@ -3839,7 +3862,7 @@ def _run_leased_generation_job(
         generation_id=job_id,
         usage_sink=lambda record: _persist_generation_provider_usage(job_id, record),
         cache_store=DatabaseProviderCache(),
-        require_acoustic_boundaries=True,
+        require_acoustic_boundaries=False,
     )
     generation_id = ""
     try:

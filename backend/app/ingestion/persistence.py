@@ -319,7 +319,8 @@ def load_reel_by_selection_candidate(
     rows = fetch_all(
         conn,
         """
-        SELECT id, video_url, t_start, t_end, search_context_json
+        SELECT id, video_url, t_start, t_end, transcript_snippet,
+               selected_cue_ids_json, search_context_json
           FROM reels
          WHERE material_id = ?
            AND concept_id = ?
@@ -349,11 +350,28 @@ def update_reel_boundary_state(
     transcript_snippet: str,
     selected_cue_ids: list[str],
     search_context: dict[str, Any],
-) -> None:
+    expected_search_context_json: str | None = None,
+) -> bool:
     """Promote/defer a candidate in place without changing its public reel id."""
-    execute_modify(
+    conditional = (
+        " AND search_context_json = ?"
+        if expected_search_context_json is not None
+        else ""
+    )
+    params: tuple[Any, ...] = (
+        video_url,
+        float(t_start),
+        float(t_end),
+        str(transcript_snippet or "")[:7000],
+        dumps_json(list(selected_cue_ids or [])),
+        dumps_json(dict(search_context or {})),
+        reel_id,
+    )
+    if expected_search_context_json is not None:
+        params = (*params, expected_search_context_json)
+    changed = execute_modify(
         conn,
-        """
+        f"""
         UPDATE reels
            SET video_url = ?,
                t_start = ?,
@@ -361,18 +379,11 @@ def update_reel_boundary_state(
                transcript_snippet = ?,
                selected_cue_ids_json = ?,
                search_context_json = ?
-         WHERE id = ?
+         WHERE id = ?{conditional}
         """,
-        (
-            video_url,
-            float(t_start),
-            float(t_end),
-            str(transcript_snippet or "")[:7000],
-            dumps_json(list(selected_cue_ids or [])),
-            dumps_json(dict(search_context or {})),
-            reel_id,
-        ),
+        params,
     )
+    return bool(changed)
 
 
 def upsert_reel_row(

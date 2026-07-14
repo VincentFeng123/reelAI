@@ -37,7 +37,10 @@ from ..clip_engine.metadata import extract_video_id as _extract_embed_video_id
 from ..clip_engine.metadata import normalize_youtube_video_id
 from ..clip_engine.provider_cache import validate_transcript_payload
 from ..clip_engine.provider_runtime import GenerationContext
-from ..clip_engine.silence import persisted_boundary_is_verified
+from ..clip_engine.silence import (
+    persisted_boundary_is_usable,
+    persisted_boundary_is_verified,
+)
 from .segmenter import (
     SegmentMatch,
     TranscriptChunk,
@@ -1204,8 +1207,9 @@ class ReelService:
     # v22: require exact cross-cue boundary grounding from the current selector.
     # v23: prefer the requested difficulty bin, with a nearest valid-bin fallback.
     # v24: expose current selector relevance consistently in cached feed rows.
-    RANKED_FEED_CACHE_VERSION = 24
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v13"
+    # v25: accept validated transcript-context boundaries in current inventory.
+    RANKED_FEED_CACHE_VERSION = 25
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v14"
     DIFFICULTY_FALLBACK_CONTRACTS = frozenset({
         "quality_silence_v3",
         "quality_silence_v4",
@@ -1218,6 +1222,7 @@ class ReelService:
         "quality_silence_v11",
         "quality_silence_v12",
         "quality_silence_v13",
+        "quality_silence_v14",
     })
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
@@ -2459,6 +2464,7 @@ class ReelService:
                 "quality_silence_v11",
                 "quality_silence_v12",
                 "quality_silence_v13",
+                "quality_silence_v14",
             }
             for reel in generated
         ):
@@ -5656,7 +5662,13 @@ class ReelService:
         )
 
     @classmethod
-    def _selection_metadata(cls, value: Any) -> dict[str, Any]:
+    def _selection_metadata(
+        cls,
+        value: Any,
+        *,
+        t_start: object | None = None,
+        t_end: object | None = None,
+    ) -> dict[str, Any]:
         """Read the versioned selection contract stored with a persisted reel."""
         if isinstance(value, dict):
             parsed = dict(value)
@@ -5688,6 +5700,11 @@ class ReelService:
             ).strip().lower()
             operational["_selection_acoustic_verified"] = (
                 persisted_boundary_is_verified(parsed)
+            )
+            operational["_selection_boundary_usable"] = (
+                persisted_boundary_is_usable(
+                    parsed, t_start=t_start, t_end=t_end
+                )
             )
             operational["_selection_surface_reason"] = str(
                 parsed.get("surface_reason") or ""
@@ -5751,6 +5768,9 @@ class ReelService:
         metadata["_selection_acoustic_verified"] = persisted_boundary_is_verified(
             parsed
         )
+        metadata["_selection_boundary_usable"] = persisted_boundary_is_usable(
+            parsed, t_start=t_start, t_end=t_end
+        )
         metadata["_selection_surface_reason"] = str(
             parsed.get("surface_reason") or ""
         ).strip().lower()
@@ -5769,6 +5789,7 @@ class ReelService:
                 "quality_silence_v11",
                 "quality_silence_v12",
                 "quality_silence_v13",
+                "quality_silence_v14",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5786,6 +5807,7 @@ class ReelService:
                 "quality_silence_v11",
                 "quality_silence_v12",
                 "quality_silence_v13",
+                "quality_silence_v14",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7237,7 +7259,11 @@ class ReelService:
             if not isinstance(selected_cue_ids, list):
                 selected_cue_ids = []
             selected_cue_ids = [str(cue_id) for cue_id in selected_cue_ids if str(cue_id).strip()]
-            selection_metadata = self._selection_metadata(row.get("search_context_json"))
+            selection_metadata = self._selection_metadata(
+                row.get("search_context_json"),
+                t_start=row.get("t_start"),
+                t_end=row.get("t_end"),
+            )
             selection_version = str(
                 selection_metadata.get("_selection_contract_version") or ""
             ).strip()
@@ -7267,6 +7293,7 @@ class ReelService:
                     "quality_silence_v11",
                     "quality_silence_v12",
                     "quality_silence_v13",
+                    "quality_silence_v14",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7290,8 +7317,8 @@ class ReelService:
             )
             if require_verified_boundaries:
                 if (
-                    boundary_status != "verified"
-                    or selection_metadata.get("_selection_acoustic_verified") is not True
+                    boundary_status not in {"verified", "context_aligned"}
+                    or selection_metadata.get("_selection_boundary_usable") is not True
                     or (
                         selection_version
                         in {
@@ -7304,6 +7331,7 @@ class ReelService:
                             "quality_silence_v11",
                             "quality_silence_v12",
                             "quality_silence_v13",
+                            "quality_silence_v14",
                         }
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
@@ -7327,6 +7355,7 @@ class ReelService:
                     "quality_silence_v11",
                     "quality_silence_v12",
                     "quality_silence_v13",
+                    "quality_silence_v14",
                 } and (
                     (
                         min(
@@ -7351,6 +7380,7 @@ class ReelService:
                             "quality_silence_v11",
                             "quality_silence_v12",
                             "quality_silence_v13",
+                            "quality_silence_v14",
                         }
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
@@ -7685,6 +7715,7 @@ class ReelService:
                 "quality_silence_v11",
                 "quality_silence_v12",
                 "quality_silence_v13",
+                "quality_silence_v14",
             }:
                 # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
@@ -7713,6 +7744,7 @@ class ReelService:
                         "quality_silence_v11",
                         "quality_silence_v12",
                         "quality_silence_v13",
+                        "quality_silence_v14",
                     }
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")

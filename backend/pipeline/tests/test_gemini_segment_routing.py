@@ -677,7 +677,7 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
     assert telemetry["model"] == G.config.SEGMENT_FLASH_MODEL
 
 
-def test_production_selector_reserves_once_and_retries_transient_failure(monkeypatch):
+def test_production_selector_reserves_once_without_transport_retry(monkeypatch):
     class TransientHTTPError(RuntimeError):
         status_code = 503
 
@@ -711,9 +711,9 @@ def test_production_selector_reserves_once_and_retries_transient_failure(monkeyp
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert len(models.calls) == 2
+    assert len(models.calls) == 1
     assert len(reservations) == 1
-    assert result.calls[0]["retries"] == 1
+    assert result.calls[0]["retries"] == 0
     assert result.calls[0]["provider_error_type"] == "TransientHTTPError"
     assert result.calls[0]["provider_status_code"] == 503
     assert result.calls[0]["retryable"] is True
@@ -788,9 +788,9 @@ def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
         (G.FLASH_SINGLE_PROFILE,
          ("medium", 24_576, 45.0, "flash_single_candidate", "gemini-3.5-flash")),
         (G.FLASH_SPLIT_PROFILE,
-         ("low", 8_192, 28.0, "flash_boundary_selector", "gemini-3-flash-preview")),
+         ("low", 10_240, 28.0, "flash_boundary_selector", "gemini-3-flash-preview")),
         (G.PRO_BOUNDARY_PROFILE,
-         ("high", 8_192, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
+         ("high", 10_240, 90.0, "pro_fallback", "gemini-3.1-pro-preview")),
     ],
 )
 def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, expected):
@@ -819,7 +819,7 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
         timeout,
         operation,
         expected_model,
-        1,
+        0,
     )
 
 
@@ -841,10 +841,10 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
     )
 
     assert captured["thinking_level"] == "low"
-    assert captured["max_output_tokens"] == 8_192
+    assert captured["max_output_tokens"] == 10_240
 
 
-def test_boundary_profile_rejects_bad_model_quote_from_cited_cue(monkeypatch):
+def test_boundary_profile_keeps_grounded_clip_with_bad_edge_quote(monkeypatch):
     proposal = G._BoundaryTopic(
         candidate_id="candidate-bad-quote",
         start_line=0,
@@ -882,9 +882,9 @@ def test_boundary_profile_rejects_bad_model_quote_from_cited_cue(monkeypatch):
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert result.classification == "invalid"
-    assert result.accepted_count == 0
-    assert result.rejection_reasons == ["proposal_0:bad_start_quote"]
+    assert result.classification == "green"
+    assert result.accepted_count == 1
+    assert result.rejection_reasons == []
 
 
 def test_production_boundary_selector_keeps_every_candidate_beyond_sixteen(monkeypatch):

@@ -55,6 +55,124 @@ def _prepared() -> silence.AudioPreparationResult:
     )
 
 
+def _context_aligned_search_context() -> dict:
+    return {
+        "selection_contract_version": "quality_silence_v14",
+        "boundary_status": "context_aligned",
+        "speech_corridor_verified": True,
+        "selection_caption_cues": [
+            {"cue_id": "selected", "start": 2.0, "end": 9.0, "text": "Teaching"}
+        ],
+        "boundary_diagnostics": {
+            "method": "transcript_context",
+            "context_aligned": True,
+            "acoustic_verified": False,
+            "transcript": {
+                "context_aligned": True,
+                "stage": "analyze",
+                "reason": "start_silence_not_found",
+                "required_speech_range": [2.0, 8.0],
+                "semantic_range": [1.0, 9.0],
+                "final_range": [2.0, 9.0],
+            },
+        },
+    }
+
+
+def test_context_aligned_boundary_is_usable_but_not_acoustically_verified() -> None:
+    context = _context_aligned_search_context()
+
+    assert silence.persisted_boundary_is_verified(context) is False
+    assert silence.persisted_boundary_is_usable(context) is True
+    assert silence.persisted_boundary_is_usable(
+        context, t_start=2.0, t_end=9.0
+    ) is True
+    assert silence.persisted_boundary_is_usable(
+        context, t_start=2.1, t_end=9.0
+    ) is False
+
+
+def test_current_strict_boundary_is_bound_to_persisted_range() -> None:
+    context = {
+        "selection_contract_version": "quality_silence_v14",
+        "boundary_status": "verified",
+        "boundary_diagnostics": {
+            "acoustic_verified": True,
+            "final_range": [2.0, 9.0],
+            "acoustic": {
+                "threshold_dbfs": -38.0,
+                "start_quiet": [1.9, 2.1],
+                "end_quiet": [8.9, 9.1],
+            },
+        },
+    }
+
+    assert silence.persisted_boundary_is_usable(
+        context, t_start=2.0, t_end=9.0
+    ) is True
+    for start, end in (
+        (float("nan"), 9.0),
+        (9.0, 2.0),
+        (-1.0, 9.0),
+        (0.0, 900.0),
+    ):
+        assert silence.persisted_boundary_is_usable(
+            context, t_start=start, t_end=end
+        ) is False
+
+    context["boundary_diagnostics"]["acoustic"].update(
+        start_quiet=[20.0, 21.0], end_quiet=[30.0, 31.0]
+    )
+    assert silence.persisted_boundary_is_usable(
+        context, t_start=2.0, t_end=9.0
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda context: context.update(boundary_status="verified"),
+        lambda context: context.update(speech_corridor_verified=False),
+        lambda context: context.update(selection_caption_cues=[]),
+        lambda context: context["boundary_diagnostics"].update(context_aligned=False),
+        lambda context: context["boundary_diagnostics"]["transcript"].update(
+            final_range=[2.0, 7.0]
+        ),
+        lambda context: context["boundary_diagnostics"]["transcript"].update(
+            final_range=[0.5, 9.0]
+        ),
+        lambda context: context["boundary_diagnostics"]["transcript"].update(
+            required_speech_range=[-1.0, 8.0],
+            semantic_range=[-2.0, 9.0],
+            final_range=[-1.0, 9.0],
+        ),
+        lambda context: context.update(selection_caption_cues=[{}]),
+        lambda context: context.update(selection_caption_cues=[{
+            "start": 2.0, "end": 9.0, "text": "",
+        }]),
+        lambda context: context.update(selection_caption_cues=[{
+            "start": float("nan"), "end": 9.0, "text": "Teaching",
+        }]),
+        lambda context: context.update(selection_caption_cues=[{
+            "start": 3.0, "end": 8.0, "text": "Teaching",
+        }]),
+        lambda context: context.update(selection_caption_cues=[
+            {"start": 8.0, "end": 9.0, "text": "Ending"},
+            {"start": 2.0, "end": 8.0, "text": "Beginning"},
+        ]),
+        lambda context: context.update(selection_caption_cues=[
+            {"start": 2.0, "end": 3.0, "text": "Before"},
+            {"start": 8.0, "end": 9.0, "text": "After"},
+        ]),
+    ],
+)
+def test_malformed_context_aligned_boundary_is_not_usable(mutation) -> None:
+    context = _context_aligned_search_context()
+    mutation(context)
+
+    assert silence.persisted_boundary_is_usable(context) is False
+
+
 def test_verified_edges_preserve_required_quiet_cushions(tmp_path: Path) -> None:
     start_wav = tmp_path / "source-start.wav"
     end_wav = tmp_path / "source-end.wav"

@@ -71,7 +71,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v13:v8:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v14:v8:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -173,14 +173,24 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
         [medium_uncertainty], transcript=transcript, settings=settings
     ) == [medium_uncertainty]
 
-    high_uncertainty = _clip()
-    high_uncertainty.update({
+    boundary_only_high_uncertainty = _clip()
+    boundary_only_high_uncertainty.update({
         "uncertainty": "high",
-        "uncertainty_reasons": ["incomplete_context"],
+        "uncertainty_reasons": ["boundary_ambiguous", "overlap_risk"],
     })
     assert segment_cache._valid_clips(
-        [high_uncertainty], transcript=transcript, settings=settings
-    ) is None
+        [boundary_only_high_uncertainty], transcript=transcript, settings=settings
+    ) == [boundary_only_high_uncertainty]
+
+    for uncertainty_reason in ("topic_ambiguous", "incomplete_context"):
+        content_high_uncertainty = _clip()
+        content_high_uncertainty.update({
+            "uncertainty": "high",
+            "uncertainty_reasons": [uncertainty_reason],
+        })
+        assert segment_cache._valid_clips(
+            [content_high_uncertainty], transcript=transcript, settings=settings
+        ) is None
 
     invalid = _clip()
     invalid["self_contained"] = False
@@ -371,6 +381,10 @@ def test_segment_cache_sqlite_round_trip_expiry_and_tombstone(monkeypatch) -> No
     settings = {"segment_accept_partial_flash": True}
     cache_key = _key(transcript, settings)
     cached_clip = _clip()
+    cached_clip.update({
+        "uncertainty": "high",
+        "uncertainty_reasons": ["boundary_ambiguous", "overlap_risk"],
+    })
 
     segment_cache.store_segment_result(
         cache_key,
@@ -386,6 +400,35 @@ def test_segment_cache_sqlite_round_trip_expiry_and_tombstone(monkeypatch) -> No
         transcript=transcript,
         settings=settings,
     ) == ([cached_clip], "cached")
+
+    for uncertainty_reason in ("topic_ambiguous", "incomplete_context"):
+        rejected_key = _key(
+            transcript,
+            settings,
+            topic=f"rejected-{uncertainty_reason}",
+        )
+        rejected_clip = _clip()
+        rejected_clip.update({
+            "uncertainty": "high",
+            "uncertainty_reasons": [uncertainty_reason],
+        })
+        segment_cache.store_segment_result(
+            rejected_key,
+            [rejected_clip],
+            "must not cache",
+            video_id=VIDEO_ID,
+            transcript=transcript,
+            settings=settings,
+        )
+        assert connection.execute(
+            "SELECT 1 FROM llm_cache WHERE cache_key = ?", (rejected_key,)
+        ).fetchone() is None
+        assert segment_cache.load_segment_result(
+            rejected_key,
+            video_id=VIDEO_ID,
+            transcript=transcript,
+            settings=settings,
+        ) is None
 
     stale_payload = json.loads(
         connection.execute(

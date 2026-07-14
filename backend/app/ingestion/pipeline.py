@@ -354,6 +354,111 @@ def _supadata_boundary_diagnostics(
     }
 
 
+def _transcript_boundary_seed(
+    transcript: dict[str, Any],
+    raw_clip: dict[str, Any],
+) -> tuple[dict[str, Any] | None, tuple[float, float]]:
+    """Recover complete transcript cues without making edge metadata a quality gate."""
+
+    strict = _supadata_boundary_diagnostics(transcript, raw_clip)
+    if strict is not None:
+        return strict, _complete_caption_speech_bounds(raw_clip, strict)
+    segments = [
+        segment
+        for segment in (transcript.get("segments") or [])
+        if isinstance(segment, dict)
+    ]
+    index_by_id = {
+        str(segment.get("cue_id") or f"cue-{index}").strip(): index
+        for index, segment in enumerate(segments)
+    }
+    requested_cue_ids = [
+        str(value or "").strip() for value in (raw_clip.get("cue_ids") or [])
+    ]
+    indices = (
+        [index_by_id[cue_id] for cue_id in requested_cue_ids]
+        if requested_cue_ids
+        and all(cue_id in index_by_id for cue_id in requested_cue_ids)
+        else []
+    )
+    recovered_from_timestamps = False
+    if not indices or indices != list(range(indices[0], indices[-1] + 1)):
+        try:
+            selected_start = float(raw_clip.get("start"))
+            selected_end = float(raw_clip.get("end"))
+        except (TypeError, ValueError, OverflowError):
+            return None, (0.0, 0.0)
+        if (
+            not math.isfinite(selected_start)
+            or not math.isfinite(selected_end)
+            or selected_start < 0.0
+            or selected_end <= selected_start
+        ):
+            return None, (0.0, 0.0)
+        overlapping: list[int] = []
+        for index, segment in enumerate(segments):
+            try:
+                cue_start = float(segment.get("start"))
+                cue_end = float(segment.get("end"))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if (
+                math.isfinite(cue_start)
+                and math.isfinite(cue_end)
+                and cue_end > cue_start
+                and cue_end > selected_start + 1e-3
+                and cue_start < selected_end - 1e-3
+            ):
+                overlapping.append(index)
+        if not overlapping:
+            return None, (0.0, 0.0)
+        indices = list(range(overlapping[0], overlapping[-1] + 1))
+        recovered_from_timestamps = True
+    try:
+        start = float(segments[indices[0]]["start"])
+        end = float(segments[indices[-1]]["end"])
+        source_end = max(
+            float(transcript.get("duration") or 0.0),
+            *(float(segment.get("end") or 0.0) for segment in segments),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None, (0.0, 0.0)
+    if (
+        not math.isfinite(start)
+        or not math.isfinite(end)
+        or not math.isfinite(source_end)
+        or start < 0.0
+        or end <= start
+        or end > source_end + 1e-3
+    ):
+        return None, (0.0, 0.0)
+    cue_ids = [
+        str(segments[index].get("cue_id") or f"cue-{index}").strip()
+        for index in indices
+    ]
+    if any(not cue_id for cue_id in cue_ids):
+        return None, (0.0, 0.0)
+    if recovered_from_timestamps:
+        # The selector's finite range is still transcript-grounded even if an
+        # upstream cue identifier drifted. Canonicalizing it here keeps a good
+        # educational candidate and gives persistence an immutable cue snapshot.
+        raw_clip["cue_ids"] = cue_ids
+        raw_clip["start"] = start
+        raw_clip["end"] = end
+    return {
+        "method": "contiguous_transcript_cues",
+        "acoustic_verified": False,
+        "start_cue_id": cue_ids[0],
+        "end_cue_id": cue_ids[-1],
+        "start_padding_ms": 0,
+        "end_padding_ms": 0,
+        "preceding_gap_ms": 0,
+        "following_gap_ms": 0,
+        "fallback_from_strict_caption_diagnostics": True,
+        "recovered_from_timestamp_range": recovered_from_timestamps,
+    }, (start, end)
+
+
 def _required_speech_bounds(
     raw_clip: dict[str, Any],
     caption_diagnostics: dict[str, Any],
@@ -390,6 +495,46 @@ def _required_speech_bounds(
         if required_end > required_start
         else (cue_start, cue_end)
     )
+
+
+def _complete_caption_speech_bounds(
+    raw_clip: dict[str, Any],
+    caption_diagnostics: dict[str, Any],
+) -> tuple[float, float]:
+    """Keep the complete selected cues when exact lexical projection is unavailable."""
+
+    without_partial_hints = dict(raw_clip)
+    without_partial_hints.pop("required_first_speech_sec", None)
+    without_partial_hints.pop("required_last_speech_sec", None)
+    return _required_speech_bounds(without_partial_hints, caption_diagnostics)
+
+
+def _boundary_evidence_grade(
+    context: object,
+    *,
+    t_start: object | None = None,
+    t_end: object | None = None,
+) -> int:
+    """Order persisted boundary evidence so retries can only improve a reel."""
+
+    if (
+        not isinstance(context, dict)
+        or str(context.get("selection_contract_version") or "").strip()
+        != "quality_silence_v14"
+    ):
+        return 0
+    if (
+        clip_engine_silence.persisted_boundary_is_verified(context)
+        and clip_engine_silence.persisted_boundary_is_usable(
+            context, t_start=t_start, t_end=t_end
+        )
+    ):
+        return 2
+    if clip_engine_silence.persisted_boundary_is_usable(
+        context, t_start=t_start, t_end=t_end
+    ):
+        return 1
+    return 0
 
 
 def _overlapping_caption_end_handoff(
@@ -703,9 +848,9 @@ def _selected_caption_cues(
         if str(cue_id or "").strip()
     ]
     segments_by_id = {
-        str(segment.get("cue_id") or "").strip(): segment
-        for segment in (transcript.get("segments") or [])
-        if isinstance(segment, dict) and str(segment.get("cue_id") or "").strip()
+        str(segment.get("cue_id") or f"cue-{index}").strip(): segment
+        for index, segment in enumerate(transcript.get("segments") or [])
+        if isinstance(segment, dict)
     }
     if not cue_ids or any(cue_id not in segments_by_id for cue_id in cue_ids):
         return []
@@ -1008,6 +1153,110 @@ def _acoustic_boundary_plan(
     )
 
 
+def _transcript_aligned_result(
+    acoustic: object,
+    *,
+    speech_bounds: tuple[float, float],
+    search_limits: tuple[float, float],
+    projection_diagnostics: dict[str, Any],
+) -> clip_engine_silence.SilenceVerificationResult:
+    """Use the selected complete transcript thought when audio is not preferred.
+
+    Gemini's exact edge quotes and deterministic discourse checks choose the
+    semantic unit. Native lexical timestamps may tighten a coarse edge cue when
+    they are already available; otherwise the whole cue is retained so this
+    fast path never guesses a word time or cuts required speech.
+    """
+
+    if bool(getattr(acoustic, "verified", False)):
+        return acoustic
+    diagnostics = dict(getattr(acoustic, "diagnostics", {}) or {})
+    reason = str(diagnostics.get("reason") or "sentence_boundary_selected").strip()
+    stage = str(diagnostics.get("stage") or "transcript").strip()
+    if reason == "cancelled":
+        return acoustic
+    required_start, required_end = speech_bounds
+    semantic_start, semantic_end = search_limits
+    final_start = required_start
+    final_end = (
+        semantic_end
+        if isinstance(projection_diagnostics.get("end"), dict)
+        else required_end
+    )
+    if (
+        not all(
+            math.isfinite(value)
+            for value in (
+                required_start,
+                required_end,
+                semantic_start,
+                semantic_end,
+                final_start,
+                final_end,
+            )
+        )
+        or semantic_start > final_start
+        or final_start > required_start
+        or required_end > final_end
+        or final_end > semantic_end
+        or final_end <= final_start
+    ):
+        return acoustic
+    return clip_engine_silence.SilenceVerificationResult(
+        "context_aligned",
+        round(final_start, 3),
+        round(final_end, 3),
+        {
+            **diagnostics,
+            "stage": stage,
+            "reason": reason,
+            "context_aligned": True,
+            "required_speech_range": [
+                round(required_start, 3),
+                round(required_end, 3),
+            ],
+            "semantic_range": [
+                round(semantic_start, 3),
+                round(semantic_end, 3),
+            ],
+            "final_range": [round(final_start, 3), round(final_end, 3)],
+        },
+    )
+
+
+def _context_result_range_is_safe(
+    result: object,
+    *,
+    source_end_sec: float,
+) -> bool:
+    """Validate a transcript fallback without requiring perfect edge evidence."""
+
+    if str(getattr(result, "status", "")) != "context_aligned":
+        return False
+    try:
+        start = float(getattr(result, "start_sec"))
+        end = float(getattr(result, "end_sec"))
+        source_end = float(source_end_sec)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    diagnostics = dict(getattr(result, "diagnostics", {}) or {})
+    final = diagnostics.get("final_range")
+    if not isinstance(final, (list, tuple)) or len(final) != 2:
+        return False
+    try:
+        final_start, final_end = (float(value) for value in final)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return bool(
+        all(math.isfinite(value) for value in (start, end, source_end, final_start, final_end))
+        and start >= 0.0
+        and end > start
+        and end <= source_end + 1e-3
+        and abs(start - final_start) <= 1e-3
+        and abs(end - final_end) <= 1e-3
+    )
+
+
 def _acoustic_range_is_safe(
     *,
     start_sec: float,
@@ -1164,7 +1413,7 @@ def _direct_adapter_duration_sec(
     transcript: dict[str, Any],
     verified_clips: list[dict[str, Any]],
 ) -> float:
-    """Return the verified media duration, falling back to transcript timing."""
+    """Return known media duration, falling back to transcript timing."""
     candidates: list[float] = []
     raw_values = [
         transcript.get("duration"),
@@ -1194,7 +1443,7 @@ def _verified_direct_adapter_clips(
     exact_topic: str = "",
     embedding_service: Any = None,
 ) -> list[dict[str, Any]]:
-    """Return difficulty-ranked candidates with two verified silence cuts."""
+    """Return difficulty-ranked candidates with complete transcript cuts."""
     transcript = dict(engine_out.get("transcript") or {})
     segments = list(transcript.get("segments") or [])
     transcript_end = max(
@@ -1275,24 +1524,19 @@ def _verified_direct_adapter_clips(
         )
     )
 
+    # Audio lookup is intentionally not started here. Production boundaries are
+    # transcript-authoritative; callers may still supply an already prepared
+    # source for an opt-in acoustic refinement without changing the fallback.
     prepared = prepared_audio
-    if prepared is None:
-        prepared = clip_engine_silence.prepare_audio_source(
-            source_url,
-            cancel_check=should_cancel,
-            language=str(
-                transcript.get("returned_language")
-                or transcript.get("requested_language")
-                or "en"
-            ),
-        )
     media_end = _prepared_media_end_sec(
         prepared,
         transcript_end_sec=transcript_end,
     )
 
     def verify(raw_clip: dict[str, Any]):
-        diagnostics = _supadata_boundary_diagnostics(transcript, raw_clip)
+        diagnostics, complete_cue_bounds = _transcript_boundary_seed(
+            transcript, raw_clip
+        )
         if diagnostics is None:
             return diagnostics, None, {}, (0.0, 0.0)
         speech_bounds, projection, projection_error = _projected_speech_bounds(
@@ -1302,13 +1546,19 @@ def _verified_direct_adapter_clips(
             prepared,
         )
         start_sec, end_sec = speech_bounds
-        if projection_error:
-            return diagnostics, clip_engine_silence.SilenceVerificationResult(
-                "unavailable",
-                start_sec,
-                end_sec,
-                {"stage": "lexical_projection", "reason": projection_error},
-            ), {}, speech_bounds
+        if projection_error or not bool(getattr(prepared, "ready", False)):
+            speech_bounds = complete_cue_bounds
+            start_sec, end_sec = speech_bounds
+            projection = (
+                {
+                    "context_fallback": {
+                        "stage": "transcript",
+                        "reason": projection_error,
+                    }
+                }
+                if projection_error
+                else {}
+            )
         search_start_limit, search_end_limit, corridor_error = _selected_speech_corridor(
             transcript,
             raw_clip,
@@ -1318,12 +1568,29 @@ def _verified_direct_adapter_clips(
             projection_diagnostics=projection,
         )
         if corridor_error:
-            return diagnostics, clip_engine_silence.SilenceVerificationResult(
-                "unavailable",
-                start_sec,
-                end_sec,
-                {"stage": "semantic_corridor", "reason": corridor_error},
-            ), projection, speech_bounds
+            speech_bounds = complete_cue_bounds
+            projection = {
+                **projection,
+                "context_fallback": {
+                    "stage": "transcript",
+                    "reason": f"full_cue_fallback:{corridor_error}",
+                },
+            }
+            transcript_boundary = _transcript_aligned_result(
+                clip_engine_silence.SilenceVerificationResult(
+                    "unavailable",
+                    speech_bounds[0],
+                    speech_bounds[1],
+                    {
+                        "stage": "transcript",
+                        "reason": f"full_cue_fallback:{corridor_error}",
+                    },
+                ),
+                speech_bounds=speech_bounds,
+                search_limits=speech_bounds,
+                projection_diagnostics={},
+            )
+            return diagnostics, transcript_boundary, projection, speech_bounds
         boundary_plan = _acoustic_boundary_plan(
             transcript,
             raw_clip,
@@ -1332,12 +1599,22 @@ def _verified_direct_adapter_clips(
             search_limits=(search_start_limit, search_end_limit),
         )
         if boundary_plan is None:
-            return diagnostics, clip_engine_silence.SilenceVerificationResult(
-                "unavailable",
-                start_sec,
-                end_sec,
-                {"stage": "semantic_corridor", "reason": "boundary_plan_invalid"},
-            ), projection, speech_bounds
+            speech_bounds = complete_cue_bounds
+            transcript_boundary = _transcript_aligned_result(
+                clip_engine_silence.SilenceVerificationResult(
+                    "unavailable",
+                    speech_bounds[0],
+                    speech_bounds[1],
+                    {
+                        "stage": "transcript",
+                        "reason": "full_cue_fallback:boundary_plan_invalid",
+                    },
+                ),
+                speech_bounds=speech_bounds,
+                search_limits=speech_bounds,
+                projection_diagnostics={},
+            )
+            return diagnostics, transcript_boundary, projection, speech_bounds
         (
             start_target,
             end_target,
@@ -1346,29 +1623,33 @@ def _verified_direct_adapter_clips(
             start_two_sided,
             end_two_sided,
         ) = boundary_plan
-        acoustic = clip_engine_silence.verify_acoustic_boundaries(
-            source_url,
-            start_target,
-            end_target,
-            search_start_limit_sec=search_start_limit,
-            search_end_limit_sec=search_end_limit,
-            require_speech_handoff=False,
-            require_start_speech_handoff=start_handoff,
-            require_end_speech_handoff=end_handoff,
-            require_start_two_sided=start_two_sided,
-            require_end_two_sided=end_two_sided,
-            prepared=prepared,
-            cancel_check=should_cancel,
-        )
-        crossed_semantic_fence = bool(
-            float(acoustic.start_sec)
-            < search_start_limit - SPEECH_OWNERSHIP_EPSILON_SEC
-            or float(acoustic.end_sec)
-            > search_end_limit + SPEECH_OWNERSHIP_EPSILON_SEC
-        )
+        if bool(getattr(prepared, "ready", False)):
+            acoustic = clip_engine_silence.verify_acoustic_boundaries(
+                source_url,
+                start_target,
+                end_target,
+                search_start_limit_sec=search_start_limit,
+                search_end_limit_sec=search_end_limit,
+                require_speech_handoff=False,
+                require_start_speech_handoff=start_handoff,
+                require_end_speech_handoff=end_handoff,
+                require_start_two_sided=start_two_sided,
+                require_end_two_sided=end_two_sided,
+                prepared=prepared,
+                cancel_check=should_cancel,
+            )
+        else:
+            acoustic = clip_engine_silence.SilenceVerificationResult(
+                "unavailable",
+                start_target,
+                end_target,
+                {
+                    "stage": "transcript",
+                    "reason": "complete_discourse_boundary",
+                },
+            )
         if (
             acoustic.verified
-            and crossed_semantic_fence
             and not _acoustic_range_is_safe(
                 start_sec=float(acoustic.start_sec),
                 end_sec=float(acoustic.end_sec),
@@ -1384,78 +1665,141 @@ def _verified_direct_adapter_clips(
                 require_end_two_sided=end_two_sided,
             )
         ):
-            return diagnostics, clip_engine_silence.SilenceVerificationResult(
+            acoustic = clip_engine_silence.SilenceVerificationResult(
                 "unavailable",
-                acoustic.start_sec,
-                acoustic.end_sec,
+                speech_bounds[0],
+                speech_bounds[1],
                 {
                     **dict(acoustic.diagnostics or {}),
                     "stage": "semantic_corridor",
-                    "reason": "acoustic_crossed_unselected_speech",
+                    "reason": "acoustic_refinement_unsafe",
                 },
-            ), projection, speech_bounds
+            )
+        acoustic = _transcript_aligned_result(
+            acoustic,
+            speech_bounds=speech_bounds,
+            search_limits=(search_start_limit, search_end_limit),
+            projection_diagnostics=projection,
+        )
         return diagnostics, acoustic, projection, speech_bounds
 
-    with ThreadPoolExecutor(
-        max_workers=min(3, len(candidates)),
-        thread_name_prefix="direct-clip-boundary-verify",
-    ) as executor:
-        verification_results = list(executor.map(verify, candidates))
+    if bool(getattr(prepared, "ready", False)):
+        with ThreadPoolExecutor(
+            max_workers=min(3, len(candidates)),
+            thread_name_prefix="direct-clip-boundary-verify",
+        ) as executor:
+            verification_results = list(executor.map(verify, candidates))
+    else:
+        # Transcript-only checks are short, deterministic Python work. Running
+        # them inline avoids thread scheduling overhead on the small Railway
+        # instance without changing candidate order or delaying any I/O.
+        verification_results = [verify(candidate) for candidate in candidates]
 
     verified: list[dict[str, Any]] = []
     for raw_clip, (caption, acoustic, projection, speech_bounds) in zip(
         candidates, verification_results, strict=True
     ):
         raise_if_cancelled(should_cancel)
-        if caption is None or acoustic is None or not acoustic.verified:
+        if caption is None:
             continue
-        semantic_start, semantic_end, corridor_error = _selected_speech_corridor(
-            transcript,
-            raw_clip,
-            caption,
-            source_end_sec=media_end,
-            required_speech_bounds=speech_bounds,
-            projection_diagnostics=projection,
-        )
-        boundary_plan = _acoustic_boundary_plan(
-            transcript,
-            raw_clip,
-            projection,
-            speech_bounds=speech_bounds,
-            search_limits=(semantic_start, semantic_end),
-        )
-        if corridor_error or boundary_plan is None:
-            continue
-        (
-            start_target,
-            end_target,
-            start_handoff,
-            end_handoff,
-            start_two_sided,
-            end_two_sided,
-        ) = boundary_plan
-        if not _acoustic_range_is_safe(
-            start_sec=float(acoustic.start_sec),
-            end_sec=float(acoustic.end_sec),
-            required_start_sec=start_target,
-            required_end_sec=end_target,
-            semantic_start_limit_sec=semantic_start,
-            semantic_end_limit_sec=semantic_end,
-            source_end_sec=media_end,
-            diagnostics=dict(acoustic.diagnostics or {}),
-            require_start_handoff=start_handoff,
-            require_end_handoff=end_handoff,
-            require_start_two_sided=start_two_sided,
-            require_end_two_sided=end_two_sided,
+        if acoustic is None or not (
+            bool(getattr(acoustic, "verified", False))
+            or str(getattr(acoustic, "status", "")) == "context_aligned"
         ):
+            acoustic = _transcript_aligned_result(
+                clip_engine_silence.SilenceVerificationResult(
+                    "unavailable",
+                    speech_bounds[0],
+                    speech_bounds[1],
+                    {
+                        "stage": "transcript",
+                        "reason": "boundary_refinement_unavailable",
+                    },
+                ),
+                speech_bounds=speech_bounds,
+                search_limits=speech_bounds,
+                projection_diagnostics={},
+            )
+        strict_acoustic = bool(getattr(acoustic, "verified", False))
+        context_aligned = str(getattr(acoustic, "status", "")) == "context_aligned"
+        if strict_acoustic:
+            semantic_start, semantic_end, corridor_error = _selected_speech_corridor(
+                transcript,
+                raw_clip,
+                caption,
+                source_end_sec=media_end,
+                required_speech_bounds=speech_bounds,
+                projection_diagnostics=projection,
+            )
+            boundary_plan = _acoustic_boundary_plan(
+                transcript,
+                raw_clip,
+                projection,
+                speech_bounds=speech_bounds,
+                search_limits=(semantic_start, semantic_end),
+            )
+            if corridor_error or boundary_plan is None:
+                boundary_range_is_safe = False
+            else:
+                (
+                    start_target,
+                    end_target,
+                    start_handoff,
+                    end_handoff,
+                    start_two_sided,
+                    end_two_sided,
+                ) = boundary_plan
+                boundary_range_is_safe = _acoustic_range_is_safe(
+                    start_sec=float(acoustic.start_sec),
+                    end_sec=float(acoustic.end_sec),
+                    required_start_sec=start_target,
+                    required_end_sec=end_target,
+                    semantic_start_limit_sec=semantic_start,
+                    semantic_end_limit_sec=semantic_end,
+                    source_end_sec=media_end,
+                    diagnostics=dict(acoustic.diagnostics or {}),
+                    require_start_handoff=start_handoff,
+                    require_end_handoff=end_handoff,
+                    require_start_two_sided=start_two_sided,
+                    require_end_two_sided=end_two_sided,
+                )
+            if not boundary_range_is_safe:
+                acoustic = _transcript_aligned_result(
+                    clip_engine_silence.SilenceVerificationResult(
+                        "unavailable",
+                        speech_bounds[0],
+                        speech_bounds[1],
+                        {
+                            "stage": "transcript",
+                            "reason": "acoustic_refinement_unsafe",
+                        },
+                    ),
+                    speech_bounds=speech_bounds,
+                    search_limits=speech_bounds,
+                    projection_diagnostics={},
+                )
+                strict_acoustic = False
+                context_aligned = (
+                    str(getattr(acoustic, "status", "")) == "context_aligned"
+                )
+                boundary_range_is_safe = _context_result_range_is_safe(
+                    acoustic,
+                    source_end_sec=media_end,
+                )
+        else:
+            boundary_range_is_safe = _context_result_range_is_safe(
+                acoustic,
+                source_end_sec=media_end,
+            )
+        if not boundary_range_is_safe:
             continue
         clip = dict(raw_clip)
         clip.pop("_quality_scores", None)
         clip.pop("_grounded_topic_evidence_quote", None)
         clip["start"] = round(float(acoustic.start_sec), 3)
         clip["end"] = round(float(acoustic.end_sec), 3)
-        # Persistence must validate an acoustically extended tail against the
-        # prepared media, not a caption track that may end slightly earlier.
+        # Persistence may validate an optional acoustic tail against prepared
+        # media; the normal transcript path keeps the source cue duration.
         clip["_verified_media_duration_sec"] = media_end
         informativeness, topic_relevance, educational_importance = raw_clip[
             "_quality_scores"
@@ -1468,7 +1812,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v13",
+            selection_contract_version="quality_silence_v14",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -1504,12 +1848,18 @@ def _verified_direct_adapter_clips(
             ).strip(),
             source_rank=0,
             surface_eligible=True,
-            boundary_status="verified",
+            boundary_status=("verified" if strict_acoustic else "context_aligned"),
             boundary_diagnostics={
-                "method": "energy_silence",
-                "acoustic_verified": True,
+                "method": "energy_silence" if strict_acoustic else "transcript_context",
+                "acoustic_verified": strict_acoustic,
+                "final_range": [clip["start"], clip["end"]],
+                **({"context_aligned": True} if context_aligned else {}),
                 "caption": caption,
-                "acoustic": dict(acoustic.diagnostics or {}),
+                **(
+                    {"acoustic": dict(acoustic.diagnostics or {})}
+                    if strict_acoustic
+                    else {"transcript": dict(acoustic.diagnostics or {})}
+                ),
                 **({"lexical_projection": projection} if projection else {}),
             },
         )
@@ -1535,37 +1885,22 @@ def _verified_direct_adapter_clip(
     return clips[0] if clips else None
 
 
-def _run_direct_clip_with_audio_prefetch(
+def _run_direct_clip(
     source_url: str,
     *,
     topic: str,
     language: str,
     should_cancel: Callable[[], bool] | None,
     generation_context: GenerationContext,
-) -> tuple[dict[str, Any], clip_engine_silence.AudioPreparationResult]:
-    """Overlap the direct adapter's one selector call with audio resolution."""
-    executor = ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="direct-audio-prepare",
-    )
-    prepared_future = executor.submit(
-        clip_engine_silence.prepare_audio_source,
+) -> dict[str, Any]:
+    """Run the one whole-transcript selector without starting audio work."""
+    return _run_clip(
         source_url,
-        cancel_check=should_cancel,
+        topic=topic,
         language=language,
+        should_cancel=should_cancel,
+        generation_context=generation_context,
     )
-    try:
-        engine_out = _run_clip(
-            source_url,
-            topic=topic,
-            language=language,
-            should_cancel=should_cancel,
-            generation_context=generation_context,
-        )
-        return engine_out, prepared_future.result()
-    finally:
-        prepared_future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _strict_topic_clips(
@@ -1801,9 +2136,9 @@ class IngestionPipeline:
             generation_context = GenerationContext(
                 "fast",
                 generation_id=f"url:{video_id}",
-                require_acoustic_boundaries=True,
+                require_acoustic_boundaries=False,
             )
-            engine_out, prepared_audio = _run_direct_clip_with_audio_prefetch(
+            engine_out = _run_direct_clip(
                 source_url,
                 # concept_id is an opaque row id, NOT a topic — it must never
                 # steer segmentation (it flows to _persist_ingest for row
@@ -1827,11 +2162,11 @@ class IngestionPipeline:
             engine_out=engine_out,
             should_cancel=should_cancel,
             limit=None,
-            prepared_audio=prepared_audio,
+            prepared_audio=None,
         )
         if not verified:
             raise SegmentationError(
-                "no quality clip with verified silence boundaries could be produced"
+                "no quality clip with complete transcript boundaries could be produced"
             )
 
         raise_if_cancelled(should_cancel)
@@ -1881,7 +2216,7 @@ class IngestionPipeline:
                 persisted = stored
 
         # Keep the legacy singular reel while the additive inventory exposes
-        # every verified unit persisted above.
+        # every qualifying unit persisted above.
         assert persisted is not None
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -1959,9 +2294,9 @@ class IngestionPipeline:
             generation_context = GenerationContext(
                 "fast",
                 generation_id=f"topic-cut:{video_id}",
-                require_acoustic_boundaries=True,
+                require_acoustic_boundaries=False,
             )
-            engine_out, prepared_audio = _run_direct_clip_with_audio_prefetch(
+            engine_out = _run_direct_clip(
                 source_url,
                 topic=(query or ""),
                 language=language,
@@ -1982,7 +2317,7 @@ class IngestionPipeline:
             engine_out=engine_out,
             should_cancel=should_cancel,
             limit=None,
-            prepared_audio=prepared_audio,
+            prepared_audio=None,
             exact_topic=(query or ""),
             embedding_service=self._embedding_service,
         )
@@ -2094,7 +2429,7 @@ class IngestionPipeline:
                 generation_context = GenerationContext(
                     "fast",
                     generation_id=f"feed:{video_id}",
-                    require_acoustic_boundaries=True,
+                    require_acoustic_boundaries=False,
                 )
                 engine_out = _run_clip(
                     url,
@@ -2787,16 +3122,11 @@ class IngestionPipeline:
             )
 
             def verify_boundary(raw_clip: dict[str, Any]):
-                caption = _supadata_boundary_diagnostics(
+                caption, complete_cue_bounds = _transcript_boundary_seed(
                     engine_out["transcript"], raw_clip
                 )
-                if caption is None or not require_acoustic_boundaries:
-                    fallback = (
-                        _required_speech_bounds(raw_clip, caption)
-                        if caption is not None
-                        else (0.0, 0.0)
-                    )
-                    return caption, None, {}, fallback
+                if caption is None:
+                    return caption, None, {}, (0.0, 0.0)
                 speech_bounds, projection, projection_error = _projected_speech_bounds(
                     engine_out["transcript"],
                     raw_clip,
@@ -2804,16 +3134,21 @@ class IngestionPipeline:
                     prepared_audio,
                 )
                 required_start, required_end = speech_bounds
-                if projection_error:
-                    return caption, clip_engine_silence.SilenceVerificationResult(
-                        "unavailable",
-                        required_start,
-                        required_end,
+                if projection_error or not bool(
+                    getattr(prepared_audio, "ready", False)
+                ):
+                    speech_bounds = complete_cue_bounds
+                    required_start, required_end = speech_bounds
+                    projection = (
                         {
-                            "stage": "lexical_projection",
-                            "reason": projection_error,
-                        },
-                    ), {}, speech_bounds
+                            "context_fallback": {
+                                "stage": "transcript",
+                                "reason": projection_error,
+                            }
+                        }
+                        if projection_error
+                        else {}
+                    )
                 search_start_limit, search_end_limit, corridor_error = _selected_speech_corridor(
                     engine_out["transcript"],
                     raw_clip,
@@ -2823,15 +3158,29 @@ class IngestionPipeline:
                     projection_diagnostics=projection,
                 )
                 if corridor_error:
-                    return caption, clip_engine_silence.SilenceVerificationResult(
-                        "unavailable",
-                        required_start,
-                        required_end,
-                        {
-                            "stage": "semantic_corridor",
-                            "reason": corridor_error,
+                    speech_bounds = complete_cue_bounds
+                    projection = {
+                        **projection,
+                        "context_fallback": {
+                            "stage": "transcript",
+                            "reason": f"full_cue_fallback:{corridor_error}",
                         },
-                    ), projection, speech_bounds
+                    }
+                    transcript_boundary = _transcript_aligned_result(
+                        clip_engine_silence.SilenceVerificationResult(
+                            "unavailable",
+                            speech_bounds[0],
+                            speech_bounds[1],
+                            {
+                                "stage": "transcript",
+                                "reason": f"full_cue_fallback:{corridor_error}",
+                            },
+                        ),
+                        speech_bounds=speech_bounds,
+                        search_limits=speech_bounds,
+                        projection_diagnostics={},
+                    )
+                    return caption, transcript_boundary, projection, speech_bounds
                 boundary_plan = _acoustic_boundary_plan(
                     engine_out["transcript"],
                     raw_clip,
@@ -2840,15 +3189,22 @@ class IngestionPipeline:
                     search_limits=(search_start_limit, search_end_limit),
                 )
                 if boundary_plan is None:
-                    return caption, clip_engine_silence.SilenceVerificationResult(
-                        "unavailable",
-                        required_start,
-                        required_end,
-                        {
-                            "stage": "semantic_corridor",
-                            "reason": "boundary_plan_invalid",
-                        },
-                    ), projection, speech_bounds
+                    speech_bounds = complete_cue_bounds
+                    transcript_boundary = _transcript_aligned_result(
+                        clip_engine_silence.SilenceVerificationResult(
+                            "unavailable",
+                            speech_bounds[0],
+                            speech_bounds[1],
+                            {
+                                "stage": "transcript",
+                                "reason": "full_cue_fallback:boundary_plan_invalid",
+                            },
+                        ),
+                        speech_bounds=speech_bounds,
+                        search_limits=speech_bounds,
+                        projection_diagnostics={},
+                    )
+                    return caption, transcript_boundary, projection, speech_bounds
                 (
                     start_target,
                     end_target,
@@ -2857,17 +3213,42 @@ class IngestionPipeline:
                     start_two_sided,
                     end_two_sided,
                 ) = boundary_plan
+                if not require_acoustic_boundaries:
+                    transcript_boundary = _transcript_aligned_result(
+                        clip_engine_silence.SilenceVerificationResult(
+                            "unavailable",
+                            start_target,
+                            end_target,
+                            {
+                                "stage": "transcript",
+                                "reason": "complete_discourse_boundary",
+                            },
+                        ),
+                        speech_bounds=speech_bounds,
+                        search_limits=(search_start_limit, search_end_limit),
+                        projection_diagnostics=projection,
+                    )
+                    return caption, transcript_boundary, projection, speech_bounds
                 assert verification_deadline is not None
                 remaining_verification_sec = (
                     verification_deadline - time.monotonic()
                 )
                 if remaining_verification_sec <= 0:
-                    return caption, clip_engine_silence.SilenceVerificationResult(
-                        "unavailable",
-                        required_start,
-                        required_end,
-                        {"stage": "verify", "reason": "deadline_exceeded"},
-                    ), projection, speech_bounds
+                    transcript_boundary = _transcript_aligned_result(
+                        clip_engine_silence.SilenceVerificationResult(
+                            "unavailable",
+                            required_start,
+                            required_end,
+                            {
+                                "stage": "transcript",
+                                "reason": "audio_refinement_deadline_exceeded",
+                            },
+                        ),
+                        speech_bounds=speech_bounds,
+                        search_limits=(search_start_limit, search_end_limit),
+                        projection_diagnostics=projection,
+                    )
+                    return caption, transcript_boundary, projection, speech_bounds
                 acoustic = clip_engine_silence.verify_acoustic_boundaries(
                     str(v.get("url") or v.get("id") or ""),
                     start_target,
@@ -2883,15 +3264,8 @@ class IngestionPipeline:
                     timeout_sec=remaining_verification_sec,
                     cancel_check=should_cancel,
                 )
-                crossed_semantic_fence = bool(
-                    float(acoustic.start_sec)
-                    < search_start_limit - SPEECH_OWNERSHIP_EPSILON_SEC
-                    or float(acoustic.end_sec)
-                    > search_end_limit + SPEECH_OWNERSHIP_EPSILON_SEC
-                )
                 if (
                     acoustic.verified
-                    and crossed_semantic_fence
                     and not _acoustic_range_is_safe(
                         start_sec=float(acoustic.start_sec),
                         end_sec=float(acoustic.end_sec),
@@ -2907,16 +3281,22 @@ class IngestionPipeline:
                         require_end_two_sided=end_two_sided,
                     )
                 ):
-                    return caption, clip_engine_silence.SilenceVerificationResult(
+                    acoustic = clip_engine_silence.SilenceVerificationResult(
                         "unavailable",
-                        acoustic.start_sec,
-                        acoustic.end_sec,
+                        speech_bounds[0],
+                        speech_bounds[1],
                         {
                             **dict(acoustic.diagnostics or {}),
                             "stage": "semantic_corridor",
-                            "reason": "acoustic_crossed_unselected_speech",
+                            "reason": "acoustic_refinement_unsafe",
                         },
-                    ), projection, speech_bounds
+                    )
+                acoustic = _transcript_aligned_result(
+                    acoustic,
+                    speech_bounds=speech_bounds,
+                    search_limits=(search_start_limit, search_end_limit),
+                    projection_diagnostics=projection,
+                )
                 return caption, acoustic, projection, speech_bounds
 
             def boundary_results():
@@ -2930,6 +3310,10 @@ class IngestionPipeline:
                             {},
                             (0.0, 0.0),
                         )
+                    return
+                if not require_acoustic_boundaries:
+                    for index, clip in enumerate(candidate_clips):
+                        yield index, verify_boundary(clip)
                     return
                 boundary_executor = ThreadPoolExecutor(
                     max_workers=min(3, len(candidate_clips)),
@@ -2984,25 +3368,26 @@ class IngestionPipeline:
                             future.cancel()
                         for _future, index in unfinished:
                             clip = candidate_clips[index]
-                            caption = _supadata_boundary_diagnostics(
+                            caption, speech_bounds = _transcript_boundary_seed(
                                 engine_out["transcript"], clip
                             )
-                            speech_bounds = (
-                                _required_speech_bounds(clip, caption)
-                                if caption is not None
-                                else (0.0, 0.0)
-                            )
-                            yield index, (
-                                caption,
+                            timeout_result = _transcript_aligned_result(
                                 clip_engine_silence.SilenceVerificationResult(
                                     "unavailable",
                                     speech_bounds[0],
                                     speech_bounds[1],
                                     {
-                                        "stage": "verify",
-                                        "reason": "deadline_exceeded",
+                                        "stage": "transcript",
+                                        "reason": "audio_refinement_deadline_exceeded",
                                     },
                                 ),
+                                speech_bounds=speech_bounds,
+                                search_limits=speech_bounds,
+                                projection_diagnostics={},
+                            )
+                            yield index, (
+                                caption,
+                                timeout_result,
                                 {},
                                 speech_bounds,
                             )
@@ -3041,7 +3426,7 @@ class IngestionPipeline:
                     search_context["surface_reason"] = "supadata_boundary_unavailable"
                     record_boundary_unavailable("supadata_boundary_unavailable")
                 elif semantic_eligible and generation_context is not None:
-                    if require_acoustic_boundaries:
+                    if acoustic is not None:
                         assert acoustic is not None
                         acoustic_diagnostics = dict(acoustic.diagnostics or {})
                         semantic_start, semantic_end, corridor_error = (
@@ -3074,8 +3459,13 @@ class IngestionPipeline:
                                 start_two_sided,
                                 end_two_sided,
                             ) = boundary_plan
+                        strict_acoustic = bool(getattr(acoustic, "verified", False))
+                        context_aligned = (
+                            str(getattr(acoustic, "status", ""))
+                            == "context_aligned"
+                        )
                         acoustic_range_is_safe = bool(
-                            acoustic.verified
+                            strict_acoustic
                             and corridor_error is None
                             and boundary_plan is not None
                             and _acoustic_range_is_safe(
@@ -3093,18 +3483,42 @@ class IngestionPipeline:
                                 require_end_two_sided=end_two_sided,
                             )
                         )
+                        context_range_is_safe = _context_result_range_is_safe(
+                            acoustic,
+                            source_end_sec=media_end,
+                        )
+                        boundary_range_is_safe = (
+                            acoustic_range_is_safe or context_range_is_safe
+                        )
                         boundary_diagnostics = {
-                            "method": "energy_silence",
+                            "method": (
+                                "energy_silence"
+                                if acoustic_range_is_safe
+                                else "transcript_context"
+                            ),
                             "acoustic_verified": acoustic_range_is_safe,
+                            "final_range": [
+                                round(float(acoustic.start_sec), 3),
+                                round(float(acoustic.end_sec), 3),
+                            ],
+                            **(
+                                {"context_aligned": True}
+                                if context_range_is_safe
+                                else {}
+                            ),
                             "caption": caption_diagnostics,
-                            "acoustic": acoustic_diagnostics,
+                            **(
+                                {"acoustic": acoustic_diagnostics}
+                                if acoustic_range_is_safe
+                                else {"transcript": acoustic_diagnostics}
+                            ),
                         }
                         if projection_diagnostics:
                             boundary_diagnostics["lexical_projection"] = (
                                 projection_diagnostics
                             )
                         search_context["boundary_diagnostics"] = boundary_diagnostics
-                        if not acoustic_range_is_safe:
+                        if not boundary_range_is_safe:
                             surface_eligible = False
                             permanently_rejected = True
                             search_context["boundary_status"] = "unavailable"
@@ -3119,7 +3533,7 @@ class IngestionPipeline:
                                 f"{failure_stage}:{search_context['surface_reason']}"
                             )
                         else:
-                            boundary_verified_for_storage = True
+                            boundary_verified_for_storage = acoustic_range_is_safe
                             clip["start"] = round(float(acoustic.start_sec), 3)
                             clip["end"] = round(float(acoustic.end_sec), 3)
                             search_context["selection_caption_cues"] = (
@@ -3129,10 +3543,13 @@ class IngestionPipeline:
                                     boundary_bounds=(clip["start"], clip["end"]),
                                 )
                             )
-                            search_context["boundary_status"] = "verified"
+                            search_context["boundary_status"] = (
+                                "verified"
+                                if acoustic_range_is_safe
+                                else "context_aligned"
+                            )
                             search_context["speech_corridor_verified"] = True
                     else:
-                        boundary_verified_for_storage = True
                         search_context["boundary_status"] = "caption_aligned"
                         search_context["boundary_diagnostics"] = caption_diagnostics
                 else:
@@ -3291,7 +3708,7 @@ class IngestionPipeline:
                 remaining = max(0.0, deadline - time.monotonic())
                 done, _ = wait(
                     pending,
-                    timeout=min(0.01, remaining),
+                    timeout=min(0.05, remaining),
                     return_when=FIRST_COMPLETED,
                 )
                 if not done:
@@ -3662,7 +4079,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v13",
+                    selection_contract_version="quality_silence_v14",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,
@@ -4052,33 +4469,60 @@ class IngestionPipeline:
             upsert_video(conn, platform=adapter_result.platform, source_id=adapter_result.source_id, metadata=metadata)
 
             raise_if_cancelled(should_cancel)
-            existing_candidate = load_reel_by_selection_candidate(
-                conn,
-                material_id=effective_material_id,
-                concept_id=effective_concept_id,
-                video_id=video_id,
-                generation_id=generation_id,
-                selection_candidate_id=str(
+            candidate_lookup = {
+                "material_id": effective_material_id,
+                "concept_id": effective_concept_id,
+                "video_id": video_id,
+                "generation_id": generation_id,
+                "selection_candidate_id": str(
                     selection_context.get("selection_candidate_id") or ""
                 ),
+            }
+            existing_candidate = load_reel_by_selection_candidate(
+                conn, **candidate_lookup
             )
             if existing_candidate:
                 created_new_reel = False
-                reel_id = str(existing_candidate["id"])
-                existing_context = {}
-                try:
-                    existing_context = json.loads(
-                        str(existing_candidate.get("search_context_json") or "{}")
+                retained_candidate: dict[str, Any] | None = None
+                for _attempt in range(3):
+                    reel_id = str(existing_candidate["id"])
+                    existing_context: dict[str, Any] = {}
+                    existing_context_json = str(
+                        existing_candidate.get("search_context_json") or "{}"
                     )
-                except (TypeError, json.JSONDecodeError):
-                    pass
-                existing_surfaceable = (
-                    isinstance(existing_context, dict)
-                    and existing_context.get("surface_eligible") is True
-                )
-                incoming_surfaceable = selection_context.get("surface_eligible") is True
-                if incoming_surfaceable or not existing_surfaceable:
-                    update_reel_boundary_state(
+                    try:
+                        parsed_context = json.loads(existing_context_json)
+                        if isinstance(parsed_context, dict):
+                            existing_context = parsed_context
+                    except (TypeError, json.JSONDecodeError):
+                        pass
+                    existing_surfaceable = (
+                        existing_context.get("surface_eligible") is True
+                    )
+                    incoming_surfaceable = (
+                        selection_context.get("surface_eligible") is True
+                    )
+                    existing_grade = _boundary_evidence_grade(
+                        existing_context,
+                        t_start=existing_candidate.get("t_start"),
+                        t_end=existing_candidate.get("t_end"),
+                    )
+                    incoming_grade = _boundary_evidence_grade(
+                        selection_context,
+                        t_start=clip_start,
+                        t_end=clip_end,
+                    )
+                    should_update = bool(
+                        incoming_grade > existing_grade
+                        or (
+                            incoming_grade == existing_grade
+                            and (incoming_surfaceable or not existing_surfaceable)
+                        )
+                    )
+                    if not should_update:
+                        retained_candidate = existing_candidate
+                        break
+                    if update_reel_boundary_state(
                         conn,
                         reel_id=reel_id,
                         video_url=video_url,
@@ -4087,7 +4531,60 @@ class IngestionPipeline:
                         transcript_snippet=snippet,
                         selected_cue_ids=selected_cue_ids,
                         search_context=selection_context,
+                        expected_search_context_json=existing_context_json,
+                    ):
+                        break
+                    latest_candidate = load_reel_by_selection_candidate(
+                        conn, **candidate_lookup
                     )
+                    if latest_candidate is None:
+                        raise DatabaseIntegrityError(
+                            "Selection candidate disappeared during boundary promotion."
+                        )
+                    existing_candidate = latest_candidate
+                else:
+                    retained_candidate = existing_candidate
+                if retained_candidate is not None:
+                    reel_id = str(retained_candidate["id"])
+                    clip_start = float(retained_candidate["t_start"])
+                    clip_end = float(retained_candidate["t_end"])
+                    video_url = str(retained_candidate.get("video_url") or video_url)
+                    snippet = str(
+                        retained_candidate.get("transcript_snippet") or snippet
+                    )
+                    try:
+                        retained_ids = json.loads(
+                            str(
+                                retained_candidate.get("selected_cue_ids_json")
+                                or "[]"
+                            )
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        retained_ids = []
+                    if isinstance(retained_ids, list):
+                        selected_cue_ids = [
+                            str(value) for value in retained_ids if str(value).strip()
+                        ]
+                    try:
+                        retained_context = json.loads(
+                            str(
+                                retained_candidate.get("search_context_json") or "{}"
+                            )
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        retained_context = {}
+                    if isinstance(retained_context, dict):
+                        selection_context = retained_context
+                    retained_snapshot = _selection_snapshot_payload(
+                        selection_context,
+                        clip_start=clip_start,
+                        clip_end=clip_end,
+                        selected_cue_ids=selected_cue_ids,
+                    )
+                    if retained_snapshot is not None:
+                        snippet, selection_snapshot_captions = retained_snapshot
+                    else:
+                        selection_snapshot_captions = None
                 inserted = True
             else:
                 reel_id = f"ingest-{uuid.uuid4().hex[:16]}"
@@ -4211,11 +4708,7 @@ class IngestionPipeline:
             ),
             model_used=str(details.get("model_used") or ""),
             quality_degraded=bool(details.get("quality_degraded", False)),
-            selected_cue_ids=[
-                str(cue_id)
-                for cue_id in (details.get("cue_ids") or [])
-                if str(cue_id or "").strip()
-            ],
+            selected_cue_ids=list(selected_cue_ids),
             selection_contract_version=(
                 str(selection_context.get("selection_contract_version") or "").strip()
                 or None

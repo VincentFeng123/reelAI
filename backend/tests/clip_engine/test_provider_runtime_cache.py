@@ -221,14 +221,14 @@ def test_job_cost_budget_fits_expansion_and_realistic_long_transcript_selectors(
             operation="flash_boundary_selector",
             model="gemini-3-flash-preview",
             estimated_input_tokens=40_000,
-            max_output_tokens=8_192,
+            max_output_tokens=10_240,
         )
 
     budget = context.budget.snapshot()["gemini"]
     expected_reserved_cost = (
         1_000 * 0.25
         + 1_024 * 1.5
-        + selector_count * (40_000 * 0.5 + 8_192 * 3.0)
+        + selector_count * (40_000 * 0.5 + 10_240 * 3.0)
     ) / 1_000_000.0
     assert budget["flash_selector_calls"] == selector_count
     assert budget["reserved_cost_usd"] == pytest.approx(expected_reserved_cost)

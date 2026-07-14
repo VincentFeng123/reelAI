@@ -407,10 +407,12 @@ def test_cue_quotes_are_authoritative_when_word_timing_is_missing_or_untrusted()
     assert len(G._plan_to_clips(plan, segs, bad_words, {"segment_fine_snap": False})) == 1
 
 
-def test_quote_on_a_different_declared_line_is_rejected():
+def test_quote_on_a_different_declared_line_uses_declared_cue_fallback():
     segs = _segs(2)
     plan = G._Plan(topics=[_topic("T", 0, 1, start_quote="line 1")])
-    assert _convert(plan, segs) == []
+    clips = _convert(plan, segs)
+    assert len(clips) == 1
+    assert (clips[0]["start"], clips[0]["end"]) == (0.0, 20.0)
 
 
 def test_locate_quote_finds_start_and_latest_end():
@@ -624,6 +626,57 @@ def test_medium_uncertainty_is_accepted_but_high_uncertainty_is_rejected():
     assert classification == G._Classification("green", ())
 
 
+def test_high_uncertainty_with_only_boundary_reasons_is_retained():
+    segs = _segs(1)
+    report = G._plan_to_report(
+        G._Plan(topics=[
+            _topic(
+                "boundary fallback",
+                0,
+                0,
+                uncertainty="high",
+                uncertainty_reasons=["boundary_ambiguous", "overlap_risk"],
+            ),
+        ]),
+        segs,
+        [],
+        {},
+    )
+
+    assert [clip["title"] for clip in report.clips] == ["boundary fallback"]
+    assert report.clips[0]["uncertainty"] == "high"
+    assert report.clips[0]["uncertainty_reasons"] == [
+        "boundary_ambiguous",
+        "overlap_risk",
+    ]
+    assert report.clips[0]["_boundary_fallback_reasons"] == [
+        "model_boundary_ambiguous",
+        "model_overlap_risk",
+    ]
+    assert "proposal_0:high_uncertainty" not in report.rejected_reasons
+
+
+@pytest.mark.parametrize("reason", ["topic_ambiguous", "incomplete_context"])
+def test_high_topic_or_context_uncertainty_is_rejected(reason):
+    report = G._plan_to_report(
+        G._Plan(topics=[
+            _topic(
+                "content uncertainty",
+                0,
+                0,
+                uncertainty="high",
+                uncertainty_reasons=[reason],
+            ),
+        ]),
+        _segs(1),
+        [],
+        {},
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:high_uncertainty"]
+
+
 def test_equal_quality_ranking_is_stable_and_not_duration_or_uncertainty_shaped():
     segs = _segs(2)
     plan = G._Plan(topics=[
@@ -653,8 +706,11 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
         "  are each at least 0.75"
     ) in prompt
     assert "low or medium uncertainty" in prompt
-    assert "omit only high-uncertainty" in prompt
-    assert G._BOUNDARY_OUTPUT_TOKENS == 8_192
+    assert (
+        "never omit a substantive grounded unit solely because its boundary is uncertain"
+        in prompt
+    )
+    assert G._BOUNDARY_OUTPUT_TOKENS == 10_240
     assert "scan the whole transcript from first to last" in prompt
     assert "every distinct" in prompt
     assert "return every distinct qualifying moment" in prompt
@@ -669,6 +725,29 @@ def test_production_flash_has_a_bounded_latency_tail():
     assert G._TOTAL_DEADLINE_S == 36.0
     assert G._FLASH_BOUNDARY_TIMEOUT_S == 28.0
     assert G._FLASH_BOUNDARY_TIMEOUT_S < G._TOTAL_DEADLINE_S
+
+
+def test_production_flash_selector_disables_transport_retries(monkeypatch):
+    dispatched = []
+
+    def call_model(*args, **kwargs):
+        dispatched.append(kwargs)
+        return G._BoundaryPlan(topics=[]), {}
+
+    monkeypatch.setattr(G, "_call_model", call_model)
+
+    G._run_selection_profile(
+        G.PRODUCTION_FLASH_PROFILE,
+        {"segments": _segs(1), "words": []},
+        "chemistry",
+        {},
+        deadline=10_000.0,
+        cancelled=None,
+    )
+
+    assert len(dispatched) == 1
+    assert dispatched[0]["operation"] == "flash_boundary_selector"
+    assert dispatched[0]["max_retries"] == 0
 
 
 def test_production_flash_has_no_requested_duration_contract():

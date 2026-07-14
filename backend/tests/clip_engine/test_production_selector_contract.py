@@ -215,7 +215,7 @@ def test_exact_end_quote_split_across_adjacent_cues_is_projected() -> None:
     assert clip["_quote_repaired"] is True
 
 
-def test_repeated_cross_cue_boundary_quote_is_rejected_as_ambiguous() -> None:
+def test_repeated_cross_cue_boundary_quote_falls_back_to_selected_cues() -> None:
     segments = [
         {"cue_id": "cue-0", "start": 0.0, "end": 2.0, "text": "Cells use"},
         {
@@ -248,11 +248,12 @@ def test_repeated_cross_cue_boundary_quote_is_rejected_as_ambiguous() -> None:
         topic="photosynthesis",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["cue-0", "cue-1", "cue-2", "cue-3"]
+    assert "bad_start_quote" in report.clips[0]["_boundary_fallback_reasons"]
 
 
-def test_cross_cue_boundary_quote_cannot_cross_section_reset() -> None:
+def test_cross_cue_boundary_quote_reset_keeps_finite_selected_range() -> None:
     segments = [
         {
             "cue_id": "cue-0",
@@ -282,8 +283,9 @@ def test_cross_cue_boundary_quote_cannot_cross_section_reset() -> None:
         topic="photosynthesis",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["cue-0", "cue-1"]
+    assert "bad_start_quote" in report.clips[0]["_boundary_fallback_reasons"]
 
 
 def test_cross_cue_reanchoring_never_discards_substantive_context() -> None:
@@ -322,8 +324,9 @@ def test_cross_cue_reanchoring_never_discards_substantive_context() -> None:
         topic="photosynthesis",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
+    assert "bad_start_quote" in report.clips[0]["_boundary_fallback_reasons"]
 
 
 def test_boundary_quote_reanchoring_never_discards_substantive_context() -> None:
@@ -361,7 +364,9 @@ def test_boundary_quote_reanchoring_never_discards_substantive_context() -> None
     )
 
     assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+    assert report.rejected_reasons == [
+        "proposal_0:ungrounded_topic_evidence_quote"
+    ]
 
 
 @pytest.mark.parametrize(
@@ -419,8 +424,9 @@ def test_boundary_quote_reanchoring_remains_exact_unique_and_in_range(
         topic="photosynthesis",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:bad_start_quote"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
+    assert "bad_start_quote" in report.clips[0]["_boundary_fallback_reasons"]
 
 
 def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None:
@@ -441,7 +447,7 @@ def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None
     assert "return units across that entire scale" in user.lower()
     assert "unseen visual" in user
     assert "every qualifying related unit" in (_system + user)
-    assert "brief internal aside" in (_system + user)
+    assert "internal interruption" in (_system + user)
     assert "prioritize them within difficulty stages" in (_system + user)
     assert "title (at most 12 words)" in user
     assert "learning_objective (at most 24 words)" in user
@@ -476,13 +482,13 @@ def test_same_cue_trailing_preview_is_trimmed_from_model_end_quote() -> None:
 
     assert report.rejected_reasons == []
     [clip] = report.clips
-    assert clip["end_quote"] == "power the chemical reactions of photosynthesis"
+    assert clip["end_quote"] == "power the chemical reactions of photosynthesis."
     assert clip["edge_projection"]["end"] == {
         "required": True,
         "cue_id": "cue-0",
-        "quote": "power the chemical reactions of photosynthesis",
+        "quote": "power the chemical reactions of photosynthesis.",
     }
-    assert clip["_clip_text"].endswith("chemical reactions of photosynthesis")
+    assert clip["_clip_text"].endswith("chemical reactions of photosynthesis.")
     assert "next time" not in clip["_clip_text"]
 
 

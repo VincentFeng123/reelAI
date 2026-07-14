@@ -140,16 +140,8 @@ def test_boundary_schema_defaults_compact_nonessential_fields():
     assert item.uncertainty_reasons == []
 
 
-@pytest.mark.parametrize(
-    ("field", "reason"),
-    [
-        ("start_quote", "proposal_0:bad_start_quote"),
-        ("end_quote", "proposal_0:bad_end_quote"),
-    ],
-)
-def test_production_boundary_quotes_must_be_grounded_in_their_cited_cues(
-    field, reason,
-):
+@pytest.mark.parametrize("field", ["start_quote", "end_quote"])
+def test_bad_boundary_quote_falls_back_without_dropping_grounded_teaching(field):
     data = {
         key: value
         for key, value in _topic(0, 0).model_dump().items()
@@ -164,8 +156,67 @@ def test_production_boundary_quotes_must_be_grounded_in_their_cited_cues(
         topic="lesson 0",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == [reason]
+    assert len(report.clips) == 1
+    assert f"bad_{field}" in report.clips[0]["_boundary_fallback_reasons"]
+
+
+@pytest.mark.parametrize(
+    ("field", "text", "start_quote", "end_quote", "edge_filler"),
+    [
+        (
+            "start_quote",
+            (
+                "Welcome to the channel. Photosynthesis converts light energy "
+                "into chemical energy."
+            ),
+            "words absent from the cited cue",
+            "into chemical energy",
+            "Welcome to the channel",
+        ),
+        (
+            "end_quote",
+            (
+                "Photosynthesis converts light energy into chemical energy. "
+                "Thanks for watching."
+            ),
+            "Photosynthesis converts light energy",
+            "words absent from the cited cue",
+            "Thanks for watching",
+        ),
+    ],
+)
+def test_bad_boundary_quote_still_trims_removable_edge_filler(
+    field,
+    text,
+    start_quote,
+    end_quote,
+    edge_filler,
+):
+    proposal = _topic(
+        0,
+        0,
+        start_quote=start_quote,
+        end_quote=end_quote,
+        topic_evidence_quote=(
+            "Photosynthesis converts light energy into chemical energy"
+        ),
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        [{"cue_id": "lesson", "start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+    assert edge_filler not in report.clips[0]["_clip_text"]
+    assert report.clips[0]["_clip_text"].rstrip(".") == (
+        "Photosynthesis converts light energy into chemical energy"
+    )
+    assert f"bad_{field}" in report.clips[0]["_boundary_fallback_reasons"]
 
 
 def test_apostrophe_typography_is_grounded_and_source_spelling_is_preserved():
@@ -226,7 +277,61 @@ def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
 
     estimated_tokens = (len(payload) + 3) // 4
     assert estimated_tokens < G._BOUNDARY_OUTPUT_TOKENS
-    assert estimated_tokens + 1_024 < G._BOUNDARY_OUTPUT_TOKENS
+    assert estimated_tokens + 2_048 < G._BOUNDARY_OUTPUT_TOKENS
+
+
+def test_complete_teaching_survives_a_long_internal_structural_aside():
+    segments = [
+        {
+            "cue_id": "setup",
+            "start": 0.0,
+            "end": 10.0,
+            "text": (
+                "Photosynthesis stores light energy by exciting electrons in "
+                "chlorophyll."
+            ),
+        },
+        {
+            "cue_id": "aside",
+            "start": 10.0,
+            "end": 28.0,
+            "text": (
+                "Today's sponsor supports this lesson with study tools, practice "
+                "notes, review cards, quizzes, classroom resources, and other "
+                "materials for learners and teachers."
+            ),
+        },
+        {
+            "cue_id": "conclusion",
+            "start": 28.0,
+            "end": 40.0,
+            "text": (
+                "The energized electrons then drive reactions that store that "
+                "energy in chemical bonds."
+            ),
+        },
+    ]
+    proposal = _topic(
+        0,
+        2,
+        start_quote="Photosynthesis stores light energy",
+        end_quote="energy in chemical bonds",
+        topic_evidence_quote=(
+            "Photosynthesis stores light energy by exciting electrons in chlorophyll"
+        ),
+    )
+
+    report = G._plan_to_report(
+        G._Plan(topics=[proposal]),
+        segments,
+        [],
+        {},
+        topic="how photosynthesis stores energy",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["setup", "aside", "conclusion"]
 
 
 @pytest.mark.parametrize("field", ["start_line", "end_line"])
@@ -454,7 +559,7 @@ def test_brief_internal_channel_bump_does_not_discard_complete_teaching():
     assert "Welcome to Biology Pro Tips" in report.clips[0]["_clip_text"]
 
 
-def test_production_biology_fragment_fails_closed_without_a_clean_prior_onset():
+def test_production_biology_fragment_keeps_expanded_context_at_source_edge():
     raw_cues = [
         (74.120, 77.600, "Ok, so enzymes make life possible by speeding up chemical reactions,"),
         (77.600, 83.760, "but what even is…life? Scientists don't really seem to agree, but obviously a cat is different"),
@@ -511,8 +616,10 @@ def test_production_biology_fragment_fails_closed_without_a_clean_prior_onset():
         topic="biology",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:unresolved_weak_start"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"][0] == "3tisOnOkwzo:cue:15"
+    assert report.clips[0]["cue_ids"][-1] == "3tisOnOkwzo:cue:24"
+    assert "unresolved_weak_start" in report.clips[0]["_boundary_fallback_reasons"]
 
 
 def test_visual_ligature_instruction_is_rejected_without_frame_analysis():
@@ -671,7 +778,7 @@ def test_range_repair_keeps_paraphrased_objective_without_lost_support():
     ) == objective
 
 
-def test_structural_filler_edge_is_rejected_when_model_quotes_the_intro():
+def test_structural_filler_edge_is_trimmed_when_model_quotes_the_intro():
     segments = [{
         "start": 0.0,
         "end": 10.0,
@@ -691,8 +798,8 @@ def test_structural_filler_edge_is_rejected_when_model_quotes_the_intro():
         topic="biology",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["_clip_text"] == "Today cells are the basic unit of life."
 
 
 def test_punctuated_welcome_is_detected_as_structural_filler():
@@ -851,10 +958,10 @@ def test_trailing_non_speech_marker_is_trimmed_after_teaching():
 
     assert len(report.clips) == 1
     clip = report.clips[0]
-    assert clip["_clip_text"].endswith("enters and exits")
+    assert clip["_clip_text"].endswith("enters and exits.")
     assert "Outro Music" not in clip["_clip_text"]
     assert clip["edge_projection"]["end"]["quote"] == (
-        "membrane controls what enters and exits"
+        "membrane controls what enters and exits."
     )
 
 
@@ -1174,7 +1281,7 @@ def test_same_cue_internal_filler_remains_between_semantic_quotes():
     assert "A quick aside about the name" in report.clips[0]["_clip_text"]
 
 
-def test_ambiguous_projected_edge_quote_is_rejected():
+def test_ambiguous_projected_edge_quote_falls_back_without_rejection():
     text = (
         "A theatrical question comes first. The actual lesson begins with entropy. "
         "The actual lesson begins with entropy and concludes that disorder can increase."
@@ -1195,8 +1302,8 @@ def test_ambiguous_projected_edge_quote_is_rejected():
         topic="entropy",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:ambiguous_start_quote"]
+    assert len(report.clips) == 1
+    assert "start_edge_fallback" in report.clips[0]["_boundary_fallback_reasons"]
 
 
 def test_adjacent_facets_inside_one_coarse_cue_remain_distinct():
@@ -1394,7 +1501,7 @@ def test_visual_dependency_inside_semantic_projection_is_rejected():
     assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
 
 
-def test_long_same_cue_internal_sponsor_block_is_rejected():
+def test_long_same_cue_internal_sponsor_block_does_not_discard_teaching():
     text = (
         "Photosynthesis converts light energy into chemical energy. "
         "Today's sponsor is Acme, whose premium study platform gives every learner "
@@ -1417,8 +1524,15 @@ def test_long_same_cue_internal_sponsor_block_is_rejected():
         topic="photosynthesis",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:long_internal_filler_block"]
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+    assert "Photosynthesis converts light energy" in report.clips[0]["_clip_text"]
+    assert "Chlorophyll captures photons" in report.clips[0]["_clip_text"]
+    assert "Today's sponsor is Acme" in report.clips[0]["_clip_text"]
+    assert (
+        "retained_long_internal_filler_block"
+        in report.clips[0]["_boundary_fallback_reasons"]
+    )
 
 
 def test_brief_same_cue_internal_aside_is_tolerated():
@@ -1553,7 +1667,7 @@ def test_selector_rejects_an_explicitly_ungrounded_teaching_claim():
     assert report.rejected_reasons == ["proposal_0:not_factually_grounded"]
 
 
-def test_video_plug_tail_is_rejected_even_after_substantive_teaching():
+def test_video_plug_tail_is_trimmed_after_substantive_teaching():
     segments = [{
         "start": 0.0,
         "end": 20.0,
@@ -1576,8 +1690,10 @@ def test_video_plug_tail_is_rejected_even_after_substantive_teaching():
         topic="biology",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["_clip_text"] == (
+        "Complement proteins mark bacteria and help immune cells destroy them."
+    )
 
 
 def test_video_recording_example_is_not_mistaken_for_a_channel_plug():
@@ -1641,15 +1757,18 @@ def test_instructional_language_is_not_mistaken_for_structural_filler(
     assert len(report.clips) == 1
 
 
-def test_name_led_welcome_intro_remains_structural_filler():
-    text = "Professor Nguyen welcome to the course. Matrices represent linear maps."
+def test_name_led_welcome_intro_is_trimmed_from_grounded_teaching():
+    text = (
+        "Professor Nguyen welcome to the course. "
+        "Matrices represent linear maps between vector spaces."
+    )
     report = G._plan_to_report(
         G._Plan(topics=[_topic(
             0,
             0,
             start_quote="Professor Nguyen welcome to the course",
-            end_quote="represent linear maps",
-            topic_evidence_quote="Matrices represent linear maps in coordinate systems",
+            end_quote="linear maps between vector spaces",
+            topic_evidence_quote="Matrices represent linear maps between vector spaces",
         )]),
         [{"start": 0.0, "end": 12.0, "text": text}],
         [],
@@ -1657,8 +1776,10 @@ def test_name_led_welcome_intro_remains_structural_filler():
         topic="linear algebra",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler"]
+    assert len(report.clips) == 1
+    assert report.clips[0]["_clip_text"] == (
+        "Matrices represent linear maps between vector spaces."
+    )
 
 
 def test_complete_unpunctuated_teaching_trims_a_trailing_outro_cue():
@@ -1802,7 +1923,7 @@ def test_brief_internal_aside_is_tolerated_inside_complete_teaching():
     assert report.clips[0]["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
 
 
-def test_long_internal_sponsor_block_rejects_the_candidate():
+def test_long_internal_sponsor_block_does_not_discard_the_candidate():
     segments = [
         {
             "start": 0.0,
@@ -1839,8 +1960,13 @@ def test_long_internal_sponsor_block_rejects_the_candidate():
         topic="cellular respiration",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:long_internal_filler_block"]
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["cue-0", "cue-1", "cue-2"]
+    assert (
+        "retained_long_internal_filler_block"
+        in report.clips[0]["_boundary_fallback_reasons"]
+    )
 
 
 def test_multiple_brief_internal_admin_and_tangent_blocks_are_tolerated():

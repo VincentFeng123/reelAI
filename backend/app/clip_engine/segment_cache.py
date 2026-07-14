@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 SEGMENT_CACHE_VERSION = 8
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v13"
+SELECTION_CONTRACT_VERSION = "quality_silence_v14"
 
 
 def _objective_tokens(clip: Mapping[str, Any]) -> set[str]:
@@ -222,6 +222,15 @@ def _valid_clips(
             return None
         uncertainty = str(raw.get("uncertainty") or "low").strip().lower()
         uncertainty_reasons = raw.get("uncertainty_reasons") or []
+        boundary_only_high_uncertainty = bool(
+            uncertainty == "high"
+            and isinstance(uncertainty_reasons, list)
+            and uncertainty_reasons
+            and {
+                str(reason or "").strip().lower()
+                for reason in uncertainty_reasons
+            }.issubset({"boundary_ambiguous", "overlap_risk"})
+        )
         evidence_quote = " ".join(str(raw.get("topic_evidence_quote") or "").split())
         evidence_words = re.findall(r"[\w+#'-]+", evidence_quote.casefold())
         window_parts: list[str] = []
@@ -291,7 +300,10 @@ def _valid_clips(
             or raw.get("factually_grounded") is not True
             or not evidence_grounded
             or raw.get("kind") != "educational"
-            or uncertainty not in {"low", "medium"}
+            or not (
+                uncertainty in {"low", "medium"}
+                or boundary_only_high_uncertainty
+            )
             or not isinstance(uncertainty_reasons, list)
             or any(
                 not str(raw.get(field) or "").strip()

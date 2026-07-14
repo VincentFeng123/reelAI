@@ -15,9 +15,17 @@ import pytest
 from backend.app import db
 from backend.app import main
 from backend.app.clip_engine import segment_cache
+from backend.app.clip_engine import silence as clip_engine_silence
 from backend.app.clip_engine.errors import ProviderQuotaError, ProviderTransientError
+from backend.app.ingestion import pipeline as ingestion_pipeline
+from backend.app.ingestion.models import (
+    IngestMetadata,
+    IngestRequest,
+    IngestSegment,
+    IngestTranscriptCue,
+    YouTubeSourceRef,
+)
 from backend.app.models import ReelOut, ReelsGenerateRequest
-from backend.app.ingestion.models import IngestRequest
 from backend.app.services import generation_jobs
 from backend.app.services.reels import ReelService
 
@@ -34,8 +42,8 @@ def test_fresh_inventory_and_selector_cache_share_current_contract() -> None:
         main.SELECTION_CONTRACT_VERSION,
         generation_jobs.REQUEST_SCHEMA_VERSION,
         ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-    } == {"quality_silence_v13"}
-    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v13"
+    } == {"quality_silence_v14"}
+    assert segment_cache.SELECTION_CONTRACT_VERSION == "quality_silence_v14"
 
 
 def test_reel_response_schema_retains_v3_source_and_selector_metadata() -> None:
@@ -135,7 +143,7 @@ def _insert_generation_reel(
             json.dumps({
                 "surface_eligible": True,
                 "boundary_status": "verified",
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
                 "speech_corridor_verified": True,
                 "directly_teaches_topic": True,
                 "substantive": True,
@@ -153,7 +161,12 @@ def _insert_generation_reel(
                 "boundary_diagnostics": {
                     "method": "energy_silence",
                     "acoustic_verified": True,
-                    "acoustic": {"threshold_dbfs": -38.0},
+                    "final_range": [0.0, 30.0],
+                    "acoustic": {
+                        "threshold_dbfs": -38.0,
+                        "start_quiet": [0.0, 0.1],
+                        "end_quiet": [29.9, 30.1],
+                    },
                 },
             }),
             created_at,
@@ -164,7 +177,7 @@ def _insert_generation_reel(
         "video_id": video_id,
         "t_start": 0.0,
         "t_end": 30.0,
-        "selection_contract_version": "quality_silence_v13",
+        "selection_contract_version": "quality_silence_v14",
     }
 
 
@@ -176,11 +189,52 @@ def _set_reel_boundary_state(
     surface_eligible: bool = True,
     acoustic_verified: bool | None = None,
 ) -> None:
+    row = conn.execute(
+        "SELECT t_start, t_end FROM reels WHERE id = ?", (reel_id,)
+    ).fetchone()
+    assert row is not None
+    start, end = float(row[0]), float(row[1])
     verified = (
         boundary_status == "verified"
         if acoustic_verified is None
         else acoustic_verified
     )
+    if boundary_status == "context_aligned":
+        boundary_diagnostics = {
+            "method": "transcript_context",
+            "context_aligned": True,
+            "acoustic_verified": False,
+            "transcript": {
+                "context_aligned": True,
+                "stage": "transcript",
+                "reason": "complete_discourse_boundary",
+                "required_speech_range": [start, end],
+                "semantic_range": [start, end],
+                "final_range": [start, end],
+            },
+        }
+        caption_cues = [{
+            "cue_id": "cue-1",
+            "start": start,
+            "end": end,
+            "text": "Cells transfer usable chemical energy through ATP.",
+        }]
+    else:
+        boundary_diagnostics = {
+            "method": "energy_silence",
+            "acoustic_verified": verified,
+            "final_range": [start, end],
+            "acoustic": (
+                {
+                    "threshold_dbfs": -38.0,
+                    "start_quiet": [max(0.0, start - 0.1), start + 0.1],
+                    "end_quiet": [max(0.0, end - 0.1), end + 0.1],
+                }
+                if verified
+                else {}
+            ),
+        }
+        caption_cues = []
     conn.execute(
         "UPDATE reels SET search_context_json = ? WHERE id = ?",
         (
@@ -188,12 +242,9 @@ def _set_reel_boundary_state(
                 "surface_eligible": surface_eligible,
                 "boundary_status": boundary_status,
                 "speech_corridor_verified": True,
-                "boundary_diagnostics": {
-                    "method": "energy_silence",
-                    "acoustic_verified": verified,
-                    "acoustic": ({"threshold_dbfs": -38.0} if verified else {}),
-                },
-                "selection_contract_version": "quality_silence_v13",
+                "selection_caption_cues": caption_cues,
+                "boundary_diagnostics": boundary_diagnostics,
+                "selection_contract_version": "quality_silence_v14",
                 "directly_teaches_topic": True,
                 "substantive": True,
                 "factually_grounded": True,
@@ -264,7 +315,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
             "takeaways": [],
             "score": 0.93,
             "relevance_score": 0.13,
-            "_selection_contract_version": "quality_silence_v13",
+            "_selection_contract_version": "quality_silence_v14",
             "_selection_topic_relevance": 0.93,
             "_selection_source_rank": 0,
         }],
@@ -286,7 +337,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
 
         assert len(reels) == 1
         assert reels[0]["video_id"] == "AbCdEf12345"
-        assert reels[0]["selection_contract_version"] == "quality_silence_v13"
+        assert reels[0]["selection_contract_version"] == "quality_silence_v14"
         assert reels[0]["relevance_score"] == 0.93
         assert reels[0]["topic_relevance"] == 0.93
         assert not any(key.startswith("_selection_") for key in reels[0])
@@ -380,6 +431,69 @@ def test_reusable_generation_requires_every_quality_score_at_threshold(
             generation_id=generation_id,
             material_id="m1",
         ) is True
+    finally:
+        conn.close()
+
+
+def test_transcript_aligned_inventory_counts_reuses_and_replays_only_current_surface_rows() -> None:
+    conn = _conn()
+    generation_id = "transcript-boundary-generation"
+    created_at = "2026-07-10T00:00:00+00:00"
+    conn.execute(
+        "INSERT INTO reel_generations "
+        "(id, material_id, concept_id, request_key, generation_mode, "
+        "retrieval_profile, status, reel_count, created_at) "
+        "VALUES (?, 'm1', 'c1', 'transcript-boundary', 'fast', 'deep', "
+        "'completed', 1, ?)",
+        (generation_id, created_at),
+    )
+    _insert_generation_reel(
+        conn,
+        generation_id=generation_id,
+        reel_id="transcript-boundary-reel",
+        video_id="transcript-boundary-video",
+        created_at=created_at,
+    )
+    try:
+        _set_reel_boundary_state(
+            conn,
+            reel_id="transcript-boundary-reel",
+            boundary_status="context_aligned",
+        )
+        assert main._count_generation_reels(conn, generation_id) == 1
+        assert main._verified_reusable_generation_chain(
+            conn,
+            generation_id=generation_id,
+            material_id="m1",
+        ) is True
+        assert main._usable_boundary_reel_ids(
+            conn, ["transcript-boundary-reel"]
+        ) == {"transcript-boundary-reel"}
+
+        context = json.loads(conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = ?",
+            ("transcript-boundary-reel",),
+        ).fetchone()[0])
+        context["surface_eligible"] = False
+        conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = ?",
+            (json.dumps(context), "transcript-boundary-reel"),
+        )
+        assert main._count_generation_reels(conn, generation_id) == 0
+        assert main._usable_boundary_reel_ids(
+            conn, ["transcript-boundary-reel"]
+        ) == set()
+
+        context["surface_eligible"] = True
+        context["selection_contract_version"] = "quality_silence_v12"
+        conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = ?",
+            (json.dumps(context), "transcript-boundary-reel"),
+        )
+        assert main._count_generation_reels(conn, generation_id) == 0
+        assert main._usable_boundary_reel_ids(
+            conn, ["transcript-boundary-reel"]
+        ) == set()
     finally:
         conn.close()
 
@@ -812,14 +926,19 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
                 json.dumps({
                         "surface_eligible": True,
                         "boundary_status": "verified",
-                        "selection_contract_version": "quality_silence_v13",
+                        "selection_contract_version": "quality_silence_v14",
                         "speech_corridor_verified": True,
                         "directly_teaches_topic": True,
                         "substantive": True,
                         "factually_grounded": True,
                         "boundary_diagnostics": {
                             "acoustic_verified": True,
-                            "acoustic": {"threshold_dbfs": -38.0},
+                            "final_range": [0.0, 30.0],
+                                "acoustic": {
+                                    "threshold_dbfs": -38.0,
+                                    "start_quiet": [0.0, 0.1],
+                                    "end_quiet": [29.9, 30.1],
+                                },
                         },
                     }),
                 now.isoformat(),
@@ -1332,7 +1451,7 @@ def test_slow_generation_uses_one_deep_retrieval_with_three_source_cap(monkeypat
         assert [call["max_new_reels"] for call in calls] == [3]
         assert calls[0]["max_generation_videos"] == 3
         assert all(
-            call["generation_context"].require_acoustic_boundaries
+            not call["generation_context"].require_acoustic_boundaries
             for call in calls
         )
         assert calls[0]["exclude_video_ids"] == ["manual-exclusion"]
@@ -1425,7 +1544,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
                 "video_id": f"{mode}-video-{index % expected_source_cap}",
                 "t_start": float(index * 10),
                 "t_end": float(index * 10 + 8),
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
             }
             kwargs["on_reel_created"](reel)
         generated_count += int(kwargs["max_new_reels"])
@@ -1442,7 +1561,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         lambda *_args, **_kwargs: [
             {
                 "reel_id": f"{mode}-reel-{index}",
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
             }
             for index in range(expected_reel_cap)
         ],
@@ -1912,6 +2031,11 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         video_id="stream-video",
         created_at=datetime.now(timezone.utc).isoformat(),
     )
+    _set_reel_boundary_state(
+        conn,
+        reel_id="provisional",
+        boundary_status="context_aligned",
+    )
     generation_jobs.append_event(
         conn,
         job_id=job["id"],
@@ -1919,7 +2043,7 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         payload={
             "reel": {
                 "reel_id": "provisional",
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
             },
             "provisional": True,
         },
@@ -1994,7 +2118,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": "streamed-video",
                 "t_start": 10.0,
                 "t_end": 40.0,
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
             },
             "provisional": True,
         },
@@ -2019,7 +2143,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{
             "reel_id": "ranked-reel",
-            "selection_contract_version": "quality_silence_v13",
+            "selection_contract_version": "quality_silence_v14",
         }],
     )
     monkeypatch.setattr(
@@ -2080,7 +2204,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": f"ranked-video-{index}",
                 "t_start": float(index * 30),
                 "t_end": float(index * 30 + 20),
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
             }
             for index in range(4)
         ],
@@ -2119,6 +2243,11 @@ def test_completed_job_status_and_replay_drop_currently_invalid_candidate(monkey
         reel_id="current-valid",
         video_id="current-valid-video",
         created_at=now.isoformat(),
+    )
+    _set_reel_boundary_state(
+        conn,
+        reel_id="current-valid",
+        boundary_status="context_aligned",
     )
     stale = _insert_generation_reel(
         conn,
@@ -2182,6 +2311,224 @@ def test_completed_job_status_and_replay_drop_currently_invalid_candidate(monkey
     assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
         "current-valid"
     ]
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "fallback_reason",
+    [
+        "acoustic_refinement_unsafe",
+        "start_silence_not_found",
+        "audio_refinement_deadline_exceeded",
+    ],
+)
+def test_boundary_only_failure_survives_persistence_feed_and_authoritative_replay(
+    monkeypatch,
+    fallback_reason: str,
+) -> None:
+    conn = _conn()
+
+    @contextmanager
+    def shared_connection(**_kwargs):
+        yield conn
+
+    monkeypatch.setattr(ingestion_pipeline, "get_conn", shared_connection)
+    monkeypatch.setattr(
+        main.reel_service,
+        "learner_progress",
+        lambda *_args, **_kwargs: {
+            "selected_level": "beginner",
+            "global_adjustment": 0.0,
+            "feedback_revision": 0,
+        },
+    )
+
+    generation_id = main._create_generation_row(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=f"boundary-fallback-{fallback_reason}",
+        generation_mode="fast",
+        retrieval_profile="unified",
+    )
+    transcript_boundary = ingestion_pipeline._transcript_aligned_result(
+        clip_engine_silence.SilenceVerificationResult(
+            "unavailable",
+            10.0,
+            20.0,
+            {"stage": "transcript", "reason": fallback_reason},
+        ),
+        speech_bounds=(10.0, 20.0),
+        search_limits=(9.0, 21.0),
+        projection_diagnostics={},
+    )
+    assert transcript_boundary.status == "context_aligned"
+
+    transcript_diagnostics = dict(transcript_boundary.diagnostics)
+    search_context = {
+        "selection_candidate_id": f"candidate-{fallback_reason}",
+        "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+        "surface_eligible": True,
+        "speech_corridor_verified": True,
+        "boundary_confidence": 0.9,
+        "boundary_status": "context_aligned",
+        "selection_caption_cues": [
+            {
+                "cue_id": "cue-1",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "Mitochondria produce ATP that cells use as chemical energy.",
+            }
+        ],
+        "boundary_diagnostics": {
+            "method": "transcript_context",
+            "context_aligned": True,
+            "acoustic_verified": False,
+            "final_range": [10.0, 20.0],
+            "transcript": transcript_diagnostics,
+        },
+        "directly_teaches_topic": True,
+        "substantive": True,
+        "factually_grounded": True,
+        "self_contained": True,
+        "is_standalone": True,
+        "informativeness": 0.95,
+        "topic_relevance": 0.95,
+        "educational_importance": 0.95,
+        "quality_floor": 0.95,
+        "quality_mean": 0.95,
+        "topic_evidence_quote": (
+            "Mitochondria produce ATP that cells use as chemical energy."
+        ),
+    }
+    pipeline = ingestion_pipeline.IngestionPipeline(
+        youtube_service=None,
+        embedding_service=None,
+        serverless_mode=False,
+    )
+    persisted = pipeline._persist_ingest(
+        adapter_result=YouTubeSourceRef(
+            source_id="BoundaryVid",
+            source_url="https://www.youtube.com/watch?v=BoundaryVid",
+            playback_url="https://www.youtube.com/embed/BoundaryVid",
+        ),
+        metadata=IngestMetadata(
+            platform="yt",
+            source_id="BoundaryVid",
+            source_url="https://www.youtube.com/watch?v=BoundaryVid",
+            playback_url="https://www.youtube.com/embed/BoundaryVid",
+            title="Mitochondria and cellular energy",
+            duration_sec=30.0,
+        ),
+        cues=[
+            IngestTranscriptCue(
+                cue_id="cue-1",
+                start=10.0,
+                end=20.0,
+                text="Mitochondria produce ATP that cells use as chemical energy.",
+            )
+        ],
+        chosen=IngestSegment(
+            t_start=10.0,
+            t_end=20.0,
+            text="Mitochondria produce ATP that cells use as chemical energy.",
+            score=0.95,
+        ),
+        snippet="Mitochondria produce ATP that cells use as chemical energy.",
+        material_id="m1",
+        concept_id="c1",
+        clip_window=(10.0, 20.0),
+        target_max=0,
+        generation_id=generation_id,
+        clip_title="How mitochondria supply cellular energy",
+        clip_difficulty=0.2,
+        clip_details={
+            "cue_ids": ["cue-1"],
+            "informativeness": 0.95,
+            "search_context": search_context,
+        },
+    )
+
+    ranked_feed = main.reel_service.ranked_feed(
+        conn,
+        "m1",
+        fast_mode=True,
+        generation_id=generation_id,
+        learner_id="learner-1",
+        require_verified_boundaries=True,
+    )
+    assert [reel["reel_id"] for reel in ranked_feed] == [persisted.reel_id]
+
+    job, _ = generation_jobs.submit_or_get_active(
+        conn,
+        material_id="m1",
+        concept_id="c1",
+        request_key=f"job-{fallback_reason}",
+        content_fingerprint="boundary-fallback-fingerprint",
+        learner_id="learner-1",
+        request_params={"generation_mode": "fast", "num_reels": 8},
+    )
+    leased = generation_jobs.lease_job(
+        conn,
+        job_id=job["id"],
+        lease_owner="boundary-fallback-worker",
+    )
+    assert leased
+    candidate_reel = {
+        "reel_id": persisted.reel_id,
+        "video_id": "BoundaryVid",
+        "t_start": persisted.t_start,
+        "t_end": persisted.t_end,
+        "selection_contract_version": main.SELECTION_CONTRACT_VERSION,
+    }
+    generation_jobs.append_event(
+        conn,
+        job_id=job["id"],
+        event_type="candidate",
+        payload={"reel": candidate_reel, "provisional": True},
+        lease_owner="boundary-fallback-worker",
+    )
+    generation_jobs.append_event(
+        conn,
+        job_id=job["id"],
+        event_type="final",
+        payload={"reels": [candidate_reel], "authoritative": True},
+        lease_owner="boundary-fallback-worker",
+    )
+    terminal = generation_jobs.transition_terminal(
+        conn,
+        job_id=job["id"],
+        status="completed",
+        lease_owner="boundary-fallback-worker",
+        result_generation_id=generation_id,
+    )
+    assert terminal
+
+    status = main._generation_job_status_payload(conn, terminal)
+    replay = main._sanitize_generation_replay_events(
+        conn,
+        terminal,
+        generation_jobs.replay_events(conn, job_id=job["id"]),
+    )
+    assert [reel["reel_id"] for reel in status["reels"]] == [persisted.reel_id]
+    assert [
+        event["payload"]["reel"]["reel_id"]
+        for event in replay
+        if event["type"] == "candidate"
+    ] == [persisted.reel_id]
+    final = next(event for event in replay if event["type"] == "final")
+    assert final["payload"]["authoritative"] is True
+    assert [reel["reel_id"] for reel in final["payload"]["reels"]] == [
+        persisted.reel_id
+    ]
+    stored_context = json.loads(conn.execute(
+        "SELECT search_context_json FROM reels WHERE id = ?",
+        (persisted.reel_id,),
+    ).fetchone()[0])
+    assert stored_context["boundary_status"] == "context_aligned"
+    assert stored_context["boundary_diagnostics"]["transcript"]["reason"] == (
+        fallback_reason
+    )
     conn.close()
 
 
@@ -2747,7 +3094,7 @@ def test_v7_feed_merges_value_ranked_batches_without_breaking_batch_topology(
             "_selection_topic_relevance": relevance,
             "_selection_source_rank": source_rank,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v13",
+            "selection_contract_version": "quality_silence_v14",
         }
 
     root_reels = [
@@ -2878,7 +3225,7 @@ def test_generation_chain_uses_nearest_difficulty_across_all_batches(
             "_selection_topic_relevance": 0.9,
             "_selection_source_rank": 0,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v13",
+            "selection_contract_version": "quality_silence_v14",
         }
 
     monkeypatch.setattr(
@@ -3090,7 +3437,7 @@ def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
             }
         ],
     )
@@ -3116,7 +3463,7 @@ def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v13",
+                "selection_contract_version": "quality_silence_v14",
             }
         ]
         assert conn.execute(
