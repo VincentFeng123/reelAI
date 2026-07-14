@@ -188,6 +188,37 @@ def test_empty_selector_result_is_cached(monkeypatch):
     assert stored == [[]]
 
 
+def test_failed_selector_result_is_not_cached(monkeypatch):
+    transcript = {
+        "segments": [{"start": 0.0, "end": 5.0, "text": "hello world"}],
+        "words": [],
+        "duration": 5.0,
+    }
+    stored: list[list[dict]] = []
+    monkeypatch.setattr(run, "_transcribe", lambda *_args, **_kwargs: transcript)
+    monkeypatch.setattr(
+        run.gemini_segment,
+        "segment_clips_detailed",
+        lambda *_args, **_kwargs: run.gemini_segment.SegmentResult(
+            [],
+            "Segmentation model call failed.",
+            "flash_only",
+            "invalid",
+            error="GeminiTransportError: status 400",
+        ),
+    )
+    monkeypatch.setattr(
+        run.segment_cache,
+        "store_segment_result",
+        lambda _key, clips, *_args, **_kwargs: stored.append(clips),
+    )
+
+    with pytest.raises(run.ClipError, match="Gemini segmentation failed"):
+        run.clip("https://youtu.be/dQw4w9WgXcQ", "topic")
+
+    assert stored == []
+
+
 def test_boundary_repair_usage_is_recorded_in_repair_stage():
     context = GenerationContext("slow")
     settings = {"generation_context": context}

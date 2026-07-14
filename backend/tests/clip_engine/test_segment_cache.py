@@ -111,6 +111,7 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
 
 
 def test_segmenter_source_signature_includes_imported_validators(monkeypatch) -> None:
+    from backend import gemini_client
     from backend.pipeline import discourse, sentences
 
     real_read_bytes = segment_cache.Path.read_bytes
@@ -118,7 +119,7 @@ def test_segmenter_source_signature_includes_imported_validators(monkeypatch) ->
     baseline = segment_cache._segmenter_source_signature()
     assert baseline is not None
 
-    for module in (discourse, sentences):
+    for module in (discourse, sentences, gemini_client):
         target_name = segment_cache.Path(module.__file__).name
 
         def changed_validator(path, *, expected_name=target_name):

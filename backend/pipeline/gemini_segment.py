@@ -3523,4 +3523,9 @@ def segment_clips(
         progress=progress,
         routing_mode="flash_only",
     )
+    if result.error:
+        # A provider/schema/transport failure is not a valid empty selection.
+        # Raising prevents the caller from persisting a poisoned empty cache
+        # entry while successful zero-match responses remain cacheable.
+        raise RuntimeError("segmentation provider call failed")
     return result.clips, result.notes

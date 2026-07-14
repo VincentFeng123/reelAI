@@ -76,10 +76,11 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
 def _segmenter_source_signature() -> str | None:
     """Invalidate cache entries whenever the active prompt or validators change."""
     try:
+        from ... import gemini_client
         from ...pipeline import discourse, gemini_segment, sentences
 
         digest = hashlib.sha256()
-        for module in (gemini_segment, discourse, sentences):
+        for module in (gemini_segment, discourse, sentences, gemini_client):
             source_path = Path(str(module.__file__ or ""))
             digest.update(source_path.name.encode("utf-8"))
             digest.update(b"\0")
