@@ -40,9 +40,9 @@ DEEP_PHASE_TIMEOUT_SEC = 24.0
 DEFAULT_PREPARE_TIMEOUT_SEC = 24.0
 EDGE_WINDOW_SEC = 6.0
 QUIET_THRESHOLD_DBFS = -38.0
-MIN_QUIET_MS = 120
+MIN_QUIET_MS = 100
 START_CUSHION_MS = 100
-END_CUSHION_MS = 200
+END_CUSHION_MS = 100
 HANDOFF_OBSERVATION_HALO_SEC = 1.0
 HANDOFF_TIMESTAMP_TOLERANCE_SEC = 0.05
 _FRAME_MS = 10
@@ -665,7 +665,19 @@ def _decode_window(
                 str(output_path),
             ]
         )
-        _run_command(command, deadline=deadline, cancel_check=cancel_check, stage="decode")
+        for attempt in range(2):
+            try:
+                _run_command(
+                    command,
+                    deadline=deadline,
+                    cancel_check=cancel_check,
+                    stage="decode",
+                )
+                break
+            except _Unavailable as exc:
+                if attempt or exc.stage != "decode" or exc.reason != "process_failed":
+                    raise
+                output_path.unlink(missing_ok=True)
     finally:
         _decode_slots.release()
     if not output_path.is_file() or output_path.stat().st_size <= 44:
@@ -1043,9 +1055,9 @@ def verify_acoustic_boundaries(
     With ``require_speech_handoff``, both caption timestamps are treated as
     semantic fences: a one-second decode-only halo may complete a quiet run
     across each fence, but no later quiet run separated by sound can qualify.
-    The per-edge handoff arguments override that legacy all-edges switch so a
-    projected intra-cue edge can be exact while the opposite ordinary cue edge
-    retains progressive nearest-quiet search.
+    The per-edge handoff arguments override that legacy all-edges switch. A
+    two-sided progressive search may also prove a real quiet gap between native
+    lexical ownership fences without treating either word onset as the cut.
 
     ``prepared`` may be produced concurrently with transcript selection. On any
     resolution, decoding, cancellation, timeout, or silence failure, this
@@ -1075,8 +1087,6 @@ def verify_acoustic_boundaries(
         or original_end <= original_start
         or not math.isfinite(timeout_sec)
         or timeout_sec <= 0
-        or (require_start_two_sided and not start_speech_handoff)
-        or (require_end_two_sided and not end_speech_handoff)
     ):
         return _unavailable(
             original_start, original_end, stage="input", reason="invalid_range", started=started
@@ -1360,7 +1370,12 @@ def verify_acoustic_boundaries(
         start_speech_handoff_verified=start_speech_handoff,
         end_speech_handoff_verified=end_speech_handoff,
     )
-    if start_speech_handoff or end_speech_handoff:
+    if (
+        start_speech_handoff
+        or end_speech_handoff
+        or require_start_two_sided
+        or require_end_two_sided
+    ):
         diagnostics.update(
             speech_handoff_verified=(
                 start_speech_handoff and end_speech_handoff

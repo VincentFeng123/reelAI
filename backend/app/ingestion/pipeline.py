@@ -29,6 +29,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -119,6 +120,59 @@ INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
 )
 PARTIAL_CUE_MATERIALITY_SEC = 0.05
 SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
+_QUOTE_WORD_RE = re.compile(
+    r"[\w+#]+(?:['\u2018\u2019\u02bc-][\w+#]+)*",
+    re.UNICODE,
+)
+_QUOTE_APOSTROPHES = str.maketrans(
+    {"\u2018": "'", "\u2019": "'", "\u02bc": "'"}
+)
+
+
+def _quote_token(value: str) -> str:
+    return (
+        unicodedata.normalize("NFKC", value)
+        .translate(_QUOTE_APOSTROPHES)
+        .casefold()
+    )
+
+
+def _quote_character_spans(text: str, quote: str) -> list[tuple[int, int]]:
+    text_matches = list(_QUOTE_WORD_RE.finditer(str(text or "")))
+    quote_tokens = [
+        _quote_token(match.group(0))
+        for match in _QUOTE_WORD_RE.finditer(str(quote or ""))
+    ]
+    if not quote_tokens or len(quote_tokens) > len(text_matches):
+        return []
+    text_tokens = [_quote_token(match.group(0)) for match in text_matches]
+    width = len(quote_tokens)
+    return [
+        (
+            text_matches[index].start(),
+            text_matches[index + width - 1].end(),
+        )
+        for index in range(len(text_tokens) - width + 1)
+        if text_tokens[index:index + width] == quote_tokens
+    ]
+
+
+def _literal_source_quote(
+    text: str,
+    quote: str,
+    span: tuple[int, int],
+) -> str:
+    source = str(text or "")
+    quote_matches = list(_QUOTE_WORD_RE.finditer(str(quote or "")))
+    start, end = span
+    if quote_matches:
+        prefix = str(quote or "")[:quote_matches[0].start()]
+        suffix = str(quote or "")[quote_matches[-1].end():]
+        if prefix and start >= len(prefix) and source[start - len(prefix):start] == prefix:
+            start -= len(prefix)
+        if suffix and source[end:end + len(suffix)] == suffix:
+            end += len(suffix)
+    return source[start:end]
 
 
 def _run_clip(
@@ -349,22 +403,52 @@ def _projected_speech_bounds(
     caption_diagnostics: dict[str, Any],
     prepared: object,
 ) -> tuple[tuple[float, float], dict[str, Any], str | None]:
-    """Resolve semantic sub-cue edges only from explicit native word timing."""
+    """Resolve selected speech edges from explicit native word onsets when available."""
     fallback = _required_speech_bounds(raw_clip, caption_diagnostics)
     edge_projection = raw_clip.get("edge_projection")
-    if not isinstance(edge_projection, dict) or not edge_projection:
-        return fallback, {}, None
+    projections = edge_projection if isinstance(edge_projection, dict) else {}
 
     source = getattr(prepared, "source", None)
     words = tuple(getattr(source, "lexical_words", ()) or ())
     if not words:
-        return fallback, {}, "lexical_timing_unavailable"
+        return (
+            (fallback, {}, "lexical_timing_unavailable")
+            if projections
+            else (fallback, {}, None)
+        )
 
-    segments_by_id = {
-        str(segment.get("cue_id") or "").strip(): segment
+    segments = [
+        segment
         for segment in (transcript.get("segments") or [])
-        if isinstance(segment, dict) and str(segment.get("cue_id") or "").strip()
+        if isinstance(segment, dict)
+    ]
+    index_by_id = {
+        str(segment.get("cue_id") or f"cue-{index}").strip(): index
+        for index, segment in enumerate(segments)
     }
+    selected_ids = [
+        str(value or "").strip() for value in (raw_clip.get("cue_ids") or [])
+    ]
+    if (
+        not selected_ids
+        or any(cue_id not in index_by_id for cue_id in selected_ids)
+    ):
+        return (
+            (fallback, {}, "projection_selected_cues_unavailable")
+            if projections
+            else (fallback, {}, None)
+        )
+    selected_indices = [index_by_id[cue_id] for cue_id in selected_ids]
+    if selected_indices != list(
+        range(selected_indices[0], selected_indices[-1] + 1)
+    ):
+        return (
+            (fallback, {}, "projection_selected_cues_unavailable")
+            if projections
+            else (fallback, {}, None)
+        )
+    first_index = selected_indices[0]
+    last_index = selected_indices[-1]
     required_start, required_end = fallback
     verified: dict[str, Any] = {}
     expected_cue_ids = {
@@ -374,45 +458,111 @@ def _projected_speech_bounds(
     from ..clip_engine import lexical_timing
 
     for edge in ("start", "end"):
-        marker = edge_projection.get(edge)
-        if not isinstance(marker, dict):
-            continue
-        cue_id = str(marker.get("cue_id") or "").strip()
-        quote = " ".join(str(marker.get("quote") or "").split())
-        cue = segments_by_id.get(cue_id)
-        if not cue_id or cue_id != expected_cue_ids[edge] or not quote or cue is None:
-            return fallback, {}, f"{edge}_projection_marker_invalid"
+        marker = projections.get(edge)
+        is_projected = isinstance(marker, dict)
+        if is_projected:
+            cue_id = str(marker.get("cue_id") or "").strip()
+            quote = " ".join(str(marker.get("quote") or "").split())
+            selected_index = first_index if edge == "start" else last_index
+            cue = segments[selected_index]
+            if (
+                not cue_id
+                or cue_id != expected_cue_ids[edge]
+                or not quote
+                or index_by_id.get(cue_id) != selected_index
+            ):
+                return fallback, {}, f"{edge}_projection_marker_invalid"
+            context_text = str(cue.get("text") or "")
+            context_start = float(cue.get("start") or 0.0)
+            context_end = float(cue.get("end") or 0.0)
+        else:
+            quote = " ".join(
+                str(raw_clip.get(f"{edge}_quote") or "").split()
+            )
+            if not quote:
+                continue
+            if edge == "start":
+                if first_index == 0:
+                    continue
+                prior = segments[first_index - 1]
+                selected = segments[first_index]
+                context_text = (
+                    f"{str(prior.get('text') or '')} "
+                    f"{str(selected.get('text') or '')}"
+                )
+                context_start = float(prior.get("start") or 0.0)
+                context_end = float(selected.get("end") or 0.0)
+            else:
+                if last_index + 1 >= len(segments):
+                    continue
+                selected = segments[last_index]
+                following = segments[last_index + 1]
+                context_text = (
+                    f"{str(selected.get('text') or '')} "
+                    f"{str(following.get('text') or '')}"
+                )
+                context_start = float(selected.get("start") or 0.0)
+                context_end = float(following.get("end") or 0.0)
         anchor = lexical_timing.align_edge_anchor(
             words,
-            cue_text=str(cue.get("text") or ""),
+            cue_text=context_text,
             quote=quote,
             edge=edge,
-            cue_start_sec=float(cue.get("start") or 0.0),
-            cue_end_sec=float(cue.get("end") or 0.0),
+            cue_start_sec=context_start,
+            cue_end_sec=context_end,
         )
         if anchor is None:
-            return fallback, {}, f"{edge}_lexical_alignment_unavailable"
-        anchor_sec = float(anchor.anchor_sec)
+            if is_projected:
+                return fallback, {}, f"{edge}_lexical_alignment_unavailable"
+            continue
+        required_sec = (
+            float(anchor.quote_start_sec)
+            if edge == "start"
+            else float(anchor.quote_last_onset_sec)
+        )
+        excluded_sec = float(anchor.excluded_neighbor_onset_sec)
+        if (
+            not math.isfinite(required_sec)
+            or not math.isfinite(excluded_sec)
+            or (
+                excluded_sec >= required_sec
+                if edge == "start"
+                else excluded_sec <= required_sec
+            )
+        ):
+            if is_projected:
+                return fallback, {}, f"{edge}_lexical_alignment_unavailable"
+            continue
         if edge == "start":
-            required_start = anchor_sec
+            required_start = required_sec
         else:
-            required_end = anchor_sec
+            required_end = required_sec
         verified[edge] = {
-            "cue_id": cue_id,
+            "cue_id": expected_cue_ids[edge],
             "quote": quote,
-            "anchor_sec": round(anchor_sec, 3),
+            "mode": "projected" if is_projected else "cue_edge",
+            "required_speech_sec": round(required_sec, 3),
+            "excluded_neighbor_onset_sec": round(excluded_sec, 3),
         }
 
     if (
-        not verified
-        or not math.isfinite(required_start)
+        not math.isfinite(required_start)
         or not math.isfinite(required_end)
         or required_end <= required_start
     ):
         return fallback, {}, "lexical_projection_invalid"
+    if not verified:
+        return fallback, {}, None
     return (
         (required_start, required_end),
-        {"lexical_projection_verified": True, **verified},
+        {
+            "lexical_boundary_verified": True,
+            "lexical_projection_verified": any(
+                details.get("mode") == "projected"
+                for details in verified.values()
+            ),
+            **verified,
+        },
         None,
     )
 
@@ -439,21 +589,6 @@ def _selected_caption_cues(
     edge_projection = raw_clip.get("edge_projection")
     projection = edge_projection if isinstance(edge_projection, dict) else {}
 
-    def quote_span(text: str, quote: str) -> tuple[int, int] | None:
-        text_words = list(re.finditer(r"[\w+#'-]+", text.casefold()))
-        quote_words = re.findall(r"[\w+#'-]+", quote.casefold())
-        matches = [
-            (
-                text_words[index].start(),
-                text_words[index + len(quote_words) - 1].end(),
-            )
-            for index in range(len(text_words) - len(quote_words) + 1)
-            if quote_words
-            and [word.group(0) for word in text_words[index:index + len(quote_words)]]
-            == quote_words
-        ]
-        return matches[0] if len(matches) == 1 else None
-
     cues: list[dict[str, Any]] = []
     for index, cue_id in enumerate(cue_ids):
         segment = segments_by_id[cue_id]
@@ -462,13 +597,17 @@ def _selected_caption_cues(
         start_marker = projection.get("start") if index == 0 else None
         end_marker = projection.get("end") if index == len(cue_ids) - 1 else None
         if isinstance(start_marker, dict) and str(start_marker.get("cue_id") or "") == cue_id:
-            span = quote_span(text, str(start_marker.get("quote") or ""))
-            if span is not None:
-                text_start = span[0]
+            spans = _quote_character_spans(
+                text, str(start_marker.get("quote") or "")
+            )
+            if len(spans) == 1:
+                text_start = spans[0][0]
         if isinstance(end_marker, dict) and str(end_marker.get("cue_id") or "") == cue_id:
-            span = quote_span(text, str(end_marker.get("quote") or ""))
-            if span is not None:
-                text_end = span[1]
+            spans = _quote_character_spans(
+                text, str(end_marker.get("quote") or "")
+            )
+            if len(spans) == 1:
+                text_end = spans[0][1]
         cue_start = float(segment["start"])
         cue_end = float(segment["end"])
         if boundary_bounds is not None:
@@ -607,36 +746,51 @@ def _selected_speech_corridor(
         if required_speech_bounds is not None
         else _required_speech_bounds(raw_clip, caption_diagnostics)
     )
-    projection = (
+    lexical_boundaries = (
         projection_diagnostics
         if isinstance(projection_diagnostics, dict)
-        and projection_diagnostics.get("lexical_projection_verified") is True
+        and (
+            projection_diagnostics.get("lexical_boundary_verified") is True
+            or projection_diagnostics.get("lexical_projection_verified") is True
+        )
         else {}
     )
-    start_is_projected = "start" in projection
-    end_is_projected = "end" in projection
+    start_boundary = lexical_boundaries.get("start")
+    end_boundary = lexical_boundaries.get("end")
+    start_is_lexical = isinstance(start_boundary, dict)
+    end_is_lexical = isinstance(end_boundary, dict)
     start_is_partial = required_start > first_start + PARTIAL_CUE_MATERIALITY_SEC
     end_is_partial = required_end < last_end - PARTIAL_CUE_MATERIALITY_SEC
     if (
-        (start_is_partial and "start" not in projection)
-        or (end_is_partial and "end" not in projection)
+        (start_is_partial and not start_is_lexical)
+        or (end_is_partial and not end_is_lexical)
     ):
         return 0.0, source_end, "partial_cue_edge_requires_projection"
 
     start_limit = (
-        required_start
-        if start_is_projected
+        float(start_boundary["excluded_neighbor_onset_sec"])
+        if start_is_lexical
         else 0.0
         if first_index == 0
         else first_start
     )
     end_limit = (
-        required_end
-        if end_is_projected
+        float(end_boundary["excluded_neighbor_onset_sec"])
+        if end_is_lexical
         else source_end
         if last_index + 1 >= len(segments)
         else float(segments[last_index + 1]["start"])
     )
+    if start_limit > required_start:
+        if start_limit - required_start <= SPEECH_OWNERSHIP_EPSILON_SEC:
+            start_limit = required_start
+        else:
+            return start_limit, end_limit, "selected_cue_range_unavailable"
+    if end_limit < required_end:
+        if required_end - end_limit <= SPEECH_OWNERSHIP_EPSILON_SEC:
+            end_limit = required_end
+        else:
+            return start_limit, end_limit, "selected_cue_range_unavailable"
     if end_limit <= start_limit:
         return start_limit, end_limit, "selected_cue_range_unavailable"
     return max(0.0, start_limit), min(source_end, end_limit), None
@@ -666,9 +820,11 @@ def _acoustic_boundary_plan(
     first_index = min(indices)
     last_index = max(indices)
     start_target = float(speech_bounds[0])
+    start_is_lexical = isinstance(projection_diagnostics.get("start"), dict)
+    end_is_lexical = isinstance(projection_diagnostics.get("end"), dict)
     end_target = (
         float(speech_bounds[1])
-        if "end" in projection_diagnostics or last_index + 1 >= len(segments)
+        if end_is_lexical or last_index + 1 >= len(segments)
         else float(segments[last_index + 1]["start"])
     )
     search_start, search_end = search_limits
@@ -682,17 +838,23 @@ def _acoustic_boundary_plan(
         or end_target <= start_target
     ):
         return None
-    start_two_sided = "start" in projection_diagnostics or first_index > 0
+    start_two_sided = start_is_lexical or first_index > 0
     end_two_sided = (
-        "end" in projection_diagnostics or last_index + 1 < len(segments)
+        end_is_lexical or last_index + 1 < len(segments)
     )
-    start_handoff = start_two_sided or (
-        first_index == 0
-        and start_target > search_start + SPEECH_OWNERSHIP_EPSILON_SEC
+    start_handoff = not start_is_lexical and (
+        start_two_sided
+        or (
+            first_index == 0
+            and start_target > search_start + SPEECH_OWNERSHIP_EPSILON_SEC
+        )
     )
-    end_handoff = end_two_sided or (
-        last_index + 1 >= len(segments)
-        and end_target < search_end - SPEECH_OWNERSHIP_EPSILON_SEC
+    end_handoff = not end_is_lexical and (
+        end_two_sided
+        or (
+            last_index + 1 >= len(segments)
+            and end_target < search_end - SPEECH_OWNERSHIP_EPSILON_SEC
+        )
     )
     return (
         start_target,
@@ -750,6 +912,14 @@ def _acoustic_range_is_safe(
     )
     if (start_crosses_fence and not require_start_handoff) or (
         end_crosses_fence and not require_end_handoff
+    ):
+        return False
+    if (
+        require_start_two_sided
+        and diagnostics.get("start_two_sided_required") is not True
+    ) or (
+        require_end_two_sided
+        and diagnostics.get("end_two_sided_required") is not True
     ):
         return False
 
@@ -1156,7 +1326,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v7",
+            selection_contract_version="quality_silence_v8",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -1323,12 +1493,14 @@ def _grounded_topic_evidence_quote(text: str, quote: object) -> str:
     logistics) from becoming sufficient evidence on its own.
     """
     cleaned_quote = " ".join(str(quote or "").split()).strip()
-    quote_words = re.findall(r"[\w+#'-]+", cleaned_quote.casefold())
+    quote_words = [
+        _quote_token(match.group(0))
+        for match in _QUOTE_WORD_RE.finditer(cleaned_quote)
+    ]
     if not 5 <= len(quote_words) <= 40:
         return ""
-    text_words = re.findall(r"[\w+#'-]+", str(text or "").casefold())
-    width = len(quote_words)
-    if not any(text_words[index : index + width] == quote_words for index in range(len(text_words) - width + 1)):
+    spans = _quote_character_spans(text, cleaned_quote)
+    if not spans:
         return ""
     generic = {
         "a", "an", "and", "are", "course", "class", "for", "in", "intro",
@@ -1336,7 +1508,9 @@ def _grounded_topic_evidence_quote(text: str, quote: object) -> str:
         "university", "welcome", "we", "will", "you", "your",
     }
     content_words = {word for word in quote_words if len(word) >= 3 and word not in generic}
-    return cleaned_quote if len(content_words) >= 2 else ""
+    if len(content_words) < 2:
+        return ""
+    return _literal_source_quote(str(text or ""), cleaned_quote, spans[0])
 
 
 def _retrieval_search_context(
@@ -2637,16 +2811,19 @@ class IngestionPipeline:
                 }
                 prerequisites_ready = prerequisite_ids.issubset(surfaceable_candidate_ids)
                 surface_eligible = semantic_eligible and prerequisites_ready
+                boundary_verified_for_storage = False
+                permanently_rejected = False
                 if not prerequisites_ready:
                     search_context["surface_reason"] = "prerequisite_not_surfaceable"
 
-                if semantic_eligible and generation_context is not None:
-                    if caption_diagnostics is None:
-                        surface_eligible = False
-                        search_context["boundary_status"] = "unavailable"
-                        search_context["surface_reason"] = "supadata_boundary_unavailable"
-                        record_boundary_unavailable("supadata_boundary_unavailable")
-                    elif require_acoustic_boundaries:
+                if generation_context is not None and caption_diagnostics is None:
+                    surface_eligible = False
+                    permanently_rejected = True
+                    search_context["boundary_status"] = "unavailable"
+                    search_context["surface_reason"] = "supadata_boundary_unavailable"
+                    record_boundary_unavailable("supadata_boundary_unavailable")
+                elif semantic_eligible and generation_context is not None:
+                    if require_acoustic_boundaries:
                         assert acoustic is not None
                         acoustic_diagnostics = dict(acoustic.diagnostics or {})
                         semantic_start, semantic_end, corridor_error = (
@@ -2711,6 +2888,7 @@ class IngestionPipeline:
                         search_context["boundary_diagnostics"] = boundary_diagnostics
                         if not acoustic_range_is_safe:
                             surface_eligible = False
+                            permanently_rejected = True
                             search_context["boundary_status"] = "unavailable"
                             search_context["surface_reason"] = str(
                                 acoustic_diagnostics.get("reason")
@@ -2723,6 +2901,7 @@ class IngestionPipeline:
                                 f"{failure_stage}:{search_context['surface_reason']}"
                             )
                         else:
+                            boundary_verified_for_storage = True
                             clip["start"] = round(float(acoustic.start_sec), 3)
                             clip["end"] = round(float(acoustic.end_sec), 3)
                             search_context["selection_caption_cues"] = (
@@ -2735,6 +2914,7 @@ class IngestionPipeline:
                             search_context["boundary_status"] = "verified"
                             search_context["speech_corridor_verified"] = True
                     else:
+                        boundary_verified_for_storage = True
                         search_context["boundary_status"] = "caption_aligned"
                         search_context["boundary_diagnostics"] = caption_diagnostics
                 else:
@@ -2746,6 +2926,17 @@ class IngestionPipeline:
 
                 search_context["surface_eligible"] = bool(surface_eligible)
                 clip["search_context"] = search_context
+                if permanently_rejected:
+                    if generation_context is not None:
+                        # ``deferred_clips`` remains the backward-compatible
+                        # aggregate for every non-surfaceable candidate. The
+                        # specific counter distinguishes terminal boundary
+                        # rejection from reusable difficulty deferral.
+                        generation_context.increment_counter("deferred_clips")
+                        generation_context.increment_counter(
+                            "permanently_rejected_clips"
+                        )
+                    continue
                 reel, _ = self._persist_engine_clip(
                     v=v,
                     clip=clip,
@@ -2759,9 +2950,15 @@ class IngestionPipeline:
                 stored_count += 1
                 if generation_context is not None:
                     generation_context.increment_counter("stored_clips")
+                    if boundary_verified_for_storage:
+                        generation_context.increment_counter("verified_clips")
                 if not surface_eligible:
                     if generation_context is not None:
                         generation_context.increment_counter("deferred_clips")
+                        if search_context.get("surface_reason") == "level_mismatch":
+                            generation_context.increment_counter(
+                                "level_deferred_clips"
+                            )
                     continue
                 candidate_id = str(clip.get("selection_candidate_id") or "").strip()
                 if candidate_id:
@@ -3240,7 +3437,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v7",
+                    selection_contract_version="quality_silence_v8",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

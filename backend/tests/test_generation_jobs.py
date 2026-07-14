@@ -171,7 +171,7 @@ def test_request_key_version_invalidates_v6_inventory(monkeypatch) -> None:
         "target_clip_duration_min_sec": 20,
         "target_clip_duration_max_sec": 55,
     }
-    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v7"
+    assert jobs.REQUEST_SCHEMA_VERSION == "quality_silence_v8"
     verified_key = jobs.build_request_key(**params)
     monkeypatch.setattr(jobs, "REQUEST_SCHEMA_VERSION", "quality_silence_v6")
 

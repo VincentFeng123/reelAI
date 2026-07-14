@@ -77,7 +77,7 @@ def test_verified_edges_preserve_required_quiet_cushions(tmp_path: Path) -> None
     assert result.diagnostics["end_quiet"] == [20.0, 20.4]
     assert result.diagnostics["threshold_dbfs"] == -38.0
     assert result.diagnostics["start_cushion_ms"] == 100
-    assert result.diagnostics["end_cushion_ms"] == 200
+    assert result.diagnostics["end_cushion_ms"] == 100
 
 
 def test_caption_handoff_observation_accepts_only_the_straddling_quiet_run(
@@ -120,7 +120,7 @@ def test_caption_handoff_observation_accepts_only_the_straddling_quiet_run(
 
     assert result.verified
     assert result.start_sec == 9.93
-    assert result.end_sec == 19.92
+    assert result.end_sec == 19.82
     assert result.diagnostics["speech_handoff_verified"] is True
     assert result.diagnostics["semantic_start_limit_sec"] == 10.0
     assert result.diagnostics["semantic_end_limit_sec"] == 20.0
@@ -169,6 +169,56 @@ def test_caption_handoff_rejects_nearby_silence_separated_by_sound(
     assert result.status == "unavailable"
     assert result.diagnostics["reason"] == "end_silence_not_found"
     assert result.diagnostics["end_windows"] == [[17.0, 21.0]]
+
+
+def test_lexical_ownership_corridor_accepts_real_one_hundred_ten_ms_gaps(
+    tmp_path: Path,
+) -> None:
+    quiet_by_edge = {
+        "start": (504.04, 504.15),
+        "end": (530.23, 530.34),
+    }
+
+    def fake_decode(
+        _source,
+        *,
+        window_start_sec,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        edge = output_path.name.split("-", 1)[0]
+        quiet_start, quiet_end = quiet_by_edge[edge]
+        before = quiet_start - window_start_sec
+        after = window_duration_sec - before - (quiet_end - quiet_start)
+        _write_wav(
+            output_path,
+            [(before, 12000), (quiet_end - quiet_start, 0), (after, 12000)],
+        )
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "sQK3Yr4Sc_k",
+            504.08,
+            530.16,
+            search_start_limit_sec=503.68,
+            search_end_limit_sec=530.399,
+            require_start_two_sided=True,
+            require_end_two_sided=True,
+            prepared=_prepared(),
+        )
+
+    assert result.verified
+    assert result.start_sec == pytest.approx(504.05)
+    assert result.end_sec == pytest.approx(530.33)
+    assert result.diagnostics["start_quiet"] == [504.04, 504.15]
+    assert result.diagnostics["end_quiet"] == [530.23, 530.34]
+    assert result.diagnostics["start_speech_handoff_verified"] is False
+    assert result.diagnostics["end_speech_handoff_verified"] is False
+    assert result.diagnostics["start_two_sided_required"] is True
+    assert result.diagnostics["end_two_sided_required"] is True
+    assert result.diagnostics["semantic_start_limit_sec"] == 503.68
+    assert result.diagnostics["semantic_end_limit_sec"] == 530.399
 
 
 def test_caption_handoff_never_skips_sound_before_a_late_start_quiet_run(
@@ -343,7 +393,7 @@ def test_mixed_edge_modes_keep_exact_start_handoff_and_progressive_end_search(
 
     assert result.verified
     assert result.start_sec == 20.0
-    assert result.end_sec == 46.2
+    assert result.end_sec == 46.1
     assert result.diagnostics["start_windows"] == [[19.0, 23.0]]
     assert result.diagnostics["end_windows"] == [[37.0, 43.0], [43.0, 49.0]]
     assert result.diagnostics["start_speech_handoff_verified"] is True
@@ -394,7 +444,7 @@ def test_progressive_search_finds_silence_beyond_the_old_edge_window(
 
     assert result.verified
     assert result.start_sec == 11.7
-    assert result.end_sec == 46.2
+    assert result.end_sec == 46.1
     assert result.start_sec <= 20.0
     assert result.end_sec >= 40.0
     assert result.diagnostics["start_quiet"] == [11.5, 11.8]
@@ -440,7 +490,7 @@ def test_non_overlapping_windows_preserve_silence_transitions_at_chunk_edges(
 
     assert result.verified
     assert result.start_sec == 16.9
-    assert result.end_sec == 43.2
+    assert result.end_sec == 43.1
     assert result.diagnostics["start_quiet"] == [16.7, 17.0]
     assert result.diagnostics["end_quiet"] == [43.0, 43.3]
 
@@ -494,9 +544,9 @@ def test_forward_search_stitches_short_quiet_fragments_across_window_seam(
         if output_path.name == "start-0.wav":
             spans = [(2.7, 12000), (0.3, 0), (window_duration_sec - 3.0, 12000)]
         elif output_path.name == "end-0.wav":
-            spans = [(window_duration_sec - 0.11, 12000), (0.11, 0)]
+            spans = [(window_duration_sec - 0.06, 12000), (0.06, 0)]
         elif output_path.name == "end-1.wav":
-            spans = [(0.11, 0), (window_duration_sec - 0.11, 12000)]
+            spans = [(0.06, 0), (window_duration_sec - 0.06, 12000)]
         _write_wav(output_path, spans)
 
     with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
@@ -510,8 +560,8 @@ def test_forward_search_stitches_short_quiet_fragments_across_window_seam(
         )
 
     assert result.verified
-    assert result.end_sec == 43.09
-    assert result.diagnostics["end_quiet"] == [42.89, 43.11]
+    assert result.end_sec == 43.04
+    assert result.diagnostics["end_quiet"] == [42.94, 43.06]
     assert result.diagnostics["end_windows"] == [[37.0, 43.0], [43.0, 49.0]]
 
 
@@ -576,7 +626,7 @@ def test_source_edges_are_accepted_only_when_the_audio_at_each_edge_is_quiet(
 
     assert result.verified
     assert result.start_sec == 0.2
-    assert result.end_sec == 9.9
+    assert result.end_sec == 9.8
     assert result.diagnostics["start_quiet"] == [0.0, 0.3]
     assert result.diagnostics["end_quiet"] == [9.7, 10.0]
 
@@ -625,7 +675,7 @@ def test_true_media_duration_allows_post_caption_end_silence(
         )
 
     assert result.verified
-    assert result.end_sec == 10.2
+    assert result.end_sec == 10.1
     assert decoded_end_limits == [12.0]
     assert result.diagnostics["search_end_limit_sec"] == 12.0
     assert result.diagnostics["source_duration_sec"] == 12.0
@@ -754,8 +804,8 @@ def test_final_cue_can_extend_into_measured_end_silence(tmp_path: Path) -> None:
 
     assert result.verified
     assert result.start_sec == 10.0
-    assert result.end_sec == 20.2
-    assert result.diagnostics["end_shift_sec"] == 0.2
+    assert result.end_sec == 20.1
+    assert result.diagnostics["end_shift_sec"] == 0.1
 
 
 def test_background_noise_above_required_threshold_is_unavailable(tmp_path: Path) -> None:
@@ -795,11 +845,11 @@ def test_missing_start_silence_is_unavailable_and_keeps_original_range(tmp_path:
     assert result.diagnostics["reason"] == "start_silence_not_found"
 
 
-def test_end_requires_full_two_hundred_millisecond_cushion(tmp_path: Path) -> None:
+def test_end_requires_full_one_hundred_millisecond_cushion(tmp_path: Path) -> None:
     start_wav = tmp_path / "start.wav"
     short_end = tmp_path / "short-end.wav"
     _write_wav(start_wav, [(2.8, 12000), (0.25, 0), (2.95, 12000)])
-    _write_wav(short_end, [(3.0, 12000), (0.15, 0), (2.85, 12000)])
+    _write_wav(short_end, [(3.0, 12000), (0.09, 0), (2.91, 12000)])
 
     def fake_decode(_source, *, window_start_sec, output_path, **_kwargs):
         shutil.copyfile(start_wav if window_start_sec < 8 else short_end, output_path)
@@ -914,6 +964,63 @@ def test_ffmpeg_uses_bounded_seek_before_input(tmp_path: Path) -> None:
     assert command[command.index("-threads") + 1] == "1"
     assert command.index("-threads") < command.index("-i")
     assert command[command.index("-ar") + 1] == "16000"
+
+
+def test_ffmpeg_decode_retries_one_transient_process_failure(tmp_path: Path) -> None:
+    output = tmp_path / "edge.wav"
+    calls = 0
+
+    def fake_run(_command, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            output.write_bytes(b"partial")
+            raise silence._Unavailable("decode", "process_failed")
+        assert not output.exists()
+        _write_wav(output, [(0.2, 0)])
+        return b"", b""
+
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        silence._decode_window(
+            silence.PreparedAudioSource(url="https://media.example/audio.m4a"),
+            window_start_sec=0.0,
+            window_duration_sec=0.2,
+            output_path=output,
+            ffmpeg_bin="ffmpeg",
+            deadline=time.monotonic() + 10.0,
+            cancel_check=None,
+        )
+
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_calls"),
+    [("process_failed", 2), ("cancelled", 1), ("deadline_exceeded", 1)],
+)
+def test_ffmpeg_decode_retry_is_bounded_and_reason_specific(
+    tmp_path: Path,
+    reason: str,
+    expected_calls: int,
+) -> None:
+    output = tmp_path / f"{reason}.wav"
+    run = mock.Mock(side_effect=silence._Unavailable("decode", reason))
+
+    with mock.patch.object(silence, "_run_command", run), pytest.raises(
+        silence._Unavailable,
+        match=reason,
+    ):
+        silence._decode_window(
+            silence.PreparedAudioSource(url="https://media.example/audio.m4a"),
+            window_start_sec=0.0,
+            window_duration_sec=0.2,
+            output_path=output,
+            ffmpeg_bin="ffmpeg",
+            deadline=time.monotonic() + 10.0,
+            cancel_check=None,
+        )
+
+    assert run.call_count == expected_calls
 
 
 def test_ffmpeg_decodes_are_globally_bounded_to_four(tmp_path: Path) -> None:

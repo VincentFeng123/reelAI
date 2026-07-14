@@ -37,6 +37,11 @@ class EmbeddingService:
         if not text_list:
             return np.empty((0, self.dim), dtype=np.float32)
 
+        if self._semantic_model is None:
+            hash_embeddings = [self._hash_embed(text) for text in text_list]
+            # Preserve the cache-miss path's second normalization exactly.
+            return np.vstack([self._normalize(vec) for vec in hash_embeddings]).astype(np.float32)
+
         hashes = [self._hash_text(t) for t in text_list]
         embeddings: list[np.ndarray | None] = [None] * len(text_list)
         missing_indices: list[int] = []

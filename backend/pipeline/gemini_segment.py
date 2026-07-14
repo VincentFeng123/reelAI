@@ -17,6 +17,7 @@ import logging
 import math
 import re
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, is_dataclass
 from enum import Enum
@@ -41,7 +42,8 @@ CancelledCb = Optional[Callable[[], bool]]
 
 log = logging.getLogger("clipper.segment")
 
-_WORD_RE = re.compile(r"[a-z0-9']+", re.IGNORECASE)
+_WORD_RE = re.compile(r"[^\W_]+(?:['\u2018\u2019\u02bc][^\W_]+)*", re.UNICODE)
+_APOSTROPHES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u02bc": "'"})
 _CandidateId = Annotated[
     str, StringConstraints(strip_whitespace=True, min_length=1)
 ]
@@ -269,7 +271,12 @@ class _AssessmentDraft(_StrictModel):
     options: list[_NonBlank] = Field(min_length=4, max_length=4)
     correct_index: int = Field(ge=0, le=3, strict=True)
     explanation: _NonBlank
-    evidence_quote: _NonBlank
+    evidence_quote: _NonBlank = Field(
+        description=(
+            "Exact consecutive transcript words copied from inside this clip; preserve "
+            "the transcript spelling and never paraphrase or stitch text."
+        )
+    )
 
     @model_validator(mode="after")
     def _unique_options(self):
@@ -285,8 +292,18 @@ class _BoundaryTopic(_StrictModel):
     candidate_id: _CandidateId
     start_line: int = Field(ge=0, strict=True)
     end_line: int = Field(ge=0, strict=True)
-    start_quote: _BoundaryQuote
-    end_quote: _BoundaryQuote
+    start_quote: _BoundaryQuote = Field(
+        description=(
+            "Four to eight consecutive words copied exactly from the cited start line, "
+            "beginning at the first required teaching words."
+        )
+    )
+    end_quote: _BoundaryQuote = Field(
+        description=(
+            "Four to eight consecutive words copied exactly from the cited end line, "
+            "ending at the complete teaching conclusion."
+        )
+    )
     title: _ClipTitle
     learning_objective: _LearningObjective
     facet: _Facet
@@ -298,7 +315,12 @@ class _BoundaryTopic(_StrictModel):
     directly_teaches_topic: bool = Field(strict=True)
     substantive: bool = Field(strict=True)
     factually_grounded: bool = Field(strict=True)
-    topic_evidence_quote: _EvidenceQuote
+    topic_evidence_quote: _EvidenceQuote = Field(
+        description=(
+            "Shortest five to twelve consecutive transcript words wholly between the "
+            "chosen start and end quotes that prove relevance; never paraphrase or stitch."
+        )
+    )
     self_contained: bool = Field(strict=True)
     is_standalone: bool = Field(strict=True)
     prerequisite_candidate_ids: list[_CandidateId] = Field(default_factory=list, max_length=8)
@@ -445,8 +467,12 @@ _POLICY_AND_EXAMPLES = """Policy:
   first words a cold viewer needs to hear for this one teaching objective, after every
   atmospheric hook, scene-setting flourish, or opening joke. end_quote must be the last
   words of its complete conclusion, before audience banter, a next-topic setup, or a
-  post-conclusion joke. Quotes may begin or end inside a coarse transcript line. Copy each
-  quote exactly and make it specific enough to occur only once in its cited edge line.
+  post-conclusion joke. Quotes may begin or end inside a coarse transcript line. Copy 4-8
+  consecutive words exactly, preserve the transcript spelling, keep the quote wholly inside
+  its cited edge line, and make it specific enough to occur only once there. Never
+  paraphrase, correct, stitch, or cross transcript lines. topic_evidence_quote must be the
+  shortest useful 5-12 consecutive words wholly between those chosen edges, copied with the
+  same exactness.
 - A worked example cannot end at its question, setup, or first substituted value. Either
   include its reasoning and answer through end_quote or end the candidate before that
   optional example begins.
@@ -544,14 +570,17 @@ def _learner_rule(level: str) -> str:
 def _selection_fields(*, enriched: bool) -> str:
     fields = (
         "candidate_id (a short unique slug), start_line, end_line, start_quote and "
-        "end_quote (each an exact, unique short quote marking the first required teaching "
-        "words and last complete conclusion, even inside a coarse line), title (at most 12 words), "
+        "end_quote (each 4-8 exact consecutive words wholly inside its cited line, preserving "
+        "transcript spelling and marking the first required teaching words and last complete "
+        "conclusion, even inside a coarse line; never paraphrase, stitch, or cross lines), "
+        "title (at most 12 words), "
         "learning_objective (at most 24 words), facet (at most 12 words), "
         "informativeness, topic_relevance, "
         "educational_importance, difficulty, directly_teaches_topic, substantive, "
         "factually_grounded, "
-        "topic_evidence_quote (an exact 5-40 word quote copied from within the selected "
-        "cue range that proves the clip teaches the topic), self_contained, is_standalone, "
+        "topic_evidence_quote (the shortest exact 5-12 consecutive-word quote copied wholly "
+        "between the chosen edges that proves the clip teaches the topic; preserve spelling "
+        "and never paraphrase or stitch), self_contained, is_standalone, "
         "prerequisite_candidate_ids (omit it or return []), uncertainty (omit for low), "
         "uncertainty_reasons (omit for low)"
     )
@@ -793,7 +822,12 @@ def _mmss(seconds: float) -> str:
 
 
 def _toks(text: str) -> list[str]:
-    return [match.group(0).lower() for match in _WORD_RE.finditer(text or "")]
+    return [
+        unicodedata.normalize("NFKC", match.group(0))
+        .translate(_APOSTROPHES)
+        .casefold()
+        for match in _WORD_RE.finditer(text or "")
+    ]
 
 
 def _contains_quote(text: str, quote: str) -> bool:
@@ -1363,7 +1397,12 @@ def _quote_character_spans(text: str, quote: str) -> list[tuple[int, int]]:
     quote_tokens = _toks(quote)
     if not quote_tokens or len(quote_tokens) > len(text_matches):
         return []
-    text_tokens = [match.group(0).casefold() for match in text_matches]
+    text_tokens = [
+        unicodedata.normalize("NFKC", match.group(0))
+        .translate(_APOSTROPHES)
+        .casefold()
+        for match in text_matches
+    ]
     spans: list[tuple[int, int]] = []
     for index in range(len(text_tokens) - len(quote_tokens) + 1):
         if text_tokens[index:index + len(quote_tokens)] == quote_tokens:
@@ -1377,6 +1416,25 @@ def _quote_character_spans(text: str, quote: str) -> list[tuple[int, int]]:
 def _quote_character_span(text: str, quote: str) -> tuple[int, int] | None:
     spans = _quote_character_spans(text, quote)
     return spans[0] if spans else None
+
+
+def _literal_source_quote(
+    text: str,
+    quote: str,
+    span: tuple[int, int],
+) -> str:
+    """Return the matched source spelling, including exact requested punctuation."""
+    source = str(text or "")
+    quote_matches = list(_WORD_RE.finditer(str(quote or "")))
+    start, end = span
+    if quote_matches:
+        prefix = str(quote or "")[:quote_matches[0].start()]
+        suffix = str(quote or "")[quote_matches[-1].end():]
+        if prefix and start >= len(prefix) and source[start - len(prefix):start] == prefix:
+            start -= len(prefix)
+        if suffix and source[end:end + len(suffix)] == suffix:
+            end += len(suffix)
+    return source[start:end]
 
 
 def _semantic_edge_quote(
@@ -2327,6 +2385,8 @@ def _plan_to_report(
             report.rejected_reasons.append(f"{prefix}:{edge_error}")
             continue
         assert start_span is not None
+        start_text = str(segments[a].get("text") or "")
+        start_quote = _literal_source_quote(start_text, start_quote, start_span)
         if _edge_has_unresolved_structural_filler(
             str(segments[a].get("text") or ""), start_span, want="start"
         ):
@@ -2348,6 +2408,8 @@ def _plan_to_report(
             report.rejected_reasons.append(f"{prefix}:{edge_error}")
             continue
         assert end_span is not None
+        end_text = str(segments[b].get("text") or "")
+        end_quote = _literal_source_quote(end_text, end_quote, end_span)
         if _edge_has_unresolved_structural_filler(
             str(segments[b].get("text") or ""), end_span, want="end"
         ):
@@ -2382,9 +2444,15 @@ def _plan_to_report(
             if evidence_word_count < 5 or evidence_word_count > 40:
                 report.rejected_reasons.append(f"{prefix}:invalid_topic_evidence_quote_length")
                 continue
-            if not _contains_quote(clip_text, topic_evidence_quote):
+            evidence_span = _quote_character_span(clip_text, topic_evidence_quote)
+            if evidence_span is None:
                 report.rejected_reasons.append(f"{prefix}:ungrounded_topic_evidence_quote")
                 continue
+            topic_evidence_quote = _literal_source_quote(
+                clip_text,
+                topic_evidence_quote,
+                evidence_span,
+            )
         learning_objective = str(
             getattr(proposal, "learning_objective", "")
             or getattr(proposal, "reason", "")

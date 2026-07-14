@@ -168,6 +168,38 @@ def test_production_boundary_quotes_must_be_grounded_in_their_cited_cues(
     assert report.rejected_reasons == [reason]
 
 
+def test_apostrophe_typography_is_grounded_and_source_spelling_is_preserved():
+    text = (
+        "We’ll explain how chlorophyll captures light, and it’s converted into "
+        "chemical energy."
+    )
+    proposal = _topic(
+        0,
+        0,
+        start_quote="We'll explain how chlorophyll",
+        end_quote="it's converted into chemical energy",
+        topic_evidence_quote=(
+            "chlorophyll captures light and it's converted into chemical energy"
+        ),
+    )
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        [{"start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.rejected_reasons == []
+    assert len(report.clips) == 1
+    assert report.clips[0]["start_quote"] == "We’ll explain how chlorophyll"
+    assert report.clips[0]["end_quote"] == "it’s converted into chemical energy"
+    assert report.clips[0]["topic_evidence_quote"] == (
+        "chlorophyll captures light, and it’s converted into chemical energy"
+    )
+
+
 def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
     topics = []
     for index in range(40):
