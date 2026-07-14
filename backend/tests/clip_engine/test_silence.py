@@ -1199,23 +1199,33 @@ def test_ffmpeg_uses_bounded_seek_before_input(tmp_path: Path) -> None:
     assert command[command.index("-ar") + 1] == "16000"
 
 
-def test_ffmpeg_decode_retries_one_transient_process_failure(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "reason",
+    ["process_failed", "media_http_5xx", "media_network_error"],
+)
+def test_ffmpeg_decode_retries_one_transient_failure_without_refreshing(
+    tmp_path: Path,
+    reason: str,
+) -> None:
     output = tmp_path / "edge.wav"
     calls = 0
+    refresh = mock.Mock()
+    source = silence.PreparedAudioSource(url="https://media.example/audio.m4a")
+    source._decode_state.configure_refresh(refresh)
 
     def fake_run(_command, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
             output.write_bytes(b"partial")
-            raise silence._Unavailable("decode", "process_failed")
+            raise silence._Unavailable("decode", reason)
         assert not output.exists()
         _write_wav(output, [(0.2, 0)])
         return b"", b""
 
     with mock.patch.object(silence, "_run_command", side_effect=fake_run):
         silence._decode_window(
-            silence.PreparedAudioSource(url="https://media.example/audio.m4a"),
+            source,
             window_start_sec=0.0,
             window_duration_sec=0.2,
             output_path=output,
@@ -1225,6 +1235,7 @@ def test_ffmpeg_decode_retries_one_transient_process_failure(tmp_path: Path) -> 
         )
 
     assert calls == 2
+    refresh.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1256,17 +1267,153 @@ def test_ffmpeg_decode_retry_is_bounded_and_reason_specific(
     assert run.call_count == expected_calls
 
 
-def test_ffmpeg_decodes_are_globally_bounded_to_four(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("stderr", "reason"),
+    [
+        (b"HTTP error 401 Unauthorized for ?token=secret", "media_http_401"),
+        (b"HTTP error 403 Forbidden for ?token=secret", "media_http_403"),
+        (b"HTTP error 404 Not Found for ?token=secret", "media_http_404"),
+        (b"Server returned 410 Gone for ?token=secret", "media_http_410"),
+        (b"HTTP error 429 Too Many Requests for ?token=secret", "media_http_429"),
+        (b"HTTP error 503 Service Unavailable for ?token=secret", "media_http_5xx"),
+        (b"Connection timed out for ?token=secret", "media_network_error"),
+    ],
+)
+def test_ffmpeg_media_failures_are_safely_classified(
+    stderr: bytes,
+    reason: str,
+) -> None:
+    assert silence._process_failure_reason("decode", stderr) == reason
+    assert "secret" not in silence._process_failure_reason("decode", stderr)
+
+
+def test_concurrent_decode_failures_share_one_source_refresh(tmp_path: Path) -> None:
+    source = silence.PreparedAudioSource(url="https://media.example/expired.m4a")
+    refreshed = silence.PreparedAudioSource(url="https://media.example/healthy.m4a")
+    old_route_barrier = threading.Barrier(2)
+    refresh_calls = 0
+    decoded_urls: list[str] = []
+    lock = threading.Lock()
+
+    def refresh(_deadline, _cancel_check):
+        nonlocal refresh_calls
+        with lock:
+            refresh_calls += 1
+        time.sleep(0.02)
+        return refreshed
+
+    def fake_run(command, **_kwargs):
+        media_url = command[command.index("-i") + 1]
+        with lock:
+            decoded_urls.append(media_url)
+        if media_url.endswith("expired.m4a"):
+            old_route_barrier.wait(timeout=1.0)
+            raise silence._Unavailable("decode", "media_http_403")
+        _write_wav(Path(command[-1]), [(0.2, 0)])
+        return b"", b""
+
+    source._decode_state.configure_refresh(refresh)
+    with mock.patch.object(silence, "_run_command", side_effect=fake_run):
+        with silence.ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    silence._decode_window,
+                    source,
+                    window_start_sec=float(index),
+                    window_duration_sec=0.2,
+                    output_path=tmp_path / f"shared-refresh-{index}.wav",
+                    ffmpeg_bin="ffmpeg",
+                    deadline=time.monotonic() + 5.0,
+                    cancel_check=None,
+                )
+                for index in range(2)
+            ]
+            for future in futures:
+                future.result(timeout=3.0)
+
+    assert refresh_calls == 1
+    assert decoded_urls.count("https://media.example/expired.m4a") == 2
+    assert decoded_urls.count("https://media.example/healthy.m4a") == 2
+
+
+def test_two_transient_failures_trip_source_and_suppress_later_decode(
+    tmp_path: Path,
+) -> None:
+    source = silence.PreparedAudioSource(url="https://media.example/audio.m4a")
+    run = mock.Mock(
+        side_effect=silence._Unavailable("decode", "media_network_error")
+    )
+
+    with mock.patch.object(silence, "_run_command", run):
+        for index in range(2):
+            with pytest.raises(silence._Unavailable) as exc:
+                silence._decode_window(
+                    source,
+                    window_start_sec=float(index),
+                    window_duration_sec=0.2,
+                    output_path=tmp_path / f"network-{index}.wav",
+                    ffmpeg_bin="ffmpeg",
+                    deadline=time.monotonic() + 5.0,
+                    cancel_check=None,
+                )
+            assert exc.value.reason == "media_network_error"
+
+    assert run.call_count == 2
+
+
+def test_terminal_media_failure_trips_only_that_source_circuit(tmp_path: Path) -> None:
+    failed = silence.PreparedAudioSource(url="https://media.example/failed.m4a")
+    independent = silence.PreparedAudioSource(url="https://media.example/other.m4a")
+    run = mock.Mock(side_effect=silence._Unavailable("decode", "media_http_403"))
+
+    with mock.patch.object(silence, "_run_command", run):
+        for index in range(2):
+            with pytest.raises(silence._Unavailable) as exc:
+                silence._decode_window(
+                    failed,
+                    window_start_sec=float(index),
+                    window_duration_sec=0.2,
+                    output_path=tmp_path / f"failed-{index}.wav",
+                    ffmpeg_bin="ffmpeg",
+                    deadline=time.monotonic() + 10.0,
+                    cancel_check=None,
+                )
+            assert exc.value.reason == "media_http_403"
+
+        with pytest.raises(silence._Unavailable):
+            silence._decode_window(
+                independent,
+                window_start_sec=0.0,
+                window_duration_sec=0.2,
+                output_path=tmp_path / "other.wav",
+                ffmpeg_bin="ffmpeg",
+                deadline=time.monotonic() + 10.0,
+                cancel_check=None,
+            )
+
+    assert run.call_count == 2
+
+
+def test_ffmpeg_decodes_are_globally_bounded_to_four_and_per_source_to_two(
+    tmp_path: Path,
+) -> None:
     active = 0
     peak_active = 0
+    active_by_source: dict[str, int] = {}
+    peak_by_source: dict[str, int] = {}
     active_lock = threading.Lock()
     four_entered = threading.Event()
 
     def fake_run(command, **_kwargs):
         nonlocal active, peak_active
+        source_url = command[command.index("-i") + 1]
         with active_lock:
             active += 1
             peak_active = max(peak_active, active)
+            active_by_source[source_url] = active_by_source.get(source_url, 0) + 1
+            peak_by_source[source_url] = max(
+                peak_by_source.get(source_url, 0), active_by_source[source_url]
+            )
             if active == 4:
                 four_entered.set()
         assert four_entered.wait(timeout=1.0)
@@ -1274,9 +1421,13 @@ def test_ffmpeg_decodes_are_globally_bounded_to_four(tmp_path: Path) -> None:
         _write_wav(Path(command[-1]), [(0.2, 0)])
         with active_lock:
             active -= 1
+            active_by_source[source_url] -= 1
         return b"", b""
 
-    source = silence.PreparedAudioSource(url="https://media.example/audio.m4a")
+    sources = (
+        silence.PreparedAudioSource(url="https://media.example/a.m4a"),
+        silence.PreparedAudioSource(url="https://media.example/b.m4a"),
+    )
     decode_slots = threading.BoundedSemaphore(4)
     with mock.patch.object(silence, "_decode_slots", decode_slots), mock.patch.object(
         silence, "_run_command", side_effect=fake_run
@@ -1285,7 +1436,7 @@ def test_ffmpeg_decodes_are_globally_bounded_to_four(tmp_path: Path) -> None:
             futures = [
                 executor.submit(
                     silence._decode_window,
-                    source,
+                    sources[index % len(sources)],
                     window_start_sec=float(index),
                     window_duration_sec=0.2,
                     output_path=tmp_path / f"edge-{index}.wav",
@@ -1299,6 +1450,10 @@ def test_ffmpeg_decodes_are_globally_bounded_to_four(tmp_path: Path) -> None:
                 future.result(timeout=2.0)
 
     assert peak_active == 4
+    assert peak_by_source == {
+        "https://media.example/a.m4a": 2,
+        "https://media.example/b.m4a": 2,
+    }
 
 
 def test_ffmpeg_decode_slot_wait_is_cancellable(tmp_path: Path) -> None:
@@ -1329,6 +1484,44 @@ def test_ffmpeg_decode_slot_wait_is_cancellable(tmp_path: Path) -> None:
             )
 
     assert exc.value.reason == "cancelled"
+    run.assert_not_called()
+
+
+def test_global_decode_slot_wait_exits_when_source_circuit_trips(
+    tmp_path: Path,
+) -> None:
+    waiting = threading.Event()
+    source = silence.PreparedAudioSource(url="https://media.example/audio.m4a")
+
+    class BusySlots:
+        def acquire(self, *, timeout: float) -> bool:
+            waiting.set()
+            time.sleep(min(0.02, timeout))
+            return False
+
+        def release(self) -> None:
+            raise AssertionError("an unacquired slot must not be released")
+
+    with mock.patch.object(silence, "_decode_slots", BusySlots()), mock.patch.object(
+        silence, "_run_command"
+    ) as run:
+        with silence.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                silence._decode_window,
+                source,
+                window_start_sec=0.0,
+                window_duration_sec=1.0,
+                output_path=tmp_path / "tripped.wav",
+                ffmpeg_bin="ffmpeg",
+                deadline=time.monotonic() + 2.0,
+                cancel_check=None,
+            )
+            assert waiting.wait(timeout=1.0)
+            source._decode_state.trip("media_http_403")
+            with pytest.raises(silence._Unavailable) as exc:
+                future.result(timeout=1.0)
+
+    assert exc.value.reason == "media_http_403"
     run.assert_not_called()
 
 
@@ -1426,6 +1619,66 @@ def test_audio_entry_rejects_video_unknown_and_nonpositive_formats(entry) -> Non
     assert silence._audio_entry({"requested_downloads": [entry]}) == {}
 
 
+def test_decode_http_403_refreshes_once_through_next_route_without_refetching_words(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
+    )
+    resolved_commands: list[list[str]] = []
+    decoded_urls: list[str] = []
+    words = (silence.lexical_timing.LexicalWord("biology", 1.0),)
+
+    def fake_run(command, **kwargs):
+        if kwargs["stage"] == "resolve":
+            resolved_commands.append(list(command))
+            suffix = "expired" if len(resolved_commands) == 1 else "healthy"
+            return (
+                b'{"url":"https://media.example/'
+                + suffix.encode()
+                + b'.m4a","format_id":"140","acodec":"aac",'
+                b'"vcodec":"none","tbr":49.0,"automatic_captions":'
+                b'{"en-orig":[{"ext":"json3",'
+                b'"url":"https://captions.example/en?lang=en&kind=asr"}]}}',
+                b"",
+            )
+        media_url = command[command.index("-i") + 1]
+        decoded_urls.append(media_url)
+        if media_url.endswith("expired.m4a"):
+            raise silence._Unavailable("decode", "media_http_403")
+        _write_wav(Path(command[-1]), [(0.2, 0)])
+        return b"", b""
+
+    fetch = mock.Mock(return_value=words)
+    with mock.patch.object(
+        silence, "_run_command", side_effect=fake_run
+    ), mock.patch.object(
+        silence.lexical_timing, "fetch_json3_words", fetch
+    ):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ")
+        assert result.ready and result.source is not None
+        silence._decode_window(
+            result.source,
+            window_start_sec=0.0,
+            window_duration_sec=0.2,
+            output_path=tmp_path / "refreshed.wav",
+            ffmpeg_bin="ffmpeg",
+            deadline=time.monotonic() + 10.0,
+            cancel_check=None,
+        )
+
+    assert decoded_urls == [
+        "https://media.example/expired.m4a",
+        "https://media.example/healthy.m4a",
+    ]
+    assert len(resolved_commands) == 2
+    assert "youtube:player_client=web_embedded;player_skip=webpage" in resolved_commands[1]
+    assert fetch.call_count == 1
+
+
 def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monkeypatch) -> None:
     cookie_file = tmp_path / "cookies.txt"
     cookie_file.write_text("# Netscape HTTP Cookie File\n")
@@ -1443,7 +1696,9 @@ def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monke
         b'"acodec":"aac","vcodec":"none","tbr":49.0,'
         b'"duration":123.456,"http_headers":{"User-Agent":"agent"}}'
     )
-    with mock.patch.object(silence, "_run_command", return_value=(payload, b"")) as run:
+    with mock.patch.object(
+        silence, "_run_command", return_value=(payload, b"")
+    ) as run:
         result = silence.prepare_audio_source("dQw4w9WgXcQ")
 
     assert result.ready
@@ -1483,7 +1738,9 @@ def test_prepare_fetches_json3_words_once_from_the_existing_ytdlp_metadata(
         silence.lexical_timing.LexicalWord("is", 37.48),
     )
     fetch = mock.Mock(return_value=words)
-    with mock.patch.object(silence, "_run_command", return_value=(payload, b"")) as run, mock.patch.object(
+    with mock.patch.object(
+        silence, "_run_command", return_value=(payload, b"")
+    ) as run, mock.patch.object(
         silence.lexical_timing,
         "fetch_json3_words",
         fetch,

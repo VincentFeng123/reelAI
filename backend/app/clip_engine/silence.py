@@ -50,7 +50,114 @@ _FRAME_SEC = _FRAME_MS / 1000.0
 _YT_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _YT_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com"})
 _MAX_CONCURRENT_DECODES = 4
+_MAX_SOURCE_CONCURRENT_DECODES = 2
+_REFRESHABLE_MEDIA_FAILURES = frozenset(
+    {
+        "media_http_401",
+        "media_http_403",
+        "media_http_404",
+        "media_http_410",
+        "media_http_429",
+    }
+)
+_TRANSIENT_DECODE_FAILURES = frozenset(
+    {"media_http_5xx", "media_network_error", "process_failed"}
+)
 _decode_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_DECODES)
+
+
+class _SourceDecodeState:
+    def __init__(self) -> None:
+        self.slots = threading.BoundedSemaphore(_MAX_SOURCE_CONCURRENT_DECODES)
+        self.condition = threading.Condition()
+        self.active_source: PreparedAudioSource | None = None
+        self.generation = 0
+        self.refresh_callback: (
+            Callable[[float, CancelCheck | None], PreparedAudioSource] | None
+        ) = None
+        self.refreshing = False
+        self.refresh_used = False
+        self.terminal_reason = ""
+
+    def configure_initial(self, source: PreparedAudioSource) -> None:
+        with self.condition:
+            if self.active_source is None:
+                self.active_source = source
+
+    def configure_refresh(
+        self,
+        callback: Callable[[float, CancelCheck | None], PreparedAudioSource],
+    ) -> None:
+        with self.condition:
+            self.refresh_callback = callback
+
+    def failure(self) -> str:
+        with self.condition:
+            return self.terminal_reason
+
+    def trip(self, reason: str) -> None:
+        with self.condition:
+            if not self.terminal_reason:
+                self.terminal_reason = reason
+            self.condition.notify_all()
+
+    def snapshot(self) -> tuple[PreparedAudioSource, int]:
+        with self.condition:
+            if self.terminal_reason:
+                raise _Unavailable("decode", self.terminal_reason)
+            if self.active_source is None:
+                raise _Unavailable("decode", "media_route_unavailable")
+            return self.active_source, self.generation
+
+    def refresh_after_failure(
+        self,
+        *,
+        failed_generation: int,
+        reason: str,
+        deadline: float,
+        cancel_check: CancelCheck | None,
+    ) -> None:
+        callback: Callable[[float, CancelCheck | None], PreparedAudioSource] | None
+        while True:
+            with self.condition:
+                if self.terminal_reason:
+                    raise _Unavailable("decode", self.terminal_reason)
+                if self.generation != failed_generation:
+                    return
+                if not self.refreshing:
+                    if self.refresh_used or self.refresh_callback is None:
+                        self.terminal_reason = reason
+                        self.condition.notify_all()
+                        raise _Unavailable("decode", reason)
+                    self.refresh_used = True
+                    self.refreshing = True
+                    callback = self.refresh_callback
+                    break
+                if _is_cancelled(cancel_check):
+                    raise _Unavailable("decode", "cancelled")
+                remaining = _remaining(deadline, "decode")
+                self.condition.wait(timeout=min(0.05, remaining))
+
+        try:
+            refreshed = callback(deadline, cancel_check)
+        except _Unavailable:
+            with self.condition:
+                self.refreshing = False
+                self.terminal_reason = reason
+                self.condition.notify_all()
+            raise _Unavailable("decode", reason) from None
+        except Exception:
+            with self.condition:
+                self.refreshing = False
+                self.terminal_reason = reason
+                self.condition.notify_all()
+            raise _Unavailable("decode", reason) from None
+
+        with self.condition:
+            self.active_source = refreshed
+            self.generation += 1
+            self.refreshing = False
+            self.condition.notify_all()
 
 
 @dataclass(frozen=True)
@@ -71,6 +178,14 @@ class PreparedAudioSource:
         repr=False,
     )
     lexical_language: str = ""
+    _decode_state: _SourceDecodeState = field(
+        default_factory=_SourceDecodeState,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        self._decode_state.configure_initial(self)
 
 
 @dataclass(frozen=True)
@@ -178,9 +293,36 @@ def _is_cancelled(cancel_check: CancelCheck | None) -> bool:
 
 def _process_failure_reason(stage: str, stderr: bytes) -> str:
     """Classify resolver failures without retaining sensitive command output."""
+    decoded = stderr.decode("utf-8", errors="ignore")
+    if stage == "decode":
+        message = decoded.casefold()
+        http_status = re.search(
+            r"(?:http (?:error )?|server returned\s+)(401|403|404|410|429|5\d\d)\b",
+            message,
+        )
+        if http_status:
+            status = int(http_status.group(1))
+            return (
+                f"media_http_{status}"
+                if status in {401, 403, 404, 410, 429}
+                else "media_http_5xx"
+            )
+        if any(
+            marker in message
+            for marker in (
+                "connection refused",
+                "connection reset",
+                "connection timed out",
+                "failed to resolve",
+                "network is unreachable",
+                "no route to host",
+                "temporary failure in name resolution",
+            )
+        ):
+            return "media_network_error"
+        return "process_failed"
     if stage != "resolve":
         return "process_failed"
-    decoded = stderr.decode("utf-8", errors="ignore")
     terminal_errors = [
         line for line in decoded.splitlines() if line.lstrip().casefold().startswith("error:")
     ]
@@ -415,6 +557,9 @@ def _prepare_audio_source(
     deadline: float,
     cancel_check: CancelCheck | None,
     language: str = "en",
+    excluded_attempts: frozenset[tuple[str, str]] = frozenset(),
+    configure_refresh: bool = True,
+    fetch_lexical: bool = True,
 ) -> PreparedAudioSource:
     watch_url = _canonical_watch_url(video_id_or_url)
     if watch_url is None:
@@ -441,7 +586,11 @@ def _prepare_audio_source(
         if len(attempts) >= 3:
             break
         attempts.append(("", profile))
-    attempts = attempts[:3]
+    attempts = [
+        attempt for attempt in attempts[:3] if attempt not in excluded_attempts
+    ]
+    if not attempts:
+        raise _Unavailable("resolve", "media_route_exhausted")
     attempt_reasons: list[str] = []
     for attempt_index, (proxy, player_client) in enumerate(attempts):
         try:
@@ -490,31 +639,32 @@ def _prepare_audio_source(
             }
             lexical_words: tuple[lexical_timing.LexicalWord, ...] = ()
             lexical_language = ""
-            tracks = lexical_timing.select_original_json3_tracks(
-                info,
-                expected_language=language,
-            )
-            lexical_deadline = min(
-                deadline,
-                time.monotonic() + lexical_timing.MAX_FETCH_TIMEOUT_SEC,
-            )
-            for track in tracks:
-                try:
-                    lexical_words = lexical_timing.fetch_json3_words(
-                        track,
-                        headers=headers,
-                        proxy_url=proxy,
-                        deadline=lexical_deadline,
-                        cancel_check=cancel_check,
-                    )
-                except Exception:
-                    if _is_cancelled(cancel_check):
-                        raise _Unavailable("resolve", "cancelled") from None
-                    lexical_words = ()
-                if lexical_words:
-                    lexical_language = track.language
-                    break
-            return PreparedAudioSource(
+            if fetch_lexical:
+                tracks = lexical_timing.select_original_json3_tracks(
+                    info,
+                    expected_language=language,
+                )
+                lexical_deadline = min(
+                    deadline,
+                    time.monotonic() + lexical_timing.MAX_FETCH_TIMEOUT_SEC,
+                )
+                for track in tracks:
+                    try:
+                        lexical_words = lexical_timing.fetch_json3_words(
+                            track,
+                            headers=headers,
+                            proxy_url=proxy,
+                            deadline=lexical_deadline,
+                            cancel_check=cancel_check,
+                        )
+                    except Exception:
+                        if _is_cancelled(cancel_check):
+                            raise _Unavailable("resolve", "cancelled") from None
+                        lexical_words = ()
+                    if lexical_words:
+                        lexical_language = track.language
+                        break
+            prepared = PreparedAudioSource(
                 url=media_url,
                 headers=headers,
                 proxy_url=proxy,
@@ -523,6 +673,27 @@ def _prepare_audio_source(
                 lexical_words=lexical_words,
                 lexical_language=lexical_language,
             )
+            if configure_refresh:
+                consumed_attempts = frozenset(
+                    [*excluded_attempts, *attempts[: attempt_index + 1]]
+                )
+
+                def refresh_source(
+                    refresh_deadline: float,
+                    refresh_cancel_check: CancelCheck | None,
+                ) -> PreparedAudioSource:
+                    return _prepare_audio_source(
+                        video_id_or_url,
+                        deadline=refresh_deadline,
+                        cancel_check=refresh_cancel_check,
+                        language=language,
+                        excluded_attempts=consumed_attempts,
+                        configure_refresh=False,
+                        fetch_lexical=False,
+                    )
+
+                prepared._decode_state.configure_refresh(refresh_source)
+            return prepared
         except _Unavailable as exc:
             if exc.reason in {"cancelled", "invalid_youtube_source"}:
                 raise
@@ -544,6 +715,7 @@ def _prepare_audio_source(
         "component_failed",
         "deadline_exceeded",
         "attempt_timeout",
+        "media_route_exhausted",
         "process_failed",
         "audio_url_missing",
         "invalid_ytdlp_response",
@@ -633,58 +805,119 @@ def _decode_window(
     deadline: float,
     cancel_check: CancelCheck | None,
 ) -> None:
-    acquired = False
-    while not acquired:
+    source_acquired = False
+    while not source_acquired:
+        terminal_reason = source._decode_state.failure()
+        if terminal_reason:
+            raise _Unavailable("decode", terminal_reason)
         if _is_cancelled(cancel_check):
             raise _Unavailable("decode", "cancelled")
         remaining = _remaining(deadline, "decode")
-        acquired = _decode_slots.acquire(timeout=min(0.1, remaining))
-    try:
-        if _is_cancelled(cancel_check):
-            raise _Unavailable("decode", "cancelled")
-        duration = min(EDGE_WINDOW_SEC, max(0.01, window_duration_sec))
-        command = [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
-        if source.proxy_url.startswith(("http://", "https://")):
-            command.extend(["-http_proxy", source.proxy_url])
-        if source.headers:
-            command.extend(["-headers", _ffmpeg_headers(source.headers)])
-        command.extend(
-            [
-                "-rw_timeout",
-                str(max(1, int(min(8.0, _remaining(deadline, "decode")) * 1_000_000))),
-                "-ss",
-                f"{max(0.0, window_start_sec):.3f}",
-                "-threads",
-                "1",
-                "-i",
-                source.url,
-                "-t",
-                f"{duration:.3f}",
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-c:a",
-                "pcm_s16le",
-                str(output_path),
-            ]
+        source_acquired = source._decode_state.slots.acquire(
+            timeout=min(0.1, remaining)
         )
-        for attempt in range(2):
+    try:
+        duration = min(EDGE_WINDOW_SEC, max(0.01, window_duration_sec))
+        transient_failures = 0
+        transient_generation = -1
+        while True:
+            global_acquired = False
+            generation: int | None = None
+            failure: _Unavailable | None = None
             try:
+                while not global_acquired:
+                    terminal_reason = source._decode_state.failure()
+                    if terminal_reason:
+                        raise _Unavailable("decode", terminal_reason)
+                    if _is_cancelled(cancel_check):
+                        raise _Unavailable("decode", "cancelled")
+                    remaining = _remaining(deadline, "decode")
+                    global_acquired = _decode_slots.acquire(
+                        timeout=min(0.1, remaining)
+                    )
+                active_source, generation = source._decode_state.snapshot()
+                if generation != transient_generation:
+                    transient_failures = 0
+                    transient_generation = generation
+                if _is_cancelled(cancel_check):
+                    raise _Unavailable("decode", "cancelled")
+                command = [
+                    ffmpeg_bin,
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                ]
+                if active_source.proxy_url.startswith(("http://", "https://")):
+                    command.extend(["-http_proxy", active_source.proxy_url])
+                if active_source.headers:
+                    command.extend(["-headers", _ffmpeg_headers(active_source.headers)])
+                command.extend(
+                    [
+                        "-rw_timeout",
+                        str(
+                            max(
+                                1,
+                                int(
+                                    min(8.0, _remaining(deadline, "decode"))
+                                    * 1_000_000
+                                ),
+                            )
+                        ),
+                        "-ss",
+                        f"{max(0.0, window_start_sec):.3f}",
+                        "-threads",
+                        "1",
+                        "-i",
+                        active_source.url,
+                        "-t",
+                        f"{duration:.3f}",
+                        "-vn",
+                        "-ac",
+                        "1",
+                        "-ar",
+                        "16000",
+                        "-c:a",
+                        "pcm_s16le",
+                        str(output_path),
+                    ]
+                )
                 _run_command(
                     command,
                     deadline=deadline,
                     cancel_check=cancel_check,
                     stage="decode",
                 )
-                break
             except _Unavailable as exc:
-                if attempt or exc.stage != "decode" or exc.reason != "process_failed":
-                    raise
-                output_path.unlink(missing_ok=True)
+                failure = exc
+            finally:
+                if global_acquired:
+                    _decode_slots.release()
+            if failure is None:
+                break
+            output_path.unlink(missing_ok=True)
+            if failure.stage != "decode":
+                raise failure
+            if failure.reason in _REFRESHABLE_MEDIA_FAILURES:
+                if generation is None:
+                    raise failure
+                source._decode_state.refresh_after_failure(
+                    failed_generation=generation,
+                    reason=failure.reason,
+                    deadline=deadline,
+                    cancel_check=cancel_check,
+                )
+                continue
+            if failure.reason in _TRANSIENT_DECODE_FAILURES:
+                transient_failures += 1
+                if transient_failures < 2:
+                    continue
+                source._decode_state.trip(failure.reason)
+            raise failure
     finally:
-        _decode_slots.release()
+        if source_acquired:
+            source._decode_state.slots.release()
     if not output_path.is_file() or output_path.stat().st_size <= 44:
         raise _Unavailable("decode", "empty_audio_window")
 
