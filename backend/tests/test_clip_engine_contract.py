@@ -181,8 +181,10 @@ class ClipEngineContractTests(unittest.TestCase):
         body = response.json()
 
         # --- top-level envelope ---
-        for key in ("reel", "metadata", "terms_notice", "trace_id"):
+        for key in ("reel", "reels", "metadata", "terms_notice", "trace_id"):
             self.assertIn(key, body, f"missing top-level key: {key}")
+        self.assertEqual(len(body["reels"]), 1)
+        self.assertEqual(body["reels"][0]["reel_id"], body["reel"]["reel_id"])
 
         # --- reel shape ---
         reel = body["reel"]

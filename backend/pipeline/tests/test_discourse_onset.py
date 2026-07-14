@@ -1,6 +1,6 @@
 """Discourse-onset primitive — text-only, offline. Decides whether a sentence used as a
-clip's FIRST line drops the viewer mid-thought. A leading continuation marker is NOT weak
-when the sentence is self-contained framing or a question (the 'so' disambiguation)."""
+clip's FIRST line drops the viewer mid-thought. A presentational ``so`` question can open a
+topic, while an adversative question still depends on the preceding contrast."""
 from __future__ import annotations
 
 from backend.pipeline.discourse import opens_mid_thought, is_onset
@@ -70,9 +70,28 @@ def test_late_question_mark_does_not_rescue_a_long_continuation_cue():
     )
     assert is_onset("So what is life?")
 
+
+def test_adversative_question_needs_context_but_bare_question_is_standalone():
+    assert opens_mid_thought("But what even is life?")
+    assert opens_mid_thought("But what about prokaryotic cells?")
+    assert is_onset("What even is life?")
+    assert is_onset("So what even is life?")
+
 def test_dangling_anaphor_is_weak():
     assert opens_mid_thought("This is why the reaction proceeds so quickly.")
     assert opens_mid_thought("That gives us the final concentration.")
+
+
+def test_leading_demonstrative_noun_phrase_needs_its_antecedent():
+    assert opens_mid_thought("Those groups of cells are called tissues.")
+    assert opens_mid_thought("This example demonstrates genetic drift.")
+
+
+def test_opening_aside_marker_is_not_a_cold_viewer_onset():
+    assert opens_mid_thought(
+        "Oh yeah, by the way, multicellular organisms also reproduce."
+    )
+    assert opens_mid_thought("By the way, chloroplasts contain chlorophyll.")
 
 
 def test_question_with_missing_antecedent_is_weak():
@@ -101,6 +120,11 @@ def test_context_dependent_np_is_weak():
 
 def test_mid_clause_fragment_is_weak():
     assert opens_mid_thought("writing oxygen we're going to write a two")  # lowercase mid-clause
+
+
+def test_opening_quotes_and_brackets_do_not_hide_a_lowercase_fragment():
+    assert opens_mid_thought("“chloroplasts” inside of which photosynthesis occurs.")
+    assert opens_mid_thought("[chloroplasts] inside of which photosynthesis occurs.")
 
 
 def test_elliptical_instruction_and_action_reference_are_weak():

@@ -446,6 +446,60 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(search.discover.call_args.kwargs.get("level"), "advanced")
 
+    def test_full_material_generation_keeps_subject_as_literal_topic(self) -> None:
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute(
+                "UPDATE materials SET subject_tag = ? WHERE id = ?",
+                ("  biology   and\nlife  ", MATERIAL_ID),
+            )
+
+        with mock.patch.object(
+            main_module.ingestion_pipeline,
+            "ingest_topic",
+            return_value=([], [VIDEO_ID]),
+        ) as ingest_topic:
+            with db_module.get_conn() as conn:
+                main_module.reel_service.generate_reels(
+                    conn,
+                    material_id=MATERIAL_ID,
+                    concept_id=None,
+                    num_reels=1,
+                    creative_commons_only=False,
+                    generation_id="gen-full-material-literal-topic",
+                )
+
+        self.assertEqual(
+            ingest_topic.call_args.kwargs["literal_topic"],
+            "biology and life",
+        )
+
+    def test_explicit_concept_generation_keeps_concept_as_literal_topic(self) -> None:
+        with db_module.get_conn(transactional=True) as conn:
+            conn.execute(
+                "UPDATE materials SET subject_tag = ? WHERE id = ?",
+                ("  biology   and\nlife  ", MATERIAL_ID),
+            )
+
+        with mock.patch.object(
+            main_module.ingestion_pipeline,
+            "ingest_topic",
+            return_value=([], [VIDEO_ID]),
+        ) as ingest_topic:
+            with db_module.get_conn() as conn:
+                main_module.reel_service.generate_reels(
+                    conn,
+                    material_id=MATERIAL_ID,
+                    concept_id=CONCEPT_ID,
+                    num_reels=1,
+                    creative_commons_only=False,
+                    generation_id="gen-explicit-concept-literal-topic",
+                )
+
+        self.assertEqual(
+            ingest_topic.call_args.kwargs["literal_topic"],
+            "Cellular respiration",
+        )
+
     def test_acronym_leaf_search_keeps_parent_topic_and_avoids_sap_atp(self) -> None:
         """Production regression: ``advanced ATP`` retrieved SAP S/4HANA for a
         cellular-respiration material. The leaf remains valid, but both search and

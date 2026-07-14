@@ -117,3 +117,19 @@ test("partial multi-topic uploads preserve each fulfilled topic and material pai
   assert.match(source, /materialIds = fulfilledTopicMaterials\.map\(\(\{ materialId \}\) => materialId\)/);
   assert.match(source, /fulfilledTopicMaterials\.forEach\(\(\{ topic, materialId \}, index\) =>/);
 });
+
+test("URL ingestion primes every returned reel with a legacy single-reel fallback", () => {
+  const filePath = path.join(__dirname, "UploadPanel.tsx");
+  const source = fs.readFileSync(filePath, "utf8");
+
+  assert.match(
+    source,
+    /Array\.isArray\(result\.reels\) && result\.reels\.length > 0[\s\S]*\? result\.reels[\s\S]*: \[result\.reel\]/,
+    "new URL responses must use all reels while old responses keep working",
+  );
+  assert.match(
+    source,
+    /primeFeedSessionSnapshot\(ingestMaterialId, ingestedReels, ingestedReel\.reel_id, activeSettings\)/,
+    "the feed snapshot must receive the complete verified URL inventory",
+  );
+});

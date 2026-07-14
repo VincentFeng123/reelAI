@@ -393,7 +393,7 @@ def test_brief_internal_channel_bump_does_not_discard_complete_teaching():
     assert "Welcome to Biology Pro Tips" in report.clips[0]["_clip_text"]
 
 
-def test_production_biology_fragment_expands_to_question_and_complete_list():
+def test_production_biology_fragment_fails_closed_without_a_clean_prior_onset():
     raw_cues = [
         (74.120, 77.600, "Ok, so enzymes make life possible by speeding up chemical reactions,"),
         (77.600, 83.760, "but what even is…life? Scientists don't really seem to agree, but obviously a cat is different"),
@@ -450,14 +450,8 @@ def test_production_biology_fragment_expands_to_question_and_complete_list():
         topic="biology",
     )
 
-    assert len(report.clips) == 1
-    clip = report.clips[0]
-    assert clip["cue_ids"][0] == "3tisOnOkwzo:cue:16"
-    assert clip["cue_ids"][-1] == "3tisOnOkwzo:cue:26"
-    assert clip["end"] - clip["start"] <= 55
-    clip_text = G._cue_clip_text(segments, clip["_start_line"], clip["_end_line"])
-    assert clip_text.startswith("but what even is…life?")
-    assert clip_text.endswith("related to one another.")
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:unresolved_weak_start"]
 
 
 def test_visual_ligature_instruction_is_rejected_without_frame_analysis():

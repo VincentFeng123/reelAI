@@ -293,6 +293,7 @@ export type IngestMetadata = {
 
 export type IngestResult = {
   reel: Reel;
+  reels?: Reel[];
   metadata: IngestMetadata;
   terms_notice: string;
   trace_id: string;

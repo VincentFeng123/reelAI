@@ -330,6 +330,12 @@ class ClipEngineIngestUrlTests(unittest.TestCase):
 
         self.assertAlmostEqual(result.reel.t_start, 0.0)
         self.assertAlmostEqual(result.reel.t_end, 20.0)
+        self.assertEqual(len(result.reels), 2)
+        self.assertEqual(result.reels[0].reel_id, result.reel.reel_id)
+        self.assertEqual(
+            [(reel.t_start, reel.t_end) for reel in result.reels],
+            [(0.0, 20.0), (30.0, 74.0)],
+        )
         with db_module.get_conn() as conn:
             rows = db_module.fetch_all(
                 conn,

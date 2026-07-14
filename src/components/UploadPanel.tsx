@@ -383,7 +383,10 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
         if (controller.signal.aborted) {
           return;
         }
-        const ingestedReel = result.reel;
+        const ingestedReels = Array.isArray(result.reels) && result.reels.length > 0
+          ? result.reels
+          : [result.reel];
+        const ingestedReel = ingestedReels[0];
         const ingestedMetadata = result.metadata;
         const ingestMaterialId = ingestedReel.material_id || INGEST_SENTINEL_MATERIAL_ID;
         const ingestTitle =
@@ -392,9 +395,9 @@ export function UploadPanel({ active = true, onMaterialCreated, onScrollOffsetCh
             (ingestedMetadata.author_handle ? `@${ingestedMetadata.author_handle}` : "") ||
             "Ingested reel").slice(0, 58);
 
-        // Prime the feed snapshot with the single ingested reel so the feed page's
-        // bootstrap hydrates with it and skips the legacy generate path.
-        primeFeedSessionSnapshot(ingestMaterialId, [ingestedReel], ingestedReel.reel_id, activeSettings);
+        // Prime every verified clip returned by the URL adapter. Older backends
+        // expose only `reel`, which is normalized into the fallback array above.
+        primeFeedSessionSnapshot(ingestMaterialId, ingestedReels, ingestedReel.reel_id, activeSettings);
 
         if (typeof window !== "undefined") {
           const seeds = parseMaterialSeeds(window.localStorage.getItem(MATERIAL_SEEDS_STORAGE_KEY));

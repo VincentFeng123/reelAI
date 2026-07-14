@@ -118,6 +118,9 @@ INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
     os.environ.get("INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC", "45")
 )
 SEMANTIC_SECTION_RESET_GAP_SEC = 8.0
+EXACT_TOPIC_SEMANTIC_MIN = 0.20
+EXACT_TOPIC_LITERAL_SOURCE_SEMANTIC_MIN = 0.12
+EXACT_TOPIC_REJECTION_REASON = "uncorroborated_exact_topic"
 
 
 def _run_clip(
@@ -944,6 +947,7 @@ class IngestionPipeline:
         cues = clip_engine_bridge.to_cues(engine_out["transcript"])
         chosen = clip_engine_bridge.to_segment(verified[0], engine_out["transcript"])
         persisted: ReelOutWithAttribution | None = None
+        persisted_reels: list[ReelOutWithAttribution] = []
         for index, clip in enumerate(verified):
             raise_if_cancelled(should_cancel)
             segment = (
@@ -973,11 +977,12 @@ class IngestionPipeline:
                 clip_details=clip,
                 should_cancel=should_cancel,
             )
+            persisted_reels.append(stored)
             if persisted is None:
                 persisted = stored
 
-        # The legacy URL response exposes one reel, while the shared feed can
-        # immediately load every additional verified unit persisted above.
+        # Keep the legacy singular reel while the additive inventory exposes
+        # every verified unit persisted above.
         assert persisted is not None
 
         elapsed_ms = int((time.monotonic() - started) * 1000)
@@ -999,6 +1004,7 @@ class IngestionPipeline:
 
         return IngestResult(
             reel=persisted,
+            reels=persisted_reels,
             metadata=metadata,
             terms_notice=TERMS_NOTICE,
             trace_id=effective_trace,
@@ -2331,9 +2337,41 @@ class IngestionPipeline:
             )
             for clip in raw_clips
         ]
+        selector_topic_contracts = [
+            any(
+                key in clip
+                for key in (
+                    "directly_teaches_topic",
+                    "substantive",
+                    "factually_grounded",
+                    "topic_evidence_quote",
+                )
+            )
+            for clip in raw_clips
+        ]
+        grounded_selector_quotes = [
+            (
+                _grounded_topic_evidence_quote(
+                    transcript_texts[index], clip.get("topic_evidence_quote")
+                )
+                if selector_topic_contracts[index]
+                else ""
+            )
+            for index, clip in enumerate(raw_clips)
+        ]
+        exact_topic = " ".join(str(topic or "").split())
+        exact_lexical_support = [
+            (
+                bool(_topic_evidence(grounded_selector_quotes[index], [exact_topic]))
+                if exact_topic and selector_topic_contracts[index]
+                else True
+            )
+            for index in range(len(raw_clips))
+        ]
         semantic_scores: list[float | None] = [None] * len(raw_clips)
         if (
             topic_terms
+            and any(not contract for contract in selector_topic_contracts)
             and trusted_transcript
             and self._embedding_service is not None
             and getattr(self._embedding_service, "semantic_available", False) is True
@@ -2348,6 +2386,41 @@ class IngestionPipeline:
                         )
             except Exception:
                 logger.warning("semantic topic gate unavailable; using lexical evidence")
+
+        exact_topic_semantic_scores: list[float | None] = [None] * len(raw_clips)
+        semantic_candidate_indices = [
+            index
+            for index, grounded_quote in enumerate(grounded_selector_quotes)
+            if (
+                exact_topic
+                and selector_topic_contracts[index]
+                and grounded_quote
+                and not exact_lexical_support[index]
+            )
+        ]
+        if (
+            semantic_candidate_indices
+            and trusted_transcript
+            and self._embedding_service is not None
+            and getattr(self._embedding_service, "semantic_available", False) is True
+        ):
+            semantic_inputs = [exact_topic]
+            semantic_offsets: dict[int, int] = {}
+            for index in semantic_candidate_indices:
+                semantic_offsets[index] = len(semantic_inputs)
+                semantic_inputs.append(grounded_selector_quotes[index])
+            try:
+                vectors = self._embedding_service.embed_semantic(semantic_inputs)
+                if vectors is not None and len(vectors) == len(semantic_inputs):
+                    exact_topic_vector = vectors[0]
+                    for index, offset in semantic_offsets.items():
+                        score = float(vectors[offset].dot(exact_topic_vector))
+                        if math.isfinite(score):
+                            exact_topic_semantic_scores[index] = score
+            except Exception:
+                logger.warning(
+                    "exact-topic semantic corroboration unavailable; failing closed"
+                )
 
         kept: list[dict[str, Any]] = []
         for index, clip in enumerate(raw_clips):
@@ -2373,20 +2446,10 @@ class IngestionPipeline:
                 if generation_context is not None:
                     generation_context.increment_counter("topic_rejections")
                 continue
-            selector_topic_contract = any(
-                key in clip
-                for key in (
-                    "directly_teaches_topic",
-                    "substantive",
-                    "factually_grounded",
-                    "topic_evidence_quote",
-                )
-            )
+            selector_topic_contract = selector_topic_contracts[index]
             grounded_evidence_quote = ""
             if selector_topic_contract:
-                grounded_evidence_quote = _grounded_topic_evidence_quote(
-                    transcript_texts[index], clip.get("topic_evidence_quote")
-                )
+                grounded_evidence_quote = grounded_selector_quotes[index]
                 if (
                     clip.get("directly_teaches_topic") is not True
                     or clip.get("substantive") is not True
@@ -2395,6 +2458,27 @@ class IngestionPipeline:
                 ):
                     if generation_context is not None:
                         generation_context.increment_counter("topic_rejections")
+                    continue
+                semantic_floor = (
+                    EXACT_TOPIC_LITERAL_SOURCE_SEMANTIC_MIN
+                    if v.get("literal_match") is True
+                    else EXACT_TOPIC_SEMANTIC_MIN
+                )
+                semantic_score = exact_topic_semantic_scores[index]
+                if (
+                    exact_topic
+                    and not exact_lexical_support[index]
+                    and (
+                        semantic_score is None
+                        or semantic_score < semantic_floor
+                    )
+                ):
+                    if generation_context is not None:
+                        generation_context.increment_counter("topic_rejections")
+                        generation_context.record_segment_event({
+                            "event": "segment_completed",
+                            "rejection_reasons": [EXACT_TOPIC_REJECTION_REASON],
+                        })
                     continue
                 evidence = [grounded_evidence_quote]
             else:

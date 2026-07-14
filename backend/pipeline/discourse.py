@@ -34,6 +34,11 @@ _ALL_RIGHT_REPLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_OPENING_ASIDE_RE = re.compile(
+    r"^(?:oh\s*[,;:]?\s*)?(?:yeah\s*[,;:]?\s*)?by\s+the\s+way\b",
+    re.IGNORECASE,
+)
+
 _ELLIPTICAL_SPATIAL_INSTRUCTION_RE = re.compile(
     r"^(?:little|slightly|just)\s+(?:above|below|behind|inside|outside|over|under)\b",
     re.IGNORECASE,
@@ -112,11 +117,25 @@ _INTERROGATIVE_FORMS = frozenset({
     "is", "are", "can", "could", "would", "should", "does", "do", "did", "will",
 })
 
+# These markers can introduce a fresh pedagogical question without requiring a
+# prior contrast. Adversative/causal markers such as "but" and "because" cannot.
+_QUESTION_FRAMING_MARKERS = frozenset({"now", "so"})
+
+_DEMONSTRATIVE_DETERMINERS = frozenset({"this", "that", "these", "those"})
+
 _FRAMING_WINDOW_WORDS = 20
 
 
 def _words(text: str) -> list[str]:
     return _WORD_RE.findall(text or "")
+
+
+def first_lexical_character_index(text: str) -> int | None:
+    """Return the first letter/digit index, ignoring opening quotes/brackets."""
+    return next(
+        (index for index, character in enumerate(text or "") if character.isalnum()),
+        None,
+    )
 
 
 def _is_framing_or_question(text: str, words: list[str]) -> bool:
@@ -126,6 +145,13 @@ def _is_framing_or_question(text: str, words: list[str]) -> bool:
     opening_text = opening_match.group(1) if opening_match else low
     opening_terminator = opening_match.group(2) if opening_match else ""
     opening_words = list(_WORD_RE.finditer(opening_text))
+    contextual_question_marker = bool(
+        words
+        and words[0].lower() in CONTINUATION_MARKERS
+        and words[0].lower() not in _QUESTION_FRAMING_MARKERS
+    )
+    if opening_terminator == "?" and contextual_question_marker:
+        return False
     if (
         opening_terminator == "?"
         and len(opening_words) <= _FRAMING_WINDOW_WORDS
@@ -174,14 +200,17 @@ def opens_mid_thought(text: str) -> bool:
     # 4) mid-clause fragment: begins lowercase (checked first—overrides framing)
     #    (post-punctuation-restoration sentences are capitalized at true onsets)
     stripped = (text or "").lstrip()
-    if stripped and stripped[0].islower():
+    lexical_index = first_lexical_character_index(stripped)
+    lexical_text = stripped[lexical_index:] if lexical_index is not None else ""
+    if lexical_text and lexical_text[0].islower():
         return True
 
     if (
-        _MID_LIST_OR_REPLY_RE.match(stripped)
-        or _ALL_RIGHT_REPLY_RE.match(stripped)
-        or _ELLIPTICAL_SPATIAL_INSTRUCTION_RE.match(stripped)
-        or _UNRESOLVED_ACTION_REFERENCE_RE.match(stripped)
+        _MID_LIST_OR_REPLY_RE.match(lexical_text)
+        or _ALL_RIGHT_REPLY_RE.match(lexical_text)
+        or _OPENING_ASIDE_RE.match(lexical_text)
+        or _ELLIPTICAL_SPATIAL_INSTRUCTION_RE.match(lexical_text)
+        or _UNRESOLVED_ACTION_REFERENCE_RE.match(lexical_text)
     ):
         return True
 
@@ -194,8 +223,10 @@ def opens_mid_thought(text: str) -> bool:
     w1 = words[1].lower() if len(words) > 1 else ""
     if w0 in CONTINUATION_MARKERS and _ANAPHORIC_QUESTION_RE.search(stripped):
         return True
+    if w0 in CONTINUATION_MARKERS and w1 in _DEMONSTRATIVE_DETERMINERS:
+        return True
 
-    framing = _is_framing_or_question(text, words)
+    framing = _is_framing_or_question(lexical_text, words)
     if framing:
         return False                       # self-contained framing/question wins outright
 
@@ -205,6 +236,8 @@ def opens_mid_thought(text: str) -> bool:
     if w0 == "back" and w1 == "to":
         return True
     # 2) dangling anaphor (pronoun immediately before a verb/aux) → unresolved reference
+    if w0 in _DEMONSTRATIVE_DETERMINERS:
+        return True
     if w0 in ANAPHORS and (w1 in _AUX_VERB or w1 == "s"):
         return True
     # 3) context-dependent definite NP: "the answer/previous/…"

@@ -167,6 +167,7 @@ class ReelOutWithAttribution(ReelOut):
 
 class IngestResult(BaseModel):
     reel: ReelOutWithAttribution
+    reels: list[ReelOutWithAttribution] = Field(default_factory=list)
     metadata: IngestMetadata
     terms_notice: str
     trace_id: str

@@ -77,6 +77,7 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"next we(?:['’]ll| will)|cover (?:that|this) in (?:this|the) course)\b|"
     r"(?:^|[.!?]\s+)(?:(?:all right|alright|okay|ok|so|now|well|yeah)"
     r"\s*[,;:]?\s+)*(?:"
+    r"(?:oh\s*[,;:]?\s*)?(?:yeah\s*[,;:]?\s*)?by the way\b|"
     r"sponsored by\b|"
     r"we (?:made|have) (?:a|an|another|whole) video "
     r"(?:about|explaining|on)\b|my name is\b|"
@@ -464,7 +465,9 @@ def _topic_rule(topic: str) -> str:
         "alone is not a direct match to the requested task; return it only as a separate "
         "facet when exact evidence anchors it to the named subject. Task fulfillment raises "
         "educational importance and centrality; it does not exclude a genuinely related, "
-        "topic-anchored prerequisite facet."
+        "topic-anchored prerequisite facet. Shared vocabulary, a loose analogy, or general "
+        "systems thinking alone is not a useful prerequisite. Include supporting material "
+        "only when it is genuinely needed to understand or apply the exact requested topic."
         " Exclude fictional, supernatural, pseudoscientific, or invented mechanisms unless "
         "the viewer explicitly requested that fictional subject. Borrowing real academic "
         "terminology does not make an invented claim educational evidence."
@@ -850,9 +853,20 @@ def _locate_quote(words: list[dict], quote: str, lo_t: float, hi_t: float,
 
 def _guard_text(text: str, *, ignore_caption_case: bool) -> str:
     """Remove only the unreliable lowercase signal from auto-caption guards."""
+    from .discourse import first_lexical_character_index
+
     normalized = str(text or "").strip()
-    if ignore_caption_case and normalized[:1].islower():
-        normalized = normalized[:1].upper() + normalized[1:]
+    lexical_index = first_lexical_character_index(normalized)
+    if (
+        ignore_caption_case
+        and lexical_index is not None
+        and normalized[lexical_index].islower()
+    ):
+        normalized = (
+            normalized[:lexical_index]
+            + normalized[lexical_index].upper()
+            + normalized[lexical_index + 1:]
+        )
     return normalized
 
 
@@ -871,6 +885,8 @@ def _cue_opens_mid_thought_at(
     ignore_caption_case: bool,
 ) -> bool:
     """Use the preceding cue to recover reliable lowercase-fragment evidence."""
+    from .discourse import first_lexical_character_index
+
     text = str(segments[index].get("text") or "").strip()
     if _DANGLING_TAIL_PREFIX_RE.search(text):
         return True
@@ -879,10 +895,14 @@ def _cue_opens_mid_thought_at(
     ):
         return True
     opening_terminator = re.search(r"[.!?]", text)
+    lexical_index = first_lexical_character_index(text)
+    starts_lowercase = bool(
+        lexical_index is not None and text[lexical_index].islower()
+    )
     if (
         not ignore_caption_case
         or index <= 0
-        or not text[:1].islower()
+        or not starts_lowercase
         or (
             opening_terminator is not None
             and opening_terminator.group(0) == "?"
@@ -1447,6 +1467,19 @@ def _cue_range_requires_visual_context(
 
 
 def _near_duplicate(a: dict, b: dict, threshold: float = _DUPLICATE_OVERLAP) -> bool:
+    a_cue_ids = {
+        str(value).strip()
+        for value in (a.get("cue_ids") or [])
+        if str(value).strip()
+    }
+    b_cue_ids = {
+        str(value).strip()
+        for value in (b.get("cue_ids") or [])
+        if str(value).strip()
+    }
+    if a_cue_ids and b_cue_ids:
+        return bool(a_cue_ids & b_cue_ids)
+
     overlap = min(float(a["end"]), float(b["end"])) - max(float(a["start"]), float(b["start"]))
     if overlap <= 0:
         return False

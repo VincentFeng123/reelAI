@@ -34,6 +34,42 @@ def _pipeline() -> IngestionPipeline:
     )
 
 
+class _SemanticVector:
+    def __init__(self, score: float) -> None:
+        self.score = score
+
+    def dot(self, _other) -> float:
+        return self.score
+
+
+class _FixedSemanticEmbedding:
+    semantic_available = True
+
+    def __init__(self, score: float) -> None:
+        self.score = score
+        self.inputs: list[list[str]] = []
+
+    def embed_semantic(self, texts):
+        values = [str(text) for text in texts]
+        self.inputs.append(values)
+        return [
+            _SemanticVector(1.0 if index == 0 else self.score)
+            for index, _text in enumerate(values)
+        ]
+
+
+def _pipeline_with_semantic(score: float) -> tuple[IngestionPipeline, _FixedSemanticEmbedding]:
+    embedding = _FixedSemanticEmbedding(score)
+    return (
+        IngestionPipeline(
+            youtube_service=None,
+            embedding_service=embedding,
+            rate_limiter=_PlatformRateLimiter(overrides={"yt": (100, 60.0)}),
+        ),
+        embedding,
+    )
+
+
 def _plan() -> SearchQueryPlan:
     return SearchQueryPlan(
         literal_query="Intro to Python",
@@ -121,6 +157,34 @@ def _quality_clip(
     }
     clip.update(overrides)
     return clip
+
+
+def _one_cue_selector_result(
+    evidence_quote: str,
+    *,
+    clip_text: str | None = None,
+    **clip_overrides,
+) -> dict:
+    text = clip_text or evidence_quote
+    return {
+        "clips": [
+            _quality_clip(
+                cue_id="unit",
+                quote=evidence_quote,
+                **clip_overrides,
+            )
+        ],
+        "transcript": {
+            "source": "supadata",
+            "native_mode": False,
+            "artifact_key": "supadata-transcript:v2:exact-topic-corroboration",
+            "duration": 10.0,
+            "segments": [
+                {"cue_id": "unit", "start": 0.0, "end": 10.0, "text": text},
+            ],
+        },
+        "notes": "",
+    }
 
 
 def test_required_speech_bounds_prefer_verified_same_cue_edge_quotes() -> None:
@@ -844,7 +908,8 @@ def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
         "_knowledge_level": "beginner",
     }
 
-    _video_row, clips, _engine = _pipeline()._clip_and_filter(
+    pipeline, _embedding = _pipeline_with_semantic(0.3)
+    _video_row, clips, _engine = pipeline._clip_and_filter(
         video, "biology", "en"
     )
 
@@ -854,6 +919,176 @@ def test_one_word_biology_logistics_never_surfaces_but_concrete_teaching_does(
     assert clips[0]["score"] == 0.8
     assert clips[0]["search_context"]["topic_evidence_quote"].startswith("Cells convert")
     assert clips[0]["search_context"]["factually_grounded"] is True
+
+
+@pytest.mark.parametrize(
+    ("literal_match", "semantic_score", "accepted"),
+    [
+        (False, 0.199, False),
+        (False, 0.20, True),
+        (True, 0.119, False),
+        (True, 0.12, True),
+    ],
+)
+def test_exact_topic_semantic_corroboration_uses_inclusive_floors(
+    monkeypatch,
+    literal_match: bool,
+    semantic_score: float,
+    accepted: bool,
+) -> None:
+    quote = (
+        "Cells convert nutrient energy into ATP through a sequence of enzyme "
+        "controlled reactions."
+    )
+    engine_out = _one_cue_selector_result(quote, score=1.0)
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    pipeline, embedding = _pipeline_with_semantic(semantic_score)
+    context = GenerationContext("slow")
+    video = {
+        **_video(),
+        "literal_match": literal_match,
+        "_topic_terms": ["biology"],
+    }
+
+    _video_row, clips, _engine = pipeline._clip_and_filter(
+        video,
+        "biology",
+        "en",
+        generation_context=context,
+    )
+
+    assert bool(clips) is accepted
+    assert embedding.inputs[0][0] == "biology"
+    assert context.counters()["topic_rejections"] == (0 if accepted else 1)
+    assert context.usage_payload()["summary"]["rejection_reason_counts"] == (
+        {} if accepted else {"uncorroborated_exact_topic": 1}
+    )
+
+
+@pytest.mark.parametrize(
+    ("quote", "semantic_score"),
+    [
+        (
+            "An operating system schedules processes, manages virtual memory, and "
+            "provides file system abstractions.",
+            0.15,
+        ),
+        (
+            "This video game power system lets players spend mana to cast abilities "
+            "and regenerate energy after combat.",
+            0.08,
+        ),
+    ],
+)
+def test_high_selector_scores_cannot_self_certify_unrelated_biology_clips(
+    monkeypatch,
+    quote: str,
+    semantic_score: float,
+) -> None:
+    engine_out = _one_cue_selector_result(quote, score=1.0)
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    pipeline, _embedding = _pipeline_with_semantic(semantic_score)
+
+    _video_row, clips, _engine = pipeline._clip_and_filter(
+        {**_video(), "literal_match": False, "_topic_terms": ["biology"]},
+        "biology",
+        "en",
+    )
+
+    assert clips == []
+
+
+def test_topic_mention_elsewhere_cannot_rescue_an_unrelated_evidence_quote(
+    monkeypatch,
+) -> None:
+    evidence_quote = (
+        "An operating system schedules processes, manages virtual memory, and "
+        "provides file system abstractions."
+    )
+    clip_text = (
+        f"{evidence_quote} Biology studies living organisms, their cells, and "
+        "their interactions."
+    )
+    engine_out = _one_cue_selector_result(
+        evidence_quote,
+        clip_text=clip_text,
+        score=1.0,
+    )
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    pipeline, embedding = _pipeline_with_semantic(0.15)
+
+    _video_row, clips, _engine = pipeline._clip_and_filter(
+        {**_video(), "literal_match": False, "_topic_terms": ["biology"]},
+        "biology",
+        "en",
+    )
+
+    assert clips == []
+    assert embedding.inputs == [["biology", evidence_quote]]
+
+
+def test_exact_topic_corroboration_fails_closed_without_semantic_inference(
+    monkeypatch,
+) -> None:
+    quote = "Cells convert nutrient energy into ATP through enzyme controlled reactions."
+    engine_out = _one_cue_selector_result(quote)
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    context = GenerationContext("slow")
+
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(
+        {**_video(), "literal_match": False, "_topic_terms": ["biology"]},
+        "biology",
+        "en",
+        generation_context=context,
+    )
+
+    assert clips == []
+    assert context.counters()["topic_rejections"] == 1
+    assert context.usage_payload()["summary"]["rejection_reason_counts"] == {
+        "uncorroborated_exact_topic": 1,
+    }
+
+
+def test_exact_topic_lexical_proof_survives_without_semantic_inference(
+    monkeypatch,
+) -> None:
+    quote = "Biology studies living organisms, their cells, and their interactions."
+    engine_out = _one_cue_selector_result(quote)
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(
+        {**_video(), "literal_match": False, "_topic_terms": ["biology"]},
+        "biology",
+        "en",
+    )
+
+    assert len(clips) == 1
+
+
+def test_expanded_search_terms_never_become_corroboration_anchors(
+    monkeypatch,
+) -> None:
+    quote = (
+        "An operating system schedules processes, manages virtual memory, and "
+        "provides file system abstractions."
+    )
+    engine_out = _one_cue_selector_result(quote, score=1.0)
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    pipeline, embedding = _pipeline_with_semantic(0.19)
+
+    _video_row, clips, _engine = pipeline._clip_and_filter(
+        {
+            **_video(),
+            "literal_match": False,
+            "_topic_terms": ["biology", "operating systems"],
+        },
+        "biology",
+        "en",
+    )
+
+    assert clips == []
+    assert embedding.inputs[0][0] == "biology"
+    assert all(value != "operating systems" for value in embedding.inputs[0])
 
 
 def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
@@ -924,7 +1159,8 @@ def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
     topic = "Carolingian minuscule ligature identification"
     video = {**_video(), "_topic_terms": [topic], "_knowledge_level": "beginner"}
 
-    _video_row, clips, _engine = _pipeline()._clip_and_filter(video, topic, "en")
+    pipeline, _embedding = _pipeline_with_semantic(0.3)
+    _video_row, clips, _engine = pipeline._clip_and_filter(video, topic, "en")
 
     assert [clip["selection_candidate_id"] for clip in clips] == [
         "dQw4w9WgXcQ::recognition"
@@ -979,19 +1215,29 @@ def test_candidate_plan_prioritizes_level_eligible_then_difficulty(
     expected_starts: list[float],
     expected_deferred: list[bool],
 ) -> None:
+    transcript = _transcript()
+    transcript["segments"][1] = {
+        "cue_id": "advanced-python",
+        "start": 10.0,
+        "end": 20.0,
+        "text": "Python generators yield values lazily and preserve suspended execution state.",
+    }
     engine_out = {
         "clips": [
             _quality_clip(score=0.8, difficulty=0.1),
             _quality_clip(
-                cue_id="garden",
+                cue_id="advanced-python",
                 start=10.0,
                 end=20.0,
-                quote="Garden soil needs regular watering.",
+                quote=(
+                    "Python generators yield values lazily and preserve suspended "
+                    "execution state."
+                ),
                 score=0.9,
                 difficulty=0.9,
             ),
         ],
-        "transcript": _transcript(),
+        "transcript": transcript,
         "notes": "",
     }
     monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)

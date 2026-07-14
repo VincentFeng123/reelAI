@@ -1646,7 +1646,7 @@ class ReelService:
             else stored_knowledge_level
         )
         subject_tag = str((material or {}).get("subject_tag") or "").strip() or None
-        literal_subject_tag = subject_tag
+        literal_subject_tag = self._clean_query_text(subject_tag or "") or None
         strict_topic_only = str((material or {}).get("source_type") or "").strip().lower() == "topic"
         strict_topic_expansion: dict[str, Any] | None = None
         if strict_topic_only and subject_tag:
@@ -1885,7 +1885,6 @@ class ReelService:
                 break
             if videos_processed >= generation_video_limit:
                 break
-            leaf_topic = self._concept_topic_query(concept)
             topic = self._concept_topic_query(
                 concept,
                 parent_topic=material_parent_topic,
@@ -1950,13 +1949,9 @@ class ReelService:
                     preferred_video_duration=safe_video_duration_pref,
                     generation_context=generation_context,
                     literal_topic=(
-                        topic
-                        if topic != leaf_topic
-                        else (
-                            literal_subject_tag
-                            if strict_topic_only and literal_subject_tag
-                            else topic
-                        )
+                        literal_subject_tag
+                        if literal_subject_tag and concept_id is None
+                        else topic
                     ),
                     retrieval_profile=retrieval_profile,
                     analyzed_video_ids=analyzed_ids,

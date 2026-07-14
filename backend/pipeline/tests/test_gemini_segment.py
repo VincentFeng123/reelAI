@@ -310,10 +310,45 @@ def test_bad_line_indices_are_rejected_instead_of_clamped(start, end):
     assert _convert(G._Plan(topics=[_topic("T", start, end)]), segs) == []
 
 
-def test_contextual_overlap_below_duplicate_threshold_is_preserved():
+def test_shared_cue_overlap_is_deduplicated_even_below_eighty_percent():
     segs = _segs(4)
     clips = _convert(_plan(("A", 0, 2), ("B", 1, 3)), segs)
-    assert [(clip["start"], clip["end"]) for clip in clips] == [(0.0, 30.0), (10.0, 40.0)]
+    assert [(clip["start"], clip["end"]) for clip in clips] == [(0.0, 30.0)]
+
+
+def test_non_overlapping_distinct_facets_from_one_source_are_preserved():
+    segs = _segs(4)
+    clips = _convert(_plan(("Alpha", 0, 1), ("Beta", 2, 3)), segs)
+
+    assert [clip["title"] for clip in clips] == ["Alpha", "Beta"]
+
+
+def test_shared_cue_overlap_keeps_the_higher_quality_candidate():
+    segs = _segs(4)
+    plan = G._Plan(topics=[
+        _topic(
+            "Lower quality",
+            0,
+            2,
+            candidate_id="lower",
+            informativeness=0.76,
+            topic_relevance=0.8,
+            educational_importance=0.77,
+        ),
+        _topic(
+            "Higher quality",
+            1,
+            3,
+            candidate_id="higher",
+            informativeness=0.94,
+            topic_relevance=0.92,
+            educational_importance=0.93,
+        ),
+    ])
+
+    clips = _convert(plan, segs)
+
+    assert [clip["selection_candidate_id"] for clip in clips] == ["higher"]
 
 
 def test_span_covering_eighty_percent_of_shorter_is_deduplicated():
@@ -627,6 +662,11 @@ def test_compound_topic_allows_grounded_related_facets():
     assert "multiple linked ideas" in user
     assert "useful prerequisite facet is relevant" in user
     assert "unrelated domain is not enough" in user
+    assert (
+        "shared vocabulary, a loose analogy, or general systems thinking alone"
+        in user.casefold()
+    )
+    assert "genuinely needed to understand or apply the exact requested topic" in user.casefold()
 
 
 def test_budget_is_reserved_once_and_selector_allows_one_transient_retry(monkeypatch):

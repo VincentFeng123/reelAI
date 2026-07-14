@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from backend.pipeline import gemini_segment as G
 
 
@@ -118,6 +120,99 @@ def test_lowercase_fragment_uses_previous_unfinished_cue_as_evidence() -> None:
     assert G._cue_opens_mid_thought_at(
         segments, 2, ignore_caption_case=True
     ) is False
+
+
+@pytest.mark.parametrize(
+    ("fragment", "guarded_prefix"),
+    [
+        ("“chloroplasts” inside of which photosynthesis occurs.", "“Chloroplasts”"),
+        ("[chloroplasts] inside of which photosynthesis occurs.", "[Chloroplasts]"),
+    ],
+)
+def test_opening_quotes_and_brackets_do_not_hide_lowercase_context(
+    fragment: str,
+    guarded_prefix: str,
+) -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Plant cells contain specialized organelles called",
+        },
+        {"start": 5.0, "end": 11.0, "text": fragment},
+    ]
+
+    assert G._guard_text(
+        fragment, ignore_caption_case=True
+    ).startswith(guarded_prefix)
+    assert G._cue_opens_mid_thought_at(
+        segments, 1, ignore_caption_case=True
+    ) is True
+    assert G._close_cue_context(
+        segments, 1, 1, ignore_caption_case=True
+    ) == (0, 1, None)
+
+
+def test_demonstrative_noun_phrase_expands_to_its_antecedent() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "Cells of the same type can form functional groups.",
+        },
+        {
+            "start": 6.0,
+            "end": 12.0,
+            "text": "Those groups of cells working together are called tissues.",
+        },
+    ]
+
+    assert G._close_cue_context(
+        segments, 1, 1, ignore_caption_case=True
+    ) == (0, 1, None)
+
+
+def test_by_the_way_opener_expands_or_fails_closed_at_a_section_edge() -> None:
+    opener = "Oh yeah, by the way, multicellular organisms can reproduce sexually."
+    with_context = [
+        {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "Organisms reproduce to pass genetic information to offspring.",
+        },
+        {"start": 6.0, "end": 12.0, "text": opener},
+    ]
+
+    assert G._structural_filler_matches(opener)
+    assert G._close_cue_context(
+        with_context, 1, 1, ignore_caption_case=True
+    ) == (0, 1, None)
+    assert G._close_cue_context(
+        [with_context[1]], 0, 0, ignore_caption_case=True
+    ) == (0, 0, "unresolved_weak_start")
+
+
+def test_adversative_question_expands_but_bare_question_can_open() -> None:
+    contextual = [
+        {
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Enzymes make life possible by speeding chemical reactions,",
+        },
+        {
+            "start": 5.0,
+            "end": 11.0,
+            "text": "but what even is life? Scientists disagree about its exact definition.",
+        },
+    ]
+    bare = [{**contextual[1], "text": "What even is life? Scientists study its traits."}]
+
+    assert G._close_cue_context(
+        contextual, 1, 1, ignore_caption_case=True
+    ) == (0, 1, None)
+    assert G._close_cue_context(
+        bare, 0, 0, ignore_caption_case=True
+    ) == (0, 0, None)
 
 
 def test_live_biology_comparative_question_recovers_its_missing_setup() -> None:
@@ -619,7 +714,7 @@ def test_production_trailing_forward_setup_is_trimmed_to_complete_teaching() -> 
         3,
         ignore_caption_case=True,
     )
-    assert (start, end, error) == (2, 4, None)
+    assert (start, end, error) == (0, 4, None)
 
 
 def test_unpunctuated_prefix_expands_into_following_solution() -> None:
