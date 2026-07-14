@@ -183,13 +183,15 @@ def _transient_gemini_error(error: Exception) -> bool:
     if isinstance(error, (TimeoutError, ConnectionError)):
         return True
     name = type(error).__name__.lower()
-    if "timeout" in name or "connect" in name:
+    if any(marker in name for marker in ("timeout", "connect", "network", "protocol")):
         return True
     message = str(error).lower()
     return any(
         marker in message
         for marker in (
             "resource_exhausted", "unavailable", "overloaded",
+            "server disconnected", "connection reset", "connection closed",
+            "peer closed",
             "status 408", "status 429", "status 500", "status 502",
             "status 503", "status 504",
         )

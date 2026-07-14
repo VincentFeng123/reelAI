@@ -58,6 +58,10 @@ class _HTTPError(RuntimeError):
         self.status_code = status_code
 
 
+class _RemoteProtocolError(RuntimeError):
+    pass
+
+
 def _enum_value(value) -> str:
     return str(getattr(value, "value", value)).lower()
 
@@ -177,6 +181,24 @@ def test_gemini3_retries_one_transient_error_with_short_jitter(monkeypatch):
     assert sleeps == [0.2]
     assert all(call["config"].http_options.retry_options.attempts == 1
                for call in fake.models.calls)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _RemoteProtocolError("unexpected EOF"),
+        RuntimeError("Server disconnected without sending a response"),
+        RuntimeError("connection reset by peer"),
+    ],
+)
+def test_gemini3_retries_common_remote_disconnects(monkeypatch, error):
+    fake = _FakeClient(error, _FakeResponse())
+    monkeypatch.setattr(gc.time, "sleep", lambda _: None)
+
+    result = _call_v3(monkeypatch, fake, max_retries=1)
+
+    assert len(fake.models.calls) == 2
+    assert result.telemetry.retries == 1
 
 
 def test_gemini3_cancellation_during_jitter_prevents_retry(monkeypatch):

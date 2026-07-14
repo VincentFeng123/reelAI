@@ -43,25 +43,25 @@ log = logging.getLogger("clipper.segment")
 
 _WORD_RE = re.compile(r"[a-z0-9']+", re.IGNORECASE)
 _CandidateId = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)
+    str, StringConstraints(strip_whitespace=True, min_length=1)
 ]
 _BoundaryQuote = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=180)
+    str, StringConstraints(strip_whitespace=True, min_length=1)
 ]
 _ClipTitle = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)
+    str, StringConstraints(strip_whitespace=True, min_length=1)
 ]
 _LearningObjective = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=240)
+    str, StringConstraints(strip_whitespace=True, min_length=1)
 ]
 _Facet = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)
+    str, StringConstraints(strip_whitespace=True, min_length=1)
 ]
 _EvidenceQuote = Annotated[
-    str, StringConstraints(strip_whitespace=True, min_length=1, max_length=480)
+    str, StringConstraints(strip_whitespace=True, min_length=1)
 ]
 _OptionalReason = Annotated[
-    str, StringConstraints(strip_whitespace=True, max_length=240)
+    str, StringConstraints(strip_whitespace=True)
 ]
 _STRUCTURAL_FILLER_RE = re.compile(
     r"(?:\b(?:thanks? for watching|have a great day|see you next time|"
@@ -495,8 +495,10 @@ def _learner_rule(level: str) -> str:
 
 def _selection_fields(*, enriched: bool) -> str:
     fields = (
-        "candidate_id, start_line, end_line, start_quote, end_quote, title, "
-        "learning_objective, facet, informativeness, topic_relevance, "
+        "candidate_id (a short unique slug), start_line, end_line, start_quote and "
+        "end_quote (each an exact short edge quote), title (at most 12 words), "
+        "learning_objective (at most 24 words), facet (at most 12 words), "
+        "informativeness, topic_relevance, "
         "educational_importance, difficulty, directly_teaches_topic, substantive, "
         "factually_grounded, "
         "topic_evidence_quote (an exact 5-40 word quote copied from within the selected "
@@ -2263,6 +2265,36 @@ def _telemetry_dict(value: object) -> dict:
     return {"value": str(value)}
 
 
+def _validate_model_response(
+    schema: type[BaseModel], text: str,
+) -> tuple[BaseModel, list[str]]:
+    """Validate one response, salvaging valid boundary candidates independently."""
+    if schema is not _BoundaryPlan:
+        return schema.model_validate_json(text), []
+
+    payload = json.loads(text)
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"topics"}
+        or not isinstance(payload.get("topics"), list)
+    ):
+        return schema.model_validate(payload), []
+
+    topics: list[_BoundaryTopic] = []
+    rejection_reasons: list[str] = []
+    for index, raw_topic in enumerate(payload["topics"]):
+        try:
+            topics.append(_BoundaryTopic.model_validate(raw_topic))
+        except ValidationError as exc:
+            first_error = exc.errors(include_url=False)[0]
+            location = ".".join(str(part) for part in first_error.get("loc", ()))
+            rejection_reasons.append(
+                f"proposal_{index}:schema_invalid:{location or 'item'}:"
+                f"{first_error.get('type') or 'validation_error'}"
+            )
+    return _BoundaryPlan(topics=topics), rejection_reasons
+
+
 def _call_model(
     system: str,
     user: str,
@@ -2304,7 +2336,7 @@ def _call_model(
             deadline_monotonic=deadline_monotonic,
             operation=operation,
             prompt_version=prompt_version,
-            max_retries=0,
+            max_retries=1,
             cancelled=cancelled,
         )
     except Exception as exc:
@@ -2329,11 +2361,16 @@ def _call_model(
         telemetry.setdefault(key, value)
     telemetry.setdefault("dispatched", True)
     try:
-        parsed = schema.model_validate_json(result.text.strip())
+        parsed, schema_rejections = _validate_model_response(
+            schema, result.text.strip(),
+        )
     except (ValidationError, ValueError) as exc:
         raise _SchemaResponseError(
             f"invalid {schema.__name__} response: {exc}", telemetry,
         ) from exc
+    if schema_rejections:
+        telemetry["schema_rejected_count"] = len(schema_rejections)
+        telemetry["schema_rejection_reasons"] = schema_rejections
     return parsed, telemetry
 
 
@@ -2607,6 +2644,13 @@ def _run_selection_profile(
         topic=topic,
         require_enrichment=require_enrichment,
     )
+    schema_rejections = call.get("schema_rejection_reasons")
+    if isinstance(schema_rejections, list):
+        clean_rejections = [
+            str(reason) for reason in schema_rejections if str(reason).strip()
+        ]
+        report.proposed_count += len(clean_rejections)
+        report.rejected_reasons = clean_rejections + report.rejected_reasons
     calls = [call]
     if profile in {FLASH_SPLIT_PROFILE, PRO_BOUNDARY_PROFILE}:
         _drop_unmet_prerequisite_clips(report)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import time
 
@@ -539,6 +540,82 @@ def test_schema_failure_preserves_successful_call_usage_telemetry(monkeypatch):
         )
     assert G._exception_telemetry(exc_info.value)["total_tokens"] == 130
     assert G._exception_telemetry(exc_info.value)["dispatched"] is True
+
+
+def test_boundary_schema_rejects_one_bad_topic_without_losing_valid_sibling(
+    monkeypatch,
+):
+    valid = G._BoundaryTopic(
+        candidate_id="candidate-alpha",
+        start_line=0,
+        end_line=0,
+        start_quote="Alpha lesson defines the concept",
+        end_quote="closes with a clear conclusion",
+        title="Alpha lesson",
+        learning_objective="Understand the complete alpha lesson.",
+        facet="alpha",
+        reason="Complete grounded teaching.",
+        informativeness=0.9,
+        topic_relevance=0.9,
+        educational_importance=0.9,
+        difficulty=0.5,
+        directly_teaches_topic=True,
+        substantive=True,
+        factually_grounded=True,
+        topic_evidence_quote="Alpha lesson defines the concept completely",
+        self_contained=True,
+        is_standalone=True,
+        prerequisite_candidate_ids=[],
+        uncertainty="low",
+        uncertainty_reasons=[],
+    ).model_dump(mode="json")
+    malformed = {**valid, "candidate_id": "candidate-bad", "topic_relevance": "high"}
+    telemetry = GC.GeminiCallTelemetry(
+        model=G.config.SEGMENT_FLASH_MODEL,
+        operation="flash_boundary_selector",
+        prompt_version=G.FLASH_SPLIT_PROFILE,
+        thinking_level="low",
+        latency_ms=12.0,
+        retries=0,
+        finish_reason="STOP",
+        prompt_tokens=100,
+        candidate_tokens=100,
+        thought_tokens=0,
+        total_tokens=200,
+    )
+    monkeypatch.setattr(
+        GC,
+        "generate_json_v3",
+        lambda *args, **kwargs: GC.GenerationResult(
+            json.dumps({"topics": [malformed, valid]}), telemetry,
+        ),
+    )
+
+    result = G.run_segment_profile(
+        {
+            "segments": [{
+                "start": 0.0,
+                "end": 10.0,
+                "text": (
+                    "Alpha lesson defines the concept completely. Therefore, the lesson "
+                    "closes with a clear conclusion."
+                ),
+            }],
+            "words": [],
+            "source": "supadata",
+        },
+        {},
+        G.FLASH_SPLIT_PROFILE,
+        topic="alpha lesson",
+    )
+
+    assert result.accepted_count == 1
+    assert result.proposed_count == 2
+    assert result.classification == "green"
+    assert result.rejection_reasons == [
+        "proposal_0:schema_invalid:topic_relevance:float_type"
+    ]
+    assert result.calls[0]["schema_rejected_count"] == 1
 
 
 def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):

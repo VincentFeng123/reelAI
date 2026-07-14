@@ -47,6 +47,26 @@ def test_single_call_boundary_schema_caps_exhaustive_output_before_truncation() 
         ])
 
 
+def test_selector_accepts_non_lossy_descriptive_strings_beyond_prompt_limits() -> None:
+    proposal = _proposal().model_copy(update={
+        "candidate_id": "candidate-" + ("identifier-" * 8),
+        "start_quote": "opening " * 40,
+        "end_quote": "closing " * 40,
+        "title": "A complete descriptive title " * 8,
+        "learning_objective": "Explain the complete grounded educational relationship " * 8,
+        "facet": "A detailed but valid supporting facet " * 8,
+        "reason": "The model supplied a detailed optional reason. " * 10,
+        "topic_evidence_quote": "grounded transcript evidence " * 40,
+    })
+
+    parsed = gemini_segment._BoundaryPlan.model_validate_json(
+        gemini_segment._BoundaryPlan(topics=[proposal]).model_dump_json()
+    )
+
+    assert len(parsed.topics) == 1
+    assert parsed.topics[0].facet.startswith("A detailed but valid")
+
+
 def test_duration_settings_do_not_change_a_complete_clip() -> None:
     complete = [{
         "cue_id": "cue-0",
@@ -98,6 +118,9 @@ def test_selector_prompt_is_exhaustive_and_allows_one_listed_component() -> None
     assert "every qualifying related unit" in (_system + user)
     assert "brief internal aside" in (_system + user)
     assert "prioritize them within difficulty stages" in (_system + user)
+    assert "title (at most 12 words)" in user
+    assert "learning_objective (at most 24 words)" in user
+    assert "facet (at most 12 words)" in user
     assert user.index("Transcript (") < user.index("Exact user request:")
     assert "1. Understand the whole transcript" in user
     assert "2. Map every distinct educational unit" in user

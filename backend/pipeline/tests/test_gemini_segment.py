@@ -629,7 +629,7 @@ def test_compound_topic_allows_grounded_related_facets():
     assert "unrelated domain is not enough" in user
 
 
-def test_budget_is_reserved_once_and_selector_dispatch_has_no_retry(monkeypatch):
+def test_budget_is_reserved_once_and_selector_allows_one_transient_retry(monkeypatch):
     order = []
     payload = {}
 
@@ -639,7 +639,7 @@ def test_budget_is_reserved_once_and_selector_dispatch_has_no_retry(monkeypatch)
 
     def generate(*args, **kwargs):
         order.append("dispatch")
-        assert kwargs["max_retries"] == 0
+        assert kwargs["max_retries"] == 1
         return SimpleNamespace(text='{"topics": []}', telemetry={})
 
     monkeypatch.setattr("backend.gemini_client.generate_json_v3", generate)
