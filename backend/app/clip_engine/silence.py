@@ -644,11 +644,11 @@ def _prepare_audio_source(
                     info,
                     expected_language=language,
                 )
-                lexical_deadline = min(
-                    deadline,
-                    time.monotonic() + lexical_timing.MAX_FETCH_TIMEOUT_SEC,
-                )
                 for track in tracks:
+                    lexical_deadline = min(
+                        deadline,
+                        time.monotonic() + lexical_timing.MAX_FETCH_TIMEOUT_SEC,
+                    )
                     try:
                         lexical_words = lexical_timing.fetch_json3_words(
                             track,

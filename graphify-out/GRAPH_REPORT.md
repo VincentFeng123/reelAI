@@ -1,7 +1,7 @@
 # Graph Report - .  (2026-07-14)
 
 ## Corpus Check
-- 388 files · ~1,066,030 words
+- 388 files · ~1,066,026 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -361,7 +361,7 @@ Nodes (6): ClipEngineFeedTests, Tests for Task 12: ingest_feed routed through cl
 
 ### Community 81 - "Community 81"
 Cohesion: 0.12
-Nodes (0): 
+Nodes (0):
 
 ### Community 82 - "Community 82"
 Cohesion: 0.14
@@ -469,7 +469,7 @@ Nodes (3): normalizeSignupEmailForComparison(), onSendVerificationEmail(), onVer
 
 ### Community 108 - "Community 108"
 Cohesion: 0.18
-Nodes (0): 
+Nodes (0):
 
 ### Community 109 - "Community 109"
 Cohesion: 0.22
@@ -477,7 +477,7 @@ Nodes (2): FastAPI assessment contract, privacy, resume, and learner isolation.,
 
 ### Community 110 - "Community 110"
 Cohesion: 0.2
-Nodes (0): 
+Nodes (0):
 
 ### Community 111 - "Community 111"
 Cohesion: 0.39
@@ -561,7 +561,7 @@ Nodes (6): Per-clip orientation cards (feed display). Offline — llm_json monke
 
 ### Community 131 - "Community 131"
 Cohesion: 0.29
-Nodes (0): 
+Nodes (0):
 
 ### Community 132 - "Community 132"
 Cohesion: 0.33
@@ -581,7 +581,7 @@ Nodes (2): _build_request(), RateLimitClientIpResolutionTests
 
 ### Community 136 - "Community 136"
 Cohesion: 0.29
-Nodes (0): 
+Nodes (0):
 
 ### Community 137 - "Community 137"
 Cohesion: 0.48
@@ -589,7 +589,7 @@ Nodes (5): _cancel_shortly(), test_active_async_request_is_cancelled_within_thre
 
 ### Community 138 - "Community 138"
 Cohesion: 0.29
-Nodes (0): 
+Nodes (0):
 
 ### Community 139 - "Community 139"
 Cohesion: 0.43
@@ -597,11 +597,11 @@ Nodes (5): applySearchFeedSettingsToParams(), buildSearchFeedQuery(), parseQuery
 
 ### Community 140 - "Community 140"
 Cohesion: 0.33
-Nodes (0): 
+Nodes (0):
 
 ### Community 141 - "Community 141"
 Cohesion: 0.33
-Nodes (0): 
+Nodes (0):
 
 ### Community 142 - "Community 142"
 Cohesion: 0.33
@@ -617,11 +617,11 @@ Nodes (1): FE1 (embed bleed fix) + FE2 (quality payload) — the serving embed p
 
 ### Community 145 - "Community 145"
 Cohesion: 0.33
-Nodes (0): 
+Nodes (0):
 
 ### Community 146 - "Community 146"
 Cohesion: 0.33
-Nodes (0): 
+Nodes (0):
 
 ### Community 147 - "Community 147"
 Cohesion: 0.33
@@ -637,15 +637,15 @@ Nodes (4): _collect_referenced_names(), Completeness guard: every config.<CONSTA
 
 ### Community 150 - "Community 150"
 Cohesion: 0.5
-Nodes (0): 
+Nodes (0):
 
 ### Community 151 - "Community 151"
 Cohesion: 0.5
-Nodes (0): 
+Nodes (0):
 
 ### Community 152 - "Community 152"
 Cohesion: 0.5
-Nodes (0): 
+Nodes (0):
 
 ### Community 153 - "Community 153"
 Cohesion: 0.5
@@ -661,7 +661,7 @@ Nodes (2): _sent(), test_opening_onset_rate_counts_only_good_openers()
 
 ### Community 156 - "Community 156"
 Cohesion: 0.5
-Nodes (0): 
+Nodes (0):
 
 ### Community 157 - "Community 157"
 Cohesion: 0.67
@@ -669,7 +669,7 @@ Nodes (2): createInitialState(), LoadingFlappyMiniGame()
 
 ### Community 158 - "Community 158"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 159 - "Community 159"
 Cohesion: 0.67
@@ -677,171 +677,171 @@ Nodes (1): pysbd's Segmenter is not thread-safe: segment() stashes the input on 
 
 ### Community 160 - "Community 160"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 161 - "Community 161"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 162 - "Community 162"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 163 - "Community 163"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 164 - "Community 164"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 165 - "Community 165"
 Cohesion: 0.67
-Nodes (0): 
+Nodes (0):
 
 ### Community 166 - "Community 166"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 167 - "Community 167"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 168 - "Community 168"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 169 - "Community 169"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 170 - "Community 170"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 171 - "Community 171"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 172 - "Community 172"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 173 - "Community 173"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 174 - "Community 174"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 175 - "Community 175"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 176 - "Community 176"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 177 - "Community 177"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 178 - "Community 178"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 179 - "Community 179"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 180 - "Community 180"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 181 - "Community 181"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 182 - "Community 182"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 183 - "Community 183"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 184 - "Community 184"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 185 - "Community 185"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 186 - "Community 186"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 187 - "Community 187"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 188 - "Community 188"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 189 - "Community 189"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 190 - "Community 190"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 191 - "Community 191"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 192 - "Community 192"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 193 - "Community 193"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 194 - "Community 194"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 195 - "Community 195"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 196 - "Community 196"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 197 - "Community 197"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 198 - "Community 198"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 199 - "Community 199"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 200 - "Community 200"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ### Community 201 - "Community 201"
 Cohesion: 1.0
-Nodes (0): 
+Nodes (0):
 
 ## Knowledge Gaps
 - **391 isolated node(s):** `Submit one autocrop job and return the URL of the rendered short.`, `MuAPI result shapes vary by endpoint — try common keys.`, `Find the most viral-worthy highlights in a transcript.  Logic ported from ViralV`, `Default LLM backend: MuAPI gpt-5-mini.`, `gpt-5-4 sometimes wraps JSON in markdown fences — strip and parse.` (+386 more)

@@ -1921,7 +1921,7 @@ def test_prepare_fetches_json3_words_once_from_the_existing_ytdlp_metadata(
     assert "captions.example" not in repr(result.source)
 
 
-def test_prepare_falls_back_between_tracks_with_one_shared_lexical_deadline(
+def test_prepare_gives_each_fallback_track_a_bounded_lexical_deadline(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -1941,15 +1941,19 @@ def test_prepare_falls_back_between_tracks_with_one_shared_lexical_deadline(
         silence.lexical_timing.LexicalWord("biology", 36.48),
         silence.lexical_timing.LexicalWord("is", 37.48),
     )
-    deadline_observations: list[tuple[float, float]] = []
+    clock = [100.0]
+    deadline_budgets: list[float] = []
 
     def fake_fetch(track, **kwargs):
-        deadline_observations.append(
-            (float(kwargs["deadline"]), time.monotonic())
-        )
-        return () if "automatic" in track.url else words
+        deadline_budgets.append(float(kwargs["deadline"]) - clock[0])
+        if "automatic" in track.url:
+            clock[0] += 1.9
+            return ()
+        return words
 
     with mock.patch.object(
+        silence.time, "monotonic", side_effect=lambda: clock[0]
+    ), mock.patch.object(
         silence, "_run_command", return_value=(payload, b"")
     ), mock.patch.object(
         silence.lexical_timing, "fetch_json3_words", side_effect=fake_fetch
@@ -1958,11 +1962,7 @@ def test_prepare_falls_back_between_tracks_with_one_shared_lexical_deadline(
 
     assert result.ready and result.source is not None
     assert fetch.call_count == 2
-    assert deadline_observations[0][0] == deadline_observations[1][0]
-    assert all(
-        0 < deadline - observed_at <= 2.0
-        for deadline, observed_at in deadline_observations
-    )
+    assert deadline_budgets == [2.0, 2.0]
     assert result.source.lexical_words == words
     assert result.source.lexical_language == "en"
     assert "captions.example" not in repr(result.source)
