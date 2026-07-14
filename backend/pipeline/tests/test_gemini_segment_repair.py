@@ -172,6 +172,79 @@ def test_demonstrative_noun_phrase_expands_to_its_antecedent() -> None:
     ) == (0, 1, None)
 
 
+def test_fronted_quantified_demonstrative_expands_to_its_antecedent() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "Genes on the X chromosome are called X-linked genes.",
+        },
+        {
+            "start": 6.0,
+            "end": 12.0,
+            "text": (
+                "If one of these genes is recessive, males express the trait "
+                "because they have only one X chromosome."
+            ),
+        },
+    ]
+
+    assert G._close_cue_context(
+        segments, 1, 1, ignore_caption_case=True
+    ) == (0, 1, None)
+
+    for contextual_opener in (
+        "If these genes are recessive, males express the trait.",
+        "When this happens, the recessive trait becomes visible.",
+        "Although those results are uncommon, they support the model.",
+    ):
+        contextual_segments = [segments[0], {**segments[1], "text": contextual_opener}]
+        assert G._close_cue_context(
+            contextual_segments, 1, 1, ignore_caption_case=True
+        ) == (0, 1, None)
+
+
+def test_uppercase_fragment_expands_after_unfinished_function_word() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 5.0,
+            "text": "Fun fact: if you stretched out all the",
+        },
+        {
+            "start": 5.0,
+            "end": 11.0,
+            "text": (
+                "DNA of one cell, it would be about two meters long."
+            ),
+        },
+    ]
+
+    assert G._cue_opens_mid_thought_at(
+        segments, 1, ignore_caption_case=True
+    ) is True
+    assert G._close_cue_context(
+        segments, 1, 1, ignore_caption_case=True
+    ) == (0, 1, None)
+
+
+def test_structural_only_previous_tail_does_not_capture_clean_opener() -> None:
+    segments = [
+        {"start": 0.0, "end": 4.0, "text": "Let's move on to"},
+        {
+            "start": 4.0,
+            "end": 10.0,
+            "text": (
+                "Photosynthesis converts light energy into stored chemical energy."
+            ),
+        },
+    ]
+
+    assert G._close_cue_context(
+        segments, 1, 1, ignore_caption_case=True
+    ) == (1, 1, None)
+
+
 def test_by_the_way_opener_expands_or_fails_closed_at_a_section_edge() -> None:
     opener = "Oh yeah, by the way, multicellular organisms can reproduce sexually."
     with_context = [
@@ -190,6 +263,20 @@ def test_by_the_way_opener_expands_or_fails_closed_at_a_section_edge() -> None:
     assert G._close_cue_context(
         [with_context[1]], 0, 0, ignore_caption_case=True
     ) == (0, 0, "unresolved_weak_start")
+
+
+def test_conversational_edge_labels_are_structural_not_topic_words() -> None:
+    for text in (
+        "Cool! Photosynthesis converts light energy.",
+        "Hey, cells contain DNA.",
+        "Fun fact! One cell contains about two meters of DNA.",
+        "The explanation is complete. Brilliant.",
+    ):
+        assert G._structural_filler_matches(text)
+
+    assert G._structural_filler_matches(
+        "Cool stars can have surface temperatures below 4,000 kelvin."
+    ) == []
 
 
 def test_adversative_question_expands_but_bare_question_can_open() -> None:
@@ -323,6 +410,99 @@ def test_live_biology_terminal_contraction_finishes_the_following_explanation() 
     )
 
     assert (start, end, error) == (0, 8, None)
+
+
+def test_unfinished_bare_subject_expands_to_its_conclusion() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "Helpful bacteria live in symbiosis with you, so you",
+        },
+        {
+            "start": 6.0,
+            "end": 12.0,
+            "text": "give them food and they help you digest it.",
+        },
+    ]
+
+    assert G._cue_has_weak_end(
+        segments[0]["text"],
+        segments[1]["text"],
+        ignore_caption_case=True,
+    ) is True
+    assert G._close_cue_context(
+        segments, 0, 0, ignore_caption_case=True
+    ) == (0, 1, None)
+
+
+def test_dangling_degree_transition_trims_to_prior_complete_teaching() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "Translation uses ribosomes to assemble a protein.",
+        },
+        {
+            "start": 6.0,
+            "end": 12.0,
+            "text": "Hey, this genetics stuff is pretty",
+        },
+        {
+            "start": 12.0,
+            "end": 18.0,
+            "text": "cool, so subscribe for another genetics lesson.",
+        },
+    ]
+
+    assert G._cue_has_weak_end(
+        segments[1]["text"],
+        segments[2]["text"],
+        ignore_caption_case=True,
+    ) is True
+    assert G._close_cue_context(
+        segments, 0, 1, ignore_caption_case=True
+    ) == (0, 0, None)
+
+
+def test_mixed_complete_thought_and_dangling_cta_fails_closed() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 6.0,
+            "text": "An action potential reaches the next node and",
+        },
+        {
+            "start": 6.0,
+            "end": 14.0,
+            "text": (
+                "triggers another action potential, which repeats the cycle. "
+                "Something in my brain is telling me that you"
+            ),
+        },
+        {
+            "start": 14.0,
+            "end": 20.0,
+            "text": "should subscribe to continue learning.",
+        },
+    ]
+
+    assert G._close_cue_context(
+        segments, 0, 1, ignore_caption_case=True
+    ) == (0, 1, "unresolved_weak_end")
+
+
+def test_complete_degree_predicate_with_punctuation_remains_clean() -> None:
+    assert G._cue_has_weak_end(
+        "The flower is pretty.",
+        "Pollinators visit the flower.",
+        ignore_caption_case=True,
+    ) is False
+    assert G._cue_has_weak_end(
+        "The flower is pretty",
+        "Pollinators visit the flower.",
+        ignore_caption_case=True,
+    ) is False
 
 
 def test_comparative_question_without_dependency_evidence_remains_eligible() -> None:

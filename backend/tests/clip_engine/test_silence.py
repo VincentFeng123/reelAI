@@ -299,6 +299,14 @@ def test_exact_source_end_is_accepted_when_audio_reaches_edge_in_quiet(
             spans = [(window_duration_sec - 0.3, 12000), (0.3, 0)]
         _write_wav(output_path, spans)
 
+    prepared = silence.AudioPreparationResult(
+        "ready",
+        source=silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            format_id="140",
+            duration_sec=10.0,
+        ),
+    )
     with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
         result = silence.verify_acoustic_boundaries(
             "dQw4w9WgXcQ",
@@ -306,12 +314,50 @@ def test_exact_source_end_is_accepted_when_audio_reaches_edge_in_quiet(
             10.0,
             search_start_limit_sec=0.0,
             search_end_limit_sec=10.0,
-            prepared=_prepared(),
+            prepared=prepared,
         )
 
     assert result.verified
     assert result.end_sec == 10.0
     assert result.diagnostics["end_quiet"] == [9.7, 10.0]
+
+
+def test_semantic_end_limit_is_not_treated_as_the_physical_source_edge(
+    tmp_path: Path,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        if output_path.name == "start-0.wav":
+            spans = [(0.3, 0), (window_duration_sec - 0.3, 12000)]
+        else:
+            spans = [(window_duration_sec - 0.3, 12000), (0.3, 0)]
+        _write_wav(output_path, spans)
+
+    prepared = silence.AudioPreparationResult(
+        "ready",
+        source=silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            format_id="140",
+            duration_sec=20.0,
+        ),
+    )
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            2.0,
+            10.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=10.0,
+            prepared=prepared,
+        )
+
+    assert result.status == "unavailable"
+    assert result.diagnostics["reason"] == "end_silence_not_found"
 
 
 def test_source_end_with_continuous_sound_is_not_assumed_to_be_silence(

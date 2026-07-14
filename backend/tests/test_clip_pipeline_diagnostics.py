@@ -131,7 +131,7 @@ def _quality_clip(
     score: float = 0.9,
     **overrides,
 ) -> dict:
-    """A complete quality_silence_v4 selector result grounded to one cue."""
+    """A complete current selector result grounded to one cue."""
     clip = {
         "start": start,
         "end": end,
@@ -518,7 +518,7 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
     assert {
         (call.kwargs["search_start_limit_sec"], call.kwargs["search_end_limit_sec"])
         for call in verify_audio_mock.call_args_list
-    } == {(0.0, 30.0)}
+    } == {(0.0, 10.0), (10.0, 20.0), (20.0, 30.0)}
     assert context.counters()["stored_clips"] == 3
     assert context.counters()["deferred_clips"] == 0
     assert context.counters()["persisted_clips"] == 3
@@ -708,6 +708,282 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
     assert persisted[0]["end"] == 20.2
 
 
+def test_acoustic_result_crossing_unselected_speech_fails_closed(
+    monkeypatch,
+) -> None:
+    transcript = _transcript()
+    engine_out = {
+        "clips": [_quality_clip()],
+        "transcript": transcript,
+        "notes": "",
+    }
+    verify = mock.Mock(
+        return_value=mock.Mock(
+            verified=True,
+            start_sec=0.0,
+            end_sec=12.0,
+            diagnostics={"threshold_dbfs": -38.0},
+        )
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery()
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify,
+    )
+    persisted: list[dict] = []
+    pipeline = _pipeline()
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        lambda *, clip, **_kwargs: (
+            persisted.append(clip) or "stored-crossing",
+            mock.sentinel.metadata,
+        ),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext(
+            "slow", require_acoustic_boundaries=True
+        ),
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == []
+    assert verify.call_args.kwargs["search_end_limit_sec"] == 10.0
+    assert persisted[0]["search_context"]["surface_eligible"] is False
+    assert (
+        persisted[0]["search_context"]["surface_reason"]
+        == "acoustic_crossed_unselected_speech"
+    )
+
+
+def test_acoustic_result_crossing_prior_unselected_speech_fails_closed(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:start-crossing",
+        "duration": 20.0,
+        "segments": [
+            {
+                "cue_id": "prior",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "A sponsor and unrelated introduction appear first.",
+            },
+            {
+                "cue_id": "python",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "Python functions package reusable instructions.",
+            },
+        ],
+    }
+    engine_out = {
+        "clips": [_quality_clip(cue_id="python", start=10.0, end=20.0)],
+        "transcript": transcript,
+        "notes": "",
+    }
+    verify = mock.Mock(
+        return_value=mock.Mock(
+            verified=True,
+            start_sec=8.0,
+            end_sec=20.0,
+            diagnostics={"threshold_dbfs": -38.0},
+        )
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery()
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify,
+    )
+    persisted: list[dict] = []
+    pipeline = _pipeline()
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        lambda *, clip, **_kwargs: (
+            persisted.append(clip) or "stored-start-crossing",
+            mock.sentinel.metadata,
+        ),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext(
+            "slow", require_acoustic_boundaries=True
+        ),
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == []
+    assert verify.call_args.kwargs["search_start_limit_sec"] == 10.0
+    assert persisted[0]["search_context"]["surface_eligible"] is False
+    assert (
+        persisted[0]["search_context"]["surface_reason"]
+        == "acoustic_crossed_unselected_speech"
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "required_bound"),
+    [
+        (
+            "Welcome to the channel. Python functions package reusable instructions.",
+            {"required_first_speech_sec": 4.0},
+        ),
+        (
+            "Python functions package reusable instructions. Thanks for watching.",
+            {"required_last_speech_sec": 10.0},
+        ),
+    ],
+)
+def test_partial_cue_edge_filler_fails_before_acoustic_verification(
+    monkeypatch, text: str, required_bound: dict,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:partial-cue-filler",
+        "duration": 14.0,
+        "segments": [
+            {"cue_id": "unit", "start": 0.0, "end": 14.0, "text": text},
+        ],
+    }
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                cue_id="unit",
+                start=0.0,
+                end=14.0,
+                quote="Python functions package reusable instructions.",
+                **required_bound,
+            )
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    verify = mock.Mock()
+    monkeypatch.setattr(
+        pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery()
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify,
+    )
+    persisted: list[dict] = []
+    pipeline = _pipeline()
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        lambda *, clip, **_kwargs: (
+            persisted.append(clip) or "stored-partial-cue",
+            mock.sentinel.metadata,
+        ),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Python functions",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext(
+            "slow", require_acoustic_boundaries=True
+        ),
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == []
+    verify.assert_not_called()
+    assert persisted[0]["search_context"]["surface_eligible"] is False
+    assert (
+        persisted[0]["search_context"]["surface_reason"]
+        == "partial_cue_edge_requires_projection"
+    )
+
+
+@pytest.mark.parametrize(
+    "segments",
+    [
+        [
+            {"cue_id": "prior", "start": 0.0, "end": 10.02, "text": "Prior."},
+            {"cue_id": "selected", "start": 10.0, "end": 20.0, "text": "Selected."},
+        ],
+        [
+            {"cue_id": "selected", "start": 0.0, "end": 10.0, "text": "Selected."},
+            {"cue_id": "next", "start": 9.98, "end": 20.0, "text": "Next."},
+        ],
+    ],
+)
+def test_overlapping_unselected_cue_has_no_speech_free_corridor(segments) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:overlap",
+        "duration": 20.0,
+        "segments": segments,
+    }
+    selected = next(segment for segment in segments if segment["cue_id"] == "selected")
+    clip = {
+        "cue_ids": ["selected"],
+        "start": selected["start"],
+        "end": selected["end"],
+    }
+    diagnostics = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert diagnostics is not None
+
+    _start, _end, error = pipeline_module._selected_speech_corridor(
+        transcript,
+        clip,
+        diagnostics,
+        source_end_sec=20.0,
+    )
+
+    assert error == "unselected_speech_overlaps_required_range"
+
+
 @pytest.mark.parametrize(
     ("verification", "expected_reason"),
     [
@@ -728,6 +1004,24 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
                 "verified": True,
                 "start_sec": 0.0,
                 "end_sec": 9.5,
+                "diagnostics": {},
+            },
+            "acoustic_boundary_outside_source_or_required_speech",
+        ),
+        (
+            {
+                "verified": True,
+                "start_sec": 0.049,
+                "end_sec": 10.0,
+                "diagnostics": {},
+            },
+            "acoustic_boundary_outside_source_or_required_speech",
+        ),
+        (
+            {
+                "verified": True,
+                "start_sec": 0.0,
+                "end_sec": 9.951,
                 "diagnostics": {},
             },
             "acoustic_boundary_outside_source_or_required_speech",
@@ -1310,13 +1604,22 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v4"
+        assert context["selection_contract_version"] == "quality_silence_v5"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
         assert context["chain_position"] == 2
         assert context["selection_candidate_id"] == "dQw4w9WgXcQ::python-functions-2"
         assert context["prerequisite_ids"] == []
+        assert context["selection_caption_cues"] == [
+            {
+                "cue_id": "python",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "Python functions package reusable instructions.",
+                "lang": "",
+            }
+        ]
 
     assert scores == pytest.approx([0.85, 0.85])
 

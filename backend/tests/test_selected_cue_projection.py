@@ -100,3 +100,26 @@ def test_caption_projection_never_truncates_selected_transcript_text() -> None:
 
     assert len(selected_text) > 220
     assert captions == [{"start": 0.0, "end": 30.0, "text": selected_text}]
+
+
+def test_caption_projection_keeps_every_cue_for_long_complete_clips() -> None:
+    service = ReelService(embedding_service=None, youtube_service=None)
+    transcript = [
+        {
+            "cue_id": f"cue-{index}",
+            "start": float(index),
+            "end": float(index + 1),
+            "text": f"Complete teaching sentence {index}.",
+        }
+        for index in range(181)
+    ]
+
+    captions = service._build_caption_cues(
+        transcript=transcript,
+        clip_start=0.0,
+        clip_end=181.0,
+        selected_cue_ids=[entry["cue_id"] for entry in transcript],
+    )
+
+    assert len(captions) == 181
+    assert captions[-1]["text"] == "Complete teaching sentence 180."

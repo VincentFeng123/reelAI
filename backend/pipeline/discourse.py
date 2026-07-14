@@ -49,6 +49,16 @@ _UNRESOLVED_ACTION_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_OPENING_QUANTIFIED_DEMONSTRATIVE_RE = re.compile(
+    r"^(?:"
+    r"(?:one|any|some|each|either|neither)\s+of\s+(?:these|those)|"
+    r"(?:if|when|because|although|while|since)\s+"
+    r"(?:(?:one|any|some|each|either|neither)\s+of\s+)?"
+    r"(?:this|that|these|those)"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _DANGLING_QUESTION_REFERENCE_RE = re.compile(
     r"(?:\b(?:this|that|these|those|it|they|them)\s*\?|"
     r"\b(?:how|why|when|where|what)\s+"
@@ -211,6 +221,7 @@ def opens_mid_thought(text: str) -> bool:
         or _OPENING_ASIDE_RE.match(lexical_text)
         or _ELLIPTICAL_SPATIAL_INSTRUCTION_RE.match(lexical_text)
         or _UNRESOLVED_ACTION_REFERENCE_RE.match(lexical_text)
+        or _OPENING_QUANTIFIED_DEMONSTRATIVE_RE.match(lexical_text)
     ):
         return True
 

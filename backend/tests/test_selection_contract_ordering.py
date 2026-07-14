@@ -13,6 +13,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from backend.app.db import SCHEMA
+from backend.app.clip_engine.provider_cache import (
+    TRANSCRIPT_SCHEMA_VERSION,
+    transcript_artifact_key,
+)
 from backend.app.services.reels import ReelService
 
 
@@ -566,6 +570,161 @@ class SelectionContractOrderingTests(unittest.TestCase):
             )
             self.assertAlmostEqual(result[0]["relevance_score"], 0.13)
             self.assertAlmostEqual(result[0]["topic_relevance"], 0.93)
+
+    def test_ranked_feed_uses_selector_cue_snapshot_after_artifact_refresh(self) -> None:
+        response_video_id = "yt:dQw4w9WgXcQ"
+        bare_video_id = "dQw4w9WgXcQ"
+        correct_artifact_key = transcript_artifact_key(
+            video_id=bare_video_id,
+            provider="supadata",
+            requested_language="en",
+            returned_language="en",
+            native_mode=False,
+        )
+        self.conn.execute(
+            "INSERT INTO videos "
+            "(id, title, channel_title, description, duration_sec, created_at) "
+            "VALUES (?, 'Chemical bonding explained', 'Teacher', "
+            "'A chemistry lesson about chemical bonding.', 600, "
+            "'2026-07-12T00:00:00+00:00')",
+            (response_video_id,),
+        )
+        self._insert_versioned_reel(
+            reel_id="artifact-bound",
+            video_id=response_video_id,
+            start=10,
+            difficulty=0.15,
+            base_score=0.8,
+        )
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'artifact-bound'"
+        ).fetchone()
+        context = json.loads(row[0])
+        context.update(
+            {
+                "selection_contract_version": "quality_silence_v5",
+                "self_contained": True,
+                "topic_evidence_quote": (
+                    "Chemical bonding explains how atoms share or transfer electrons"
+                ),
+                "surface_eligible": True,
+                "deferred_level": False,
+                "boundary_status": "verified",
+                "boundary_diagnostics": {
+                    "acoustic_verified": True,
+                    "acoustic": {"threshold_dbfs": -38.0},
+                },
+                "speech_corridor_verified": True,
+                "transcript_artifact_key": correct_artifact_key,
+                "selection_caption_cues": [
+                    {
+                        "cue_id": "correct",
+                        "start": 10.0,
+                        "end": 30.0,
+                        "text": (
+                            "Chemical bonding explains how atoms share or transfer "
+                            "electrons in the exact selector snapshot."
+                        ),
+                        "lang": "en",
+                    }
+                ],
+            }
+        )
+        self.conn.execute(
+            "UPDATE reels SET selected_cue_ids_json = '[\"correct\"]', "
+            "search_context_json = ? WHERE id = 'artifact-bound'",
+            (json.dumps(context),),
+        )
+
+        def insert_artifact(
+            artifact_key: str,
+            cue_id: str,
+            text: str,
+            created_at: str,
+            *,
+            native_mode: bool,
+        ) -> None:
+            payload = {
+                "artifact_key": artifact_key,
+                "video_id": bare_video_id,
+                "provider": "supadata",
+                "requested_language": "en",
+                "returned_language": "en",
+                "native_mode": native_mode,
+                "schema_version": TRANSCRIPT_SCHEMA_VERSION,
+                "segments": [
+                    {
+                        "cue_id": cue_id,
+                        "start": 10.0,
+                        "end": 30.0,
+                        "text": text,
+                        "lang": "en",
+                    }
+                ],
+                "duration_sec": 30.0,
+                "created_at": created_at,
+            }
+            self.conn.execute(
+                "INSERT INTO transcript_artifacts "
+                "(cache_key, video_id, provider, requested_language, "
+                "returned_language, native_mode, schema_version, artifact_json, "
+                "duration_sec, cue_count, created_at, expires_at) "
+                "VALUES (?, ?, 'supadata', 'en', 'en', ?, ?, ?, 30, 1, ?, "
+                "'2027-07-12T00:00:00+00:00')",
+                (
+                    artifact_key,
+                    bare_video_id,
+                    1 if native_mode else 0,
+                    str(TRANSCRIPT_SCHEMA_VERSION),
+                    json.dumps(payload),
+                    created_at,
+                ),
+            )
+
+        correct_text = (
+            "Chemical bonding explains how atoms share or transfer electrons "
+            "in the exact selector snapshot."
+        )
+        insert_artifact(
+            correct_artifact_key,
+            "wrong",
+            "A same-profile refresh replaced the cached transcript content.",
+            "2026-07-12T01:00:00+00:00",
+            native_mode=False,
+        )
+
+        with mock.patch.object(
+            self.service, "_score_text_relevance", side_effect=self._relevance,
+        ):
+            result = self.service.ranked_feed(
+                self.conn,
+                material_id=self.MATERIAL,
+                generation_id="selection-generation",
+                fast_mode=True,
+                learner_id=self.LEARNER,
+            )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["captions"][0]["text"], correct_text)
+
+        context.pop("selection_caption_cues")
+        context.pop("transcript_artifact_key")
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'artifact-bound'",
+            (json.dumps(context),),
+        )
+        self.conn.execute("DELETE FROM ranked_feed_cache")
+        with mock.patch.object(
+            self.service, "_score_text_relevance", side_effect=self._relevance,
+        ):
+            missing_snapshot = self.service.ranked_feed(
+                self.conn,
+                material_id=self.MATERIAL,
+                generation_id="selection-generation",
+                fast_mode=True,
+                learner_id=self.LEARNER,
+            )
+        self.assertEqual(missing_snapshot[0]["captions"], [])
 
     def test_v4_deferred_boundary_clips_release_only_in_their_exact_bin(self) -> None:
         cases = (

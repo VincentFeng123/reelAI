@@ -30,6 +30,7 @@ def _serverless_mode() -> bool:
 # Singleton model handle — lazy-loaded on first use, None means "we already
 # tried and the model path is unavailable; never retry this process".
 _semantic_model_lock = threading.Lock()
+_semantic_inference_lock = threading.Lock()
 _semantic_model: object | None = None
 _semantic_model_tried = False
 
@@ -167,12 +168,13 @@ class EmbeddingService:
         if not text_list or self._semantic_model is None:
             return None
         try:
-            vectors = self._semantic_model.encode(  # type: ignore[attr-defined]
-                text_list,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )
+            with _semantic_inference_lock:
+                vectors = self._semantic_model.encode(  # type: ignore[attr-defined]
+                    text_list,
+                    show_progress_bar=False,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                )
         except Exception:
             logger.exception("semantic embed raised; semantic proof unavailable")
             return None

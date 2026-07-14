@@ -1198,8 +1198,9 @@ class ReelService:
     # gates must be recomputed instead of replaying pre-gate cached rows.
     # v14: discard rows accepted only by the retired -24 dBFS adaptive verifier.
     # v17: retain public source identity and authoritative selector relevance.
-    RANKED_FEED_CACHE_VERSION = 17
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v4"
+    # v18: bind captions to an immutable selection-time cue snapshot.
+    RANKED_FEED_CACHE_VERSION = 18
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v5"
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -2428,7 +2429,7 @@ class ReelService:
             return []
         if all(
             str(reel.get("selection_contract_version") or "").strip()
-            in {"quality_silence_v3", "quality_silence_v4"}
+            in {"quality_silence_v3", "quality_silence_v4", "quality_silence_v5"}
             for reel in generated
         ):
             ordered = sorted(
@@ -5686,6 +5687,7 @@ class ReelService:
                 "quality_silence_v2",
                 "quality_silence_v3",
                 "quality_silence_v4",
+                "quality_silence_v5",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5694,6 +5696,7 @@ class ReelService:
                 "quality_silence_v2",
                 "quality_silence_v3",
                 "quality_silence_v4",
+                "quality_silence_v5",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -5706,6 +5709,18 @@ class ReelService:
             parsed.get("uncertainty") or "low"
         ).strip().lower()
         metadata["_selection_deferred_level"] = selection_bool("deferred_level", False)
+        metadata["_selection_speech_corridor_verified"] = selection_bool(
+            "speech_corridor_verified", False
+        )
+        metadata["_selection_transcript_artifact_key"] = str(
+            parsed.get("transcript_artifact_key") or ""
+        ).strip()
+        raw_caption_cues = parsed.get("selection_caption_cues")
+        metadata["_selection_caption_cues"] = (
+            [dict(cue) for cue in raw_caption_cues if isinstance(cue, dict)]
+            if isinstance(raw_caption_cues, list)
+            else []
+        )
         try:
             metadata["_selection_source_rank"] = max(
                 0, int(parsed.get("source_rank") or 0)
@@ -6835,9 +6850,6 @@ class ReelService:
             else:
                 cues.append(payload)
 
-            if len(cues) >= 140:
-                break
-
         if not cues and fallback_text and fallback_text.strip():
             # Truncate to 240 chars but snap to a sentence or word boundary
             # so the cue text doesn't end mid-word.
@@ -7154,7 +7166,11 @@ class ReelService:
                     self._difficulty(row),
                     str(progress.get("selected_level") or "beginner"),
                 )
-                if selection_version in {"quality_silence_v3", "quality_silence_v4"}
+                if selection_version in {
+                    "quality_silence_v3",
+                    "quality_silence_v4",
+                    "quality_silence_v5",
+                }
                 else legacy_difficulty_matches_level
             )
             deferred_level_ready = bool(
@@ -7174,7 +7190,11 @@ class ReelService:
             ):
                 continue
             if (
-                selection_version in {"quality_silence_v3", "quality_silence_v4"}
+                selection_version in {
+                    "quality_silence_v3",
+                    "quality_silence_v4",
+                    "quality_silence_v5",
+                }
                 and not difficulty_matches_level
             ):
                 continue
@@ -7185,6 +7205,12 @@ class ReelService:
                 if (
                     boundary_status != "verified"
                     or selection_metadata.get("_selection_acoustic_verified") is not True
+                    or (
+                        selection_version == "quality_silence_v5"
+                        and selection_metadata.get(
+                            "_selection_speech_corridor_verified"
+                        ) is not True
+                    )
                 ):
                     continue
             elif boundary_status == "unavailable":
@@ -7194,6 +7220,7 @@ class ReelService:
                     "quality_silence_v2",
                     "quality_silence_v3",
                     "quality_silence_v4",
+                    "quality_silence_v5",
                 } and (
                     (
                         min(
@@ -7414,7 +7441,8 @@ class ReelService:
         deduped = self.adaptive_curriculum_order(conn, material_id, learner_id, deduped)
 
         deduped_video_ids = sorted({str(item.get("video_id") or "") for item in deduped if item.get("video_id")})
-        transcript_by_video: dict[str, list[dict[str, Any]]] = {}
+        legacy_transcript_by_video: dict[str, list[dict[str, Any]]] = {}
+        transcript_by_artifact_key: dict[str, list[dict[str, Any]]] = {}
         if deduped_video_ids:
             bare_to_response_ids: dict[str, list[str]] = defaultdict(list)
             for response_video_id in deduped_video_ids:
@@ -7427,7 +7455,7 @@ class ReelService:
                 placeholders = ", ".join(["?"] * len(bare_video_ids))
                 transcript_rows = fetch_all(
                     conn,
-                    "SELECT video_id, artifact_json FROM transcript_artifacts "
+                    "SELECT cache_key, video_id, artifact_json FROM transcript_artifacts "
                     f"WHERE video_id IN ({placeholders}) "
                     "ORDER BY created_at DESC",
                     tuple(bare_video_ids),
@@ -7440,8 +7468,13 @@ class ReelService:
                 artifact = validate_transcript_payload(payload)
                 if artifact is None:
                     continue
+                cache_key = str(trow.get("cache_key") or "").strip()
+                if cache_key and cache_key == artifact.artifact_key:
+                    transcript_by_artifact_key[cache_key] = artifact.segments
                 for response_video_id in bare_to_response_ids.get(artifact.video_id, []):
-                    transcript_by_video.setdefault(response_video_id, artifact.segments)
+                    legacy_transcript_by_video.setdefault(
+                        response_video_id, artifact.segments
+                    )
 
         response_rows: list[dict[str, Any]] = []
         for item in deduped:
@@ -7476,6 +7509,12 @@ class ReelService:
             selection_source_rank = int(
                 clean_item.get("_selection_source_rank") or 0
             )
+            transcript_artifact_key = str(
+                clean_item.get("_selection_transcript_artifact_key") or ""
+            ).strip()
+            selection_caption_cues = list(
+                clean_item.get("_selection_caption_cues") or []
+            )
             for internal_key in [
                 key for key in clean_item if key.startswith("_selection_")
             ]:
@@ -7505,11 +7544,29 @@ class ReelService:
             # on it. Stripping it here silently defeated client pagination.
             video_id = str(clean_item.get("video_id") or "")
             clean_item["video_id"] = video_id
+            if selection_caption_cues:
+                caption_transcript = selection_caption_cues
+            elif selection_contract_version == "quality_silence_v5":
+                # V5 captions must be immutable selection-time evidence. A
+                # provider artifact key identifies a retrieval profile and may
+                # be overwritten by a later same-profile refresh.
+                caption_transcript = []
+            elif transcript_artifact_key:
+                caption_transcript = transcript_by_artifact_key.get(
+                    transcript_artifact_key, []
+                )
+            else:
+                caption_transcript = legacy_transcript_by_video.get(video_id, [])
             clean_item["captions"] = self._build_caption_cues(
-                transcript=transcript_by_video.get(video_id, []),
+                transcript=caption_transcript,
                 clip_start=float(clean_item.get("t_start") or 0.0),
                 clip_end=float(clean_item.get("t_end") or 0.0),
-                fallback_text=str(clean_item.get("transcript_snippet") or ""),
+                fallback_text=(
+                    ""
+                    if selection_contract_version == "quality_silence_v5"
+                    or transcript_artifact_key
+                    else str(clean_item.get("transcript_snippet") or "")
+                ),
                 selected_cue_ids=list(clean_item.get("selected_cue_ids") or []),
             )
             response_rows.append(clean_item)

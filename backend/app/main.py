@@ -350,7 +350,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v4"
+SELECTION_CONTRACT_VERSION = "quality_silence_v5"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -2544,7 +2544,13 @@ def _shape_reels_for_request_context(
 
 
 def _search_context_has_verified_acoustic_boundary(context: Any) -> bool:
-    return persisted_boundary_is_verified(context)
+    if not isinstance(context, dict) or not persisted_boundary_is_verified(context):
+        return False
+    return bool(
+        str(context.get("selection_contract_version") or "").strip()
+        != SELECTION_CONTRACT_VERSION
+        or context.get("speech_corridor_verified") is True
+    )
 
 
 def _count_generation_reels(conn, generation_id: str) -> int:

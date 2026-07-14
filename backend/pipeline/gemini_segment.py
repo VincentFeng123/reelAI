@@ -77,6 +77,7 @@ _STRUCTURAL_FILLER_RE = re.compile(
     r"next we(?:['’]ll| will)|cover (?:that|this) in (?:this|the) course)\b|"
     r"(?:^|[.!?]\s+)(?:(?:all right|alright|okay|ok|so|now|well|yeah)"
     r"\s*[,;:]?\s+)*(?:"
+    r"(?:cool|hey|fun fact|brilliant)\s*[!,.](?=\s|$)|"
     r"(?:oh\s*[,;:]?\s*)?(?:yeah\s*[,;:]?\s*)?by the way\b|"
     r"sponsored by\b|"
     r"we (?:made|have) (?:a|an|another|whole) video "
@@ -122,6 +123,25 @@ _TERMINAL_DANGLING_TRANSITION_RE = re.compile(
 _TERMINAL_INCOMPLETE_SUBJECT_RE = re.compile(
     r"\b(?:i|we|you|he|she|it|they|this|that)['’](?:d|ll|m|re|s|ve)"
     r"[.!?]?\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_BARE_SUBJECT_RE = re.compile(
+    r"\b(?:and|as|because|but|if|or|since|so|that|though|unless|until|when|while)"
+    r"\s+(?:i|we|you|he|she|it|they)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_DANGLING_ARTICLE_RE = re.compile(
+    r"\b(?:a|an|the)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_DANGLING_DEGREE_RE = re.compile(
+    r"\b(?:am|are|be|been|being|feels?|is|looks?|seems?|sounds?|was|were)"
+    r"\s+(?:less|more|quite|rather|really|so|too|very)\s*$",
+    re.IGNORECASE,
+)
+_TERMINAL_AMBIGUOUS_DEGREE_RE = re.compile(
+    r"\b(?:am|are|be|been|being|feels?|is|looks?|seems?|sounds?|was|were)"
+    r"\s+pretty\s*$",
     re.IGNORECASE,
 )
 _TRAILING_FORWARD_SETUP_RE = re.compile(
@@ -894,6 +914,16 @@ def _cue_opens_mid_thought_at(
         text, ignore_caption_case=ignore_caption_case
     ):
         return True
+    if index > 0:
+        previous_text = str(segments[index - 1].get("text") or "")
+        if (
+            not _cue_is_only_structural_filler(previous_text)
+            and _cue_has_explicit_dangling_end(
+                previous_text,
+                text,
+            )
+        ):
+            return True
     opening_terminator = re.search(r"[.!?]", text)
     lexical_index = first_lexical_character_index(text)
     starts_lowercase = bool(
@@ -960,13 +990,7 @@ def _cue_has_weak_end(
     from .sentences import Sentence, classify_terminator
 
     raw_text = str(text or "").strip()
-    if (
-        _TERMINAL_CALLBACK_RE.search(raw_text)
-        or _TERMINAL_DANGLING_TRANSITION_RE.search(raw_text)
-        or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
-    ):
-        return True
-    if re.search(r"[,;:\-—][\"')\]]*$", raw_text):
+    if _cue_has_explicit_dangling_end(raw_text, next_text):
         return True
     guarded = _guard_text(raw_text, ignore_caption_case=ignore_caption_case)
     terminator = classify_terminator(guarded)
@@ -1038,6 +1062,29 @@ def _cue_has_weak_end(
     )
 
 
+def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
+    """Detect syntax that cannot end a thought without broad caption guesses."""
+    from .discourse import first_lexical_character_index
+
+    raw_text = str(text or "").strip()
+    next_lexical_index = first_lexical_character_index(next_text)
+    ambiguous_degree_continues = bool(
+        _TERMINAL_AMBIGUOUS_DEGREE_RE.search(raw_text)
+        and next_lexical_index is not None
+        and str(next_text)[next_lexical_index].islower()
+    )
+    return bool(
+        _TERMINAL_CALLBACK_RE.search(raw_text)
+        or _TERMINAL_DANGLING_TRANSITION_RE.search(raw_text)
+        or _TERMINAL_INCOMPLETE_SUBJECT_RE.search(raw_text)
+        or _TERMINAL_BARE_SUBJECT_RE.search(raw_text)
+        or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
+        or _TERMINAL_DANGLING_DEGREE_RE.search(raw_text)
+        or ambiguous_degree_continues
+        or re.search(r"[,;:\-—][\"')\]]*$", raw_text)
+    )
+
+
 def _cue_boundary_confidence(text: str, *, ignore_caption_case: bool) -> float:
     from .sentences import classify_terminator
 
@@ -1049,6 +1096,7 @@ def _trim_trailing_incomplete_suffix(
     segments: list[dict], start_line: int, end_line: int,
 ) -> int | None:
     """Trim a cue-aligned teaser/transition suffix, or reject if no clean prefix exists."""
+    from .discourse import first_lexical_character_index
     from .sentences import classify_terminator
 
     following_text = (
@@ -1068,7 +1116,26 @@ def _trim_trailing_incomplete_suffix(
             solution_continues
             and _TRAILING_FORWARD_SETUP_RE.search(suffix)
         )
-        if not (dangling_transition or forward_setup):
+        dangling_degree = bool(_TERMINAL_DANGLING_DEGREE_RE.search(suffix))
+        ambiguous_degree = _TERMINAL_AMBIGUOUS_DEGREE_RE.search(suffix)
+        following_lexical_index = first_lexical_character_index(following_text)
+        dangling_ambiguous_degree = bool(
+            ambiguous_degree
+            and following_lexical_index is not None
+            and following_text[following_lexical_index].islower()
+        )
+        bare_subject = _TERMINAL_BARE_SUBJECT_RE.search(suffix)
+        dangling_bare_subject = bool(
+            bare_subject
+            and re.search(r"[.!?]", suffix[:bare_subject.start()])
+        )
+        if not (
+            dangling_transition
+            or dangling_degree
+            or dangling_ambiguous_degree
+            or dangling_bare_subject
+            or forward_setup
+        ):
             continue
         previous_line = line - 1
         if previous_line < start_line:
@@ -1315,6 +1382,16 @@ def _mixed_edge_required_speech_time(
     if not matches or _cue_is_only_structural_filler(text):
         return False, None
     quote_span = _quote_character_span(text, quote)
+    aligned_quote = quote
+
+    def is_brief_acknowledgment(match: re.Match[str]) -> bool:
+        return tuple(_toks(match.group(0))) in {
+            ("brilliant",),
+            ("cool",),
+            ("fun", "fact"),
+            ("hey",),
+        }
+
     if want == "start":
         edge_matches = [
             match
@@ -1323,6 +1400,17 @@ def _mixed_edge_required_speech_time(
             and len(_toks(text[:match.start()])) <= 5
             and _WORD_RE.search(text[match.end():])
         ]
+        if (
+            edge_matches
+            and all(is_brief_acknowledgment(match) for match in edge_matches)
+            and quote_span is not None
+        ):
+            filler_end = max(match.end() for match in edge_matches)
+            if quote_span[0] < filler_end < quote_span[1]:
+                teaching_start = _WORD_RE.search(text, filler_end)
+                if teaching_start is not None:
+                    quote_span = (teaching_start.start(), quote_span[1])
+                    aligned_quote = text[quote_span[0]:quote_span[1]].strip()
         aligned = bool(
             edge_matches
             and quote_span is not None
@@ -1335,6 +1423,20 @@ def _mixed_edge_required_speech_time(
             if _WORD_RE.search(text[:match.start()])
             and not _WORD_RE.search(text[match.end():])
         ]
+        if (
+            edge_matches
+            and all(is_brief_acknowledgment(match) for match in edge_matches)
+            and quote_span is not None
+        ):
+            filler_start = min(match.start() for match in edge_matches)
+            if quote_span[0] < filler_start < quote_span[1]:
+                teaching_words = [
+                    match
+                    for match in _WORD_RE.finditer(text, quote_span[0], filler_start)
+                ]
+                if teaching_words:
+                    quote_span = (quote_span[0], teaching_words[-1].end())
+                    aligned_quote = text[quote_span[0]:quote_span[1]].strip()
         aligned = bool(
             edge_matches
             and quote_span is not None
@@ -1347,7 +1449,7 @@ def _mixed_edge_required_speech_time(
 
     start = float(segment.get("start") or 0.0)
     end = float(segment.get("end") or start)
-    located = _locate_quote(words, quote, start, end, want)
+    located = _locate_quote(words, aligned_quote, start, end, want)
     if located is not None:
         return True, located
 

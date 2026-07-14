@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 SEGMENT_CACHE_VERSION = 5
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v4"
+SELECTION_CONTRACT_VERSION = "quality_silence_v5"
 
 
 def _canonical_json(value: Any) -> str:
@@ -28,6 +28,12 @@ def _canonical_json(value: Any) -> str:
 
 def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     fine_snap = settings.get("segment_fine_snap")
+    knowledge_level = (
+        settings.get("_knowledge_level")
+        or settings.get("knowledge_level")
+        or settings.get("learner_level")
+        or ""
+    )
     return {
         "fine_snap": (
             bool(pipeline_config.SEGMENT_FINE_SNAP)
@@ -35,6 +41,7 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
             else bool(fine_snap)
         ),
         "language": " ".join(str(settings.get("language") or "en").split()).lower(),
+        "knowledge_level": " ".join(str(knowledge_level).split()).lower(),
     }
 
 

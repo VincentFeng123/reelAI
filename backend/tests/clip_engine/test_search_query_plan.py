@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -801,6 +804,39 @@ def test_loaded_semantic_backend_fails_closed_instead_of_returning_hash_vectors(
 
     with pytest.raises(RuntimeError, match="Semantic embedding inference failed"):
         embedding._embed_local(["calculus"])
+
+
+def test_semantic_model_inference_is_serialized_across_source_workers() -> None:
+    class ConcurrencyDetectingModel:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+            self.lock = threading.Lock()
+
+        def encode(self, texts, **_kwargs):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            time.sleep(0.04)
+            with self.lock:
+                self.active -= 1
+            return np.ones((len(texts), 384), dtype=np.float32)
+
+    model = ConcurrencyDetectingModel()
+    embedding = object.__new__(embeddings_module.EmbeddingService)
+    embedding._semantic_model = model
+    embedding.dim = 384
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                embedding.embed_semantic,
+                (["photosynthesis"], ["cellular respiration"]),
+            )
+        )
+
+    assert all(result is not None for result in results)
+    assert model.max_active == 1
 
 
 def test_failed_semantic_model_load_reports_hash_backend_without_semantic_proof(monkeypatch) -> None:

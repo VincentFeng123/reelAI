@@ -189,6 +189,55 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         )
         self._assert_persisted_tail(result.reels[0].reel_id)
 
+    def test_direct_adapter_rejects_acoustic_crossing_next_unselected_cue(self) -> None:
+        engine_out = _media_tail_engine_out()
+        engine_out["transcript"]["segments"].append(
+            {
+                "cue_id": "next-cue",
+                "start": 10.0,
+                "end": 20.0,
+                "text": "A sponsor and unrelated lesson begin here.",
+            }
+        )
+        engine_out["transcript"]["duration"] = 20.0
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/crossing",
+                format_id="140",
+                duration_sec=20.0,
+            ),
+        )
+        verify = mock.Mock(
+            return_value=pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                "verified",
+                0.0,
+                12.0,
+                {"threshold_dbfs": -38.0},
+            )
+        )
+
+        with (
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "prepare_audio_source",
+                return_value=prepared,
+            ),
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "verify_acoustic_boundaries",
+                verify,
+            ),
+        ):
+            clips = pipeline_module._verified_direct_adapter_clips(
+                source_url=SOURCE_URL,
+                engine_out=engine_out,
+                should_cancel=None,
+            )
+
+        self.assertEqual(clips, [])
+        self.assertEqual(verify.call_args.kwargs["search_end_limit_sec"], 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()

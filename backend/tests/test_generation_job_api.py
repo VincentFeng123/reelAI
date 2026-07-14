@@ -12,10 +12,12 @@ import pytest
 
 from backend.app import db
 from backend.app import main
+from backend.app.clip_engine import segment_cache
 from backend.app.clip_engine.errors import ProviderQuotaError, ProviderTransientError
 from backend.app.models import ReelOut, ReelsGenerateRequest
 from backend.app.ingestion.models import IngestRequest
 from backend.app.services import generation_jobs
+from backend.app.services.reels import ReelService
 
 
 def test_generate_request_supports_full_material_inventory() -> None:
@@ -23,6 +25,15 @@ def test_generate_request_supports_full_material_inventory() -> None:
     assert ReelsGenerateRequest(material_id="m1", num_reels=300).num_reels == 300
     with pytest.raises(ValueError):
         ReelsGenerateRequest(material_id="m1", num_reels=301)
+
+
+def test_current_quality_contract_versions_stay_synchronized() -> None:
+    assert {
+        main.SELECTION_CONTRACT_VERSION,
+        generation_jobs.REQUEST_SCHEMA_VERSION,
+        segment_cache.SELECTION_CONTRACT_VERSION,
+        ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
+    } == {"quality_silence_v5"}
 
 
 def test_reel_response_schema_retains_v3_source_and_selector_metadata() -> None:
@@ -108,7 +119,8 @@ def _insert_generation_reel(
             json.dumps({
                 "surface_eligible": True,
                 "boundary_status": "verified",
-                "selection_contract_version": "quality_silence_v4",
+                "selection_contract_version": "quality_silence_v5",
+                "speech_corridor_verified": True,
                 "directly_teaches_topic": True,
                 "substantive": True,
                 "factually_grounded": True,
@@ -136,7 +148,7 @@ def _insert_generation_reel(
         "video_id": video_id,
         "t_start": 0.0,
         "t_end": 30.0,
-        "selection_contract_version": "quality_silence_v4",
+        "selection_contract_version": "quality_silence_v5",
     }
 
 
@@ -159,12 +171,13 @@ def _set_reel_boundary_state(
             json.dumps({
                 "surface_eligible": surface_eligible,
                 "boundary_status": boundary_status,
+                "speech_corridor_verified": True,
                 "boundary_diagnostics": {
                     "method": "energy_silence",
                     "acoustic_verified": verified,
                     "acoustic": ({"threshold_dbfs": -38.0} if verified else {}),
                 },
-                "selection_contract_version": "quality_silence_v4",
+                "selection_contract_version": "quality_silence_v5",
                 "directly_teaches_topic": True,
                 "substantive": True,
                 "factually_grounded": True,
@@ -235,7 +248,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
             "takeaways": [],
             "score": 0.93,
             "relevance_score": 0.13,
-            "_selection_contract_version": "quality_silence_v4",
+            "_selection_contract_version": "quality_silence_v5",
             "_selection_topic_relevance": 0.93,
             "_selection_source_rank": 0,
         }],
@@ -257,7 +270,7 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
 
         assert len(reels) == 1
         assert reels[0]["video_id"] == "AbCdEf12345"
-        assert reels[0]["selection_contract_version"] == "quality_silence_v4"
+        assert reels[0]["selection_contract_version"] == "quality_silence_v5"
         assert reels[0]["relevance_score"] == 0.13
         assert reels[0]["topic_relevance"] == 0.93
         assert not any(key.startswith("_selection_") for key in reels[0])
@@ -265,21 +278,21 @@ def test_generation_job_reels_promote_internal_current_metadata_and_source(
         conn.close()
 
 
-def test_generation_job_reels_reject_stale_v3_inventory(monkeypatch) -> None:
+def test_generation_job_reels_reject_stale_v4_inventory(monkeypatch) -> None:
     conn = _conn()
     monkeypatch.setattr(
         main,
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{
-            "reel_id": "stale-v3-reel",
-            "selection_contract_version": "quality_silence_v3",
+            "reel_id": "stale-v4-reel",
+            "selection_contract_version": "quality_silence_v4",
         }],
     )
     try:
         assert main._generation_job_reels(
             conn,
             {
-                "result_generation_id": "stale-v3-generation",
+                "result_generation_id": "stale-v4-generation",
                 "material_id": "m1",
                 "concept_id": "c1",
                 "learner_id": "learner-1",
@@ -638,7 +651,8 @@ def test_generation_worker_propagates_the_full_source_generation_chain(
                 json.dumps({
                         "surface_eligible": True,
                         "boundary_status": "verified",
-                        "selection_contract_version": "quality_silence_v4",
+                        "selection_contract_version": "quality_silence_v5",
+                        "speech_corridor_verified": True,
                         "directly_teaches_topic": True,
                         "substantive": True,
                         "factually_grounded": True,
@@ -1027,7 +1041,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
                 "video_id": f"{mode}-video-{index % expected_source_cap}",
                 "t_start": float(index * 10),
                 "t_end": float(index * 10 + 8),
-                "selection_contract_version": "quality_silence_v4",
+                "selection_contract_version": "quality_silence_v5",
             }
             kwargs["on_reel_created"](reel)
         generated_count += int(kwargs["max_new_reels"])
@@ -1044,7 +1058,7 @@ def test_generation_mode_uses_one_deep_stage_and_mode_caps(
         lambda *_args, **_kwargs: [
             {
                 "reel_id": f"{mode}-reel-{index}",
-                "selection_contract_version": "quality_silence_v4",
+                "selection_contract_version": "quality_silence_v5",
             }
             for index in range(expected_reel_cap)
         ],
@@ -1424,7 +1438,7 @@ def test_generation_stream_replays_monotonic_persisted_events(monkeypatch) -> No
         payload={
             "reel": {
                 "reel_id": "provisional",
-                "selection_contract_version": "quality_silence_v4",
+                "selection_contract_version": "quality_silence_v5",
             },
             "provisional": True,
         },
@@ -1499,7 +1513,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": "streamed-video",
                 "t_start": 10.0,
                 "t_end": 40.0,
-                "selection_contract_version": "quality_silence_v4",
+                "selection_contract_version": "quality_silence_v5",
             },
             "provisional": True,
         },
@@ -1524,7 +1538,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
         "_ranked_request_reels",
         lambda *_args, **_kwargs: [{
             "reel_id": "ranked-reel",
-            "selection_contract_version": "quality_silence_v4",
+            "selection_contract_version": "quality_silence_v5",
         }],
     )
     monkeypatch.setattr(
@@ -1585,7 +1599,7 @@ def test_authoritative_job_inventory_drops_candidates_absent_from_final_rank(mon
                 "video_id": f"ranked-video-{index}",
                 "t_start": float(index * 30),
                 "t_end": float(index * 30 + 20),
-                "selection_contract_version": "quality_silence_v4",
+                "selection_contract_version": "quality_silence_v5",
             }
             for index in range(4)
         ],
@@ -2122,7 +2136,7 @@ def test_cross_request_reuse_skips_newer_invalid_chain_for_older_valid_chain() -
         conn.close()
 
 
-def test_v4_feed_merges_value_ranked_batches_without_breaking_batch_topology(
+def test_v5_feed_merges_value_ranked_batches_without_breaking_batch_topology(
     monkeypatch,
 ) -> None:
     conn = _conn()
@@ -2164,7 +2178,7 @@ def test_v4_feed_merges_value_ranked_batches_without_breaking_batch_topology(
             "_selection_topic_relevance": relevance,
             "_selection_source_rank": source_rank,
             "_selection_ordered": True,
-            "selection_contract_version": "quality_silence_v4",
+            "selection_contract_version": "quality_silence_v5",
         }
 
     root_reels = [
@@ -2436,7 +2450,7 @@ def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v4",
+                "selection_contract_version": "quality_silence_v5",
             }
         ],
     )
@@ -2462,7 +2476,7 @@ def test_generate_slow_reservoir_immediately_satisfies_fast_without_queuing(
             {
                 "reel_id": "verified-concept-reel",
                 "video_id": "verified-concept-video-0",
-                "selection_contract_version": "quality_silence_v4",
+                "selection_contract_version": "quality_silence_v5",
             }
         ]
         assert conn.execute(

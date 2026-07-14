@@ -117,7 +117,8 @@ INGEST_TOPIC_VIDEO_TIMEOUT_SEC = float(os.environ.get("INGEST_TOPIC_VIDEO_TIMEOU
 INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC = float(
     os.environ.get("INGEST_TOPIC_BOOTSTRAP_TIMEOUT_SEC", "45")
 )
-SEMANTIC_SECTION_RESET_GAP_SEC = 8.0
+PARTIAL_CUE_MATERIALITY_SEC = 0.05
+SPEECH_OWNERSHIP_EPSILON_SEC = 0.001
 EXACT_TOPIC_SEMANTIC_MIN = 0.20
 EXACT_TOPIC_LITERAL_SOURCE_SEMANTIC_MIN = 0.12
 EXACT_TOPIC_REJECTION_REASON = "uncorroborated_exact_topic"
@@ -345,13 +346,42 @@ def _required_speech_bounds(
     )
 
 
-def _semantic_section_search_limits(
+def _selected_caption_cues(
+    transcript: dict[str, Any], raw_clip: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Snapshot the exact selected cues so later transcript refreshes cannot drift."""
+    cue_ids = [
+        str(cue_id or "").strip()
+        for cue_id in (raw_clip.get("cue_ids") or [])
+        if str(cue_id or "").strip()
+    ]
+    segments_by_id = {
+        str(segment.get("cue_id") or "").strip(): segment
+        for segment in (transcript.get("segments") or [])
+        if isinstance(segment, dict) and str(segment.get("cue_id") or "").strip()
+    }
+    if not cue_ids or any(cue_id not in segments_by_id for cue_id in cue_ids):
+        return []
+    return [
+        {
+            "cue_id": cue_id,
+            "start": float(segments_by_id[cue_id]["start"]),
+            "end": float(segments_by_id[cue_id]["end"]),
+            "text": str(segments_by_id[cue_id].get("text") or ""),
+            "lang": str(segments_by_id[cue_id].get("lang") or ""),
+        }
+        for cue_id in cue_ids
+    ]
+
+
+def _selected_speech_corridor(
     transcript: dict[str, Any],
     raw_clip: dict[str, Any],
+    caption_diagnostics: dict[str, Any],
     *,
     source_end_sec: float | None = None,
-) -> tuple[float, float]:
-    """Bound silence search to the candidate's enclosing transcript section."""
+) -> tuple[float, float, str | None]:
+    """Keep acoustic padding inside the selected cues' speech-free corridor."""
     segments = [
         segment
         for segment in list(transcript.get("segments") or [])
@@ -372,7 +402,7 @@ def _semantic_section_search_limits(
     if math.isfinite(candidate_source_end) and candidate_source_end >= transcript_end:
         source_end = candidate_source_end
     if not segments:
-        return 0.0, source_end
+        return 0.0, source_end, "selected_cue_range_unavailable"
 
     selected_ids = {
         str(cue_id)
@@ -385,37 +415,54 @@ def _semantic_section_search_limits(
         if str(segment.get("cue_id") or f"cue-{index}") in selected_ids
     ]
     if not selected_indices:
-        start_sec = float(raw_clip.get("start") or 0.0)
-        end_sec = float(raw_clip.get("end") or start_sec)
-        selected_indices = [
-            index
-            for index, segment in enumerate(segments)
-            if (
-                float(segment.get("end") or 0.0) > start_sec
-                and float(segment.get("start") or 0.0) < end_sec
-            )
-        ]
-    if not selected_indices:
-        return 0.0, source_end
+        return 0.0, source_end, "selected_cue_range_unavailable"
 
     first_index = min(selected_indices)
     last_index = max(selected_indices)
-    start_limit = 0.0
-    for index in range(first_index, 0, -1):
-        previous_end = float(segments[index - 1].get("end") or 0.0)
-        current_start = float(segments[index].get("start") or previous_end)
-        if current_start - previous_end >= SEMANTIC_SECTION_RESET_GAP_SEC:
-            start_limit = max(0.0, previous_end)
-            break
+    if selected_indices != list(range(first_index, last_index + 1)):
+        return 0.0, source_end, "selected_cue_range_unavailable"
 
-    end_limit = source_end
-    for index in range(last_index, len(segments) - 1):
-        current_end = float(segments[index].get("end") or 0.0)
-        next_start = float(segments[index + 1].get("start") or current_end)
-        if next_start - current_end >= SEMANTIC_SECTION_RESET_GAP_SEC:
-            end_limit = min(source_end, next_start)
-            break
-    return start_limit, end_limit
+    first_start = float(segments[first_index].get("start") or 0.0)
+    last_end = float(segments[last_index].get("end") or first_start)
+    required_start, required_end = _required_speech_bounds(
+        raw_clip, caption_diagnostics
+    )
+    if (
+        required_start > first_start + PARTIAL_CUE_MATERIALITY_SEC
+        or required_end < last_end - PARTIAL_CUE_MATERIALITY_SEC
+    ):
+        return 0.0, source_end, "partial_cue_edge_requires_projection"
+
+    start_limit = (
+        0.0
+        if first_index == 0
+        else float(segments[first_index - 1].get("end") or 0.0)
+    )
+    end_limit = (
+        source_end
+        if last_index + 1 >= len(segments)
+        else float(segments[last_index + 1].get("start") or last_end)
+    )
+    if (
+        start_limit > required_start + SPEECH_OWNERSHIP_EPSILON_SEC
+        or end_limit + SPEECH_OWNERSHIP_EPSILON_SEC < required_end
+    ):
+        return start_limit, end_limit, "unselected_speech_overlaps_required_range"
+    return max(0.0, start_limit), min(source_end, end_limit), None
+
+
+def _acoustic_exits_selected_speech_corridor(
+    *,
+    start_sec: float,
+    end_sec: float,
+    search_start_limit_sec: float,
+    search_end_limit_sec: float,
+) -> bool:
+    """Defense in depth for mocked or provider-returned out-of-corridor cuts."""
+    return bool(
+        start_sec < search_start_limit_sec - SPEECH_OWNERSHIP_EPSILON_SEC
+        or end_sec > search_end_limit_sec + SPEECH_OWNERSHIP_EPSILON_SEC
+    )
 
 
 def _prepared_media_end_sec(
@@ -557,20 +604,44 @@ def _verified_direct_adapter_clips(
         if diagnostics is None:
             return diagnostics, None
         start_sec, end_sec = _required_speech_bounds(raw_clip, diagnostics)
-        search_start_limit, search_end_limit = _semantic_section_search_limits(
+        search_start_limit, search_end_limit, corridor_error = _selected_speech_corridor(
             transcript,
             raw_clip,
+            diagnostics,
             source_end_sec=media_end,
         )
+        if corridor_error:
+            return diagnostics, clip_engine_silence.SilenceVerificationResult(
+                "unavailable",
+                start_sec,
+                end_sec,
+                {"stage": "semantic_corridor", "reason": corridor_error},
+            )
         acoustic = clip_engine_silence.verify_acoustic_boundaries(
             source_url,
             start_sec,
             end_sec,
             search_start_limit_sec=search_start_limit,
-            search_end_limit_sec=max(end_sec, search_end_limit),
+            search_end_limit_sec=search_end_limit,
             prepared=prepared,
             cancel_check=should_cancel,
         )
+        if acoustic.verified and _acoustic_exits_selected_speech_corridor(
+            start_sec=float(acoustic.start_sec),
+            end_sec=float(acoustic.end_sec),
+            search_start_limit_sec=search_start_limit,
+            search_end_limit_sec=search_end_limit,
+        ):
+            return diagnostics, clip_engine_silence.SilenceVerificationResult(
+                "unavailable",
+                acoustic.start_sec,
+                acoustic.end_sec,
+                {
+                    **dict(acoustic.diagnostics or {}),
+                    "stage": "semantic_corridor",
+                    "reason": "acoustic_crossed_unselected_speech",
+                },
+            )
         return diagnostics, acoustic
 
     with ThreadPoolExecutor(
@@ -594,8 +665,10 @@ def _verified_direct_adapter_clips(
             and math.isfinite(acoustic.end_sec)
             and acoustic.start_sec >= 0.0
             and acoustic.end_sec > acoustic.start_sec
-            and acoustic.start_sec <= required_first_speech + 0.05
-            and acoustic.end_sec + 0.05 >= required_last_speech
+            and acoustic.start_sec
+            <= required_first_speech + SPEECH_OWNERSHIP_EPSILON_SEC
+            and acoustic.end_sec + SPEECH_OWNERSHIP_EPSILON_SEC
+            >= required_last_speech
             and acoustic.end_sec <= media_end + 1e-3
         ):
             continue
@@ -617,7 +690,7 @@ def _verified_direct_adapter_clips(
         ) / 3.0
         search_context = dict(clip.get("search_context") or {})
         search_context.update(
-            selection_contract_version="quality_silence_v4",
+            selection_contract_version="quality_silence_v5",
             content_score=topic_relevance,
             quality_floor=quality_floor,
             quality_mean=quality_mean,
@@ -629,6 +702,11 @@ def _verified_direct_adapter_clips(
             factually_grounded=True,
             self_contained=True,
             is_standalone=True,
+            speech_corridor_verified=True,
+            transcript_artifact_key=str(
+                transcript.get("artifact_key") or ""
+            ).strip(),
+            selection_caption_cues=_selected_caption_cues(transcript, clip),
             boundary_confidence=float(
                 clip.get("boundary_confidence") or 0.0
             ),
@@ -1884,11 +1962,22 @@ class IngestionPipeline:
                 required_start, required_end = _required_speech_bounds(
                     raw_clip, caption
                 )
-                search_start_limit, search_end_limit = _semantic_section_search_limits(
+                search_start_limit, search_end_limit, corridor_error = _selected_speech_corridor(
                     engine_out["transcript"],
                     raw_clip,
+                    caption,
                     source_end_sec=media_end,
                 )
+                if corridor_error:
+                    return caption, clip_engine_silence.SilenceVerificationResult(
+                        "unavailable",
+                        required_start,
+                        required_end,
+                        {
+                            "stage": "semantic_corridor",
+                            "reason": corridor_error,
+                        },
+                    )
                 remaining = acoustic_phase_deadline_for(v) - time.monotonic()
                 if remaining <= 0:
                     return caption, clip_engine_silence.SilenceVerificationResult(
@@ -1897,16 +1986,33 @@ class IngestionPipeline:
                         required_end,
                         {"stage": "verify", "reason": "deadline_exceeded"},
                     )
-                return caption, clip_engine_silence.verify_acoustic_boundaries(
+                acoustic = clip_engine_silence.verify_acoustic_boundaries(
                     str(v.get("url") or v.get("id") or ""),
                     required_start,
                     required_end,
                     search_start_limit_sec=search_start_limit,
-                    search_end_limit_sec=max(required_end, search_end_limit),
+                    search_end_limit_sec=search_end_limit,
                     prepared=prepared_audio,
                     timeout_sec=remaining,
                     cancel_check=should_cancel,
                 )
+                if acoustic.verified and _acoustic_exits_selected_speech_corridor(
+                    start_sec=float(acoustic.start_sec),
+                    end_sec=float(acoustic.end_sec),
+                    search_start_limit_sec=search_start_limit,
+                    search_end_limit_sec=search_end_limit,
+                ):
+                    return caption, clip_engine_silence.SilenceVerificationResult(
+                        "unavailable",
+                        acoustic.start_sec,
+                        acoustic.end_sec,
+                        {
+                            **dict(acoustic.diagnostics or {}),
+                            "stage": "semantic_corridor",
+                            "reason": "acoustic_crossed_unselected_speech",
+                        },
+                    )
+                return caption, acoustic
 
             def boundary_results():
                 if generation_context is None or not candidate_clips:
@@ -1973,8 +2079,10 @@ class IngestionPipeline:
                             and math.isfinite(acoustic.end_sec)
                             and acoustic.start_sec >= 0.0
                             and acoustic.end_sec > acoustic.start_sec
-                            and acoustic.start_sec <= first_start + 0.05
-                            and acoustic.end_sec + 0.05 >= last_end
+                            and acoustic.start_sec
+                            <= first_start + SPEECH_OWNERSHIP_EPSILON_SEC
+                            and acoustic.end_sec + SPEECH_OWNERSHIP_EPSILON_SEC
+                            >= last_end
                             and acoustic.end_sec <= media_end + 1e-3
                         )
                         boundary_diagnostics = {
@@ -2001,6 +2109,7 @@ class IngestionPipeline:
                             clip["start"] = round(float(acoustic.start_sec), 3)
                             clip["end"] = round(float(acoustic.end_sec), 3)
                             search_context["boundary_status"] = "verified"
+                            search_context["speech_corridor_verified"] = True
                     else:
                         search_context["boundary_status"] = "caption_aligned"
                         search_context["boundary_diagnostics"] = caption_diagnostics
@@ -2515,6 +2624,12 @@ class IngestionPipeline:
                 "factually_grounded": bool(clip.get("factually_grounded")),
                 "self_contained": bool(clip.get("self_contained")),
                 "topic_evidence_quote": grounded_evidence_quote,
+                "transcript_artifact_key": str(
+                    engine_out["transcript"].get("artifact_key") or ""
+                ).strip(),
+                "selection_caption_cues": _selected_caption_cues(
+                    engine_out["transcript"], clip
+                ),
                 "surface_eligible": True,
                 "deferred_level": not difficulty_matches_knowledge_level(
                     difficulty,
@@ -2561,7 +2676,7 @@ class IngestionPipeline:
                 clip["prerequisite_ids"] = namespaced_prerequisites
                 clip["chain_id"] = chain_id
                 search_context.update(
-                    selection_contract_version="quality_silence_v4",
+                    selection_contract_version="quality_silence_v5",
                     content_score=content_score,
                     quality_floor=quality_floor,
                     quality_mean=quality_mean,

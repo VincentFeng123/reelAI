@@ -70,7 +70,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v4:v5:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v5:v5:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -102,8 +102,11 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
         {"segment_enrich_clips": False},
     )
     assert _key(transcript, {"_segment_routing_mode": "flash_only"}) == baseline
-    assert _key(transcript, {"_knowledge_level": "beginner"}) == _key(
+    assert _key(transcript, {"_knowledge_level": "beginner"}) != _key(
         transcript, {"_knowledge_level": "advanced"},
+    )
+    assert _key(transcript, {"_knowledge_level": " Beginner "}) == _key(
+        transcript, {"_knowledge_level": "beginner"},
     )
 
     monkeypatch.setattr(segment_cache.pipeline_config, "SEGMENT_FLASH_MODEL", "new-model")

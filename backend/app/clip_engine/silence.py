@@ -740,6 +740,7 @@ def _search_quiet(
     required_boundary: float,
     search_start_limit: float,
     search_end_limit: float,
+    allow_source_edge: bool = False,
     temp_dir: Path,
     ffmpeg_bin: str,
     deadline: float,
@@ -805,8 +806,7 @@ def _search_quiet(
             else _pick_end_interval(
                 intervals,
                 required_boundary,
-                allow_source_edge=abs(required_boundary - search_end_limit)
-                <= _FRAME_SEC + 1e-9,
+                allow_source_edge=allow_source_edge,
             )
         )
         if quiet is not None:
@@ -958,6 +958,12 @@ def verify_acoustic_boundaries(
             and source_duration >= original_end
         ):
             search_end_limit = min(search_end_limit, source_duration)
+        end_is_physical_source_edge = bool(
+            source_duration is not None
+            and math.isfinite(source_duration)
+            and abs(original_end - source_duration) <= _FRAME_SEC + 1e-9
+            and abs(search_end_limit - source_duration) <= _FRAME_SEC + 1e-9
+        )
 
         with tempfile.TemporaryDirectory(prefix="reelai_silence_") as temp_dir:
             edge_temp_dir = Path(temp_dir)
@@ -982,6 +988,7 @@ def verify_acoustic_boundaries(
                         required_boundary=original_end,
                         search_start_limit=search_start_limit,
                         search_end_limit=search_end_limit,
+                        allow_source_edge=end_is_physical_source_edge,
                         temp_dir=edge_temp_dir,
                         ffmpeg_bin=ffmpeg_bin,
                         deadline=deadline,
@@ -1033,7 +1040,7 @@ def verify_acoustic_boundaries(
                 ),
             )
             end_is_verified_source_edge = bool(
-                abs(original_end - search_end_limit) <= _FRAME_SEC + 1e-9
+                end_is_physical_source_edge
                 and abs(end_quiet.end_sec - search_end_limit)
                 <= _FRAME_SEC + 1e-9
             )
