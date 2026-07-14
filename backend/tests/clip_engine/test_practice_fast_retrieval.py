@@ -463,7 +463,7 @@ def test_long_topic_deep_searches_only_bounded_ai_queries(monkeypatch):
 
     expanded = "cell biology information flow and homeostasis"
     expected = [topic, f"{topic} explained tutorial", expanded]
-    assert search_calls == [expected]
+    assert search_calls == [[topic], expected[1:]]
     assert expansion_calls == [(topic, 3)]
     assert result["queries"] == expected
     assert result["topic_terms"] == [topic]
@@ -531,9 +531,9 @@ def test_deep_search_runs_only_ai_queries_without_broadening_selection(monkeypat
         retrieval_profile="deep",
     )
 
-    assert calls == [([topic, "chain rule derivative example"], 2)]
+    assert calls == [([topic], 1), (["chain rule derivative example"], 1)]
     assert expansion_calls == [(topic, 3, None)]
-    assert result["queries"] == calls[0][0]
+    assert result["queries"] == [topic, "chain rule derivative example"]
     assert result["topic_terms"] == [topic]
 
 
@@ -586,7 +586,7 @@ def test_deep_source_ranking_does_not_filter_by_learner_level(monkeypatch):
     assert [video["id"] for video in result["videos"]] == ["topic-source"]
 
 
-def test_deep_search_uses_ai_acronym_expansion_as_its_only_search_stage(monkeypatch):
+def test_deep_search_uses_ai_acronym_expansion_only_after_literal_is_sparse(monkeypatch):
     topic = "NLP attention mechanism"
     calls = []
     expansion_calls = []
@@ -629,7 +629,10 @@ def test_deep_search_uses_ai_acronym_expansion_as_its_only_search_stage(monkeypa
         retrieval_profile="deep",
     )
 
-    assert calls == [["natural language processing attention mechanism"]]
+    assert calls == [
+        [topic],
+        ["natural language processing attention mechanism"],
+    ]
     assert expansion_calls == [(topic, 3)]
     assert "direct" in [video["id"] for video in result["videos"]]
 
@@ -914,16 +917,16 @@ def test_discover_practice_fast_threads_runtime_args_and_applies_exclude_top_n(m
 
     def fake_search_all(queries, filters=None, **kwargs):
         seen.append({"queries": list(queries), "filters": filters, **kwargs})
-        assert list(queries) == ["Calculus", "Derivatives", "Limits"]
+        videos_by_query = {
+            "calclus": [{"id": "excluded", "viewCount": 10_000}],
+            "Derivatives": [{"id": "keep", "viewCount": 10}],
+        }
         return {
             "per_query": [
-                {"query": "Calculus", "videos": [
-                    {"id": "excluded", "viewCount": 10_000},
-                ]},
-                {"query": "Derivatives", "videos": [{"id": "keep", "viewCount": 10}]},
-                {"query": "Limits", "videos": []},
+                {"query": query, "videos": videos_by_query.get(query, [])}
+                for query in queries
             ],
-            "credits_used": 3,
+            "credits_used": len(queries),
             "warning": None,
         }
 
@@ -948,21 +951,30 @@ def test_discover_practice_fast_threads_runtime_args_and_applies_exclude_top_n(m
     assert result["corrected"] == "Calculus"
     assert [video["id"] for video in result["videos"]] == ["keep"]
     assert result["credits_used"] == 3
-    assert seen[0].pop("should_cancel") is cancel_probe
-    assert seen[0].pop("parallel_prefix") == 3
-    assert seen[0] == {
-        "queries": ["Calculus", "Derivatives", "Limits"],
-        "filters": {"duration": "medium"},
-        "language": "es",
-        "context": context,
-        "cache_store": cache,
-    }
+    assert [call.pop("should_cancel") for call in seen] == [cancel_probe, cancel_probe]
+    assert [call.pop("parallel_prefix") for call in seen] == [1, 2]
+    assert seen == [
+        {
+            "queries": ["calclus"],
+            "filters": {"duration": "medium"},
+            "language": "es",
+            "context": context,
+            "cache_store": cache,
+        },
+        {
+            "queries": ["Calculus", "Derivatives"],
+            "filters": {"duration": "medium"},
+            "language": "es",
+            "context": context,
+            "cache_store": cache,
+        },
+    ]
 
 
 def test_discover_practice_fast_limits_ai_queries_to_remaining_search_budget(monkeypatch):
     context = GenerationContext("fast")
     context.reserve("search")
-    seen = {}
+    seen = {"queries": []}
 
     def fake_expand(topic, n, **kwargs):
         seen["n"] = n
@@ -975,7 +987,7 @@ def test_discover_practice_fast_limits_ai_queries_to_remaining_search_budget(mon
     monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
 
     def fake_search_all(queries, filters=None, **kwargs):
-        seen["queries"] = list(queries)
+        seen["queries"].append(list(queries))
         return {
             "per_query": [], "credits_used": 0, "warning": None,
         }
@@ -985,7 +997,7 @@ def test_discover_practice_fast_limits_ai_queries_to_remaining_search_budget(mon
     search.discover_practice_fast("physics", limit=1, breadth=8, context=context)
 
     assert seen["n"] == 3
-    assert seen["queries"] == ["physics", "physics explained"]
+    assert seen["queries"] == [["physics"], ["physics explained"]]
 
 
 def test_discover_practice_fast_caps_ai_search_to_three_queries(monkeypatch):
@@ -1013,7 +1025,12 @@ def test_discover_practice_fast_caps_ai_search_to_three_queries(monkeypatch):
     assert seen["n"] == 3
 
 
-def test_discover_practice_fast_always_expands_before_one_search_stage(monkeypatch):
+@pytest.mark.parametrize(("mode", "source_count"), [("fast", 2), ("slow", 3)])
+def test_literal_sufficient_retrieval_skips_expansion_and_follow_up(
+    monkeypatch,
+    mode,
+    source_count,
+):
     calls = []
 
     def fake_search_all(queries, filters=None, **kwargs):
@@ -1021,15 +1038,14 @@ def test_discover_practice_fast_always_expands_before_one_search_stage(monkeypat
         return {
             "per_query": [
                 {
-                    "query": "physics",
+                    "query": queries[0],
                     "videos": [
                         {"id": f"video-{index}", "title": "Physics lecture", "viewCount": 10}
-                        for index in range(4)
+                        for index in range(source_count)
                     ],
                 },
-                {"query": "physics explained tutorial", "videos": []},
             ],
-            "credits_used": 2,
+            "credits_used": 1,
             "warning": None,
         }
 
@@ -1046,13 +1062,83 @@ def test_discover_practice_fast_always_expands_before_one_search_stage(monkeypat
     monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
     monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
 
-    result = search.discover_practice_fast("physics", limit=4, breadth=3)
+    result = search.discover_practice_fast(
+        "physics",
+        limit=source_count * 2,
+        breadth=8,
+        context=GenerationContext(mode),
+    )
 
-    assert calls == [["physics", "physics explained tutorial"]]
-    assert expansion_calls == [("physics", 3)]
-    assert result["provider_used"] == "gemini"
-    assert len(result["videos"]) == 4
+    assert calls == [["physics"]]
+    assert expansion_calls == []
+    assert result["provider_used"] == "literal_fallback"
+    assert len(result["videos"]) == source_count
     assert all(video["retrieval_score"] >= 0.60 for video in result["videos"])
+
+
+@pytest.mark.parametrize(
+    ("mode", "source_budget", "expected_follow_up"),
+    [
+        ("fast", 2, ["physics mechanics"]),
+        ("slow", 3, ["physics mechanics", "physics waves"]),
+    ],
+)
+def test_sparse_deep_retrieval_runs_one_expansion_and_one_follow_up(
+    monkeypatch,
+    mode,
+    source_budget,
+    expected_follow_up,
+):
+    topic = "physics"
+    search_calls = []
+    expansion_calls = []
+
+    def fake_search_all(queries, filters=None, **_kwargs):
+        search_calls.append(list(queries))
+        return {
+            "per_query": [
+                {
+                    "query": query,
+                    "videos": [
+                        {
+                            "id": f"video-{len(search_calls)}-{index}",
+                            "title": "Physics lesson",
+                        }
+                    ],
+                }
+                for index, query in enumerate(queries)
+            ],
+            "credits_used": len(queries),
+            "warning": None,
+        }
+
+    def fake_expand(expansion_topic, n, **kwargs):
+        expansion_calls.append((expansion_topic, n, kwargs.get("level")))
+        return {
+            "corrected": expansion_topic,
+            "queries": [
+                expansion_topic,
+                "physics mechanics",
+                "physics waves",
+            ],
+            "provider_used": "gemini",
+        }
+
+    monkeypatch.setattr(search.supadata_search, "search_all", fake_search_all)
+    monkeypatch.setattr(search.expand, "expand_query_practice_fast", fake_expand)
+
+    result = search.discover_practice_fast(
+        topic,
+        limit=source_budget * 2,
+        breadth=8,
+        context=GenerationContext(mode),
+        retrieval_profile="deep",
+    )
+
+    assert search_calls == [[topic], expected_follow_up]
+    assert expansion_calls == [(topic, 3, None)]
+    assert result["queries"] == [topic, *expected_follow_up]
+    assert result["topic_terms"] == [topic]
 
 
 @pytest.mark.parametrize(
@@ -1106,7 +1192,11 @@ def test_discovery_oversampling_puts_ai_diversity_in_analysis_prefix(
             "warning": None,
         },
     )
-    monkeypatch.setattr(search.rank, "merge_and_rank", lambda *_args, **_kwargs: ranked)
+    monkeypatch.setattr(
+        search.rank,
+        "merge_and_rank",
+        lambda result_sets, **_kwargs: ranked if len(result_sets) > 1 else ranked[:1],
+    )
 
     result = search.discover_practice_fast(
         "physics",

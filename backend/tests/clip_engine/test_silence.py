@@ -199,6 +199,61 @@ def test_caption_handoff_never_skips_sound_before_a_late_start_quiet_run(
     assert result.diagnostics["reason"] == "start_silence_not_found"
 
 
+@pytest.mark.parametrize(
+    ("one_sided_edge", "expected_reason"),
+    [
+        ("start", "start_silence_not_found"),
+        ("end", "end_silence_not_found"),
+    ],
+)
+def test_partial_cue_handoffs_require_sound_on_both_sides_of_the_quiet_gap(
+    tmp_path: Path,
+    one_sided_edge: str,
+    expected_reason: str,
+) -> None:
+    """A source/caption edge is not proof of an in-cue semantic handoff."""
+
+    def fake_decode(
+        _source,
+        *,
+        window_start_sec,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        if output_path.name == "start-0.wav":
+            quiet_start = 10.0 - window_start_sec
+            spans = (
+                [(quiet_start, 12000), (0.30, 0), (window_duration_sec - quiet_start - 0.30, 12000)]
+                if one_sided_edge != "start"
+                else [(quiet_start + 0.30, 0), (window_duration_sec - quiet_start - 0.30, 12000)]
+            )
+        else:
+            quiet_start = 19.70 - window_start_sec
+            spans = (
+                [(quiet_start, 12000), (0.30, 0), (window_duration_sec - quiet_start - 0.30, 12000)]
+                if one_sided_edge != "end"
+                else [(quiet_start, 12000), (window_duration_sec - quiet_start, 0)]
+            )
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            10.0,
+            20.0,
+            search_start_limit_sec=10.0,
+            search_end_limit_sec=20.0,
+            require_speech_handoff=True,
+            require_start_two_sided=True,
+            require_end_two_sided=True,
+            prepared=_prepared(),
+        )
+
+    assert result.status == "unavailable"
+    assert result.diagnostics["reason"] == expected_reason
+
+
 def test_caption_handoff_does_not_scan_an_entire_inter_caption_gap(
     tmp_path: Path,
 ) -> None:
@@ -237,6 +292,56 @@ def test_caption_handoff_does_not_scan_an_entire_inter_caption_gap(
     assert sorted(decoded) == ["end-0.wav", "start-0.wav"]
     assert result.diagnostics["start_windows"] == [[7.0, 13.0]]
     assert result.diagnostics["end_windows"] == [[17.0, 23.0]]
+
+
+def test_mixed_edge_modes_keep_exact_start_handoff_and_progressive_end_search(
+    tmp_path: Path,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_start_sec,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        spans = [(window_duration_sec, 12000)]
+        if output_path.name == "start-0.wav":
+            quiet_start = 19.8 - window_start_sec
+            spans = [
+                (quiet_start, 12000),
+                (0.3, 0),
+                (window_duration_sec - quiet_start - 0.3, 12000),
+            ]
+        elif output_path.name == "end-1.wav":
+            quiet_start = 46.0 - window_start_sec
+            spans = [
+                (quiet_start, 12000),
+                (0.3, 0),
+                (window_duration_sec - quiet_start - 0.3, 12000),
+            ]
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            20.0,
+            40.0,
+            search_start_limit_sec=20.0,
+            search_end_limit_sec=60.0,
+            require_start_speech_handoff=True,
+            require_start_two_sided=True,
+            prepared=_prepared(),
+        )
+
+    assert result.verified
+    assert result.start_sec == 20.0
+    assert result.end_sec == 46.2
+    assert result.diagnostics["start_windows"] == [[19.0, 23.0]]
+    assert result.diagnostics["end_windows"] == [[37.0, 43.0], [43.0, 49.0]]
+    assert result.diagnostics["start_speech_handoff_verified"] is True
+    assert result.diagnostics["end_speech_handoff_verified"] is False
+    assert result.diagnostics["start_two_sided_required"] is True
 
 
 def test_progressive_search_finds_silence_beyond_the_old_edge_window(
@@ -331,6 +436,76 @@ def test_non_overlapping_windows_preserve_silence_transitions_at_chunk_edges(
     assert result.end_sec == 43.2
     assert result.diagnostics["start_quiet"] == [16.7, 17.0]
     assert result.diagnostics["end_quiet"] == [43.0, 43.3]
+
+
+def test_backward_search_stitches_short_quiet_fragments_across_window_seam(
+    tmp_path: Path,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        spans = [(window_duration_sec, 12000)]
+        if output_path.name == "start-0.wav":
+            spans = [(0.08, 0), (window_duration_sec - 0.08, 12000)]
+        elif output_path.name == "start-1.wav":
+            spans = [(window_duration_sec - 0.08, 12000), (0.08, 0)]
+        elif output_path.name == "end-0.wav":
+            spans = [(3.0, 12000), (0.3, 0), (window_duration_sec - 3.3, 12000)]
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            20.0,
+            40.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=60.0,
+            prepared=_prepared(),
+        )
+
+    assert result.verified
+    assert result.start_sec == 16.98
+    assert result.diagnostics["start_quiet"] == [16.92, 17.08]
+    assert result.diagnostics["start_windows"] == [[17.0, 23.0], [11.0, 17.0]]
+
+
+def test_forward_search_stitches_short_quiet_fragments_across_window_seam(
+    tmp_path: Path,
+) -> None:
+    def fake_decode(
+        _source,
+        *,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        spans = [(window_duration_sec, 12000)]
+        if output_path.name == "start-0.wav":
+            spans = [(2.7, 12000), (0.3, 0), (window_duration_sec - 3.0, 12000)]
+        elif output_path.name == "end-0.wav":
+            spans = [(window_duration_sec - 0.11, 12000), (0.11, 0)]
+        elif output_path.name == "end-1.wav":
+            spans = [(0.11, 0), (window_duration_sec - 0.11, 12000)]
+        _write_wav(output_path, spans)
+
+    with mock.patch.object(silence, "_decode_window", side_effect=fake_decode):
+        result = silence.verify_acoustic_boundaries(
+            "dQw4w9WgXcQ",
+            20.0,
+            40.0,
+            search_start_limit_sec=0.0,
+            search_end_limit_sec=60.0,
+            prepared=_prepared(),
+        )
+
+    assert result.verified
+    assert result.end_sec == 43.09
+    assert result.diagnostics["end_quiet"] == [42.89, 43.11]
+    assert result.diagnostics["end_windows"] == [[37.0, 43.0], [43.0, 49.0]]
 
 
 def test_progressive_search_fails_closed_when_limits_contain_no_silence(
@@ -763,6 +938,40 @@ def test_prepare_reuses_cookie_proxy_and_pot_configuration(tmp_path: Path, monke
     assert result.source is not None and result.source.format_id == "140"
     assert result.source.duration_sec == 123.456
     assert "media.example" not in repr(result)
+
+
+def test_prepare_fetches_json3_words_once_from_the_existing_ytdlp_metadata(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        silence,
+        "get_settings",
+        lambda: mock.Mock(proxy_urls="", ytdlp_pot_provider_url=""),
+    )
+    payload = (
+        b'{"url":"https://media.example/audio.m4a","format_id":"140",'
+        b'"automatic_captions":{"en-orig":[{"ext":"json3",'
+        b'"url":"https://captions.example/timed?sig=secret"}]}}'
+    )
+    words = (
+        silence.lexical_timing.LexicalWord("biology", 36.48),
+        silence.lexical_timing.LexicalWord("is", 37.48),
+    )
+    fetch = mock.Mock(return_value=words)
+    with mock.patch.object(silence, "_run_command", return_value=(payload, b"")) as run, mock.patch.object(
+        silence.lexical_timing,
+        "fetch_json3_words",
+        fetch,
+    ):
+        result = silence.prepare_audio_source("dQw4w9WgXcQ", language="en-US")
+
+    assert result.ready and result.source is not None
+    assert run.call_count == 1
+    assert fetch.call_count == 1
+    assert result.source.lexical_words == words
+    assert result.source.lexical_language == "en"
+    assert result.diagnostics["lexical_word_count"] == 2
+    assert "captions.example" not in repr(result.source)
 
 
 def test_prepare_rotates_to_the_next_configured_proxy(monkeypatch) -> None:

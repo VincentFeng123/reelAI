@@ -59,6 +59,16 @@ _OPENING_QUANTIFIED_DEMONSTRATIVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CONTEXTUAL_REFORMULATION_RE = re.compile(
+    r"^(?:(?:to\s+be\s+(?:more\s+)?(?:exact|precise))|"
+    r"(?:more\s+(?:exactly|precisely))|(?:strictly|technically)\s+speaking|"
+    r"in\s+other\s+words|put\s+differently|"
+    r"to\s+put\s+(?:it|that)\s+another\s+way)\s*[,;:]?\s+"
+    r"(?:the|this|that|these|those|it|they|them|such|both|either|neither|"
+    r"former|latter)\b",
+    re.IGNORECASE,
+)
+
 _DANGLING_QUESTION_REFERENCE_RE = re.compile(
     r"(?:\b(?:this|that|these|those|it|they|them)\s*\?|"
     r"\b(?:how|why|when|where|what)\s+"
@@ -222,6 +232,7 @@ def opens_mid_thought(text: str) -> bool:
         or _ELLIPTICAL_SPATIAL_INSTRUCTION_RE.match(lexical_text)
         or _UNRESOLVED_ACTION_REFERENCE_RE.match(lexical_text)
         or _OPENING_QUANTIFIED_DEMONSTRATIVE_RE.match(lexical_text)
+        or _CONTEXTUAL_REFORMULATION_RE.match(lexical_text)
     ):
         return True
 

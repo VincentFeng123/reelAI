@@ -670,6 +670,30 @@ def test_production_anaphoric_question_recovers_its_distant_antecedent() -> None
     assert (start, end, error) == (0, 1, None)
 
 
+def test_model_selected_complete_context_survives_a_long_caption_gap() -> None:
+    segments = [
+        {
+            "start": 0.0,
+            "end": 8.0,
+            "text": "The chain rule multiplies the outer derivative because",
+        },
+        {
+            "start": 42.0,
+            "end": 50.0,
+            "text": "the inner derivative supplies the remaining rate of change.",
+        },
+    ]
+
+    start, end, error = G._close_cue_context(
+        segments,
+        0,
+        1,
+        ignore_caption_case=True,
+    )
+
+    assert (start, end, error) == (0, 1, None)
+
+
 def test_plan_rejects_live_biology_cue_despite_later_framing_sentence() -> None:
     segments = [
         {
@@ -931,7 +955,7 @@ def test_unpunctuated_prefix_expands_into_following_solution() -> None:
     assert (start, end, error) == (0, 3, None)
 
 
-def test_plan_regrounds_metadata_after_trimming_a_forward_setup() -> None:
+def test_boundary_plan_rejects_a_quote_removed_with_a_forward_setup() -> None:
     segments = [
         {
             "cue_id": "K1a2Bk8NrYQ:cue:110",
@@ -974,14 +998,8 @@ def test_plan_regrounds_metadata_after_trimming_a_forward_setup() -> None:
         topic="B-tree deletion rebalancing",
     )
 
-    assert len(report.clips) == 1
-    clip = report.clips[0]
-    assert clip["_clip_text"] == segments[0]["text"]
-    assert clip["cue_ids"] == ["K1a2Bk8NrYQ:cue:110"]
-    assert clip["_quote_repaired"] is True
-    for field in ("title", "learning_objective", "facet", "reason"):
-        assert "merge" not in clip[field].lower()
-        assert G._text_has_grounding(clip[field], clip["_clip_text"])
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:ungrounded_boundary_quote"]
 
 
 def test_complete_cannot_explanation_is_not_mistaken_for_a_forward_setup() -> None:

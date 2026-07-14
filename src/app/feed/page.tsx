@@ -789,22 +789,33 @@ function sourceVideoKeyFromUrl(value: string): string {
   }
   try {
     const parsed = new URL(trimmed);
-    if (parsed.pathname.startsWith("/embed/")) {
-      return parsed.pathname.split("/")[2] ?? "";
+    const host = parsed.hostname.toLowerCase();
+    const validVideoId = (candidate: string | null | undefined): candidate is string => (
+      typeof candidate === "string" && /^[A-Za-z0-9_-]{11}$/.test(candidate)
+    );
+    if (host === "youtu.be" || host.endsWith(".youtu.be")) {
+      const candidate = parsed.pathname.split("/").filter(Boolean)[0];
+      return validVideoId(candidate) ? candidate : trimmed;
     }
-    if (parsed.pathname.startsWith("/shorts/")) {
-      return parsed.pathname.split("/")[2] ?? "";
+    const isYouTubeHost = host === "youtube.com"
+      || host.endsWith(".youtube.com")
+      || host === "youtube-nocookie.com"
+      || host.endsWith(".youtube-nocookie.com");
+    if (!isYouTubeHost) {
+      return trimmed;
     }
-    if (parsed.hostname.includes("youtu.be")) {
-      return parsed.pathname.replace("/", "") || "";
+    if (parsed.pathname === "/watch" || parsed.pathname === "/watch/") {
+      const candidate = parsed.searchParams.get("v");
+      return validVideoId(candidate) ? candidate : trimmed;
     }
-    const youtubeId = parsed.searchParams.get("v");
-    if (youtubeId?.trim()) {
-      return youtubeId.trim();
+    for (const prefix of ["/shorts/", "/embed/", "/v/", "/live/"]) {
+      if (!parsed.pathname.startsWith(prefix)) {
+        continue;
+      }
+      const candidate = parsed.pathname.slice(prefix.length).split("/")[0];
+      return validVideoId(candidate) ? candidate : trimmed;
     }
-    parsed.search = "";
-    parsed.hash = "";
-    return parsed.toString();
+    return trimmed;
   } catch {
     return trimmed;
   }
@@ -1918,7 +1929,7 @@ function FeedPageInner() {
           return reel;
         }
         consumedAuthoritative.add(authoritative);
-        return mergeReelMetadata(reel, authoritative);
+        return authoritative;
       });
       const stableUnseenRows = currentRows.slice(lockedPrefixLength);
       const provisionalReelIds = new Set(
@@ -1943,7 +1954,7 @@ function FeedPageInner() {
           return reel;
         }
         consumedStableUnseen.add(stable);
-        return mergeReelMetadata(stable, reel);
+        return reel;
       });
       // Retain pre-existing unseen inventory during stream settlement. A
       // provisional candidate that is absent from the authoritative final was

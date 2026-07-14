@@ -140,6 +140,34 @@ def test_boundary_schema_defaults_compact_nonessential_fields():
     assert item.uncertainty_reasons == []
 
 
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [
+        ("start_quote", "proposal_0:bad_start_quote"),
+        ("end_quote", "proposal_0:bad_end_quote"),
+    ],
+)
+def test_production_boundary_quotes_must_be_grounded_in_their_cited_cues(
+    field, reason,
+):
+    data = {
+        key: value
+        for key, value in _topic(0, 0).model_dump().items()
+        if key in G._BoundaryTopic.model_fields
+    }
+    data[field] = "words absent from the cited cue"
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[G._BoundaryTopic.model_validate(data)]),
+        _segs(1),
+        [],
+        {},
+        topic="lesson 0",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == [reason]
+
+
 def test_forty_realistic_boundary_candidates_fit_bounded_output_reservation():
     topics = []
     for index in range(40):
@@ -203,17 +231,13 @@ def test_self_contained_gate_still_fails_closed():
     assert _run([_topic(0, 1, self_contained=False)]) == []
 
 
-def test_relevance_is_the_only_numeric_green_gate():
-    relevant = _topic(
-        0,
-        1,
-        informativeness=0.0,
-        topic_relevance=0.75,
-        educational_importance=0.0,
-        difficulty=0.0,
-    )
-    assert _run([relevant])
-    assert _run([_topic(0, 1, topic_relevance=0.74)]) == []
+@pytest.mark.parametrize(
+    "field",
+    ["informativeness", "topic_relevance", "educational_importance"],
+)
+def test_each_quality_score_has_an_independent_green_gate(field):
+    assert _run([_topic(0, 1, **{field: 0.75})])
+    assert _run([_topic(0, 1, **{field: 0.74})]) == []
 
 
 def test_request_quality_floor_overrides_cannot_change_fixed_contract():
@@ -225,7 +249,7 @@ def test_request_quality_floor_overrides_cannot_change_fixed_contract():
     assert _run([proposal], settings={"segment_topic_relevance_min": 0.8})
     assert _run([
         _topic(0, 1, informativeness=0.1, educational_importance=0.1)
-    ], settings={"segment_informativeness_min": 0.8})
+    ], settings={"segment_informativeness_min": 0.1}) == []
     rejected = _topic(0, 1, topic_relevance=0.74)
     assert _run([rejected], settings={"segment_topic_relevance_min": 0.1}) == []
 
@@ -353,7 +377,7 @@ def test_brief_internal_channel_bump_does_not_discard_complete_teaching():
         candidate_id="biology-transcription",
         start_line=0,
         end_line=len(segments) - 1,
-        start_quote="Cool! There's just one issue",
+        start_quote="Your DNA and its information is in the nucleus",
         end_quote="assembling a chain of amino acids",
         title="RNA polymerase transcribes DNA into messenger RNA",
         learning_objective="Understand how RNA polymerase transcribes DNA into messenger RNA.",
@@ -390,6 +414,9 @@ def test_brief_internal_channel_bump_does_not_discard_complete_teaching():
     assert report.clips[0]["cue_ids"] == [
         f"3tisOnOkwzo:cue:{index + 78}" for index in range(len(segments))
     ]
+    assert report.clips[0]["_clip_text"].startswith(
+        "Your DNA and its information is in the nucleus"
+    )
     assert "Welcome to Biology Pro Tips" in report.clips[0]["_clip_text"]
 
 
@@ -631,7 +658,7 @@ def test_structural_filler_edge_is_rejected_when_model_quotes_the_intro():
     )
 
     assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler_timing"]
+    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler"]
 
 
 def test_punctuated_welcome_is_detected_as_structural_filler():
@@ -639,7 +666,7 @@ def test_punctuated_welcome_is_detected_as_structural_filler():
     assert G._STRUCTURAL_FILLER_RE.search("Welcome back.")
 
 
-def test_same_cue_leading_filler_aligns_required_speech_to_teaching_quote():
+def test_same_cue_leading_filler_emits_semantic_edge_projection():
     text = (
         "Welcome back. Photosynthesis converts light energy into chemical energy "
         "that cells store in sugars."
@@ -661,10 +688,20 @@ def test_same_cue_leading_filler_aligns_required_speech_to_teaching_quote():
     )
 
     assert len(report.clips) == 1
-    assert 0.0 < report.clips[0]["required_first_speech_sec"] < 12.0
+    clip = report.clips[0]
+    assert clip["edge_projection"] == {
+        "start": {
+            "required": True,
+            "cue_id": "cue-0",
+            "quote": "Photosynthesis converts light energy",
+        }
+    }
+    assert clip["_clip_text"].startswith("Photosynthesis converts")
+    assert "Welcome back" not in clip["_clip_text"]
+    assert "required_first_speech_sec" not in clip
 
 
-def test_same_cue_trailing_filler_aligns_required_speech_to_conclusion_quote():
+def test_same_cue_trailing_filler_emits_semantic_edge_projection():
     text = (
         "Differentiate the outer function, multiply by the inner derivative, and the "
         "final derivative is two x. Thanks for watching."
@@ -686,7 +723,469 @@ def test_same_cue_trailing_filler_aligns_required_speech_to_conclusion_quote():
     )
 
     assert len(report.clips) == 1
-    assert 0.0 < report.clips[0]["required_last_speech_sec"] < 14.0
+    clip = report.clips[0]
+    assert clip["edge_projection"] == {
+        "end": {
+            "required": True,
+            "cue_id": "cue-0",
+            "quote": "final derivative is two x",
+        }
+    }
+    assert clip["_clip_text"].endswith("final derivative is two x")
+    assert "Thanks for watching" not in clip["_clip_text"]
+    assert "required_last_speech_sec" not in clip
+
+
+def test_context_expansion_projects_past_leading_filler_in_added_cue():
+    segments = [
+        {
+            "cue_id": "prerequisite",
+            "start": 0.0,
+            "end": 8.0,
+            "text": (
+                "Welcome back, The chain rule differentiates a composition by "
+                "multiplying derivatives."
+            ),
+        },
+        {
+            "cue_id": "continuation",
+            "start": 8.0,
+            "end": 14.0,
+            "text": "because the outer derivative is evaluated at the inner function.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            1,
+            1,
+            start_quote="because the outer derivative",
+            end_quote="evaluated at the inner function",
+            topic_evidence_quote=(
+                "The chain rule differentiates a composition by multiplying derivatives"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic="chain rule",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["cue_ids"] == ["prerequisite", "continuation"]
+    assert clip["_clip_text"].startswith("The chain rule differentiates")
+    assert "Welcome back" not in clip["_clip_text"]
+    assert clip["edge_projection"]["start"]["quote"] == (
+        "The chain rule differentiates a composition"
+    )
+
+
+def test_context_expansion_projects_before_trailing_filler_in_added_cue():
+    segments = [
+        {
+            "cue_id": "setup",
+            "start": 0.0,
+            "end": 7.0,
+            "text": "For x squared, differentiate the outer function and",
+        },
+        {
+            "cue_id": "conclusion",
+            "start": 7.0,
+            "end": 13.0,
+            "text": "the final derivative is two x, thanks for watching.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="For x squared differentiate",
+            end_quote="the outer function and",
+            topic_evidence_quote=(
+                "For x squared differentiate the outer function and"
+            ),
+        )]),
+        segments,
+        [],
+        {},
+        topic="chain rule",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["cue_ids"] == ["setup", "conclusion"]
+    assert clip["_clip_text"].endswith("the final derivative is two x")
+    assert "Thanks for watching" not in clip["_clip_text"]
+    assert clip["edge_projection"]["end"]["quote"] == (
+        "the final derivative is two x"
+    )
+
+
+def test_semantic_quotes_remove_generic_opening_hook_and_trailing_joke():
+    text = (
+        "Imagine a mysterious envelope arriving at midnight. "
+        "A checksum detects whether transmitted data changed. "
+        "Comparing the received checksum with the expected value exposes corrupted data. "
+        "I mean, unless the bits were feeling mischievous."
+    )
+    proposal = _topic(
+        0,
+        0,
+        start_quote="A checksum detects whether transmitted data changed",
+        end_quote="expected value exposes corrupted data",
+        topic_evidence_quote=(
+            "A checksum detects whether transmitted data changed Comparing the received checksum"
+        ),
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[proposal]),
+        [{"cue_id": "coarse", "start": 0.0, "end": 30.0, "text": text}],
+        [],
+        {},
+        topic="checksums",
+    )
+
+    assert len(report.clips) == 1
+    clip = report.clips[0]
+    assert clip["_clip_text"] == (
+        "A checksum detects whether transmitted data changed. Comparing the received "
+        "checksum with the expected value exposes corrupted data"
+    )
+    assert clip["edge_projection"] == {
+        "start": {
+            "required": True,
+            "cue_id": "coarse",
+            "quote": "A checksum detects whether transmitted data changed",
+        },
+        "end": {
+            "required": True,
+            "cue_id": "coarse",
+            "quote": "expected value exposes corrupted data",
+        },
+    }
+    assert clip["start_quote"] == proposal.start_quote
+    assert clip["end_quote"] == proposal.end_quote
+    [public_clip] = G._public_clips(report.clips)
+    assert public_clip["start_quote"] == proposal.start_quote
+    assert public_clip["end_quote"] == proposal.end_quote
+
+
+def test_topic_evidence_in_omitted_hook_cannot_ground_projected_clip():
+    text = (
+        "This dramatic opening repeatedly names cellular respiration for suspense. "
+        "Mitochondria use a proton gradient to drive ATP synthase."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Mitochondria use a proton gradient",
+            end_quote="drive ATP synthase",
+            topic_evidence_quote=(
+                "This dramatic opening repeatedly names cellular respiration for suspense"
+            ),
+        )]),
+        [{"start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {},
+        topic="cellular respiration",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:ungrounded_topic_evidence_quote"]
+
+
+def test_same_cue_internal_filler_remains_between_semantic_quotes():
+    text = (
+        "A hash maps an input to a fixed-size digest. A quick aside about the name. "
+        "Changing the input usually changes the digest."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="A hash maps an input",
+            end_quote="usually changes the digest",
+            topic_evidence_quote="A hash maps an input to a fixed-size digest",
+        )]),
+        [{"start": 0.0, "end": 20.0, "text": text}],
+        [],
+        {},
+        topic="hash functions",
+    )
+
+    assert len(report.clips) == 1
+    assert "A quick aside about the name" in report.clips[0]["_clip_text"]
+
+
+def test_ambiguous_projected_edge_quote_is_rejected():
+    text = (
+        "A theatrical question comes first. The actual lesson begins with entropy. "
+        "The actual lesson begins with entropy and concludes that disorder can increase."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="The actual lesson begins with entropy",
+            end_quote="disorder can increase",
+            topic_evidence_quote=(
+                "actual lesson begins with entropy and concludes that disorder can increase"
+            ),
+        )]),
+        [{"start": 0.0, "end": 20.0, "text": text}],
+        [],
+        {},
+        topic="entropy",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:ambiguous_start_quote"]
+
+
+def test_adjacent_facets_inside_one_coarse_cue_remain_distinct():
+    text = (
+        "Osmosis moves water across a selectively permeable membrane. "
+        "It moves toward the side with greater solute concentration. "
+        "ATP hydrolysis releases energy by transferring a phosphate group. "
+        "Cells couple that transfer to otherwise unfavorable reactions."
+    )
+    osmosis = _topic(
+        0,
+        0,
+        candidate_id="osmosis",
+        title="Osmosis direction",
+        learning_objective="Explain the direction of osmosis.",
+        facet="water movement",
+        start_quote="Osmosis moves water",
+        end_quote="greater solute concentration",
+        topic_evidence_quote=(
+            "Osmosis moves water across a selectively permeable membrane"
+        ),
+    )
+    atp = _topic(
+        0,
+        0,
+        candidate_id="atp",
+        title="ATP coupling",
+        learning_objective="Explain how ATP transfer drives reactions.",
+        facet="energy coupling",
+        start_quote="ATP hydrolysis releases energy",
+        end_quote="otherwise unfavorable reactions",
+        topic_evidence_quote=(
+            "ATP hydrolysis releases energy by transferring a phosphate group"
+        ),
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[osmosis, atp]),
+        [{"cue_id": "coarse", "start": 0.0, "end": 32.0, "text": text}],
+        [],
+        {},
+        topic="cell transport and energy",
+    )
+
+    assert [clip["selection_candidate_id"] for clip in report.clips] == [
+        "osmosis",
+        "atp",
+    ]
+    assert report.clips[0]["_clip_text"].endswith("greater solute concentration")
+    assert report.clips[1]["_clip_text"].startswith("ATP hydrolysis releases energy")
+
+
+def test_optional_example_setup_after_a_complete_conclusion_is_excluded():
+    text = (
+        "The arithmetic mean equals the sum divided by the count, so the value is four. "
+        "For example, suppose the next dataset has missing values."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="The arithmetic mean equals",
+            end_quote="the value is four",
+            topic_evidence_quote=(
+                "arithmetic mean equals the sum divided by the count so the value"
+            ),
+        )]),
+        [{"start": 0.0, "end": 18.0, "text": text}],
+        [],
+        {},
+        topic="arithmetic mean",
+    )
+
+    assert len(report.clips) == 1
+    assert report.clips[0]["_clip_text"].endswith("the value is four")
+    assert "next dataset" not in report.clips[0]["_clip_text"]
+
+
+def test_unfinished_exemplification_tail_expands_to_its_completion():
+    segments = [
+        {
+            "cue_id": "example-setup",
+            "start": 0.0,
+            "end": 8.0,
+            "text": "Ionic solutes dissociate in water, so, for example, salt",
+        },
+        {
+            "cue_id": "example-completion",
+            "start": 8.0,
+            "end": 14.0,
+            "text": "dissolves into sodium and chloride ions.",
+        },
+    ]
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Ionic solutes dissociate",
+            end_quote="for example salt",
+            topic_evidence_quote="Ionic solutes dissociate in water so for example salt",
+        )]),
+        segments,
+        [],
+        {},
+        topic="ionic solutes",
+    )
+
+    assert len(report.clips) == 1
+    assert report.clips[0]["cue_ids"] == ["example-setup", "example-completion"]
+    assert report.clips[0]["_clip_text"].endswith("sodium and chloride ions.")
+
+
+def test_unfinished_exemplification_tail_fails_closed_without_completion():
+    text = "Ionic solutes dissociate in water, so, for example, salt"
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Ionic solutes dissociate",
+            end_quote="for example salt",
+            topic_evidence_quote="Ionic solutes dissociate in water so for example salt",
+        )]),
+        [{"cue_id": "dangling-example", "start": 0.0, "end": 8.0, "text": text}],
+        [],
+        {},
+        topic="ionic solutes",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:unresolved_weak_end"]
+
+
+def test_complete_exemplification_is_not_mistaken_for_a_dangling_setup():
+    text = "For example, salt dissolves into sodium and chloride ions in water."
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="For example salt dissolves",
+            end_quote="chloride ions in water",
+            topic_evidence_quote="salt dissolves into sodium and chloride ions in water",
+        )]),
+        [{"cue_id": "complete-example", "start": 0.0, "end": 8.0, "text": text}],
+        [],
+        {},
+        topic="ionic solutes",
+    )
+
+    assert len(report.clips) == 1
+
+
+def test_visual_phrase_outside_semantic_projection_does_not_reject_audio_teaching():
+    text = (
+        "As shown here, this opening hook depends on the screen. "
+        "Photosynthesis converts light energy into chemical energy."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Photosynthesis converts light energy",
+            end_quote="into chemical energy",
+            topic_evidence_quote="Photosynthesis converts light energy into chemical energy",
+        )]),
+        [{"cue_id": "visual-hook", "start": 0.0, "end": 8.0, "text": text}],
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert len(report.clips) == 1
+    assert report.clips[0]["_clip_text"] == (
+        "Photosynthesis converts light energy into chemical energy."
+    )
+
+
+def test_visual_dependency_inside_semantic_projection_is_rejected():
+    text = (
+        "Photosynthesis converts light energy as shown here into stored chemical energy."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Photosynthesis converts light energy",
+            end_quote="stored chemical energy",
+            topic_evidence_quote="Photosynthesis converts light energy as shown here into stored chemical energy",
+        )]),
+        [{"cue_id": "visual-teaching", "start": 0.0, "end": 8.0, "text": text}],
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:requires_visual_context"]
+
+
+def test_long_same_cue_internal_sponsor_block_is_rejected():
+    text = (
+        "Photosynthesis converts light energy into chemical energy. "
+        "Today's sponsor is Acme, whose premium study platform gives every learner "
+        "custom dashboards, daily reminders, animated badges, downloadable templates, "
+        "private groups, unlimited notes, practice calendars, progress reports, and a "
+        "special discount when viewers use the promotional code printed below. "
+        "Chlorophyll captures photons that power sugar production."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Photosynthesis converts light energy",
+            end_quote="power sugar production",
+            topic_evidence_quote="Photosynthesis converts light energy into chemical energy",
+        )]),
+        [{"cue_id": "long-sponsor", "start": 0.0, "end": 25.0, "text": text}],
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:long_internal_filler_block"]
+
+
+def test_brief_same_cue_internal_aside_is_tolerated():
+    text = (
+        "Photosynthesis converts light energy into chemical energy. "
+        "A quick aside: chlorophyll is green. "
+        "Chlorophyll captures photons that power sugar production."
+    )
+    report = G._plan_to_report(
+        G._Plan(topics=[_topic(
+            0,
+            0,
+            start_quote="Photosynthesis converts light energy",
+            end_quote="power sugar production",
+            topic_evidence_quote="Photosynthesis converts light energy into chemical energy",
+        )]),
+        [{"cue_id": "brief-aside", "start": 0.0, "end": 14.0, "text": text}],
+        [],
+        {},
+        topic="photosynthesis",
+    )
+
+    assert len(report.clips) == 1
 
 
 @pytest.mark.parametrize("topic", ["biology", "biology myths", "Gothic architecture"])
@@ -822,7 +1321,7 @@ def test_video_plug_tail_is_rejected_even_after_substantive_teaching():
     )
 
     assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler_timing"]
+    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler"]
 
 
 def test_video_recording_example_is_not_mistaken_for_a_channel_plug():
@@ -903,7 +1402,7 @@ def test_name_led_welcome_intro_remains_structural_filler():
     )
 
     assert report.clips == []
-    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler_timing"]
+    assert report.rejected_reasons == ["proposal_0:unresolved_edge_filler"]
 
 
 def test_complete_unpunctuated_teaching_trims_a_trailing_outro_cue():
@@ -1088,7 +1587,7 @@ def test_long_internal_sponsor_block_rejects_the_candidate():
     assert report.rejected_reasons == ["proposal_0:long_internal_filler_block"]
 
 
-def test_multiple_brief_internal_admin_and_tangent_blocks_are_rejected():
+def test_multiple_brief_internal_admin_and_tangent_blocks_are_tolerated():
     segments = [
         {
             "start": 0.0,
@@ -1132,10 +1631,9 @@ def test_multiple_brief_internal_admin_and_tangent_blocks_are_rejected():
         topic="opportunity cost versus sunk cost",
     )
 
-    assert report.clips == []
-    assert report.rejected_reasons == [
-        "proposal_0:multiple_internal_filler_blocks"
-    ]
+    assert len(report.clips) == 1
+    assert "Administrative note" in report.clips[0]["_clip_text"]
+    assert "brief tangent" in report.clips[0]["_clip_text"]
 
 
 def test_explicit_max_clips_is_respected_below_forty_ceiling():
@@ -1147,7 +1645,12 @@ def test_explicit_max_clips_is_respected_below_forty_ceiling():
 @pytest.mark.parametrize(
     "overrides,rejected_reason",
     [
+        ({"informativeness": 0.7}, "proposal_1:informativeness_below_green"),
         ({"topic_relevance": 0.7}, "proposal_1:topic_relevance_below_green"),
+        (
+            {"educational_importance": 0.7},
+            "proposal_1:educational_importance_below_green",
+        ),
         ({"uncertainty": "medium", "uncertainty_reasons": ["boundary_ambiguous"]},
          None),
         ({"uncertainty": "high", "uncertainty_reasons": ["incomplete_context"]},

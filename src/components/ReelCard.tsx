@@ -341,7 +341,7 @@ export function ReelCard({
       }
       // The iframe's integer `end` parameter is only a safety net. Enforce the
       // authoritative floating-point boundary ourselves, including at 2x.
-      if (playerTime >= clipEnd) {
+      if (playerTime + 0.01 >= clipEnd) {
         onPlaybackProgress?.(1, true);
         if (!didHandleClipEndRef.current) {
           didHandleClipEndRef.current = true;

@@ -646,6 +646,48 @@ def test_dispatched_transport_failure_preserves_call_identity(monkeypatch):
     assert telemetry["model"] == G.config.SEGMENT_FLASH_MODEL
 
 
+def test_production_selector_reserves_and_dispatches_exactly_once(monkeypatch):
+    class TransientHTTPError(RuntimeError):
+        status_code = 503
+
+    class Models:
+        def __init__(self):
+            self.calls = []
+
+        def generate_content(self, **kwargs):
+            self.calls.append(kwargs)
+            raise TransientHTTPError("status 503")
+
+    models = Models()
+    monkeypatch.setattr(
+        GC,
+        "get_client",
+        lambda: type("Client", (), {"models": models})(),
+    )
+    reservations = []
+
+    def reserve(**kwargs):
+        reservations.append(kwargs)
+        return {"reserved_cost_usd": 0.25}
+
+    result = G.run_segment_profile(
+        _transcript(),
+        {"_segment_budget_reserve": reserve},
+        G.PRODUCTION_FLASH_PROFILE,
+        topic="calculus",
+        deadline_monotonic=time.monotonic() + 10,
+    )
+
+    assert len(models.calls) == 1
+    assert len(reservations) == 1
+    assert result.calls[0]["retries"] == 0
+    assert result.calls[0]["dispatched"] is True
+    assert result.calls[0]["reserved_cost_usd"] == 0.25
+    assert result.classification_reasons == [
+        "request_failure:GeminiTransportError"
+    ]
+
+
 def test_transport_failure_reports_inner_type_and_retry_telemetry(monkeypatch):
     provider_telemetry = GC.GeminiCallTelemetry(
         model=G.config.SEGMENT_FLASH_MODEL,
@@ -720,7 +762,15 @@ def test_profile_operation_settings_are_wired_to_client(monkeypatch, profile, ex
     assert (
         captured["thinking_level"], captured["max_output_tokens"],
         captured["timeout_s"], captured["operation"], captured["model"],
-    ) == (level, cap, timeout, operation, expected_model)
+        captured["max_retries"],
+    ) == (
+        level,
+        cap,
+        timeout,
+        operation,
+        expected_model,
+        0 if profile == G.FLASH_SPLIT_PROFILE else 1,
+    )
 
 
 def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypatch):
@@ -744,7 +794,7 @@ def test_flash_boundary_profile_accepts_bootstrap_low_thinking_override(monkeypa
     assert captured["max_output_tokens"] == 12_288
 
 
-def test_boundary_profile_repairs_bad_model_quote_from_cited_cue(monkeypatch):
+def test_boundary_profile_rejects_bad_model_quote_from_cited_cue(monkeypatch):
     proposal = G._BoundaryTopic(
         candidate_id="candidate-bad-quote",
         start_line=0,
@@ -782,9 +832,9 @@ def test_boundary_profile_repairs_bad_model_quote_from_cited_cue(monkeypatch):
         deadline_monotonic=time.monotonic() + 10,
     )
 
-    assert result.classification == "green"
-    assert result.accepted_count == 1
-    assert result.rejection_reasons == []
+    assert result.classification == "invalid"
+    assert result.accepted_count == 0
+    assert result.rejection_reasons == ["proposal_0:bad_start_quote"]
 
 
 def test_production_boundary_selector_keeps_every_candidate_beyond_sixteen(monkeypatch):
@@ -893,7 +943,7 @@ def test_production_order_uses_information_and_importance_with_relevance(monkeyp
             uncertainty_reasons=[],
         )
         for index, title, informativeness, relevance, importance in (
-            (0, "Most relevant", 0.05, 0.99, 0.05),
+            (0, "Most relevant", 0.75, 0.99, 0.75),
             (1, "Less relevant", 1.0, 0.80, 1.0),
         )
     ]
@@ -1138,17 +1188,18 @@ def test_cancelled_worker_never_publishes_late_boundary_or_done_progress(monkeyp
     assert [fraction for fraction, _message in progress] == [0.1]
 
 
-def test_clip_grounding_text_matches_the_delivered_complete_cue_window():
+def test_clip_grounding_text_matches_the_selected_semantic_projection():
     segments = [{
         "start": 0.0,
         "end": 180.0,
-        "text": "outside before alpha lesson closes cleanly outside after",
+        "text": "outside before alpha educational lesson closes cleanly outside after",
     }]
     words = [
         {"word": "outside", "start": 0.0, "end": 1.0},
         {"word": "before", "start": 1.0, "end": 2.0},
         {"word": "alpha", "start": 40.0, "end": 41.0},
-        {"word": "lesson", "start": 41.0, "end": 42.0},
+        {"word": "educational", "start": 41.0, "end": 42.0},
+        {"word": "lesson", "start": 42.0, "end": 43.0},
         {"word": "closes", "start": 60.0, "end": 61.0},
         {"word": "cleanly", "start": 61.0, "end": 62.0},
         {"word": "outside", "start": 120.0, "end": 121.0},
@@ -1157,13 +1208,13 @@ def test_clip_grounding_text_matches_the_delivered_complete_cue_window():
     proposal = G._Topic(
         candidate_id="candidate-alpha",
         start_line=0, end_line=0,
-        start_quote="alpha lesson", end_quote="closes cleanly",
+        start_quote="alpha educational lesson", end_quote="closes cleanly",
         title="Alpha", learning_objective="Understand the alpha lesson.",
         facet="lesson", reason="A complete alpha lesson.",
         informativeness=0.9, topic_relevance=0.9,
         educational_importance=0.9, difficulty=0.5,
         directly_teaches_topic=True, substantive=True, factually_grounded=True,
-        topic_evidence_quote="outside before alpha lesson closes cleanly",
+        topic_evidence_quote="alpha educational lesson closes cleanly",
         self_contained=True, is_standalone=True,
         prerequisite_candidate_ids=[], uncertainty="low", uncertainty_reasons=[],
         summary="The alpha lesson closes cleanly.",
@@ -1181,4 +1232,6 @@ def test_clip_grounding_text_matches_the_delivered_complete_cue_window():
         G._Plan(topics=[proposal]), segments, words,
         {"segment_fine_snap": True}, topic="alpha", require_enrichment=True,
     )
-    assert report.clips[0]["_clip_text"] == segments[0]["text"]
+    assert report.clips[0]["_clip_text"] == (
+        "alpha educational lesson closes cleanly"
+    )

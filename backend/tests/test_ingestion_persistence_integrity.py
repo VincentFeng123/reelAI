@@ -25,6 +25,7 @@ from backend.app.ingestion.errors import InvalidReferenceError  # noqa: E402
 from backend.app.ingestion.models import (  # noqa: E402
     IngestMetadata,
     IngestSegment,
+    IngestTranscriptCue,
     YouTubeSourceRef,
 )
 
@@ -302,6 +303,93 @@ class PersistenceIntegrityTests(unittest.TestCase):
         context = json.loads(rows[0]["search_context_json"])
         self.assertTrue(context["surface_eligible"])
         self.assertEqual(context["boundary_status"], "verified")
+
+    def test_persisted_candidate_uses_projected_selection_caption_snapshot(self) -> None:
+        with db_module.get_conn(transactional=True) as conn:
+            self._seed_identity(conn, "material-a", "concept-a")
+
+        pipeline = pipeline_module.IngestionPipeline(
+            youtube_service=None,
+            embedding_service=None,
+            serverless_mode=False,
+        )
+        source_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        adapter_result = YouTubeSourceRef(
+            source_id="dQw4w9WgXcQ",
+            source_url=source_url,
+            playback_url="https://www.youtube.com/embed/dQw4w9WgXcQ",
+        )
+        metadata = IngestMetadata(
+            platform="yt",
+            source_id="dQw4w9WgXcQ",
+            source_url=source_url,
+            playback_url=adapter_result.playback_url,
+            title="Photosynthesis lesson",
+            duration_sec=20.0,
+        )
+        projected_text = (
+            "Photosynthesis converts light energy into chemical energy."
+        )
+
+        reel = pipeline._persist_ingest(
+            adapter_result=adapter_result,
+            metadata=metadata,
+            cues=[
+                IngestTranscriptCue(
+                    cue_id="cue-1",
+                    start=0.0,
+                    end=20.0,
+                    text=(
+                        "Welcome back. Photosynthesis converts light energy into "
+                        "chemical energy. Thanks for watching."
+                    ),
+                )
+            ],
+            chosen=IngestSegment(
+                t_start=5.25,
+                t_end=15.75,
+                text=projected_text,
+            ),
+            snippet=(
+                "Welcome back. Photosynthesis converts light energy into chemical "
+                "energy. Thanks for watching."
+            ),
+            material_id="material-a",
+            concept_id="concept-a",
+            clip_window=(5.25, 15.75),
+            target_max=0,
+            generation_id="generation-a",
+            clip_details={
+                "cue_ids": ["cue-1"],
+                "search_context": {
+                    "selection_contract_version": "quality_silence_v6",
+                    "selection_caption_cues": [
+                        {
+                            "cue_id": "cue-1",
+                            "start": 5.25,
+                            "end": 15.75,
+                            "text": projected_text,
+                            "lang": "en",
+                        }
+                    ],
+                    "surface_eligible": True,
+                    "boundary_status": "verified",
+                },
+            },
+        )
+
+        self.assertEqual(reel.transcript_snippet, projected_text)
+        self.assertEqual(
+            [cue.model_dump() for cue in reel.captions],
+            [{"start": 0.0, "end": 10.5, "text": projected_text}],
+        )
+        with db_module.get_conn() as conn:
+            row = db_module.fetch_one(
+                conn,
+                "SELECT transcript_snippet FROM reels WHERE id = ?",
+                (reel.reel_id,),
+            )
+        self.assertEqual(row["transcript_snippet"], projected_text)
 
 
 if __name__ == "__main__":

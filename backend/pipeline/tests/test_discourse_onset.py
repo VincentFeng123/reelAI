@@ -118,6 +118,23 @@ def test_context_dependent_np_is_weak():
     assert opens_mid_thought("The answer is fifteen newtons.")
     assert opens_mid_thought("The previous equation tells us the velocity.")
 
+
+def test_contextless_precision_reformulation_is_weak():
+    assert opens_mid_thought(
+        "To be exact, the signals travel from the retina to the visual cortex."
+    )
+    assert opens_mid_thought(
+        "More precisely, these signals encode contrast rather than brightness."
+    )
+
+
+def test_precision_phrase_with_self_contained_subject_or_local_context_is_an_onset():
+    assert is_onset("To be exact, one parsec equals about 3.26 light-years.")
+    assert is_onset(
+        "Retinal ganglion cells emit action potentials. To be exact, the signals "
+        "encode changes in local contrast."
+    )
+
 def test_mid_clause_fragment_is_weak():
     assert opens_mid_thought("writing oxygen we're going to write a two")  # lowercase mid-clause
 

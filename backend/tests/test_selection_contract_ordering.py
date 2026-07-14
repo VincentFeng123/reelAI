@@ -409,6 +409,64 @@ class SelectionContractOrderingTests(unittest.TestCase):
                 require_verified_boundaries=require_verified_boundaries,
             )
 
+    def test_v6_ranked_feed_requires_each_quality_score_at_threshold(self) -> None:
+        self._insert_versioned_reel(
+            reel_id="v6-quality",
+            video_id="video-a",
+            start=10,
+            difficulty=0.15,
+            base_score=0.8,
+        )
+        row = self.conn.execute(
+            "SELECT search_context_json FROM reels WHERE id = 'v6-quality'"
+        ).fetchone()
+        baseline = json.loads(row[0])
+        baseline.update({
+            "selection_contract_version": "quality_silence_v6",
+            "self_contained": True,
+            "is_standalone": True,
+            "topic_evidence_quote": (
+                "Chemical bonding explains how atoms share or transfer electrons"
+            ),
+            "surface_eligible": True,
+            "boundary_status": "verified",
+            "boundary_diagnostics": {
+                "acoustic_verified": True,
+                "acoustic": {"threshold_dbfs": -38.0},
+            },
+            "speech_corridor_verified": True,
+        })
+
+        for field in (
+            "informativeness",
+            "topic_relevance",
+            "educational_importance",
+        ):
+            with self.subTest(field=field):
+                context = {**baseline, field: 0.74}
+                self.conn.execute(
+                    "UPDATE reels SET search_context_json = ? WHERE id = 'v6-quality'",
+                    (json.dumps(context),),
+                )
+                self.conn.execute("DELETE FROM ranked_feed_cache")
+                self.assertEqual(self._ranked(require_verified_boundaries=True), [])
+
+        accepted = {
+            **baseline,
+            "informativeness": 0.75,
+            "topic_relevance": 0.75,
+            "educational_importance": 0.75,
+        }
+        self.conn.execute(
+            "UPDATE reels SET search_context_json = ? WHERE id = 'v6-quality'",
+            (json.dumps(accepted),),
+        )
+        self.conn.execute("DELETE FROM ranked_feed_cache")
+        self.assertEqual(
+            [item["reel_id"] for item in self._ranked(require_verified_boundaries=True)],
+            ["v6-quality"],
+        )
+
     def test_ranked_feed_order_is_difficulty_first_and_stable(self) -> None:
         self._insert_versioned_reel(
             reel_id="easy", video_id="video-a", start=10,

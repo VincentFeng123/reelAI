@@ -52,6 +52,24 @@ function compileUseCallback(name, bindings) {
   return factory(...names.map((key) => bindings[key]));
 }
 
+function compileFunctionDeclaration(name) {
+  let declaration = null;
+  function visit(node) {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === name) {
+      declaration = node;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  }
+  visit(sourceFile);
+  assert.ok(declaration, `expected ${name} function declaration`);
+  const compiled = ts.transpile(
+    declaration.getText(sourceFile),
+    { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  );
+  return new Function(`${compiled}\nreturn ${name};`)();
+}
+
 test("learner level remains internal and has no manual feed control", () => {
   assert.match(source, /const \[knowledgeLevel, setKnowledgeLevel\] = useState/);
   assert.doesNotMatch(source, /const cycleLevel =/);
@@ -252,7 +270,6 @@ test("restored reconciliation removes cached unseen rows and stream settlement d
     watchedFrontierIndexRef,
     orderReelsByDifficulty,
     reelClipKey: (reel) => reel.video_url,
-    mergeReelMetadata: (current, next) => ({ ...current, ...next }),
     dedupeByIdentity: (rows) => {
       const seen = new Set();
       return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
@@ -267,13 +284,23 @@ test("restored reconciliation removes cached unseen rows and stream settlement d
   callback(
     [],
     [
-      { reel_id: "current", video_url: "current", video_title: "Authoritative current" },
+      {
+        reel_id: "current",
+        video_url: "current",
+        video_title: "",
+        captions: [],
+        t_start: 10.125,
+        t_end: 30.875,
+      },
       { reel_id: "new-unseen", video_url: "new-unseen", video_title: "New unseen" },
     ],
     { preserveUnmatchedUnseen: false },
   );
   assert.deepEqual(renderedRows.map((row) => row.reel_id), ["watched", "current", "new-unseen"]);
-  assert.equal(renderedRows[1].video_title, "Authoritative current");
+  assert.equal(renderedRows[1].video_title, "");
+  assert.deepEqual(renderedRows[1].captions, []);
+  assert.equal(renderedRows[1].t_start, 10.125);
+  assert.equal(renderedRows[1].t_end, 30.875);
 
   reelsRef.current = currentRows;
   callback(
@@ -308,7 +335,6 @@ test("generation settlement freezes the watched frontier and orders only the uns
     watchedFrontierIndexRef,
     orderReelsByDifficulty,
     reelClipKey: (reel) => reel.video_url,
-    mergeReelMetadata: (current, next) => ({ ...current, ...next }),
     dedupeByIdentity: (rows) => {
       const seen = new Set();
       return rows.filter((row) => !seen.has(row.reel_id) && seen.add(row.reel_id));
@@ -476,6 +502,32 @@ test("same-source clips remain distinct when their authoritative float ranges di
   assert.deepEqual(rows.map((reel) => reel.reel_id), ["facet-a", "facet-b"]);
 });
 
+test("web and iOS canonicalize the same supported YouTube source URL forms", () => {
+  const sourceVideoKeyFromUrl = compileFunctionDeclaration("sourceVideoKeyFromUrl");
+  const videoId = "dQw4w9WgXcQ";
+  const supported = [
+    `https://www.youtube.com/watch?v=${videoId}&list=PL123`,
+    `https://m.youtube.com/watch?v=${videoId}`,
+    `https://music.youtube.com/watch?v=${videoId}`,
+    `https://www.youtube.com/shorts/${videoId}`,
+    `https://www.youtube.com/embed/${videoId}`,
+    `https://www.youtube.com/v/${videoId}`,
+    `https://www.youtube.com/live/${videoId}`,
+    `https://youtu.be/${videoId}?t=12`,
+    `https://www.youtube-nocookie.com/embed/${videoId}`,
+  ];
+
+  assert.deepEqual(supported.map(sourceVideoKeyFromUrl), supported.map(() => videoId));
+  assert.equal(
+    sourceVideoKeyFromUrl(" https://example.com/embed/dQw4w9WgXcQ?view=full#part "),
+    "https://example.com/embed/dQw4w9WgXcQ?view=full#part",
+  );
+  assert.equal(
+    sourceVideoKeyFromUrl("https://www.youtube.com/live/not-valid?feature=share"),
+    "https://www.youtube.com/live/not-valid?feature=share",
+  );
+});
+
 test("legacy duration settings are readable but removed from newly written feed URLs", () => {
   assert.match(feedQuerySource, /getParam\("target_clip_duration_sec"\)/);
   assert.match(feedQuerySource, /params\.delete\("target_clip_duration_sec"\)/);
@@ -487,10 +539,10 @@ test("legacy duration settings are readable but removed from newly written feed 
 test("YouTube playback honors float boundaries with a sub-50ms end watchdog", () => {
   assert.match(reelCardSource, /const CLIP_END_POLL_INTERVAL_MS = 20;/);
   assert.match(reelCardSource, /clipEndRaw > clipStart \? clipEndRaw : clipStart/);
-  assert.match(reelCardSource, /if \(playerTime >= clipEnd\)/);
+  assert.match(reelCardSource, /if \(playerTime \+ 0\.01 >= clipEnd\)/);
   assert.match(
     reelCardSource,
-    /if \(playerTime >= clipEnd\) \{[\s\S]*?if \(!didHandleClipEndRef\.current\) \{[\s\S]*?player\.pauseVideo\(\);[\s\S]*?if \(autoplayEnabledRef\.current/,
+    /if \(playerTime \+ 0\.01 >= clipEnd\) \{[\s\S]*?if \(!didHandleClipEndRef\.current\) \{[\s\S]*?player\.pauseVideo\(\);[\s\S]*?if \(autoplayEnabledRef\.current/,
   );
   assert.match(reelCardSource, /event\.target\.seekTo\(clipStart, true\)/);
   assert.doesNotMatch(reelCardSource, /clipStart \+ 1/);

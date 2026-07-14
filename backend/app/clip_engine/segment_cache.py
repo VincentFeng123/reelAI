@@ -17,9 +17,43 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_CACHE_VERSION = 5
+SEGMENT_CACHE_VERSION = 6
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v5"
+SELECTION_CONTRACT_VERSION = "quality_silence_v6"
+
+
+def _objective_tokens(clip: Mapping[str, Any]) -> set[str]:
+    generic = {
+        "complete",
+        "concept",
+        "example",
+        "explain",
+        "idea",
+        "learn",
+        "lesson",
+        "point",
+        "teach",
+        "understand",
+        "work",
+    }
+    return {
+        token
+        for token in re.findall(
+            r"[a-z0-9]+",
+            f"{clip.get('learning_objective', '')} {clip.get('facet', '')}".casefold(),
+        )
+        if len(token) >= 2 and token not in generic
+    }
+
+
+def _semantic_restatement(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    left_tokens = _objective_tokens(left)
+    right_tokens = _objective_tokens(right)
+    smaller = min(len(left_tokens), len(right_tokens))
+    if smaller < 2:
+        return False
+    shared = len(left_tokens & right_tokens)
+    return shared >= 2 and shared / smaller >= 0.8
 
 
 def _canonical_json(value: Any) -> str:
@@ -49,10 +83,16 @@ def _relevant_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
 def _segmenter_source_signature() -> str | None:
     """Invalidate cache entries whenever the active prompt or validators change."""
     try:
-        from ...pipeline import gemini_segment
+        from ...pipeline import discourse, gemini_segment, sentences
 
-        source_path = Path(str(gemini_segment.__file__ or ""))
-        return hashlib.sha256(source_path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        for module in (gemini_segment, discourse, sentences):
+            source_path = Path(str(module.__file__ or ""))
+            digest.update(source_path.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(source_path.read_bytes())
+            digest.update(b"\0")
+        return digest.hexdigest()
     except (OSError, TypeError, ValueError):
         return None
 
@@ -161,7 +201,7 @@ def _valid_clips(
         return None
     transcript_start, transcript_end = bounds
     clips: list[dict[str, Any]] = []
-    previous_order: tuple[int, float, float, float, float, float, str] | None = None
+    previous_order: tuple[int, float, float, float, float, float] | None = None
     for index, raw in enumerate(value, start=1):
         if not isinstance(raw, dict):
             return None
@@ -223,7 +263,6 @@ def _valid_clips(
             -topic_relevance,
             start,
             end,
-            str(raw.get("selection_candidate_id") or ""),
         )
         if (
             not all(
@@ -249,7 +288,7 @@ def _valid_clips(
             or not 0 <= informativeness <= 1
             or not 0 <= topic_relevance <= 1
             or not 0 <= educational_importance <= 1
-            or topic_relevance < 0.75
+            or quality_floor < 0.75
             or not 0 <= difficulty <= 1
             or raw.get("self_contained") is not True
             or raw.get("is_standalone") is not True
@@ -270,11 +309,7 @@ def _valid_clips(
             or not _valid_assessment(raw.get("assessment"))
         ):
             return None
-        if any(
-            min(end, float(prior["end"])) - max(start, float(prior["start"]))
-            >= 0.8 * min(end - start, float(prior["end"]) - float(prior["start"]))
-            for prior in clips
-        ):
+        if any(_semantic_restatement(raw, prior) for prior in clips):
             return None
         clips.append(dict(raw))
         previous_order = order_key

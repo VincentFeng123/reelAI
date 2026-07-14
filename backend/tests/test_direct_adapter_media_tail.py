@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,6 +24,27 @@ from backend.app.ingestion import pipeline as pipeline_module  # noqa: E402
 
 VIDEO_ID = "dQw4w9WgXcQ"
 SOURCE_URL = f"https://www.youtube.com/watch?v={VIDEO_ID}"
+
+
+class _SemanticVector:
+    def __init__(self, score: float) -> None:
+        self.score = score
+
+    def dot(self, _other) -> float:
+        return self.score
+
+
+class _FixedSemanticEmbedding:
+    semantic_available = True
+
+    def __init__(self, score: float) -> None:
+        self.score = score
+        self.inputs: list[list[str]] = []
+
+    def embed_semantic(self, texts):
+        values = [str(text) for text in texts]
+        self.inputs.append(values)
+        return [_SemanticVector(self.score) for _text in values]
 
 
 def _media_tail_engine_out() -> dict:
@@ -150,6 +172,45 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         self.assertAlmostEqual(float(row["t_start"]), 0.0)
         self.assertAlmostEqual(float(row["t_end"]), 10.2)
 
+    def test_direct_selector_overlaps_audio_preparation(self) -> None:
+        audio_started = threading.Event()
+        selector_released_audio = threading.Event()
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/parallel",
+            ),
+        )
+
+        def prepare(*_args, **_kwargs):
+            audio_started.set()
+            self.assertTrue(selector_released_audio.wait(timeout=1.0))
+            return prepared
+
+        def select(*_args, **_kwargs):
+            self.assertTrue(audio_started.wait(timeout=1.0))
+            selector_released_audio.set()
+            return _media_tail_engine_out()
+
+        with (
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "prepare_audio_source",
+                side_effect=prepare,
+            ),
+            mock.patch.object(pipeline_module, "_run_clip", side_effect=select),
+        ):
+            engine_out, result = pipeline_module._run_direct_clip_with_audio_prefetch(
+                SOURCE_URL,
+                topic="photosynthesis",
+                language="en",
+                should_cancel=None,
+                generation_context=pipeline_module.GenerationContext("fast"),
+            )
+
+        self.assertEqual(engine_out["video_id"], VIDEO_ID)
+        self.assertIs(result, prepared)
+
     def test_url_adapter_persists_acoustic_tail_within_prepared_media(self) -> None:
         run_patch, meta_patch, prepare_patch, verify_patch = self._patch_media_tail()
         with (
@@ -169,9 +230,12 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         self.assertAlmostEqual(result.reel.t_end, 10.2)
         self.assertAlmostEqual(result.metadata.duration_sec, 12.0)
         self.assertAlmostEqual(
-            mock_verify.call_args.kwargs["search_end_limit_sec"], 10.0
+            mock_verify.call_args.kwargs["search_end_limit_sec"], 12.0
         )
-        self.assertTrue(mock_verify.call_args.kwargs["require_speech_handoff"])
+        self.assertFalse(mock_verify.call_args.kwargs["require_speech_handoff"])
+        self.assertFalse(
+            mock_verify.call_args.kwargs["require_end_speech_handoff"]
+        )
         self._assert_persisted_tail(result.reel.reel_id)
 
     def test_topic_cut_adapter_persists_acoustic_tail_within_prepared_media(self) -> None:
@@ -196,9 +260,12 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
         self.assertAlmostEqual(result.duration_sec, 12.0)
         self.assertAlmostEqual(result.metadata.duration_sec, 12.0)
         self.assertAlmostEqual(
-            mock_verify.call_args.kwargs["search_end_limit_sec"], 10.0
+            mock_verify.call_args.kwargs["search_end_limit_sec"], 12.0
         )
-        self.assertTrue(mock_verify.call_args.kwargs["require_speech_handoff"])
+        self.assertFalse(mock_verify.call_args.kwargs["require_speech_handoff"])
+        self.assertFalse(
+            mock_verify.call_args.kwargs["require_end_speech_handoff"]
+        )
         self._assert_persisted_tail(result.reels[0].reel_id)
 
     def test_direct_adapter_rejects_acoustic_crossing_next_unselected_cue(self) -> None:
@@ -249,6 +316,217 @@ class DirectAdapterMediaTailTests(unittest.TestCase):
 
         self.assertEqual(clips, [])
         self.assertEqual(verify.call_args.kwargs["search_end_limit_sec"], 10.0)
+
+    def test_direct_adapter_requires_each_quality_score_at_green_threshold(self) -> None:
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/quality",
+                duration_sec=10.0,
+            ),
+        )
+        acoustic = pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "verified",
+            0.0,
+            10.0,
+            {
+                "semantic_start_limit_sec": 0.0,
+                "semantic_end_limit_sec": 10.0,
+            },
+        )
+        for field in (
+            "informativeness",
+            "topic_relevance",
+            "educational_importance",
+        ):
+            with self.subTest(field=field):
+                engine_out = _media_tail_engine_out()
+                engine_out["clips"][0][field] = 0.74
+                with (
+                    mock.patch.object(
+                        pipeline_module.clip_engine_silence,
+                        "prepare_audio_source",
+                        return_value=prepared,
+                    ),
+                    mock.patch.object(
+                        pipeline_module.clip_engine_silence,
+                        "verify_acoustic_boundaries",
+                        return_value=acoustic,
+                    ) as verify,
+                ):
+                    clips = pipeline_module._verified_direct_adapter_clips(
+                        source_url=SOURCE_URL,
+                        engine_out=engine_out,
+                        should_cancel=None,
+                    )
+
+                self.assertEqual(clips, [])
+                verify.assert_not_called()
+
+        engine_out = _media_tail_engine_out()
+        for field in (
+            "informativeness",
+            "topic_relevance",
+            "educational_importance",
+        ):
+            engine_out["clips"][0][field] = 0.75
+        with (
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "prepare_audio_source",
+                return_value=prepared,
+            ),
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "verify_acoustic_boundaries",
+                return_value=acoustic,
+            ),
+        ):
+            clips = pipeline_module._verified_direct_adapter_clips(
+                source_url=SOURCE_URL,
+                engine_out=engine_out,
+                should_cancel=None,
+            )
+
+        self.assertEqual(len(clips), 1)
+
+    def test_direct_topic_gate_rejects_unrelated_self_certified_clip(self) -> None:
+        engine_out = _media_tail_engine_out()
+        unrelated = (
+            "An operating system schedules processes, manages virtual memory, "
+            "and provides file system abstractions."
+        )
+        engine_out["transcript"]["segments"][0]["text"] = unrelated
+        engine_out["clips"][0]["topic_evidence_quote"] = unrelated
+        embedding = _FixedSemanticEmbedding(0.199)
+
+        with (
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "prepare_audio_source",
+            ) as prepare,
+            mock.patch.object(
+                pipeline_module.clip_engine_silence,
+                "verify_acoustic_boundaries",
+            ) as verify,
+        ):
+            clips = pipeline_module._verified_direct_adapter_clips(
+                source_url=SOURCE_URL,
+                engine_out=engine_out,
+                should_cancel=None,
+                exact_topic="biology",
+                embedding_service=embedding,
+            )
+
+        self.assertEqual(clips, [])
+        self.assertEqual(embedding.inputs, [["biology", unrelated]])
+        prepare.assert_not_called()
+        verify.assert_not_called()
+
+    def test_direct_topic_gate_accepts_semantic_floor_with_one_batched_call(self) -> None:
+        first_quote = (
+            "Giving up the next best alternative is the real economic sacrifice "
+            "made whenever a person chooses."
+        )
+        second_quote = (
+            "Past expenditures that cannot be recovered should not change the "
+            "choice between future alternatives."
+        )
+        engine_out = _media_tail_engine_out()
+        engine_out["transcript"]["segments"] = [
+            {"cue_id": "choice", "start": 0.0, "end": 10.0, "text": first_quote},
+            {"cue_id": "past", "start": 11.0, "end": 20.0, "text": second_quote},
+        ]
+        engine_out["transcript"]["duration"] = 20.0
+        first_clip = engine_out["clips"][0]
+        first_clip["cue_ids"] = ["choice"]
+        first_clip["topic_evidence_quote"] = first_quote
+        second_clip = {
+            **first_clip,
+            "start": 11.0,
+            "end": 20.0,
+            "cue_ids": ["past"],
+            "topic_evidence_quote": second_quote,
+            "selection_candidate_id": "past-candidate",
+            "sequence_index": 1,
+        }
+        engine_out["clips"] = [first_clip, second_clip]
+        embedding = _FixedSemanticEmbedding(0.20)
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/comparison",
+                duration_sec=20.0,
+            ),
+        )
+
+        def verify(_source_url, start_sec, end_sec, **_kwargs):
+            return pipeline_module.clip_engine_silence.SilenceVerificationResult(
+                "verified", start_sec, end_sec, {}
+            )
+
+        with mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "verify_acoustic_boundaries",
+            side_effect=verify,
+        ):
+            clips = pipeline_module._verified_direct_adapter_clips(
+                source_url=SOURCE_URL,
+                engine_out=engine_out,
+                should_cancel=None,
+                prepared_audio=prepared,
+                exact_topic="opportunity cost versus sunk cost",
+                embedding_service=embedding,
+            )
+
+        self.assertEqual(len(clips), 2)
+        self.assertEqual(
+            embedding.inputs,
+            [[
+                "opportunity cost versus sunk cost",
+                "opportunity cost",
+                "sunk cost",
+                first_quote,
+                second_quote,
+            ]],
+        )
+
+    def test_direct_topic_gate_accepts_explicit_comparison_component_lexically(self) -> None:
+        engine_out = _media_tail_engine_out()
+        quote = (
+            "Opportunity cost is the value of the next best alternative given up "
+            "when making a choice."
+        )
+        engine_out["transcript"]["segments"][0]["text"] = quote
+        engine_out["clips"][0]["topic_evidence_quote"] = quote
+        embedding = _FixedSemanticEmbedding(0.0)
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/comparison-lexical",
+                duration_sec=10.0,
+            ),
+        )
+        acoustic = pipeline_module.clip_engine_silence.SilenceVerificationResult(
+            "verified", 0.0, 10.0, {}
+        )
+
+        with mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "verify_acoustic_boundaries",
+            return_value=acoustic,
+        ):
+            clips = pipeline_module._verified_direct_adapter_clips(
+                source_url=SOURCE_URL,
+                engine_out=engine_out,
+                should_cancel=None,
+                prepared_audio=prepared,
+                exact_topic="opportunity cost versus sunk cost",
+                embedding_service=embedding,
+            )
+
+        self.assertEqual(len(clips), 1)
+        self.assertEqual(embedding.inputs, [])
 
 
 if __name__ == "__main__":

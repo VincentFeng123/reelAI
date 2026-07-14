@@ -155,7 +155,7 @@ def test_topic_evidence_quote_requires_five_to_forty_words(quote, reason):
     assert report.rejected_reasons == [reason]
 
 
-def test_near_exact_topic_evidence_is_repaired_to_transcript_words():
+def test_near_exact_topic_evidence_is_rejected_instead_of_rewritten():
     segments = [{
         "start": 0.0,
         "end": 12.0,
@@ -180,11 +180,33 @@ def test_near_exact_topic_evidence_is_repaired_to_transcript_words():
         topic="mitochondria",
     )
 
-    assert len(report.clips) == 1
-    assert report.clips[0]["topic_evidence_quote"] == (
-        "Mitochondria transform chemical energy from nutrients into ATP for cells"
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:ungrounded_topic_evidence_quote"]
+
+
+def test_near_exact_topic_evidence_cannot_invert_negation():
+    text = "Vaccination does increase immune memory after controlled antigen exposure."
+    proposal = _topic(
+        "Immune memory",
+        0,
+        0,
+        start_quote="Vaccination does increase",
+        end_quote="controlled antigen exposure",
+        topic_evidence_quote=(
+            "Vaccination does not increase immune memory after controlled antigen exposure"
+        ),
     )
-    assert report.clips[0]["_quote_repaired"] is True
+
+    report = G._plan_to_report(
+        G._BoundaryPlan(topics=[proposal]),
+        [{"start": 0.0, "end": 12.0, "text": text}],
+        [],
+        {},
+        topic="vaccination",
+    )
+
+    assert report.clips == []
+    assert report.rejected_reasons == ["proposal_0:ungrounded_topic_evidence_quote"]
 
 
 def test_selector_rejects_clip_that_requires_a_separate_prerequisite():
@@ -420,7 +442,7 @@ def test_interpolated_words_never_tighten_physical_boundaries():
         "T", 0, 0,
         start_quote="topic starts",
         end_quote="ends now",
-        topic_evidence_quote="intro then the real topic starts here",
+        topic_evidence_quote="topic starts here and ends now",
         summary="The real topic starts and ends now.",
         takeaways=["The topic starts here.", "The topic ends now."],
         match_reason="The topic starts in this explanation.",
@@ -626,7 +648,10 @@ def test_production_flash_is_compact_exhaustive_boundary_first():
 
     assert G.PRODUCTION_FLASH_PROFILE == G.FLASH_SPLIT_PROFILE
     assert "duration is never a selection criterion" in prompt
-    assert "topic_relevance is at least 0.75" in prompt
+    assert (
+        "informativeness, topic_relevance, and educational_importance\n"
+        "  are each at least 0.75"
+    ) in prompt
     assert "low or medium uncertainty" in prompt
     assert "omit only high-uncertainty" in prompt
     assert G._BOUNDARY_OUTPUT_TOKENS == 12_288

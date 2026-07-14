@@ -153,6 +153,12 @@ _FORWARD_SOLUTION_CONTINUATION_RE = re.compile(
     r"^\s*(?:so\s+)?instead\b",
     re.IGNORECASE,
 )
+_TERMINAL_EXEMPLIFICATION_RE = re.compile(
+    r"(?:^|[.!?;,]\s+)(?P<so>so\s*[,]?\s+)?"
+    r"(?:for\s+(?:example|instance)|such\s+as)\s*[,]?\s*"
+    r"(?P<tail>[^.!?]*)$",
+    re.IGNORECASE,
+)
 _TERMINAL_STRANDED_PREPOSITION_RE = re.compile(
     r"\b(?:a|an|the|this|that|these|those|our|your|their)\s+"
     r"(?:[a-z][a-z'-]*\s+){1,4}(?:(?:that|which|who|whom)\s+)?"
@@ -211,7 +217,6 @@ _ENRICH_OUTPUT_TOKENS = 2_048
 _MAX_CLIPS = 40
 _GREEN_SCORE = 0.75
 _DUPLICATE_OVERLAP = 0.8
-_MAX_INTERNAL_FILLER_BLOCKS = 1
 _MAX_INTERNAL_FILLER_DURATION_S = 12.0
 _MAX_INTERNAL_FILLER_WORDS = 32
 _SECTION_RESET_GAP_S = 8.0
@@ -406,8 +411,11 @@ _POLICY_AND_EXAMPLES = """Policy:
   clearly useful prerequisite or supporting facets, not merely adjacent material.
 - Include every necessary setup or prerequisite through the explanation's natural
   conclusion. For a worked example, include the question or setup, reasoning, and answer.
+- Give each candidate exactly one coherent learning objective. When adjacent speech teaches
+  independent facets, return separate candidates for those facets instead of bundling them.
 - Omit greetings, credentials, sponsors, administration, promos, transitions, previews,
-  recaps, outros, jokes, tangents, repeated restatements, and partial explanations.
+  recaps, outros, atmospheric hooks, scene-setting, colorful flourishes, audience banter,
+  post-conclusion jokes, tangents, repeated restatements, and partial explanations.
 - Keep starts and ends free of that filler. Never add filler or incomplete material at an
   opening or ending. A brief nonessential aside inside an otherwise
   valuable complete unit may remain when cutting around it would break the teaching arc;
@@ -421,10 +429,18 @@ _POLICY_AND_EXAMPLES = """Policy:
   teach the same learning objective in different words.
 - Return every qualifying related unit, while scoring the densest, most useful, and most
   central units highest so the application can prioritize them within difficulty stages.
-- Return a candidate when topic_relevance is at least 0.75 and the spoken unit satisfies
-  every substantive, grounding, context, and filler rule. Informativeness and educational
-  importance describe the unit but never exclude an otherwise valid relevant unit.
-- Copy exact transcript line IDs and exact opening/closing quotes.
+- Return a candidate only when informativeness, topic_relevance, and educational_importance
+  are each at least 0.75 and the spoken unit satisfies every substantive, grounding,
+  context, and filler rule.
+- Copy exact transcript line IDs and exact opening/closing quotes. start_quote must be the
+  first words a cold viewer needs to hear for this one teaching objective, after every
+  atmospheric hook, scene-setting flourish, or opening joke. end_quote must be the last
+  words of its complete conclusion, before audience banter, a next-topic setup, or a
+  post-conclusion joke. Quotes may begin or end inside a coarse transcript line. Copy each
+  quote exactly and make it specific enough to occur only once in its cited edge line.
+- A worked example cannot end at its question, setup, or first substituted value. Either
+  include its reasoning and answer through end_quote or end the candidate before that
+  optional example begins.
 - Do not provide chain-of-thought or hidden reasoning.
 
 Examples:
@@ -519,7 +535,8 @@ def _learner_rule(level: str) -> str:
 def _selection_fields(*, enriched: bool) -> str:
     fields = (
         "candidate_id (a short unique slug), start_line, end_line, start_quote and "
-        "end_quote (each an exact short edge quote), title (at most 12 words), "
+        "end_quote (each an exact, unique short quote marking the first required teaching "
+        "words and last complete conclusion, even inside a coarse line), title (at most 12 words), "
         "learning_objective (at most 24 words), facet (at most 12 words), "
         "informativeness, topic_relevance, "
         "educational_importance, difficulty, directly_teaches_topic, substantive, "
@@ -590,13 +607,16 @@ def _boundary_prompts(
         "do not stop after the first few units or at an arbitrary count below that cap.\n"
         "3. For every qualifying unit, verify its timestamps and choose the minimum complete "
         "span containing necessary setup, reasoning, and the natural conclusion, regardless "
-        "of its duration. Keep opening and ending edges clean. Split around a substantial "
+        "of its duration. Give it exactly one learning objective. Split independent adjacent "
+        "facets into separate candidates even when they share one coarse transcript line. "
+        "Keep opening and ending edges clean. Split around a substantial "
         "interruption, but keep a brief internal aside when removing it would break an "
         "otherwise valuable complete arc. Omit only high-uncertainty boundaries; low or "
         "medium uncertainty is allowed. Omit material that requires an unseen visual.\n"
         "4. Score topic relevance, information density, educational value, and difficulty "
-        "honestly. Informativeness and educational_importance prioritize clips later; they "
-        "are not exclusion thresholds. Difficulty is metadata, not an eligibility filter; "
+        "honestly. Return a unit only when topic_relevance, informativeness, and "
+        "educational_importance are each at least 0.75. Difficulty is metadata, not an "
+        "eligibility filter; "
         "it records prior knowledge only: 0.00-0.33 means "
         "beginner, 0.34-0.66 means intermediate, and 0.67-1.00 means advanced. Return units "
         "across that entire scale.\n"
@@ -782,40 +802,6 @@ def _exact_boundary_quote(text: str, *, want: str) -> str:
         return ""
     chosen = matches[:6] if want == "start" else matches[-6:]
     return (text or "")[chosen[0].start():chosen[-1].end()]
-
-
-def _repair_topic_evidence_quote(text: str, quote: str) -> str | None:
-    """Recover a nearly copied evidence quote as an exact transcript span."""
-    quote_tokens = _toks(quote)
-    matches = list(_WORD_RE.finditer(text or ""))
-    if not 5 <= len(quote_tokens) <= 40 or len(matches) < 5:
-        return None
-    try:
-        from rapidfuzz import fuzz
-
-        score_fn = lambda a, b: float(fuzz.ratio(a, b))
-    except Exception:  # pragma: no cover - rapidfuzz is a required dependency
-        from difflib import SequenceMatcher
-
-        score_fn = lambda a, b: 100.0 * SequenceMatcher(None, a, b).ratio()
-
-    target = " ".join(quote_tokens)
-    best: tuple[float, int, int] | None = None
-    for window_size in range(
-        max(5, len(quote_tokens) - 2),
-        min(40, len(quote_tokens) + 2, len(matches)) + 1,
-    ):
-        for start in range(len(matches) - window_size + 1):
-            end = start + window_size
-            candidate = " ".join(
-                match.group(0).lower() for match in matches[start:end]
-            )
-            score = score_fn(target, candidate)
-            if best is None or score > best[0]:
-                best = (score, start, end)
-    if best is None or best[0] < 90.0:
-        return None
-    return (text or "")[matches[best[1]].start():matches[best[2] - 1].end()]
 
 
 def _locate_quote_match(
@@ -1081,8 +1067,23 @@ def _cue_has_explicit_dangling_end(text: str, next_text: str) -> bool:
         or _TERMINAL_DANGLING_ARTICLE_RE.search(raw_text)
         or _TERMINAL_DANGLING_DEGREE_RE.search(raw_text)
         or ambiguous_degree_continues
+        or _has_unfinished_exemplification_tail(raw_text)
         or re.search(r"[,;:\-—][\"')\]]*$", raw_text)
     )
+
+
+def _has_unfinished_exemplification_tail(text: str) -> bool:
+    """Detect a terminal example setup that never reaches its explanatory clause."""
+    raw_text = str(text or "").strip()
+    match = _TERMINAL_EXEMPLIFICATION_RE.search(raw_text)
+    if match is None:
+        return False
+    tail_words = _toks(match.group("tail"))
+    if not tail_words:
+        return True
+    if match.group("so") and len(tail_words) <= 3:
+        return True
+    return len(tail_words) <= 2 and not re.search(r"[.!?][\"')\]]*$", raw_text)
 
 
 def _cue_boundary_confidence(text: str, *, ignore_caption_case: bool) -> float:
@@ -1166,12 +1167,6 @@ def _close_cue_context(
             - float(segments[left].get("end", 0.0))
             >= _SECTION_RESET_GAP_S
         )
-
-    if any(
-        crosses_section_reset(line, line + 1)
-        for line in range(start_line, end_line)
-    ):
-        return start_line, end_line, "crosses_section_reset"
 
     following_text = (
         str(segments[end_line + 1].get("text") or "")
@@ -1354,126 +1349,179 @@ def _cue_is_only_structural_filler(text: str) -> bool:
     return set(_toks("".join(remainder))).issubset(_FILLER_REMAINDER_WORDS)
 
 
-def _quote_character_span(text: str, quote: str) -> tuple[int, int] | None:
+def _quote_character_spans(text: str, quote: str) -> list[tuple[int, int]]:
     text_matches = list(_WORD_RE.finditer(str(text or "")))
     quote_tokens = _toks(quote)
     if not quote_tokens or len(quote_tokens) > len(text_matches):
-        return None
+        return []
     text_tokens = [match.group(0).casefold() for match in text_matches]
+    spans: list[tuple[int, int]] = []
     for index in range(len(text_tokens) - len(quote_tokens) + 1):
         if text_tokens[index:index + len(quote_tokens)] == quote_tokens:
-            return (
+            spans.append((
                 text_matches[index].start(),
                 text_matches[index + len(quote_tokens) - 1].end(),
-            )
-    return None
+            ))
+    return spans
 
 
-def _mixed_edge_required_speech_time(
-    segment: dict,
-    words: list[dict],
+def _quote_character_span(text: str, quote: str) -> tuple[int, int] | None:
+    spans = _quote_character_spans(text, quote)
+    return spans[0] if spans else None
+
+
+def _semantic_edge_quote(
+    text: str,
     quote: str,
     *,
     want: str,
-) -> tuple[bool, float | None]:
-    """Align a mixed filler/teaching cue to the first or last required quote."""
-    text = str(segment.get("text") or "")
-    matches = _structural_filler_matches(text)
-    if not matches or _cue_is_only_structural_filler(text):
-        return False, None
-    quote_span = _quote_character_span(text, quote)
-    aligned_quote = quote
+) -> tuple[tuple[int, int] | None, bool, str | None]:
+    """Ground one semantic edge without inventing a timestamp.
 
-    def is_brief_acknowledgment(match: re.Match[str]) -> bool:
-        return tuple(_toks(match.group(0))) in {
-            ("brilliant",),
-            ("cool",),
-            ("fun", "fact"),
-            ("hey",),
-        }
-
-    if want == "start":
-        edge_matches = [
-            match
-            for match in matches
-            if not re.search(r"[.!?]", text[:match.start()])
-            and len(_toks(text[:match.start()])) <= 5
-            and _WORD_RE.search(text[match.end():])
-        ]
-        if (
-            edge_matches
-            and all(is_brief_acknowledgment(match) for match in edge_matches)
-            and quote_span is not None
-        ):
-            filler_end = max(match.end() for match in edge_matches)
-            if quote_span[0] < filler_end < quote_span[1]:
-                teaching_start = _WORD_RE.search(text, filler_end)
-                if teaching_start is not None:
-                    quote_span = (teaching_start.start(), quote_span[1])
-                    aligned_quote = text[quote_span[0]:quote_span[1]].strip()
-        aligned = bool(
-            edge_matches
-            and quote_span is not None
-            and max(match.end() for match in edge_matches) <= quote_span[0]
-        )
-    else:
-        edge_matches = [
-            match
-            for match in matches
-            if _WORD_RE.search(text[:match.start()])
-            and not _WORD_RE.search(text[match.end():])
-        ]
-        if (
-            edge_matches
-            and all(is_brief_acknowledgment(match) for match in edge_matches)
-            and quote_span is not None
-        ):
-            filler_start = min(match.start() for match in edge_matches)
-            if quote_span[0] < filler_start < quote_span[1]:
-                teaching_words = [
-                    match
-                    for match in _WORD_RE.finditer(text, quote_span[0], filler_start)
-                ]
-                if teaching_words:
-                    quote_span = (quote_span[0], teaching_words[-1].end())
-                    aligned_quote = text[quote_span[0]:quote_span[1]].strip()
-        aligned = bool(
-            edge_matches
-            and quote_span is not None
-            and min(match.start() for match in edge_matches) >= quote_span[1]
-        )
-    if not edge_matches:
-        return False, None
-    if not aligned:
-        return True, None
-
-    start = float(segment.get("start") or 0.0)
-    end = float(segment.get("end") or start)
-    located = _locate_quote(words, aligned_quote, start, end, want)
-    if located is not None:
-        return True, located
-
-    token_matches = list(_WORD_RE.finditer(text))
-    assert quote_span is not None
-    if not token_matches or end <= start:
-        return True, None
-    if want == "start":
-        token_index = next(
-            (index for index, match in enumerate(token_matches) if match.start() == quote_span[0]),
-            None,
-        )
-        fraction = None if token_index is None else token_index / len(token_matches)
-    else:
-        token_index = next(
-            (index for index, match in enumerate(token_matches) if match.end() == quote_span[1]),
-            None,
-        )
-        fraction = None if token_index is None else (token_index + 1) / len(token_matches)
-    return (
-        (True, None)
-        if fraction is None
-        else (True, start + (end - start) * fraction)
+    The edge occurrence nearest the physical cue edge is authoritative when the quote
+    already begins/ends the cue. A quote that excludes real words requires projection and
+    therefore must have exactly one normalized occurrence in that cue.
+    """
+    word_matches = list(_WORD_RE.finditer(str(text or "")))
+    spans = _quote_character_spans(text, quote)
+    if not word_matches or not spans:
+        return None, False, "ungrounded_boundary_quote"
+    span = spans[0] if want == "start" else spans[-1]
+    projected = bool(
+        _WORD_RE.search(text[:span[0]])
+        if want == "start"
+        else _WORD_RE.search(text[span[1]:])
     )
+    if projected and len(spans) != 1:
+        return None, True, f"ambiguous_{want}_quote"
+    return span, projected, None
+
+
+def _expanded_context_edge_quote(
+    text: str,
+    *,
+    want: str,
+) -> tuple[str, str | None]:
+    """Choose an exact edge quote after safely removable filler-only sentences."""
+    raw_text = str(text or "")
+    sentence_spans = [
+        (match.start(), match.end())
+        for match in re.finditer(r"[^.!?]+(?:[.!?]+|$)", raw_text)
+        if _WORD_RE.search(match.group(0))
+    ]
+    if not sentence_spans:
+        return "", "empty_expanded_context_edge"
+
+    retained_left = 0
+    retained_right = len(raw_text)
+    ordered_spans = sentence_spans if want == "start" else list(reversed(sentence_spans))
+    for left, right in ordered_spans:
+        sentence = raw_text[left:right]
+        matches = _structural_filler_matches(sentence)
+        if not matches:
+            break
+        if _cue_is_only_structural_filler(sentence):
+            if want == "start":
+                retained_left = right
+            else:
+                retained_right = left
+            continue
+
+        edge_matches = [
+            match
+            for match in matches
+            if (
+                (
+                    not re.search(r"[.!?]", sentence[:match.start()])
+                    and len(_toks(sentence[:match.start()])) <= 5
+                    and _WORD_RE.search(sentence[match.end():]) is not None
+                )
+                if want == "start"
+                else (
+                    _WORD_RE.search(sentence[:match.start()]) is not None
+                    and _WORD_RE.search(sentence[match.end():]) is None
+                )
+            )
+        ]
+        if edge_matches:
+            inline_boundary_applied = False
+            if want == "start":
+                match = max(edge_matches, key=lambda value: value.end())
+                separator = re.match(r"\s*[,;:—-]\s*", sentence[match.end():])
+                if separator is not None:
+                    retained_left = left + match.end() + separator.end()
+                    inline_boundary_applied = True
+            else:
+                match = min(edge_matches, key=lambda value: value.start())
+                separator = re.search(r"[,;:—-]\s*$", sentence[:match.start()])
+                if separator is not None:
+                    retained_right = left + separator.start()
+                    inline_boundary_applied = True
+            if inline_boundary_applied:
+                break
+            return "", "unresolved_expanded_edge_filler"
+        break
+
+    retained_words = [
+        match
+        for match in _WORD_RE.finditer(raw_text)
+        if retained_left <= match.start() and match.end() <= retained_right
+    ]
+    if not retained_words:
+        return "", "empty_expanded_context_edge"
+    chosen = retained_words[:6] if want == "start" else retained_words[-6:]
+    return raw_text[chosen[0].start():chosen[-1].end()], None
+
+
+def _edge_has_unresolved_structural_filler(
+    text: str,
+    quote_span: tuple[int, int],
+    *,
+    want: str,
+) -> bool:
+    """Reject structural filler that the semantic quote still leaves on an edge."""
+    for match in _structural_filler_matches(text):
+        if want == "start":
+            is_edge_match = (
+                not re.search(r"[.!?]", text[:match.start()])
+                and len(_toks(text[:match.start()])) <= 5
+                and _WORD_RE.search(text[match.end():])
+            )
+            if is_edge_match and quote_span[0] < match.end():
+                return True
+        else:
+            is_edge_match = (
+                _WORD_RE.search(text[:match.start()])
+                and not _WORD_RE.search(text[match.end():])
+            )
+            if is_edge_match and quote_span[1] > match.start():
+                return True
+    return False
+
+
+def _semantic_clip_slice(
+    segments: list[dict],
+    start_line: int,
+    end_line: int,
+    *,
+    start_span: tuple[int, int] | None,
+    end_span: tuple[int, int] | None,
+) -> tuple[str, dict[str, tuple[int, int]]]:
+    """Return transcript speech between projected edge quotes, including internal asides."""
+    parts: list[str] = []
+    spans_by_cue: dict[str, tuple[int, int]] = {}
+    for line in range(start_line, end_line + 1):
+        text = str(segments[line].get("text") or "")
+        left = start_span[0] if line == start_line and start_span is not None else 0
+        right = end_span[1] if line == end_line and end_span is not None else len(text)
+        if right <= left:
+            return "", {}
+        cue_id = str(segments[line].get("cue_id") or f"cue-{line}")
+        spans_by_cue[cue_id] = (left, right)
+        selected = text[left:right].strip()
+        if selected:
+            parts.append(selected)
+    return " ".join(parts).strip(), spans_by_cue
 
 
 def _trim_structural_filler_edges(
@@ -1515,7 +1563,7 @@ def _trim_structural_filler_edges(
 def _internal_structural_filler_reason(
     segments: list[dict], start_line: int, end_line: int,
 ) -> str | None:
-    """Allow one brief interruption, but reject substantial internal filler."""
+    """Tolerate brief internal interruptions, but reject substantial filler."""
     filler_lines = [
         line
         for line in range(start_line + 1, end_line)
@@ -1530,13 +1578,6 @@ def _internal_structural_filler_reason(
     ]
     if not filler_lines:
         return None
-
-    block_count = 1 + sum(
-        current != previous + 1
-        for previous, current in zip(filler_lines, filler_lines[1:])
-    )
-    if block_count > _MAX_INTERNAL_FILLER_BLOCKS:
-        return "multiple_internal_filler_blocks"
 
     duration = 0.0
     word_count = 0
@@ -1559,13 +1600,37 @@ def _internal_structural_filler_reason(
     return None
 
 
-def _cue_range_requires_visual_context(
-    segments: list[dict], start_line: int, end_line: int,
-) -> bool:
-    return any(
-        _VISUAL_DEPENDENCY_RE.search(str(segment.get("text") or ""))
-        for segment in segments[start_line:end_line + 1]
-    )
+def _same_cue_internal_filler_reason(text: str) -> str | None:
+    """Apply the existing filler budget to interruption blocks inside coarse cues."""
+    raw_text = str(text or "")
+    blocks: set[tuple[int, int]] = set()
+    for match in _INTERNAL_INTERRUPTION_MARKER_RE.finditer(raw_text):
+        if not _WORD_RE.search(raw_text[:match.start()]):
+            continue
+        if not _WORD_RE.search(raw_text[match.end():]):
+            continue
+        previous = max(
+            raw_text.rfind(".", 0, match.start()),
+            raw_text.rfind("!", 0, match.start()),
+            raw_text.rfind("?", 0, match.start()),
+        )
+        following = re.search(r"[.!?]", raw_text[match.end():])
+        right = (
+            match.end() + following.end()
+            if following is not None
+            else len(raw_text)
+        )
+        blocks.add((previous + 1, right))
+    if sum(
+        len(_toks(raw_text[left:right]))
+        for left, right in blocks
+    ) > _MAX_INTERNAL_FILLER_WORDS:
+        return "long_internal_filler_block"
+    return None
+
+
+def _clip_requires_visual_context(text: str) -> bool:
+    return bool(_VISUAL_DEPENDENCY_RE.search(str(text or "")))
 
 
 def _near_duplicate(a: dict, b: dict, threshold: float = _DUPLICATE_OVERLAP) -> bool:
@@ -1580,7 +1645,27 @@ def _near_duplicate(a: dict, b: dict, threshold: float = _DUPLICATE_OVERLAP) -> 
         if str(value).strip()
     }
     if a_cue_ids and b_cue_ids:
-        return bool(a_cue_ids & b_cue_ids)
+        shared = a_cue_ids & b_cue_ids
+        if not shared:
+            return False
+        a_semantic_spans = a.get("_semantic_spans_by_cue")
+        b_semantic_spans = b.get("_semantic_spans_by_cue")
+        if not isinstance(a_semantic_spans, dict) or not isinstance(
+            b_semantic_spans, dict
+        ):
+            return True
+        for cue_id in shared:
+            a_span = a_semantic_spans.get(cue_id)
+            b_span = b_semantic_spans.get(cue_id)
+            if (
+                isinstance(a_span, tuple)
+                and len(a_span) == 2
+                and isinstance(b_span, tuple)
+                and len(b_span) == 2
+                and max(a_span[0], b_span[0]) < min(a_span[1], b_span[1])
+            ):
+                return True
+        return False
 
     overlap = min(float(a["end"]), float(b["end"])) - max(float(a["start"]), float(b["start"]))
     if overlap <= 0:
@@ -1845,6 +1930,7 @@ def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
             -_quality_order(clip)[2],
             float(clip["start"]),
             float(clip["end"]),
+            int(clip.get("_proposal_index") or 0),
             str(clip.get("selection_candidate_id") or ""),
         ),
     )
@@ -1916,6 +2002,7 @@ def _finalize_clips(clips: list[dict], settings: dict) -> list[dict]:
             -_quality_order(clip)[2],
             float(clip["start"]),
             float(clip["end"]),
+            int(clip.get("_proposal_index") or 0),
             str(clip.get("selection_candidate_id") or ""),
         )
     )
@@ -1999,6 +2086,7 @@ def _plan_to_report(
                 or not isinstance(b, int) or a < 0 or b < 0 or a >= n or b >= n or a > b):
             report.rejected_reasons.append(f"{prefix}:bad_index")
             continue
+        selected_start_before_context = a
         selected_end_before_context = b
         context_repair_source_text = _cue_clip_text(
             segments, a, min(n - 1, b + 1)
@@ -2009,17 +2097,11 @@ def _plan_to_report(
         end_text = str(segments[b].get("text") or "").strip()
         quote_repaired = False
         if not _contains_quote(start_text, start_quote):
-            if type(proposal) is _BoundaryTopic and start_text:
-                quote_repaired = True
-            else:
-                report.rejected_reasons.append(f"{prefix}:bad_start_quote")
-                continue
+            report.rejected_reasons.append(f"{prefix}:bad_start_quote")
+            continue
         if not _contains_quote(end_text, end_quote):
-            if type(proposal) is _BoundaryTopic and end_text:
-                quote_repaired = True
-            else:
-                report.rejected_reasons.append(f"{prefix}:bad_end_quote")
-                continue
+            report.rejected_reasons.append(f"{prefix}:bad_end_quote")
+            continue
         info = _strict_score(proposal.informativeness)
         relevance = _strict_score(proposal.topic_relevance)
         raw_importance = getattr(proposal, "educational_importance", None)
@@ -2036,8 +2118,20 @@ def _plan_to_report(
         if info is None or relevance is None or importance is None or difficulty is None:
             report.rejected_reasons.append(f"{prefix}:score_out_of_range")
             continue
-        if relevance < _GREEN_SCORE:
-            report.rejected_reasons.append(f"{prefix}:topic_relevance_below_green")
+        below_green = next(
+            (
+                name
+                for name, score in (
+                    ("informativeness", info),
+                    ("topic_relevance", relevance),
+                    ("educational_importance", importance),
+                )
+                if score < _GREEN_SCORE
+            ),
+            None,
+        )
+        if below_green is not None:
+            report.rejected_reasons.append(f"{prefix}:{below_green}_below_green")
             continue
         if proposal.self_contained is not True:
             report.rejected_reasons.append(f"{prefix}:not_self_contained")
@@ -2080,8 +2174,32 @@ def _plan_to_report(
             report.rejected_reasons.append(f"{prefix}:{uncertainty}_uncertainty")
             continue
 
+        # Run discourse closure against the teaching slice the model selected, not
+        # against hook/joke text that is deliberately outside its exact edge quotes.
+        closure_segments = segments
+        preliminary_start_spans = _quote_character_spans(start_text, start_quote)
+        preliminary_end_spans = _quote_character_spans(end_text, end_quote)
+        if len(preliminary_start_spans) == 1 or len(preliminary_end_spans) == 1:
+            closure_segments = [dict(segment) for segment in segments]
+            start_left = (
+                preliminary_start_spans[0][0]
+                if len(preliminary_start_spans) == 1
+                else 0
+            )
+            end_right = (
+                preliminary_end_spans[0][1]
+                if len(preliminary_end_spans) == 1
+                else len(end_text)
+            )
+            if a == b:
+                if start_left < end_right:
+                    closure_segments[a]["text"] = start_text[start_left:end_right]
+            else:
+                closure_segments[a]["text"] = start_text[start_left:]
+                closure_segments[b]["text"] = end_text[:end_right]
+
         a, b, closure_error = _close_cue_context(
-            segments,
+            closure_segments,
             a,
             b,
             ignore_caption_case=ignore_caption_case,
@@ -2105,53 +2223,95 @@ def _plan_to_report(
         if internal_filler_reason:
             report.rejected_reasons.append(f"{prefix}:{internal_filler_reason}")
             continue
-        has_leading_edge_filler, required_first_speech = (
-            _mixed_edge_required_speech_time(
-                segments[a], words, start_quote, want="start"
-            )
-        )
-        has_trailing_edge_filler, required_last_speech = (
-            _mixed_edge_required_speech_time(
-                segments[b], words, end_quote, want="end"
-            )
-        )
-        if (
-            (has_leading_edge_filler and required_first_speech is None)
-            or (has_trailing_edge_filler and required_last_speech is None)
-        ):
-            report.rejected_reasons.append(f"{prefix}:unresolved_edge_filler_timing")
-            continue
         context_was_trimmed = b < selected_end_before_context
         start, end = _padded_cue_bounds(segments, a, b)
         if not math.isfinite(start) or not math.isfinite(end) or end <= start:
             report.rejected_reasons.append(f"{prefix}:reversed_cue_boundary")
             continue
-        if (
-            required_first_speech is not None
-            and required_last_speech is not None
-            and required_last_speech <= required_first_speech
-        ):
-            report.rejected_reasons.append(f"{prefix}:reversed_required_speech")
-            continue
         start, end = round(start, 3), round(end, 3)
 
-        clip_text = _cue_clip_text(segments, a, b)
-        if not clip_text:
+        full_clip_text = _cue_clip_text(segments, a, b)
+        if not full_clip_text:
             report.rejected_reasons.append(f"{prefix}:empty_cue_transcript")
             continue
-        if not _contains_quote(clip_text, start_quote):
-            start_quote = _exact_boundary_quote(clip_text, want="start")
+        if not _contains_quote(full_clip_text, start_quote):
+            if type(proposal) is _BoundaryTopic:
+                report.rejected_reasons.append(f"{prefix}:ungrounded_boundary_quote")
+                continue
+            start_quote = _exact_boundary_quote(full_clip_text, want="start")
             quote_repaired = True
-        if not _contains_quote(clip_text, end_quote):
-            end_quote = _exact_boundary_quote(clip_text, want="end")
+        if not _contains_quote(full_clip_text, end_quote):
+            if type(proposal) is _BoundaryTopic:
+                report.rejected_reasons.append(f"{prefix}:ungrounded_boundary_quote")
+                continue
+            end_quote = _exact_boundary_quote(full_clip_text, want="end")
             quote_repaired = True
         if not start_quote or not end_quote:
             report.rejected_reasons.append(f"{prefix}:ungrounded_boundary_quote")
             continue
+
+        start_span: tuple[int, int] | None = None
+        end_span: tuple[int, int] | None = None
+        if a != selected_start_before_context:
+            start_quote, edge_error = _expanded_context_edge_quote(
+                str(segments[a].get("text") or ""), want="start"
+            )
+            if edge_error:
+                report.rejected_reasons.append(f"{prefix}:{edge_error}")
+                continue
+            quote_repaired = True
+        start_span, start_projected, edge_error = _semantic_edge_quote(
+            str(segments[a].get("text") or ""), start_quote, want="start"
+        )
+        if edge_error:
+            report.rejected_reasons.append(f"{prefix}:{edge_error}")
+            continue
+        assert start_span is not None
+        if _edge_has_unresolved_structural_filler(
+            str(segments[a].get("text") or ""), start_span, want="start"
+        ):
+            report.rejected_reasons.append(f"{prefix}:unresolved_edge_filler")
+            continue
+
+        if b != selected_end_before_context:
+            end_quote, edge_error = _expanded_context_edge_quote(
+                str(segments[b].get("text") or ""), want="end"
+            )
+            if edge_error:
+                report.rejected_reasons.append(f"{prefix}:{edge_error}")
+                continue
+            quote_repaired = True
+        end_span, end_projected, edge_error = _semantic_edge_quote(
+            str(segments[b].get("text") or ""), end_quote, want="end"
+        )
+        if edge_error:
+            report.rejected_reasons.append(f"{prefix}:{edge_error}")
+            continue
+        assert end_span is not None
+        if _edge_has_unresolved_structural_filler(
+            str(segments[b].get("text") or ""), end_span, want="end"
+        ):
+            report.rejected_reasons.append(f"{prefix}:unresolved_edge_filler")
+            continue
+
+        clip_text, semantic_spans_by_cue = _semantic_clip_slice(
+            segments,
+            a,
+            b,
+            start_span=start_span if start_projected else None,
+            end_span=end_span if end_projected else None,
+        )
+        if not clip_text:
+            report.rejected_reasons.append(f"{prefix}:reversed_semantic_boundary")
+            continue
         if _contains_unrequested_vampire_pseudoscience(clip_text, topic):
             report.rejected_reasons.append(f"{prefix}:fictional_framing")
             continue
-        if _cue_range_requires_visual_context(segments, a, b):
+        same_cue_filler_reason = _same_cue_internal_filler_reason(clip_text)
+        if same_cue_filler_reason:
+            report.rejected_reasons.append(f"{prefix}:{same_cue_filler_reason}")
+            continue
+        if _clip_requires_visual_context(clip_text):
             report.rejected_reasons.append(f"{prefix}:requires_visual_context")
             continue
         topic_evidence_quote = " ".join(
@@ -2163,15 +2323,8 @@ def _plan_to_report(
                 report.rejected_reasons.append(f"{prefix}:invalid_topic_evidence_quote_length")
                 continue
             if not _contains_quote(clip_text, topic_evidence_quote):
-                repaired_evidence_quote = _repair_topic_evidence_quote(
-                    clip_text,
-                    topic_evidence_quote,
-                )
-                if repaired_evidence_quote is None:
-                    report.rejected_reasons.append(f"{prefix}:ungrounded_topic_evidence_quote")
-                    continue
-                topic_evidence_quote = repaired_evidence_quote
-                quote_repaired = True
+                report.rejected_reasons.append(f"{prefix}:ungrounded_topic_evidence_quote")
+                continue
         learning_objective = str(
             getattr(proposal, "learning_objective", "")
             or getattr(proposal, "reason", "")
@@ -2217,10 +2370,25 @@ def _plan_to_report(
             str(segments[line].get("cue_id") or f"cue-{line}")
             for line in range(a, b + 1)
         ]
+        edge_projection: dict[str, dict[str, object]] = {}
+        if start_projected:
+            edge_projection["start"] = {
+                "required": True,
+                "cue_id": cue_ids[0],
+                "quote": start_quote,
+            }
+        if end_projected:
+            edge_projection["end"] = {
+                "required": True,
+                "cue_id": cue_ids[-1],
+                "quote": end_quote,
+            }
         clip_id = f"clip-{index + 1:03d}-{a}-{b}"
         clip = {
             "start": start,
             "end": end,
+            "start_quote": start_quote,
+            "end_quote": end_quote,
             "title": clip_title,
             "learning_objective": learning_objective,
             "facet": clip_facet,
@@ -2249,6 +2417,8 @@ def _plan_to_report(
             "_end_line": b,
             "_clip_id": clip_id,
             "_clip_text": clip_text,
+            "_proposal_index": index,
+            "_semantic_spans_by_cue": semantic_spans_by_cue,
             "_quote_repaired": quote_repaired,
             "directly_teaches_topic": bool(
                 getattr(proposal, "directly_teaches_topic", True)
@@ -2261,10 +2431,8 @@ def _plan_to_report(
             "match_reason": "",
             "assessment": None,
         }
-        if required_first_speech is not None:
-            clip["required_first_speech_sec"] = round(required_first_speech, 3)
-        if required_last_speech is not None:
-            clip["required_last_speech_sec"] = round(required_last_speech, 3)
+        if edge_projection:
+            clip["edge_projection"] = edge_projection
         if hasattr(proposal, "summary"):
             details, errors = _learning_details(proposal, clip_text, topic)
             clip.update(details)
@@ -2309,7 +2477,13 @@ def _plan_to_report(
         clip.get("uncertainty") == "medium" for clip in raw
     )
     report.score_below_green = any(
-        float(clip["topic_relevance"]) < _GREEN_SCORE for clip in raw
+        min(
+            float(clip["informativeness"]),
+            float(clip["topic_relevance"]),
+            float(clip["educational_importance"]),
+        )
+        < _GREEN_SCORE
+        for clip in raw
     )
     for i, candidate in enumerate(raw):
         if any(_duplicates(candidate, other) for other in raw[i + 1:]):
@@ -2444,6 +2618,7 @@ def _call_model(
     prompt_version: str,
     cancelled: CancelledCb,
     budget_reserve: Optional[Callable[..., object]] = None,
+    max_retries: int = 1,
 ) -> tuple[BaseModel, dict]:
     from ..gemini_client import generate_json_v3
 
@@ -2471,7 +2646,7 @@ def _call_model(
             deadline_monotonic=deadline_monotonic,
             operation=operation,
             prompt_version=prompt_version,
-            max_retries=1,
+            max_retries=max_retries,
             cancelled=cancelled,
         )
     except Exception as exc:
@@ -2760,6 +2935,7 @@ def _run_selection_profile(
         prompt_version=profile,
         cancelled=cancelled,
         budget_reserve=settings.get("_segment_budget_reserve"),
+        max_retries=0 if profile == FLASH_SPLIT_PROFILE else 1,
     )
     require_enrichment = profile in {CORRECTED_PRO_PROFILE, FLASH_SINGLE_PROFILE}
     conversion_settings = dict(settings)

@@ -350,7 +350,7 @@ assessment_service = AssessmentService()
 MAX_REELS_PER_MATERIAL = 300
 GENERATION_OUTPUT_CEILINGS = {"fast": 8, "slow": 12}
 GENERATION_SOURCE_BUDGETS = {"fast": 2, "slow": 3}
-SELECTION_CONTRACT_VERSION = "quality_silence_v5"
+SELECTION_CONTRACT_VERSION = "quality_silence_v6"
 
 VALID_VIDEO_DURATION_PREFS = {"any", "short", "medium", "long"}
 VALID_SEARCH_INPUT_MODES = {"topic", "source", "file"}
@@ -2951,7 +2951,7 @@ def _verified_reusable_generation_chain(
             return False
         if (
             any(not math.isfinite(score) for score in quality_scores)
-            or quality_scores[1] < 0.75
+            or any(score < 0.75 for score in quality_scores)
         ):
             return False
         if any(

@@ -141,6 +141,20 @@ class ClipEngineTopicCutTests(unittest.TestCase):
         main_module.ingestion_pipeline._rate_limiter = _PlatformRateLimiter(
             overrides={"yt": (1000, 60.0)}
         )
+        prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+            "ready",
+            source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+                "https://audio.invalid/test",
+                duration_sec=300.0,
+            ),
+        )
+        self._prepare_patch = mock.patch.object(
+            pipeline_module.clip_engine_silence,
+            "prepare_audio_source",
+            return_value=prepared,
+        )
+        self._prepare_patch.start()
+        self.addCleanup(self._prepare_patch.stop)
 
     def _restore_environment(self) -> None:
         if self.previous_data_dir is None:
@@ -181,6 +195,11 @@ class ClipEngineTopicCutTests(unittest.TestCase):
 
         mock_verify.assert_called_once()
         self.assertIsNone(mock_verify.call_args.kwargs["limit"])
+        self.assertEqual(mock_verify.call_args.kwargs["exact_topic"], "chain rule")
+        self.assertIs(
+            mock_verify.call_args.kwargs["embedding_service"],
+            main_module.ingestion_pipeline._embedding_service,
+        )
 
         # The exact-topic selector returns only the chain-rule teaching unit.
         self.assertFalse(result.is_short)
@@ -232,6 +251,7 @@ class ClipEngineTopicCutTests(unittest.TestCase):
             )
 
         mock_verify.assert_called_once()
+        self.assertEqual(mock_verify.call_args.kwargs["exact_topic"], "")
 
         # With no additional interest, both selector-approved facets persist.
         self.assertFalse(result.is_short)

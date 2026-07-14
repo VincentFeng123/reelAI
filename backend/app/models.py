@@ -516,20 +516,11 @@ class CommunitySettingsPayload(BaseModel):
     start_muted: bool = True
     creative_commons_only: bool = False
     preferred_video_duration: Literal["any", "short", "medium", "long"] = "any"
-    target_clip_duration_sec: int = Field(default=55, ge=15, le=180)
-    target_clip_duration_min_sec: int = Field(default=20, ge=15, le=180)
-    target_clip_duration_max_sec: int = Field(default=55, ge=15, le=180)
+    # Deprecated compatibility fields. Clip generation ignores them.
+    target_clip_duration_sec: int | None = None
+    target_clip_duration_min_sec: int | None = None
+    target_clip_duration_max_sec: int | None = None
     autoplay_next_reel: bool = False
-
-    @model_validator(mode="after")
-    def validate_clip_duration_bounds(self) -> "CommunitySettingsPayload":
-        if self.target_clip_duration_max_sec <= self.target_clip_duration_min_sec:
-            raise ValueError("target_clip_duration_max_sec must be greater than target_clip_duration_min_sec.")
-        if self.target_clip_duration_max_sec - self.target_clip_duration_min_sec < 15:
-            raise ValueError("target clip duration range must be at least 15 seconds wide.")
-        if not self.target_clip_duration_min_sec <= self.target_clip_duration_sec <= self.target_clip_duration_max_sec:
-            raise ValueError("target_clip_duration_sec must fall within the configured min/max range.")
-        return self
 
 
 class CommunitySettingsResponse(CommunitySettingsPayload):

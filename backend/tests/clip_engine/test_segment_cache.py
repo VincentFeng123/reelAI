@@ -70,7 +70,7 @@ def _key(transcript: dict, settings: dict | None = None, *, topic: str = "physic
 def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> None:
     transcript = _transcript()
     baseline = _key(transcript)
-    assert baseline.startswith("clip-segmentation:quality_silence_v5:v5:")
+    assert baseline.startswith("clip-segmentation:quality_silence_v6:v6:")
 
     changed_text = deepcopy(transcript)
     changed_text["segments"][0]["text"] = "changed lesson"
@@ -113,6 +113,34 @@ def test_segment_cache_key_tracks_transcript_topic_and_policy(monkeypatch) -> No
     assert _key(transcript) != baseline
 
 
+def test_segmenter_source_signature_includes_imported_validators(monkeypatch) -> None:
+    from backend.pipeline import discourse, sentences
+
+    real_read_bytes = segment_cache.Path.read_bytes
+    segment_cache._segmenter_source_signature.cache_clear()
+    baseline = segment_cache._segmenter_source_signature()
+    assert baseline is not None
+
+    for module in (discourse, sentences):
+        target_name = segment_cache.Path(module.__file__).name
+
+        def changed_validator(path, *, expected_name=target_name):
+            content = real_read_bytes(path)
+            return (
+                content + b"\n# changed imported validator"
+                if path.name == expected_name
+                else content
+            )
+
+        monkeypatch.setattr(segment_cache.Path, "read_bytes", changed_validator)
+        segment_cache._segmenter_source_signature.cache_clear()
+        changed = segment_cache._segmenter_source_signature()
+        assert changed is not None
+        assert changed != baseline
+
+    segment_cache._segmenter_source_signature.cache_clear()
+
+
 def test_segment_cache_revalidates_public_clip_contract() -> None:
     transcript = _transcript()
     settings = {"segment_accept_partial_flash": True}
@@ -120,29 +148,22 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
         [_clip()], transcript=transcript, settings=settings
     ) == [_clip()]
 
-    for field in ("informativeness", "educational_importance"):
+    for field in (
+        "informativeness",
+        "topic_relevance",
+        "educational_importance",
+    ):
         below_floor = _clip()
-        below_floor[field] = 0.0
+        below_floor[field] = 0.74
         assert segment_cache._valid_clips(
             [below_floor], transcript=transcript, settings=settings
-        ) == [below_floor]
+        ) is None
 
         at_floor = _clip()
         at_floor[field] = 0.75
         assert segment_cache._valid_clips(
             [at_floor], transcript=transcript, settings=settings
         ) == [at_floor]
-
-    below_relevance = _clip()
-    below_relevance["topic_relevance"] = 0.74
-    assert segment_cache._valid_clips(
-        [below_relevance], transcript=transcript, settings=settings
-    ) is None
-    at_relevance = _clip()
-    at_relevance["topic_relevance"] = 0.75
-    assert segment_cache._valid_clips(
-        [at_relevance], transcript=transcript, settings=settings
-    ) == [at_relevance]
 
     medium_uncertainty = _clip()
     medium_uncertainty.update({
@@ -189,6 +210,28 @@ def test_segment_cache_revalidates_public_clip_contract() -> None:
     ) is None
 
 
+def test_segment_cache_keeps_distinct_facets_inside_one_coarse_cue() -> None:
+    transcript = _transcript()
+    first = _clip()
+    first.update({
+        "selection_candidate_id": "force-definition",
+        "learning_objective": "Define force as an interaction",
+        "facet": "force definition",
+        "sequence_index": 1,
+    })
+    second = _clip()
+    second.update({
+        "selection_candidate_id": "motion-effect",
+        "learning_objective": "Describe how motion changes",
+        "facet": "acceleration effect",
+        "sequence_index": 2,
+    })
+
+    assert segment_cache._valid_clips(
+        [first, second], transcript=transcript, settings={}
+    ) == [first, second]
+
+
 def test_segment_cache_treats_requested_max_as_preference() -> None:
     transcript = _transcript()
     transcript["segments"] = [{
@@ -224,7 +267,12 @@ def test_segment_cache_preserves_difficulty_order_not_chronology() -> None:
         "sequence_index": 1,
     })
     hard_earlier = _clip()
-    hard_earlier.update({"difficulty": 0.8, "sequence_index": 2})
+    hard_earlier.update({
+        "difficulty": 0.8,
+        "sequence_index": 2,
+        "learning_objective": "Analyze force vectors quantitatively",
+        "facet": "vector analysis",
+    })
 
     assert segment_cache._valid_clips(
         [easy_later, hard_earlier], transcript=transcript, settings={}

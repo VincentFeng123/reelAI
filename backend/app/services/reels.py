@@ -1200,7 +1200,7 @@ class ReelService:
     # v17: retain public source identity and authoritative selector relevance.
     # v18: bind captions to an immutable selection-time cue snapshot.
     RANKED_FEED_CACHE_VERSION = 18
-    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v5"
+    RANKED_FEED_CACHE_CONTRACT_VERSION = "quality_silence_v6"
     CONCEPT_ADJUSTMENT_BOUND = 0.25
     GOT_IT_CONCEPT_STEP = 0.04
     NEED_HELP_CONCEPT_STEP = 0.06
@@ -2429,7 +2429,12 @@ class ReelService:
             return []
         if all(
             str(reel.get("selection_contract_version") or "").strip()
-            in {"quality_silence_v3", "quality_silence_v4", "quality_silence_v5"}
+            in {
+                "quality_silence_v3",
+                "quality_silence_v4",
+                "quality_silence_v5",
+                "quality_silence_v6",
+            }
             for reel in generated
         ):
             ordered = sorted(
@@ -5688,6 +5693,7 @@ class ReelService:
                 "quality_silence_v3",
                 "quality_silence_v4",
                 "quality_silence_v5",
+                "quality_silence_v6",
             },
         )
         metadata["_selection_substantive"] = selection_bool(
@@ -5697,6 +5703,7 @@ class ReelService:
                 "quality_silence_v3",
                 "quality_silence_v4",
                 "quality_silence_v5",
+                "quality_silence_v6",
             },
         )
         metadata["_selection_factually_grounded"] = selection_bool(
@@ -7170,6 +7177,7 @@ class ReelService:
                     "quality_silence_v3",
                     "quality_silence_v4",
                     "quality_silence_v5",
+                    "quality_silence_v6",
                 }
                 else legacy_difficulty_matches_level
             )
@@ -7194,6 +7202,7 @@ class ReelService:
                     "quality_silence_v3",
                     "quality_silence_v4",
                     "quality_silence_v5",
+                    "quality_silence_v6",
                 }
                 and not difficulty_matches_level
             ):
@@ -7206,7 +7215,8 @@ class ReelService:
                     boundary_status != "verified"
                     or selection_metadata.get("_selection_acoustic_verified") is not True
                     or (
-                        selection_version == "quality_silence_v5"
+                        selection_version
+                        in {"quality_silence_v5", "quality_silence_v6"}
                         and selection_metadata.get(
                             "_selection_speech_corridor_verified"
                         ) is not True
@@ -7221,6 +7231,7 @@ class ReelService:
                     "quality_silence_v3",
                     "quality_silence_v4",
                     "quality_silence_v5",
+                    "quality_silence_v6",
                 } and (
                     (
                         min(
@@ -7234,7 +7245,8 @@ class ReelService:
                                 selection_metadata.get("_selection_educational_importance"), 0.0
                             ),
                         ) < 0.75
-                        if selection_version == "quality_silence_v2"
+                        if selection_version
+                        in {"quality_silence_v2", "quality_silence_v6"}
                         else self._selection_number(
                             selection_metadata.get("_selection_topic_relevance"), 0.0
                         ) < 0.75
@@ -7546,8 +7558,11 @@ class ReelService:
             clean_item["video_id"] = video_id
             if selection_caption_cues:
                 caption_transcript = selection_caption_cues
-            elif selection_contract_version == "quality_silence_v5":
-                # V5 captions must be immutable selection-time evidence. A
+            elif selection_contract_version in {
+                "quality_silence_v5",
+                "quality_silence_v6",
+            }:
+                # V5+ captions must be immutable selection-time evidence. A
                 # provider artifact key identifies a retrieval profile and may
                 # be overwritten by a later same-profile refresh.
                 caption_transcript = []
@@ -7563,7 +7578,8 @@ class ReelService:
                 clip_end=float(clean_item.get("t_end") or 0.0),
                 fallback_text=(
                     ""
-                    if selection_contract_version == "quality_silence_v5"
+                    if selection_contract_version
+                    in {"quality_silence_v5", "quality_silence_v6"}
                     or transcript_artifact_key
                     else str(clean_item.get("transcript_snippet") or "")
                 ),

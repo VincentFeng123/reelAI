@@ -839,11 +839,11 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
             )
         self.assertEqual(len(feed), 2)
         self.assertTrue(all(
-            reel.get("selection_contract_version") == "quality_silence_v5"
+            reel.get("selection_contract_version") == "quality_silence_v6"
             for reel in feed
         ))
 
-    def test_quality_silence_v5_response_orders_stage_before_quality(self) -> None:
+    def test_quality_silence_v6_response_orders_stage_before_quality(self) -> None:
         generated = [
             {
                 "reel_id": "a-late",
@@ -855,7 +855,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "_selection_quality_mean": 0.94,
                 "_selection_topic_relevance": 0.96,
                 "_selection_source_rank": 0,
-                "selection_contract_version": "quality_silence_v5",
+                "selection_contract_version": "quality_silence_v6",
             },
             {
                 "reel_id": "b",
@@ -867,7 +867,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "_selection_quality_mean": 0.97,
                 "_selection_topic_relevance": 0.99,
                 "_selection_source_rank": 1,
-                "selection_contract_version": "quality_silence_v5",
+                "selection_contract_version": "quality_silence_v6",
             },
             {
                 "reel_id": "a-early",
@@ -879,7 +879,7 @@ class ClipEngineGenerateReelsTests(unittest.TestCase):
                 "_selection_quality_mean": 0.92,
                 "_selection_topic_relevance": 0.93,
                 "_selection_source_rank": 0,
-                "selection_contract_version": "quality_silence_v5",
+                "selection_contract_version": "quality_silence_v6",
             },
         ]
 

@@ -524,7 +524,114 @@ def test_topic_generation_streams_independent_acoustic_passes_immediately_but_re
     assert context.counters()["persisted_clips"] == 3
 
 
-def test_final_caption_clip_uses_handoff_halo_and_keeps_verified_quiet_pad(
+def test_queued_acoustic_candidate_gets_a_fresh_verification_timeout(
+    monkeypatch,
+) -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:queued-acoustic",
+        "duration": 40.0,
+        "segments": [
+            {
+                "cue_id": f"unit-{index}",
+                "start": index * 10.0,
+                "end": (index + 1) * 10.0,
+                "text": f"Python teaching unit {index} explains a distinct concept.",
+            }
+            for index in range(4)
+        ],
+    }
+    clips = [
+        {
+            "start": index * 10.0,
+            "end": (index + 1) * 10.0,
+            "cue_ids": [f"unit-{index}"],
+            "score": 0.9 - index * 0.01,
+            "selection_candidate_id": f"unit-{index}",
+            "prerequisite_ids": [],
+            "search_context": {"surface_eligible": True},
+        }
+        for index in range(4)
+    ]
+    engine_out = {"clips": clips, "transcript": transcript, "notes": ""}
+    pipeline = _pipeline()
+    monkeypatch.setattr(
+        pipeline_module,
+        "_discover",
+        lambda *_args, **_kwargs: _discovery(),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_clip_and_filter",
+        lambda selected, *_args, **_kwargs: (selected, clips, engine_out),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=mock.sentinel.prepared_audio),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "DEEP_PHASE_TIMEOUT_SEC",
+        0.05,
+    )
+
+    started: list[float] = []
+    timeouts: list[float] = []
+    lock = threading.Lock()
+    first_wave_started = threading.Event()
+
+    def verify_audio(_source, start_sec, end_sec, *, timeout_sec, **_kwargs):
+        with lock:
+            started.append(start_sec)
+            timeouts.append(timeout_sec)
+            if len(started) == 3:
+                first_wave_started.set()
+        if start_sec < 30.0:
+            assert first_wave_started.wait(timeout=1.0)
+            time.sleep(0.08)
+        return mock.Mock(
+            verified=True,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            diagnostics={},
+        )
+
+    verify = mock.Mock(side_effect=verify_audio)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        lambda *, clip, **_kwargs: (
+            str(clip["selection_candidate_id"]),
+            mock.sentinel.metadata,
+        ),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Intro to Python",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext(
+            "slow", require_acoustic_boundaries=True
+        ),
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=4,
+    )
+
+    assert reels == [f"unit-{index}" for index in range(4)]
+    assert verify.call_count == 4
+    assert 30.0 in started
+    assert timeouts == pytest.approx([0.05] * 4)
+
+
+def test_final_caption_clip_uses_progressive_source_corridor_for_quiet_pad(
     monkeypatch,
 ) -> None:
     transcript = {
@@ -621,8 +728,9 @@ def test_final_caption_clip_uses_handoff_halo_and_keeps_verified_quiet_pad(
 
     assert reels == ["verified-tail"]
     assert persisted[0]["end"] == 10.2
-    assert verify.call_args.kwargs["search_end_limit_sec"] == 10.0
-    assert verify.call_args.kwargs["require_speech_handoff"] is True
+    assert verify.call_args.kwargs["search_end_limit_sec"] == 12.0
+    assert verify.call_args.kwargs["require_speech_handoff"] is False
+    assert verify.call_args.kwargs["require_end_speech_handoff"] is False
     assert persisted[0]["search_context"]["boundary_status"] == "verified"
     assert persisted[0]["search_context"]["boundary_diagnostics"]["acoustic"][
         "threshold_dbfs"
@@ -721,7 +829,9 @@ def test_acoustic_search_anchors_to_required_speech_not_selector_padding(
 
     assert reels == ["verified-padded-speech"]
     assert verify.call_args.args[1:] == (10.0, 20.0)
-    assert verify.call_args.kwargs["require_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_speech_handoff"] is False
+    assert verify.call_args.kwargs["require_start_speech_handoff"] is False
+    assert verify.call_args.kwargs["require_end_speech_handoff"] is False
     assert persisted[0]["start"] == 9.9
     assert persisted[0]["end"] == 20.2
 
@@ -962,6 +1072,342 @@ def test_partial_cue_edge_filler_fails_before_acoustic_verification(
     )
 
 
+def test_native_json3_quotes_authorize_only_the_exact_partial_cue_corridor() -> None:
+    text = (
+        "Welcome everyone. Python functions package reusable instructions. "
+        "Thanks."
+    )
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:native-edge-projection",
+        "duration": 10.0,
+        "segments": [
+            {"cue_id": "unit", "start": 0.0, "end": 10.0, "text": text},
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="unit",
+        start=0.0,
+        end=10.0,
+        edge_projection={
+            "start": {"cue_id": "unit", "quote": "Python functions package"},
+            "end": {"cue_id": "unit", "quote": "reusable instructions"},
+        },
+    )
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+    words = tuple(
+        pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(word, onset)
+        for word, onset in zip(
+            (
+                "welcome",
+                "everyone",
+                "python",
+                "functions",
+                "package",
+                "reusable",
+                "instructions",
+                "thanks",
+            ),
+            (0.5, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0),
+            strict=True,
+        )
+    )
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            lexical_words=words,
+        ),
+    )
+
+    bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        prepared,
+    )
+    corridor = pipeline_module._selected_speech_corridor(
+        transcript,
+        clip,
+        caption,
+        source_end_sec=10.0,
+        required_speech_bounds=bounds,
+        projection_diagnostics=projection,
+    )
+    cues = pipeline_module._selected_caption_cues(
+        transcript,
+        clip,
+        boundary_bounds=(1.9, 6.8),
+    )
+
+    assert error is None
+    assert bounds == (2.0, 7.0)
+    assert projection["lexical_projection_verified"] is True
+    assert corridor == (2.0, 7.0, None)
+    assert cues == [
+        {
+            "cue_id": "unit",
+            "start": 1.9,
+            "end": 6.8,
+            "text": "Python functions package reusable instructions",
+            "lang": "",
+        }
+    ]
+
+
+def test_production_boundary_path_mixes_projected_start_with_progressive_end(
+    monkeypatch,
+) -> None:
+    text = (
+        "Opening hook. Python functions package reusable instructions and preserve "
+        "state for later calls."
+    )
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:mixed-edge-modes",
+        "duration": 30.0,
+        "segments": [
+            {"cue_id": "unit", "start": 10.0, "end": 30.0, "text": text},
+        ],
+    }
+    engine_out = {
+        "clips": [
+            _quality_clip(
+                cue_id="unit",
+                start=10.0,
+                end=30.0,
+                quote=(
+                    "Python functions package reusable instructions and preserve state"
+                ),
+                edge_projection={
+                    "start": {"cue_id": "unit", "quote": "Python functions package"}
+                },
+            )
+        ],
+        "transcript": transcript,
+        "notes": "",
+    }
+    lexical_words = tuple(
+        pipeline_module.clip_engine_silence.lexical_timing.LexicalWord(word, onset)
+        for word, onset in zip(
+            (
+                "opening",
+                "hook",
+                "python",
+                "functions",
+                "package",
+                "reusable",
+                "instructions",
+                "and",
+                "preserve",
+                "state",
+                "for",
+                "later",
+                "calls",
+            ),
+            (10.5, 11.0, 12.0, 13.0, 14.0, 15.0, 17.0, 19.0, 21.0, 23.0, 25.0, 27.0, 29.0),
+            strict=True,
+        )
+    )
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a",
+            format_id="140",
+            duration_sec=40.0,
+            lexical_words=lexical_words,
+        ),
+    )
+
+    def fake_decode(
+        _source,
+        *,
+        window_start_sec,
+        window_duration_sec,
+        output_path,
+        **_kwargs,
+    ):
+        spans = [(window_duration_sec, 12000)]
+        if output_path.name == "start-0.wav":
+            quiet_start = 11.8 - window_start_sec
+            spans = [
+                (quiet_start, 12000),
+                (0.3, 0),
+                (window_duration_sec - quiet_start - 0.3, 12000),
+            ]
+        elif output_path.name == "end-1.wav":
+            quiet_start = 36.0 - window_start_sec
+            spans = [
+                (quiet_start, 12000),
+                (0.3, 0),
+                (window_duration_sec - quiet_start - 0.3, 12000),
+            ]
+        _write_wav(output_path, spans)
+
+    # Keep this regression on the real production verifier while replacing only
+    # network/media decoding with deterministic PCM fixtures.
+    from backend.tests.clip_engine.test_silence import _write_wav
+
+    monkeypatch.setattr(
+        pipeline_module, "_discover", lambda *_args, **_kwargs: _discovery()
+    )
+    monkeypatch.setattr(
+        pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "prepare_audio_source",
+        mock.Mock(return_value=prepared),
+    )
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "_decode_window",
+        fake_decode,
+    )
+    real_verify = pipeline_module.clip_engine_silence.verify_acoustic_boundaries
+    verify = mock.Mock(wraps=real_verify)
+    monkeypatch.setattr(
+        pipeline_module.clip_engine_silence,
+        "verify_acoustic_boundaries",
+        verify,
+    )
+    persisted: list[dict] = []
+    pipeline = _pipeline()
+    monkeypatch.setattr(
+        pipeline,
+        "_persist_engine_clip",
+        lambda *, clip, **_kwargs: (
+            persisted.append(clip) or "stored-mixed-edge",
+            mock.sentinel.metadata,
+        ),
+    )
+
+    reels, _ = pipeline.ingest_topic(
+        topic="Python functions",
+        material_id="material",
+        concept_id="concept",
+        generation_context=GenerationContext(
+            "slow", require_acoustic_boundaries=True
+        ),
+        retrieval_profile="deep",
+        max_videos=1,
+        max_reels=1,
+    )
+
+    assert reels == ["stored-mixed-edge"]
+    assert persisted[0]["start"] == 12.0
+    assert persisted[0]["end"] == 36.2
+    assert verify.call_args.kwargs["require_start_speech_handoff"] is True
+    assert verify.call_args.kwargs["require_end_speech_handoff"] is False
+    acoustic = persisted[0]["search_context"]["boundary_diagnostics"]["acoustic"]
+    assert acoustic["start_windows"] == [[11.0, 15.0]]
+    assert acoustic["end_windows"] == [[27.0, 33.0], [33.0, 39.0]]
+
+
+def test_mixed_boundary_safety_rejects_missing_proof_and_speech_crossings() -> None:
+    diagnostics = {
+        "start_speech_handoff_verified": True,
+        "end_speech_handoff_verified": False,
+        "start_two_sided_required": True,
+        "semantic_start_limit_sec": 12.0,
+        "semantic_end_limit_sec": 40.0,
+        "start_quiet": [11.8, 12.1],
+        "end_quiet": [36.0, 36.3],
+    }
+
+    def safe(**overrides) -> bool:
+        values = {
+            "start_sec": 12.0,
+            "end_sec": 36.2,
+            "required_start_sec": 12.0,
+            "required_end_sec": 30.0,
+            "semantic_start_limit_sec": 12.0,
+            "semantic_end_limit_sec": 40.0,
+            "source_end_sec": 40.0,
+            "diagnostics": diagnostics,
+            "require_start_handoff": True,
+            "require_end_handoff": False,
+        }
+        values.update(overrides)
+        return pipeline_module._acoustic_range_is_safe(**values)
+
+    assert safe() is True
+    assert safe(diagnostics={**diagnostics, "start_two_sided_required": False}) is False
+    assert safe(start_sec=12.1) is False
+    assert safe(end_sec=29.8) is False
+    assert safe(
+        end_sec=40.2,
+        source_end_sec=50.0,
+        require_start_handoff=False,
+    ) is False
+
+    projected_end_diagnostics = {
+        "start_speech_handoff_verified": False,
+        "end_speech_handoff_verified": True,
+        "end_two_sided_required": True,
+        "semantic_start_limit_sec": 10.0,
+        "semantic_end_limit_sec": 20.0,
+        "start_quiet": [9.8, 10.0],
+        "end_quiet": [19.7, 20.0],
+    }
+    assert safe(
+        start_sec=10.0,
+        end_sec=19.9,
+        required_start_sec=10.0,
+        required_end_sec=20.0,
+        semantic_start_limit_sec=10.0,
+        semantic_end_limit_sec=20.0,
+        source_end_sec=30.0,
+        diagnostics=projected_end_diagnostics,
+        require_start_handoff=False,
+        require_end_handoff=True,
+    ) is True
+
+
+def test_partial_cue_projection_fails_closed_without_native_lexical_words() -> None:
+    transcript = {
+        "source": "supadata",
+        "native_mode": False,
+        "artifact_key": "supadata-transcript:v2:missing-native-edge-timing",
+        "duration": 10.0,
+        "segments": [
+            {
+                "cue_id": "unit",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "Opening hook. Python functions package reusable instructions.",
+            }
+        ],
+    }
+    clip = _quality_clip(
+        cue_id="unit",
+        edge_projection={
+            "start": {"cue_id": "unit", "quote": "Python functions package"}
+        },
+    )
+    caption = pipeline_module._supadata_boundary_diagnostics(transcript, clip)
+    assert caption is not None
+    prepared = pipeline_module.clip_engine_silence.AudioPreparationResult(
+        "ready",
+        source=pipeline_module.clip_engine_silence.PreparedAudioSource(
+            url="https://media.example/audio.m4a"
+        ),
+    )
+
+    _bounds, projection, error = pipeline_module._projected_speech_bounds(
+        transcript,
+        clip,
+        caption,
+        prepared,
+    )
+
+    assert projection == {}
+    assert error == "lexical_timing_unavailable"
+
+
 @pytest.mark.parametrize(
     "segments",
     [
@@ -1002,7 +1448,7 @@ def test_overlapping_unselected_cue_has_no_speech_free_corridor(segments) -> Non
     assert error == "unselected_speech_overlaps_required_range"
 
 
-def test_single_caption_cue_uses_its_own_edges_as_semantic_fences() -> None:
+def test_single_caption_cue_uses_source_edges_as_progressive_corridor() -> None:
     transcript = {
         "source": "supadata",
         "native_mode": False,
@@ -1029,7 +1475,7 @@ def test_single_caption_cue_uses_its_own_edges_as_semantic_fences() -> None:
     )
 
     assert error is None
-    assert (start_limit, end_limit) == (10.0, 20.0)
+    assert (start_limit, end_limit) == (0.0, 100.0)
 
 
 @pytest.mark.parametrize(
@@ -1407,6 +1853,24 @@ def test_exact_topic_lexical_proof_survives_without_semantic_inference(
     assert len(clips) == 1
 
 
+def test_exact_comparison_component_survives_without_semantic_inference(
+    monkeypatch,
+) -> None:
+    quote = "A sunk cost has already been incurred and cannot be recovered."
+    engine_out = _one_cue_selector_result(quote)
+    monkeypatch.setattr(pipeline_module, "_run_clip", lambda *_args, **_kwargs: engine_out)
+    topic = "opportunity cost versus sunk cost"
+
+    _video_row, clips, _engine = _pipeline()._clip_and_filter(
+        {**_video(), "literal_match": False, "_topic_terms": [topic]},
+        topic,
+        "en",
+    )
+
+    assert len(clips) == 1
+    assert clips[0]["topic_evidence_terms"] == [quote]
+
+
 def test_expanded_search_terms_never_become_corroboration_anchors(
     monkeypatch,
 ) -> None:
@@ -1512,15 +1976,17 @@ def test_task_topic_keeps_recognition_teaching_and_rejects_object_history(
 @pytest.mark.parametrize(
     ("quality_axis", "value", "accepted"),
     [
-        ("informativeness", 0.00, True),
+        ("informativeness", 0.00, False),
+        ("informativeness", 0.74, False),
         ("informativeness", 0.75, True),
         ("topic_relevance", 0.74, False),
         ("topic_relevance", 0.75, True),
-        ("educational_importance", 0.00, True),
+        ("educational_importance", 0.00, False),
+        ("educational_importance", 0.74, False),
         ("educational_importance", 0.75, True),
     ],
 )
-def test_only_topic_relevance_has_a_hard_point_seven_five_gate(
+def test_each_quality_axis_has_a_hard_point_seven_five_gate(
     monkeypatch,
     quality_axis: str,
     value: float,
@@ -1652,7 +2118,7 @@ def test_selector_contract_uses_level_neutral_content_score(monkeypatch) -> None
         _, clips, _ = pipeline._clip_and_filter(video, "Intro to Python", "en")
         scores.append(clips[0]["score"])
         context = clips[0]["search_context"]
-        assert context["selection_contract_version"] == "quality_silence_v5"
+        assert context["selection_contract_version"] == "quality_silence_v6"
         assert context["boundary_confidence"] == 0.85
         assert context["is_standalone"] is True
         assert context["chain_id"] == "dQw4w9WgXcQ::python-functions"
