@@ -776,6 +776,44 @@ def test_compact_selector_rejects_a_retrieval_expansion_as_exact_request() -> No
     assert report.rejected_reasons == ["intent_contract_request_mismatch"]
 
 
+def test_unfiltered_selector_ignores_synthetic_request_rewording() -> None:
+    evidence_quote = (
+        "Cells use chlorophyll to capture light energy and power the chemical reactions"
+    )
+    plan = _compact_plan(
+        exact_request="every substantive lesson in this source",
+        constraints=[{
+            "constraint_id": "synthetic",
+            "kind": "scope",
+            "source_phrase": "every substantive lesson",
+            "requirement": "Return every substantive lesson",
+        }],
+        evidence=[{
+            "constraint_id": "synthetic",
+            "evidence_quote": evidence_quote,
+        }],
+    )
+
+    report = gemini_segment._plan_to_report(
+        plan,
+        [{
+            "cue_id": "photosynthesis",
+            "start": 0.0,
+            "end": 10.0,
+            "text": f"{evidence_quote} of photosynthesis.",
+        }],
+        [],
+        {},
+        topic="",
+    )
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["intent_role"] == "primary"
+    assert clip["intent_coverage"] == 1.0
+    assert clip["intent_evidence"] == []
+
+
 def test_compact_selector_derives_primary_and_topic_evidence_from_grounding() -> None:
     evidence_quote = (
         "Cells use chlorophyll to capture light energy and power the chemical reactions"

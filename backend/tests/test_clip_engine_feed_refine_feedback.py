@@ -526,16 +526,16 @@ class ClipEngineFeedRefineFeedbackTests(unittest.TestCase):
         self.assertNotEqual(learner_a_revision_1, learner_b_revision_1)
         self.assertNotEqual(learner_a_revision_1, learner_a_revision_2)
 
-    def test_ranked_feed_cache_version_is_36(self) -> None:
-        """Cache rows must require the v29 sentence-tail selector contract."""
+    def test_ranked_feed_cache_version_is_37(self) -> None:
+        """Cache rows must require the v30 direct-URL selector contract."""
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_VERSION,
-            36,
+            37,
             "Current feeds must not reuse rows missing public selector metadata.",
         )
         self.assertEqual(
             ReelService.RANKED_FEED_CACHE_CONTRACT_VERSION,
-            "quality_silence_v29",
+            "quality_silence_v30",
         )
 
 

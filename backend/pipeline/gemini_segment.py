@@ -6740,7 +6740,12 @@ def _validated_intent_constraints(
     """Validate the selector's same-call interpretation against the exact request."""
     if not isinstance(plan, (_CompactBoundaryPlan, _IntentBoundaryPlan)):
         return {}, None
-    expected_request = topic.strip() or "(all educational topics)"
+    # An unfiltered source has no user request to protect.  Do not let a model's
+    # harmless rewrite of the synthetic all-topics placeholder reject every
+    # otherwise valid educational unit.
+    expected_request = topic.strip()
+    if not expected_request:
+        return {}, None
     request_intent = plan.request_intent
     if _normalized_request_text(request_intent.exact_request) != _normalized_request_text(
         expected_request

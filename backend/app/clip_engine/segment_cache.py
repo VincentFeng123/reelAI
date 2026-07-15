@@ -17,9 +17,9 @@ from ..db import dumps_json, fetch_one, get_conn, now_iso, upsert
 
 logger = logging.getLogger(__name__)
 
-SEGMENT_CACHE_VERSION = 19
+SEGMENT_CACHE_VERSION = 20
 SEGMENT_CACHE_TTL_SEC = 30 * 24 * 60 * 60
-SELECTION_CONTRACT_VERSION = "quality_silence_v29"
+SELECTION_CONTRACT_VERSION = "quality_silence_v30"
 
 
 def _objective_tokens(clip: Mapping[str, Any]) -> set[str]:
