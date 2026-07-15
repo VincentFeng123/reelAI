@@ -663,6 +663,22 @@ _OPENING_PREPOSITIONAL_TAG_RE = re.compile(
     r"[^.!?]{0,160}\b(?:right|correct)\s*\?\s*$",
     re.IGNORECASE,
 )
+_OPENING_DEPENDENT_QUESTION_TAIL_RE = re.compile(
+    r"^\s*(?:as|at|because|by|during|for|from|if|in|into|of|on|onto|"
+    r"than|to|when|where|while|with|without)\b",
+    re.IGNORECASE,
+)
+_PREPOSITION_FRONTED_QUESTION_RE = re.compile(
+    r"^\s*(?:at|by|during|for|from|in|into|of|on|onto|to|with|without)\s+"
+    r"(?:how|what|when|where|which|who|whose|whom)\b[^?]*\?",
+    re.IGNORECASE,
+)
+_FRAMED_QUESTION_ONSET_RE = re.compile(
+    r"[,;:]\s*(?:(?:and|but|now|okay|ok|so|then|well)\s+)?"
+    r"(?:what|how|why|where|when|which|who|whose|whom|is|are|can|could|"
+    r"would|should|does|do|did|will|was|were|has|have|had)\b",
+    re.IGNORECASE,
+)
 _OPENING_NOMINAL_INFINITIVE_RE = re.compile(
     r"^\s*(?:(?:the|a|an)\s+)?"
     r"(?:ability|capacity|capability|process|method|role|way)\s+to\b",
@@ -1953,7 +1969,10 @@ def _explicit_problem_has_substantive_object(
 def _local_example_setup_is_complete(text: str) -> bool:
     """Require a stated problem/object, while allowing an explicitly defined referent."""
     raw_text = str(text or "").strip()
-    if _OPENING_AGENDA_RE.match(raw_text):
+    if (
+        _OPENING_AGENDA_RE.match(raw_text)
+        or _opening_is_dependent_question_tail(raw_text)
+    ):
         return False
     contextual_frame = _OPENING_CONTEXTUAL_EXAMPLE_RE.match(raw_text)
     if contextual_frame is not None:
@@ -2062,6 +2081,14 @@ def _cue_opens_mid_thought_at(
     opening_text = (
         text[:sentence_spans[0][1]].strip() if sentence_spans else text
     )
+    if _opening_is_dependent_question_tail(opening_text):
+        if index <= 0:
+            return True
+        from .sentences import classify_terminator
+
+        previous_text = str(segments[index - 1].get("text") or "").strip()
+        if not classify_terminator(previous_text):
+            return True
     if (
         _DANGLING_TAIL_PREFIX_RE.search(opening_text)
         or _OPENING_DEMONSTRATIVE_REFERENCE_RE.match(opening_text)
@@ -2101,6 +2128,7 @@ def _cue_opens_mid_thought_at(
                 "by", "during", "for", "from", "into", "of", "onto", "to",
                 "while", "with", "without",
             }
+            and not _opening_is_independent_preposition_question(opening_text)
             and not classify_terminator(previous_text)
         ):
             return True
@@ -2165,6 +2193,35 @@ def _cue_begins_standalone_question(text: str) -> bool:
             )
         )
     )
+
+
+def _opening_is_independent_preposition_question(text: str) -> bool:
+    """Recognize a complete question introduced by a prepositional frame."""
+    opening = str(text or "").strip()
+    question = re.match(r"^[^?]*\?", opening)
+    if question is None:
+        return False
+    clause = question.group(0)
+    return bool(
+        _PREPOSITION_FRONTED_QUESTION_RE.match(clause)
+        or _FRAMED_QUESTION_ONSET_RE.search(clause)
+    )
+
+
+def _opening_is_dependent_question_tail(text: str) -> bool:
+    """Detect a caption fragment that contains only the tail of a question."""
+    opening = str(text or "").strip()
+    question = re.match(r"^[^?]*\?", opening)
+    if question is None:
+        return False
+    clause = question.group(0)
+    if (
+        _cue_begins_standalone_question(clause)
+        or _opening_is_independent_preposition_question(clause)
+        or not _OPENING_DEPENDENT_QUESTION_TAIL_RE.match(clause)
+    ):
+        return False
+    return True
 
 
 def _cue_has_weak_end(
@@ -3351,6 +3408,7 @@ def _opening_clause_is_standalone(text: str) -> bool:
         or _NEXT_EXAMPLE_FRAMING_RE.fullmatch(opening_clause)
         or _OPENING_LIST_TAIL_RE.match(opening_clause)
         or _OPENING_PREPOSITIONAL_TAG_RE.match(opening_clause)
+        or _opening_is_dependent_question_tail(opening_clause)
         or (
             _OPENING_NOMINAL_INFINITIVE_RE.match(opening_clause)
             and finite_clause_signal is None
@@ -3368,7 +3426,10 @@ def _opening_clause_is_standalone(text: str) -> bool:
         or _OPENING_DEMONSTRATIVE_REFERENCE_RE.match(opening_clause)
         or _OPENING_BARE_RELATIONAL_PREDICATE_RE.match(opening_clause)
         or _ANAPHORIC_OPENING_RE.match(opening_clause)
-        or _NON_STANDALONE_MARKER_SUFFIX_RE.match(opening_clause)
+        or (
+            _NON_STANDALONE_MARKER_SUFFIX_RE.match(opening_clause)
+            and not _PREPOSITION_FRONTED_QUESTION_RE.match(opening_clause)
+        )
     ):
         return False
     if _OPENING_COMPLETE_ORDINAL_SUBJECT_RE.match(opening_clause):
@@ -5716,6 +5777,15 @@ def _plan_to_report(
                     )
                     if (
                         recovered_start_span is not None
+                        and recovered_start_span[0] == selected_start_span[0]
+                    ):
+                        # A recovery must move the playback boundary. Treating
+                        # the original fragment as repaired bypasses the
+                        # cue-by-cue discourse expansion below.
+                        recovered_start_quote = ""
+                    if (
+                        recovered_start_quote
+                        and recovered_start_span is not None
                         and recovered_start_span[0] == 0
                         and a > 0
                         and _cue_has_explicit_dangling_end(

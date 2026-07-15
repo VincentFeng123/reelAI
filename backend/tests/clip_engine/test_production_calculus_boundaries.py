@@ -1306,3 +1306,94 @@ def test_same_cue_described_unit_label_is_not_the_new_clip_opening() -> None:
         )
         assert report.rejected_reasons == []
         assert report.clips[0]["_clip_text"].startswith("the derivative is")
+
+
+def test_split_question_tail_recovers_the_complete_notation_context() -> None:
+    texts = [
+        "So how can we denote a derivative?",
+        "One way is known as Leibniz's notation,",
+        "and in his notation the slope of the tangent line equals dy over dx.",
+        "Now why do I like this notation?",
+        "Because it really comes from this idea of a slope,",
+        "which is change in y over change in x.",
+        "And let's see what happens as the change",
+        "in x approaches zero,",
+        "and so using these d's instead of deltas,",
+        "this was Leibniz's way of saying,",
+        '"Hey, what happens if my changes',
+        'in, say, x become close to zero?" So this idea,',
+        "this is known as differential notation,",
+        "and it is how we will calculate the derivative.",
+    ]
+    segments = [
+        _cue(f"split-question:{index}", index * 3.0, (index + 1) * 3.0, text)
+        for index, text in enumerate(texts)
+    ]
+    proposal = _proposal(
+        candidate_id="split-leibniz-question",
+        start_line=11,
+        end_line=13,
+        start_quote="in, say, x become close to",
+        end_quote="calculate the derivative",
+        evidence="this is known as differential notation",
+        objective="Explain Leibniz derivative notation",
+    )
+
+    report = _report(segments, proposal, topic="calculus derivatives")
+
+    assert report.rejected_reasons == []
+    [clip] = report.clips
+    assert clip["cue_ids"][0] == "split-question:6"
+    assert clip["_clip_text"].startswith(
+        "And let's see what happens as the change in x approaches zero"
+    )
+    assert not clip["_clip_text"].startswith("in, say")
+    assert '"Hey, what happens if my changes in, say, x become close to zero?"' in clip[
+        "_clip_text"
+    ]
+
+
+def test_preposition_fronted_question_is_a_valid_independent_opening() -> None:
+    questions = (
+        "In which direction does the gradient point?",
+        "During which phase does mitosis separate sister chromatids?",
+        "For what values does the series converge?",
+        "To what extent is the approximation valid?",
+        "In calculus, what does a derivative mean?",
+    )
+    for question in questions:
+        assert not gemini_segment._opening_is_dependent_question_tail(question)
+        assert gemini_segment._opening_clause_is_standalone(question)
+        assert not gemini_segment._cue_opens_mid_thought_at(
+            [
+                _cue("unpunctuated-prior", 0.0, 4.0, "the prior section ended"),
+                _cue("independent-question", 4.0, 8.0, question),
+            ],
+            1,
+            ignore_caption_case=True,
+        )
+
+    segments = [
+        _cue("prior", 0.0, 4.0, "the previous section explained algebra"),
+        _cue("question", 4.0, 8.0, "In calculus, what does a derivative mean?"),
+        _cue(
+            "answer",
+            8.0,
+            13.0,
+            "A derivative is the instantaneous rate of change of a function.",
+        ),
+    ]
+    proposal = _proposal(
+        candidate_id="independent-framed-question",
+        start_line=1,
+        end_line=2,
+        start_quote="In calculus, what does a derivative mean",
+        end_quote="instantaneous rate of change of a function",
+        evidence="derivative is the instantaneous rate of change",
+        objective="Define a derivative",
+    )
+
+    report = _report(segments, proposal, topic="calculus derivatives")
+
+    assert report.rejected_reasons == []
+    assert report.clips[0]["cue_ids"][0] == "question"
